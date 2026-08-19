@@ -64,11 +64,20 @@ export interface StatusData {
 
 export interface SystemData {
   hostname: string; os: string; arch: string; cpu_count: number
-  load_1m: number; load_5m: number; load_15m: number; cpu_pct: number
-  mem_total_gb: number; mem_used_gb: number; mem_free_gb: number
+  load_1m: number; load_5m: number; load_15m: number
+  /**
+   * Probe-derived metrics are OPTIONAL by construction. The server assembles
+   * `/api/system` key-by-key under a per-probe `try/except: pass`, seeded from
+   * cached static info — so a frame carrying `mem_total_gb` (static cache) with
+   * no `mem_used_gb` (live probe failed or returned nothing) is an ordinary
+   * outcome, not an error. Narrow through `utils/metrics.ts` before any
+   * arithmetic or formatting; a bare `.toFixed()` on one of these is a crash.
+   */
+  cpu_pct?: number
+  mem_total_gb?: number; mem_used_gb?: number; mem_free_gb?: number
   ip: string; net_rx_mb: number; net_tx_mb: number
   net_rx_kbs: number; net_tx_kbs: number
-  disk_total_gb: number; disk_free_gb: number
+  disk_total_gb?: number; disk_free_gb?: number
   python: string; pid: number; cwd: string
   proc_mem_mb: number; proc_cpu_pct: number
   child_processes: number; thread_count: number
@@ -533,7 +542,7 @@ export interface ConfiguredChannelTarget {
 }
 
 export interface ChatSlot {
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */

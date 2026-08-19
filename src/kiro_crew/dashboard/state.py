@@ -877,9 +877,44 @@ def _budgeted_source_links(links: list[dict]) -> list[dict]:
     Budgeting per kind keeps pre-existing pull-request behaviour unchanged and
     makes issues purely additive.
     """
+    changes, issues = _source_links_by_kind(links)
+    return changes[:_SERIALIZED_SOURCE_LINKS_PER_SLOT] + issues[:_SERIALIZED_SOURCE_LINKS_PER_SLOT]
+
+
+def _source_links_by_kind(links: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split links into (changes, issues), preserving discovery order in each.
+
+    ``kind`` is absent on older payloads and means ``"change"`` there, so the
+    default keeps a pre-``kind`` link rendering as the pull request it always
+    was.
+    """
     changes = [link for link in links if link.get("kind", "change") == "change"]
     issues = [link for link in links if link.get("kind", "change") == "issue"]
-    return changes[:_SERIALIZED_SOURCE_LINKS_PER_SLOT] + issues[:_SERIALIZED_SOURCE_LINKS_PER_SLOT]
+    return changes, issues
+
+
+def _project_source_links(links: list[dict], include_check_status: bool) -> list[dict]:
+    """Attach cached chip status to each link, gated on kind and on the caller.
+
+    The chip-status cache is pull-request-only: it holds a {ci, state}
+    projection of a PR/MR lifecycle. Consulting it for an issue would key on a
+    URL it never stores -- and if a PR and an issue ever normalized to the same
+    key, the issue chip would inherit the PR's CI glyph. Gate on kind.
+
+    Shared by the budgeted slots payload and the unbudgeted overflow-expand
+    read so the two cannot decorate the same link differently.
+    """
+    return [
+        {
+            **link,
+            **(
+                (_cached_check_status(link["url"]) or {})
+                if include_check_status and link.get("kind", "change") == "change"
+                else {}
+            ),
+        }
+        for link in links
+    ]
 
 
 _NON_DURABLE_SOURCE_LINK_ROLES = frozenset({"chunk", "done", "streaming", "queued", "permission"})
@@ -979,6 +1014,24 @@ EMPTY_RESPONSE_RECOVERY_PREFIX = "[Empty response — automatic recovery]"
 # say "automatic recovery" like the five above: a person pressed the button, and
 # the card must not claim the system recovered by itself.
 MANUAL_RESUME_RECOVERY_PREFIX = "[Continue — requested by the user]"
+# Prefix on the continuation injected when a Stop hook returns a block decision
+# (`{"decision": "block", "reason": ...}` on exit-0 stdout). The reason IS the
+# instruction, handed back as the next turn so a hook can steer the session
+# without a round-trip to the user. Named into the *_RECOVERY_PREFIX family so
+# test_recovery_card_prefixes.py's drift guard sees it — a marker outside the
+# family renders as a full-width bubble instead of a card. The VALUE deliberately
+# does not say "recovery": the turn completed and a hook asked for another, so
+# nothing failed and nothing was recovered.
+HOOK_CONTINUATION_RECOVERY_PREFIX = "[Hook continuation — automatic]"
+# Prefix on the informational row surfaced when a Stop-hook continuation run hits
+# the `agent.max_stop_hook_nudges` cap: the next block decision is refused, no
+# turn is dispatched, and this row is appended instead so the transcript shows
+# the loop was force-stopped (with the reached depth as "#N"). Named into the
+# *_RECOVERY_PREFIX family so test_recovery_card_prefixes.py's drift guard sees
+# it — a marker outside the family renders as a full-width bubble, not a card.
+# The VALUE does not say "recovery": nothing failed or recovered, a safety cap
+# fired.
+HOOK_HALTED_RECOVERY_PREFIX = "[Stop-hook nudge cap reached]"
 
 
 def should_queue_refusal_recovery(
@@ -998,6 +1051,43 @@ def should_queue_refusal_recovery(
         and not needs_reset
         and stop_reason != STOP_REASON_CANCELLED
     )
+
+
+def should_queue_hook_continuation(stopping: bool, needs_reset: bool, stop_reason: str) -> bool:
+    """Decide whether a Stop hook's block decision may inject a continuation.
+
+    Mirrors :func:`should_queue_refusal_recovery`'s suppression set so a hook can
+    never override the Stop button: a stop in progress, a pending session reset,
+    or a user-cancelled turn all win over the hook.
+    """
+    return bool(not stopping and not needs_reset and stop_reason != STOP_REASON_CANCELLED)
+
+
+def parse_hook_continuations(stdouts: list[str]) -> list[str]:
+    """Extract continuation instructions from Stop-hook exit-0 stdout texts.
+
+    ``stdouts`` is what ``_fire`` returns for the Stop event: one entry per exit-0
+    hook, plus ``BLOCKED:`` markers for exit-2 denials. Only a well-formed block
+    decision carrying a non-blank ``reason`` contributes, because ``reason`` is
+    the message that gets injected — a block without one has nothing to say, so
+    the turn stops normally. Every other string is ignored, which is what keeps an
+    ordinary Stop hook that merely logs from continuing the session.
+    """
+    reasons: list[str] = []
+    for stdout in stdouts:
+        try:
+            decision = json.loads(stdout)
+        except (ValueError, TypeError, RecursionError):
+            # RecursionError is a RuntimeError, not a ValueError: json.loads
+            # raises it on deeply-nested input, and a pathological hook must not
+            # error an otherwise-successful turn.
+            continue
+        if not isinstance(decision, dict) or decision.get("decision") != "block":
+            continue
+        reason = decision.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            reasons.append(reason)
+    return reasons
 
 
 def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
@@ -1289,6 +1379,7 @@ class _ChatSlot:
         "_artifact",
         "_channel_folder_filed",
         "_resumed_count",
+        "_hook_continuation_depth",
         "_todo",
         "_on_message",
         "_on_question_retired",
@@ -1340,6 +1431,7 @@ class _ChatSlot:
         "_compaction_fail_streak",
         "_compaction_fail_cooldown_until",
         "color_index",
+        "color_hex",
         "color_theme",
         "theme_consent",
         "theme_consent_sha",
@@ -1486,6 +1578,11 @@ class _ChatSlot:
         # Default filing is a first-surface action, not a recurring one.
         self._channel_folder_filed: bool = False
         self._resumed_count: int = 0  # messages loaded from history on resume
+        # Depth of the current unbroken Stop-hook continuation run: 0 on a normal
+        # turn, incremented on each consecutive hook-continuation turn, reset by
+        # any turn that is not a hook continuation. Surfaced to Stop hooks as
+        # `hook_continuation_count` for diagnostics or stricter hook-owned limits.
+        self._hook_continuation_depth: int = 0
         # Agent-authored TODO list, replaced wholesale from each todo_list tool
         # result (every command echoes the full list, so there is nothing to
         # merge). Shape: {description: str, tasks: [{id, text, completed}]}.
@@ -1649,6 +1746,13 @@ class _ChatSlot:
         self._compaction_fail_streak: int = 0
         self._compaction_fail_cooldown_until: float = 0.0
         self.color_index: int | None = None
+        # Custom per-session color (#rrggbb, lowercase). Mutually exclusive
+        # with color_index: the PATCH handler clears one when the other is
+        # set, and the frontend renders color_hex with priority. Unlike
+        # color_index (resolved against the viewer's generated palette, so it
+        # follows theme/palette switches), a custom hex is deliberately
+        # frozen.
+        self.color_hex: str | None = None
         self.color_theme: str = ""
         # Explicit user consent for the active INSTALLED theme's experience
         # layer (persona injection is gated on this; fail-closed default).
@@ -2493,6 +2597,24 @@ class _ChatSlot:
         self._source_links_cache = (cache_key, links)
         return links
 
+    def source_links_payload(self, *, include_check_status: bool = False) -> dict:
+        """Every source link this slot carries — the unbudgeted read.
+
+        ``to_dict`` serializes at most ``_SERIALIZED_SOURCE_LINKS_PER_SLOT`` per
+        kind, so the sidebar's "+N" overflow chip has nothing on the client to
+        expand into. This is what that expand fetches.
+
+        Ordering repeats the budgeted slice's grouping (changes, then issues) so
+        the chips already on screen keep their positions and the revealed ones
+        append inside their own group instead of shuffling the row.
+        """
+        links = self._pr_source_links()
+        changes, issues = _source_links_by_kind(links)
+        return {
+            "links": _project_source_links(changes + issues, include_check_status),
+            "total": len(links),
+        }
+
     def to_dict(self, *, include_check_status: bool = False) -> dict:
         last_ts = self.messages[-1].get("ts", "") if self.messages else ""
         # Single reverse scan for last_msg, options, and last_activity_ts.
@@ -2701,22 +2823,9 @@ class _ChatSlot:
             "last_ts": last_ts,
             "last_turn_ts": last_turn_ts,
             "last_message": last_msg,
-            "source_links": [
-                {
-                    **link,
-                    # The chip-status cache is pull-request-only: it holds a
-                    # {ci, state} projection of a PR/MR lifecycle. Consulting it
-                    # for an issue would key on a URL it never stores -- and if a
-                    # PR and an issue ever normalized to the same key, the issue
-                    # chip would inherit the PR's CI glyph. Gate on kind.
-                    **(
-                        (_cached_check_status(link["url"]) or {})
-                        if include_check_status and link.get("kind", "change") == "change"
-                        else {}
-                    ),
-                }
-                for link in _budgeted_source_links(source_links)
-            ],
+            "source_links": _project_source_links(
+                _budgeted_source_links(source_links), include_check_status
+            ),
             "source_links_total": len(source_links),
             # Agent TODO list. Absent-vs-empty is load-bearing: None means the
             # agent never used its todo tool (no pill), [] means it cleared the
@@ -2737,6 +2846,7 @@ class _ChatSlot:
             "pinned": self.pinned,
             "tags": list(self.tags),
             "color_index": self.color_index,
+            "color_hex": self.color_hex,
             "color_theme": self.color_theme,
             "theme_consent": self.theme_consent,
             "theme_consent_sha": self.theme_consent_sha,

@@ -117,6 +117,20 @@ def test_b2_dunder_attribute_rejected(attr: str) -> None:
     assert any(attr in e for e in res.errors)
 
 
+def test_b2_deeply_nested_expression_rejected_not_raised() -> None:
+    """A stack-exhausting expression is a rejection, never a raised error.
+
+    ``validate`` is reached straight from the workflow HTTP API, so a leaked
+    ``RecursionError`` would be a 500 instead of a refusal. Every walk in the
+    validator (and ``ast.parse`` itself) recurses with the tree's depth, so the
+    guard sits at the top rather than in any one walk.
+    """
+    deep = " + ".join(['"a"'] * 20_000)
+    res = validate(_bad(f"y = {deep}"))
+    assert res.ok is False
+    assert any("too deep" in e for e in res.errors)
+
+
 # --------------------------------------------------------------------------- #
 # B3 (static half) — determinism modules cannot be imported
 # --------------------------------------------------------------------------- #

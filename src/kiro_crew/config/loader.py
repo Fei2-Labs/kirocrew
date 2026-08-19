@@ -1456,6 +1456,16 @@ class AgentConfig:
             "below 3 would disable auto-sizing and run under the default).",
         ),
     )
+    max_stop_hook_nudges: int = field(
+        default=100,
+        metadata=_meta(
+            "Max Stop-hook nudges",
+            "Maximum consecutive Stop-hook block continuations before the run "
+            "halts and surfaces a halt card instead of dispatching another turn. "
+            "Bounds a buggy always-block hook in an unattended session. 0 = "
+            "uncapped (opt-in for genuinely unbounded feedback loops).",
+        ),
+    )
     spawn_min_memory_gb: float = field(
         default=4.0,
         metadata=_meta(
@@ -3117,6 +3127,22 @@ class ExternalRegistryConfig:
         default="main",
         metadata=_meta("Branch", "Git branch to read from."),
     )
+    trust: str = field(
+        default="index",
+        metadata=_meta(
+            "Trust",
+            "How much a registry's INDEX is trusted, which selects the credential "
+            "posture for cloning the apps it lists. 'index' (the default) treats the "
+            "index as untrusted content: every app it lists is cloned credential-free "
+            "so a hostile entry cannot read a private sibling repo with this machine's "
+            "git identity. 'owner' means the index is under change control the build "
+            "owns, so its apps may clone with this machine's credentials. Setting it "
+            "HERE has no effect: the trusted tier is honoured only for registries the "
+            "build supplies, because this file is agent-writable and a tier read from "
+            "it would not be your assertion. A value other than 'index' on a "
+            "configured registry is read as 'index'.",
+        ),
+    )
 
 
 @dataclass
@@ -3893,7 +3919,7 @@ class ChannelConfig:
         )
 
 
-_VALID_STT_PROVIDERS = ("whisper", "mlx", "apple", "transcribe")
+_VALID_STT_PROVIDERS = ("whisper", "mlx", "apple", "parakeet", "transcribe")
 _VALID_CHANNEL_PREFIXES = ("C", "D", "G")
 
 
@@ -4172,6 +4198,13 @@ class SttConfig:
         metadata=_meta(
             "MLX Model",
             "Hugging Face repo for the mlx_whisper model (mlx provider only).",
+        ),
+    )
+    parakeet_model: str = field(
+        default="mlx-community/parakeet-tdt-0.6b-v3",
+        metadata=_meta(
+            "Parakeet Model",
+            "Hugging Face repo for the parakeet-mlx model (parakeet provider only).",
         ),
     )
     device: str = field(
@@ -6041,6 +6074,9 @@ class KiroCrewConfig:
                 ),
                 session_sharing=bool(agent_data.get("session_sharing", True)),
                 max_subagents=agent_data.get("max_subagents", 0),
+                max_stop_hook_nudges=_safe_int(
+                    agent_data.get("max_stop_hook_nudges", 100), 100, 0
+                ),
                 subagent_mem_buffer_pct=_safe_int(
                     agent_data.get("subagent_mem_buffer_pct", 20), 20
                 ),
@@ -6502,6 +6538,9 @@ class KiroCrewConfig:
                 # (809M vs 74M, but much better latency).
                 model=stt_data.get("model", "turbo"),
                 mlx_model=stt_data.get("mlx_model", "mlx-community/whisper-large-v3-turbo"),
+                parakeet_model=stt_data.get(
+                    "parakeet_model", "mlx-community/parakeet-tdt-0.6b-v3"
+                ),
                 device=stt_data.get("device", "cpu"),
                 timeout_secs=stt_data.get("timeout_secs", 300),
                 transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
@@ -6594,6 +6633,13 @@ class KiroCrewConfig:
                     # retargeting it to ``main`` on upgrade would break any
                     # registry whose content still lives on ``mainline``.
                     branch=str(r.get("branch", "mainline")),
+                    # A credential-posture decision, so it is read back verbatim
+                    # and validated downstream rather than here: an unrecognised
+                    # value must resolve to the restrictive tier, which
+                    # ``registry._registry_trust_tier`` does. Absent -> "index",
+                    # so a config written before the field existed keeps the
+                    # credential-free posture it had.
+                    trust=str(r.get("trust", "index")),
                 )
                 for r in (data.get("registries") or [])
                 if isinstance(r, dict) and r.get("repo")

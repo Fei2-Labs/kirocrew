@@ -88,12 +88,12 @@ Every job here is blocking.
 |---|---|
 | `scrub-lint` | `scripts/scrub-lint.sh --no-history`. Fails on any internal marker in this public tree, so a sync cannot reintroduce a coupling |
 | `vendor-manifest` | `scripts/verify_vendor_manifest.py`. Hashes every file under `src/kiro_crew/_vendor` against the committed `scripts/vendor_manifest.sha256` — the tree is excluded from semgrep and the AI reviewers' diff, so this checksum is its only content review. Always-on (not behind the `changes` path filter) |
-| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12. `black --check` is commented out pending a bulk format pass |
+| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
 | `backend-test` | 2 Python versions x 4 duration-balanced pytest-split shards (8 jobs), `-n auto` within each. Coverage only on 3.12 (3.10 passes `--no-cov` for a trace-free run) |
 | `backend-test-windows` | windows-latest, 4 shards, `--no-cov`, 180s per-test timeout. The backend supports Windows natively via `platform_compat`, and nothing else in CI holds that line |
 | `backend-test-macos` | macos-14, deliberately SCOPED (gateway, socketsec, platform-compat, pod and MCP-apps suites via a glob). A full macOS run needs its own exclusion burn-down first, and a job that is red on arrival trains people to ignore it |
-| `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs `test_script_hooks` and `test_cron_script`. The shards collect the same files — nothing is deselected any more — but there the sandbox-guarded tests skip, so only here do those assertions actually run |
+| `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those 85 assertions (the `~/.kiro/crew` keystone among them) actually execute |
 | `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces the project line-rate floors, plus a per-file floor with a shrink-only baseline (all floors live in the job's `env:` block) |
 | `frontend-lint` | `tsc -b`, `eslint --max-warnings 1116`, `jscpd`, and `npm run i18n:check` |
 | `electron-test` | The Electron shell's own node:test suite (`website/electron`) |
@@ -117,7 +117,7 @@ Details worth knowing:
 - **`coverage-gate` is fail-closed.** It runs `if: always()` and its first step
   converts any non-success upstream result into an explicit failure, because GitHub
   treats a **skipped** required check as satisfied. It also compares the raw
-  line-rate and rounds only for display, so 79.95% cannot pass an 80% floor.
+  line-rate and rounds only for display, so 89.95% cannot pass a 90% floor.
 - **`coverage-gate` enforces two different shapes.** The project floors
   (`BACKEND_MIN`, `FRONTEND_MIN`) compare one lane-wide average; the per-file floor
   (`PER_FILE_MIN`, `scripts/check_per_file_coverage.py`) requires *every measured
@@ -170,16 +170,17 @@ PR-time proof only, no publishing.
 - **`build-desktop`** builds the Electron app unsigned on macos-15 and
   ubuntu-22.04 via `make desktop`, and uploads the artifacts.
 
-**Neither desktop lane ever RUNS the frozen binary.** `build-desktop` here and
-`build-desktop.yml` in the release lane both build the real PyInstaller
-`kirocrew-backend` (via `packaging/kirocrew-backend.spec`) and then only upload the
-artifact. The wheel lane at least runs `kirocrew --version`. So a packaging change
-that breaks the frozen app (a PyInstaller layout change, an executable rename, a
-missing hidden import that stops the binary from booting) passes every gate: the
-tests that cover frozen behavior monkeypatch `sys.frozen` and `sys.executable`, so
-they stay green against a simulated environment. The cheap fix is to run the
-already-built binary once in `build-desktop`, the frozen analogue of the wheel
-lane's `--version`.
+**Neither desktop lane ever RUNS the bundled backend.** `build-desktop` here and
+`build-desktop.yml` in the release lane both build the real `kirocrew-backend`
+tree via `packaging/build-desktop.sh` — which provisions a
+python-build-standalone interpreter and pip-installs the project into it — and
+then only upload the artifact. The wheel lane at least runs `kirocrew --version`.
+So a packaging change that breaks the packaged app (a layout change, a launcher
+rename, a dependency that fails to install into the bundled interpreter) passes
+every gate: the tests that cover packaged-app behavior monkeypatch `sys.frozen`
+and `sys.executable`, so they stay green against a simulated environment. The
+cheap fix is to run the already-built launcher once in `build-desktop`, the
+packaged analogue of the wheel lane's `--version`.
 
 ## `code-review.yml`: the deterministic pre-gate
 

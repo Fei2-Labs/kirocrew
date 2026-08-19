@@ -10,7 +10,8 @@ import { useRowDisclosure } from './rowDisclosure'
  * `src/kiro_crew/dashboard/state.py` (REFUSAL_RECOVERY_PREFIX,
  * STALE_RECOVERY_PREFIX, TOOL_STALL_RECOVERY_PREFIX, CONN_RECOVERY_PREFIX,
  * BUSY_RECOVERY_PREFIX, POSTTOKEN_RECOVERY_PREFIX,
- * EMPTY_RESPONSE_RECOVERY_PREFIX).
+ * EMPTY_RESPONSE_RECOVERY_PREFIX, HOOK_CONTINUATION_RECOVERY_PREFIX,
+ * HOOK_HALTED_RECOVERY_PREFIX).
  *
  * Detection is by content prefix rather than a meta flag on purpose: the rows
  * are appended with a plain CSS-class meta ("msg msg-inject"), and matching the
@@ -26,6 +27,8 @@ export type RecoveryKind =
   | 'posttoken'
   | 'empty'
   | 'manual'
+  | 'hook'
+  | 'hook_halted'
 
 /**
  * WIRE VALUES, never rendered — do not translate. These are matched with
@@ -47,6 +50,14 @@ const PREFIXES: ReadonlyArray<[RecoveryKind, string]> = [
   // the same shape (an `inject` continuation the model reads), but its copy must
   // not claim an automatic recovery — a person pressed Continue.
   ['manual', '[Continue — requested by the user]'],
+  // A Stop hook returned a block decision. Also not a recovery: the turn
+  // finished and a hook asked for another, so its copy names the hook as the
+  // cause rather than reporting an interruption that never happened.
+  ['hook', '[Hook continuation — automatic]'],
+  // The nudge-cap backstop fired: a Stop-hook run hit agent.max_stop_hook_nudges
+  // and was halted with no turn dispatched. Informational, not a continuation —
+  // the reached depth rides after the marker as " #N".
+  ['hook_halted', '[Stop-hook nudge cap reached]'],
 ]
 
 /** `Blocked by security policy: <pattern>` — the deny pattern that fired. */
@@ -144,6 +155,36 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
     }
   }
 
+  if (kind === 'hook') {
+    // Its own copy rather than a reused interruption label: the turn ran to
+    // completion and a Stop hook asked for another, so nothing was interrupted,
+    // stalled or recovered. The hook's own instruction is the expandable body.
+    return {
+      kind,
+      title: i18nT('pages.chat.recoveryCard.continued_by_a_hook'),
+      detail: i18nT('pages.chat.recoveryCard.hook_requested_continuing'),
+      chip: '',
+      body,
+    }
+  }
+
+  if (kind === 'hook_halted') {
+    // Not a continuation: the nudge cap fired and no turn was dispatched. The
+    // reached depth rides after the marker as " #N" on the marker line; surface
+    // it in the chip and strip that line from the body.
+    const after = raw.slice(prefix.length)
+    const nl = after.indexOf('\n')
+    const markerRest = (nl === -1 ? after : after.slice(0, nl)).trim()
+    const depth = markerRest.match(/#(\d+)/)
+    return {
+      kind,
+      title: i18nT('pages.chat.recoveryCard.hook_loop_halted'),
+      detail: i18nT('pages.chat.recoveryCard.nudge_cap_reached'),
+      chip: depth ? `#${depth[1]}` : '',
+      body: nl === -1 ? '' : after.slice(nl + 1).trim(),
+    }
+  }
+
   // Refusal: count the blocked-item bullets and collect the distinct deny
   // patterns. A turn can refuse several calls, and they need not share a cause.
   const blocked = body.split('\n').filter(line => BULLET_RE.test(line)).length
@@ -185,15 +226,16 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
   const { kind, title, detail, chip, body } = parsed
   // Severity split: a refusal or a stall means something was blocked or died and
   // the user may need to act, so it keeps the warning triangle. A transient
-  // backend error or an empty generation is infrastructure noise the gateway
-  // handles on its own — a neutral retry glyph, so a routine hiccup does not
+  // backend error, an empty generation, or a continuation someone asked for is
+  // not a fault the user must act on — a neutral retry glyph, so it does not
   // read as urgently as a deny-pattern block.
   const routine =
     kind === 'connection' ||
     kind === 'busy' ||
     kind === 'posttoken' ||
     kind === 'empty' ||
-    kind === 'manual'
+    kind === 'manual' ||
+    kind === 'hook'
   const Icon = routine ? RotateCcw : TriangleAlert
 
   return (

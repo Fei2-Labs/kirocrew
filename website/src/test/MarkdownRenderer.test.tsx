@@ -336,7 +336,8 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
     expect(code.querySelector('svg')).toBeNull()
-    expect(code.className).not.toContain('cursor-pointer')
+    // Non-path chips now have cursor-pointer for click-to-copy, but no file glyph.
+    expect(code.className).toContain('cursor-pointer')
   })
 
   it('renders a confirmed directory as a folder chip, not a broken file link', async () => {
@@ -356,7 +357,8 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
-    expect(code.className).not.toContain('cursor-pointer')
+    // Non-path chips now have cursor-pointer for click-to-copy.
+    expect(code.className).toContain('cursor-pointer')
     expect(code.dataset.pathKind).toBeUndefined()
   })
 
@@ -402,7 +404,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     )
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
-      expect(code.getAttribute('title')).toBe(`${path}\n${hint}`)
+      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl+click to copy`)
     })
   })
 
@@ -415,7 +417,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
       expect(code.getAttribute('title')).toBe(
-        '/home/user/a.md\nClick to open / Shift+click to show in file manager',
+        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl+click to copy',
       )
     })
   })
@@ -1168,6 +1170,23 @@ describe('MarkdownRenderer softBreaks', () => {
     expect(container.querySelectorAll('br').length).toBe(1)
     expect(container.textContent).toContain('line one')
     expect(container.textContent).toContain('line two')
+  })
+
+  it('drops the redundant <br> between two attached images (blocks already break)', () => {
+    // Each image renders as its own block (span.block.my-2); a <br> between
+    // them adds an empty line box and blocks margin collapse, inflating the
+    // gap between two attached screenshots from ~8px to ~37px.
+    const { container } = render(<MarkdownRenderer
+      content={'shots\n\n![a](https://x.test/a.png)\n![b](https://x.test/b.png)'} softBreaks />)
+    expect(container.querySelectorAll('img').length).toBe(2)
+    expect(container.querySelectorAll('br').length).toBe(0)
+  })
+
+  it('keeps the <br> between an image and following TEXT (only image-adjacent breaks drop)', () => {
+    const { container } = render(<MarkdownRenderer
+      content={'line one\nline two\n\n![a](https://x.test/a.png)'} softBreaks />)
+    // the text-to-text break survives; none render adjacent to the image
+    expect(container.querySelectorAll('br').length).toBe(1)
   })
 
   it('collapses a soft line break by default (no softBreaks, no <br>)', () => {

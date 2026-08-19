@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ShieldCheck, ShieldAlert, Lock, Eye, EyeOff, FileWarning, Terminal, Globe, Fingerprint, KeyRound, ScanLine, Layers, AlertTriangle, CheckCircle2, Circle, Clock, ExternalLink, ChevronRight, ChevronDown, Plus, Trash2, Gavel, Building2, Gauge, ToggleRight, MessageSquare, ListChecks, ArrowLeft, Boxes, BookOpen, Network, Copy, Check, Package } from 'lucide-react'
 import { useAppSelector } from '../../store'
 import { useContainerWidth } from '../../hooks/useContainerWidth'
+import { useImeGuard } from '../../hooks/useImeGuard'
 import { Badge, Btn, Input, Toggle, Checkbox } from '../../components/ui'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import Modal from '../../components/Modal'
@@ -379,6 +380,7 @@ function CustomDenyRow({ rule, onToggle, onDelete }: { rule: DeniedUserRule; onT
  *  `error` stays local: it is derived from the value and costs nothing to
  *  recompute. */
 function AddDenyInput({ value, onChange, note, onNoteChange, onAdd, busy, submitError }: { value: string; onChange: (next: string) => void; note: string; onNoteChange: (next: string) => void; onAdd: (pattern: string, note: string) => void; busy: boolean; submitError: string }) {
+  const ime = useImeGuard()
   const [error, setError] = useState('')
 
   const submit = () => {
@@ -403,7 +405,13 @@ function AddDenyInput({ value, onChange, note, onNoteChange, onAdd, busy, submit
         <Input
           value={value}
           onChange={e => { onChange(e.target.value); if (error) setError('') }}
-          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); submit() } }}
+          {...ime.bindComposition()}
+          onKeyDown={e => {
+            if (e.key !== 'Enter') return
+            // Rule 1: single-line input — decline the IME's committing Enter only.
+            if (ime.isComposing(e)) return
+            e.preventDefault(); submit()
+          }}
           placeholder={i18nT('pages.settings.securityPanel.add_a_custom_deny_pattern_regex_e_g_rm_rf_tmp_mi')}
           aria-label={i18nT('pages.settings.securityPanel.custom_deny_pattern')}
         />
@@ -420,7 +428,14 @@ function AddDenyInput({ value, onChange, note, onNoteChange, onAdd, busy, submit
         <Input
           value={note}
           onChange={e => onNoteChange(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); submit() } }}
+          {...ime.bindComposition()}
+          onKeyDown={e => {
+            if (e.key !== 'Enter') return
+            // Rule 1: single-line input — one shared instance covers both fields;
+            // the binding's blur reset makes that safe.
+            if (ime.isComposing(e)) return
+            e.preventDefault(); submit()
+          }}
           placeholder={i18nT('pages.settings.securityPanel.optional_why_shown_to_the_agent_when_this_rule_fir')}
           aria-label={i18nT('pages.settings.securityPanel.custom_deny_note')}
           maxLength={200}
@@ -1119,6 +1134,28 @@ function GovernancePolicyViewer() {
                 <Badge variant="muted"><ListChecks size={11} className="lucide-inline" /> {i18nT('pages.settings.securityPanel.profile')} {data.profile}</Badge>
               )}
             </div>
+            {(data?.fallback_profiles?.length ?? 0) > 0 && (
+              <div className="flex items-start gap-2.5 py-2.5 mt-1 mb-1 rounded-md bg-warn/10 border border-warn/30 px-3">
+                <AlertTriangle size={14} className="lucide-inline text-warn shrink-0 mt-0.5" />
+                <div className="text-[12px] text-text leading-relaxed">
+                  {/* Title on its OWN line, not joined to the body by a space:
+                      inline they render as one run-on sentence ("… in effect A
+                      profile named below could not be loaded"). */}
+                  <div className="font-semibold">{i18nT('pages.settings.securityPanel.profile_unusable_title')}</div>
+                  <div>
+                    {i18nT('pages.settings.securityPanel.profile_unusable_body')}
+                    {/* fmtList for the same reason the other_bound_surfaces block
+                        below gives: zh joins with 、 and no spaces, so a literal
+                        ', ' renders wrong in several of the twelve locales. */}
+                    {' '}{i18nT('pages.settings.securityPanel.profile_unusable_which', { profiles: fmtList(data!.fallback_profiles!, { type: 'unit' }) })}
+                  </div>
+                  {/* The cause list and the restart caveat are the rare edge of a
+                      rare state; demoted so the two sentences that matter are not
+                      buried in a paragraph wall at 12px. */}
+                  <div className="text-muted mt-1">{i18nT('pages.settings.securityPanel.profile_unusable_detail')}</div>
+                </div>
+              </div>
+            )}
             {planeRows.map(({ plane, rows }) => rows.length === 0 ? null : (
               <div key={plane.key} className="border-t border-border first:border-t-0 pt-1.5 mt-1.5 first:mt-0 first:pt-0">
                 <div className="flex items-center gap-1.5 py-1">

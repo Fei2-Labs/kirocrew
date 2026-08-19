@@ -2882,6 +2882,112 @@ class TestSessionColor:
         meta = state.conversation_log._read_metadata("dashboard:s1")
         assert "color_index" not in meta
 
+    @pytest.mark.asyncio
+    async def test_set_color_hex_success_and_lowercased(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch("/api/chat/slots/s1/color", json={"color_hex": "#A1B2C3"})
+            data = await resp.json()
+            assert resp.status == 200
+            assert data["ok"] is True
+            assert data["color_hex"] == "#a1b2c3"
+            assert state._slots["s1"].color_hex == "#a1b2c3"
+            state.push_slots_update.assert_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad", ["#GGGGGG", "#abc", "abcdef", "#abcdef00", 123, True, ["#abcdef"]]
+    )
+    async def test_set_color_hex_malformed_rejected(self, tmp_path, monkeypatch, bad):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch("/api/chat/slots/s1/color", json={"color_hex": bad})
+            assert resp.status == 400
+            assert state._slots["s1"].color_hex is None
+
+    @pytest.mark.asyncio
+    async def test_color_hex_and_index_mutually_exclusive(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        slot = state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            # Setting a hex clears an existing index.
+            slot.color_index = 4
+            resp = await client.patch("/api/chat/slots/s1/color", json={"color_hex": "#112233"})
+            data = await resp.json()
+            assert resp.status == 200
+            assert data == {"ok": True, "color_index": None, "color_hex": "#112233"}
+            assert slot.color_index is None and slot.color_hex == "#112233"
+            # Setting an index clears the hex.
+            resp = await client.patch("/api/chat/slots/s1/color", json={"color_index": 2})
+            data = await resp.json()
+            assert data == {"ok": True, "color_index": 2, "color_hex": None}
+            assert slot.color_index == 2 and slot.color_hex is None
+
+    @pytest.mark.asyncio
+    async def test_color_index_only_patch_keeps_existing_hex_when_null(
+        self, tmp_path, monkeypatch
+    ):
+        """An index-only PATCH with null must not silently null a hex (in-body gating)."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        slot = state.get_or_create_slot("s1")
+        slot.color_hex = "#445566"
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch("/api/chat/slots/s1/color", json={"color_index": None})
+            assert resp.status == 200
+            assert slot.color_hex == "#445566"
+
+    @pytest.mark.asyncio
+    async def test_color_hex_null_clears(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        slot = state.get_or_create_slot("s1")
+        slot.color_hex = "#778899"
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.patch("/api/chat/slots/s1/color", json={"color_hex": None})
+            data = await resp.json()
+            assert resp.status == 200
+            assert data["color_hex"] is None
+            assert slot.color_hex is None
+
+    @pytest.mark.asyncio
+    async def test_color_hex_in_to_dict(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.color_hex = "#0a0b0c"
+        assert slot.to_dict()["color_hex"] == "#0a0b0c"
+
+    @pytest.mark.asyncio
+    async def test_color_hex_persisted_in_history(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.chat import _save_slot_to_history
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot.color_hex = "#0a0b0c"
+        slot.append("user", "hello")
+        slot.drain()
+
+        _save_slot_to_history(state, slot, closed=True)
+
+        meta = state.conversation_log._read_metadata("dashboard:s1")
+        assert meta.get("color_hex") == "#0a0b0c"
+
 
 # ── Slash command tests ──
 
@@ -6271,6 +6377,127 @@ class TestApiChatModePropagation:
 
         state.sessions.set_approval_policy.assert_any_call("dashboard:s1", "auto")
         state.sessions.set_approval_policy.assert_any_call("dashboard:s2", "auto")
+
+
+class TestApiChatModeGlobalOverrideScope:
+    """A slot-scoped mode change must not revoke the process-global YOLO grant.
+
+    The grant covers every slot, so ending it on behalf of a request that named
+    ONE slot changes slots the request never mentioned — the shape that let a
+    per-slot `trust` setup call drop the whole gateway out of YOLO.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["trust", "trust_reads"])
+    async def test_slot_scoped_trust_preserves_global_grant(self, mode, tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.safety_override import safety_override
+
+        safety_override().activate("dashboard")
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+        state.get_or_create_slot("s2")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": mode, "slot": "s1"})
+            assert (await resp.json())["ok"] is True
+
+        assert safety_override().is_active() is True
+        # The regression itself: a slot the request never named keeps auto-approving.
+        state.sessions.set_approval_policy.assert_any_call("dashboard:s2", "auto")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["trust", "trust_reads"])
+    async def test_global_trust_revokes_global_grant(self, mode, tmp_path, monkeypatch):
+        """Without a slot the request IS global, so it may end the grant."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.safety_override import safety_override
+
+        safety_override().activate("dashboard")
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            await client.post("/api/chat/mode", json={"mode": mode})
+
+        assert safety_override().is_active() is False
+
+    @pytest.mark.asyncio
+    async def test_slot_scoped_normal_revokes_global_grant(self, tmp_path, monkeypatch):
+        """`normal` asks for NO auto-approval, so it revokes at any scope.
+
+        This is the dashboard picker's YOLO off-switch: the picker always names
+        the slot it is attached to.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.safety_override import safety_override
+
+        safety_override().activate("dashboard")
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            await client.post("/api/chat/mode", json={"mode": "normal", "slot": "s1"})
+
+        assert safety_override().is_active() is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["trust", "trust_reads"])
+    async def test_declared_grant_is_revoked_at_any_scope(self, mode, tmp_path, monkeypatch):
+        """A declared grant has no TTL, so any mode selection is its off-switch."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.safety_override import safety_override
+
+        safety_override().activate_declared()
+        assert safety_override().is_declared is True
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            await client.post("/api/chat/mode", json={"mode": mode, "slot": "s1"})
+
+        assert safety_override().is_active() is False
+
+    @pytest.mark.asyncio
+    async def test_until_shutdown_grant_is_ad_hoc_and_protected(self, tmp_path, monkeypatch):
+        """`until_shutdown` is permanent but AD HOC, so the scope rule applies.
+
+        Classifying it by permanence instead of source would revoke the grant of
+        every operator who picked "until Kiro Crew restarts".
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.safety_override import safety_override
+
+        so = safety_override()
+        so.adhoc_until_shutdown = True
+        so.activate("dashboard")
+        assert so.is_permanent is True
+        assert so.is_declared is False
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            await client.post("/api/chat/mode", json={"mode": "trust", "slot": "s1"})
+
+        assert so.is_active() is True
+
+    @pytest.mark.asyncio
+    async def test_non_string_mode_does_not_raise(self, tmp_path, monkeypatch):
+        """The membership test must answer for an unhashable body value."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": {}, "slot": "s1"})
+
+        assert resp.status == 200  # falls through to the normal branch, as before
 
 
 class TestApproveYoloPropagation:

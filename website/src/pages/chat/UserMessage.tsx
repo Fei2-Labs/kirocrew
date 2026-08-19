@@ -1,10 +1,11 @@
 import { memo, useState, useRef, useEffect, useCallback } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff, AlertCircle } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../../utils/touchActions'
 import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightContext'
+import { useImeGuard } from '../../hooks/useImeGuard'
 import { applySearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import { type PasteBlock, expandAll as expandPasteTokens } from '../../utils/pasteTokens'
@@ -35,6 +36,7 @@ interface UserMessageProps {
 
 const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin }: UserMessageProps) {
   const [editing, setEditing] = useState(false)
+  const ime = useImeGuard()
   const [draft, setDraft] = useState(content)
   const [copied, setCopied] = useState(false)
   const [linkCopied, setLinkCopied] = useState(false)
@@ -141,7 +143,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             bubble it replaces, capped at 550px or the column, whichever is
             smaller. No JS measurement. */}
         <div
-          className="edit-grow px-4 py-1.5 text-sm leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 max-w-[min(550px,100%)] outline outline-2 -outline-offset-2 outline-accent/60"
+          className="edit-grow px-4 py-1.5 text-sm leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline outline-2 -outline-offset-2 outline-accent/60"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
         >
@@ -152,7 +154,13 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-none text-sm leading-relaxed"
             value={draft}
             onChange={e => setDraft(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() } if (e.key === 'Escape') cancel() }}
+            {...ime.bindComposition()}
+            onKeyDown={e => {
+              // Rule 1: textarea — claim the key, so a declined (IME) Enter is
+              // still consumed instead of inserting a newline into the draft.
+              if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) submit() }
+              if (e.key === 'Escape') { ime.reset(); cancel() }
+            }}
           />
         </div>
         {/* Actions sit BELOW the bubble (like the read-only action row) so they
@@ -171,7 +179,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
-    <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-1.5 text-sm leading-relaxed rounded-xl overflow-hidden min-w-0 max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+    <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-1.5 text-sm leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
       {renderContent(content, meta)}
     </div>
   )
@@ -197,7 +205,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             <Target size={12} className="shrink-0" /> {i18nT('pages.chat.userMessage.steered_into_the_running_turn')}
           </div>
           <motion.div
-            className="relative max-w-full"
+            className="relative w-fit max-w-full"
             initial={playSteer ? { opacity: 0, x: 16 } : false}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.32, ease: 'easeOut' }}
@@ -215,14 +223,6 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           </motion.div>
         </>
       ) : bubble}
-      {/* Stale optimistic indicator — shown when the server echo never arrived
-          within the timeout window (#3898 item 3). */}
-      {!!(meta?.stale && meta?.optimistic) && (
-        <div className="inline-flex items-center gap-1 text-[12px] text-warning mt-0.5 pr-1" role="status" aria-label={i18nT('pages.chat.userMessage.message_unconfirmed') as string}>
-          <AlertCircle size={12} className="shrink-0" />
-          <span>{i18nT('pages.chat.userMessage.message_unconfirmed') as string}</span>
-        </div>
-      )}
       {/* Where the pointer cannot hover the footer is always visible and its
           descendant overrides grow every action to a 40px touch target (20px
           icon + 10px padding); hover-capable pointers keep the reveal-on-hover

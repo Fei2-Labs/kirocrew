@@ -4,6 +4,7 @@
   "single_commit": true,
   "gates": [
     "python -m pytest -q",
+    "python3 scripts/check_black_formatting.py",
     "isort --check-only src/kiro_crew test",
     "flake8 src/kiro_crew test",
     "mypy src/kiro_crew/",
@@ -11,6 +12,10 @@
     "BASE=\"$(git merge-base HEAD origin/main)\" && BRAND_BASE_REF=\"$BASE\" python3 scripts/check_brand_name.py",
     "python3 scripts/check_harness_parity.py --test",
     "BASE=\"$(git merge-base HEAD origin/main)\" && HARNESS_BASE_REF=\"$BASE\" python3 scripts/check_harness_parity.py",
+    "python3 scripts/check_changelog_history.py --test",
+    "BASE=\"$(git merge-base HEAD origin/main)\" && CHANGELOG_BASE_REF=\"$BASE\" python3 scripts/check_changelog_history.py",
+    "python3 scripts/check_focus_cue.py --test",
+    "BASE=\"$(git merge-base HEAD origin/main)\" && FOCUS_CUE_BASE_REF=\"$BASE\" python3 scripts/check_focus_cue.py",
     "python3 scripts/docs_lint.py --test",
     "./scripts/docs-lint.sh",
     "python3 scripts/check_per_file_coverage.py --test",

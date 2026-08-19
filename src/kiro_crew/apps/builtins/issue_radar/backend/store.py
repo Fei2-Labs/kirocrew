@@ -1057,7 +1057,13 @@ def write_issue_ai_cache(
 
     Stamped with ``generated_at`` so the UI can show how old the summary is —
     without it a cached card gives no hint whether it was written minutes or
-    months ago."""
+    months ago.
+
+    ``ui_language`` (the BCP-47 tag the prose was generated under, ``""`` for
+    English-default installs) rides along because a cached result is only
+    servable for the language it was written in — the route compares it on
+    read and treats a mismatch as a miss, so a dashboard-language switch
+    regenerates instead of serving the old language."""
     atomic_write(
         issue_ai_cache_path(owner, repo, number, root),
         json.dumps(
@@ -1065,6 +1071,7 @@ def write_issue_ai_cache(
                 "owner": owner, "repo": repo, "number": int(number),
                 "summary": payload.get("summary", ""),
                 "suggested_labels": payload.get("suggested_labels", []),
+                "ui_language": str(payload.get("ui_language") or ""),
                 "generated_at": _now_iso(),
             },
             indent=2,
@@ -1073,9 +1080,11 @@ def write_issue_ai_cache(
 
 
 def read_issue_ai_cache(owner: str, repo: str, number: int, root: Path | None = None) -> dict | None:
-    """Return ``{"summary", "suggested_labels", "generated_at"}`` for a cached
-    issue, or None. Caches written before the stamp existed fall back to the
-    file's mtime (see _cache_generated_at)."""
+    """Return ``{"summary", "suggested_labels", "ui_language", "generated_at"}``
+    for a cached issue, or None. Caches written before the stamp existed fall
+    back to the file's mtime (see _cache_generated_at); ones written before
+    ``ui_language`` existed read as ``""``, which matches the English-default
+    sentinel so legacy entries stay servable on unconfigured installs."""
     path = issue_ai_cache_path(owner, repo, number, root)
     if not path.is_file():
         return None
@@ -1086,6 +1095,7 @@ def read_issue_ai_cache(owner: str, repo: str, number: int, root: Path | None = 
     return {
         "summary": data.get("summary", ""),
         "suggested_labels": data.get("suggested_labels", []),
+        "ui_language": str(data.get("ui_language") or ""),
         "generated_at": _cache_generated_at(data, path),
     }
 
@@ -1466,6 +1476,44 @@ def apply_state_change_to_caches(
             kept = [i for i in issues if i.get("number") != int(number)]
             if len(kept) != len(issues):
                 data["issues"] = kept
+                atomic_write(path, json.dumps(data, indent=2))
+
+
+def apply_assignees_change_to_caches(
+    owner: str, repo: str, number: int, assignees: list[str], *, root: Path | None = None
+) -> None:
+    """Patch an issue's assignees in the detail cache + whichever list cache
+    holds it, so the sidebar and the row reflect the change without a refetch.
+
+    ``assignees`` is the authoritative full set of logins returned by the write.
+    Both the detail payload and the list row store assignees as a bare login
+    list, so the same value writes to both."""
+    logins = [a for a in assignees if a]
+
+    dpath = issue_detail_cache_path(owner, repo, number, root)
+    if dpath.is_file():
+        try:
+            d = json.loads(dpath.read_text(encoding="utf-8"))
+            if isinstance(d.get("detail"), dict):
+                d["detail"]["assignees"] = logins
+                atomic_write(dpath, json.dumps(d, indent=2))
+        except json.JSONDecodeError:
+            pass
+
+    for st in ("open", "closed"):
+        # Hold the lock across read AND write, matching the label patch: a
+        # concurrent full refresh would otherwise land between them and be
+        # clobbered by this stale copy.
+        with issues_cache_lock(owner, repo, root, st):
+            data, path = _load_list_cache(owner, repo, root, st)
+            if not data:
+                continue
+            changed = False
+            for iss in data.get("issues", []):
+                if iss.get("number") == int(number):
+                    iss["assignees"] = logins
+                    changed = True
+            if changed:
                 atomic_write(path, json.dumps(data, indent=2))
 
 

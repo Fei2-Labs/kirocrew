@@ -5,7 +5,13 @@ const os = require("os");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
-const { postShutdown, stopGatewayGracefully, forceStopPort, classifyPortOwner, KIROCREW_PROC_RE } = require("../gateway-stop");
+const {
+  postShutdown,
+  stopGatewayGracefully,
+  forceStopPort,
+  classifyPortOwner,
+  isKirocrewCommand,
+} = require("../gateway-stop");
 
 // Helper: temp KIROCREW_HOME containing a .local_secret file.
 function tmpHomeWithSecret(secret) {
@@ -134,7 +140,19 @@ test("stopGatewayGracefully: SIGTERM fallback when endpoint fails", async () => 
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("stopGatewayGracefully: SIGKILL fallback when SIGTERM ignored", async () => {
+// The SIGKILL escalation exists for a child that IGNORES SIGTERM, which is a
+// POSIX-only state: on Windows there are no real signals, and
+// ChildProcess.kill("SIGTERM") maps onto TerminateProcess -- an unconditional
+// kill the target cannot install a handler for (verified: the child's SIGTERM
+// handler never runs and it dies with signalCode "SIGTERM"). So the premise
+// "SIGTERM was ignored" is unreachable there, and the escalation cannot be
+// exercised rather than merely being unnecessary.
+//
+// Split per platform instead of relaxed to `signalCode != null`, which would
+// pass on POSIX even if the SIGKILL fallback regressed into a plain SIGTERM --
+// the exact bug this test exists to catch. Each platform asserts the strongest
+// true statement about its own semantics.
+test("stopGatewayGracefully: SIGKILL fallback when SIGTERM ignored", { skip: process.platform === "win32" ? "no real signals on Windows: kill(SIGTERM) is TerminateProcess, which cannot be ignored" : false }, async () => {
   const home = tmpHomeWithSecret("s3cr3t");
   const proc = spawnDummy({ ignoreSigterm: true }); // ignores SIGTERM
   await waitReady(proc);
@@ -144,6 +162,27 @@ test("stopGatewayGracefully: SIGKILL fallback when SIGTERM ignored", async () =>
       backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home, timeoutMs: 800,
     });
     assert.strictEqual(proc.signalCode, "SIGKILL");
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("stopGatewayGracefully: a SIGTERM-ignoring child still dies on Windows", { skip: process.platform === "win32" ? false : "covered by the SIGKILL-escalation test on POSIX" }, async () => {
+  // The guarantee callers actually depend on -- stopGatewayGracefully resolves
+  // only once the process is GONE, so the auto-update bundle swap never races a
+  // live gateway child. Windows reaches that end state through the first kill
+  // rather than through the escalation, so assert the end state, not the route.
+  const home = tmpHomeWithSecret("s3cr3t");
+  const proc = spawnDummy({ ignoreSigterm: true });
+  await waitReady(proc);
+  const { server, port } = await startServer({ secret: "s3cr3t", status: 500 });
+  try {
+    await stopGatewayGracefully(proc, {
+      backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home, timeoutMs: 800,
+    });
+    assert.notStrictEqual(
+      proc.exitCode === null && proc.signalCode === null,
+      true,
+      "process should be gone once stopGatewayGracefully resolves",
+    );
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -243,6 +282,59 @@ test("forceStopPort: freed reflects real port state even after killing our targe
   assert.strictEqual(r.killed, 1);
   assert.deepStrictEqual(r.survivors, []); // OUR pid is gone
   assert.strictEqual(r.freed, false); // but the port is still held by 777
+});
+
+test("forceStopPort: awaits an asynchronous Windows kill before verifying", async () => {
+  let killFinished = false;
+  let probes = 0;
+  const r = await forceStopPort(7788, {
+    getListenPids: async () => {
+      probes += 1;
+      if (probes === 1) return [4242];
+      assert.strictEqual(killFinished, true, "verification raced taskkill completion");
+      return [];
+    },
+    getCommand: async () => "C:\\bundle\\kirocrew.exe gateway",
+    kill: async () => { killFinished = true; },
+    sleep: async () => {},
+    isKirocrew: (command) => command.includes("kirocrew.exe"),
+  });
+  assert.strictEqual(r.killed, 1);
+  assert.strictEqual(r.freed, true);
+});
+
+test("forceStopPort: a failed initial Windows probe is not a free port", async () => {
+  const probeError = new Error("netstat timed out");
+  const r = await forceStopPort(7788, {
+    getListenPids: async () => { throw probeError; },
+    getCommand: async () => "",
+    kill: async () => {},
+    sleep: async () => {},
+    failClosedOnProbeError: true,
+  });
+  assert.deepStrictEqual(r, {
+    killed: 0, freed: false, survivors: [], foreignHolder: false,
+    serviceHolder: false, probeFailed: true,
+  });
+});
+
+test("forceStopPort: a failed Windows verification never claims recovery", async () => {
+  let probes = 0;
+  const r = await forceStopPort(7788, {
+    getListenPids: async () => {
+      if (probes++ === 0) return [4242];
+      throw new Error("netstat verify timed out");
+    },
+    getCommand: async () => "C:\\bundle\\kirocrew.exe gateway",
+    kill: async () => {},
+    sleep: async () => {},
+    isKirocrew: (command) => command.includes("kirocrew.exe"),
+    failClosedOnProbeError: true,
+  });
+  assert.deepStrictEqual(r, {
+    killed: 1, freed: false, survivors: [], foreignHolder: false,
+    serviceHolder: false, probeFailed: true,
+  });
 });
 
 // ── classifyPortOwner ───────────────────────────────────────────────────────
@@ -371,16 +463,40 @@ test("classifyPortOwner: ours wins when a mixed set holds the port", async () =>
 
 test("classifyPortOwner and forceStopPort share one KiroCrew matcher", async () => {
   // Drift between the two would let one mis-target a stranger's process.
-  assert.ok(KIROCREW_PROC_RE.test("python -m kiro_crew gateway"));
-  assert.ok(KIROCREW_PROC_RE.test("/Applications/KiroCrew.app/.../kirocrew"));
-  assert.ok(!KIROCREW_PROC_RE.test("ssh -NL 5476:localhost:5476 host"));
+  assert.ok(isKirocrewCommand("python -m kiro_crew gateway"));
+  assert.ok(isKirocrewCommand("/Applications/KiroCrew.app/.../kirocrew"));
+  assert.ok(!isKirocrewCommand("ssh -NL 5476:localhost:5476 host"));
+  assert.ok(!isKirocrewCommand("ssh -NL 5476:localhost:5476 kirocrew"));
   // The matcher keys on the executable/module TOKEN, not a path substring:
   // an unrelated process merely living under a `kirocrew` home dir is foreign.
-  assert.ok(!KIROCREW_PROC_RE.test("C:\\Users\\kirocrew\\OtherApp\\server.exe --port 5476"));
-  assert.ok(!KIROCREW_PROC_RE.test("/home/kirocrew/some-other-server --port 5476"));
-  assert.ok(!KIROCREW_PROC_RE.test("C:\\Users\\kirocrew\\python.exe -m http.server 5476"));
-  // …but the real Windows executable / backend / module invocation still match.
-  assert.ok(KIROCREW_PROC_RE.test("C:\\Program Files\\KiroCrew\\kirocrew.exe"));
-  assert.ok(KIROCREW_PROC_RE.test("C:\\Program Files\\KiroCrew\\kirocrew-backend.exe --gateway"));
-  assert.ok(KIROCREW_PROC_RE.test("C:\\Python\\python.exe -m kiro_crew gateway"));
+  assert.ok(!isKirocrewCommand("C:\\Users\\kirocrew\\OtherApp\\server.exe --port 5476"));
+  assert.ok(!isKirocrewCommand("/home/kirocrew/some-other-server --port 5476"));
+  assert.ok(!isKirocrewCommand("C:\\Users\\kirocrew\\python.exe -m http.server 5476"));
+  assert.ok(!isKirocrewCommand("python app.py C:\\tmp\\kirocrew"));
+  assert.ok(!isKirocrewCommand("python app.py -m kiro_crew"));
+  // A POSIX `ps` line is unquoted, so an install path with a space arrives
+  // split across tokens. Our own gateway must still be identified there, and a
+  // later argument must still never pose as the executable.
+  assert.ok(isKirocrewCommand("/Users/Jane Doe/Apps/KiroCrew.app/Contents/Resources/bin/kirocrew gateway --port 5476"));
+  assert.ok(isKirocrewCommand("/Users/Jane Doe/venv/bin/python -m kiro_crew gateway"));
+  assert.ok(!isKirocrewCommand("/tmp/evil --spoof /usr/local/bin/kirocrew"));
+  assert.ok(!isKirocrewCommand("/tmp/evil /usr/local/bin/kirocrew"));
+  assert.ok(!isKirocrewCommand("/tmp/dir with space/evil kirocrew --port 5476"));
+  // Windows identity is path-bound: a matching basename at any other location
+  // remains foreign and can never authorize taskkill.
+  const trustedCli = "C:\\Program Files\\KiroCrew\\kirocrew.exe";
+  const trustedBackend = "C:\\Program Files\\KiroCrew\\kirocrew-backend.exe";
+  const trustedPython = "C:\\Program Files\\KiroCrew\\python.exe";
+  assert.ok(isKirocrewCommand(`"${trustedCli}"`, {
+    trustedExecutablePaths: [trustedCli],
+  }));
+  assert.ok(isKirocrewCommand(`"${trustedBackend}" --gateway`, {
+    trustedExecutablePaths: [trustedBackend],
+  }));
+  assert.ok(isKirocrewCommand(`"${trustedPython}" -m kiro_crew gateway`, {
+    trustedExecutablePaths: [trustedPython],
+  }));
+  assert.ok(!isKirocrewCommand("C:\\Temp\\kirocrew.exe gateway", {
+    trustedExecutablePaths: [trustedCli],
+  }));
 });

@@ -1,6 +1,7 @@
 import { copyToClipboard } from '../utils/clipboard'
 import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type {
+  ChatSlot,
   IssueSource,
   McpApplyChange,
   PullRequestCheck,
@@ -72,8 +73,33 @@ export type McpShareReason = {
  */
 export type McpShareRecommendation = {
   strength: string
+  // Two axes, not one verdict. `recommendStub` is the safe half — Kiro Crew's
+  // stub in the path, backend still 1:1 with the session — while
+  // `recommendShare` is the one that introduces co-tenancy. A bulk action has to
+  // consult whichever one the global sharing switch makes true of a click.
+  recommendStub: boolean
   recommendShare: boolean
   reasons: McpShareReason[]
+}
+
+/**
+ * Where an operator-requested measurement pass got to.
+ *
+ * ``running`` is the only field a caller may branch on to decide whether to keep
+ * polling: ``done`` and ``total`` are a readout, and both are 0 both before a
+ * pass starts and when a pass found nothing to measure. ``error`` names the
+ * exception class of a pass that stopped early, because a pass that dies
+ * silently is indistinguishable from one that finished with nothing to do.
+ */
+export type McpMeasureProgress = {
+  running: boolean
+  // Servers attempted, which is what the progress line advances on.
+  done: number
+  // How many of those produced a verdict. Lower than `done` whenever a pre-flight
+  // could not run, so any claim about the outcome is built from this one.
+  measured: number
+  total: number
+  error?: string
 }
 
 export type McpManagedServer = {
@@ -85,6 +111,12 @@ export type McpManagedServer = {
   agents: string[]         // agent configs that declare this server
   transport: string        // "stdio" (stubbable) or "http" (no stdio pipe to interpose on)
   denylisted: boolean      // in UNPOOLABLE_SERVERS — can never be pooled
+  // True when stubbing this server cannot produce a SHARED backend anyway: the
+  // rewriter leaves an env-declaring entry unwrapped rather than spawn a pooled
+  // backend without a declared key. Optional for the same reason as
+  // `recommendation` — an older gateway does not send it, and its absence must
+  // read as "no obstacle known", not as an obstacle.
+  pooling_blocked_by_env?: boolean
   // Optional because the field is only as old as the shareability detector: a
   // dashboard served from this build can be pointed at an older gateway (Make
   // Live to an earlier worktree), and a row with no verdict must read as "not
@@ -549,6 +581,10 @@ export interface GovernancePolicyData {
    *  Rendered so a reader can see that a host row's "disabled" is one surface's
    *  posture, not the whole install's. */
   other_bound_surfaces?: string[]
+  /** True when the resolved profile is a deny-all fallback because the file
+   *  could not be read or parsed — enforcement is correct (fail-closed) but the
+   *  operator should know the ceiling is synthetic, not intentional. */
+  fallback_profiles?: string[]
   /** True when governance resolution failed — the viewer shows a soft notice. */
   unavailable: boolean
   scopes: GovernanceScope[]
@@ -1738,6 +1774,7 @@ export const api = {
   projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
   projectGitStatus: (path: string) => fetch('/api/project/git/status?path=' + encodeURIComponent(path)).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; files: { path: string; status: string; staged: boolean; additions?: number; deletions?: number }[] }>,
   projectGitLog: (path: string, limit = 20) => fetch('/api/project/git/log?path=' + encodeURIComponent(path) + '&limit=' + limit).then(j) as Promise<{ repo: boolean; commits: { sha: string; message: string; author: string; date: string; isHead: boolean }[] }>,
+  projectTree: (path: string) => fetch('/api/project/tree?path=' + encodeURIComponent(path)).then(j) as Promise<{ root: string; paths: string[]; repo: boolean; truncated?: boolean }>,
   workspaces: () => fetch('/api/workspaces').then(j),
   createWorkspace: (body: object) => post('/api/workspaces', body).then(j),
   updateWorkspace: (name: string, body: object) =>
@@ -1898,9 +1935,18 @@ export const api = {
   mcpGatewayMetrics: () => fetch('/api/mcp-gateway/metrics').then(j) as Promise<{ running: boolean; size?: number; max_backends?: number; backends: { server: string; agent: string; pid: number | null; sessions: number; idle_s: number; rss_kb: number }[]; warm_pool_hits?: number; warm_pool_misses?: number; warm_pool_hit_rate_pct?: number }>,
   mcpGatewayServers: () => fetch('/api/mcp-gateway/servers').then(j) as Promise<{ servers: McpManagedServer[] }>,
   mcpGatewaySetStub: (name: string, stub: boolean) => post('/api/mcp-gateway/servers/stub', { name, stub }).then(j) as Promise<{ ok: boolean; name: string; stub: boolean; enabled?: boolean; applied?: boolean; stub_servers?: string[] }>,
+  // Starting a measurement pass returns immediately: it spawns two processes per
+  // unmeasured server, so the answer arrives through the progress read, not here.
+  mcpMeasureStart: () => post('/api/mcp/measure', {}).then(j) as Promise<McpMeasureProgress>,
+  mcpMeasureProgress: () => fetch('/api/mcp/measure').then(j) as Promise<McpMeasureProgress>,
   // Batch form of the above — one config write + one pool re-apply for the whole
   // set, so "toggle all" can't land the allowlist half-flipped.
-  mcpGatewaySetStubMany: (names: string[], stub: boolean) => post('/api/mcp-gateway/servers/stub', { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; enabled?: boolean; applied?: boolean; stub_servers?: string[] }>,
+  //
+  // `resolveEligibility` hands the decision to the server: it re-reads the sharing
+  // switch and each server's verdict inside the same lock hold that writes them, so
+  // the policy and the write cannot disagree. The response then reports `stubbed`
+  // and `skipped` rather than echoing the request, because the two differ by design.
+  mcpGatewaySetStubMany: (names: string[], stub: boolean, resolveEligibility?: boolean) => post('/api/mcp-gateway/servers/stub', resolveEligibility ? { names, stub, resolve_eligibility: true } : { names, stub }).then(j) as Promise<{ ok: boolean; names: string[]; stub: boolean; stubbed?: string[]; skipped?: Array<{ name: string; reason: string }>; sharing_on?: boolean; applied?: boolean; stub_servers?: string[] }>,
   // Agent config
   agentConfig: () => fetch('/api/agent/config').then(j),
   saveAgentConfig: (config: object) => put('/api/agent/config', { config }).then(j),
@@ -1969,6 +2015,12 @@ export const api = {
    *  the auto-nudge feature flag is off, so callers need no flag check. */
   autonudgeList: (): Promise<{ enabled: boolean; loops: { slot_key: string; active?: boolean; cycle_count?: number; max_cycles?: number }[] }> =>
     fetch('/api/autonudge').then(j),
+  /** Every pull request / issue link a session carries — the unbudgeted read
+   *  behind the sidebar's expandable "+N" overflow chip. The slots payload caps
+   *  chips per kind, so the links behind that chip are not on the client until
+   *  this is called. */
+  chatSlotSourceLinks: (slot: string): Promise<{ links: NonNullable<ChatSlot['source_links']>; total: number }> =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/source-links').then(j),
   chatSlotDetail: (slot: string, limit?: number, before?: number, signal?: AbortSignal) => {
     const p = new URLSearchParams()
     if (limit) p.set('limit', String(limit))
@@ -2040,6 +2092,13 @@ export const api = {
   deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
   setSlotFolder: (slot: string, folderId: string | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/folder', { folder_id: folderId || '' }).then(j),
   setSlotColor: (slot: string, colorIndex: number | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: colorIndex }).then(j),
+  /** Set a custom per-session color (#rrggbb). The backend clears color_index
+   *  when a hex is set and vice versa (mutual exclusion), so callers send one
+   *  or the other, never both. */
+  setSlotColorHex: (slot: string, colorHex: string | null) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_hex: colorHex }).then(j),
+  /** Clear BOTH color fields in one PATCH. The endpoint is in-body-gated, so
+   *  an index-only null would leave a custom hex behind. */
+  clearSlotColor: (slot: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/color', { color_index: null, color_hex: null }).then(j),
   setSlotPin: (slot: string, pinned: boolean) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/pin', { pinned }).then(j),
   setSlotMode: (slot: string, mode: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/mode', { mode }).then(j),
   // Tags
@@ -2096,7 +2155,10 @@ export const api = {
   handoffChannels: () => fetch('/api/handoff-channels').then(j) as Promise<Record<string, string> | null>,
   handoffSlot: (slot: string, channel?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/handoff', channel ? { channel } : undefined).then(j),
   // Sessions (history)
-  sessions: (limit = 30, offset = 0, preview = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '')).then(j),
+  // `excludeOpen` drops sessions already open as a tab — for the sidebar's
+  // Older-sessions pane, which is the complement of the tab list above it.
+  // Off by default: every other caller wants the full inventory.
+  sessions: (limit = 30, offset = 0, preview = false, excludeOpen = false) => fetch('/api/sessions?limit=' + limit + '&offset=' + offset + (preview ? '&preview=1' : '') + (excludeOpen ? '&exclude_open=1' : '')).then(j),
   sessionsSearch: (q: string, limit = 50) => fetch('/api/sessions/search?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
   // Federated session search across the local gateway + every CONNECTED remote
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).
@@ -2335,8 +2397,8 @@ export const api = {
   // unknown[] here would break those structural assignments across files.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
-  listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string }[] }>,
-  updateRegistries: (registries: { name: string; repo: string; branch: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string }[]; newlyTrustedHosts: string[] }>,
+  listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string; trust?: string }[]; pinned?: { name: string; repo: string; branch: string; trust?: string }[] }>,
+  updateRegistries: (registries: { name: string; repo: string; branch: string; trust?: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string; trust?: string }[]; newlyTrustedHosts: string[] }>,
   refreshRegistries: (repo?: string) => post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{ ok: boolean; refreshed: string[]; failed: string[]; results: { name: string; ok: boolean }[]; apps: number; lastSyncedAt: string }>,
   installFromRegistry: (name: string) => post('/api/apps/registry/install', { name }).then(j),
   /**

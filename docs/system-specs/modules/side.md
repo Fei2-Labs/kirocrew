@@ -3,8 +3,10 @@
 ## Overview
 
 The side conversation module adds an ephemeral Q&A thread to a parent chat
-slot. Users invoke it via the `/side` command or the "Side" tab in the
-Activity panel. The `/side` command is intercepted client-side regardless of
+slot. Users invoke it via the `/side` command or the "Side Chat" tab in the
+Activity panel — the user-facing name is Side Chat, while `side` remains the
+internal spelling for the tab id, state, routes and this module. The `/side`
+command is intercepted client-side regardless of
 the parent turn's state: while a turn is running, the composer's steer path
 checks `isInterceptedSlashCommand` before steering, so the command opens the
 side chat instead of being injected into the running turn as literal text.
@@ -270,8 +272,8 @@ Deliberately separate from `broadcast_ws` main-channel events.
 
 ### `ActivityViewer.tsx`
 
-5th tab: `{key: 'side', label: 'Side', icon: MessageSquare}`. Renders
-`<SideChat slot={slot} />` when active.
+5th tab: `{key: 'side', label: i18nT('pages.chat.activityViewer.side'), icon:
+MessageCircleQuestionMark}`. Renders `<SideChat slot={slot} />` when active.
 
 ### `SideChat.tsx`
 
@@ -298,7 +300,13 @@ which owns four invariants this file must not re-derive:
 - An Enter that commits an IME candidate is not a submit. This surface's own
   handler predated the shared hook and lacked the guard, so a Chinese/Japanese/
   Korean candidate confirmed with Enter submitted the partial text with nothing
-  left to recover.
+  left to recover. Declining the submit does not release the key: the guard
+  consumes it (`useImeGuard`'s `claimEnter`), because the browser's default for an
+  unclaimed Enter is to put a line break in the draft. Recovery from a composition
+  abandoned without a `compositionend` ships with the tracking rather than with the
+  caller -- `ime.bindComposition()` is the only composition binding the hook
+  exposes, and it carries the blur reset, because a latched guard now declines
+  Enter silently instead of visibly.
 - The submit size limit (`MAX_QUESTION_BYTES`) is measured in UTF-8 bytes, not
   code units. The hook only reports whether the limit is exceeded; this file
   still owns the refusal and its wording.

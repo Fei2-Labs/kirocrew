@@ -1,9 +1,11 @@
 import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
+import { useImeGuard } from '../hooks/useImeGuard'
 import Clickable from '../components/Clickable'
 import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download } from 'lucide-react'
 import { api } from '../api/client'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useArmedDelete } from '../hooks/useArmedDelete'
 import { PageHeader, Card, Btn, SendBtn, Badge, SearchInput, EmptyState, FilteredEmpty, Skeleton, Input } from '../components/ui'
 import { CodeBlock } from '../components/CodeBlock'
 import SegmentedControl from '../components/SegmentedControl'
@@ -269,6 +271,7 @@ export default function SchedulePage() {
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(loadCollapsedFolders)
   const [folderModal, setFolderModal] = useState<{ mode: 'create'; resolve?: (id: string | undefined) => void } | null>(null)
   const [folderModalName, setFolderModalName] = useState('')
+  const folderNameIme = useImeGuard()
   const [folderModalError, setFolderModalError] = useState<string | null>(null)
   const toggleFolderCollapse = useCallback((folderId: string) => {
     setCollapsedFolders(prev => {
@@ -379,29 +382,17 @@ export default function SchedulePage() {
     }
   }, [load, refreshFolders, setActionError])
 
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
-  const [deletingId, setDeletingId] = useState<string | null>(null)
-  const confirmRevertTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const armDelete = useCallback((id: string) => {
-    setConfirmDeleteId(id)
-    if (confirmRevertTimer.current) clearTimeout(confirmRevertTimer.current)
-    confirmRevertTimer.current = setTimeout(() => setConfirmDeleteId(null), 3000)
-  }, [])
-  useEffect(() => () => { if (confirmRevertTimer.current) clearTimeout(confirmRevertTimer.current) }, [])
-  const deleteJob = useCallback(async (id: string) => {
+  // performDelete reports its own errors, so confirmDelete never rejects.
+  const performDelete = useCallback(async (id: string) => {
     try {
-      if (confirmRevertTimer.current) clearTimeout(confirmRevertTimer.current)
-      setDeletingId(id)
       await api.deleteCron(id)
       setSelected(prev => prev?.id === id ? null : prev)
       await load()
     } catch (e: unknown) {
       setActionError({ id, msg: e instanceof Error ? e.message : i18nT('pages.schedulePage.delete_failed') })
-    } finally {
-      setDeletingId(null)
-      setConfirmDeleteId(null)
     }
   }, [load, setActionError])
+  const { armedId: confirmDeleteId, arm: armDelete, confirm: confirmDelete, isDeleting } = useArmedDelete(performDelete)
   const filteredJobs = useMemo(() => sanitizedJobs.filter(j => !cronFilter || (j.name+' '+j.safeMessage+' '+(j.agent||'')+' '+(j.model||'')).toLowerCase().includes(cronFilter.toLowerCase())), [sanitizedJobs, cronFilter])
   const scheduleComparators = useMemo(() => ({
     name: (a: CronJob, b: CronJob) => a.name.localeCompare(b.name),
@@ -738,12 +729,20 @@ export default function SchedulePage() {
                       own surface): the default cell background is transparent and
                       the scrolling columns would show through. Sticky changes
                       paint position, not column width, so the `w-[176px]`
-                      contract above still holds. The pinned edge carries no
-                      static border: the seam cue is the measured gradient
-                      painted after the table, shown only while the scroller
-                      actually hides columns, so a full-width desktop table is
-                      byte-identical to the unpinned rendering at rest. */}
-                  <TableHead className="sticky right-0 w-[176px] bg-card">{i18nT('pages.schedulePage.actions')}</TableHead>
+                      contract above still holds. The seam is TWO parts, both
+                      gated on the measured overflow flag so a full-width table
+                      renders neither: a 1px child div in this cell (legible over
+                      whitespace, where a fade into the same surface colour
+                      vanishes — a child div and not `border-l`, because under
+                      Preflight's `border-collapse: collapse` a cell border
+                      belongs to the collapsed table grid and stays at the
+                      cell's layout slot instead of travelling with the sticky
+                      cell) and the gradient painted after the table (says
+                      "content continues", which a 1px rule alone does not). */}
+                  <TableHead className="sticky right-0 w-[176px] bg-card">
+                    {jobsTableEdges.right && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
+                    {i18nT('pages.schedulePage.actions')}
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>{jobs.length === 0
@@ -825,6 +824,7 @@ export default function SchedulePage() {
                     `bg-card` it matches the rest of the row exactly. */}
                 <TableCell className="sticky right-0 whitespace-nowrap bg-card" onClick={e => e.stopPropagation()}>
                   <div aria-hidden className={`absolute inset-0 -z-10 transition-colors group-hover/jobrow:bg-bg-hover ${selected?.id === j.id ? 'bg-accent-subtle' : ''} ${selectedIds.has(j.id) ? 'bg-accent-subtle/60' : ''}`} />
+                  {jobsTableEdges.right && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
                   <div className="flex items-center gap-1.5">
                     {j.is_running
                       ? <span title={i18nT('pages.schedulePage.cancel_running_execution')}><Btn danger onClick={() => cancelRun(j.id)} disabled={cancelling.has(j.id)}>{cancelling.has(j.id) ? '...' : i18nT('pages.schedulePage.cancel')}</Btn></span>
@@ -841,10 +841,10 @@ export default function SchedulePage() {
                         ChatInput's Continue/Send buttons. */}
                     <Btn
                       danger
-                      disabled={deletingId === j.id}
+                      disabled={isDeleting(j.id)}
                       title={confirmDeleteId === j.id ? i18nT('pages.schedulePage.click_again_to_confirm') : i18nT('pages.schedulePage.delete_job')}
-                      onClick={() => confirmDeleteId === j.id ? deleteJob(j.id) : armDelete(j.id)}
-                    >{deletingId === j.id ? '...' : confirmDeleteId === j.id ? i18nT('pages.schedulePage.confirm_delete_job') : i18nT('pages.schedulePage.delete')}</Btn>
+                      onClick={() => { if (confirmDeleteId === j.id) void confirmDelete(j.id); else armDelete(j.id) }}
+                    >{isDeleting(j.id) ? '...' : confirmDeleteId === j.id ? i18nT('pages.schedulePage.confirm_delete_job') : i18nT('pages.schedulePage.delete')}</Btn>
                     <CronRowActions
                       job={j}
                       folders={cronFolders}
@@ -915,7 +915,14 @@ export default function SchedulePage() {
               aria-label={i18nT('pages.schedulePage.cronFolders.new_folder_name')}
               value={folderModalName}
               onChange={e => setFolderModalName(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && folderModalName.trim()) handleFolderModalSubmit() }}
+              {...folderNameIme.bindComposition()}
+              onFocus={() => folderNameIme.reset()}
+              onKeyDown={e => {
+                if (e.key !== 'Enter') return
+                // Rule 1: single-line input; emptiness stays outside the guard.
+                if (folderNameIme.isComposing(e)) return
+                if (folderModalName.trim()) handleFolderModalSubmit()
+              }}
               placeholder={i18nT('pages.schedulePage.cronFolders.new_folder_name')}
               className="w-full"
             />

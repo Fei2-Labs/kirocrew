@@ -1,5 +1,5 @@
 {
-  "name": "kirocrew-electron-mac",
+  "name": "kirocrew-desktop",
   "version": "0.3.0",
   "description": "Kiro Crew \u2014 AI agent desktop app",
   "homepage": "https://github.com/kirodotdev/KiroCrew",
@@ -30,7 +30,7 @@
     "productName": "KiroCrew",
     "mac": {
       "category": "public.app-category.developer-tools",
-      "icon": "icon.png",
+      "icon": "icon.icns",
       "target": [
         "dmg",
         "zip"
@@ -107,6 +107,24 @@
       ]
     },
     "dmg": {
+      "background": "../../packaging/installer-assets/dmg-background.tiff",
+      "iconSize": 96,
+      "iconTextSize": 13,
+      "title": "${productName}",
+      "filesystem": "HFS+",
+      "contents": [
+        {
+          "x": 170,
+          "y": 246,
+          "type": "file"
+        },
+        {
+          "x": 490,
+          "y": 246,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ],
       "writeUpdateInfo": false
     },
     "files": [
@@ -129,6 +147,7 @@
       "gateway-stop.js",
       "gateway-wait.js",
       "sandbox-profile.js",
+      "windows-port.js",
       "home-dir.js",
       "local-token.js",
       "local-gateway.js",
@@ -216,7 +235,9 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": false,
       "deleteAppDataOnUninstall": false,
-      "runAfterFinish": true
+      "runAfterFinish": true,
+      "installerSidebar": "../../packaging/installer-assets/windows-installer-sidebar.bmp",
+      "installerHeader": "../../packaging/installer-assets/windows-installer-header.bmp"
     }
   },
   "author": "Kiro Crew"

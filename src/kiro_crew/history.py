@@ -29,7 +29,7 @@ from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
 from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect, stream_and_collect_json
-from kiro_crew.messaging.link import legacy_key
+from kiro_crew.messaging.link import canonical_key, legacy_key
 from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
@@ -173,6 +173,7 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "artifact",
         "pinned",
         "color_index",
+        "color_hex",
         "color_theme",
         "tags",
         "forked_from",
@@ -1619,6 +1620,48 @@ class ConversationLog:
     _flock_state: dict[str, list[int]] = {}
     _flock_guard = threading.Lock()
 
+    # Monotonic count of cross-process flock RELEASES per lock_key, bumped
+    # under ``_flock_guard`` when a deferred release actually retires a held
+    # flock. Part of the unlocked-fill publish witness
+    # (:meth:`_flock_hold_witness`): "held now" at two instants does not prove
+    # the hold was CONTINUOUS — the flock could have been released and
+    # re-acquired between them with an external process's write in the gap,
+    # and ``os.open`` can recycle the fd number, so the fd alone cannot prove
+    # continuity either. An unchanged (fd, epoch) pair can: the epoch moves on
+    # every release, so equal pairs mean the same unbroken hold. Same growth
+    # class as ``_flock_state``.
+    _flock_epochs: dict[str, int] = {}
+
+    # Per-key invalidation generation, bumped by ``_invalidate_cache`` BEFORE
+    # it drops entries. The mtime guard alone cannot protect a cache FILL:
+    # housekeeping rewrites (compaction / rotation / metadata edits /
+    # mark_consolidated) restore the pre-write mtime via ``_restore_mtime``,
+    # so a fill that stats the file before such a rewrite and publishes after
+    # its invalidation would park pre-rewrite data under an mtime the file
+    # still has — undetectable for the life of the process. Fill paths
+    # snapshot the generation before their stat and publish only while it is
+    # unmoved (``_publish_if_current`` for the mtime-keyed memos; the unlocked
+    # ``_msg_cache`` fallback in ``_read_messages`` checks it inline alongside
+    # the flock-hold witness), discarding the fill otherwise. Class-level for
+    # the same reason
+    # ``_file_locks`` is: the writer whose lock hold forces a reader onto the
+    # unlocked fill may live on a DIFFERENT ``ConversationLog`` instance over
+    # the same directory, and its bump must be visible to that reader's
+    # snapshot. Keyed by ``(transcript dir, sanitized filename stem)`` — pure
+    # string math, so a snapshot costs no I/O, the dir component keeps
+    # distinct ``base_dir``s from sharing counters, and the stem (see
+    # ``_cache_gen``) makes the logical-key and ``path.stem`` spellings of one
+    # session share one counter. ``_cache_gens_guard`` is always innermost:
+    # taken under ``_file_lock`` (every writer invalidates while holding it),
+    # never the reverse, and never across I/O — so no read path waits on a
+    # writer's file operations. Grows one small int per (dir, spelling) ever
+    # invalidated in this process — a session can occupy up to two buckets
+    # (a legacy bare Slack stem plus its canonical spelling) — the same
+    # growth class as ``_file_locks``, and entries are never evicted because
+    # a missing entry must always mean "generation 0", not "forgotten bump".
+    _cache_gens: dict[tuple[str, str], int] = {}
+    _cache_gens_guard = threading.Lock()
+
     def __init__(
         self,
         base_dir: Path | None = None,
@@ -1631,8 +1674,12 @@ class ConversationLog:
         # parsed-transcript working set without limit. Eviction is
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
-        self._msg_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
-        self._meta_cache: _LRUCache[tuple[float, dict]] = _LRUCache(cache_max)
+        self._msg_cache: _LRUCache[tuple[float, int, list[dict]]] = _LRUCache(cache_max)
+        #: ``(mtime, gen, meta)`` — like the search memos, entries record the
+        #: invalidation generation and a warm hit requires both fields to
+        #: match, so a preserved-mtime metadata edit through another
+        #: instance (whose pops cannot reach this cache) still unhits.
+        self._meta_cache: _LRUCache[tuple[float, int, dict]] = _LRUCache(cache_max)
         #: Bounded, mtime-keyed LRU of formatted ``recent()`` windows keyed by
         #: (key, max_messages, roles). The tail-read fast path intentionally
         #: never warms ``_msg_cache`` (it returns a partial view), so a session
@@ -1642,8 +1689,15 @@ class ConversationLog:
         #: staleness (an append bumps the file mtime, so the entry is
         #: recomputed on the next call). Own ``_LRUCache`` → own internal lock.
         self._recent_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
-        #: Bounded, mtime-keyed memo of ``(mtime, doc_chars, casefolded_blob)``
-        #: per session, consumed only by :meth:`search_sessions`.
+        #: Bounded memo of ``(mtime, gen, doc_chars, casefolded_blob)`` per
+        #: session, consumed only by :meth:`search_sessions`. ``gen`` is the
+        #: invalidation generation (:meth:`_cache_gen`) the entry was folded
+        #: under; a hit requires BOTH the mtime and the generation to match,
+        #: because ``_invalidate_cache``'s pops reach only their own
+        #: instance's caches while a preserved-mtime rewrite can be performed
+        #: through a different ``ConversationLog`` instance over the same
+        #: directory — the generation bump is what unhits such an entry where
+        #: the instance-local pop cannot.
         #:
         #: Folding is the dominant cost of a search: the substring count itself
         #: is cheap, but ``str.casefold`` over a whole corpus is not, and it
@@ -1658,10 +1712,10 @@ class ConversationLog:
         #: order; :class:`_SearchTextCache` keeps that guarantee by refusing
         #: admission instead of evicting, so the sessions that fit stay cached
         #: and the bound is now a real memory ceiling rather than a proxy for one.
-        self._folded_cache: _SearchTextCache[tuple[float, int, str]] = _SearchTextCache(
-            _SEARCH_FOLD_BUDGET_BYTES, lambda v: v[2].__sizeof__(), "fold"
+        self._folded_cache: _SearchTextCache[tuple[float, int, int, str]] = _SearchTextCache(
+            _SEARCH_FOLD_BUDGET_BYTES, lambda v: v[3].__sizeof__(), "fold"
         )
-        #: session key → (mtime, raw message texts) for snippet extraction.
+        #: session key → (mtime, gen, raw message texts) for snippet extraction.
         #:
         #: The fold above answers "does this session match"; this answers "show me
         #: the line". Without it every returned row re-opened its file and
@@ -1674,10 +1728,13 @@ class ConversationLog:
         #: Filled by :meth:`_build_folded`, which already materializes exactly
         #: this list to build the fold — so the second corpus costs one extra
         #: reference, never an extra read. Raw (not folded) because the snippet is
-        #: displayed to the user; the fold cannot be reused for it.
-        self._snippet_cache: _SearchTextCache[tuple[float, list[str]]] = _SearchTextCache(
+        #: displayed to the user; the fold cannot be reused for it. Carries the
+        #: same generation field as ``_folded_cache`` above, for the same
+        #: cross-instance reason: both memos are derived from the messages, so
+        #: they go stale at exactly the same moment.
+        self._snippet_cache: _SearchTextCache[tuple[float, int, list[str]]] = _SearchTextCache(
             _SEARCH_SNIPPET_BUDGET_BYTES,
-            lambda v: v[1].__sizeof__() + sum(t.__sizeof__() for t in v[1]),
+            lambda v: v[2].__sizeof__() + sum(t.__sizeof__() for t in v[2]),
             "snippet",
         )
         #: tab_id → [session keys] chain index. ``None`` means "stale, rebuild
@@ -1941,6 +1998,13 @@ class ConversationLog:
                     if st is None or st[0] != fd or st[1] != 0:
                         return  # reused or replaced — leave the flock in place
                     ConversationLog._flock_state.pop(lock_key, None)
+                    # The hold is over: advance the release epoch so an
+                    # unlocked fill's witness (:meth:`_flock_hold_witness`)
+                    # spanning this release can no longer claim a continuous
+                    # hold, even if a re-acquire lands on a recycled fd number.
+                    ConversationLog._flock_epochs[lock_key] = (
+                        ConversationLog._flock_epochs.get(lock_key, 0) + 1
+                    )
                 try:
                     platform_compat.release_lock(fd)
                 finally:
@@ -2198,8 +2262,10 @@ class ConversationLog:
             if created_with_tab_id:
                 self.invalidate_tab_id_cache()
 
-            # Rotate if file exceeds size limit
-            self._maybe_rotate(path)
+            # Rotate if file exceeds size limit. Pass the logical key so the
+            # rotation's invalidation reaches every cache-key spelling; the
+            # file stem alone cannot recover it (sanitization is lossy).
+            self._maybe_rotate(path, key)
 
     def append_if_absent(
         self,
@@ -2518,7 +2584,15 @@ class ConversationLog:
             # (see _restore_mtime). Otherwise consolidation floats stale sessions
             # to the top of list_sessions on every gateway restart.
             _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+            # Invalidate while still holding the lock. Outside it there is a
+            # window where the file is already rewritten with its mtime
+            # restored but the generation has not moved, so a concurrent fold /
+            # snippet / metadata read passes both the mtime and the generation
+            # guard and memoizes pre-rewrite data. Every other preserved-mtime
+            # writer already invalidates inside its locked section;
+            # _invalidate_cache is pure in-memory work, so this adds no I/O
+            # under the cross-process flock.
+            self._invalidate_cache(key)
 
     def unconsolidated_count(self, key: str) -> int:
         """Count messages not yet processed by the consolidator."""
@@ -2851,6 +2925,13 @@ class ConversationLog:
         # Deduplicate stacked dashboard_ prefixes by canonical key, keeping newer
         by_canon: dict[str, dict] = {}
         for path in self._dir.glob("*.jsonl"):
+            key = path.stem
+            # Snapshot the invalidation generation BEFORE the stat: the
+            # first-line fill below publishes under this stat's mtime, and a
+            # housekeeping rewrite restores the pre-write mtime
+            # (``_restore_mtime``), so only the generation can prove the
+            # stat → read → publish window stayed write-free for this key.
+            gen = self._cache_gen(key)
             try:
                 stat = path.stat()
             except OSError:
@@ -2858,7 +2939,6 @@ class ConversationLog:
             # Skip symlinks — these are handoff aliases pointing to the real session
             if path.is_symlink():
                 continue
-            key = path.stem
             meta: dict = {
                 "key": key,
                 "messages": max(1, int(stat.st_size / 200)),
@@ -2867,8 +2947,12 @@ class ConversationLog:
             }
             # Try metadata cache first (populated by _read_metadata calls)
             cached_meta = self._meta_cache.get(key)
-            if cached_meta and cached_meta[0] == stat.st_mtime:
-                d = cached_meta[1]
+            if (
+                cached_meta
+                and cached_meta[0] == stat.st_mtime
+                and cached_meta[1] == self._cache_gen(key)
+            ):
+                d = cached_meta[2]
                 if d.get("created_at"):
                     meta["created"] = d["created_at"]
                 if d.get("title"):
@@ -2895,7 +2979,12 @@ class ConversationLog:
                             meta["memory_mode"] = d.get("memory_mode", "persistent")
                             if d.get("folder_id"):
                                 meta["folder_id"] = d["folder_id"]
-                            self._meta_cache[key] = (stat.st_mtime, d)
+                            # Guarded publish — discard the fill if a write
+                            # invalidated this key inside the stat → read
+                            # window (see the generation snapshot above).
+                            self._publish_if_current(
+                                self._meta_cache, key, (stat.st_mtime, gen, d), key=key, gen=gen
+                            )
                 except Exception:
                     pass
             # Ensure memory_mode is always present (old sessions lack it)
@@ -2903,8 +2992,12 @@ class ConversationLog:
             # Extract first user message as title fallback
             if "title" not in meta:
                 msg_cached = self._msg_cache.get(key)
-                if msg_cached and msg_cached[0] == stat.st_mtime:
-                    for m in msg_cached[1]:
+                if (
+                    msg_cached
+                    and msg_cached[0] == stat.st_mtime
+                    and msg_cached[1] == self._cache_gen(key)
+                ):
+                    for m in msg_cached[2]:
                         if m.get("role") == "user" and m.get("content"):
                             meta["title"] = m["content"][:80]
                             break
@@ -3101,7 +3194,8 @@ class ConversationLog:
         return out
 
     def _folded_content(self, key: str) -> tuple[int, str]:
-        """Return ``(doc_chars, casefolded_content)`` for *key*, memoized by mtime.
+        """Return ``(doc_chars, casefolded_content)`` for *key*, memoized by
+        mtime plus invalidation generation.
 
         ``doc_chars`` counts the ORIGINAL (unfolded) characters, because it
         feeds the length normalizer in :meth:`search_sessions` and folding can
@@ -3123,8 +3217,11 @@ class ConversationLog:
             self._snippet_cache.pop(key, None)
             return (0, "")
         cached = self._folded_cache.get(key)
-        if cached and cached[0] == mtime:
-            return (cached[1], cached[2])
+        # The hit wants the LATEST generation (a moved counter means a write
+        # landed, so a miss is the correct answer), so it is read at check
+        # time rather than snapshotted earlier — matching ``_snippet_texts``.
+        if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+            return (cached[2], cached[3])
         # Cold: serialize against this key's writers for the whole
         # stat -> read -> store sequence.
         #
@@ -3136,12 +3233,27 @@ class ConversationLog:
         # has — undetectable, so the newly saved messages would be missing from
         # every later search for the life of the process.
         #
-        # ``_file_lock`` is the same in-process RLock every writer takes first in
-        # ``_locked``, so holding it here orders this fold against append /
-        # rewrite / metadata edits for this key. It is acquired ONLY on the miss
-        # path: a warm search never contends, and two threads racing the same
-        # cold key fold once (the re-check below).
+        # ``_file_lock`` is the same process-wide, path-keyed RLock every writer
+        # takes first in ``_locked`` — shared across every ``ConversationLog``
+        # instance over this file — so holding it here orders this fold against
+        # append / rewrite / metadata edits for this key, whichever instance
+        # performs them. It is acquired ONLY on the miss path: a warm search
+        # never contends, and two threads racing the same cold key fold once
+        # (the re-check below). What the lock CANNOT fix is invalidation reach:
+        # a writer's ``_invalidate_cache`` pops only its own instance's caches,
+        # so an entry already sitting warm in THIS instance survives a rewrite
+        # performed through a different instance, mtime restored and all. That
+        # is why entries carry the generation and the warm-hit checks above and
+        # below require it to match.
         with self._file_lock(key):
+            # Snapshot the fill baseline under the lock and BEFORE the stat:
+            # the mtime that stat returns can survive a housekeeping rewrite
+            # (``_restore_mtime``), so only an unmoved generation can prove the
+            # stat → read → publish window stayed write-free. A writer that ran
+            # between the lock-free probe and the acquire already bumped the
+            # counter, and the fold below is ordered AFTER it, so its result is
+            # current for this newer generation.
+            gen = self._cache_gen(key)
             try:
                 mtime = path.stat().st_mtime
             except OSError:
@@ -3149,9 +3261,9 @@ class ConversationLog:
                 self._snippet_cache.pop(key, None)
                 return (0, "")
             cached = self._folded_cache.get(key)
-            if cached and cached[0] == mtime:
-                return (cached[1], cached[2])
-            built = self._build_folded(key, mtime)
+            if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+                return (cached[2], cached[3])
+            built = self._build_folded(key, mtime, gen)
             if built is None:
                 # The read failed rather than finding no content. Caching that
                 # would be keyed by an mtime the file still has, so a session
@@ -3161,7 +3273,9 @@ class ConversationLog:
                 # unsearchable until something wrote to it again. Fail open:
                 # report empty for this query and retry on the next one.
                 return (0, "")
-            self._folded_cache[key] = (mtime, built[0], built[1])
+            self._publish_if_current(
+                self._folded_cache, key, (mtime, gen, built[0], built[1]), key=key, gen=gen
+            )
             return built
 
     def _prune_search_memos(self, live_keys: set[str]) -> None:
@@ -3184,7 +3298,7 @@ class ConversationLog:
             if cache.refused_since_prune():
                 cache.retain(live_keys)
 
-    def _build_folded(self, key: str, mtime: float) -> tuple[int, str] | None:
+    def _build_folded(self, key: str, mtime: float, gen: int) -> tuple[int, str] | None:
         """Parse *key* and fold its content — the cache-miss half of
         :meth:`_folded_content`.
 
@@ -3208,11 +3322,19 @@ class ConversationLog:
         the file makes the fold a function of the file alone.
 
         The caller holds ``_file_lock``, which orders this read against writers
-        in THIS process. A writer in another process holds only the cross-process
-        flock, so it can still interleave — but the caller stats BEFORE this read,
-        so such a write leaves the cached mtime older than the file's and the next
-        access re-folds. That case is self-healing, unlike the preserved-mtime
-        rewrite the lock exists for.
+        in THIS process — the lock table is class-level and path-keyed, so that
+        includes writers using other ``ConversationLog`` instances. A writer in
+        another process holds only the cross-process flock, so it can still
+        interleave; if it bumps the mtime, the caller's pre-read stat leaves the
+        cached mtime older than the file's and the next access re-folds. A
+        cross-process PRESERVED-mtime rewrite, however, is caught by neither
+        the lock nor the generation (the counter lives in this process) — a
+        known residual gap shared with every memo in this class. *gen* is the
+        invalidation-generation snapshot the caller took alongside its stat;
+        the snippet store below publishes under it and records it in the entry,
+        which is what lets a warm hit notice an in-process rewrite performed
+        through a different instance (whose ``_invalidate_cache`` pops only its
+        own instance's caches).
 
         Separated from :meth:`_folded_content` so the memoization is observable:
         a caller (or a test) can count how often the expensive fold actually
@@ -3226,10 +3348,15 @@ class ConversationLog:
         if not texts:
             return (0, "")
         # Hand the same list to the snippet memo. The caller has already stat'ed
-        # under ``_file_lock`` and passes that mtime, so both memos are keyed by
-        # one observation of the file and cannot disagree about which revision
-        # they hold. Storing here is why the second corpus costs no extra read.
-        self._snippet_cache[key] = (mtime, texts)
+        # under ``_file_lock`` and passes that mtime and its generation
+        # snapshot, so both memos are keyed by one observation of the file and
+        # cannot disagree about which revision they hold. Storing here is why
+        # the second corpus costs no extra read. The publish guard here is
+        # generation-stamp hygiene: the lock already orders this store against
+        # in-process writers, so its job is refusing to stamp an entry with an
+        # already-superseded generation — the recorded generation is what the
+        # warm-hit checks compare against.
+        self._publish_if_current(self._snippet_cache, key, (mtime, gen, texts), key=key, gen=gen)
         return (sum(len(t) for t in texts), "\x00".join(texts).casefold())
 
     def _iter_message_texts(self, key: str) -> Iterator[str]:
@@ -3273,25 +3400,31 @@ class ConversationLog:
         Prefers ``_snippet_cache`` — filled by :meth:`_build_folded` from the same
         read that produced the fold — and falls back to re-reading the file.
 
-        The memo is validated against the file's current mtime, so it degrades to
-        the file read rather than serving a stale snippet. That check is cheap
-        relative to the parse it avoids, and unlike the fold this path does NOT
-        need ``_file_lock``: a snippet is display-only, so the worst case for a
-        preserved-mtime rewrite racing here is one stale preview line, not a
-        session that stops matching. The fold — which decides whether a row
-        appears at all — keeps the lock.
+        The memo is validated against the file's current mtime AND the current
+        invalidation generation (:meth:`_cache_gen`), so it degrades to the
+        file read rather than serving a stale snippet. The mtime alone cannot
+        catch a preserved-mtime rewrite performed through a DIFFERENT
+        ``ConversationLog`` instance (its ``_invalidate_cache`` pops only its
+        own instance's caches); the generation clause is what unhits such an
+        entry. Both checks are cheap relative to the parse they avoid, and
+        unlike the fold this path does NOT need ``_file_lock``: a snippet is
+        display-only, so the worst case for a preserved-mtime rewrite racing
+        here is one stale preview line, not a session that stops matching. The
+        fold — which decides whether a row appears at all — keeps the lock.
 
-        Falls back for three reasons, all of which must stay non-fatal: the entry
+        Falls back for four reasons, all of which must stay non-fatal: the entry
         was refused admission by the byte budget, the fold cached ``(0, "")`` for
-        a session with no text and so stored nothing, or the file changed since
-        the fold. Propagates ``OSError`` from the fallback read, which
+        a session with no text and so stored nothing, the file changed since
+        the fold, or the entry's generation was superseded by a write.
+        Propagates ``OSError`` from the fallback read, which
         :meth:`_content_snippet` already treats as "no snippet".
         """
         cached = self._snippet_cache.get(key)
         if cached is not None:
             try:
-                if cached[0] == self._path(key).stat().st_mtime:
-                    return iter(cached[1])
+                mtime_now = self._path(key).stat().st_mtime
+                if cached[0] == mtime_now and cached[1] == self._cache_gen(key):
+                    return iter(cached[2])
             except OSError:
                 # Let the fallback read raise the OSError the caller handles,
                 # rather than deciding here what a vanished file means.
@@ -3721,7 +3854,12 @@ class ConversationLog:
             lines[0] = json.dumps(meta) + "\n"
             atomic_write(path, "".join(lines), fsync=False)
             _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+            # Invalidate while still holding the lock — same reasoning as
+            # mark_consolidated: outside it there is a window where the file
+            # is rewritten with its mtime restored but the generation has not
+            # moved, so a concurrent metadata read passes both guards and
+            # memoizes the pre-rewrite view.
+            self._invalidate_cache(key)
 
     def _read_messages(self, key: str) -> list[dict]:
         """Read all non-metadata entries from a session JSONL file.
@@ -3738,6 +3876,164 @@ class ConversationLog:
             threads iterating the same list concurrently. Slice or ``list(...)``
             it before mutating. All current callers copy/slice; this contract
             keeps that invariant explicit.
+        """
+        path = self._path(key)
+        # ── Warm path: LOCK-FREE, byte-for-byte the pre-fix behaviour ────────
+        # A hit whose stored mtime still matches the file is served with no
+        # lock at all. This matters beyond speed: ``_read_messages`` is reached
+        # ON the event loop (``api_session_detail``, and ``restore_open_slots_
+        # async`` which stays on-loop deliberately — see
+        # ``_pause_for_transient_retry``), while a WRITER holds this same RLock
+        # across its cross-process flock wait (up to ``_FLOCK_ACQUIRE_TIMEOUT_S``
+        # in ``_locked``). Taking the lock on every read would therefore let a
+        # writer stall the sole loop — chat, WebSockets and the liveness
+        # heartbeat — which is the ``no-blocking-call-on-event-loop`` hazard.
+        # The mtime guard alone is NOT sufficient even for a hit: `_invalidate_
+        # cache`'s pops reach only THIS instance's caches, while a preserved-
+        # mtime rewrite can be performed through another ConversationLog
+        # instance over the same directory. Every entry therefore carries the
+        # generation it was published under, and a hit requires BOTH the mtime
+        # and the generation to match — the process-wide bump is what makes a
+        # cross-instance rewrite visible where the instance-local pop cannot
+        # be. The generation read is pure in-memory work (no I/O), so the hit
+        # still never waits on a writer's file operations.
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime is not None:
+            cached = self._msg_cache.get(key)
+            if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+                return cached[2]
+        # ── Cold path: serialize the FILL against this key's writers ─────────
+        # The mtime guard cannot protect the fill window, because housekeeping
+        # rewrites deliberately RESTORE the pre-write mtime (``_restore_mtime``,
+        # so compaction does not reorder ``list_sessions``). A parse that
+        # started before such a rewrite and published after its
+        # ``_invalidate_cache`` would sit in the cache holding pre-rewrite
+        # messages under an mtime the file still has — undetectable, so the
+        # dashboard, session resume and the history tools would serve removed
+        # or replaced messages for the life of the process (issue #1835).
+        #
+        # ``_file_lock`` is the same in-process RLock every writer takes first
+        # in ``_locked``, so holding it across stat → read → publish orders the
+        # fill against append / rewrite / metadata edits for this key. Miss-only
+        # acquisition, plus the re-stat + re-check ``_read_messages_locked``
+        # already does at the top of its retry loop, is exactly the
+        # double-checked shape ``_folded_content`` uses for this identical race.
+        #
+        # An UNLOCKED fill (the bounded-acquire fallback) has no lock ordering,
+        # so its publish is gated on two witnesses covering the two writer
+        # classes. LOCAL writers (threads of this process) all invalidate
+        # through ``_invalidate_cache``, so the invalidation generation
+        # witnesses them: the snapshot below precedes the fill's stat, and an
+        # unmoved generation at publish time proves the window was free of
+        # local preserved-mtime rewrites (``_restore_mtime`` puts back an
+        # mtime the guard alone could never distrust). EXTERNAL writers
+        # (subagents, crons, the CLI — other processes) bump a generation in
+        # THEIR process, invisible here; what excludes them is the
+        # cross-process flock: ``_flock_hold_witness`` proves OUR process held
+        # it continuously across the window, during which an external writer
+        # cannot touch the file. Both witnesses passing makes the parse safe
+        # to keep — sparing the next reader a full re-parse of a potentially
+        # multi-MB transcript. Either failing (including a local writer still
+        # WAITING on an external holder's flock, when the file is externally
+        # rewritable) serves the parse to this caller but never publishes it,
+        # leaving the file the only source of truth.
+        gen = self._cache_gen(key)
+        witness = self._flock_hold_witness(key)
+        with self._cache_fill_lock(key) as locked:
+            messages = self._read_messages_locked(
+                key, gen=None if locked else gen, flock_witness=witness
+            )
+            if not locked and (
+                gen != self._cache_gen(key)
+                or witness is None
+                or witness != self._flock_hold_witness(key)
+            ):
+                # A witness broke between the publish pre-check inside
+                # ``_read_messages_locked`` and here; the entry just stored may
+                # hold a pre-rewrite parse. Popping can at worst remove a
+                # FRESHER entry a concurrent fill published in the same window,
+                # which only costs one re-read — never a stale answer.
+                self._msg_cache.pop(key, None)
+            return messages
+
+    @contextlib.contextmanager
+    def _cache_fill_lock(self, key: str) -> Iterator[bool]:
+        """Best-effort hold of *key*'s writer RLock around a cache FILL.
+
+        Yields ``True`` when the lock is held, ``False`` when it was skipped.
+
+        The acquire is bounded on BOTH paths, because a read must never be able
+        to wait without an upper bound: ON a running loop exactly ONE
+        non-blocking attempt (never sleep/poll the sole event loop, the same
+        discipline ``_locked`` applies to its flock), and off the loop a wait
+        capped at ``_FLOCK_ACQUIRE_TIMEOUT_S`` — the same ceiling a writer's
+        cross-process acquire uses, so the read path's worst case is bounded by
+        the writer's.
+
+        A failed acquire fills WITHOUT the lock. Degrading is safe in a way it
+        is not for a writer: an unlocked fill can at worst lose the race this
+        lock exists to close, i.e. fall back to the pre-fix behaviour for that
+        one read, whereas an unlocked WRITE could clobber a concurrent rewrite.
+        A stalled reader is the strictly worse outcome (on the loop the
+        LoopStallWatchdog kills the gateway; off it, a wedged holder would hang
+        the caller forever), so we take the rare stale read instead.
+
+        Reentrant by construction: a writer that reaches ``_read_messages``
+        while already inside ``_locked`` on this thread re-acquires the RLock it
+        owns, bounded attempt included.
+        """
+        lock = self._file_lock(key)
+        on_loop = True
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            held = lock.acquire(blocking=False)
+        else:
+            held = lock.acquire(timeout=_FLOCK_ACQUIRE_TIMEOUT_S)
+        if not held:
+            logger.debug(
+                "history: writer lock for %s still busy (%s); filling the "
+                "message cache unlocked rather than waiting unbounded",
+                key,
+                "event loop, single non-blocking attempt" if on_loop else "off-loop deadline",
+            )
+        try:
+            yield held
+        finally:
+            if held:
+                lock.release()
+
+    def _read_messages_locked(
+        self,
+        key: str,
+        *,
+        gen: int | None,
+        flock_witness: tuple[int, int] | None,
+    ) -> list[dict]:
+        """The cache-miss half of :meth:`_read_messages`.
+
+        Called under :meth:`_cache_fill_lock` (best-effort — see there). The
+        stat + cache check at the top of the retry loop is what makes the
+        caller's locking *double-checked*: two threads racing the same cold key
+        parse once, and a rewrite that landed between the caller's lock-free
+        probe and the acquire is seen here rather than overwritten.
+
+        *gen* is ``None`` when the caller holds the writer lock (the publish is
+        ordered against writers, so it is unconditionally safe and
+        *flock_witness* is ignored). For an UNLOCKED fill *gen* is the
+        invalidation generation and *flock_witness* the
+        :meth:`_flock_hold_witness` snapshot, both taken by the caller BEFORE
+        this method's stat: the publish happens only while the generation is
+        still unmoved (no LOCAL preserved-mtime rewrite landed inside the
+        window) AND the witness still proves a continuous cross-process flock
+        hold (no EXTERNAL process could have written inside it). Either
+        failing means the parse in hand may predate a rewrite the mtime can
+        never reveal, so it is served but not cached.
         """
         path = self._path(key)
         if not path.exists():
@@ -3759,8 +4055,8 @@ class ConversationLog:
             try:
                 mtime = path.stat().st_mtime
                 cached = self._msg_cache.get(key)
-                if cached and cached[0] == mtime:
-                    return cached[1]
+                if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+                    return cached[2]
                 with open(path, encoding="utf-8") as fh:
                     raw = fh.read()
             except FileNotFoundError:
@@ -3817,7 +4113,29 @@ class ConversationLog:
                 if data.get("_type") == "metadata":
                     continue
                 messages.append(data)
-            self._msg_cache[key] = (mtime, messages)
+            # Each entry records the generation it was published under, so a
+            # LATER invalidation this instance's pops cannot reach (a rewrite
+            # performed through another ConversationLog instance) still
+            # unhits it: the bump is process-wide even though the pop is not.
+            # An unlocked fill stores its pre-stat snapshot — if a bump lands
+            # between the pre-check below and the store, the entry is born
+            # already-stale and no hit site will ever serve it. A locked fill
+            # records the generation read at publish time, which is stable
+            # ENOUGH rather than strictly stable: every preserved-mtime WRITE
+            # is serialized under the lock this fill holds, so the content in
+            # hand is at least as new as any write a concurrent bump belongs
+            # to. An invalidator that bumps after releasing the lock
+            # (mark_consolidated, clear_closed) can only make the recorded
+            # generation LAG the content — a lagging entry misses and costs
+            # one re-parse; a stale hit would require the recorded generation
+            # to LEAD the content, which no caller can produce.
+            entry_gen = self._cache_gen(key) if gen is None else gen
+            if gen is None or (
+                gen == self._cache_gen(key)
+                and flock_witness is not None
+                and flock_witness == self._flock_hold_witness(key)
+            ):
+                self._msg_cache[key] = (mtime, entry_gen, messages)
             return messages
         return []
 
@@ -3850,17 +4168,29 @@ class ConversationLog:
         O(1) from memory on subsequent turns instead of re-opening and
         re-parsing the file tail on every call. The mtime guard makes the
         memo self-invalidating: an :meth:`append` bumps the file mtime, so the
-        stale entry misses and is recomputed. A fresh list of fresh dicts is
+        stale entry misses and is recomputed. Preserved-mtime rewrites are
+        covered by :meth:`_invalidate_cache`'s pops for THIS instance only —
+        unlike ``_msg_cache``, the metadata memo, and the search memos, this
+        memo's hit does not consult the invalidation generation, so a
+        preserved-mtime rewrite performed through another
+        :class:`ConversationLog` instance is a known residual gap here (the
+        last one of its class), accepted
+        because the window is a bounded recent view rather than the
+        authoritative transcript. A fresh list of fresh dicts is
         returned each call so callers can freely mutate the result without
         corrupting the shared entry.
         """
         path = self._path(key)
+        # Snapshot the invalidation generation BEFORE the stat: the mtime this
+        # stat returns can survive a housekeeping rewrite (``_restore_mtime``),
+        # so only the generation can prove the window stayed write-free.
+        gen = self._cache_gen(key)
         try:
             mtime = path.stat().st_mtime
         except OSError:
             return None  # missing/unreadable → let the full path return []
         cached = self._msg_cache.get(key)
-        if cached and cached[0] == mtime:
+        if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
             return None  # fresh full cache → full path is a cheap O(1) hit
         rc_key = self._recent_cache_key(key, max_messages, roles)
         rc = self._recent_cache.get(rc_key)
@@ -3868,7 +4198,11 @@ class ConversationLog:
             return [dict(m) for m in rc[1]]  # memo hit — no disk I/O
         tail = self._read_tail_messages(path, max_messages, roles)
         formatted = [{"role": m["role"], "content": m["content"]} for m in tail]
-        self._recent_cache[rc_key] = (mtime, formatted)
+        # Guarded publish: a rewrite that restored the mtime while we read the
+        # tail would otherwise park this pre-rewrite window under an mtime the
+        # file still has — and this memo feeds recent(), the per-turn model
+        # context path, so the staleness would be served every turn.
+        self._publish_if_current(self._recent_cache, rc_key, (mtime, formatted), key=key, gen=gen)
         return [dict(m) for m in formatted]
 
     @staticmethod
@@ -3980,26 +4314,165 @@ class ConversationLog:
         with self._locked(key):
             return self._last_row_ts(key)
 
+    @staticmethod
+    def _cache_key_identities(key: str) -> tuple[str, ...]:
+        """Every cache-key spelling that can refer to *key*'s session.
+
+        One session is addressable by its logical key, its sanitized filename
+        stem, and — for Slack threads — the pre-migration bare ``thread_ts``
+        in either role. The closure must be BIDIRECTIONAL: a writer told only
+        the bare legacy spelling (e.g. rotation deriving it from the file
+        name) must still reach the canonical spelling readers use, or its
+        invalidation is invisible to them. Pure string math, no I/O.
+        """
+        idents = dict.fromkeys((key, *transcript_stems(key)))
+        canon = canonical_key(key)
+        if canon != key:
+            idents.update(dict.fromkeys((canon, *transcript_stems(canon))))
+        return tuple(idents)
+
+    def _flock_hold_witness(self, key: str) -> tuple[int, int] | None:
+        """Proof-of-hold snapshot of OUR cross-process flock for *key*'s file.
+
+        Returns ``(fd, release_epoch)`` when this process currently holds the
+        sidecar flock (``_flock_state.held == 1``), else ``None``. An unlocked
+        fill snapshots this before its stat and compares at publish time: an
+        equal pair proves the flock was held by this process CONTINUOUSLY
+        across the fill window, so no EXTERNAL process can have written the
+        file in that window — external writers block on the flock, and they
+        are the one writer class the in-process invalidation generation cannot
+        witness (their ``_invalidate_cache`` runs in their process, not ours).
+        Local writers write freely under our hold, and every local
+        preserved-mtime rewrite bumps the generation, so the generation check
+        covers them. ``None`` — including a local writer still WAITING on an
+        external process's flock — means the window cannot be proven
+        external-write-free and the fill must not publish.
+        """
+        lock_key = str(self._path(key))
+        with ConversationLog._flock_guard:
+            state = ConversationLog._flock_state.get(lock_key)
+            if state is None or state[2] != 1:
+                return None
+            return (state[0], ConversationLog._flock_epochs.get(lock_key, 0))
+
+    def _cache_gen(self, key: str) -> int:
+        """Current invalidation generation for *key* (0 if never invalidated).
+
+        Read under ``(transcript dir, sanitized filename stem)`` in the
+        process-wide table, because one session file is reachable under more
+        than one cache-key spelling AND from more than one
+        :class:`ConversationLog` instance: rotation invalidates under
+        ``path.stem`` while every other caller passes the logical session key
+        (``_safe_key`` maps both onto the same stem), and the writer whose
+        lock hold forces a reader onto the unlocked fill may be a different
+        instance over the same directory. Without this normalization a
+        writer's bump would be invisible to a fill running under another
+        spelling or instance — the exact blindness this counter exists to
+        remove. Pure string math: no stat, so snapshotting a generation costs
+        a fill no I/O.
+        """
+        gen_key = (str(self._dir), _safe_key(key))
+        with ConversationLog._cache_gens_guard:
+            return ConversationLog._cache_gens.get(gen_key, 0)
+
+    def _bump_cache_gen(self, key: str, idents: tuple[str, ...]) -> None:
+        """Advance *key*'s generation so in-flight cache fills discard themselves.
+
+        Bumps every identity in *idents* — the caller passes
+        :meth:`_cache_key_identities`, precomputed so
+        :meth:`_invalidate_cache` derives the closure once for its bump and
+        its pops — so a writer that only knows one spelling (a stem-keyed
+        caller knows the file stem; most callers know the logical key) still
+        moves the bucket every fill reads, including the canonical spelling of
+        a legacy bare ``thread_ts``. The identity computation stays outside
+        the guard so it holds nothing but the dict increments themselves.
+        """
+        base = str(self._dir)
+        gen_keys = [(base, _safe_key(ident)) for ident in idents]
+        with ConversationLog._cache_gens_guard:
+            for gen_key in dict.fromkeys(gen_keys):
+                ConversationLog._cache_gens[gen_key] = (
+                    ConversationLog._cache_gens.get(gen_key, 0) + 1
+                )
+
+    def _publish_if_current(
+        self,
+        cache: _LRUCache[_V] | _SearchTextCache[_V],
+        entry_key: str,
+        value: _V,
+        *,
+        key: str,
+        gen: int,
+    ) -> None:
+        """Publish *value* to *cache* only if *key*'s generation is still *gen*.
+
+        *key*/*gen* are keyword-only because *entry_key* and *key* are both
+        strings and coincide at most call sites; swapping them where they
+        differ would silently check a generation nothing ever bumps, turning
+        the guard into a permanent no-op that no type checker could see.
+
+        *gen* is the generation the caller snapshotted BEFORE its stat, so a
+        moved generation proves a write landed inside the stat → read → publish
+        window and the parse in hand may predate it. The check-store-recheck
+        shape closes every interleaving with :meth:`_invalidate_cache` (which
+        bumps before it pops):
+
+        - invalidation completes before the store → the pre-check sees the
+          moved generation and skips the publish;
+        - invalidation's bump lands between the pre-check and the store → the
+          re-check sees it and pops the entry this call just published;
+        - the store completes before the bump → the invalidation's own pop
+          removes it.
+
+        The pop can at worst remove a FRESHER entry a concurrent fill published
+        in the same window; that only costs the next reader one re-read, never
+        a stale answer. Discarding (rather than retrying) keeps the read path
+        free of any wait on writers — several fill paths run on the event loop.
+        """
+        if gen != self._cache_gen(key):
+            return
+        cache[entry_key] = value
+        if gen != self._cache_gen(key):
+            cache.pop(entry_key, None)
+
     def _invalidate_cache(self, key: str) -> None:
         """Invalidate caches for a key after a write operation."""
-        self._msg_cache.pop(key, None)
-        self._meta_cache.pop(key, None)
-        # The folded search blob is derived from the messages, so it goes stale
-        # exactly when they do. Its own mtime guard is not enough here: the
-        # housekeeping rewrites below restore the pre-write mtime.
-        self._folded_cache.pop(key, None)
-        # Same reasoning for the snippet source: it is the raw form of what the
-        # fold is derived from, so it goes stale at exactly the same moment. Its
-        # own mtime check would miss the preserved-mtime rewrites below, and a
-        # missed invalidation here shows the user a preview line quoting text
-        # that is no longer in the session.
-        self._snippet_cache.pop(key, None)
-        # Also drop any memoized recent() windows for this key. Necessary
-        # because housekeeping rewrites (mark_consolidated/update_metadata/
-        # rewrite_session/rotation) restore the pre-write mtime via
-        # _restore_mtime, so the recent cache's mtime guard alone would let a
-        # stale window survive a content change.
-        self._recent_cache.pop_prefix(f"{key}\x00")
+        idents = self._cache_key_identities(key)
+        # Bump BEFORE dropping entries: a fill publishing between a pop and a
+        # later bump would pass its generation re-check and resurrect the entry
+        # just dropped. Bump-first means any fill that stores after a pop here
+        # must re-check against the already-moved generation and discard.
+        self._bump_cache_gen(key, idents)
+        # Drop entries under EVERY spelling this session's cache keys can take
+        # (:meth:`_cache_key_identities`), because the writer and the reader do
+        # not always use the same one: rotation derives its key from the file
+        # name (``path.stem``) while readers cache under the logical session
+        # key. The bump above only guards fills still IN FLIGHT; an entry that
+        # was already published can only be removed by these pops, so the pops
+        # must be exactly as wide as the bump — popping one spelling while
+        # bumping them all would leave an alias-keyed entry holding pre-rewrite
+        # data under a restored mtime, unreachable by any guard. Over-popping
+        # costs at most one re-read; under-popping is permanent staleness.
+        for ident in idents:
+            self._msg_cache.pop(ident, None)
+            self._meta_cache.pop(ident, None)
+            # The folded search blob is derived from the messages, so it goes
+            # stale exactly when they do. Its own mtime guard is not enough
+            # here: the housekeeping rewrites below restore the pre-write
+            # mtime.
+            self._folded_cache.pop(ident, None)
+            # Same reasoning for the snippet source: it is the raw form of
+            # what the fold is derived from, so it goes stale at exactly the
+            # same moment. Its own mtime check would miss the preserved-mtime
+            # rewrites below, and a missed invalidation here shows the user a
+            # preview line quoting text that is no longer in the session.
+            self._snippet_cache.pop(ident, None)
+            # Also drop any memoized recent() windows for this key. Necessary
+            # because housekeeping rewrites (mark_consolidated/update_metadata/
+            # rewrite_session/rotation) restore the pre-write mtime via
+            # _restore_mtime, so the recent cache's mtime guard alone would let
+            # a stale window survive a content change.
+            self._recent_cache.pop_prefix(f"{ident}\x00")
 
     #: Bytes read from the end of a session file for the last-message preview.
     #: One tail block comfortably covers several trailing JSONL lines without
@@ -4150,11 +4623,18 @@ class ConversationLog:
             self._meta_cache.pop(key, None)
             return {}, True
         for attempt in range(_METADATA_READ_ATTEMPTS):
+            # Snapshot the invalidation generation BEFORE the stat (fresh per
+            # attempt — each retry is its own stat → read → publish window).
+            # The mtime alone cannot guard the fill: a housekeeping rewrite
+            # restores the pre-write mtime (``_restore_mtime``), so a fill that
+            # spans one would publish pre-rewrite metadata under an mtime the
+            # file still has.
+            gen = self._cache_gen(key)
             try:
                 mtime = path.stat().st_mtime
                 cached = self._meta_cache.get(key)
-                if cached and cached[0] == mtime:
-                    return cached[1], True
+                if cached and cached[0] == mtime and cached[1] == self._cache_gen(key):
+                    return cached[2], True
                 # Read ONLY the first line. The previous form slurped the entire
                 # file via read_text() and then threw all but the first line away
                 # — on a 26 MB transcript that is ~10ms and ~26 MB of transient
@@ -4198,7 +4678,11 @@ class ConversationLog:
                 )
             except json.JSONDecodeError:
                 meta = {}
-            self._meta_cache[key] = (mtime, meta)
+            # Guarded publish — discard the fill if a write invalidated this
+            # key inside the stat → read window (see the generation snapshot
+            # at the top of the loop). The metadata itself is still returned:
+            # it was true at read time; only the memo must not outlive it.
+            self._publish_if_current(self._meta_cache, key, (mtime, gen, meta), key=key, gen=gen)
             return meta, True
         return {}, True
 
@@ -4269,8 +4753,13 @@ class ConversationLog:
         _restore_mtime(path, prev_mtime)
         self._invalidate_cache(key)
 
-    def _maybe_rotate(self, path: Path) -> None:
+    def _maybe_rotate(self, path: Path, key: str) -> None:
         """Rotate a session file that exceeds the byte limit.
+
+        *key* is the logical session key, required because the cache
+        invalidation below cannot recover it from the file stem: the
+        sanitization is lossy (``slack:<ts>`` and ``slack_<ts>`` share one
+        stem) and cache entries live under the spelling the caller used.
 
         Keeps the metadata line plus at most ``_SESSION_KEEP_LINES`` trailing
         messages. When a file is oversized because of a handful of very large
@@ -4279,6 +4768,12 @@ class ConversationLog:
         of returning early. Previously the ``len(lines) <= _SESSION_KEEP_LINES``
         guard let such a file grow without bound (a session of a few multi-MB
         messages would never rotate), defeating the size cap entirely.
+
+        *key* is the LOGICAL session key (the spelling readers cache under),
+        not the filename stem: the rotation rewrite restores the pre-write
+        mtime, so its ``_invalidate_cache`` must pop the reader's actual cache
+        entry — ``path.stem`` is sanitized and cannot be mapped back to the
+        logical spelling at this end.
 
         Callers hold the per-session lock (this is invoked from ``append`` under
         ``_locked``); it does not acquire the lock itself.
@@ -4343,9 +4838,11 @@ class ConversationLog:
         content = meta_line + "".join(kept)
         atomic_write(path, content)
         _restore_mtime(path, prev_mtime)
-        # Invalidate cache — offsets changed
-        safe = path.stem
-        self._invalidate_cache(safe)
+        # Invalidate cache — offsets changed. Under the LOGICAL key: readers
+        # cache under that spelling, and this rewrite restored the pre-write
+        # mtime, so a missed pop here would leave their entry permanently
+        # stale (the identity closure in _invalidate_cache covers the stem).
+        self._invalidate_cache(key)
         logger.info(
             "Rotated session file %s (%d → %d lines)",
             path.name,
@@ -5250,6 +5747,17 @@ class HistoryConsolidator:
         been appended since the last pass, yet still forces a fresh pass after a
         transcript rotation (which swaps the window's content); genuine repeats
         are still caught by the dedupe verdict in ``_process_auto_skills``.
+
+        The prompt gates on RECURRENCE, not effort. A session can be long,
+        difficult, and rich in tool calls while still being one-off — a single
+        bug's fix, a one-time audit of one component, a probe answering a
+        question that is now answered — and the tool-call floor
+        (``auto_min_tool_calls``) cannot tell those apart from a repeatable
+        method. So the prompt makes the model name the future session and the
+        DIFFERENT target that would reuse the procedure, and return null when
+        the only honest answer reuses this session's own artifact. It also
+        prefers null under uncertainty: an unreusable candidate is not free,
+        because it spends the human's review attention on every later proposal.
         """
         if self._skills_loader is None:
             return
@@ -5292,24 +5800,37 @@ class HistoryConsolidator:
             )
         skill_keys = [
             '"new_skill": Object or null. Return an object ONLY if this '
-            "session contained a non-trivial reusable multi-step procedure "
-            "that future sessions would benefit from (e.g. debugging a "
-            "specific class of error, running a multi-command sequence, "
-            "a research synthesis flow). The procedure may be demonstrated by "
-            "only PART of the excerpt below — you do NOT need to cover the whole "
-            "session, just capture the one reusable procedure it contains. Shape: "
+            "session demonstrated a procedure that will RECUR — one a future "
+            "session, working on a DIFFERENT target, would run again "
+            "substantially unchanged (e.g. a repeatable debugging method for a "
+            "class of error, a fixed command/API sequence, a verification "
+            "technique). The procedure may be demonstrated by only PART of the "
+            "excerpt below — you do NOT need to cover the whole session. "
+            "Shape: "
             '{"slug": "<kebab-case-4-to-60-chars>", '
             '"description": "<=150 chars, starts with verb>", '
             '"triggers": "<3-8 comma-separated keywords/phrases>", '
             '"procedure_md": "<concise markdown body with '
             "## When to use / ## Steps / ## Gotchas sections, "
             '<=8000 chars>"' + scripts_field + "}. "
-            "Return null if the session was trivial, a single-shot answer, "
-            "a one-off failure with no reusable takeaway, or involved "
-            "sensitive paths. When a session plausibly contains a procedure "
-            "a future session could reuse, lean toward returning it — every "
-            "candidate is staged for human approval before it can activate, "
-            "so a borderline proposal is cheap while a miss is lost for good. "
+            "## The recurrence test (apply BEFORE returning an object)\n"
+            "Name the future session that would load this skill and the "
+            "DIFFERENT target it would run against. If the only honest answer "
+            "reuses this session's specific artifact — this bug, this file, "
+            "this component, this one question — the procedure does not recur "
+            "and you MUST return null. Effort is not evidence of recurrence: a "
+            "long, many-step, genuinely difficult session is still one-off if "
+            "its steps were chosen for one target.\n"
+            "Return null for: a task done once and now finished (a specific "
+            "bug's fix, a one-time audit/trace of one component, a migration, "
+            "a probe run to answer a question that is now answered); a design "
+            "or planning discussion; a narrative of what happened in this "
+            "session; a procedure whose steps only make sense against the "
+            "exact artifact at hand; a trivial or single-shot answer; a "
+            "one-off failure with no reusable takeaway; anything touching "
+            "sensitive paths. Prefer null when uncertain — an unreusable "
+            "candidate costs the user review effort on every future proposal, "
+            "so silence is cheaper than a plausible-looking one-off. "
             "Do NOT include absolute paths, credentials, tokens, or user PII "
             "in the procedure body."
         ]
@@ -5347,6 +5868,16 @@ class HistoryConsolidator:
         self._last_skillgen_marker[key] = marker
         if not result:
             return
+        # Log the verdict, not just the proposals. The prompt's default is null,
+        # so silence is the common outcome, and the staging log in
+        # ``_process_auto_skills`` only fires when a candidate is produced --
+        # which would leave the queue showing the false-POSITIVE rate while the
+        # false-negative rate had no signal at all.
+        logger.debug(
+            "Skill detection verdict for %s: %s",
+            key,
+            "candidate proposed" if result.get("new_skill") else "no recurring procedure",
+        )
         # _event_loop was captured by our caller (_consolidate) so the
         # thread-offloaded dedupe judge can marshal back onto the gateway loop.
         await asyncio.to_thread(self._process_auto_skills, result, key)

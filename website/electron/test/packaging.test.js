@@ -4,6 +4,64 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..");
+const REPO_ROOT = path.resolve(ROOT, "..", "..");
+const INSTALLER_ASSETS = path.join(REPO_ROOT, "packaging", "installer-assets");
+
+function tiffPages(file) {
+  const bytes = fs.readFileSync(file);
+  const byteOrder = bytes.toString("ascii", 0, 2);
+  assert.ok(byteOrder === "II" || byteOrder === "MM");
+  const littleEndian = byteOrder === "II";
+  const uint16 = offset =>
+    littleEndian ? bytes.readUInt16LE(offset) : bytes.readUInt16BE(offset);
+  const uint32 = offset =>
+    littleEndian ? bytes.readUInt32LE(offset) : bytes.readUInt32BE(offset);
+  assert.equal(uint16(2), 42);
+
+  const pages = [];
+  const visited = new Set();
+  let directoryOffset = uint32(4);
+  while (directoryOffset !== 0) {
+    assert.ok(!visited.has(directoryOffset), "TIFF directory chain must not loop");
+    visited.add(directoryOffset);
+    const entryCount = uint16(directoryOffset);
+    const tags = new Map();
+    for (let index = 0; index < entryCount; index += 1) {
+      const entryOffset = directoryOffset + 2 + index * 12;
+      const tag = uint16(entryOffset);
+      const type = uint16(entryOffset + 2);
+      const count = uint32(entryOffset + 4);
+      if (count !== 1) continue;
+      let value;
+      if (type === 3) value = uint16(entryOffset + 8);
+      if (type === 4) value = uint32(entryOffset + 8);
+      if (type === 5) {
+        const rationalOffset = uint32(entryOffset + 8);
+        value = uint32(rationalOffset) / uint32(rationalOffset + 4);
+      }
+      if (value !== undefined) tags.set(tag, value);
+    }
+    pages.push({
+      width: tags.get(256),
+      height: tags.get(257),
+      xResolution: tags.get(282),
+      yResolution: tags.get(283),
+      resolutionUnit: tags.get(296),
+    });
+    directoryOffset = uint32(directoryOffset + 2 + entryCount * 12);
+  }
+  return pages;
+}
+
+function bmpInfo(file) {
+  const bytes = fs.readFileSync(file);
+  assert.equal(bytes.toString("ascii", 0, 2), "BM");
+  return {
+    width: bytes.readInt32LE(18),
+    height: Math.abs(bytes.readInt32LE(22)),
+    bitsPerPixel: bytes.readUInt16LE(28),
+  };
+}
 
 describe("electron-builder files list", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
@@ -48,6 +106,89 @@ describe("macOS bundle naming", () => {
       /-c\.mac\.extendInfo\.CFBundleDisplayName=Kiro Crew Nightly/
     );
     assert.doesNotMatch(buildScript, /-c\.mac\.extendInfo\.CFBundleName=/);
+  });
+});
+
+
+describe("first-download installer design contract", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+  const background = path.join(INSTALLER_ASSETS, "dmg-background.tiff");
+  const sidebar = path.join(INSTALLER_ASSETS, "windows-installer-sidebar.bmp");
+  const header = path.join(INSTALLER_ASSETS, "windows-installer-header.bmp");
+
+  it("positions the macOS app and Applications target on the branded background", () => {
+    assert.equal(pkg.build.dmg.background, "../../packaging/installer-assets/dmg-background.tiff");
+    assert.equal(pkg.build.dmg.title, "${productName}");
+    assert.equal(pkg.build.dmg.iconSize, 96);
+    assert.equal(pkg.build.dmg.iconTextSize, 13);
+    assert.equal(pkg.build.dmg.filesystem, "HFS+");
+    assert.deepEqual(pkg.build.dmg.contents, [
+      { x: 170, y: 246, type: "file" },
+      { x: 490, y: 246, type: "link", path: "/Applications" },
+    ]);
+    assert.deepEqual(tiffPages(background), [
+      { width: 660, height: 420, xResolution: 72, yResolution: 72, resolutionUnit: 2 },
+      { width: 1320, height: 840, xResolution: 144, yResolution: 144, resolutionUnit: 2 },
+    ]);
+  });
+
+  it("uses NSIS-native branded artwork without changing the assisted install flow", () => {
+    assert.equal(
+      pkg.build.nsis.installerSidebar,
+      "../../packaging/installer-assets/windows-installer-sidebar.bmp"
+    );
+    assert.equal(
+      pkg.build.nsis.installerHeader,
+      "../../packaging/installer-assets/windows-installer-header.bmp"
+    );
+    assert.deepEqual(bmpInfo(sidebar), { width: 164, height: 314, bitsPerPixel: 24 });
+    assert.deepEqual(bmpInfo(header), { width: 150, height: 57, bitsPerPixel: 24 });
+    assert.equal(pkg.build.nsis.oneClick, false);
+    assert.equal(pkg.build.nsis.perMachine, false);
+    assert.equal(pkg.build.nsis.allowToChangeInstallationDirectory, false);
+    assert.equal(pkg.build.nsis.runAfterFinish, true);
+  });
+
+  it("reuses the shipped logo and opening-animation ghost artwork", () => {
+    const normalize = text => text.replaceAll(",", " ").replace(/\s+/g, " ");
+    const loading = normalize(fs.readFileSync(path.join(ROOT, "loading.html"), "utf8"));
+    const siteLogo = normalize(
+      fs.readFileSync(path.join(REPO_ROOT, "site", "public", "kirocrew-logo.svg"), "utf8")
+    );
+    const dmgSource = normalize(
+      fs.readFileSync(path.join(INSTALLER_ASSETS, "dmg-background.svg"), "utf8")
+    );
+    const sidebarSource = normalize(
+      fs.readFileSync(path.join(INSTALLER_ASSETS, "windows-installer-sidebar.svg"), "utf8")
+    );
+    const headerSource = normalize(
+      fs.readFileSync(path.join(INSTALLER_ASSETS, "windows-installer-header.svg"), "utf8")
+    );
+
+    const openingGhost = "M398.554 818.914C316.315 1001.03";
+    const logoGhost = "M84.76 266.62c-19.2 42.53";
+    assert.ok(loading.includes(openingGhost));
+    assert.ok(dmgSource.includes(openingGhost));
+    assert.ok(sidebarSource.includes(openingGhost));
+    assert.ok(siteLogo.includes(logoGhost));
+    assert.ok(sidebarSource.includes(logoGhost));
+    assert.ok(headerSource.includes(logoGhost));
+  });
+
+  it("applies the branded layout again after signing and stapling", () => {
+    const workflow = fs.readFileSync(
+      path.join(REPO_ROOT, ".github", "workflows", "sign-and-notarize.yml"),
+      "utf8"
+    );
+    const helperPath = path.join(REPO_ROOT, "packaging", "signing", "build-dmg.sh");
+    const helper = fs.readFileSync(helperPath, "utf8");
+
+    assert.match(workflow, /bash packaging\/signing\/build-dmg\.sh/);
+    assert.match(workflow, /unsigned_dmg_key=pre-signed/);
+    assert.match(workflow, /work\/layout-template\.dmg/);
+    assert.match(helper, /hdiutil convert/);
+    assert.match(helper, /hdiutil resize -size min/);
+    assert.match(helper, /template and signed app names differ/);
   });
 });
 
@@ -246,8 +387,8 @@ describe("uninstall data preservation contract", () => {
     // getWindowsInstallationDirName(appInfo, !oneClick || isPerMachine) in
     // app-builder-lib only uses productFilename ("KiroCrew" / "KiroCrew
     // Nightly") when that flag is true. Under oneClick+perUser it falls back to
-    // appInfo.sanitizedName -- the npm package name, "kirocrew-electron-mac" --
-    // which would put both channels in ONE directory with a nonsense name.
+    // appInfo.sanitizedName -- the npm package name -- which would put both
+    // channels in ONE directory named after the package rather than the product.
     // build-desktop.sh's -c.nsis.guid override separates the registry half.
     assert.equal(electronPkg.build.nsis.oneClick, false);
     assert.equal(electronPkg.build.nsis.perMachine, false);
@@ -283,5 +424,128 @@ describe("uninstall data preservation contract", () => {
     // StartupWMClass to desktopName; without it the nightly override above
     // would move the filename but not the window association.
     assert.equal(electronPkg.build.linux.syncDesktopName, true);
+  });
+
+  it("reclaims the updater cache the generated uninstaller cannot reach", () => {
+    // The uninstaller template only ever clears $APPDATA (Roaming), and only
+    // under deleteAppDataOnUninstall -- which stays false here to protect
+    // ~/.kiro/crew. The electron-updater cache lives under $LOCALAPPDATA and so
+    // matches no built-in path: without this macro a full installer payload
+    // (~200MB) is orphaned on every uninstall.
+    const nsh = fs.readFileSync(path.join(ROOT, "build", "installer.nsh"), "utf8");
+    assert.match(nsh, /!macro customUnInstall\b/, "the customUnInstall hook must be defined");
+    assert.match(
+      nsh,
+      /RMDir \/r "\$LOCALAPPDATA\\\$\{APP_PACKAGE_NAME\}-updater"/,
+      "the cache name must be COMPOSED from ${APP_PACKAGE_NAME}, not hardcoded: " +
+        "app-builder-lib derives updaterCacheDirName from the npm package name, so a " +
+        "literal copy stops matching after a rename and silently leaks again"
+    );
+  });
+
+  it("never deletes the update cache on the auto-update path", () => {
+    // electron-updater runs this same uninstaller during an UPDATE (NsisUpdater
+    // spawns the new installer with --updated, which the generated isUpdated
+    // flag test reads). The cache root holds installer.exe, the baseline the
+    // NEXT update diffs against, plus an in-flight pending/ download. Deleting
+    // it mid-update would discard a live download and force every subsequent
+    // update to transfer the whole installer.
+    const nsh = fs.readFileSync(path.join(ROOT, "build", "installer.nsh"), "utf8");
+    // Strip comments before locating the guard, so prose mentioning isUpdated or
+    // RMDir cannot satisfy (or break) a structural assertion about code.
+    const code = nsh
+      .split("\n")
+      .map(l => (l.trim().startsWith(";") ? "" : l))
+      .join("\n");
+    const body = code.slice(code.indexOf("!macro customUnInstall"));
+    assert.match(body, /\$\{ifNot\} \$\{isUpdated\}/, "every removal must sit behind ifNot isUpdated");
+    // Structural, not textual: assert no removal escapes the guard, so a later
+    // edit that appends one after ${endIf} fails here.
+    const guardStart = body.indexOf("${ifNot} ${isUpdated}");
+    const guardEnd = body.indexOf("${endIf}");
+    assert.ok(guardEnd > guardStart, "the isUpdated guard must be closed");
+    for (const m of body.matchAll(/^\s*(?:RMDir|Delete)\b/gm)) {
+      assert.ok(
+        m.index > guardStart && m.index < guardEnd,
+        `removal at offset ${m.index} sits outside the isUpdated guard`
+      );
+    }
+  });
+
+  it("keeps the uninstaller away from the Kiro Crew data home", () => {
+    // The one thing this macro must never touch: sessions, memory, the DB and
+    // config. It is user data and survives an uninstall by design.
+    const nsh = fs.readFileSync(path.join(ROOT, "build", "installer.nsh"), "utf8");
+    // Assert over the EXECUTABLE lines only. Matching raw file text would trip
+    // on this file's own prose explaining what it deliberately spares -- a test
+    // that fails on its own rationale teaches the next author to delete the
+    // rationale. NSIS comments start with ';'.
+    const removals = nsh
+      .split("\n")
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith(";"))
+      .filter(l => /^(RMDir|Delete)\b/.test(l));
+    assert.ok(removals.length > 0, "expected at least one removal statement to audit");
+    for (const line of removals) {
+      assert.doesNotMatch(line, /\.kiro/, `data home in a removal path: ${line}`);
+      assert.doesNotMatch(line, /\$PROFILE|\$USERPROFILE/, `profile-rooted removal: ${line}`);
+      // Kiro-Cli is a separate product with its own installer; removing another
+      // product's files would be a bug, not thoroughness.
+      assert.doesNotMatch(line, /Kiro-Cli/i, `another product's files: ${line}`);
+      // A bare $LOCALAPPDATA / $APPDATA with no subdirectory would wipe the
+      // user's entire per-user app data.
+      assert.doesNotMatch(
+        line,
+        /"\$(LOCALAPPDATA|APPDATA)\\?"/,
+        `removal targets an app-data ROOT: ${line}`
+      );
+    }
+  });
+
+  it("pins the updater cache name the running app actually resolves", () => {
+    // updaterCacheDirName is sanitizedName.toLowerCase() + "-updater" over the
+    // npm package `name` (app-builder-lib appInfo.ts), and PublishManager copies
+    // it into app-update.yml, which is what electron-updater reads at runtime.
+    // The NSIS macro composes the same value from ${APP_PACKAGE_NAME} (=
+    // appInfo.name), so this asserts the ONE assumption that lets those two
+    // agree: the package name is already lowercase, making the toLowerCase()
+    // step a no-op. An uppercase name would leave the macro's composed path
+    // mismatched against the real cache dir.
+    assert.equal(
+      electronPkg.name,
+      electronPkg.name.toLowerCase(),
+      "an uppercase npm name would desync the NSIS-composed cache path from " +
+        "updaterCacheDirName's lowercased value"
+    );
+    // The name is also NOT platform-scoped: it names the updater cache and the
+    // Electron userData dir on every OS, so a mac-specific name is misleading
+    // on the two platforms whose installers actually consume it.
+    assert.doesNotMatch(
+      electronPkg.name,
+      /-mac$|-win$|-linux$/,
+      "the npm name feeds cross-platform paths; it must not claim one platform"
+    );
+  });
+
+  it("gives nightly its own per-user state so an uninstall cannot cross channels", () => {
+    // THE INVARIANT THAT MAKES customUnInstall's RMDir SAFE. The npm `name`
+    // determines updaterCacheDirName AND Electron's userData dir. Shared between
+    // channels, both installs write one %LOCALAPPDATA%\<name>-updater and one
+    // %APPDATA%\<name> -- so uninstalling nightly would delete stable's pending
+    // update download, its differential baseline, and its window state (and vice
+    // versa). productName and nsis.guid separate the install directory and the
+    // registry key; neither touches per-user state.
+    const buildScript = fs.readFileSync(
+      path.resolve(ROOT, "..", "..", "packaging", "build-desktop.sh"),
+      "utf8"
+    );
+    assert.ok(
+      buildScript.includes("-c.extraMetadata.name=kirocrew-desktop-nightly"),
+      "build-desktop.sh must give the nightly channel its own npm name, or the " +
+        "uninstaller's cache removal reaches into the other channel's install"
+    );
+    // The stable default it overrides must be the one actually shipped, so a
+    // rename on either side fails here instead of silently re-sharing.
+    assert.equal(electronPkg.name, "kirocrew-desktop");
   });
 });

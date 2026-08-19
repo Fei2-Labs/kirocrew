@@ -33,14 +33,20 @@ import {
   DEFAULT_AUTO_SYNC_MINS,
   DEFAULT_SORT,
   DEFAULT_SYNC_SHORTCUT,
+  DOC_BODY_LINE_HEIGHT,
+  DOC_BODY_PX,
+  DOC_H1_PX,
+  DOC_HEADING_WEIGHTS,
   FONT_BODY,
   FONT_MONO,
   LS,
   MAX_AUTO_SYNC_MINS,
+  MENU_SECTION_LABEL,
   MIN_AUTO_SYNC_MINS,
   PANEL_DEFAULT_WIDTH,
   PANEL_MAX_WIDTH,
   PANEL_MIN_WIDTH,
+  RAIL_TYPE,
   SAVE_DEBOUNCE_MS,
   SORTS,
   collapsedKey,
@@ -1362,7 +1368,7 @@ export default function MdNotebookPage() {
             >
               <span
                 style={{
-                  fontSize: '14px',
+                  ...RAIL_TYPE.panelTitle,
                   fontWeight: 500,
                   color: 'var(--muted)',
                   letterSpacing: '.04em',
@@ -1437,7 +1443,7 @@ export default function MdNotebookPage() {
                       padding: '5px 8px',
                       borderRadius: '6px',
                       cursor: 'pointer',
-                      fontSize: '13px',
+                      ...RAIL_TYPE.row,
                       color: v.id === activeVaultId ? 'var(--text)' : 'var(--muted)',
                     }}
                   >
@@ -1467,7 +1473,7 @@ export default function MdNotebookPage() {
                     padding: '5px 8px',
                     borderRadius: '6px',
                     cursor: 'pointer',
-                    fontSize: '13px',
+                    ...RAIL_TYPE.row,
                     color: 'var(--muted)',
                   }}
                 >
@@ -1502,7 +1508,7 @@ export default function MdNotebookPage() {
                 border: '1px solid var(--border)',
                 borderRadius: '8px',
                 padding: '0 10px',
-                fontSize: '12px',
+                ...RAIL_TYPE.row,
                 color: 'var(--text)',
                 fontFamily: FONT_BODY,
               }}
@@ -1538,7 +1544,7 @@ export default function MdNotebookPage() {
                 >
                   <div
                     style={{
-                      fontSize: '10px',
+                      ...MENU_SECTION_LABEL,
                       textTransform: 'uppercase',
                       letterSpacing: '.04em',
                       color: 'var(--muted)',
@@ -1564,7 +1570,7 @@ export default function MdNotebookPage() {
                         padding: '5px 8px',
                         borderRadius: '6px',
                         cursor: 'pointer',
-                        fontSize: '12px',
+                        ...RAIL_TYPE.row,
                         color: view === v ? 'var(--text)' : 'var(--muted)',
                       }}
                     >
@@ -1577,7 +1583,7 @@ export default function MdNotebookPage() {
                   <div style={{ height: '1px', background: 'var(--border)', margin: '4px 0' }} />
                   <div
                     style={{
-                      fontSize: '10px',
+                      ...MENU_SECTION_LABEL,
                       textTransform: 'uppercase',
                       letterSpacing: '.04em',
                       color: 'var(--muted)',
@@ -1603,7 +1609,7 @@ export default function MdNotebookPage() {
                         padding: '5px 8px',
                         borderRadius: '6px',
                         cursor: 'pointer',
-                        fontSize: '12px',
+                        ...RAIL_TYPE.row,
                         color: sortKey === key ? 'var(--text)' : 'var(--muted)',
                       }}
                     >
@@ -1649,7 +1655,7 @@ export default function MdNotebookPage() {
                     />
                   ))
                 : (
-                    <div style={{ padding: '10px', fontSize: '11px', color: 'var(--muted)' }}>
+                    <div style={{ padding: '10px', ...RAIL_TYPE.secondary, color: 'var(--muted)' }}>
                       {i18nT('apps.mdNotebook.panel.noMatches')}
                     </div>
                   )
@@ -1843,7 +1849,16 @@ export default function MdNotebookPage() {
                 mb="0"
               />
             ) : (
-              <div style={{ fontSize: '23px', fontWeight: 700, color: 'var(--muted)' }}>
+              <div
+                style={{
+                  // The placeholder alternates with `InlineTitle` in this exact
+                  // slot, so it takes the same derived size: a literal here is
+                  // the same drift, one branch away.
+                  fontSize: `${DOC_H1_PX}px`,
+                  fontWeight: DOC_HEADING_WEIGHTS[0],
+                  color: 'var(--muted)',
+                }}
+              >
                 {i18nT('apps.mdNotebook.title')}
               </div>
             )}
@@ -2013,8 +2028,8 @@ export default function MdNotebookPage() {
                 paddingRight: `max(${COLUMN_PAD_X}px, calc((100% - ${
                   COLUMN_MAX_WIDTH - COLUMN_PAD_X * 2
                 }px) / 2))`,
-                fontSize: '13px',
-                lineHeight: 1.55,
+                fontSize: `${DOC_BODY_PX}px`,
+                lineHeight: DOC_BODY_LINE_HEIGHT,
                 fontFamily: FONT_MONO,
               }}
             />

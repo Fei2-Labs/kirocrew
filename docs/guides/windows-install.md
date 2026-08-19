@@ -5,32 +5,39 @@ The cross-platform process / signal / file-lock / metrics behavior is routed
 through `kiro_crew.platform_compat`, so macOS + Linux behavior is unchanged and
 the same code path also runs on Windows.
 
-## Desktop installer (preview, CI-built)
+## Desktop installer
 
-CI's Windows lane (`build-windows.yml`) also builds a Windows desktop app: an
-NSIS `KiroCrew Setup <version>.exe` with the backend bundled (no separate Python
+CI's Windows lane (`build-windows.yml`) builds a Windows desktop app: an NSIS
+`KiroCrew Setup <version>.exe` with the backend bundled (no separate Python
 install needed). It has its own workflow rather than being a leg of
 `build-desktop.yml` because Authenticode signing has to happen *during* the
 build — the installer compresses its own already-signed executable — so that job
 needs AWS credentials the shared build workflow deliberately does not hold.
 Current status:
 
-- **CI artifact only** — produced on nightly/release runs and the manual
-  `workflow_dispatch` probe; not yet published to the download CDN (that is
-  the upcoming `publish-windows.yml` lane).
-- **Signing wired but not yet active** — the AWS Signer path is in place and
-  skips cleanly until the signing profiles are provisioned, so today's
-  installers are still unsigned and SmartScreen shows an "unrecognized app"
-  interstitial (More info > Run anyway).
-- **No auto-update yet** — win32 remains outside `SUPPORTED_PLATFORMS` in
-  `auto-update.js`. The NSIS target removes the *packaging* blocker
-  (electron-updater's win32 path is `NsisUpdater`, and it has no
-  Squirrel.Windows support at all), but two prerequisites remain: a published
-  `latest.yml` feed alongside `latest-mac.yml`/`latest-linux.yml`, and active
-  signing — `NsisUpdater` verifies Authenticode fail-closed, so an unsigned
-  installer makes every update fail rather than merely warn. Tracked in
-  [issue #598](https://github.com/kirodotdev/KiroCrew/issues/598); until then,
-  installs update by running a newer Setup.exe.
+- **Published on nightly and insider** — `publish-windows.yml` writes the
+  installer, its `.blockmap` and the `latest.yml` feed to the download CDN. The
+  `latest/` alias is the human download:
+  `https://download.crew.kiro.dev/desktop/<channel>/latest/KiroCrew-Setup.exe`.
+  **Stable has no Windows lane yet**: the stable release republishes the
+  immutable promotion bundle, whose artifact roles include no Windows installer,
+  so `WINDOWS_CHANNELS` in `auto-update.js` admits only `nightly` and `insider`
+  and a stable Windows client reports updates as unavailable rather than
+  resolving a feed nobody wrote.
+- **Authenticode-signed** — signing runs during the build through AWS Signer and
+  the publish lane refuses to publish bytes whose certificate table is empty,
+  whose signer is not the pinned publisher, or which carry no RFC3161
+  countersignature (`scripts/verify_windows_installer.py`). Signing removes the
+  unknown-publisher prompt but not SmartScreen's first-download interstitial:
+  reputation accrues per file hash and per certificate over download volume, and
+  a nightly produces a new hash daily.
+- **Auto-update is live on the channels that publish** — win32 is in
+  `SUPPORTED_PLATFORMS` and driven by `NsisUpdater`, which reads `latest.yml`
+  from the same per-channel feed directory the other platforms use. It verifies
+  the downloaded installer's Authenticode signature **fail-closed** against
+  `win.signtoolOptions.publisherName`, so a mis-signed publish would break every
+  client's update at once rather than degrade quietly — which is why the publish
+  lane verifies the signature before the bytes become immutable.
 - **Assisted installer, per user by default** — `nsis.oneClick` is false and
   `perMachine` is false, so the installer offers an install-mode page whose
   default is a per-user install into a directory named from the product name,
@@ -41,7 +48,29 @@ Current status:
   the two channels do not share an uninstall registry key. Either mode leaves
   the Kiro Crew home alone (`deleteAppDataOnUninstall` stays false, and
   `~/.kiro/crew` is outside the install directory).
-- **Integrated Windows chrome** — the preview desktop shell uses the
+- **Guided Kiro Crew artwork** — the welcome and finish pages use the existing
+  Kiro Crew logo and ghost family in the native NSIS sidebar, and intermediate
+  pages retain a compact branded header. Buttons, progress, install-mode copy,
+  keyboard behavior, and localization remain the standard Windows experience.
+- **Uninstall removes the app and its caches, and keeps your data.** Removed:
+  the install directory, the Start Menu shortcut, the uninstall registry key,
+  and — via the `customUnInstall` macro in `website/electron/build/installer.nsh`
+  — this channel's electron-updater cache under
+  `%LOCALAPPDATA%\<package-name>-updater`, which holds a full installer payload
+  (~200MB) that nothing else would ever reclaim. Two things scope that removal.
+  It is guarded on `isUpdated`, because an auto-update runs the same uninstaller
+  and the cache is what the next update diffs against to avoid re-downloading the
+  whole installer. And the path is **per channel**: stable resolves
+  `kirocrew-desktop-updater`, nightly `kirocrew-desktop-nightly-updater`
+  (`build-desktop.sh` overrides `extraMetadata.name`), so uninstalling one
+  channel cannot touch the other's pending download or window state. An install
+  predating that split leaves a shared `kirocrew-electron-mac-updater` behind,
+  which is deliberately NOT removed for the same reason — it may still belong to
+  the other channel. **Deliberately kept:** `~/.kiro/crew` — sessions, memory,
+  the database and config. Delete it by hand to remove Kiro Crew's data too.
+  Also kept, because it belongs to a different product:
+  `%LOCALAPPDATA%\Kiro-Cli`.
+- **Integrated Windows chrome** — the desktop shell uses the
   dashboard's 42px header as its titlebar. File/Edit/View/Connection/Window/Help
   open the existing native Electron menus from the left of that row, the command
   palette remains centered on the window, and native minimize/maximize/close
@@ -132,6 +161,10 @@ gateway can't find the built-in `kirocrew-cron` / `kirocrew-core` MCP servers,
 that dir is appended to the MCP spawn `PATH` automatically
 (`env.augmented_path`), and the managed-server invocation falls back to
 `python -m kiro_crew <sub>` when the `kirocrew.exe` wrapper isn't resolvable.
+In the desktop bundle the relocatable `bin\kirocrew.cmd` shim is preferred
+over `Scripts\kirocrew.exe` (whose embedded interpreter path names the build
+machine) and is unwrapped to `<root>\python.exe -P -s -m kiro_crew <sub>` when
+spawned.
 
 ## The unsandboxed-exec opt-in
 
@@ -183,7 +216,7 @@ while the other 503s. Concretely:
 | Script hooks (Settings → Hooks) | need the `agent.sandbox_allow_unsandboxed_exec` opt-in above (like script crons — the hook command routes through `wrap_argv`, which fail-closes where no OS sandbox backend exists; without it the hook returns that message as its `error`). With the opt-in they run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
 | Pull-request source drawer provider fetch/check/resolve | not yet — provider CLIs require the POSIX OS-level sandbox and fail closed with a clear unsupported response |
 | Browser automation (`playwright-cli`) | works (`npm install -g @playwright/cli@latest`, needs Node.js 20 or newer) |
-| Vector memory / embeddings | via a **remote embedding endpoint or Docker**; local Ollama auto-install is not yet supported |
+| Vector memory / embeddings | works — embeddings run **in-process** through the vendored llama-cpp-python (`_vendor/llama_cpp_libs/win_amd64`), which loads the Qwen3-Embedding-0.6B GGUF from `~/.kiro/crew/models`. No remote endpoint, no Docker and no Ollama server is involved on any platform |
 | STT (whisper / optional cloud transcription) | works |
 | Voice reply (Piper TTS) | not yet — upstream rhasspy/piper ships no Windows binary; Polly (optional) works if the `aws` CLI is present **and** the `agent.sandbox_allow_unsandboxed_exec` opt-in above is set — the `aws polly` spawn routes through `wrap_argv`, which fail-closes where no OS sandbox backend exists. Without it synthesis returns no audio and the log names that setting |
 | SSH tunnel (`kirocrew cloud` remote dashboard) | not yet — needs the OpenSSH client on `PATH` and a signal-handling audit |
@@ -227,22 +260,114 @@ entering the critical section unserialized, since proceeding lock-less is the
 exact fail-open that loses writes. Non-blocking `try_acquire_lock` already used
 `LK_NBLCK` and is unchanged.
 
+## `os.kill(pid, 0)` is a process killer here, not a liveness probe
+
+On POSIX, `os.kill(pid, 0)` is the idiomatic "does this pid exist?" test: signal 0
+runs the permission and existence check without delivering anything. On Windows
+CPython maps `os.kill(pid, sig)` onto `TerminateProcess(handle, sig)` for every
+signal except `CTRL_C_EVENT` and `CTRL_BREAK_EVENT`, so the same expression
+**terminates the process it is asking about** and then reports it alive. This is
+not a portability wart that degrades to "unavailable" — it is a silent process
+killer, and because pids are recycled the damage lands on whatever happens to own
+that number now.
+
+Route liveness through `platform_compat.pid_exists`, or `pid_liveness` when the
+caller has to tell "gone" apart from "alive but not signallable by us". Both
+preserve the POSIX semantics callers depend on — notably that EPERM means the
+process EXISTS and must never be conflated with `ProcessLookupError` — and on
+Windows they ask `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` instead of
+signalling anything.
+
+`test/test_windows_kill_probe_audit.py` enforces this as a tripwire rather than a
+convention: it walks the AST of every module under `src/kiro_crew` and fails on a
+raw signal-0 probe until the author either routes it through the shim or records
+the site in `GATED_PROBES` with a justification for why it can never execute on
+Windows. A second test rejects allowlist entries whose code has since moved or
+gone, so an exemption cannot outlive what it covered.
+
+The scope is deliberately only the signal-0 *probe* form. The tree contains many
+raw POSIX call sites — `fcntl`, `resource`, `os.killpg`, `pty`, `termios` — and
+nearly all are legitimately POSIX-gated implementation detail, so auditing them
+here would bury the signal in noise; those are governed by the shim table in
+`AGENTS.md` and by review. What makes signal-0 worth its own gate is that getting
+it wrong is destructive rather than merely unavailable, and that the added-line CI
+check cannot see a probe which arrives by a file move or a rebase. This test reads
+the whole tree on every run.
+
+## The agent tree gets a Job object ceiling, not a cgroup scope
+
+On Linux, `sandbox.cgroup_scope_argv` bounds an agent subprocess and every
+descendant it spawns as one cgroup: `TasksMax` is the fork-bomb ceiling and
+`MemoryMax` the RSS-balloon ceiling. There is no systemd on Windows, so that
+wrapper returns argv unchanged and logs a one-time loud
+`SECURITY: cgroup v2 scope enforcement unavailable (not Linux)` — which meant the
+agent and every MCP server it spawned ran with **no fork-bomb and no memory
+ceiling at all**, a warning at boot rather than an enforced limit.
+
+A **Job object** is the native equivalent: limits apply to every process in the
+job, and a member's descendants join automatically.
+`platform_compat.apply_job_limits` sets `ActiveProcessLimit` against the same
+budget as `TasksMax` and `JobMemoryLimit` against `MemoryMax`, and
+`sandbox.apply_windows_resource_ceiling` reads the **same** `resource_limits`
+config as the cgroup path, so one operator setting governs both platforms. The
+memory limits are equivalent; the process limits are not one-for-one, because
+`TasksMax` counts every thread while `ActiveProcessLimit` counts processes — the
+same number is therefore a looser bound here, though it still bounds a fork
+bomb. The memory default is derived from `GlobalMemoryStatusEx` rather than the
+POSIX `os.sysconf` probe, so it scales with the host on Windows too instead of
+collapsing to a flat cap that a small machine could exceed. Enforcement is by denial, matching the cgroup
+tier in practice: past the process limit the member's `CreateProcess` fails with
+`ERROR_NOT_ENOUGH_QUOTA` (1816), and an allocation past the memory limit fails.
+
+Two details are load-bearing rather than incidental:
+
+- **The child is created suspended.** A Job object cannot be an argv prefix, so
+  unlike the cgroup wrapper it has to be attached to a live pid — and job
+  membership covers a member's *future* descendants only. Attaching to an
+  already-running `kiro-cli` would leave a window in which it could spawn an MCP
+  server that escapes the ceiling. Both ACP spawn sites therefore pass
+  `creationflags |= CREATE_SUSPENDED`, apply the job, then call
+  `platform_compat.resume_process_main_thread`. A process created suspended has
+  executed no instructions, so it provably has no descendants: the window is
+  closed by construction rather than merely made small. kernel32 has no
+  `ResumeProcess`, so the resume enumerates the Toolhelp thread snapshot and
+  resumes every thread owned by that pid.
+- **`KILL_ON_JOB_CLOSE` is deliberately not set.** It would terminate the agent
+  tree as soon as the last job handle closed, turning a resource ceiling into a
+  process-lifecycle change (a gateway exit would kill running agents). Leaving it
+  off also means the handle need not be held: a job stays alive while processes
+  are assigned to it, so the limits persist after `CloseHandle` and there is no
+  handle registry or teardown to get wrong.
+
+Failure modes are asymmetric on purpose. The **ceiling** fails soft — any Win32
+error logs a SECURITY warning and returns `False`, because a missing ceiling must
+not break the gateway. The **resume** is fatal when the pid still exists: a
+process that is alive but frozen would masquerade as a running agent and hang the
+session on the ACP handshake with no diagnosis, so it is killed and the spawn
+fails loudly. If the pid is already gone there is nothing frozen, and the
+handshake reports the real error instead.
+
+`CREATE_SUSPENDED` is 0 on POSIX and both helpers return `False` there, so the
+POSIX path is a plain unsuspended spawn with the cgroup scope doing the work.
+
 ## Win32 struct layouts live at module scope
 
 Every `ctypes.Structure` subclass the Win32 helpers need is declared **once at
 module scope** — `_ProcessEntry32`, `_ProcessMemoryCounters`, `_MemoryStatusEx`,
-`_SidAndAttributes` and `_TokenUser` in `platform_compat`, plus
+`_SidAndAttributes`, `_TokenUser`, and the Job object layouts `_IoCounters`,
+`_JobObjectBasicLimitInformation`, `_JobObjectExtendedLimitInformation` and
+`_ThreadEntry32` in `platform_compat`, plus
 `_SecurityAttributes` in `mcp_gateway/transport.py` and `_VMStatistics64` in
 `subagent.py`. Declaring one inside the function that uses it is a **memory
 leak**, not a style question: `ctypes.POINTER(T)` memoises `T -> POINTER(T)` in a
 module-level dict inside ctypes that is never evicted, so a locally-declared
 Structure pins a brand-new pair of type objects on every call. The affected
 helpers are all polled — the dashboard's system-metrics endpoint, the RSS-recycle
-watchdog, the process-tree walk behind `kill_process_tree`, and the MCP pipe's
-per-connection peer check — so the gateway grew unboundedly on Windows alone
-(measured at ~8 KiB per `proc_rss_bytes` call, ~15 MiB per 2,000 calls, never
-reclaimed). POSIX is unaffected because those branches read `/proc`, `sysctl` or
-`resource` instead of calling Win32.
+watchdog, the process-tree walk behind `kill_process_tree`, the MCP pipe's
+per-connection peer check, and the per-spawn Job object ceiling — so the gateway
+grew unboundedly on Windows alone (measured at ~8 KiB per `proc_rss_bytes` call,
+~15 MiB per 2,000 calls, never reclaimed). POSIX is unaffected because those
+branches read `/proc`, `sysctl` or `resource` instead of calling Win32.
 
 Taking `ctypes.POINTER()` is what pins the type, so a struct that is only ever
 instantiated (never pointed at) does not leak — but the distinction is too subtle
@@ -290,6 +415,13 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
 
 ## Troubleshooting
 
+- **Desktop gateway recovery refuses to force-stop the port** - the Electron
+  launcher uses `netstat -ano` to identify the listener, PowerShell
+  (`Get-CimInstance`) with a WMIC fallback to read its command line, and
+  `taskkill /F /PID` only after confirming a Kiro Crew executable or
+  `python -m kiro_crew` process. Localized listener-state text is ignored.
+  SSH forwards and unrelated processes are never terminated, and a failed or
+  timed-out `netstat` probe is treated as unknown rather than as a free port.
 - **`ModuleNotFoundError: No module named 'fcntl'`** — you installed a
   branch/commit that predates the Windows port. `fcntl` is a Unix-only Python
   stdlib module; it cannot be pip-installed on Windows. Update to a build that
@@ -299,11 +431,13 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
 - **"Python was not found" (Microsoft Store)** — a bare `python`/`python3` was
   resolving the Store alias stub; install a real CPython and ensure it precedes
   the stub on `PATH`.
-- **`kirocrew stop` reports "No Kiro Crew gateway currently running" on a
-  non-English Windows** — `find_listening_pids` matches the `netstat` state
-  against the wildcard foreign address and the literal English `LISTENING`;
-  some localized Windows editions emit translated state names. Workaround:
-  `netstat -ano | findstr :5476` to find the PID and `taskkill /F /PID <pid>`.
+- **`kirocrew stop` reports "No Kiro Crew gateway currently running"** — a
+  localized Windows edition is *not* the cause: `find_listening_pids` identifies
+  a listening row by its wildcard foreign address (`0.0.0.0:0` / `[::]:0`), which
+  no edition translates, and treats the English `LISTENING` literal only as a
+  defensive second signal. If it still finds nothing while the dashboard answers,
+  locate the PID by hand with `netstat -ano | findstr :5476` and stop it with
+  `taskkill /F /PID <pid>`.
 - **Web terminal / interactive SSO login panels** — unavailable on Windows
   (they need `pty`/`fork`/`termios`); they return a clear "not supported on
   Windows" response instead of crashing.

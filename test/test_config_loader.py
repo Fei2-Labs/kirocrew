@@ -180,6 +180,23 @@ def test_sandbox_allow_unsandboxed_exec_loads_from_config() -> None:
     assert enabled.agent.sandbox_allow_unsandboxed_exec is True
 
 
+def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
+    """The Stop-hook nudge cap is built field-by-field in load(), so an
+    operator's value must hydrate and survive a to_dict() -> load() round-trip.
+    Without the loader wiring, load() re-defaults it to 100 and save() then
+    overwrites the operator's file value.
+    """
+    assert KiroCrewConfig().agent.max_stop_hook_nudges == 100
+    assert _load_from_dict({}).agent.max_stop_hook_nudges == 100
+    pinned = _load_from_dict({"agent": {"max_stop_hook_nudges": 7}})
+    assert pinned.agent.max_stop_hook_nudges == 7
+    # 0 = uncapped opt-in must survive too, not be re-defaulted to 100.
+    uncapped = _load_from_dict({"agent": {"max_stop_hook_nudges": 0}})
+    assert uncapped.agent.max_stop_hook_nudges == 0
+    # Round-trip: save() (to_dict) -> load() preserves the pinned value.
+    assert _load_from_dict(pinned.to_dict()).agent.max_stop_hook_nudges == 7
+
+
 def test_dashboard_tailscale_hydrates_and_survives_a_round_trip() -> None:
     """The opt-in must survive ``load()`` and a later ``save()``.
 

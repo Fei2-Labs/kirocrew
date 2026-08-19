@@ -903,6 +903,14 @@
           "regenerate_summary": "Regenerate summary",
           "retry": "Retry"
         },
+        "assigneePicker": {
+          "assigned_but_not_a_member": "These assignees are not repo members.",
+          "choose_assignees": "Choose assignees",
+          "filter_members": "Filter members…",
+          "no_members": "No members to assign — this repo has no readable roster.",
+          "not_a_member": "{{login}} is not a member of this repo",
+          "this_is_you": "{{login}} (you)"
+        },
         "detailOverflowMenu": {
           "more_actions": "More actions"
         },
@@ -922,6 +930,7 @@
         "issueDetail": {
           "added_the": "added the",
           "added_this_to_the": "added this to the",
+          "assign_me": "Assign to me",
           "assigned": "assigned",
           "assignees": "Assignees",
           "by": "· by",
@@ -935,7 +944,11 @@
           "couldn_t_load_activity": "Couldn't load activity:",
           "dates": "Dates",
           "done": "Done",
+          "done_editing_assignees": "Done editing assignees",
+          "done_editing_labels": "Done editing labels",
           "edit": "Edit",
+          "edit_assignees": "Edit assignees",
+          "edit_labels": "Edit labels",
           "finding_suggestions": "Finding suggestions…",
           "in": "in",
           "issues": "& issues",
@@ -965,6 +978,7 @@
           "self_assigned_this": "self-assigned this",
           "suggested": "Suggested",
           "timeline": "Timeline",
+          "unassign_me": "Unassign me",
           "unassigned": "unassigned",
           "updated": "Updated"
         },
@@ -1359,6 +1373,9 @@
         "select_a": "Select a",
         "select_an_issue_to_see_its_details": "Select an issue to see its details.",
         "to_see_its_details": "to see its details."
+      },
+      "api": {
+        "assignees_changed_elsewhere": "The assignees changed elsewhere since you loaded this issue."
       }
     },
     "mdNotebook": {
@@ -2723,9 +2740,7 @@
         "typesetting_hints_one": "{{count}} typesetting hint",
         "typesetting_hints_other": "{{count}} typesetting hints"
       },
-      "editor": {
-        "loading_editor": "Loading editor…"
-      },
+      "editor": {},
       "fileTree": {
         "delete_file": "Delete {{file}}",
         "files": "Files",
@@ -3297,6 +3312,10 @@
       "skipped": "Skipped",
       "try_again": "Try again",
       "we_could_not_scan_agent_setup": "We could not scan agent setup",
+      "found_setup_kirocrew_could_not_read": "Found setup Kiro Crew could not read",
+      "found_setup_but_could_not_read_it": "Kiro Crew found {{sources}} but could not read the files, so nothing was imported.",
+      "some_setup_could_not_be_read": "Kiro Crew could not read {{sources}} — not listed below.",
+      "files_could_not_be_read": "Files could not be read",
       "your_existing_kirocrew_setup_will_not_be_affecte": "Your existing Kiro Crew setup will not be affected."
     },
     "agentSelector": {
@@ -3641,7 +3660,6 @@
     "contentRenderer": {
       "changes_update_svg_preview_as_you_type": "Changes update the preview as you type.",
       "editing_svg": "Editing SVG",
-      "loading_editor": "Loading editor…",
       "svg_source_code": "SVG source code"
     },
     "detailPanel": {
@@ -3657,17 +3675,12 @@
       "close": "Close"
     },
     "diffBlock": {
-      "collapse": "▲ collapse",
-      "context_lines": "context lines",
-      "diff": "diff",
       "generating_diff": "generating diff…",
-      "lines_hidden": "lines hidden",
       "open": "Open"
     },
     "diffPanel": {
       "click_to_copy_path": "Click to copy path",
-      "contents_identical": "Contents are identical",
-      "loading_diff": "Loading diff…"
+      "contents_identical": "Contents are identical"
     },
     "discoverySearchBar": {
       "clear_search": "Clear search",
@@ -3708,15 +3721,22 @@
       "save": "Save"
     },
     "fileChangeChips": {
+      "additions_one": "{{count}} addition",
+      "additions_other": "{{count}} additions",
       "artifact": "Artifact",
       "changed": "changed",
       "file_one": "{{count}} file",
       "file_other": "{{count}} files",
       "more": "more",
       "no_changes": "no changes",
+      "open": "Open File",
+      "open_in_side_panel": "Open {{path}} in side panel",
+      "removals_one": "{{count}} removal",
+      "removals_other": "{{count}} removals",
       "show": "Show",
       "show_less": "Show less",
-      "this_document_is_tracked_as_a_session_artifact_n": "This document is tracked as a session artifact, not a source-file change"
+      "this_document_is_tracked_as_a_session_artifact_n": "This document is tracked as a session artifact, not a source-file change",
+      "toggle_diff": "Show or hide the diff for {{path}}"
     },
     "filePickerMenu": {
       "folder": "Folder",
@@ -3876,7 +3896,6 @@
       "add_to_knowledge": "Add to Knowledge",
       "add_to_knowledge_library": "Add to Knowledge Library",
       "added": "Added!",
-      "autocomplete": "Autocomplete",
       "cancel": "Cancel",
       "cancel_discard_unsaved_edits": "Cancel — discard unsaved edits",
       "capture_the_current_file_content_as_a_new_artifa": "Capture the current file content as a new artifact version",
@@ -3884,6 +3903,7 @@
       "click_to_copy_path": "Click to copy path",
       "close_esc": "Close (Esc)",
       "close_find": "Close find",
+      "collapse_unchanged": "Collapse unchanged",
       "copy_content": "Copy content",
       "copy_path": "Copy path",
       "discard_unsaved_changes": "Discard unsaved changes?",
@@ -3898,7 +3918,6 @@
       "in_knowledge_library": "In Knowledge Library",
       "in_library": "In Library",
       "line_numbers": "Line numbers",
-      "loading_diff": "Loading diff…",
       "more_options": "More options",
       "next_enter": "Next (Enter)",
       "next_match": "Next match",
@@ -3909,7 +3928,6 @@
       "save_this_file_as_an_artifact_versioned_persiste": "Save this file as an artifact (versioned, persistent, comment-able)",
       "select_any_text_to_add_inline_comments_then_subm": "Select any text to add inline comments, then submit them all to the chat.",
       "tip": "Tip:",
-      "toggle_autocomplete": "Toggle autocomplete",
       "toggle_diff_view": "Toggle diff view",
       "toggle_line_numbers": "Toggle line numbers",
       "toggle_word_wrap": "Toggle word wrap",
@@ -3917,8 +3935,11 @@
       "word_wrap": "Word wrap"
     },
     "markdownRenderer": {
+      "click_to_copy": "Click to copy",
       "click_to_open_shift_click_to_reveal_in_finder": "Click to open / Shift+click to reveal in Finder",
       "close": "Close",
+      "copied": "Copied!",
+      "ctrl_click_to_copy": "Ctrl+click to copy",
       "download_d": "Download (d)",
       "download_image": "Download image",
       "generating_diagram": "generating diagram…"
@@ -4001,9 +4022,7 @@
     },
     "monacoCodeBlock": {
       "close_editor": "Close editor",
-      "edit_code_block": "Edit code block",
-      "edit_in_monaco_editor": "Edit in Monaco editor",
-      "loading_editor": "Loading editor…"
+      "edit_code_block": "Edit code block"
     },
     "notifications": {
       "notificationDetailPanel": {
@@ -4229,6 +4248,11 @@
       "undo_remove": "Undo remove",
       "will_be_removed_on_save": "Will be removed on save."
     },
+    "selectionToolbar": {
+      "ask": "Ask in Side Chat",
+      "copy": "Copy",
+      "quote": "Quote"
+    },
     "sendToInstanceSubmenu": {
       "failed": "Failed",
       "not_connected": "not connected",
@@ -4250,6 +4274,8 @@
       "tags": "Tags…"
     },
     "sessionColorSwatches": {
+      "custom_color": "Custom color",
+      "hex_color_code": "Hex color code",
       "no_color": "No color"
     },
     "sessionGridView": {
@@ -5136,17 +5162,14 @@
         "approved": "Approved",
         "artifacts_this_session": "This session",
         "ask_me_to_use_a_dynamic_workflow_to_runs_from_th": "Ask me to \"use a dynamic workflow to …\" — runs from this chat appear here live.",
-        "back_to_files": "Back to files",
         "cancel": "Cancel",
-        "changed_files": "Changed files",
-        "discard_unsaved_changes": "Discard unsaved changes?",
         "failed_click_to_retry": "Failed — click to retry",
-        "files": "Files",
         "input": "Input",
         "last_tool": "Last tool:",
+        "links": "Links",
         "load_output_from_disk": "Load output from disk",
         "loading": "Loading…",
-        "no_files_changed_yet": "No files changed yet",
+        "no_links_yet": "No links in this session yet. Mention a URL in the chat and it will appear here.",
         "no_subagents_running": "No subagents running",
         "no_workflow_runs": "No workflow runs",
         "open_artifact": "Open artifact",
@@ -5154,12 +5177,9 @@
         "output_shown_in_chat": "(output shown in chat)",
         "reject": "Reject",
         "rejected": "Rejected",
-        "remove": "Remove",
-        "remove_file_from_list": "Remove file from list",
         "resolving": "Resolving…",
         "resolving_2": "resolving...",
         "resources": "Resources",
-        "retry": "Retry",
         "trusted": "Trusted",
         "trusted_base": "Trusted base",
         "trusted_command": "Trusted command",
@@ -5252,16 +5272,20 @@
       "pinnedPrompt": {
         "collapse_pinned_prompt": "Collapse pinned prompt",
         "expand_pinned_prompt": "Expand pinned prompt",
-        "jump_to_this_prompt": "Jump to this prompt"
+        "jump_to_this_turn": "Jump to this turn"
       },
       "recoveryCard": {
         "backend_error_continuing": "backend error · continuation sent automatically",
         "cancelled_continuing": "stalled tool call cancelled · continuation sent automatically",
+        "continued_by_a_hook": "Continued by a hook",
         "continued_by_you": "Continued at your request",
         "empty_output_continuing": "agent returned no output · continuation sent automatically",
+        "hook_loop_halted": "Hook loop halted",
+        "hook_requested_continuing": "requested by a hook · continuing",
         "n_patterns": "{{count}} patterns",
         "n_tool_calls_blocked": "{{count}} tool calls blocked",
         "no_response_returned": "No response returned",
+        "nudge_cap_reached": "nudge cap reached",
         "recovered_continuing": "continuation sent automatically",
         "resuming_the_interrupted_turn": "resuming the interrupted turn",
         "safety_policy_continuing": "safety policy blocked the call · continuation sent automatically",
@@ -5286,7 +5310,7 @@
       "sideChat": {
         "ago": "ago",
         "ask_a_side_question": "Ask a side question",
-        "ask_a_side_question_main_agent_keeps_working": "Start a side conversation without interrupting the active run.",
+        "ask_a_side_question_main_agent_keeps_working": "Ask a side question without interrupting the active run. Nothing here is saved to the chat.",
         "context_from": "Context from",
         "refresh_context": "Refresh context",
         "refresh_blocked_queued": "Finish or cancel the queued questions first — refreshing would discard them",
@@ -5358,7 +5382,6 @@
         "send": "Send",
         "send_enter": "Send (Enter)",
         "steered_into_the_running_turn": "Steered into the running turn",
-        "message_unconfirmed": "Message not confirmed — may not have been delivered",
         "pin_message": "Pin message",
         "unpin_message": "Unpin message"
       },
@@ -5394,6 +5417,10 @@
         "copy_link": "Copy link to message",
         "unpin": "Unpin",
         "jump_to_message": "Jump to message"
+      },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "Load earlier messages",
+        "error_retry": "Couldn't load earlier messages — retry"
       }
     },
     "chatPage": {
@@ -5512,6 +5539,7 @@
       "new_chat_session": "New chat session",
       "new_folder": "New folder",
       "new_subfolder": "New subfolder",
+      "no_older_sessions": "No older sessions — closed tabs appear here",
       "no_sessions": "No sessions",
       "no_sessions_match": "No sessions match",
       "older_sessions": "Older sessions",
@@ -6365,8 +6393,6 @@
       }
     },
     "overviewPage": {
-      "apply_config_changes_by_restarting_all_sessions": "Apply config changes by restarting all sessions",
-      "apply_restart": "Apply & Restart",
       "back_to_overview": "Back to Overview",
       "days_of_history": "days of history",
       "h_idle": "h idle",
@@ -6375,11 +6401,8 @@
       "memory_graph_and_store_internals_live_on_the_dev": "Memory graph and store internals live on the Developer page",
       "messages": "messages",
       "overview": "Overview",
-      "restart": "Restart",
-      "restarting": "Restarting…",
       "semantic_memory_active": "· semantic memory active",
       "sessions": "sessions ·",
-      "sessions_restarted": "Sessions restarted.",
       "summarizes_chats_into_memory_after": "Summarizes chats into memory after",
       "today": "Today:",
       "tokens": "tokens",

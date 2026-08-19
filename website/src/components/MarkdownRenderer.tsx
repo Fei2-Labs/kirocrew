@@ -1,7 +1,9 @@
 import React, { createContext, useContext, memo, useEffect, useMemo, useRef, useId, useCallback, useState } from 'react'
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTION_BTN_CLS } from '../utils/touchActions'
-import { Paperclip, X, Download, Plus, Minus, Search, Folder, Maximize2 } from 'lucide-react'
+import { getImageDims, rememberImageDims } from '../utils/imageDims'
+import { Paperclip, X, Download, Plus, Minus, Search, Folder, Maximize2, Check } from 'lucide-react'
+import { copyToClipboard } from '../utils/clipboard'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -44,7 +46,7 @@ import JiraLogo from './icons/JiraLogo'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
 import DiffBlock from './DiffBlock'
-import MonacoCodeBlock from './MonacoCodeBlock'
+import EditableCodeBlock from './EditableCodeBlock'
 import { SmoothResize } from './SmoothResize'
 import type { ContentBlock } from '../types'
 
@@ -137,7 +139,7 @@ export function splitLineRef(s: string): { path: string; line?: number; endLine?
   const m = LINE_REF_RE.exec(s)
   if (!m) return { path: s }
   const line = Number(m[1])
-  // `:0` is not a line — Monaco and every editor number from 1 — so treat it as
+  // `:0` is not a line — every editor numbers from 1 — so treat it as
   // part of the name rather than clamping it to 1 and jumping somewhere the
   // text never named.
   if (!line) return { path: s }
@@ -607,6 +609,47 @@ function revealHintFor(isDir: boolean, platform: GatewayPlatform): string {
   return i18nT('components.markdownRenderer.click_to_open_shift_click_to_show_in_file_manager')
 }
 
+/** Click-to-copy inline code chip for non-path spans (commands, env vars, IDs).
+ *  Uses a brief "copied" feedback state and stays a plain inline `<code>` to
+ *  preserve line-wrapping. The copied state shows a small check icon inline;
+ *  the icon is `pointer-events-none` and purely decorative so it cannot steal
+ *  the click or affect layout reflow. */
+function CopyableCode({ className, safeProps, text, children }: {
+  className: string
+  safeProps: Record<string, unknown>
+  text: string
+  children: React.ReactNode
+}) {
+  const [copied, setCopied] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
+  const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    copyToClipboard(text.trim())
+    setCopied(true)
+    if (timerRef.current) clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => setCopied(false), 1500)
+  }
+  return (
+    <code
+      className={`${className} cursor-pointer hover:underline`}
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-copy)
+      role="button"
+      tabIndex={0}
+      onClick={handleCopy}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') handleCopy(e) }}
+      title={copied
+        ? i18nT('components.markdownRenderer.copied')
+        : i18nT('components.markdownRenderer.click_to_copy')}
+      {...safeProps}
+    >
+      {children}
+      {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
+    </code>
+  )
+}
+
 /**
  * Inline `code` span, upgraded to a click-to-open chip only once the backend has
  * confirmed the text names something that exists.
@@ -676,7 +719,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   )
 
   if (probePending || (kind !== 'file' && kind !== 'dir')) {
-    return <code className={CHIP_BASE} {...safeProps}>{children}</code>
+    return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{children}</CopyableCode>
   }
   const isDir = kind === 'dir'
   const revealHint = revealHintFor(isDir, gatewayPlatform)
@@ -696,9 +739,11 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   const Glyph = isDir ? Folder : fileIcon(path)
   /** stopPropagation keeps the container's artifact-link delegation from also
    *  firing for a click that this chip has already handled. */
-  const act = (e: { shiftKey: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
+  const act = (e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
     e.preventDefault()
     e.stopPropagation()
+    // Ctrl/Cmd+Click copies the path text rather than opening/revealing.
+    if (e.ctrlKey || e.metaKey) { copyToClipboard(raw); return }
     activatePath(path, kind, e.shiftKey, actions, targetLine, targetEndLine)
   }
   return (
@@ -723,7 +768,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
       // `raw`, not `path`, so a `file:447` chip discloses the line it will jump
       // to. That keeps the disclosure honest without a second catalog string:
       // the location is already in the text the user is hovering.
-      title={`${raw}\n${revealHint}`}
+      title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
     >
       <Glyph size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
       {targetLine != null && raw.length > stripped.length
@@ -818,14 +863,21 @@ function jiraCardMeta(link: PullRequestLink): LinkMeta {
 
 const MD_COMPONENTS: Components = {
   code({ className, children, ...props }) {
+    // Only a <code> inside a <pre> may render a block-level component here
+    // (CodeBlock / MermaidBlock / ExcalidrawBlock are each rooted in a <div>).
+    // rehypeMarkFencedCode stamps those with `data-fenced`; a bare <code> in
+    // prose stays inline whatever class it carries, because a <div> inside the
+    // enclosing <p> crashes React's reconciler. That comment carries the full
+    // reasoning. `data-fenced` is destructured out so it never reaches the DOM.
+    const { 'data-fenced': fenced, ...rest } = props as Record<string, unknown>
+    if (fenced === undefined) return <InlineCode {...rest}>{children}</InlineCode>
+
     const match = /language-(\w+)/.exec(className || '')
     const lang = match?.[1]
     const codeStr = String(children).replace(/\n$/, '')
 
     if (lang === 'mermaid') return <MermaidBlock code={codeStr} />
     if (lang === 'excalidraw') return <ExcalidrawBlock code={codeStr} />
-
-    if (!className) return <InlineCode {...props}>{children}</InlineCode>
 
     return <CodeBlock code={codeStr} lang={lang} complete={true} />
   },
@@ -884,6 +936,32 @@ const MD_COMPONENTS: Components = {
  *  broken. The fallback is React-rendered rather than a hand-built SVG swapped
  *  in via .replaceWith(), so it never mutates DOM React owns — which could
  *  otherwise trigger "removeChild on Node" reconciliation crashes. */
+/** Style reserving a not-yet-loaded transcript image's EXACT display box.
+ *
+ * The loaded layout follows the replaced-element min/max rules, which
+ * BACK-PROPAGATE a max-height cap into the width (a tall screenshot capped at
+ * 60vh also narrows). Neither width/height attributes nor a bare aspect-ratio
+ * reproduce that transfer — with either, max-height clamps the box's height
+ * while the width stays at max-width, leaving the image letterboxed centered
+ * inside a full-width border band. So spell the native resolution out:
+ * width = min(natural, heightCap × ratio), the class's max-width still capping
+ * on top; aspect-ratio derives the height. Same expression the loaded image
+ * resolves to, so the reserve is invisible — same size, same left edge,
+ * border hugging the image.
+ */
+export function reservedImageStyle(dims: { w: number; h: number }): React.CSSProperties {
+  // NUMBERS only — the min()/calc()/aspect-ratio arithmetic lives in the
+  // `.mc-img-reserve` rule (index.css), which is where a CSS value belongs and
+  // keeps this component free of CSS-shaped string literals.
+  return { '--mc-img-w': dims.w, '--mc-img-h': dims.h } as React.CSSProperties
+}
+
+/** Class pair applying `reservedImageStyle`'s custom properties: the shared
+ *  reserve arithmetic plus the mode's height cap (see index.css). */
+export function reservedImageClass(compact: boolean): string {
+  return compact ? 'mc-img-reserve mc-img-reserve-compact' : 'mc-img-reserve'
+}
+
 function ImgWithFallback({
   node,
   src,
@@ -962,9 +1040,31 @@ function ImgWithFallback({
   // uncommon in markdown. SVGs already get a definite width basis (their viewBox
   // derives the height), so they need no placeholder. See
   // MarkdownRenderer.streamingImageShift.test.tsx.
+  // Learned exact dimensions trump the heuristic floor: a transcript image
+  // remounts every time the virtualized window scrolls back over it, and a
+  // 120px floor under a 400-600px screenshot still realizes the difference as
+  // a visible jump on every (re)load. Recording naturalWidth/Height on first
+  // successful load (keyed by resolved URL, same mechanism as the artifact
+  // gallery's thumbnails) lets every later mount reserve the real aspect box
+  // via width/height attributes before any bytes arrive.
+  const learned = !isSvg ? getImageDims(url) : undefined
+  // The reserved box must resolve to EXACTLY the size the loaded image will
+  // take, or the difference shows as a border wrapping empty space with the
+  // image floated centered inside (object-contain letterboxing). The loaded
+  // layout follows the replaced-element min/max rules, which BACK-PROPAGATE a
+  // max-height cap into the width (a tall screenshot capped at 60vh also
+  // narrows). Neither width/height attributes nor an explicit aspect-ratio
+  // reproduce that transfer — with either, max-height clamps the box's height
+  // while the width stays at max-width, leaving a wide letterboxed band. So
+  // spell the native resolution out: width = min(natural, heightCap × ratio),
+  // with the class's max-width still capping on top; aspect-ratio then derives
+  // the height. Same expression the loaded image resolves to, so the reserve
+  // is invisible — same size, same left edge, border hugging the image.
   const imgStyle: React.CSSProperties | undefined = isSvg
     ? { width: compact ? '240px' : '760px', height: 'auto' }
-    : (loaded ? undefined : { minHeight: '120px' })
+    : learned
+      ? reservedImageStyle(learned)
+      : (loaded ? undefined : { minHeight: '120px' })
   // Sent-prompt (user message) images render as a small preview so an attached
   // screenshot doesn't dominate the bubble; the lightbox still opens full size
   // on click. Response images keep the large inline size. See CompactImagesCtx.
@@ -981,14 +1081,32 @@ function ImgWithFallback({
       {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions */}
       <img
         src={url} alt={alt || ''} loading="lazy"
-        className={compact
-          ? 'max-w-[min(100%,240px)] max-h-[180px] object-contain rounded-md border border-border cursor-pointer hover:opacity-90 transition-opacity'
-          : 'max-w-[min(100%,760px)] max-h-[60vh] object-contain rounded-md border border-border cursor-pointer hover:opacity-90 transition-opacity'}
+        // Sent-prompt images align to the END edge, matching the bubble they
+        // were sent from. `ms-auto` (logical, RTL-correct) sits on the IMG, never
+        // on its wrapper: preflight makes <img> display:block so text-align is
+        // inert here, and a shrink-to-fit wrapper makes the percentage in
+        // `max-w-[min(100%,240px)]` resolve against its own content — silently
+        // dropping the 240px cap and scattering mixed-width images. It reads
+        // right only because the bubble shrink-wraps (`w-fit` in UserMessage):
+        // inside a bubble stretched to its cap, moving the image to one edge
+        // only moves the empty band to the other. The cap is a DEFINITE 240px,
+        // not `min(100%,240px)`: a percentage max-width makes the image's
+        // max-content contribution indefinite, so the bubble's `w-fit` falls
+        // back to the full available width and the band never closes. 240px sits
+        // below the bubble's own cap at every width the app supports, so the
+        // percentage guard was redundant.
+        className={`${learned && !isSvg ? reservedImageClass(compact) + ' ' : ''}${compact
+          ? 'ms-auto max-w-[240px] max-h-[180px] object-contain rounded-md border border-border cursor-pointer hover:opacity-90 transition-opacity'
+          : 'max-w-[min(100%,760px)] max-h-[60vh] object-contain rounded-md border border-border cursor-pointer hover:opacity-90 transition-opacity'}`}
         style={imgStyle}
         onClick={(e) => dispatchLightbox(e.currentTarget)}
         data-lightbox-image=""
         title={alt || src}
-        onLoad={() => setLoaded(true)}
+        onLoad={(e) => {
+          const el = e.currentTarget
+          if (el.naturalWidth > 0 && el.naturalHeight > 0) rememberImageDims(url, el.naturalWidth, el.naturalHeight)
+          setLoaded(true)
+        }}
         onError={() => setErrored(true)}
         {...props}
       />
@@ -1366,6 +1484,68 @@ const BLOCK_ELEMENTS = new Set([
   'main', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'ul',
 ])
 
+/**
+ * Stamps `data-fenced` on every `<code>` that is the child of a `<pre>`.
+ *
+ * `MD_COMPONENTS.code` renders a block-level component for a code element that
+ * carries a class (`CodeBlock`, `MermaidBlock` and `ExcalidrawBlock` are each
+ * rooted in a `<div>`). Real fenced blocks never reach it — `useBlockAssembler`
+ * segments those out of the source and `BlockRenderer` draws them directly — so
+ * the only classed code elements arriving here come from raw HTML in prose.
+ * `<pre><code class="language-js">` is the legitimate shape: the `<pre>` is
+ * block-level, so `rehypeUnwrapBlocks` hoists it clear of any surrounding `<p>`
+ * and the block renders as a sibling.
+ *
+ * A BARE `<code class="language-js">` mid-sentence is not. The sanitizer
+ * allowlists `class` globally (see GLOBAL_ATTRS), so it survives, keeps its
+ * class, and renders a `<div>` inside the enclosing `<p>`. The browser hoists
+ * that `<div>` out of the `<p>`, React's VDOM does not follow, and the next
+ * reconciliation throws:
+ *   "Failed to execute 'removeChild' on 'Node': The node to be removed is not
+ *    a child of this node."
+ *
+ * `rehypeUnwrapBlocks` cannot catch this, because it decides block-ness from the
+ * HAST tag name and `code` is inline there — the block only appears in what the
+ * component renders. Marking the genuinely fenced ones lets the override keep
+ * inline code inline whatever class it carries, which is also what the source
+ * asked for.
+ */
+function rehypeMarkFencedCode() {
+  return (tree: HastRoot) => {
+    const walk = (node: HastRoot | HastElement) => {
+      if (!node.children) return
+      const isPre = node.type === 'element' && node.tagName === 'pre'
+      for (const child of node.children) {
+        if (child.type !== 'element') continue
+        // The marker is ours to set and no one else's. `isAllowedAttr` admits
+        // every `data-*`, so raw HTML in the message can carry its own
+        // `data-fenced` — and an inline `<code data-fenced class="language-js">`
+        // would then claim block rendering and reintroduce the very crash this
+        // plugin exists to prevent.
+        //
+        // Deleting a fixed key spelling is not enough. The HTML parser
+        // lowercases attribute names, so `dataFenced` arrives as the hast
+        // property `datafenced`, which the JSX serializer still hands to the
+        // component as `data-fenced`. Strip by NORMALIZED form so every casing
+        // and dash placement that can reach the override as the marker is
+        // removed here.
+        if (child.properties) {
+          for (const key of Object.keys(child.properties)) {
+            if (key.toLowerCase().replace(/-/g, '') === 'datafenced') {
+              delete child.properties[key]
+            }
+          }
+        }
+        if (isPre && child.tagName === 'code') {
+          child.properties = { ...(child.properties ?? {}), 'data-fenced': '' }
+        }
+        walk(child)
+      }
+    }
+    walk(tree)
+  }
+}
+
 function rehypeUnwrapBlocks() {
   return (tree: HastRoot) => {
     const walk = (parent: HastRoot | HastElement) => {
@@ -1447,7 +1627,7 @@ function rehypeUnwrapBlocks() {
   }
 }
 
-const REHYPE_PLUGINS: PluggableList = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex]
+const REHYPE_PLUGINS: PluggableList = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex]
 
 // Matches one source line break plus any leading tabs/spaces, so a trailing
 // space before the break doesn't survive as its own text node. Mirrors the
@@ -1495,7 +1675,17 @@ function remarkSoftBreaks() {
         out.push(child)
       }
     }
-    node.children = out
+    // A break ADJACENT to an image is redundant and inflates spacing: the
+    // image renders as its own block (span.block.my-2), so the line break is
+    // already implied — the <br> would add an empty line box (~one
+    // line-height) AND keep the neighbouring margins from collapsing,
+    // turning the intended 8px gap between two attached screenshots into
+    // ~37px. Text-to-text breaks (Shift+Enter prose) are untouched.
+    const isImage = (n: unknown): boolean => (n as { type?: string })?.type === 'image'
+    node.children = out.filter((n, i) => {
+      if ((n as { type?: string })?.type !== 'break') return true
+      return !(isImage(out[i - 1]) || isImage(out[i + 1]))
+    })
   }
   return (tree: unknown) => visit(tree as { children?: unknown[] })
 }
@@ -1522,7 +1712,7 @@ function rehypeSourcepos() {
     walk(tree)
   }
 }
-const REHYPE_PLUGINS_WITH_SOURCEPOS: PluggableList = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex, rehypeSourcepos]
+const REHYPE_PLUGINS_WITH_SOURCEPOS: PluggableList = [[rehypeRaw, { passThrough: ['math', 'inlineMath'] }], rehypeMarkFencedCode, rehypeUnwrapBlocks, rehypeSanitize, rehypeKatex, rehypeSourcepos]
 // NOTE: remark plugin config is shared via REMARK_PLUGINS above (singleDollarTextMath:
 // false). The sourcepos variant only differs in the rehype chain.
 
@@ -2649,9 +2839,9 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
         <div className="my-2 p-3 bg-bg-elevated border border-border rounded-md text-muted text-[12px] italic animate-pulse">{i18nT('components.markdownRenderer.generating_diagram')}</div>
       )
     case 'code': {
-      const node = <MonacoCodeBlock code={block.content} lang={block.language} complete={block.complete} />
-      // Height-grow only — streaming code is a single highlighted innerHTML blob
-      // (no per-line nodes), so per-line content animation isn't applied here.
+      const node = <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} />
+      // Height-grow only — streaming code renders as one plain <pre> text node
+      // so per-line content animation isn't applied here.
       return smooth ? <SmoothResize enabled={!block.complete}>{node}</SmoothResize> : node
     }
     case 'widget':

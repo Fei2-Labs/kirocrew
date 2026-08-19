@@ -612,7 +612,7 @@ html:lang(ko) {
   --chrome:rgba(250,244,237,.95);
   --text:#575279;--text-strong:#26233a;--muted:#716c7f;--muted-fg:#000;--muted-strong:#797593;
   --border:#e0d8d0;--border-strong:#d0c8c0;--border-hover:#b0a8a0;
-  --accent:#d7827e;--accent-fg:#fff;--accent-hover:#e09490;--accent-subtle:rgba(215,130,126,.12);
+  --accent:#d7827e;--accent-fg:#000;--accent-hover:#e09490;--accent-subtle:rgba(215,130,126,.12);
   --accent-glow:rgba(215,130,126,.15);--ring:#d7827e;
   --ok:#56949f;--ok-fg:#000;--ok-subtle:rgba(86,148,159,.1);
   --warn:#ea9d34;--warn-fg:#000;--warn-subtle:rgba(234,157,52,.1);
@@ -875,11 +875,11 @@ html:lang(ko) {
   --chrome:rgba(255,255,255,.98);
   --text:#1c1c1e;--text-strong:#000000;--muted:#6f6f74;--muted-fg:#000;--muted-strong:#636366;
   --border:#d1d1d6;--border-strong:#c7c7cc;--border-hover:#aeaeb2;
-  --accent:#007aff;--accent-fg:#fff;--accent-hover:#0a84ff;--accent-subtle:rgba(0,122,255,.12);
+  --accent:#007aff;--accent-fg:#000;--accent-hover:#0a84ff;--accent-subtle:rgba(0,122,255,.12);
   --accent-glow:rgba(0,122,255,.15);--ring:#007aff;
   --ok:#34c759;--ok-fg:#000;--ok-subtle:rgba(52,199,89,.1);
   --warn:#ff9500;--warn-fg:#000;--warn-subtle:rgba(255,149,0,.1);
-  --danger:#ff3b30;--danger-fg:#fff;--danger-subtle:rgba(255,59,48,.1);
+  --danger:#ff3b30;--danger-fg:#000;--danger-subtle:rgba(255,59,48,.1);
   --info:#5ac8fa;--info-fg:#000;
   --aim:#af52de;--aim-fg:#fff;--aim-subtle:rgba(175,82,222,.12);
   --clarify:#ff9500;--clarify-subtle:rgba(255,149,0,.06);
@@ -929,8 +929,8 @@ html:lang(ko) {
   --accent:#8e48ff;--accent-fg:#ffffff;--accent-hover:#7a35e0;--accent-subtle:rgba(142,72,255,.12);
   --accent-glow:rgba(142,72,255,.15);--ring:#8e48ff;
   --ok:#008543;--ok-subtle:rgba(0,133,67,.12);
-  --warn:#a38a00;--warn-subtle:rgba(163,138,0,.1);
-  --danger:#d92544;--danger-subtle:rgba(217,37,68,.1);
+  --warn:#a38a00;--warn-fg:#000;--warn-subtle:rgba(163,138,0,.1);
+  --danger:#d92544;--danger-fg:#fff;--danger-subtle:rgba(217,37,68,.1);
   --info:#285092;
   --aim:#8041e6;--aim-subtle:rgba(128,65,230,.12);
   --clarify:#a38a00;--clarify-subtle:rgba(163,138,0,.06);
@@ -977,11 +977,11 @@ html:lang(ko) {
   --chrome:rgba(239,240,242,.95);
   --text:#5c6370;--text-strong:#2b2d30;--muted:#666b74;--muted-strong:#6f737a;
   --border:#c8cad0;--border-strong:#b0b3ba;--border-hover:#9a9da6;
-  --accent:#5a8fd4;--accent-hover:#4a7dc0;--accent-subtle:rgba(90,143,212,.12);
+  --accent:#5a8fd4;--accent-fg:#000;--accent-hover:#4a7dc0;--accent-subtle:rgba(90,143,212,.12);
   --accent-glow:rgba(90,143,212,.15);--ring:#5a8fd4;
   --ok:#369b43;--ok-subtle:rgba(54,155,67,.1);
-  --warn:#b5a300;--warn-subtle:rgba(181,163,0,.1);
-  --danger:#db3b3b;--danger-subtle:rgba(219,59,59,.1);
+  --warn:#b5a300;--warn-fg:#000;--warn-subtle:rgba(181,163,0,.1);
+  --danger:#db3b3b;--danger-fg:#000;--danger-subtle:rgba(219,59,59,.1);
   --info:#5a8fd4;
   --aim:#9333ea;--aim-subtle:rgba(147,51,234,.12);
   --clarify:#b5a300;--clarify-subtle:rgba(181,163,0,.06);
@@ -1137,7 +1137,7 @@ html:lang(ko) {
   --accent:#5e54d9;--accent-fg:#fff;--accent-hover:#4f46c4;--accent-subtle:rgba(94,84,217,.10);
   --accent-glow:rgba(94,84,217,.18);--ring:#5e54d9;
   --ok:#059669;--ok-fg:#fff;--ok-subtle:rgba(5,150,105,.1);
-  --warn:#d97706;--warn-fg:#fff;--warn-subtle:rgba(217,119,6,.1);
+  --warn:#d97706;--warn-fg:#000;--warn-subtle:rgba(217,119,6,.1);
   --danger:#dc2626;--danger-fg:#fff;--danger-subtle:rgba(220,38,38,.1);
   --info:#4f46e5;--info-fg:#fff;
   --aim:#7c3aed;--aim-fg:#fff;--aim-subtle:rgba(124,58,237,.10);
@@ -1189,7 +1189,7 @@ html:lang(ko) {
   --accent:#4b5563;--accent-fg:#fff;--accent-hover:#1f2937;--accent-subtle:rgba(75,85,99,.12);
   --accent-glow:rgba(75,85,99,.18);--ring:#6b7280;
   --ok:#16a34a;--ok-fg:#fff;--ok-subtle:rgba(22,163,74,.1);
-  --warn:#ca8a04;--warn-fg:#fff;--warn-subtle:rgba(202,138,4,.1);
+  --warn:#ca8a04;--warn-fg:#000;--warn-subtle:rgba(202,138,4,.1);
   --danger:#dc2626;--danger-fg:#fff;--danger-subtle:rgba(220,38,38,.1);
   --info:#2563eb;--info-fg:#fff;
   --aim:#7c3aed;--aim-fg:#fff;--aim-subtle:rgba(124,58,237,.1);
@@ -1236,9 +1236,8 @@ html:lang(ko) {
      (Overview stat tiles, Settings cards) would sit fully invisible for its
      whole delay when the user asked for no motion. Zero the delay for the
      rise entrance specifically; `!important` is required to beat the inline
-     `animationDelay` the stagger ladder sets. Deliberately NOT global:
-     mc-line-reveal (below) documents that it relies on delays surviving
-     reduced motion. */
+     `animationDelay` the stagger ladder sets. Deliberately scoped to that
+     entrance rather than zeroing every animation delay globally. */
   @media(prefers-reduced-motion:reduce){.animate-rise{animation-delay:0s !important}}
   ::selection{background:var(--accent-subtle);color:var(--text-strong)}
   .bg-accent::selection{background:rgba(255,255,255,.25);color:white}
@@ -1259,13 +1258,6 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
   background:radial-gradient(ellipse at 20% 50%,color-mix(in srgb,var(--accent) 5%,transparent) 0%,transparent 50%),
              radial-gradient(ellipse at 80% 20%,color-mix(in srgb,var(--accent) 3%,transparent) 0%,transparent 50%),
              radial-gradient(ellipse at 50% 80%,color-mix(in srgb,var(--accent) 3%,transparent) 0%,transparent 50%)}
-
-/* ── Nav brand glow pseudo-elements ── */
-.nav-brand-glow::before{content:'';position:absolute;inset:-48px 0 0 0;
-  background:radial-gradient(ellipse at 50% 50%,var(--accent-glow) 0%,var(--accent-subtle) 40%,transparent 70%);
-  opacity:.8;pointer-events:none;animation:brand-glow 5s ease-in-out infinite alternate}
-.nav-brand-glow::after{content:'';position:absolute;bottom:0;left:16px;right:16px;height:1px;
-  background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.3}
 
 /* ── App icons (two-color, theme-reactive) ──
    Idle: muted structure + accent detail. Lit (selected OR hovered inside a
@@ -1347,40 +1339,17 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   .ft-anim-smooth .ft-word{opacity:1;transition:none}
 }
 
-/* ── Streaming block: height grow (code/diff) + per-line rise (diff) ──
+/* ── Streaming block: height grow (code/diff) ──
    SmoothResize wraps streaming code/diff blocks and eases their height as new
    lines arrive instead of snapping. The block's own 8px margin is relocated
    onto the `.ft-resize` wrapper (and zeroed on the child) so overflow:hidden
-   during the height animation doesn't swallow inter-block spacing. DiffBlock
-   rows additionally rise+fade in while the diff is still streaming
-   (`.ft-stream-block` scope) — gated so completed / history-reloaded diffs
-   render statically and never re-animate on a virtualizer re-mount. */
+   during the height animation doesn't swallow inter-block spacing. */
 .msg-content .ft-resize{margin:8px 0}
 .msg-content .ft-resize .code-block,.msg-content .ft-resize .diff-block{margin:0}
-@keyframes ft-line-rise{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
-.ft-stream-block .ft-drow{animation:ft-line-rise .5s cubic-bezier(.4,0,.2,1) both}
 @media (prefers-reduced-motion:reduce){
   .ft-resize{transition:none!important}
-  .ft-stream-block .ft-drow{animation:none}
 }
 
-/* ── Shimmer bar ── */
-.think-bar{width:48px;height:3px;border-radius:2px;
-  background:linear-gradient(90deg,var(--border),var(--accent),var(--border));
-  background-size:200% 100%;animation:shimmer 1.5s ease-in-out infinite}
-.activity-viewer{background:var(--bg)}
-.subagent-pane{border:1px solid var(--border);border-radius:6px;margin:4px;position:relative}
-.subagent-pane.focused{border-color:var(--accent)}
-.subagent-pane-body{max-height:200px;overflow-y:auto}
-.status-running{animation:pulse 1.5s infinite}
-.status-tool{opacity:0.9}
-.status-done{opacity:0.7}
-.status-error{opacity:0.9}
-
-/* ── Sidebar running indicator (skeleton line) ── */
-.pulse-bar-sm{display:block;padding:2px 0}
-.pulse-bar-sm::before{content:'';display:block;height:8px;border-radius:3px;background:var(--accent-subtle);width:70%;animation:skel-pulse 1.5s ease-in-out infinite}
-@keyframes skel-pulse{0%,100%{opacity:.4}50%{opacity:.8}}
 /* Update card: indeterminate download segment sweeps across the track.
    translateX is relative to the segment's own width (w-1/4 of the track), so
    -100%..400% covers off-left to off-right for a 25% segment. */
@@ -1419,14 +1388,11 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
    The stroke is in the shared asset, so it applies on both palettes — on the
    dark surface a black edge against a near-black background is imperceptible,
    which is why no dark-theme override is needed. */
-@keyframes grow{0%{width:15%}50%{width:45%}100%{width:60%}}
 @property --glow-strength{syntax:'<number>';inherits:false;initial-value:0}
 @keyframes approval-glow{0%,100%{--glow-strength:0}50%{--glow-strength:1}}
 .approval-glow{--glow-strength:0;animation:approval-glow 2.5s ease-in-out infinite;box-shadow:0 0 0 1.5px color-mix(in srgb, var(--warn) calc(var(--glow-strength) * 55%), transparent),0 0 14px 1px color-mix(in srgb, var(--warn) calc(var(--glow-strength) * 40%), transparent)}
 @keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
 .animate-shimmer{animation:shimmer 2s ease-in-out infinite}
-@keyframes slide-in-right{0%{transform:translateX(100%);opacity:0}100%{transform:translateX(0);opacity:1}}
-.animate-slide-in-right{animation:slide-in-right .2s ease-out}
 @keyframes hourglass-flip{
   0%,40%{transform:rotate(0deg)}
   50%,90%{transform:rotate(180deg)}
@@ -1478,6 +1444,89 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 .msg-content .diff-block>pre{padding:0}
 .msg-content .diff-block,.msg-content .code-block{margin:8px 0}
 
+/* Pierre surfaces (@pierre/diffs). One hook for every code/diff render:
+   the library reads these custom properties, so the theme pack's mono face
+   (--mono resolves through --theme-font-mono) and the app's code size apply
+   to all Pierre surfaces at once. */
+/* Pierre surfaces (@pierre/diffs). One hook for every code/diff render:
+   the library reads these custom properties, so the theme pack's mono face
+   (--mono resolves through --theme-font-mono) and the app's code size apply
+   to all Pierre surfaces at once. */
+.pierre-surface{
+  --diffs-font-family:var(--mono);
+  --diffs-header-font-family:var(--mono);
+  --diffs-font-size:13px;
+}
+/* Pin Pierre's canvas to the app theme's surface token. Must target the HOST
+   element from the outer tree: the Shiki theme injects --diffs-*-bg in a
+   `:host` rule inside the shadow root, which beats values merely INHERITED
+   from .pierre-surface — but outer-tree rules matching the host element beat
+   `:host` rules. Every derived tint (context rows, separators, add/del
+   washes) is color-mixed from the canvas, so the surface follows theme packs
+   while token colors stay with the Shiki theme pair in src/pierre/config.ts. */
+.pierre-surface diffs-container{
+  --diffs-light-bg:var(--bg);
+  --diffs-dark-bg:var(--bg);
+  background-color:var(--bg);
+}
+/* Inline value cells (tool details / tool-request inputs) sit on their own
+   row surface: fully transparent so the host row's background shows through.
+   Pierre drops the `className` prop on the floor, so the class must live on a
+   WRAPPER element (hence the descendant selector); declared last to win the
+   tie with the base host rule above. */
+.pierre-transparent diffs-container{
+  --diffs-light-bg:transparent;
+  --diffs-dark-bg:transparent;
+  background-color:transparent;
+}
+/* Chat diff blocks slot patch-level controls into Pierre's header metadata
+   area. The shadow template puts the slot AFTER the +/- counts; the metadata
+   row is a flex container and slotted nodes are light DOM, so ordering the
+   slotted element first keeps the counts pinned to the right edge no matter
+   how many buttons a block carries. */
+.diff-block [slot='header-metadata']{order:-1}
+/* Same flip for the file-change rows below a message: Open + diffstat cells
+   sit left of Pierre's own +/- counts, which stay rightmost. */
+.fcc-row [slot='header-metadata']{order:-1}
+/* Workspace tree (@pierre/trees): map the dashboard theme tokens onto the
+   tree's override properties so it follows every theme pack, not the
+   library's default palette. */
+.pierre-tree,
+.pierre-tree file-tree-container,
+file-tree-container{
+  --trees-bg-override:var(--bg);
+  background-color:var(--bg);
+  --trees-bg-muted-override:var(--bg-elevated);
+  --trees-fg-override:var(--text);
+  --trees-fg-muted-override:var(--muted);
+  --trees-border-color-override:var(--border);
+  --trees-accent-override:var(--accent);
+  --trees-selected-bg-override:var(--bg-hover);
+  --trees-selected-fg-override:var(--text-strong);
+  --trees-selected-focused-border-color-override:var(--accent);
+  --trees-focus-ring-color-override:var(--accent);
+  --trees-search-bg-override:var(--bg-elevated);
+  --trees-search-fg-override:var(--text);
+  --trees-input-bg-override:var(--bg-elevated);
+  --trees-indent-guide-bg-override:var(--border);
+  --trees-scrollbar-thumb-override:var(--border-strong);
+  --trees-font-family-override:var(--font-body);
+  --trees-font-size-override:12.5px;
+  --trees-padding-inline-override:0px;
+  --trees-git-added-color-override:var(--diff-add-text);
+  --trees-git-deleted-color-override:var(--diff-del-text);
+  --trees-git-modified-color-override:var(--warn);
+  --trees-git-untracked-color-override:var(--info);
+  --trees-git-renamed-color-override:var(--accent);
+  --trees-git-ignored-color-override:var(--muted);
+  --trees-status-added-override:var(--diff-add-text);
+  --trees-status-deleted-override:var(--diff-del-text);
+  --trees-status-modified-override:var(--warn);
+  --trees-status-untracked-override:var(--info);
+  --trees-status-renamed-override:var(--accent);
+  --trees-status-ignored-override:var(--muted);
+}
+
 /* Auto-sizing message-edit bubble. A hidden::after mirror, fed by
    the data-replicated-value attribute, drives the single grid track so the
    overlapping <textarea> grows with its own content in BOTH dimensions —
@@ -1495,20 +1544,6 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 .scroll-fade:hover::-webkit-scrollbar-thumb{background:var(--border)}
 .scroll-fade{scrollbar-width:thin;scrollbar-color:transparent transparent}
 .scroll-fade:hover{scrollbar-color:var(--border) transparent}
-
-/* ── Zigzag rule (diff "unchanged lines" separator) ──
- * A tiling chevron painted as a CSS mask over currentColor (the BrandGlyph
- * pattern from components/BrandIcon.tsx), so it follows the theme's hunk tint
- * and no SVG element lives in TSX (AUTOSDE use-lucide-icons). The data URI is
- * quoted — commas break an unquoted url() token and the mask silently fails. */
-.zigzag-rule{
-  flex:1 1 0%;min-width:0;height:7px;background-color:currentColor;
-  -webkit-mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='7'%3E%3Cpath d='M0 5.5 L4 1.5 L8 5.5' fill='none' stroke='black' stroke-width='1.2'/%3E%3C/svg%3E");
-  mask-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='7'%3E%3Cpath d='M0 5.5 L4 1.5 L8 5.5' fill='none' stroke='black' stroke-width='1.2'/%3E%3C/svg%3E");
-  -webkit-mask-repeat:repeat-x;mask-repeat:repeat-x;
-  -webkit-mask-position:left center;mask-position:left center;
-  -webkit-mask-size:8px 7px;mask-size:8px 7px;
-}
 
 /* ── Overlay auto-hiding vertical scrollbar ──
  * Reveals the thumb only on hover and overlays the content so it never
@@ -1625,9 +1660,12 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
    CONTENT box -- what the @container ladder below queries -- keeps the width the
    track gives it. Deliberately NOT `overflow-clip-margin`: WebKit does not
    implement it, so on every iOS browser that spelling would leave the badge
-   clipped exactly as before. Keep both values equal to the badge's offset: less
-   re-clips it, more lets real content escape into the header's padding. */
-.tb-right{justify-content:flex-end;gap:.375rem;padding:4px 4px 0 0;margin:-4px -4px 0 0}
+   clipped exactly as before. The reserve is 2px MORE than the badge's 4px offset,
+   not equal to it: a flush 4px left the badge body exactly on the clip boundary,
+   so sub-pixel rounding and the badge's glow shadow still squared its top and
+   right edges. The 2px slack clears the box; keep both values equal, and only as
+   large as needed, since more lets real content escape into the header's padding. */
+.tb-right{justify-content:flex-end;gap:.375rem;padding:6px 6px 0 0;margin:-6px -6px 0 0}
 
 /* Both side tracks are `minmax(0,1fr)` at EVERY width, and that is load-bearing
    for the containment above, not just for centring. A side track sized `auto`
@@ -1933,54 +1971,6 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
   background-color: var(--search-highlight-current);
 }
 
-/* Line reveal — a `path/to/file.py:447` chip in the transcript opens the file in
-   the side panel and flashes line 447; `file.md:10-16` flashes the whole span.
-   Monaco decoration classes (not the CSS Custom Highlight API), so unlike
-   ::highlight() these DO honor box properties, which is what allows the gutter
-   bar. --accent-subtle is theme-defined for all palettes and is the same wash
-   flashCommentRow uses, so the two "here is what you clicked" signals read as one
-   idea. Held ~1.8s, then faded out over ~1s. */
-.mc-line-reveal {
-  background-color: var(--accent-subtle, rgba(99, 102, 241, 0.25));
-  animation: var(--mc-line-reveal-anim, mc-line-reveal-out)
-             var(--mc-line-reveal-fade, 1000ms) ease-out
-             var(--mc-line-reveal-hold, 1800ms) forwards;
-}
-.mc-line-reveal-gutter {
-  border-left: 2px solid var(--accent);
-  margin-left: 3px;
-  animation: var(--mc-line-reveal-gutter-anim, mc-line-reveal-gutter-out)
-             var(--mc-line-reveal-fade, 1000ms) ease-out
-             var(--mc-line-reveal-hold, 1800ms) forwards;
-}
-/* An ANIMATION, not a transition. A transition cannot fade this out: clearing the
-   decoration removes Monaco's DOM node outright, and a removed element does not
-   animate — which is why this used to disappear in a single frame despite
-   carrying `transition: background-color`. So the class fades ITSELF on a delay
-   and useLineReveal only clears the (by then invisible) decoration afterwards.
-   Both timings come from that module as custom properties, so these fallbacks
-   apply only if the properties are somehow unset.
-
-   The `-b` aliases are byte-identical on purpose. Monaco reuses a rendered line
-   node when the overlay HTML is unchanged, so a repeat reveal would otherwise
-   inherit the finished animation and stay transparent; useLineReveal alternates
-   the requested name between reveals, and changing `animation-name` is what
-   restarts it. Global `prefers-reduced-motion` (above) zeroes animation-DURATION
-   but not the delay, so this degrades to "hold, then switch off" rather than
-   losing the hold. */
-@keyframes mc-line-reveal-out {
-  to { background-color: transparent; }
-}
-@keyframes mc-line-reveal-out-b {
-  to { background-color: transparent; }
-}
-@keyframes mc-line-reveal-gutter-out {
-  to { border-left-color: transparent; }
-}
-@keyframes mc-line-reveal-gutter-out-b {
-  to { border-left-color: transparent; }
-}
-
 /* Anchored-comment highlights on the markdown / text artifact body are drawn
    as a real overlay layer (InlineCommentOverlay), NOT the CSS Custom Highlight
    API — real elements always paint and support box-shadow + a persistent active
@@ -2065,33 +2055,6 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 @media (pointer: coarse) {
   [data-composer-typo][data-composer-typo] { font-size: 16px; }
   [data-composer-typo]::placeholder { font-size: 0.875rem; }
-}
-
-/* ── Diff panel header: theme-conditional bg/border to match Monaco vs/vs-dark ── */
-.diff-panel-header {
-  background-color: #ffffff;
-  border-color: #e5e5e5;
-}
-[data-theme*="dark"] .diff-panel-header {
-  background-color: #1e1e1e;
-  border-color: #333333;
-}
-
-/* ── Monaco find widget: prevent clipping and ensure buttons are visible ── */
-.monaco-editor .find-widget {
-  max-width: calc(100% - 28px) !important;
-}
-.monaco-editor .sticky-widget {
-  background-color: var(--vscode-editorStickyScroll-background, var(--color-chrome)) !important;
-  opacity: 1 !important;
-}
-.monaco-editor .find-widget .monaco-inputbox {
-  flex: 1 1 auto !important;
-  min-width: 50px !important;
-}
-.monaco-editor .find-widget .find-actions,
-.monaco-editor .find-widget .replace-actions {
-  flex-shrink: 0 !important;
 }
 
 /* ── Liquid-glass design system ──
@@ -2297,3 +2260,26 @@ html[data-font-family="mono"] .rail-community-links{ letter-spacing:-0.05em; wor
   -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent 100%);
   mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent 100%);
 }
+
+/* Reserve a transcript image's EXACT display box before its bytes decode.
+   The loaded layout follows the replaced-element min/max rules, which
+   BACK-PROPAGATE a max-height cap into the width (a tall screenshot capped at
+   60vh also narrows). Neither width/height attributes nor a bare aspect-ratio
+   reproduce that transfer: with either, max-height clamps the height while the
+   width stays at max-width, leaving the image letterboxed centered inside a
+   full-width border band. Spelling the native resolution out here — rather
+   than as a per-image inline style string — keeps the CSS in the stylesheet
+   (the i18n gate reads inline template literals as copy) and leaves the
+   component passing only NUMBERS via the two custom properties below.
+   --mc-img-cap comes from the mode class; the intrinsic size comes from the
+   learned natural dimensions. */
+.mc-img-reserve {
+  --mc-img-cap: 60vh;
+  width: min(
+    calc(var(--mc-img-w) * 1px),
+    calc(var(--mc-img-cap) * (var(--mc-img-w) / var(--mc-img-h)))
+  );
+  height: auto;
+  aspect-ratio: var(--mc-img-w) / var(--mc-img-h);
+}
+.mc-img-reserve-compact { --mc-img-cap: 180px; }

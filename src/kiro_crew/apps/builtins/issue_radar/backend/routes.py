@@ -40,6 +40,9 @@ builtin app's ``/api/apps/{name}/*`` surface):
                                         -> {"owner","repo","number","labels":[...]}
   POST /api/apps/issue-radar/issue/state   {"owner","repo","number","state","state_reason"?}
                                         -> {"owner","repo","number","state","state_reason"}
+  POST /api/apps/issue-radar/issue/assignees {"owner","repo","number","assignees":[...],"expected":[...]}
+                                        -> {"owner","repo","number","assignees":[...]}
+                                           409 + current set when "expected" is stale
 
 Connect / list / detail / labels stay a pure ``gh`` CLI + local-cache path (the
 same "deterministic backbone" principle as code_review_sage's repo-scan routes).
@@ -48,8 +51,8 @@ summary + suggested labels via one model call, cache-first (paid once per issue,
 served instantly on re-open). ``/pull-ai`` does the same for a pull request,
 summarizing its description + whole conversation + check state; its cache is keyed
 by a fingerprint of those inputs, so a new comment or a flipped check earns a
-fresh summary while an unchanged PR is never re-summarized. The two write routes (``/labels/apply``,
-``/issue/state``) are the confirm half of the suggest->confirm loop and are gated
+fresh summary while an unchanged PR is never re-summarized. The write routes (``/labels/apply``,
+``/issue/state``, ``/issue/assignees``) are the confirm half of the suggest->confirm loop and are gated
 on the user's ``triage``/``push`` access; a read-only repo degrades to
 suggest-only (writes 403).
 """
@@ -67,6 +70,8 @@ from aiohttp import web
 
 from kiro_crew.apps.builtins.issue_radar.backend import github_client, provider, store, watch
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.context import ui_language_tag
 from kiro_crew.sel import sel
 
 logger = logging.getLogger("kirocrew.app.issue-radar")
@@ -77,6 +82,10 @@ logger = logging.getLogger("kirocrew.app.issue-radar")
 GhCliError = github_client.GhCliError
 GhPermissionError = github_client.GhPermissionError
 GhSetupError = github_client.GhSetupError
+# The provider rejected a VALUE in the request (an unassignable login). A subclass
+# of GhCliError, so it must be caught BEFORE the generic clause or it lands in the
+# 502 branch it exists to avoid.
+GhInvalidInputError = github_client.GhInvalidInputError
 
 
 def _account_key(request: web.Request) -> provider.RepoKey:
@@ -1392,14 +1401,75 @@ _AI_BODY_MAX_CHARS = 6000
 _AI_MAX_SUGGESTIONS = 6
 
 
-def _build_ai_prompt(owner: str, repo: str, detail: dict, labels: list[dict], current_names: list[str]) -> str:
+def _ui_language() -> str:
+    """Dashboard UI language as a validated BCP-47 tag, or ``""`` when unknown.
+
+    ``""`` covers both "never chosen" (the config's follow-the-browser sentinel,
+    resolved in the SPA where the backend cannot see it) and a malformed or
+    unshipped stored value — see :func:`kiro_crew.context.ui_language_tag`. The
+    prompt then carries no language directive at all, byte-identical to what it
+    always sent, and the model keeps answering in English.
+
+    Read per generation (the load is mtime-cached) rather than captured at
+    import, so changing the language in Settings applies to the next summary
+    without restarting the gateway. Best-effort: any failure summarizes without
+    a directive rather than failing the request.
+
+    **Call this OFF the event loop** (``asyncio.to_thread``): ``KiroCrewConfig
+    .load()`` stats, reads and JSON-parses a file, which ``AUTOSDE.yaml``'s
+    ``no-blocking-call-on-event-loop`` prohibits on the gateway's single loop —
+    the same discipline ``chat_title._ui_language`` follows.
+    """
+    try:
+        return ui_language_tag(KiroCrewConfig.load())
+    except Exception:
+        logger.debug("issue-radar ai: UI language lookup failed; prompting without a directive")
+        return ""
+
+
+def _language_directive(ui_language: str, fields: str) -> str:
+    """The output-language instruction appended to a one-shot AI prompt.
+
+    ``""`` when no UI language is configured, which keeps every prompt
+    BYTE-IDENTICAL to what unconfigured installs have always sent (the model
+    then defaults to English exactly as before). ``fields`` names the JSON
+    fields whose PROSE localizes — everything structural (JSON keys, label
+    names, code spans, identifiers, file paths) is explicitly excluded, so the
+    downstream label-intersection and validation paths see unchanged tokens.
+
+    Appended AFTER the fenced untrusted block on purpose, mirroring
+    ``chat_title._TITLE_LANGUAGE_TEMPLATE``'s placement rationale: issue/PR
+    text that quotes or contradicts the directive stays data inside the fence
+    and cannot restate it.
+    """
+    if not ui_language:
+        return ""
+    return (
+        f"\nWrite {fields} in the language of BCP-47 tag {ui_language} — that is "
+        "the dashboard language the text renders in, even when the material "
+        "above is written in another language. Everything else is never "
+        "translated: JSON keys, label names, code spans, identifiers, file "
+        "paths, branch names, and product names stay verbatim."
+    )
+
+
+def _build_ai_prompt(
+    owner: str, repo: str, detail: dict, labels: list[dict], current_names: list[str],
+    *, ui_language: str = "",
+) -> str:
     """Assemble the single-call triage prompt.
 
     The issue body is UNTRUSTED (an attacker can open an issue containing
     prompt-injection text), so it is fenced in an explicit delimiter and the
     instructions tell the model to treat everything inside as data. The output
     is further constrained downstream: suggested labels are intersected with the
-    repo's real label set, so an injected "add label X" cannot invent a label."""
+    repo's real label set, so an injected "add label X" cannot invent a label.
+
+    ``ui_language`` is a validated BCP-47 tag (see :func:`_ui_language`); ``""``
+    omits the language directive entirely, leaving the prompt byte-identical to
+    what unconfigured installs have always sent. The ``summary`` and each
+    ``reason`` localize — both render as prose in the dashboard — while label
+    NAMES stay verbatim so the downstream intersection still matches."""
     title = detail.get("title") or "(no title)"
     body = (detail.get("body") or "").strip()
     if len(body) > _AI_BODY_MAX_CHARS:
@@ -1437,6 +1507,7 @@ def _build_ai_prompt(owner: str, repo: str, detail: dict, labels: list[dict], cu
         "</issue>\n\n"
         'Respond with ONLY the JSON object, e.g. {"summary": "...", '
         '"suggested_labels": [{"name": "bug", "reason": "..."}]}.'
+        + _language_directive(ui_language, 'the "summary" and each "reason"')
     )
 
 
@@ -1475,20 +1546,25 @@ async def _run_oneshot_model(request: web.Request, key: str, prompt: str) -> str
 
 
 async def _compute_issue_ai(
-    request: web.Request, owner: str, repo: str, number: int, detail: dict, labels: list[dict]
+    request: web.Request, owner: str, repo: str, number: int, detail: dict, labels: list[dict],
+    *, ui_language: str = "",
 ) -> dict:
     """Run the one-shot triage model call and return ``{"summary", "suggested_labels"}``.
 
     See :func:`_run_oneshot_model` for how the call is isolated. Output is
     validated: the summary is redacted; suggested labels are intersected with the
-    repo's real label set and de-duplicated against what is already on the issue."""
+    repo's real label set and de-duplicated against what is already on the issue.
+
+    ``ui_language`` is resolved by the caller (``_handle_issue_ai``) rather than
+    here because the same tag also keys the cached result — one read keeps the
+    prompt and the cache entry agreeing on the language."""
     import uuid
 
     from kiro_crew.llm_helpers import parse_llm_json
     from kiro_crew.security import redact
 
     current_names = [lab.get("name") for lab in (detail.get("labels") or []) if lab.get("name")]
-    prompt = _build_ai_prompt(owner, repo, detail, labels, current_names)
+    prompt = _build_ai_prompt(owner, repo, detail, labels, current_names, ui_language=ui_language)
 
     key = f"issue-radar-ai:{owner}/{repo}#{int(number)}:{uuid.uuid4().hex}"
     text = await _run_oneshot_model(request, key, prompt)
@@ -1573,9 +1649,21 @@ async def _handle_issue_ai(request: web.Request) -> web.Response:
         )
 
     force_refresh = request.query.get("refresh") == "1"
+    # Resolved once per request, off-loop (config-file I/O — see _ui_language),
+    # and used BOTH to validate the cache hit and to steer a fresh generation.
+    lang = await asyncio.to_thread(_ui_language)
     cached = None if force_refresh else await _st(
         key, store.read_issue_ai_cache, owner, repo, number
     )
+    # A cached summary is only servable if it was generated for the CURRENT
+    # dashboard language — otherwise a language switch would keep rendering the
+    # old-language card indefinitely (the pull-ai path gets this from its
+    # fingerprint; this cache has no fingerprint, so the tag is stored beside
+    # the payload and compared here). Legacy entries carry no tag and read as
+    # "" — identical to the unconfigured sentinel — so installs that never set
+    # a language keep every cached entry across the upgrade.
+    if cached is not None and str(cached.get("ui_language") or "") != lang:
+        cached = None
     if cached is not None:
         return web.json_response({
             "owner": owner, "repo": repo, "number": number,
@@ -1592,7 +1680,7 @@ async def _handle_issue_ai(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=502)
 
     try:
-        ai = await _compute_issue_ai(request, owner, repo, number, detail, labels)
+        ai = await _compute_issue_ai(request, owner, repo, number, detail, labels, ui_language=lang)
     except Exception:
         logger.exception("issue-ai: computation failed for %s/%s#%s", owner, repo, number)
         return web.json_response(
@@ -1605,7 +1693,10 @@ async def _handle_issue_ai(request: web.Request) -> web.Response:
     # caching that would strand the user on an empty card until they manually
     # regenerate, so instead we skip the cache and let the next open retry.
     if ai.get("summary") or ai.get("suggested_labels"):
-        await _st(key, store.write_issue_ai_cache, owner, repo, number, ai)
+        await _st(
+            key, store.write_issue_ai_cache, owner, repo, number,
+            {**ai, "ui_language": lang},
+        )
     return web.json_response({
         "owner": owner, "repo": repo, "number": number,
         "summary": ai["summary"], "suggested_labels": ai["suggested_labels"],
@@ -1680,7 +1771,9 @@ def _pr_ai_comment_rows(timeline: list[dict]) -> list[dict]:
     return kept
 
 
-def _pr_ai_fingerprint(detail: dict, timeline: list[dict], checks: list[dict]) -> str:
+def _pr_ai_fingerprint(
+    detail: dict, timeline: list[dict], checks: list[dict], *, ui_language: str = ""
+) -> str:
     """A short digest of everything the summary was built from.
 
     Stored beside the cached summary so the cache self-invalidates when the PR
@@ -1692,7 +1785,13 @@ def _pr_ai_fingerprint(detail: dict, timeline: list[dict], checks: list[dict]) -
     comment changes neither its ``created_at`` nor the comment count, so a
     metadata-only digest would keep serving a summary written from text that no
     longer exists. Hashing the same bounded rows the prompt actually receives ties
-    the cache key to the real input."""
+    the cache key to the real input.
+
+    ``ui_language`` is an input too: the tag steers the summary's output
+    language, so switching the dashboard language must earn a fresh summary the
+    same way a new comment does. It is folded in only when non-empty so that
+    installs with no configured language keep byte-identical digests across the
+    upgrade (no one-time invalidation of every cached summary)."""
     comments = _pr_ai_comment_rows(timeline)
     convo = hashlib.sha256()
     for c in comments:
@@ -1714,6 +1813,8 @@ def _pr_ai_fingerprint(detail: dict, timeline: list[dict], checks: list[dict]) -
         convo.hexdigest(),
         ",".join(sorted(f"{c.get('name')}:{c.get('bucket')}" for c in checks if isinstance(c, dict))),
     ]
+    if ui_language:
+        parts.append(ui_language)
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
@@ -1727,7 +1828,8 @@ def _pr_lifecycle(detail: dict) -> str:
 
 
 def _build_pr_ai_prompt(
-    owner: str, repo: str, detail: dict, timeline: list[dict], checks: list[dict]
+    owner: str, repo: str, detail: dict, timeline: list[dict], checks: list[dict],
+    *, ui_language: str = "",
 ) -> str:
     """Assemble the single-call PR summary prompt.
 
@@ -1736,7 +1838,11 @@ def _build_pr_ai_prompt(
     prompt-injection text — so the whole payload is fenced in explicit markers and
     the instruction says to treat it as data. The output is prose only: there is
     no tool access and nothing downstream acts on it, so an injected instruction
-    has no mechanism to do anything beyond distorting one summary."""
+    has no mechanism to do anything beyond distorting one summary.
+
+    ``ui_language`` is a validated BCP-47 tag (see :func:`_ui_language`); ``""``
+    omits the language directive entirely, leaving the prompt byte-identical to
+    what unconfigured installs have always sent."""
     title = detail.get("title") or "(no title)"
     body = (detail.get("body") or "").strip() or "(no description)"
     if len(body) > _PR_AI_BODY_MAX_CHARS:
@@ -1822,20 +1928,26 @@ def _build_pr_ai_prompt(
         f"CONVERSATION (oldest first, newest last):\n{comments_block}\n"
         "</pull-request>\n\n"
         'Respond with ONLY the JSON object, e.g. {"summary": "..."}.'
+        + _language_directive(ui_language, 'the "summary"')
     )
 
 
 async def _compute_pr_ai(
     request: web.Request, owner: str, repo: str, number: int,
     detail: dict, timeline: list[dict], checks: list[dict],
+    *, ui_language: str = "",
 ) -> str:
-    """Run the one-shot PR summary call and return the redacted summary text."""
+    """Run the one-shot PR summary call and return the redacted summary text.
+
+    ``ui_language`` is resolved by the caller (``_handle_pull_ai``) rather than
+    here because the same tag must also feed :func:`_pr_ai_fingerprint` — one
+    read keeps the prompt and the cache key agreeing on the language."""
     import uuid
 
     from kiro_crew.llm_helpers import parse_llm_json
     from kiro_crew.security import redact
 
-    prompt = _build_pr_ai_prompt(owner, repo, detail, timeline, checks)
+    prompt = _build_pr_ai_prompt(owner, repo, detail, timeline, checks, ui_language=ui_language)
     key = f"issue-radar-pr-ai:{owner}/{repo}#{int(number)}:{uuid.uuid4().hex}"
     text = await _run_oneshot_model(request, key, prompt)
     data = parse_llm_json(text) or {}
@@ -1901,7 +2013,11 @@ async def _handle_pull_ai(request: web.Request) -> web.Response:
             key, store.write_pr_detail_cache, owner, repo, number, detail, timeline, checks
         )
 
-    fingerprint = _pr_ai_fingerprint(detail, timeline, checks)
+    # Resolved once per request, off-loop (config-file I/O — see _ui_language),
+    # and fed to BOTH the fingerprint and the prompt so the cached summary's
+    # language always matches the key it is stored under.
+    lang = await asyncio.to_thread(_ui_language)
+    fingerprint = _pr_ai_fingerprint(detail, timeline, checks, ui_language=lang)
     cached = None if force_refresh else await _st(
         key, store.read_pr_ai_cache, owner, repo, number, fingerprint=fingerprint
     )
@@ -1914,7 +2030,9 @@ async def _handle_pull_ai(request: web.Request) -> web.Response:
         })
 
     try:
-        summary = await _compute_pr_ai(request, owner, repo, number, detail, timeline, checks)
+        summary = await _compute_pr_ai(
+            request, owner, repo, number, detail, timeline, checks, ui_language=lang
+        )
     except Exception:
         logger.exception("pull-ai: computation failed for %s/%s#%s", owner, repo, number)
         return web.json_response(
@@ -2202,6 +2320,228 @@ async def _handle_issue_state(request: web.Request) -> web.Response:
     })
 
 
+# GitHub caps an issue at 10 assignees (its documented limit); reject a longer
+# list at the door rather than sending a request the forge will refuse. GitLab
+# Free allows one and truncates silently, which is why the returned set is always
+# read back from the write rather than echoed.
+MAX_ASSIGNEES = 10
+
+
+def _replace_assignees_checked(
+    key: provider.RepoKey, number: int, expected: list[str], desired: list[str]
+) -> tuple[list[str] | None, list[str]]:
+    """Replace an issue's assignees, but only if the forge still holds ``expected``.
+
+    Replace semantics have a lost-update hazard that a delta does not: two people
+    who each start from ``{A}`` and add one name send ``{A,B}`` and ``{A,C}``, and
+    the later write silently erases the earlier one's addition. A delta would
+    commute -- but a delta is not implementable across both providers, because
+    GitLab has no add/remove assignee endpoint at all (only whole-set
+    ``assignee_ids``), so an add/remove API would have to be emulated there by the
+    same read-modify-write and would carry the identical race while hiding it.
+
+    So the write keeps replace semantics and gains a PRECONDITION instead, which is
+    this repo's established answer to exactly this problem: the PR merge pins the
+    reviewed ``head_sha`` and the settings PUT echoes the ``revision`` it read, and
+    both answer 409 rather than clobbering. Here the client echoes the assignee set
+    it actually rendered; if the forge has moved since, nobody's edit is lost --
+    the second writer is told.
+
+    Returns ``(final_assignees, current)``. ``final_assignees`` is ``None`` when the
+    precondition failed, and ``current`` is then the set the forge actually holds so
+    the caller can hand it back for a re-read.
+
+    Runs in a worker thread with the per-issue write lock held across the read, the
+    compare and the write, so two writers inside THIS process serialize rather than
+    interleave; the precondition is what covers writers outside it.
+    """
+    owner, repo = key.owner, key.repo
+    client = provider.client_for(key)
+    pkw = provider.call_kwargs(key)
+    scope = _scope(key)
+
+    def _fold(logins: list[str]) -> set[str]:
+        # Order does not matter and the forge is case-preserving but not
+        # case-sensitive, so compare as a case-folded set.
+        return {s.strip().lower() for s in logins if isinstance(s, str) and s.strip()}
+
+    with store.issue_write_lock(owner, repo, number, scope):
+        detail = client.get_issue_detail(owner, repo, number, **pkw)
+        current = [a for a in (detail.get("assignees") or []) if isinstance(a, str) and a]
+        if _fold(current) != _fold(expected):
+            return None, current
+        final = client.set_issue_assignees(owner, repo, number, desired, **pkw)
+        try:
+            store.apply_assignees_change_to_caches(owner, repo, number, final, root=scope)
+        except Exception:
+            logger.warning(
+                "issue-radar: cache patch failed after an assignee change on %s#%s",
+                f"{owner}/{repo}", number, exc_info=True,
+            )
+        return final, current
+
+
+async def _handle_issue_assignees(request: web.Request) -> web.Response:
+    """POST /issue/assignees {"owner","repo","number","assignees":[...],"expected":[...]} —
+    REPLACE an issue's assignees with the given set.
+
+    The confirm half of the assignee editor: the client sends the FINAL set of
+    logins (not an add/remove delta) plus ``expected``, the set it last read. The
+    write only lands if the forge still holds ``expected``; otherwise it is a 409
+    carrying the current set, so a concurrent edit is reported rather than silently
+    overwritten (see :func:`_replace_assignees_checked`). An empty ``assignees``
+    array clears everyone -- but a junk entry is a 400, never a silent clear.
+
+    Gated on triage/push access (read-only repos get 403). A login the forge will
+    not assign is a 400 (``invalid_assignees`` names them), not a 502: GitHub
+    answers 422 and applies none of the write, and GitLab is pre-checked against the
+    project roster for the same reason. The response otherwise carries the set read
+    back from the write rather than the request, because a success is not required
+    to be an exact echo (GitLab Free keeps only the first assignee)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"error": "request body must be JSON", "code": "invalid_json"}, status=400
+        )
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "request body must be a JSON object", "code": "invalid_json"}, status=400
+        )
+
+    key = _key_from_body(body)
+    owner, repo = key.owner, key.repo
+    # No client/pkw here: every provider call for this route happens inside
+    # _replace_assignees_checked, which needs them under the same lock as the write.
+    number = body.get("number")
+    if not owner or not repo:
+        return web.json_response(
+            {"error": "missing 'owner'/'repo'", "code": "missing_repo"}, status=400
+        )
+    # bool is a subclass of int: JSON `true` would otherwise validate as #1.
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        return web.json_response(
+            {"error": "'number' must be a positive integer", "code": "invalid_number"}, status=400
+        )
+    # An unbounded int reaches the FILESYSTEM: issue_write_lock names its lock file
+    # after the number, so a several-hundred-digit value raises ENAMETOOLONG and
+    # answers 500 on input that should simply be a 400. Same bound and code the
+    # investigation route uses.
+    if number > MAX_ITEM_NUMBER:
+        return web.json_response(
+            {
+                "error": f"number must be at most {MAX_ITEM_NUMBER}",
+                "code": "item_number_out_of_range",
+            },
+            status=400,
+        )
+
+    assignees = body.get("assignees")
+    if not isinstance(assignees, list):
+        return web.json_response(
+            {"error": "'assignees' must be an array", "code": "assignees_not_array"}, status=400
+        )
+    # REJECT a junk entry rather than dropping it. Silently filtering was a
+    # destructive bug on a replace endpoint: `[null]` normalized to `[]`, which is
+    # the wire form for "clear everyone", so a malformed request unassigned the
+    # whole issue instead of failing. An empty array still means clear -- but only
+    # when the caller actually sent an empty array.
+    cleaned: list[str] = []
+    for entry in assignees:
+        if not isinstance(entry, str) or not entry.strip():
+            return web.json_response(
+                {"error": "each entry in 'assignees' must be a non-empty string",
+                 "code": "invalid_assignee_entry"},
+                status=400,
+            )
+        cleaned.append(entry.strip())
+    assignees = cleaned
+    # Dedupe while preserving order — a repeated login is a no-op to the provider
+    # but would inflate the count against the cap.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for login in assignees:
+        low = login.lower()
+        if low not in seen:
+            seen.add(low)
+            deduped.append(login)
+    assignees = deduped
+
+    # The set the client RENDERED, echoed back so the write carries a precondition
+    # (see _replace_assignees_checked). Required, and fail-closed: without it the
+    # endpoint would silently overwrite a concurrent edit, which is the whole
+    # hazard replace semantics carry.
+    expected = body.get("expected")
+    if not isinstance(expected, list) or not all(isinstance(s, str) for s in expected):
+        return web.json_response(
+            {"error": "'expected' must be an array of the assignee logins you last read",
+             "code": "expected_required"},
+            status=400,
+        )
+    if len(assignees) > MAX_ASSIGNEES:
+        return web.json_response(
+            {"error": f"at most {MAX_ASSIGNEES} assignees", "code": "too_many_assignees"},
+            status=400,
+        )
+
+    if not await asyncio.to_thread(_connected, key):
+        return web.json_response(
+            {"error": f"{owner}/{repo} is not connected — call /connect first",
+             "code": "repo_not_connected"},
+            status=404,
+        )
+
+    target = f"{owner}/{repo}#{number}"
+    if (await asyncio.to_thread(_repo_can_write, key)) is not True:
+        _audit("issue_assignees", target, "denied", error="no confirmed write access")
+        return web.json_response(
+            {"error": "This repo is connected read-only — you need triage or push access to edit assignees.",
+             "code": "repo_read_only"},
+            status=403,
+        )
+
+    try:
+        final_assignees, current = await asyncio.to_thread(
+            partial(_replace_assignees_checked, key, number, expected, assignees)
+        )
+    except GhPermissionError as exc:
+        _audit("issue_assignees", target, "denied", error=str(exc))
+        return web.json_response(
+            {"error": str(exc), "code": "provider_forbidden"}, status=403
+        )
+    except GhInvalidInputError as exc:
+        # The forge refused a LOGIN, not the caller: 400, naming who was refused.
+        # A 502 here would report the forge as broken and invite a retry that can
+        # only fail the same way. Neither provider applies a partial write in this
+        # case, so nothing changed on the issue.
+        _audit("issue_assignees", target, "failure", error=str(exc))
+        return web.json_response(
+            {"error": str(exc), "code": "invalid_assignees", "invalid_assignees": exc.values},
+            status=400,
+        )
+    except GhCliError as exc:
+        _audit("issue_assignees", target, "failure", error=str(exc))
+        return web.json_response(
+            {"error": str(exc), "code": "provider_error"}, status=502
+        )
+
+    if final_assignees is None:
+        # Somebody else changed the assignees between the read this client rendered
+        # and this write. Nothing was written; hand back what the forge holds so the
+        # client can re-render and let the user redo the edit on current state.
+        _audit("issue_assignees", target, "failure", error="assignees changed elsewhere")
+        return web.json_response(
+            {"error": "The assignees changed elsewhere since you loaded this issue.",
+             "code": "assignees_conflict", "assignees": current},
+            status=409,
+        )
+
+    _audit("issue_assignees", target, "ok")
+    return web.json_response(
+        {"owner": owner, "repo": repo, "number": number, "assignees": final_assignees}
+    )
+
+
 # ── investigation records (the "Investigate" button) ────────────────────────
 #
 # "Investigate" opens a KiroCrew chat session (seeded with an investigation
@@ -2378,11 +2718,22 @@ def _short_rationale(raw: object) -> str:
     return redact(text)[:_RATIONALE_MAX_CHARS]
 
 
-def _build_reco_prompt(owner: str, repo: str, existing_labels: list[dict], issues: list[dict]) -> str:
+def _build_reco_prompt(
+    owner: str, repo: str, existing_labels: list[dict], issues: list[dict],
+    *, ui_language: str = "",
+) -> str:
     """Assemble the taxonomy-proposal prompt. Open-issue text is UNTRUSTED
     (prompt-injection surface), so it is fenced and marked as data; the output is
     further constrained downstream (names intersected AGAINST the existing set to
     guarantee 'new', category constrained to the known set, colors validated).
+
+    ``ui_language`` is a validated BCP-47 tag (see :func:`_ui_language`); ``""``
+    omits the language directive entirely, leaving the prompt byte-identical to
+    what unconfigured installs have always sent. ONLY the ``rationale``
+    localizes — it renders purely as dashboard prose. ``name`` and
+    ``description`` are deliberately excluded: /labels/create writes both onto
+    the GitHub repo itself when a proposal is applied, and repo content should
+    follow the repo's own label language, not one operator's dashboard setting.
 
     The prompt deliberately presets NO naming style. Real repos are split across
     several mutually incompatible conventions — flat (`bug`), slash namespaces
@@ -2451,6 +2802,12 @@ def _build_reco_prompt(owner: str, repo: str, existing_labels: list[dict], issue
         '{"recommendations": [{"name": "<name in this repo\'s style>", "category": '
         '"priority", "color": "d73a4a", "description": "Urgent, address first", '
         '"rationale": "...", "examples": [12]}]}'
+        + _language_directive(
+            ui_language,
+            'each "rationale" — and ONLY the rationale; "name" and "description" '
+            "become repo content on GitHub when applied, so keep them consistent "
+            "with the EXISTING LABELS language",
+        )
     )
 
 
@@ -2474,7 +2831,9 @@ async def _compute_label_recommendations(
         raise RuntimeError("session manager unavailable")
 
     kiro_agent = "kirocrew-lite"
-    prompt = _build_reco_prompt(owner, repo, existing_labels, issues)
+    # Off-loop: the language read is config-file I/O (see _ui_language).
+    lang = await asyncio.to_thread(_ui_language)
+    prompt = _build_reco_prompt(owner, repo, existing_labels, issues, ui_language=lang)
 
     import uuid
 
@@ -4173,6 +4532,9 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/apps/issue-radar/pull-ai", _require_enabled(_handle_pull_ai))
     app.router.add_post("/api/apps/issue-radar/labels/apply", _require_enabled(_handle_labels_apply))
     app.router.add_post("/api/apps/issue-radar/issue/state", _require_enabled(_handle_issue_state))
+    app.router.add_post(
+        "/api/apps/issue-radar/issue/assignees", _require_enabled(_handle_issue_assignees)
+    )
     # Pull-request actions (see the "pull-request actions" section above).
     app.router.add_post("/api/apps/issue-radar/pull/state", _require_enabled(_handle_pull_state))
     app.router.add_post("/api/apps/issue-radar/pull/review", _require_enabled(_handle_pull_review))

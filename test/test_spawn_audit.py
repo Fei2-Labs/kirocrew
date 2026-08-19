@@ -148,6 +148,14 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
         # futex, never exec'd, never exited, and pinned every fd it inherited --
         # including gateway.lock and the dashboard listener.
         "kiro_prerequisite.py::_run_process",
+        # Spawns NOTHING. It PATCHES `sandboxed_spawn_argv` and raises from the
+        # replacement, so the argv is captured at the boundary and no child is ever
+        # created -- but the name appears in the function body, which is what this scan
+        # matches on. A resource ceiling has nothing to apply to. Deliberately NOT in
+        # BENIGN_SPAWNS: that set is for an UNROUTED spawn, and the staleness check
+        # correctly rejects this key there.
+        "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py"
+        "::test_every_git_invocation_carries_the_identity",
     }
 )
 
@@ -489,6 +497,11 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Same classification as the other ``asyncio.run`` sites in this list
         # (cli_doctor.py::_doctor, cli_commands.py::_cleanup_app_crons_from_scheduler).
         "apps/builtins/issue_radar/tests/test_pr_actions.py::_await",
+        # Same construct, same classification, for the assignee-route tests: an
+        # ``asyncio.run`` that drives one in-process aiohttp handler coroutine to
+        # completion. No child process, and every payload is a literal in the test
+        # file.
+        "apps/builtins/issue_radar/tests/test_assignees.py::_await",
         # md-notebook shells out to the real git binary rather than a pure-Python
         # implementation, because a server refuses a push from the shallow clone
         # isomorphic-git produces. The command is the literal "git"; the remote

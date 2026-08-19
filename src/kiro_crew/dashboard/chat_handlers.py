@@ -34,6 +34,7 @@ from kiro_crew.dashboard.chat_auto_tag import maybe_auto_tag
 from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_orchestrator import _stage_loop
 from kiro_crew.dashboard.chat_persistence import (
+    COLOR_HEX_RE,
     _attach_variants,
     _rehydrate_slot_title,
     get_reasoning_effort_values,
@@ -110,6 +111,12 @@ _SESSION_RELOAD_NOTICE = (
     "Reloading session: relaunching the agent process with a freshly loaded "
     "agent spec, environment, and MCP servers. The conversation is preserved."
 )
+
+# Approval modes that grant auto-approval to the SLOT they name, as opposed to
+# the process-global YOLO grant. A tuple, not a set: membership is tested against
+# a request-supplied value, and tuple `in` compares by equality rather than
+# hashing, so a non-string body value answers False instead of raising.
+_SLOT_SCOPED_TRUST_MODES = ("trust", "trust_reads")
 
 
 def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
@@ -711,6 +718,81 @@ async def api_chat_slots(request: web.Request) -> web.Response:
         if urls:
             schedule_check_refresh(urls, state.push_slots_update)
     return web.json_response(payloads)
+
+
+async def api_chat_slot_source_links(request: web.Request) -> web.Response:
+    """GET /api/chat/slots/{slot}/source-links — every PR/issue link, unbudgeted.
+
+    The slots payload caps chips per kind, so the sidebar's "+N" overflow chip
+    has nothing on the client to expand into. This is the lazy read behind that
+    expand, kept off the slots broadcast on purpose: widening the budget would
+    put up to ``_MAX_SOURCE_LINKS_PER_SLOT`` links per slot on the wire for every
+    row nobody expanded, on every push.
+    """
+    # circular import: source_providers imports chat state helpers, so a
+    # top-level import would close a cycle (same pattern as api_chat_slots'
+    # owner-only check-status gate above).
+    from kiro_crew.dashboard.handlers.source_providers import (
+        ensure_gitlab_hosts_loaded,
+        is_owner_dashboard_request,
+    )
+
+    state: DashboardState = request.app["state"]
+    slot = state._slots.get(request.match_info["slot"])
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    # App ownership check (App Kit §5.2): deny-by-default for app tokens. An app
+    # token scoped to /api/chat/slots/* would otherwise name any slot the list
+    # endpoint reveals and read every pull request and issue URL a dashboard or
+    # foreign-app session ever mentioned. Same indistinguishable 404 as the send
+    # path -- SAME error code too, so the response cannot be used to probe which
+    # foreign slots exist.
+    request_app = request.get("app", "")
+    if request_app and request_app != slot._app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat_source_links",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+            error=(
+                "app cannot access unscoped slots"
+                if not slot._app
+                else "app does not own this slot"
+            ),
+        )
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if request_app:
+        # The ALLOW is a permission decision too, and an audit trail that records
+        # only refusals cannot answer which app actually read a slot's links.
+        # Dashboard callers are deliberately not logged here: they are the owner,
+        # and every sidebar expand would otherwise write an event.
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat_source_links",
+            outcome="allowed",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+        )
+
+    # Same warm-up as GET /api/chat/slots: link extraction is synchronous and
+    # cannot load the self-managed GitLab allowlist itself, so a cold expand
+    # would drop every self-hosted MR link from the revealed set.
+    try:
+        await ensure_gitlab_hosts_loaded()
+    except Exception:
+        logger.debug(
+            "GitLab allowlist warm-up failed; expanded chips may lag one round", exc_info=True
+        )
+
+    # Cached status only, owner-gated exactly like the list endpoint. No
+    # schedule_check_refresh here: that pushes a `slots` update, which by
+    # definition cannot carry links outside the budget, so the provider work
+    # would produce a result this response can never show.
+    return web.json_response(
+        slot.source_links_payload(include_check_status=is_owner_dashboard_request(request))
+    )
 
 
 def _finite_number(value: Any) -> float | None:
@@ -4018,6 +4100,9 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         slot.pinned = True
     if meta.get("color_index") is not None:
         slot.color_index = meta["color_index"]
+    _ch = meta.get("color_hex")
+    if isinstance(_ch, str) and COLOR_HEX_RE.match(_ch):
+        slot.color_hex = _ch.lower()
     if meta.get("color_theme"):
         slot.color_theme = meta["color_theme"]
         slot.theme_consent = meta.get("theme_consent") is True
@@ -4138,6 +4223,26 @@ async def api_chat_mode(request: web.Request) -> web.Response:
     mode = body.get("mode", "normal")
     slot_key = body.get("slot") or None
 
+    # The safety override (YOLO) is PROCESS-GLOBAL while an approval mode is
+    # per-slot, so revoking it on behalf of a request that named ONE slot drops
+    # every OTHER slot out of YOLO too. That is how a programmatic per-slot
+    # `trust` — the call an automation makes when it creates a session — silently
+    # ends an operator's live grant minutes after they enabled it.
+    #
+    # A slot-scoped `trust`/`trust_reads` therefore leaves the grant alone: it
+    # asks for auto-approval on one slot and cannot be answered by withdrawing
+    # authority elsewhere. Everything else still revokes, so `normal` remains the
+    # off-switch at any scope and the dashboard picker (which always names its own
+    # slot) keeps working.
+    #
+    # A grant DECLARED in owner-only config is exempt from the narrowing: it has
+    # no TTL, and selecting another approval mode is the one action documented to
+    # end it. Identity is the grant's source, never its permanence — an
+    # `until_shutdown` ad-hoc pick is equally permanent and must stay protected.
+    slot_scoped_trust = slot_key is not None and mode in _SLOT_SCOPED_TRUST_MODES
+    if mode != "yolo" and (not slot_scoped_trust or safety_override().is_declared):
+        safety_override().deactivate("dashboard")
+
     if mode == "yolo":
         result = await asyncio.to_thread(safety_override().activate, "dashboard")
         if not result.active:
@@ -4155,7 +4260,6 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("SEL audit failed for YOLO mode activation", exc_info=True)
     elif mode == "trust_reads":
-        safety_override().deactivate("dashboard")
         if slot_key and slot_key in state._slots:
             state._slots[slot_key]._trust = False
             state._slots[slot_key]._trust_reads = True
@@ -4175,7 +4279,6 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("SEL audit failed for trust_reads mode activation", exc_info=True)
     elif mode == "trust":
-        safety_override().deactivate("dashboard")
         mgr = getattr(state, "channel_manager", None)
         if slot_key is not None:
             if slot_key not in state._slots:
@@ -4208,7 +4311,6 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("SEL audit failed for trust mode activation", exc_info=True)
     else:  # normal
-        safety_override().deactivate("dashboard")
         mgr = getattr(state, "channel_manager", None)
         if slot_key is not None:
             if slot_key not in state._slots:
@@ -4497,7 +4599,16 @@ MAX_COLOR_INDEX = 20
 
 
 async def api_chat_slot_color(request: web.Request) -> web.Response:
-    """PATCH /api/chat/slots/{slot}/color — set session color."""
+    """PATCH /api/chat/slots/{slot}/color — set session color.
+
+    Accepts ``color_index`` (int 0..MAX_COLOR_INDEX or null, resolved
+    client-side against the viewer's generated palette) and/or ``color_hex``
+    (``#rrggbb`` or null, a theme-independent custom color). The two are
+    mutually exclusive: setting a non-null value for one clears the other, so
+    a slot can never carry both and clients need no precedence rule. Keys are
+    ``in body``-gated so an old client sending only ``color_index`` cannot
+    silently null an existing hex.
+    """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
     slot = state._slots.get(name)
@@ -4507,6 +4618,8 @@ async def api_chat_slot_color(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    has_ci = "color_index" in body
+    has_ch = "color_hex" in body
     ci = body.get("color_index")
     if ci is not None and (
         isinstance(ci, bool) or not isinstance(ci, int) or ci < 0 or ci > MAX_COLOR_INDEX
@@ -4515,10 +4628,25 @@ async def api_chat_slot_color(request: web.Request) -> web.Response:
             {"error": f"color_index must be a non-negative integer <= {MAX_COLOR_INDEX} or null"},
             status=400,
         )
-    slot.color_index = ci
+    ch = body.get("color_hex")
+    if ch is not None and (not isinstance(ch, str) or not COLOR_HEX_RE.match(ch)):
+        return web.json_response(
+            {"error": "color_hex must be #RRGGBB or null", "code": "invalid_color_hex"},
+            status=400,
+        )
+    if has_ci:
+        slot.color_index = ci
+        if ci is not None:
+            slot.color_hex = None
+    if has_ch:
+        slot.color_hex = ch.lower() if isinstance(ch, str) else None
+        if ch is not None:
+            slot.color_index = None
     slot._dirty = True
     state.push_slots_update()
-    return web.json_response({"ok": True, "color_index": ci})
+    return web.json_response(
+        {"ok": True, "color_index": slot.color_index, "color_hex": slot.color_hex}
+    )
 
 
 _MAX_CONTEXT_PER_SOURCE = 10

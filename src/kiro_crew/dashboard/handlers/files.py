@@ -1932,8 +1932,6 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
     (file-raw) performs no content scan at all. The probe exists to catch
     the honest-mistake shape: a text file wearing a forged media magic.
     """
-    import os  # noqa: F811
-
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
     def _log(outcome: str, res: str) -> None:
@@ -2015,9 +2013,12 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
     result = await asyncio.to_thread(_open_media, raw_path)
     if result[0] == "refused":
         _, code, res = result
-        outcome = "not_found" if code == "not_found" else (
-            "failure" if code == "read_failed" else "denied"
-        )
+        if code == "not_found":
+            outcome = "not_found"
+        elif code == "read_failed":
+            outcome = "failure"
+        else:
+            outcome = "denied"
         _log(outcome, res)
         # One literal response per refusal class: the error-response contract
         # requires the {"error", "code"} body and the status to be statically
@@ -2198,6 +2199,31 @@ async def api_file_write(request: web.Request) -> web.Response:
         return web.json_response({"error": "failed to write file"}, status=500)
 
 
+def _subsequence_run(q: str, haystack: str) -> tuple[int, int]:
+    """Greedily match ``q`` as a subsequence of ``haystack``.
+
+    Returns how many of ``q``'s characters were consumed in order, and the
+    longest run of matches that landed on consecutive ``haystack`` positions
+    within that single greedy pass -- NOT the longest contiguous occurrence of
+    ``q``, since the scan never backtracks over an earlier isolated match
+    (``q="ab"`` against ``"axxab"`` consumes both chars but reports a run of
+    1). A consumed count below ``len(q)`` means ``haystack`` does not contain
+    ``q`` as a subsequence at all; the caller normalizes the run length by
+    ``len(q)`` into the contiguity term of the fuzzy score.
+    """
+    qi = 0
+    consecutive = 0
+    max_run = 0
+    for ch in haystack:
+        if qi < len(q) and ch == q[qi]:
+            qi += 1
+            consecutive += 1
+            max_run = max(max_run, consecutive)
+        else:
+            consecutive = 0
+    return qi, max_run
+
+
 def _fuzzy_score(q: str, name: str, rel: str) -> float:
     """Score a file match. Higher = better. Returns 0 for no match."""
     nl = name.lower()
@@ -2215,31 +2241,14 @@ def _fuzzy_score(q: str, name: str, rel: str) -> float:
     elif q in rl:
         score += 10.0
     else:
-        # Fuzzy: check if query chars appear in order in filename
+        # Fuzzy: check whether the query chars appear in order in the
+        # filename, falling back to the search-root-relative path when the
+        # filename alone does not carry the query as an in-order subsequence.
         matched_on_name = True
-        qi = 0
-        consecutive = 0
-        max_run = 0
-        for ch in nl:
-            if qi < len(q) and ch == q[qi]:
-                qi += 1
-                consecutive += 1
-                max_run = max(max_run, consecutive)
-            else:
-                consecutive = 0
+        qi, max_run = _subsequence_run(q, nl)
         if qi < len(q):
-            # Try path if filename didn't match all chars
             matched_on_name = False
-            qi = 0
-            consecutive = 0
-            max_run = 0
-            for ch in rl:
-                if qi < len(q) and ch == q[qi]:
-                    qi += 1
-                    consecutive += 1
-                    max_run = max(max_run, consecutive)
-                else:
-                    consecutive = 0
+            qi, max_run = _subsequence_run(q, rl)
         if qi < len(q):
             return 0.0  # not all query chars found
         # Score based on coverage ratio and longest consecutive run
@@ -3425,8 +3434,6 @@ async def api_file_sheet(request: web.Request) -> web.Response:
     soft-imported: without it the endpoint answers 501 and the frontend
     degrades to the download card.
     """
-    import os  # noqa: F811
-
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
     def _log(outcome: str, res: str) -> None:
@@ -3865,6 +3872,143 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         result["branch"] = redact(result["branch"])
     for f in result.get("files", []):
         f["path"] = redact(f["path"])
+    return web.json_response(result)
+
+
+# Cap on entries returned by api_project_tree. The dashboard tree virtualizes
+# rendering, so the cap bounds response size and walk time, not the UI.
+_PROJECT_TREE_MAX_ENTRIES = 10_000
+
+# Directories never worth listing in a workspace tree. Applied only on the
+# non-git fallback walk — git listings already honor .gitignore.
+_PROJECT_TREE_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        "dist",
+        "build",
+        ".next",
+        ".cache",
+        "target",
+        ".gradle",
+        ".idea",
+    }
+)
+
+
+async def api_project_tree(request: web.Request) -> web.Response:
+    """GET /api/project/tree?path=... - workspace file listing for a project dir.
+
+    Returns project-relative POSIX file paths for rendering a workspace tree.
+    Inside a git repository the listing is ``git ls-files --cached --others
+    --exclude-standard`` scoped to the project dir (tracked + untracked,
+    .gitignore honored); outside one it is a bounded directory walk. Path must
+    match a known project directory (same allow-list as api_project_git).
+    """
+    state: DashboardState = request.app["state"]
+    caller = request.get("user", "dashboard")
+    raw = request.query.get("path", "").strip()
+    if not raw:
+        return web.json_response({"error": "path required", "code": "path_required"}, status=400)
+    project = await asyncio.to_thread(
+        _match_known_project_for, _slot_project_snapshot(state), raw
+    )
+    if project is None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="project_tree",
+            outcome="denied",
+            resources=raw,
+            error="not a known project directory",
+        )
+        return web.json_response(
+            {"error": "Unknown project directory", "code": "unknown_project_dir"}, status=403
+        )
+
+    base = await asyncio.to_thread(
+        lambda: os.path.realpath(os.path.expanduser(project))
+    )
+    if await asyncio.to_thread(is_sensitive_path, base):
+        _sel().log_api_access(
+            caller=caller,
+            operation="project_tree",
+            outcome="denied",
+            resources=base,
+            error="sensitive path",
+        )
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
+    _sel().log_api_access(
+        caller=caller, operation="project_tree", outcome="allowed", resources=base
+    )
+    if not await asyncio.to_thread(os.path.isdir, base):
+        return web.json_response({"root": redact(base), "paths": [], "repo": False})
+
+    def _run() -> dict:
+        # git listing first: honors .gitignore, includes tracked-but-deleted
+        # files (they render with a deleted status lane), and with cwd=base a
+        # project dir that is a repo SUBDIRECTORY lists only its own subtree.
+        # -z: NUL separation, so no C-quoting and exotic names survive intact.
+        probe_rc, _probe_out, _ = _run_git_bounded(
+            ["git", "rev-parse", "--git-dir"], cwd=base, env=os.environ.copy(), timeout=5,
+        )
+        if probe_rc == 0:
+            ls_rc, ls_out, _ = _run_git_bounded(
+                # `core.fsmonitor=` disables the filesystem-monitor hook: it names a
+                # command git would SPAWN, and it is repository-writable, so an agent
+                # that can write `.git/config` could otherwise have a tree listing
+                # execute it. Empty rather than `false` to match the sibling git
+                # invocations in this module. The `rev-parse` probe above needs no
+                # such guard — it reads no index and walks no working tree.
+                [
+                    "git", "-c", "core.fsmonitor=",
+                    "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+                ],
+                cwd=base,
+                env=os.environ.copy(),
+                timeout=15,
+            )
+            if ls_rc == 0:
+                listed = [p for p in ls_out.split("\0") if p]
+                truncated = len(listed) > _PROJECT_TREE_MAX_ENTRIES
+                return {
+                    "root": base,
+                    "paths": listed[:_PROJECT_TREE_MAX_ENTRIES],
+                    "repo": True,
+                    "truncated": truncated,
+                }
+
+        # Fallback: bounded filesystem walk (non-repo project dirs).
+        paths: list[str] = []
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in _PROJECT_TREE_SKIP_DIRS and not d.startswith(".")
+            )
+            rel_dir = os.path.relpath(dirpath, base)
+            prefix = "" if rel_dir == "." else rel_dir.replace(os.sep, "/") + "/"
+            for name in sorted(filenames):
+                paths.append(prefix + name)
+                if len(paths) >= _PROJECT_TREE_MAX_ENTRIES:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        return {"root": base, "paths": paths, "repo": False, "truncated": truncated}
+
+    result = await asyncio.to_thread(_run)
+    # Egress redaction, same rationale as api_project_git_status: listed names
+    # are repo content and this body is rendered by the dashboard.
+    result["root"] = redact(result["root"])
+    result["paths"] = [redact(p) for p in result["paths"]]
     return web.json_response(result)
 
 

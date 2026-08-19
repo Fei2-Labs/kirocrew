@@ -14,7 +14,7 @@
     "apps": "アプリ",
     "auto_update_on_restart": "再起動時に自動更新",
     "bonus_credits": "ボーナスクレジット",
-    "builder_id": "ビルダー ID",
+    "builder_id": "Builder ID",
     "cancel_update": "更新をキャンセル",
     "changelog": "チェンジログ",
     "check_logs_for_details": "詳細はログを確認してください。",
@@ -1481,6 +1481,7 @@
     },
     "issueRadar": {
       "api": {
+        "assignees_changed_elsewhere": "この課題を読み込んだ後、担当者が別の場所で変更されました。",
         "these_settings_changed_elsewhere": "これらの設定は別の場所で変更されました。"
       },
       "components": {
@@ -1501,6 +1502,14 @@
           "regenerate_ai_summary": "AI要約を再生成",
           "regenerate_summary": "要約を再生成",
           "retry": "再試行"
+        },
+        "assigneePicker": {
+          "assigned_but_not_a_member": "これらの担当者はリポジトリのメンバーではありません。",
+          "choose_assignees": "担当者を選択",
+          "filter_members": "メンバーを絞り込む…",
+          "no_members": "割り当てられるメンバーがいません — このリポジトリには読み取り可能な名簿がありません。",
+          "not_a_member": "{{login}} はこのリポジトリのメンバーではありません",
+          "this_is_you": "{{login}}（あなた）"
         },
         "detailOverflowMenu": {
           "more_actions": "その他の操作"
@@ -1534,6 +1543,7 @@
           "added_this_to_the": "これを追加した",
           "as_completed": "完了として",
           "as_not_planned": "計画外として",
+          "assign_me": "自分に割り当てる",
           "assigned": "割り当て",
           "assignees": "担当者",
           "by": "· 者",
@@ -1544,11 +1554,16 @@
           "closed_as_not_planned": "計画外として閉じられた",
           "closed_this": "これを閉じた",
           "commented": "コメント",
+          "copy_failed": "コピーに失敗しました",
           "copy_link_to_this_issue": "このIssueへのリンクをコピー",
           "couldn_t_load_activity": "アクティビティを読み込めませんでした：",
           "dates": "日付",
           "done": "完了",
+          "done_editing_assignees": "担当者の編集を完了",
+          "done_editing_labels": "ラベルの編集を完了",
           "edit": "編集",
+          "edit_assignees": "担当者を編集",
+          "edit_labels": "ラベルを編集",
           "finding_suggestions": "提案を検索中…",
           "in": "の中",
           "issue": "Issue",
@@ -1582,6 +1597,7 @@
           "self_assigned_this": "自分に割り当てた",
           "suggested": "提案",
           "timeline": "タイムライン",
+          "unassign_me": "自分の割り当てを解除",
           "unassigned": "未割り当て",
           "updated": "更新"
         },
@@ -1735,6 +1751,7 @@
           "closed_this": "これを閉じました",
           "commented": "コメント",
           "commits": "コミット",
+          "copy_failed": "コピーに失敗しました",
           "copy_link_to_this": "この {{subject}} へのリンクをコピー",
           "couldnt_load_activity": "アクティビティを読み込めませんでした：{{error}}",
           "dates": "日付",
@@ -2141,7 +2158,12 @@
             "refresh_section": "更新",
             "repositories": "リポジトリ",
             "settings": "設定",
-            "your": "あなたの"
+            "your": "あなたの",
+            "agent_section": "エージェント",
+            "agent_intro": "調査エージェントとレビューエージェントが結果をどのように報告するか。",
+            "agent_language": "エージェントの言語",
+            "agent_language_hint": "エージェントが調査結果とレビュー案を書く言語です。ラベル名、コード、ファイルパスは原文のままです。変更後に開始したセッションに適用され、再開した調査は開始時の言語を保ちます。",
+            "agent_language_follow": "ダッシュボードと同じ（{{language}}）"
           },
           "repoSettings": {
             "ai_label_recommendations": "AIラベル推奨",
@@ -3659,9 +3681,7 @@
         "no_messages": "コンパイラーが何も報告していません。",
         "typesetting_hints_other": "{{count}} 件の植字ヒント"
       },
-      "editor": {
-        "loading_editor": "エディターを読み込み中…"
-      },
+      "editor": {},
       "fileTree": {
         "delete_file": "{{file}} を削除",
         "files": "ファイル",
@@ -3752,13 +3772,13 @@
     "personalShopper": {
       "manifest": {
         "description": "実際のストアを調べ、購入で終わるとは限らない問題の解決を手伝うパーソナルアドバイザーです。「好み」タブはあなた用の参照リストで、大事なものはチャットに貼ってください。購入は一切行いません — 決めるのはあなたです。",
-        "display_name": "パーソナルショッパー",
+        "display_name": "Personal Shopper",
         "highlight_1": "何かを薦める前に問題を見極めます — 買わないことが答えの場合もあります",
         "highlight_2": "大事な好みはチャットに貼ってください — アドバイザーが読むのはあなたのメッセージで、「好み」タブではありません",
         "highlight_3": "あなたが挙げたストアだけを調べ、価格はアカウント経由ではなく公開ページのものだと明示します",
         "highlight_4": "カートや決済に到達する手段をそもそも持ちません",
         "highlight_5": "保存した好みは「好み」タブでグループに整理できます",
-        "page_label": "パーソナルショッパー"
+        "page_label": "Personal Shopper"
       },
       "historyTab": {
         "liked": "高評価",
@@ -3776,7 +3796,7 @@
         "change_feedback": "評価を変更"
       },
       "personalShopperPage": {
-        "personal_shopper": "パーソナルショッパー",
+        "personal_shopper": "Personal Shopper",
         "say_something_like_help_me_find_running_shoes_or": "「ランニングシューズを探して」や「娘の誕生日が近い」のように話しかけてください",
         "start_a_conversation_with_your_personal_advisor": "どのチャットセッションでもパーソナルアドバイザーと会話を始められます。",
         "start_advisor_conversation": "アドバイザーと会話を始める",
@@ -4334,6 +4354,10 @@
       "the_import_did_not_finish_please_try_again": "インポートが完了しませんでした。もう一度お試しください。",
       "try_again": "もう一度試す",
       "we_could_not_scan_agent_setup": "エージェントセットアップをスキャンできませんでした",
+      "found_setup_kirocrew_could_not_read": "Kiro Crew が読み取れないセットアップが見つかりました",
+      "found_setup_but_could_not_read_it": "Kiro Crew は {{sources}} を検出しましたが、ファイルを読み取れなかったため、何もインポートされませんでした。",
+      "some_setup_could_not_be_read": "Kiro Crew は {{sources}} を読み取れませんでした（以下には表示されません）。",
+      "files_could_not_be_read": "ファイルを読み取れませんでした",
       "your_existing_kirocrew_setup_will_not_be_affecte": "既存の Kiro Crew セットアップは影響を受けません。",
       "your_selected_setup_is_ready_in_kiro_crew": "選択されたセットアップは Kiro Crew で準備ができています。"
     },
@@ -4672,9 +4696,9 @@
       "project": "プロジェクト",
       "project_2": "プロジェクト：{{path}}",
       "queue": "キュー",
-      "queue_desc": "現在のターンが完了した後に実行",
+      "queue_run_after_the_current_work_finishes_desc": "現在の処理が完了した後に実行",
       "queue_message": "メッセージをキューに追加",
-      "queue_run_after_the_current_turn_finishes_enter": "キュー — 現在のターンが完了した後に実行 (Enter)",
+      "queue_run_after_the_current_work_finishes_enter": "キュー — 現在の処理が完了した後に実行 (Enter)",
       "quick_actions_like_clearing_the_chat_or_checking": "チャットをクリアしたり使用状況を確認したりするなどのクイックアクション",
       "recording_click_mic_to_stop": "録音中… マイクをクリックして停止",
       "reference_a_file": "ファイルを参照",
@@ -4698,8 +4722,8 @@
       "skill": "スキル",
       "slash_commands": "スラッシュコマンド",
       "steer": "指示を追加",
-      "steer_desc": "実行中のターンに今すぐ注入",
-      "steer_inject_into_the_running_turn_enter": "指示を追加 — 実行中のターンへ反映（Enter）",
+      "steer_act_on_this_right_away_desc": "今すぐ対応",
+      "steer_act_on_this_as_soon_as_possible_enter": "指示を追加 — できるだけ早く対応 (Enter)",
       "stop_generation": "生成を停止",
       "stop_recording": "録音を停止",
       "stop_the_current_response_to_switch_agents": "現在の応答を停止してエージェントを切り替え",
@@ -4921,7 +4945,6 @@
     "contentRenderer": {
       "changes_update_svg_preview_as_you_type": "入力内容に合わせてプレビューが更新されます。",
       "editing_svg": "SVG を編集中",
-      "loading_editor": "エディターを読み込み中…",
       "svg_source_code": "SVG ソースコード"
     },
     "contextBar": {
@@ -4946,25 +4969,19 @@
       "close": "閉じる"
     },
     "diffBlock": {
-      "collapse": "▲ 折りたたむ",
-      "context_lines": "コンテキスト行",
       "copied": "コピーしました！",
       "copy_patch": "パッチをコピー",
-      "diff": "diff",
       "generating_diff": "diff を生成中…",
-      "lines_hidden": "行を非表示",
       "open": "開く",
       "open_in_side_panel": "{{path}} をサイドパネルで開く",
       "split_view": "分割ビュー",
       "switch_to_split_view": "分割ビューに切り替え",
       "switch_to_unified_view": "統一ビューに切り替え",
-      "unchanged_lines_other": "{{count}} 行の変更なし",
       "unified_view": "統一ビュー"
     },
     "diffPanel": {
       "click_to_copy_path": "クリックしてパスをコピー",
-      "contents_identical": "内容は同じです",
-      "loading_diff": "diff を読み込み中…"
+      "contents_identical": "内容は同じです"
     },
     "discoverySearchBar": {
       "clear_search": "検索をクリア",
@@ -5024,14 +5041,19 @@
       "video": "動画：{{name}}"
     },
     "fileChangeChips": {
+      "additions_other": "{{count}} 件の追加",
       "artifact": "アーティファクト",
       "changed": "変更",
       "file_other": "{{count}} 個のファイル",
       "more": "その他",
       "no_changes": "変更なし",
+      "open": "ファイルを開く",
+      "open_in_side_panel": "{{path}} をサイドパネルで開く",
+      "removals_other": "{{count}} 件の削除",
       "show": "表示",
       "show_less": "表示を減らす",
-      "this_document_is_tracked_as_a_session_artifact_n": "このドキュメントはセッションアーティファクトとして追跡されており、ソースファイルの変更ではありません"
+      "this_document_is_tracked_as_a_session_artifact_n": "このドキュメントはセッションアーティファクトとして追跡されており、ソースファイルの変更ではありません",
+      "toggle_diff": "{{path}} の差分を表示または非表示にする"
     },
     "filePickerMenu": {
       "folder": "フォルダー",
@@ -5408,7 +5430,6 @@
       "adding": "追加中…",
       "adding_2": "追加中…",
       "already_in_library": "既にライブラリに含まれています",
-      "autocomplete": "オートコンプリート",
       "cancel": "キャンセル",
       "cancel_discard_unsaved_edits": "キャンセル — 保存されていない編集内容を破棄",
       "cannot_read_file": "ファイルを読み込めません",
@@ -5417,6 +5438,7 @@
       "click_to_copy_path": "クリックしてパスをコピー",
       "close_esc": "閉じる (Esc)",
       "close_find": "検索を閉じる",
+      "collapse_unchanged": "変更なしを折りたたむ",
       "copy_content": "コンテンツをコピー",
       "copy_path": "パスをコピー",
       "discard_unsaved_changes": "保存されていない変更を破棄しますか？",
@@ -5436,14 +5458,13 @@
       "in_knowledge_library": "ナレッジライブラリに含まれています",
       "in_library": "ライブラリに含まれています",
       "line_numbers": "行番号",
-      "loading_diff": "差分を読み込み中…",
       "more_options": "その他のオプション",
       "next_enter": "次へ (Enter)",
       "next_match": "次の一致",
+      "no_changes_in_file": "このファイルに変更はありません",
       "no_results": "結果がありません",
       "open_artifact": "アーティファクト {{name}} を開く",
       "open_as_artifact": "アーティファクトとして開く",
-      "open_folder": "フォルダー {{path}} を開く",
       "open_in_file_explorer": "エクスプローラーで開く",
       "open_in_finder": "Finder で開く",
       "open_with_default_app": "デフォルトアプリで開く",
@@ -5460,14 +5481,14 @@
       "save_this_file_as_an_artifact_versioned_persiste": "このファイルをアーティファクトとして保存 (バージョン管理、永続化、コメント可能)",
       "saving": "保存中…",
       "select_any_text_to_add_inline_comments_then_subm": "任意のテキストを選択してインラインコメントを追加し、すべてをチャットに送信します。",
+      "show_full_file": "ファイル全体を表示",
       "show_in_file_manager": "ファイルマネージャーに表示",
       "snapshot_version": "スナップショットバージョン",
       "snapshotting": "スナップショット作成中…",
-      "switch_to_split_view": "分割ビューに切り替え",
-      "switch_to_unified_view": "統合ビューに切り替え",
+      "split_view": "分割ビュー",
       "tip": "ヒント：",
-      "toggle_autocomplete": "オートコンプリートを切り替え",
       "toggle_diff_view": "差分ビューを切り替え",
+      "toggle_file_browser": "ファイルブラウザーを切り替え",
       "toggle_line_numbers": "行番号を切り替え",
       "toggle_word_wrap": "ワードラップを切り替え",
       "tracking_description": "{{path}} を追跡中",
@@ -5480,10 +5501,13 @@
       "click_to_browse_shift_click_to_open_in_file_explorer": "クリックして参照 / Shift+クリックでエクスプローラーに表示",
       "click_to_browse_shift_click_to_reveal_in_finder": "クリックして参照 / Shift+クリックで Finder に表示",
       "click_to_browse_shift_click_to_show_in_file_manager": "クリックして参照 / Shift+クリックでファイルマネージャーに表示",
+      "click_to_copy": "クリックしてコピー",
       "click_to_open_shift_click_to_open_in_file_explorer": "クリックして開く / Shift+クリックでエクスプローラーに表示",
       "click_to_open_shift_click_to_reveal_in_finder": "クリックして開く / Shift+クリックで Finder に表示",
       "click_to_open_shift_click_to_show_in_file_manager": "クリックして開く / Shift+クリックでファイルマネージャーに表示",
       "close": "閉じる",
+      "copied": "コピーしました！",
+      "ctrl_click_to_copy": "Ctrl+クリックでコピー",
       "download_d": "ダウンロード (d)",
       "download_image": "画像をダウンロード",
       "generating_diagram": "ダイアグラムを生成中…",
@@ -5605,9 +5629,7 @@
       "close_editor": "エディターを閉じる",
       "copied": "コピーしました！",
       "copy": "コピー",
-      "edit_code_block": "コードブロックを編集",
-      "edit_in_monaco_editor": "Monaco エディターで編集",
-      "loading_editor": "エディターを読み込み中…"
+      "edit_code_block": "コードブロックを編集"
     },
     "notifications": {
       "notifMeta": {
@@ -5618,7 +5640,7 @@
         "kind_notification": "通知",
         "kind_skills": "スキル",
         "kind_subagent": "サブエージェント",
-        "kind_task_runner": "タスクランナー",
+        "kind_task_runner": "Task Runner",
         "kind_webhook": "Webhook",
         "this_week": "今週",
         "today": "今日",
@@ -5919,7 +5941,11 @@
       "these_hosts": "これらのホスト",
       "this_host": "このホスト",
       "you_are_now_trusting_apps_from": "以下からのアプリを信頼するようになりました",
-      "registry_url_install_public_repos_only": "レジストリ URL からのインストールはパブリックリポジトリでのみ動作します。プライベートリポジトリの場合は、まずローカルにクローンしてから、下の Install from Path を使用してください。"
+      "registry_url_install_public_repos_only": "レジストリ URL からのインストールはパブリックリポジトリでのみ動作します。プライベートリポジトリの場合は、まずローカルにクローンしてから、下の Install from Path を使用してください。",
+      "name_is_taken_by_a_build_pinned_registry": "「{{name}}」はこのビルドで提供されるレジストリの名前です。別の名前を選んでください",
+      "included_with_this_installation": "このインストールに含まれています",
+      "trusted_source": "信頼されたソース",
+      "trusted_source_clones_with_your_git_credentials": "信頼されたソース — このレジストリのアプリは、あなたの Git 認証情報を使ってクローンされます。"
     },
     "remoteArtifactCard": {
       "clone": "クローン",
@@ -6020,6 +6046,11 @@
       "undo_remove": "削除を取り消し",
       "will_be_removed_on_save": "保存時に削除されます。"
     },
+    "selectionToolbar": {
+      "ask": "サイドチャットで質問",
+      "copy": "コピー",
+      "quote": "引用"
+    },
     "sendToInstanceSubmenu": {
       "failed": "失敗",
       "not_connected": "未接続",
@@ -6051,6 +6082,8 @@
       "unpin": "ピン留め解除"
     },
     "sessionColorSwatches": {
+      "custom_color": "カスタムカラー",
+      "hex_color_code": "16進カラーコード",
       "no_color": "色なし"
     },
     "sessionGridView": {
@@ -6185,7 +6218,7 @@
       "desc_prompts": "保存されたプロンプトとエージェントSOPをリストまたは呼び出す",
       "desc_quit": "チャットセッションを終了する",
       "desc_reply": "最後のアシスタントメッセージに返信する",
-      "desc_side": "サイド会話パネルを開く",
+      "desc_side": "サイドチャットを開く — 中断せずに質問",
       "desc_tangent": "接線会話を開始する",
       "desc_todos": "タスクリストを表示または管理する",
       "desc_tools": "利用可能なツールを表示する",
@@ -6638,14 +6671,15 @@
       "context": "コンテキスト",
       "diff": "{{name}} - 差分",
       "files": "ファイル",
+      "git": "Git",
       "issues": "イシュー",
+      "links": "リンク",
       "logs": "ログ",
-      "side": "サイド",
+      "pins": "ピン",
+      "side": "サイドチャット",
       "subagents": "サブエージェント",
       "summary": "サマリー",
-      "workflows": "ワークフロー",
-      "git": "Git",
-      "pins": "ピン"
+      "workflows": "ワークフロー"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "すべてのスロットが使用中です",
@@ -6723,7 +6757,7 @@
     "schedule": "スケジュール",
     "sessions": "セッション",
     "settings": "設定",
-    "task_runner": "タスクランナー",
+    "task_runner": "Task Runner",
     "webhooks": "Webhooks"
   },
   "pages": {
@@ -7459,32 +7493,24 @@
         "artifacts_search_library": "ライブラリを検索…",
         "artifacts_this_session": "このセッション",
         "ask_me_to_use_a_dynamic_workflow_to_runs_from_th": "「動的ワークフローを使用して…」とお願いしてください。このチャットからの実行がここにライブで表示されます。",
-        "back_to_files": "ファイルに戻る",
         "cancel": "キャンセル",
         "cancelled": "キャンセル済み",
-        "changed_files": "変更されたファイル",
         "changes": "変更",
         "clear": "クリア",
         "complete": "完了",
-        "discard_unsaved_changes": "保存していない変更を破棄しますか？",
         "dismiss_done_count": "完了を閉じる({{count}})",
         "error": "エラー",
         "failed_click_to_retry": "失敗 — クリックして再試行",
-        "file_artifact_add": "アーティファクトに追加",
-        "file_artifact_add_aria": "このファイルをアーティファクトライブラリに追加",
-        "file_artifact_add_failed": "追加できません — もう一度試してください",
-        "file_artifact_open": "アーティファクトを開く",
-        "file_artifact_open_aria": "このファイルのアーティファクトを開く",
-        "file_not_found_on_disk_it_may_have_been_moved_or": "ファイルがディスクに見つかりません。移動または削除されている可能性があります。",
-        "files": "ファイル",
         "input": "入力",
         "issues": "イシュー",
         "last_tool": "最後のツール:",
+        "links": "Links",
         "load_output_from_disk": "ディスクから出力を読み込む",
         "loading": "読み込み中…",
+        "loading_workspace": "ワークスペースを読み込み中…",
         "logs": "ログ",
-        "no_files_changed_yet": "まだファイルは変更されていません",
         "no_issues_in_this_session_yet_mention_a_github_o": "このセッションにはまだイシューがありません。GitHub または GitLab のイシューリンクを言及すると、ここに表示されます。",
+        "no_links_yet": "このセッションにはまだリンクがありません。チャットで URL を言及すると、ここに表示されます。",
         "no_matches": "一致するものがありません",
         "no_pull_requests_yet": "このセッションにはまだプルリクエストがありません",
         "no_subagents_running": "実行中のサブエージェントはありません",
@@ -7495,8 +7521,6 @@
         "pending_approval": "承認待ち",
         "reject": "却下",
         "rejected": "却下済み",
-        "remove": "削除",
-        "remove_file_from_list": "リストからファイルを削除",
         "resolved": "解決済み",
         "resolving": "解決中…",
         "resolving_2": "解決中…",
@@ -7504,13 +7528,12 @@
         "resource_type_link": "リンク",
         "resource_type_pr": "PR",
         "resources": "リソース",
-        "retry": "再試行",
         "retry_failed_count": "失敗を再試行({{count}})",
         "running": "実行中",
         "running_tool": "ツール実行中",
-        "search_files": "ファイル名、フォルダー、またはリンクで検索…",
+        "search_files": "ラベルまたは URL で検索…",
         "show_all_count": "すべて表示({{count}})",
-        "side": "サイド",
+        "side": "サイドチャット",
         "starting": "開始中…",
         "stopped": "停止",
         "subagent": "サブエージェント {{label}}",
@@ -7518,11 +7541,11 @@
         "trusted": "信頼済み",
         "trusted_base": "信頼済みベース",
         "trusted_command": "信頼済みコマンド",
-        "unable_to_read_file": "ファイルを読み込めません。",
-        "unable_to_read_this_file": "このファイルを読み込めません。",
         "waiting_for_output": "出力待機中…",
         "waiting_to_start_queued_behind_the_concurrency_l": "開始を待機中 — 同時実行制限の後ろのキューに入っています",
-        "workflows": "ワークフロー"
+        "workflows": "ワークフロー",
+        "workspace_empty": "このワークスペースにはまだファイルがありません",
+        "workspace_truncated": "大規模なワークスペース — 最初の10,000ファイルのみ表示しています"
       },
       "assistantMessage": {
         "applied_to_tasks": "タスクに適用済み",
@@ -7595,6 +7618,7 @@
       "folderPanel": {
         "empty_folder": "空のフォルダー",
         "loading": "読み込み中…",
+        "no_changes": "作業ツリーに変更はありません",
         "open_in_file_explorer": "エクスプローラーで開く",
         "open_in_finder": "Finder で開く",
         "parent_folder": "親フォルダー",
@@ -7641,16 +7665,20 @@
       "pinnedPrompt": {
         "collapse_pinned_prompt": "固定したプロンプトを折りたたむ",
         "expand_pinned_prompt": "固定したプロンプトを展開",
-        "jump_to_this_prompt": "このプロンプトへ移動"
+        "jump_to_this_turn": "このターンへ移動"
       },
       "recoveryCard": {
         "backend_error_continuing": "バックエンドエラー・継続を自動送信しました",
         "cancelled_continuing": "停止したツール呼び出しをキャンセルしました・継続を自動送信しました",
+        "continued_by_a_hook": "フックにより続行しました",
         "continued_by_you": "リクエストにより続行しました",
         "empty_output_continuing": "エージェントから出力がありませんでした・継続を自動送信しました",
+        "hook_loop_halted": "フックループを停止しました",
+        "hook_requested_continuing": "フックのリクエスト · 続行中",
         "n_patterns": "パターン {{count}} 件",
         "n_tool_calls_blocked": "ブロックされたツール呼び出し {{count}} 件",
         "no_response_returned": "応答がありませんでした",
+        "nudge_cap_reached": "ナッジ上限に到達",
         "recovered_continuing": "継続を自動送信しました",
         "resuming_the_interrupted_turn": "中断したターンを再開中",
         "safety_policy_continuing": "安全ポリシーにより呼び出しがブロックされました・継続を自動送信しました",
@@ -7676,7 +7704,7 @@
         "ago": "前",
         "ask_a_side_question": "サイドで質問",
         "ask_a_side_question_2": "サイドで質問…",
-        "ask_a_side_question_main_agent_keeps_working": "アクティブな実行を中断せずにサイド会話を開始します。",
+        "ask_a_side_question_main_agent_keeps_working": "実行中の処理を止めずにサイドで質問できます。ここの内容はチャットには保存されません。",
         "context_from": "コンテキスト元",
         "question_too_long": "質問が長すぎます — 約 {{max}} 文字未満に短くしてください（現在は {{current}} 文字）",
         "queue_cancel_failed": "キューに入っている質問をキャンセルできませんでした",
@@ -7705,12 +7733,18 @@
         "menu_context_desc": "このセッションのターン中に追加されたコンテキスト",
         "menu_files": "ファイル",
         "menu_files_desc": "ファイルを閲覧・編集",
+        "menu_git": "Git",
+        "menu_git_desc": "ブランチ、変更、最近のコミット",
         "menu_issues": "Issue",
         "menu_issues_desc": "このセッションで言及された Issue",
+        "menu_links": "リンク",
+        "menu_links_desc": "このチャットで参照された URL",
         "menu_logs": "ログ",
         "menu_logs_desc": "ゲートウェイのログストリーム",
-        "menu_side": "サイド",
-        "menu_side_desc": "コンテキストを共有する並行チャット",
+        "menu_pins": "ピン",
+        "menu_pins_desc": "このセッションでピン留めしたメッセージ",
+        "menu_side": "サイドチャット",
+        "menu_side_desc": "メインエージェントを止めずに質問",
         "menu_subagents": "サブエージェント",
         "menu_subagents_desc": "エージェントのライブ活動とトランスクリプト",
         "menu_summary": "サマリー",
@@ -7727,11 +7761,7 @@
         "switch_to_split_view": "分割表示に切り替え",
         "switch_to_unified_view": "統合表示に切り替え",
         "this_app_render_is_no_longer_available": "このアプリの表示は利用できなくなりました。もう一度ツールを実行して表示してください。",
-        "turn_diff": "ターンの差分",
-        "menu_git": "Git",
-        "menu_git_desc": "ブランチ、変更、最近のコミット",
-        "menu_pins": "ピン",
-        "menu_pins_desc": "このセッションでピン留めしたメッセージ"
+        "turn_diff": "ターンの差分"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "停止に失敗したため、セッションをリセットしました",
@@ -7811,9 +7841,10 @@
       "toolDetails": {
         "auto": "自動",
         "details_unavailable_for_historical_tool_calls": "過去のツール呼び出しの詳細は表示できません。",
+        "formatted": "整形",
         "no_input_or_output_captured_for_this_tool_call": "このツール呼び出しの入力または出力は記録されていません。",
-        "not_yet_available": "{{label}} はまだ利用できません",
         "null": "null",
+        "raw": "生",
         "render_escaped_whitespace_as_real_line_breaks": "エスケープされた空白を実際の改行として表示",
         "show_the_exact_payload_escaping_preserved": "エスケープを維持して正確なペイロードを表示",
         "waiting_for_approval": "承認待ち"
@@ -7828,7 +7859,6 @@
         "send": "送信",
         "send_enter": "送信 (Enter)",
         "steered_into_the_running_turn": "実行中のターンに追加しました",
-        "message_unconfirmed": "Message not confirmed — may not have been delivered",
         "pin_message": "メッセージをピン留め",
         "unpin_message": "メッセージのピン留めを解除"
       },
@@ -7867,6 +7897,10 @@
         "unpin": "ピン留めを解除",
         "jump_to_message": "メッセージに移動"
       },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "以前のメッセージを読み込む",
+        "error_retry": "以前のメッセージを読み込めませんでした — 再試行"
+      },
       "sessionSummary": {
         "empty_body": "サマリーはターンの終了時に作成されます。このセッションのサマリーを得るにはメッセージを送信してください。",
         "empty_generate_body": "このセッションのサマリーはまだ作成されていません。",
@@ -7887,6 +7921,7 @@
         "off_body": "有効にすると以降のターンが要約されます。過去のターンは遡って作成されません。",
         "off_title": "セッションサマリーは無効です",
         "open_items_heading": "未対応の項目",
+        "open_items_less": "表示を減らす",
         "open_items_more": "他 {{n}} 件",
         "open_items_other": "未対応 {{count}} 件",
         "pivoted_from_turn": "ターン {{turn}} のあなたの質問から派生",
@@ -7905,6 +7940,23 @@
         "updated_behind": "{{when}}に更新 — 会話に追いついていません",
         "where_it_stands": "現在の状況",
         "you_asked_for": "依頼した内容"
+      },
+      "fileBrowserRail": {
+        "all_files": "すべてのファイル",
+        "changed": "変更あり",
+        "close_search": "検索を閉じる",
+        "filter_placeholder": "ファイルを絞り込む…",
+        "refresh": "更新",
+        "resize": "ファイルブラウザーのサイズを変更",
+        "tree_mode": "ファイル一覧モード"
+      },
+      "filesHome": {
+        "no_project_dir": "このチャットにはプロジェクトディレクトリが設定されていません",
+        "refresh": "更新",
+        "reveal_in_finder": "ファイルマネージャーで表示",
+        "select_file_hint": "ツリーからファイルを選択すると新しいタブで開きます",
+        "title": "ファイル",
+        "tree_error": "ファイルツリーを読み込めませんでした"
       }
     },
     "chatPage": {
@@ -8110,6 +8162,7 @@
       "new_folder": "新しいフォルダー",
       "new_subfolder": "新しいサブフォルダー",
       "no_inactive_sessions_to_archive": "アーカイブする非アクティブなセッションはありません。",
+      "no_older_sessions": "以前のセッションはありません — 閉じたタブがここに表示されます",
       "no_sessions": "セッションなし",
       "no_sessions_match": "一致するセッションはありません",
       "older": "以前",
@@ -8177,7 +8230,9 @@
       "crew_mode": "Crew Mode — トピックごとに並列のサブセッションで実行",
       "new_crew_chat": "新しい Crew Mode チャット",
       "autopilot_desc": "1 つの作業を段階的に — まず計画を示し、承認後に段階ごとに実行します。",
-      "crew_desc": "複数の作業を同時に — トピックごとに別のサブセッションで進み、終わり次第返答します。"
+      "crew_desc": "複数の作業を同時に — トピックごとに別のサブセッションで進み、終わり次第返答します。",
+      "collapse_source_links": "表示を減らす",
+      "source_links_expand_failed": "残りを読み込めませんでした。クリックして再試行してください。"
     },
     "connectionsPage": {
       "access": "アクセス",
@@ -8539,12 +8594,14 @@
       "bundled": "バンドル済み",
       "cancel": "キャンセル",
       "check_your_connection_or_configuration_and_try_a": "接続または設定を確認して、もう一度試してください。",
+      "click_again_to_confirm": "もう一度クリックして確認",
       "command": "コマンド",
       "config": "設定",
       "configure_via": "{{path}} で設定します。",
+      "confirm_delete_hook": "削除？",
       "create_a_hook_to_run_scripts_on_chat_events": "チャットイベントでスクリプトを実行するフックを作成",
       "delete": "削除",
-      "delete_hook": "フック「{{name}}」を削除しますか？",
+      "delete_hook": "フック「{{name}}」を削除",
       "disable_hook": "フックを無効化",
       "echo_hook_fired": "echo 'hook fired'",
       "edit": "編集",
@@ -8563,8 +8620,10 @@
       "last_run": "最後の実行",
       "loading": "読み込み中…",
       "matcher": "マッチャー",
+      "matcher_mode": "Matcher mode",
       "matcher_optional_e_g_deploy": "マッチャー（オプション、例：*deploy*）",
       "matcher_tool_filter_e_g_fs_write_git": "マッチャー（ツールフィルタ、例：fs_write、@git/*）",
+      "more_actions": "その他の操作",
       "ms": "ms",
       "name": "名前",
       "new_hook": "+ 新しいフック",
@@ -8586,12 +8645,12 @@
       "timeout": "タイムアウト",
       "total": "合計",
       "total_runs": "総実行回数",
-      "user": "ユーザー",
-      "matcher_mode": "Matcher mode"
+      "user": "ユーザー"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "このワークスペースの一意な識別子。エージェントは名前でワークスペースを参照します。",
       "additional_stores_coming_with_memory_v2": "現在はデフォルトストアのみが利用可能です — より多くのメモリストアのサポートは近日予定です。",
+      "agent_template_is_required": "エージェントテンプレートは必須です",
       "agents": "クルー",
       "also_used_by_these_crews": "{{crews}}でも使用されています。ストアを共有するクルーは相互にファイルとメモリを読むことができます。",
       "bindings_preview_info": "プレビュー。クルーごとに分離されたメモリはまだ開発中です。クルーには自分のワークスペースフォルダーがありますが、意味記憶、過去の会話の想起、グローバルなレッスンはすべてのクルーに届くため、ここを変えてもクルーが記憶する内容はまだ分離されません。",
@@ -8645,6 +8704,7 @@
       "routing": "ルーティング",
       "runtime_binding": "このクルーが使用するもの",
       "save_changes": "変更を保存",
+      "select_an_agent_template": "エージェントテンプレートを選択…",
       "shared_lower": "共有",
       "subdirectory_inside_kiro_crew_where_this_workspa": "~/.kiro/crew内のサブディレクトリで、このワークスペースがそのデータ（チャット履歴、レッスン、プロジェクト）を保存します。各ワークスペースには独自の分離されたディレクトリがあります。",
       "the_agent_definition_it_boots_from_tools_mcp_ser": "このクルーが使用する開始設定 — ツール、接続、指示。",
@@ -8955,9 +9015,14 @@
         "col_evidence": "根拠",
         "col_running_as": "現在の実行形態",
         "connections_link": "Connections",
-        "how_measured": "server は Kiro Crew が調べるまで未測定と表示されます。調査は {{link}} の MCP server 一覧を更新したときに 2 件ずつ行われます。",
+        "how_measured": "サーバーは Kiro Crew が測定するまで未測定と表示されます。下のボタンは未測定のサーバーをまとめて測定します。{{link}} の MCP サーバー一覧を更新したときにも 数台ずつ測定されます。",
         "lede": "Kiro Crew が各サーバーについて観測できた内容と、それが現在の実行形態とどう一致しているかを示します。この画面では何も変更されません — 切り替えは「サーバー」にあります。",
-        "legend": "共有バックエンドを推奨するには、サーバーが呼び出し元を区別できると表明している必要がありますが、そう表明するサーバーはほとんどありません — そのため、正常なサーバーの多くは「異議なし」に留まります。これは保守的な回答であって、欠落ではありません。共有するかどうかは引き続きご自身の判断です。",
+        "legend": "共有バックエンドを推奨するには、サーバー自身が呼び出し元を区別できると宣言している必要があり、そう宣言するサーバーはごくわずかです。測定で除外できるのは呼び出し元ごとに異なるハンドシェイクだけで、ツール呼び出しが生む状態は見えません。そのため正常なサーバーの多くは「測定済み」か「異議なし」に留まります。これは保守的な答えであり、欠落ではありません。共有するかどうかはあなたの判断です。",
+        "measure_failed": "測定が途中で停止しました。ゲートウェイのログを確認してください",
+        "measure_finished_other": "{{count}} 台のサーバーを測定しました",
+        "measure_none_left": "すべてのサーバーを測定済みです",
+        "measure_running": "測定中です。{{total}} 台のうち {{done}} 台が完了しました",
+        "measure_unmeasured_other": "未測定のサーバー {{count}} 台を測定します",
         "open_servers": "Servers を開く",
         "reason_all_tools_read_only": "すべてのツールが読み取り専用と宣言しています",
         "reason_caller_sensitive": "2 つの異なる呼び出し元に対してハンドシェイクの応答が異なりました",
@@ -8976,6 +9041,7 @@
         "shared_without_support": "バックエンド共有はすでに有効ですが、証拠は共有に反しています。影響を受ける server: {{count}}",
         "strength_declared": "共有向け設計",
         "strength_disqualified": "共有に適さない",
+        "strength_measured": "測定済み、差異なし",
         "strength_no_objection": "異議なし",
         "strength_refuted": "共有すると危険",
         "strength_unknown": "未計測"
@@ -8992,6 +9058,10 @@
       "confirm_title": "セッション間でバックエンドを共有しますか？",
       "confirm_turn_on": "共有を有効にする",
       "confirm_unsupported": "そのうち {{count}} 件は、証拠が共有に反しています。",
+      "enable_all": "証拠が許すサーバーすべてにスタブを設定",
+      "enable_all_hint": "判定のないサーバーを先に測定します。証拠が支持しないサーバー、および宣言された環境変数が共有バックエンドで渡されないサーバーは対象外です。",
+      "enable_all_result": "{{enabled}} 件にスタブを設定し、{{skipped}} 件は対象外にしました。",
+      "enable_all_still_measuring": "測定中です。変更は行われていません。完了後にもう一度お試しください。",
       "learn_more": "詳細",
       "learn_more_docs": "ドキュメントで詳細を見る",
       "lede": "Kiro Crew は、各セッションに MCP サーバーを起動させる代わりに、サーバーの前に独自のスタブを置くことができます。スタブはサーバー自身が UI を描画する (MCP Apps) ための前提であり、共有バックエンドがルーティングされる先もスタブだけです。そのため、サーバー単位のオプトインになっています。 {{link}}",
@@ -9272,7 +9342,7 @@
         "no_lessons": "レッスンなし",
         "no_lessons_yet": "まだレッスンはありません",
         "no_sessions_to_consolidate_start_a_chat_first": "統合するセッションがありません — まずチャットを開始してください",
-        "persistent_lessons_injected_into_every_session_a": "すべてのセッションに注入される永続的なレッスン。タスクランナーの失敗から自動抽出されます。'kirocrew learn add' を使って手動で追加できます。ベクトルメモリがアクティブな場合、レッスンはセマンティックタブで lesson.* エントリとして管理されます。",
+        "persistent_lessons_injected_into_every_session_a": "すべてのセッションに注入される永続的なレッスン。Task Runnerの失敗から自動抽出されます。'kirocrew learn add' を使って手動で追加できます。ベクトルメモリがアクティブな場合、レッスンはセマンティックタブで lesson.* エントリとして管理されます。",
         "preference": "優先度",
         "preferences": "優先度",
         "projects": "プロジェクト",
@@ -9568,8 +9638,6 @@
     },
     "overviewPage": {
       "all_systems_running": "すべてのシステムが実行中",
-      "apply_config_changes_by_restarting_all_sessions": "すべてのセッションを再起動して設定変更を適用",
-      "apply_restart": "適用して再起動",
       "back_to_overview": "概要に戻る",
       "connecting": "接続中…",
       "days_of_history": "日分の履歴",
@@ -9580,11 +9648,8 @@
       "messages": "メッセージ",
       "overview": "概要",
       "reconnecting": "再接続中…",
-      "restart": "再起動",
-      "restarting": "再起動中…",
       "semantic_memory_active": "· 意味的メモリがアクティブ",
       "sessions": "セッション ·",
-      "sessions_restarted": "セッションが再起動されました。",
       "stat_cron_jobs": "Cronジョブ",
       "stat_lessons": "レッスン",
       "stat_messages": "メッセージ",
@@ -9709,7 +9774,7 @@
       "running": "実行中",
       "schedule": "スケジュール",
       "scheduled_as_daily_cron_job": "日次cronジョブとしてスケジュール済み",
-      "task_runner": "タスクランナー",
+      "task_runner": "Task Runner",
       "upload_a_file": "ファイルをアップロード",
       "workspace": "ワークスペース：",
       "workspace_folder": "ワークスペースフォルダー",
@@ -10609,7 +10674,7 @@
         "category_subagent": "サブエージェント",
         "category_subagent_description": "バックグラウンドサブエージェントの完了",
         "category_taskrunner": "タスク",
-        "category_taskrunner_description": "タスクランナーの完了",
+        "category_taskrunner_description": "Task Runnerの完了",
         "category_turn": "エージェントの返信",
         "category_turn_description": "エージェントが任意のチャットでターンを完了するとき",
         "channel_default": "チャネルのデフォルト",
@@ -10704,6 +10769,10 @@
         "disable_this_denied_command": "この拒否されたコマンドを無効化しますか？",
         "disabled_by_policy": "ポリシーで無効化",
         "disabled_for_this_surface": "ホスト表面では無効化",
+        "profile_unusable_title": "全面拒否フォールバックが有効です",
+        "profile_unusable_body": "下に示すプロファイルを読み込めなかったため、その表面はフェイルクローズの全面拒否の上限に保たれています。Kiro Crew のデータホームにある profiles フォルダー内のファイルを修正してください。修正すれば自動的に再読み込みされます。",
+        "profile_unusable_detail": "ファイルが読み取り不能、解析に失敗、または継承元のプロファイルが存在しません。再起動が必要なのは、ファイルが実行中のビルドより新しいビルド向けである場合のみです。",
+        "profile_unusable_which": "対象のプロファイル: {{profiles}}。",
         "disabling_a_rule_that_overlaps_an_always_on_cont": "常時オンコントロール(機密ファイルの読み取り、IMDS、git-publish)と重複するルールを無効化しても、完全には解除されません。多層防御がブロック状態に保ちます。",
         "disabling_all_built_in_denies_removes_kirocrew_s": "すべての組み込み拒否を無効にすると、破壊的なコマンドや認証情報を持ち出すコマンドに対する Kiro Crew の保護が解除されます。一部のコマンドは、独立した多層防御（機密パス、IMDS、git-publish）によって引き続きブロックされる場合があります。",
         "disabling_weakens_protection": "「{{name}}」を無効にすると、破壊的なコマンドや認証情報の持ち出しに対する保護が弱まります。独立した多層防御の制御によって引き続きブロックされるコマンドもあります。",
@@ -11707,7 +11776,7 @@
     "worldsPage": {
       "active": "アクティブ、",
       "agent_other": "{{count}} エージェント",
-      "agent_worlds": "エージェントワールド",
+      "agent_worlds": "Agent Worlds",
       "focus_popout": "ポップアウトをフォーカス",
       "hide_controls": "コントロールを隠す",
       "open": "空き",

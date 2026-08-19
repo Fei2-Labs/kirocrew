@@ -1481,6 +1481,7 @@
     },
     "issueRadar": {
       "api": {
+        "assignees_changed_elsewhere": "이 이슈를 불러온 뒤 다른 곳에서 담당자가 변경되었습니다.",
         "these_settings_changed_elsewhere": "이 설정이 다른 곳에서 변경되었습니다."
       },
       "components": {
@@ -1501,6 +1502,14 @@
           "regenerate_ai_summary": "AI 요약 다시 생성",
           "regenerate_summary": "요약 다시 생성",
           "retry": "다시 시도"
+        },
+        "assigneePicker": {
+          "assigned_but_not_a_member": "이 담당자들은 저장소 멤버가 아닙니다.",
+          "choose_assignees": "담당자 선택",
+          "filter_members": "멤버 필터…",
+          "no_members": "할당할 멤버가 없습니다 — 이 저장소에는 읽을 수 있는 명단이 없습니다.",
+          "not_a_member": "{{login}} 은(는) 이 저장소의 멤버가 아닙니다",
+          "this_is_you": "{{login}} (나)"
         },
         "detailOverflowMenu": {
           "more_actions": "추가 작업"
@@ -1534,6 +1543,7 @@
           "added_this_to_the": "이 항목을 다음에 추가함",
           "as_completed": "완료로",
           "as_not_planned": "계획 없음으로",
+          "assign_me": "나에게 할당",
           "assigned": "할당함",
           "assignees": "담당자",
           "by": "· 작성자",
@@ -1544,11 +1554,16 @@
           "closed_as_not_planned": "계획 없음으로 닫힘",
           "closed_this": "이 항목을 닫음",
           "commented": "댓글을 남김",
+          "copy_failed": "복사 실패",
           "copy_link_to_this_issue": "이 이슈 링크 복사",
           "couldn_t_load_activity": "활동을 불러오지 못했습니다:",
           "dates": "날짜",
           "done": "완료",
+          "done_editing_assignees": "담당자 편집 완료",
+          "done_editing_labels": "라벨 편집 완료",
           "edit": "편집",
+          "edit_assignees": "담당자 편집",
+          "edit_labels": "라벨 편집",
           "finding_suggestions": "제안을 찾는 중…",
           "in": "위치",
           "issue": "이슈",
@@ -1582,6 +1597,7 @@
           "self_assigned_this": "이 항목을 자신에게 할당함",
           "suggested": "제안",
           "timeline": "타임라인",
+          "unassign_me": "내 할당 해제",
           "unassigned": "할당 해제함",
           "updated": "업데이트"
         },
@@ -1735,6 +1751,7 @@
           "closed_this": "이 항목을 닫았습니다",
           "commented": "댓글을 남겼습니다",
           "commits": "커밋",
+          "copy_failed": "복사 실패",
           "copy_link_to_this": "이 {{subject}} 링크 복사",
           "couldnt_load_activity": "활동을 불러오지 못했습니다: {{error}}",
           "dates": "날짜",
@@ -2141,7 +2158,12 @@
             "refresh_section": "새로 고침",
             "repositories": "저장소",
             "settings": "설정",
-            "your": "내"
+            "your": "내",
+            "agent_section": "에이전트",
+            "agent_intro": "조사 및 리뷰 에이전트가 결과를 보고하는 방식입니다.",
+            "agent_language": "에이전트 언어",
+            "agent_language_hint": "에이전트가 조사 결과와 리뷰 제안을 작성하는 언어입니다. 레이블 이름, 코드, 파일 경로는 원문 그대로 유지됩니다. 변경 후 시작한 세션에 적용되며, 이어서 진행하는 조사는 시작할 때의 언어를 유지합니다.",
+            "agent_language_follow": "대시보드와 동일({{language}})"
           },
           "repoSettings": {
             "ai_label_recommendations": "AI 레이블 추천",
@@ -3659,9 +3681,7 @@
         "no_messages": "컴파일러가 보고한 내용이 없습니다.",
         "typesetting_hints_other": "조판 힌트 {{count}}건"
       },
-      "editor": {
-        "loading_editor": "에디터를 불러오는 중…"
-      },
+      "editor": {},
       "fileTree": {
         "delete_file": "{{file}} 삭제",
         "files": "파일",
@@ -3752,13 +3772,13 @@
     "personalShopper": {
       "manifest": {
         "description": "실제 스토어를 조사하고, 구매로 끝나지 않을 수도 있는 문제의 해결을 돕는 개인 어드바이저입니다. 취향 탭은 사용자용 참조 목록이며, 중요한 항목은 채팅에 붙여 주세요. 절대 직접 구매하지 않습니다 — 구매는 사용자가 합니다.",
-        "display_name": "퍼스널 쇼퍼",
+        "display_name": "Personal Shopper",
         "highlight_1": "무언가를 추천하기 전에 문제를 먼저 진단합니다 — 답이 구매가 아닐 때도 있습니다",
         "highlight_2": "중요한 취향은 채팅에 붙여 주세요 — 어드바이저가 읽는 것은 대화이며 취향 탭이 아닙니다",
         "highlight_3": "사용자가 지목한 스토어만 조사하고, 가격이 계정이 아니라 공개 페이지에서 나온 것임을 알려 줍니다",
         "highlight_4": "장바구니나 결제에 도달할 방법 자체가 없습니다",
         "highlight_5": "저장한 취향은 취향 탭에서 그룹으로 정리할 수 있습니다",
-        "page_label": "퍼스널 쇼퍼"
+        "page_label": "Personal Shopper"
       },
       "historyTab": {
         "liked": "좋아요",
@@ -3776,7 +3796,7 @@
         "change_feedback": "평가 변경"
       },
       "personalShopperPage": {
-        "personal_shopper": "퍼스널 쇼퍼",
+        "personal_shopper": "Personal Shopper",
         "say_something_like_help_me_find_running_shoes_or": "‘러닝화 찾아 줘’ 또는 ‘딸 생일이 다가와’처럼 말해 보세요",
         "start_a_conversation_with_your_personal_advisor": "어떤 채팅 세션에서든 퍼스널 어드바이저와 대화를 시작할 수 있습니다.",
         "start_advisor_conversation": "어드바이저와 대화 시작",
@@ -4334,6 +4354,10 @@
       "the_import_did_not_finish_please_try_again": "가져오기가 완료되지 않았습니다. 다시 시도해 주세요.",
       "try_again": "다시 시도",
       "we_could_not_scan_agent_setup": "에이전트 설정을 스캔할 수 없습니다",
+      "found_setup_kirocrew_could_not_read": "Kiro Crew가 읽을 수 없는 설정을 찾았습니다",
+      "found_setup_but_could_not_read_it": "Kiro Crew에서 {{sources}}을(를) 찾았지만 파일을 읽을 수 없어 아무것도 가져오지 않았습니다.",
+      "some_setup_could_not_be_read": "Kiro Crew가 {{sources}}을(를) 읽을 수 없습니다 — 아래에 표시되지 않습니다.",
+      "files_could_not_be_read": "파일을 읽을 수 없습니다",
       "your_existing_kirocrew_setup_will_not_be_affecte": "기존 Kiro Crew 설정은 영향을 받지 않습니다.",
       "your_selected_setup_is_ready_in_kiro_crew": "선택한 설정이 Kiro Crew에 준비되었습니다."
     },
@@ -4672,9 +4696,9 @@
       "project": "프로젝트",
       "project_2": "프로젝트: {{path}}",
       "queue": "대기열",
-      "queue_desc": "현재 턴이 끝난 후 실행",
+      "queue_run_after_the_current_work_finishes_desc": "현재 작업이 끝난 후 실행",
       "queue_message": "메시지를 대기열에 추가",
-      "queue_run_after_the_current_turn_finishes_enter": "대기열 — 현재 턴이 끝난 후 실행 (Enter)",
+      "queue_run_after_the_current_work_finishes_enter": "대기열 — 현재 작업이 끝난 후 실행 (Enter)",
       "quick_actions_like_clearing_the_chat_or_checking": "채팅 지우기나 사용량 확인 같은 빠른 작업",
       "recording_click_mic_to_stop": "녹음 중… 중지하려면 마이크를 클릭하세요",
       "reference_a_file": "파일 참조",
@@ -4698,8 +4722,8 @@
       "skill": "스킬",
       "slash_commands": "슬래시 명령",
       "steer": "방향 지시",
-      "steer_desc": "실행 중인 턴에 바로 삽입",
-      "steer_inject_into_the_running_turn_enter": "방향 지시 — 실행 중인 턴에 바로 삽입 (Enter)",
+      "steer_act_on_this_right_away_desc": "지금 바로 처리",
+      "steer_act_on_this_as_soon_as_possible_enter": "방향 지시 — 최대한 빨리 처리 (Enter)",
       "stop_generation": "생성 중지",
       "stop_recording": "녹음 중지",
       "stop_the_current_response_to_switch_agents": "에이전트를 전환하려면 현재 응답을 중지하세요",
@@ -4921,7 +4945,6 @@
     "contentRenderer": {
       "changes_update_svg_preview_as_you_type": "입력하는 동안 변경 사항이 미리보기에 반영됩니다.",
       "editing_svg": "SVG 편집 중",
-      "loading_editor": "편집기를 불러오는 중…",
       "svg_source_code": "SVG 소스 코드"
     },
     "contextBar": {
@@ -4946,25 +4969,19 @@
       "close": "닫기"
     },
     "diffBlock": {
-      "collapse": "▲ 접기",
-      "context_lines": "컨텍스트 줄",
       "copied": "복사했습니다!",
       "copy_patch": "패치 복사",
-      "diff": "diff",
       "generating_diff": "diff 생성 중…",
-      "lines_hidden": "줄 숨김",
       "open": "열기",
       "open_in_side_panel": "{{path}}을(를) 사이드 패널에서 열기",
       "split_view": "분할 보기",
       "switch_to_split_view": "분할 보기로 전환",
       "switch_to_unified_view": "통합 보기로 전환",
-      "unchanged_lines_other": "변경되지 않은 {{count}}줄",
       "unified_view": "통합 보기"
     },
     "diffPanel": {
       "click_to_copy_path": "클릭하여 경로 복사",
-      "contents_identical": "내용이 동일합니다",
-      "loading_diff": "diff를 불러오는 중…"
+      "contents_identical": "내용이 동일합니다"
     },
     "discoverySearchBar": {
       "clear_search": "검색 지우기",
@@ -5024,14 +5041,19 @@
       "video": "동영상: {{name}}"
     },
     "fileChangeChips": {
+      "additions_other": "추가 {{count}}건",
       "artifact": "아티팩트",
       "changed": "변경됨",
       "file_other": "파일 {{count}}개",
       "more": "더 보기",
       "no_changes": "변경 없음",
+      "open": "파일 열기",
+      "open_in_side_panel": "{{path}}을(를) 사이드 패널에서 열기",
+      "removals_other": "삭제 {{count}}건",
       "show": "표시",
       "show_less": "간략히 보기",
-      "this_document_is_tracked_as_a_session_artifact_n": "이 문서는 소스 파일 변경이 아니라 세션 아티팩트로 추적됩니다"
+      "this_document_is_tracked_as_a_session_artifact_n": "이 문서는 소스 파일 변경이 아니라 세션 아티팩트로 추적됩니다",
+      "toggle_diff": "{{path}}의 차이 표시 또는 숨기기"
     },
     "filePickerMenu": {
       "folder": "폴더",
@@ -5408,7 +5430,6 @@
       "adding": "추가하는 중…",
       "adding_2": "추가하는 중…",
       "already_in_library": "이미 라이브러리에 있음",
-      "autocomplete": "자동 완성",
       "cancel": "취소",
       "cancel_discard_unsaved_edits": "취소 — 저장하지 않은 편집 내용 삭제",
       "cannot_read_file": "파일을 읽을 수 없습니다",
@@ -5417,6 +5438,7 @@
       "click_to_copy_path": "클릭하여 경로 복사",
       "close_esc": "닫기 (Esc)",
       "close_find": "찾기 닫기",
+      "collapse_unchanged": "변경되지 않은 부분 접기",
       "copy_content": "콘텐츠 복사",
       "copy_path": "경로 복사",
       "discard_unsaved_changes": "저장하지 않은 변경 사항을 버리시겠습니까?",
@@ -5436,14 +5458,13 @@
       "in_knowledge_library": "지식 라이브러리에 있음",
       "in_library": "라이브러리에 있음",
       "line_numbers": "줄 번호",
-      "loading_diff": "차이를 불러오는 중…",
       "more_options": "옵션 더 보기",
       "next_enter": "다음 (Enter)",
       "next_match": "다음 일치 항목",
+      "no_changes_in_file": "이 파일에는 변경 사항이 없습니다",
       "no_results": "결과 없음",
       "open_artifact": "아티팩트 {{name}} 열기",
       "open_as_artifact": "아티팩트로 열기",
-      "open_folder": "폴더 {{path}} 열기",
       "open_in_file_explorer": "파일 탐색기에서 열기",
       "open_in_finder": "Finder에서 열기",
       "open_with_default_app": "기본 앱으로 열기",
@@ -5460,14 +5481,14 @@
       "save_this_file_as_an_artifact_versioned_persiste": "이 파일을 아티팩트로 저장합니다 (버전 관리·영구 보존·댓글 가능)",
       "saving": "저장하는 중…",
       "select_any_text_to_add_inline_comments_then_subm": "텍스트를 선택해 인라인 댓글을 추가한 뒤 한 번에 채팅으로 보내세요.",
+      "show_full_file": "전체 파일 보기",
       "show_in_file_manager": "파일 관리자에서 보기",
       "snapshot_version": "스냅샷 버전",
       "snapshotting": "스냅샷을 만드는 중…",
-      "switch_to_split_view": "분할 보기로 전환",
-      "switch_to_unified_view": "통합 보기로 전환",
+      "split_view": "분할 보기",
       "tip": "팁:",
-      "toggle_autocomplete": "자동 완성 전환",
       "toggle_diff_view": "차이 보기 전환",
+      "toggle_file_browser": "파일 브라우저 전환",
       "toggle_line_numbers": "줄 번호 전환",
       "toggle_word_wrap": "자동 줄 바꿈 전환",
       "tracking_description": "{{path}} 추적 중",
@@ -5480,10 +5501,13 @@
       "click_to_browse_shift_click_to_open_in_file_explorer": "클릭하여 찾아보기 / Shift+클릭하여 파일 탐색기에 표시",
       "click_to_browse_shift_click_to_reveal_in_finder": "클릭하여 찾아보기 / Shift+클릭하여 Finder에 표시",
       "click_to_browse_shift_click_to_show_in_file_manager": "클릭하여 찾아보기 / Shift+클릭하여 파일 관리자에 표시",
+      "click_to_copy": "클릭하여 복사",
       "click_to_open_shift_click_to_open_in_file_explorer": "클릭하여 열기 / Shift+클릭하여 파일 탐색기에 표시",
       "click_to_open_shift_click_to_reveal_in_finder": "클릭하여 열기 / Shift+클릭하여 Finder에 표시",
       "click_to_open_shift_click_to_show_in_file_manager": "클릭하여 열기 / Shift+클릭하여 파일 관리자에 표시",
       "close": "닫기",
+      "copied": "복사됨!",
+      "ctrl_click_to_copy": "Ctrl+클릭으로 복사",
       "download_d": "다운로드 (d)",
       "download_image": "이미지 다운로드",
       "generating_diagram": "다이어그램을 생성하는 중…",
@@ -5605,9 +5629,7 @@
       "close_editor": "편집기 닫기",
       "copied": "복사했습니다!",
       "copy": "복사",
-      "edit_code_block": "코드 블록 편집",
-      "edit_in_monaco_editor": "Monaco 편집기에서 편집",
-      "loading_editor": "편집기를 불러오는 중…"
+      "edit_code_block": "코드 블록 편집"
     },
     "notifications": {
       "notifMeta": {
@@ -5618,7 +5640,7 @@
         "kind_notification": "알림",
         "kind_skills": "스킬",
         "kind_subagent": "서브에이전트",
-        "kind_task_runner": "작업 실행기",
+        "kind_task_runner": "Task Runner",
         "kind_webhook": "웹훅",
         "this_week": "이번 주",
         "today": "오늘",
@@ -5919,7 +5941,11 @@
       "these_hosts": "이 호스트",
       "this_host": "이 호스트",
       "you_are_now_trusting_apps_from": "이제 다음 출처의 앱을 신뢰합니다",
-      "registry_url_install_public_repos_only": "레지스트리 URL 설치는 공개 저장소에서만 작동합니다. 비공개 저장소는 먼저 로컬로 복제한 다음 아래의 Install from Path를 사용하세요."
+      "registry_url_install_public_repos_only": "레지스트리 URL 설치는 공개 저장소에서만 작동합니다. 비공개 저장소는 먼저 로컬로 복제한 다음 아래의 Install from Path를 사용하세요.",
+      "name_is_taken_by_a_build_pinned_registry": "'{{name}}'은(는) 이 빌드에서 제공하는 레지스트리 이름입니다. 다른 이름을 선택하세요",
+      "included_with_this_installation": "이 설치에 포함됨",
+      "trusted_source": "신뢰된 출처",
+      "trusted_source_clones_with_your_git_credentials": "신뢰된 출처 — 이 레지스트리의 앱은 사용자의 Git 자격 증명으로 복제됩니다."
     },
     "remoteArtifactCard": {
       "clone": "클론",
@@ -6020,6 +6046,11 @@
       "undo_remove": "삭제 취소",
       "will_be_removed_on_save": "저장할 때 삭제됩니다."
     },
+    "selectionToolbar": {
+      "ask": "사이드 채팅에서 질문",
+      "copy": "복사",
+      "quote": "인용"
+    },
     "sendToInstanceSubmenu": {
       "failed": "실패",
       "not_connected": "연결되지 않음",
@@ -6051,6 +6082,8 @@
       "unpin": "고정 해제"
     },
     "sessionColorSwatches": {
+      "custom_color": "사용자 지정 색상",
+      "hex_color_code": "16진수 색상 코드",
       "no_color": "색 없음"
     },
     "sessionGridView": {
@@ -6185,7 +6218,7 @@
       "desc_prompts": "저장된 프롬프트와 에이전트 SOP를 나열하거나 호출합니다",
       "desc_quit": "채팅 세션을 종료합니다",
       "desc_reply": "마지막 어시스턴트 메시지에 답장합니다",
-      "desc_side": "사이드 대화 패널을 엽니다",
+      "desc_side": "사이드 채팅 열기 — 중단 없이 질문",
       "desc_tangent": "곁가지 대화를 시작합니다",
       "desc_todos": "작업 목록을 표시하거나 관리합니다",
       "desc_tools": "사용할 수 있는 도구를 표시합니다",
@@ -6638,14 +6671,15 @@
       "context": "컨텍스트",
       "diff": "{{name}} - 차이",
       "files": "파일",
+      "git": "Git",
       "issues": "이슈",
+      "links": "링크",
       "logs": "로그",
-      "side": "사이드",
+      "pins": "핀",
+      "side": "사이드 채팅",
       "subagents": "서브에이전트",
       "summary": "요약",
-      "workflows": "워크플로",
-      "git": "Git",
-      "pins": "핀"
+      "workflows": "워크플로"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "모든 슬롯이 사용 중입니다",
@@ -6723,7 +6757,7 @@
     "schedule": "스케줄",
     "sessions": "세션",
     "settings": "설정",
-    "task_runner": "태스크 러너",
+    "task_runner": "Task Runner",
     "webhooks": "Webhooks"
   },
   "pages": {
@@ -7459,32 +7493,24 @@
         "artifacts_search_library": "라이브러리 검색…",
         "artifacts_this_session": "이 세션",
         "ask_me_to_use_a_dynamic_workflow_to_runs_from_th": "‘동적 워크플로로 …해 줘’라고 요청하세요 — 이 채팅에서 시작된 실행이 여기에 실시간으로 표시됩니다.",
-        "back_to_files": "파일로 돌아가기",
         "cancel": "취소",
         "cancelled": "취소됨",
-        "changed_files": "변경된 파일",
         "changes": "변경 사항",
         "clear": "지우기",
         "complete": "완료",
-        "discard_unsaved_changes": "저장하지 않은 변경 사항을 버리시겠습니까?",
         "dismiss_done_count": "완료 항목 닫기({{count}})",
         "error": "오류",
         "failed_click_to_retry": "실패 — 클릭하면 재시도",
-        "file_artifact_add": "아티팩트에 추가",
-        "file_artifact_add_aria": "이 파일을 아티팩트 라이브러리에 추가",
-        "file_artifact_add_failed": "추가하지 못했습니다 — 다시 시도하세요",
-        "file_artifact_open": "아티팩트 열기",
-        "file_artifact_open_aria": "이 파일의 아티팩트 열기",
-        "file_not_found_on_disk_it_may_have_been_moved_or": "디스크에서 파일을 찾을 수 없습니다. 이동되었거나 삭제되었을 수 있습니다.",
-        "files": "파일",
         "input": "입력",
         "issues": "이슈",
         "last_tool": "마지막 도구:",
+        "links": "Links",
         "load_output_from_disk": "디스크에서 출력 불러오기",
         "loading": "불러오는 중…",
+        "loading_workspace": "워크스페이스 로드 중…",
         "logs": "로그",
-        "no_files_changed_yet": "아직 변경된 파일이 없습니다",
         "no_issues_in_this_session_yet_mention_a_github_o": "이 세션에는 아직 이슈가 없습니다. GitHub 또는 GitLab 이슈 링크를 언급하면 여기에 표시됩니다.",
+        "no_links_yet": "이 세션에는 아직 링크가 없습니다. 채팅에서 URL을 언급하면 여기에 표시됩니다.",
         "no_matches": "일치하는 항목 없음",
         "no_pull_requests_yet": "이 세션에는 아직 풀 리퀘스트가 없습니다",
         "no_subagents_running": "실행 중인 서브에이전트 없음",
@@ -7495,8 +7521,6 @@
         "pending_approval": "승인 대기 중",
         "reject": "거부",
         "rejected": "거부됨",
-        "remove": "삭제",
-        "remove_file_from_list": "목록에서 파일 삭제",
         "resolved": "해결됨",
         "resolving": "확인 중…",
         "resolving_2": "확인 중…",
@@ -7504,13 +7528,12 @@
         "resource_type_link": "링크",
         "resource_type_pr": "PR",
         "resources": "리소스",
-        "retry": "재시도",
         "retry_failed_count": "실패 재시도({{count}})",
         "running": "실행 중",
         "running_tool": "도구 실행 중",
-        "search_files": "파일 이름, 폴더 또는 링크로 검색…",
+        "search_files": "라벨 또는 URL로 검색…",
         "show_all_count": "전체 표시({{count}})",
-        "side": "사이드",
+        "side": "사이드 채팅",
         "starting": "시작 중…",
         "stopped": "중지됨",
         "subagent": "서브에이전트 {{label}}",
@@ -7518,11 +7541,11 @@
         "trusted": "신뢰됨",
         "trusted_base": "신뢰된 기본 명령",
         "trusted_command": "신뢰된 명령",
-        "unable_to_read_file": "파일을 읽을 수 없습니다.",
-        "unable_to_read_this_file": "이 파일을 읽을 수 없습니다.",
         "waiting_for_output": "출력 대기 중…",
         "waiting_to_start_queued_behind_the_concurrency_l": "시작 대기 중 — 동시 실행 한도로 대기열에 있습니다",
-        "workflows": "워크플로"
+        "workflows": "워크플로",
+        "workspace_empty": "이 워크스페이스에는 아직 파일이 없습니다",
+        "workspace_truncated": "큰 워크스페이스 — 처음 10,000개 파일만 표시합니다"
       },
       "assistantMessage": {
         "applied_to_tasks": "작업에 적용됨",
@@ -7595,6 +7618,7 @@
       "folderPanel": {
         "empty_folder": "빈 폴더",
         "loading": "불러오는 중…",
+        "no_changes": "작업 트리에 변경 사항 없음",
         "open_in_file_explorer": "파일 탐색기에서 열기",
         "open_in_finder": "Finder에서 열기",
         "parent_folder": "상위 폴더",
@@ -7641,7 +7665,7 @@
       "pinnedPrompt": {
         "collapse_pinned_prompt": "고정한 프롬프트 접기",
         "expand_pinned_prompt": "고정한 프롬프트 펼치기",
-        "jump_to_this_prompt": "이 프롬프트로 이동"
+        "jump_to_this_turn": "이 턴으로 이동"
       },
       "recoveryCard": {
         "backend_error_continuing": "백엔드 오류 · 자동으로 후속 요청 전송됨",
@@ -7658,7 +7682,11 @@
         "tool_call_blocked": "도구 호출이 차단되었습니다",
         "tool_stopped_responding": "도구가 응답하지 않습니다",
         "turn_interrupted": "턴이 중단되었습니다",
-        "turn_stalled": "턴이 멈춰 있습니다"
+        "turn_stalled": "턴이 멈춰 있습니다",
+        "continued_by_a_hook": "훅에 의해 계속 진행했습니다",
+        "hook_requested_continuing": "훅에서 요청함 · 계속 진행 중",
+        "hook_loop_halted": "훅 루프가 중지되었습니다",
+        "nudge_cap_reached": "넛지 한도에 도달함"
       },
       "sessionColorPicker": {
         "change_your_color_palette_in_display_settings": "색상 팔레트는 표시 설정에서 변경할 수 있습니다",
@@ -7676,7 +7704,7 @@
         "ago": "전",
         "ask_a_side_question": "사이드 질문하기",
         "ask_a_side_question_2": "사이드 질문하기…",
-        "ask_a_side_question_main_agent_keeps_working": "활성 실행을 중단하지 않고 사이드 대화를 시작합니다.",
+        "ask_a_side_question_main_agent_keeps_working": "실행 중인 작업을 멈추지 않고 사이드에서 질문할 수 있습니다. 여기 내용은 대화에 저장되지 않습니다.",
         "context_from": "컨텍스트 출처",
         "question_too_long": "질문이 너무 깁니다 — 약 {{max}} 글자 이내로 줄여 주세요 (현재: {{current}})",
         "queue_cancel_failed": "대기열에 있는 해당 질문을 취소할 수 없습니다",
@@ -7705,12 +7733,18 @@
         "menu_context_desc": "이 세션의 턴 동안 추가된 컨텍스트",
         "menu_files": "파일",
         "menu_files_desc": "파일 탐색 및 편집",
+        "menu_git": "Git",
+        "menu_git_desc": "브랜치·변경 사항·최근 커밋",
         "menu_issues": "이슈",
         "menu_issues_desc": "이 세션에서 언급된 이슈",
+        "menu_links": "링크",
+        "menu_links_desc": "이 채팅에서 참조한 URL",
         "menu_logs": "로그",
         "menu_logs_desc": "게이트웨이 로그 스트림",
-        "menu_side": "사이드",
-        "menu_side_desc": "컨텍스트를 공유하는 병렬 채팅",
+        "menu_pins": "핀",
+        "menu_pins_desc": "이 세션에서 핀으로 표시한 메시지",
+        "menu_side": "사이드 채팅",
+        "menu_side_desc": "메인 에이전트를 멈추지 않고 질문",
         "menu_subagents": "서브에이전트",
         "menu_subagents_desc": "실시간 에이전트 활동과 기록",
         "menu_summary": "요약",
@@ -7727,11 +7761,7 @@
         "switch_to_split_view": "분할 보기로 전환",
         "switch_to_unified_view": "통합 보기로 전환",
         "this_app_render_is_no_longer_available": "이 앱 렌더링은 더 이상 사용할 수 없습니다. 도구를 다시 실행해 확인하세요.",
-        "turn_diff": "턴 차이",
-        "menu_git": "Git",
-        "menu_git_desc": "브랜치·변경 사항·최근 커밋",
-        "menu_pins": "핀",
-        "menu_pins_desc": "이 세션에서 핀으로 표시한 메시지"
+        "turn_diff": "턴 차이"
       },
       "stopEventCard": {
         "stop_failed_session_reset": "중지에 실패하여 세션을 초기화했습니다",
@@ -7811,9 +7841,10 @@
       "toolDetails": {
         "auto": "자동",
         "details_unavailable_for_historical_tool_calls": "과거 도구 호출의 세부 정보는 표시할 수 없습니다.",
+        "formatted": "서식",
         "no_input_or_output_captured_for_this_tool_call": "이 도구 호출의 입력 또는 출력이 기록되지 않았습니다.",
-        "not_yet_available": "{{label}}은(는) 아직 사용할 수 없습니다",
         "null": "null",
+        "raw": "원문",
         "render_escaped_whitespace_as_real_line_breaks": "이스케이프된 공백을 실제 줄바꿈으로 표시",
         "show_the_exact_payload_escaping_preserved": "이스케이프를 유지한 채 정확한 페이로드 표시",
         "waiting_for_approval": "승인 대기 중"
@@ -7828,7 +7859,6 @@
         "send": "보내기",
         "send_enter": "보내기 (Enter)",
         "steered_into_the_running_turn": "실행 중인 턴에 추가되었습니다",
-        "message_unconfirmed": "Message not confirmed — may not have been delivered",
         "pin_message": "Pin message",
         "unpin_message": "Unpin message"
       },
@@ -7867,6 +7897,10 @@
         "unpin": "Unpin",
         "jump_to_message": "Jump to message"
       },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "이전 메시지 불러오기",
+        "error_retry": "이전 메시지를 불러올 수 없습니다 — 다시 시도"
+      },
       "sessionSummary": {
         "empty_body": "요약은 턴이 끝날 때 작성됩니다. 이 세션의 요약을 받으려면 메시지를 보내세요.",
         "empty_generate_body": "이 세션은 아직 요약되지 않았습니다.",
@@ -7887,6 +7921,7 @@
         "off_body": "켜면 이후 턴이 요약됩니다. 이전 턴은 소급 생성되지 않습니다.",
         "off_title": "세션 요약이 꺼져 있습니다",
         "open_items_heading": "미해결 항목",
+        "open_items_less": "간략히 보기",
         "open_items_more": "외 {{n}}건",
         "open_items_other": "미해결 {{count}}건",
         "pivoted_from_turn": "턴 {{turn}}의 질문에서 시작됨",
@@ -7905,6 +7940,23 @@
         "updated_behind": "{{when}} 업데이트 — 대화보다 뒤처져 있음",
         "where_it_stands": "현재 상황",
         "you_asked_for": "요청한 내용"
+      },
+      "fileBrowserRail": {
+        "all_files": "모든 파일",
+        "changed": "변경됨",
+        "close_search": "검색 닫기",
+        "filter_placeholder": "파일 필터링…",
+        "refresh": "새로 고침",
+        "resize": "파일 브라우저 크기 조절",
+        "tree_mode": "파일 목록 모드"
+      },
+      "filesHome": {
+        "no_project_dir": "이 채팅에는 프로젝트 디렉터리가 설정되어 있지 않습니다",
+        "refresh": "새로 고침",
+        "reveal_in_finder": "파일 관리자에서 보기",
+        "select_file_hint": "트리에서 파일을 선택하면 새 탭에서 열립니다",
+        "title": "파일",
+        "tree_error": "파일 트리를 불러올 수 없습니다"
       }
     },
     "chatPage": {
@@ -8025,6 +8077,7 @@
       "collapse_folder_name": "{{name}} 폴더 접기",
       "collapse_group_results": "{{group}} 결과 접기",
       "collapse_hidden_folders": "숨긴 폴더 접기",
+      "collapse_source_links": "간략히 보기",
       "column_filter": "열 필터",
       "column_name_optional": "열 이름 (선택)",
       "connected_to": "{{label}}에 연결됨",
@@ -8109,6 +8162,7 @@
       "new_folder": "새 폴더",
       "new_subfolder": "새 하위 폴더",
       "no_inactive_sessions_to_archive": "아카이브할 비활성 세션이 없습니다.",
+      "no_older_sessions": "이전 세션이 없습니다 — 닫은 탭이 여기에 표시됩니다",
       "no_sessions": "세션 없음",
       "no_sessions_match": "일치하는 세션 없음",
       "older": "이전",
@@ -8151,6 +8205,7 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "최신순",
       "sort_oldest": "오래된순",
+      "source_links_expand_failed": "나머지를 불러올 수 없습니다. 클릭하여 다시 시도하세요.",
       "started_in_channel": "이 대화는 {{channel}}에서 시작되었습니다.",
       "started_in_direct_message": "이 대화는 다이렉트 메시지에서 시작되었습니다.",
       "stop_filtering_by_tag": "{{name}} 필터 해제",
@@ -8539,12 +8594,14 @@
       "bundled": "번들 제공",
       "cancel": "취소",
       "check_your_connection_or_configuration_and_try_a": "연결 또는 설정을 확인하고 다시 시도하세요.",
+      "click_again_to_confirm": "다시 클릭하여 확인",
       "command": "명령",
       "config": "설정",
       "configure_via": "{{path}}에서 설정합니다.",
+      "confirm_delete_hook": "삭제?",
       "create_a_hook_to_run_scripts_on_chat_events": "채팅 이벤트에서 스크립트를 실행할 훅을 만드세요",
       "delete": "삭제",
-      "delete_hook": "훅 ‘{{name}}’을(를) 삭제하시겠습니까?",
+      "delete_hook": "훅 ‘{{name}}’ 삭제",
       "disable_hook": "훅 비활성화",
       "echo_hook_fired": "echo 'hook fired'",
       "edit": "편집",
@@ -8563,8 +8620,10 @@
       "last_run": "마지막 실행",
       "loading": "불러오는 중…",
       "matcher": "매처",
+      "matcher_mode": "Matcher mode",
       "matcher_optional_e_g_deploy": "매처(선택 사항, 예: *deploy*)",
       "matcher_tool_filter_e_g_fs_write_git": "매처(도구 필터, 예: fs_write, @git/*)",
+      "more_actions": "추가 작업",
       "ms": "ms",
       "name": "이름",
       "new_hook": "+ 새 훅",
@@ -8586,12 +8645,12 @@
       "timeout": "제한 시간",
       "total": "합계",
       "total_runs": "총 실행 횟수",
-      "user": "사용자",
-      "matcher_mode": "Matcher mode"
+      "user": "사용자"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "이 워크스페이스의 고유 식별자입니다. 에이전트는 이름으로 워크스페이스를 참조합니다.",
       "additional_stores_coming_with_memory_v2": "현재는 기본 저장소만 사용할 수 있습니다 — 더 많은 메모리 저장소 지원이 곧 제공됩니다.",
+      "agent_template_is_required": "에이전트 템플릿은 필수입니다",
       "agents": "크루",
       "also_used_by_these_crews": "{{crews}}에서도 사용합니다. 저장소를 공유하는 크루는 서로의 파일과 메모리를 읽을 수 있습니다.",
       "bindings_preview_info": "미리 보기 기능입니다. 크루별 격리 메모리는 아직 개발 중입니다. 크루는 자체 워크스페이스 폴더를 갖지만 의미 기억, 지난 대화 회상, 전역 학습 내용은 모든 크루에 전달되므로, 이 설정을 바꿔도 크루가 기억하는 내용은 아직 분리되지 않습니다.",
@@ -8645,6 +8704,7 @@
       "routing": "라우팅",
       "runtime_binding": "이 크루가 사용하는 것",
       "save_changes": "변경 사항 저장",
+      "select_an_agent_template": "에이전트 템플릿 선택…",
       "shared_lower": "공유",
       "subdirectory_inside_kiro_crew_where_this_workspa": "이 워크스페이스가 데이터(채팅 기록, 레슨, 프로젝트)를 저장하는 ~/.kiro/crew 내부 하위 디렉터리입니다. 각 워크스페이스는 격리된 자체 디렉터리를 갖습니다.",
       "the_agent_definition_it_boots_from_tools_mcp_ser": "이 크루가 사용하는 시작 설정 — 도구, 연결, 지침입니다.",
@@ -8955,9 +9015,14 @@
         "col_evidence": "근거",
         "col_running_as": "실행 형태",
         "connections_link": "Connections",
-        "how_measured": "server 는 Kiro Crew 가 조사하기 전까지 측정되지 않음으로 표시됩니다. 조사는 {{link}} 의 MCP server 목록을 새로 고칠 때 한 번에 두 개씩 진행됩니다.",
+        "how_measured": "서버는 Kiro Crew가 측정할 때까지 측정되지 않음으로 표시됩니다. 아래 버튼은 측정되지 않은 서버를 한 번에 측정하고, {{link}}의 MCP 서버 목록을 새로 고칠 때도 몇 개씩 측정됩니다.",
         "lede": "Kiro Crew가 각 서버에 대해 관찰할 수 있었던 내용과, 그것이 지금 서버가 실행되고 있는 형태와 어떻게 맞물리는지 보여 줍니다. 이 화면에서는 아무것도 바뀌지 않습니다 — 스위치는 Servers 아래에 있습니다.",
-        "legend": "공유 백엔드를 권장하려면 서버가 자신의 호출자를 구분할 수 있다고 밝혀야 하는데, 그렇게 밝히는 서버는 드뭅니다 — 그래서 대부분의 정상 서버는 이의 없음 상태에 머뭅니다. 이는 빠진 답이 아니라 보수적인 답이며, 공유 여부는 여전히 사용자의 판단에 달려 있습니다.",
+        "legend": "공유 백엔드를 권장하려면 서버가 호출자를 구별할 수 있다고 선언해야 하며, 그렇게 선언하는 서버는 드뭅니다. 측정은 호출자별로 다른 핸드셰이크를 배제할 뿐, 도구 호출이 만드는 상태는 볼 수 없습니다. 그래서 정상적인 서버 대부분은 '측정됨' 또는 '이의 없음'에 머무릅니다. 이는 보수적인 답이지 누락된 답이 아니며, 공유 여부는 사용자의 판단입니다.",
+        "measure_failed": "측정이 도중에 중단되었습니다. 게이트웨이 로그를 확인하세요",
+        "measure_finished_other": "서버 {{count}}개를 측정했습니다",
+        "measure_none_left": "모든 서버를 측정했습니다",
+        "measure_running": "측정 중, {{total}}개 중 {{done}}개 완료",
+        "measure_unmeasured_other": "측정되지 않은 서버 {{count}}개 측정",
         "open_servers": "Servers 열기",
         "reason_all_tools_read_only": "모든 도구가 스스로 읽기 전용이라고 선언함",
         "reason_caller_sensitive": "서로 다른 두 호출자에게 핸드셰이크에 다르게 응답함",
@@ -8976,6 +9041,7 @@
         "shared_without_support": "백엔드 공유가 이미 적용되어 있지만 증거는 공유에 반대합니다. 영향을 받는 server: {{count}}",
         "strength_declared": "공유 지원",
         "strength_disqualified": "공유에 적합하지 않음",
+        "strength_measured": "측정됨, 차이 없음",
         "strength_no_objection": "이의 없음",
         "strength_refuted": "공유 시 안전하지 않음",
         "strength_unknown": "미측정"
@@ -8992,6 +9058,10 @@
       "confirm_title": "세션 간에 백엔드를 공유할까요?",
       "confirm_turn_on": "공유 켜기",
       "confirm_unsupported": "그중 {{count}} 개는 증거가 공유에 반대합니다.",
+      "enable_all": "증거가 허용하는 모든 서버에 스텁 적용",
+      "enable_all_hint": "판정이 없는 서버를 먼저 측정합니다. 증거가 반대하는 서버와 선언된 환경 변수가 공유 백엔드에 전달되지 않는 서버는 건드리지 않습니다.",
+      "enable_all_result": "{{enabled}}개에 스텁을 적용하고 {{skipped}}개는 그대로 두었습니다.",
+      "enable_all_still_measuring": "아직 측정 중입니다. 변경된 것은 없으니 완료 후 다시 시도하세요.",
       "learn_more": "자세히 보기",
       "learn_more_docs": "문서에서 자세히 보기",
       "lede": "Kiro Crew는 모든 세션이 MCP 서버를 직접 실행하게 하는 대신, 서버 앞에 자체 스텁을 둘 수 있습니다. 스텁은 서버가 자체 UI를 그리는 것(MCP Apps)의 전제이며, 공유 백엔드가 라우팅될 수 있는 유일한 대상이기도 합니다. 그래서 서버별 옵트인입니다. {{link}}",
@@ -9568,8 +9638,6 @@
     },
     "overviewPage": {
       "all_systems_running": "모든 시스템 실행 중",
-      "apply_config_changes_by_restarting_all_sessions": "모든 세션을 재시작해 설정 변경을 적용합니다",
-      "apply_restart": "적용 및 재시작",
       "back_to_overview": "개요로 돌아가기",
       "connecting": "연결 중…",
       "days_of_history": "일간 기록",
@@ -9580,11 +9648,8 @@
       "messages": "메시지",
       "overview": "개요",
       "reconnecting": "다시 연결하는 중…",
-      "restart": "재시작",
-      "restarting": "재시작 중…",
       "semantic_memory_active": "· 의미 기억 활성",
       "sessions": "세션 ·",
-      "sessions_restarted": "세션을 재시작했습니다.",
       "stat_cron_jobs": "cron 작업",
       "stat_lessons": "학습 내용",
       "stat_messages": "메시지",
@@ -9709,7 +9774,7 @@
       "running": "실행 중",
       "schedule": "정기 실행",
       "scheduled_as_daily_cron_job": "매일 실행되는 cron 작업으로 등록했습니다",
-      "task_runner": "작업 실행기",
+      "task_runner": "Task Runner",
       "upload_a_file": "파일 업로드",
       "workspace": "워크스페이스:",
       "workspace_folder": "워크스페이스 폴더",
@@ -10620,7 +10685,7 @@
         "category_subagent": "서브에이전트",
         "category_subagent_description": "백그라운드 서브에이전트 완료",
         "category_taskrunner": "작업",
-        "category_taskrunner_description": "작업 실행기 완료",
+        "category_taskrunner_description": "Task Runner 완료",
         "category_turn": "에이전트 응답",
         "category_turn_description": "에이전트가 어떤 채팅에서든 한 차례를 마쳤을 때",
         "channel_default": "채널 기본값",
@@ -10704,6 +10769,10 @@
         "disable_this_denied_command": "이 거부된 명령을 비활성화할까요?",
         "disabled_by_policy": "정책으로 비활성화됨",
         "disabled_for_this_surface": "호스트 표면에서 비활성화됨",
+        "profile_unusable_title": "전체 거부 폴백이 적용 중입니다",
+        "profile_unusable_body": "아래에 표시된 프로필을 로드할 수 없어 해당 표면이 실패 시 차단되는 전체 거부 상한에 묶입니다. Kiro Crew 데이터 홈의 profiles 폴더에서 파일을 수정하십시오. 수정하면 자동으로 다시 로드됩니다.",
+        "profile_unusable_detail": "파일을 읽을 수 없거나, 구문 분석에 실패했거나, 확장 대상 프로필이 없습니다. 재시작은 파일이 실행 중인 빌드보다 최신 빌드용인 경우에만 필요합니다.",
+        "profile_unusable_which": "영향을 받는 프로필: {{profiles}}.",
         "disabling_a_rule_that_overlaps_an_always_on_cont": "항상 켜져 있는 제어(민감 파일 읽기, IMDS, git-publish)와 겹치는 규칙을 비활성화해도 완전히 허용되지는 않습니다 — 다층 방어가 계속 차단합니다.",
         "disabling_all_built_in_denies_removes_kirocrew_s": "모든 기본 거부 규칙을 비활성화하면 파괴적인 명령과 자격 증명 유출 명령에 대한 Kiro Crew의 보호가 사라집니다. 일부 명령은 독립적인 다층 방어(민감 경로, IMDS, git-publish)로 계속 차단될 수 있습니다.",
         "disabling_weakens_protection": "‘{{name}}’을(를) 비활성화하면 파괴적인 명령이나 자격 증명 유출에 대한 보호가 약해집니다. 일부 명령은 독립적인 다층 방어로 계속 차단될 수 있습니다.",
@@ -11707,7 +11776,7 @@
     "worldsPage": {
       "active": "활동 중,",
       "agent_other": "에이전트 {{count}}개",
-      "agent_worlds": "에이전트 월드",
+      "agent_worlds": "Agent Worlds",
       "focus_popout": "팝아웃 포커스",
       "hide_controls": "컨트롤 숨기기",
       "open": "빈 시간",

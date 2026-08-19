@@ -364,14 +364,14 @@ function MentionInput({ agents, value, onChange, onSend }: {
         aria-label={i18nT('pages.channelPage.message_the_channel')}
         className="w-full bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none flex-1 transition-colors focus-ring resize-none"
         placeholder={i18nT('pages.channelPage.message_the_channel_type_to_mention')}
-        {...ime.composition}
+        {...ime.bindComposition()}
         onKeyDown={e => {
           if (show && active.length > 0) {
             if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => (s + 1) % active.length) }
             else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => (s - 1 + active.length) % active.length) }
-            else if (e.key === 'Enter' && !ime.isComposing(e)) { e.preventDefault(); pick(active[sel]) }
+            else if (e.key === 'Enter') { if (ime.claimEnter(e)) pick(active[sel]) }
             else if (e.key === 'Escape') { ime.reset(); setShow(false) }
-          } else if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e)) { e.preventDefault(); onSend() }
+          } else if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) onSend() }
         }} />
     </div>
   )
@@ -380,6 +380,7 @@ function MentionInput({ agents, value, onChange, onSend }: {
 // ── Add Agent Form ──
 
 function AddAgentForm({ onAdd, onCancel }: { onAdd: (role: string, task: string, agent: string) => void; onCancel: () => void }) {
+  const ime = useImeGuard()
   const [role, setRole] = useState('')
   const [task, setTask] = useState('')
   const { agents, defaultAgent } = useAgents(0)
@@ -394,7 +395,14 @@ function AddAgentForm({ onAdd, onCancel }: { onAdd: (role: string, task: string,
         className="w-full text-[13px]" />
       <Input value={task} onChange={e => setTask(e.target.value)} placeholder={i18nT('pages.channelPage.task_e_g_search_cloudwatch_logs')} aria-label={i18nT('pages.channelPage.task')}
         className="w-full text-[13px]"
-        onKeyDown={e => { if (e.key === 'Enter' && role.trim()) onAdd(role.trim(), task.trim(), agent || defaultAgent) }} />
+        {...ime.bindComposition()}
+        onKeyDown={e => {
+          if (e.key !== 'Enter') return
+          // Rule 1: single-line input — the guard alone is enough; claiming would
+          // suppress an implicit form submit where one is wanted.
+          if (ime.isComposing(e)) return
+          if (role.trim()) onAdd(role.trim(), task.trim(), agent || defaultAgent)
+        }} />
       <div className="flex gap-1">
         <Btn onClick={() => { if (role.trim()) onAdd(role.trim(), task.trim(), agent || defaultAgent) }} disabled={!role.trim()} primary className="flex-1">{i18nT('pages.channelPage.add')}</Btn>
         <Btn onClick={onCancel}>{i18nT('pages.channelPage.cancel')}</Btn>

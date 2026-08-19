@@ -116,6 +116,8 @@ from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     CRON_NOTIFY_RE,
+    HOOK_CONTINUATION_RECOVERY_PREFIX,
+    HOOK_HALTED_RECOVERY_PREFIX,
     NATIVE_SUBAGENT_DONE_RESULT_CAP,
     NATIVE_SUBAGENT_DONE_TRUNC_MARKER,
     NATIVE_SUBAGENT_OUTPUT_HARD,
@@ -135,6 +137,8 @@ from kiro_crew.dashboard.state import (
     build_stale_recovery_prompt,
     build_tool_stall_recovery_prompt,
     is_read_only_bash,
+    parse_hook_continuations,
+    should_queue_hook_continuation,
     should_queue_refusal_recovery,
     unsafe_bash_reason,
 )
@@ -1065,6 +1069,28 @@ def _redact_acp_string(s: str) -> str:
     return s
 
 
+# Native subagent cards carry a short error string only, so a long provider
+# message is clipped. The request id is what identifies the failure
+# server-side and the formatter appends it LAST, so a plain head-slice drops
+# precisely the part worth keeping.
+_MAX_NATIVE_CARD_ERROR = 200
+_RE_TRAILING_REQUEST_ID = re.compile(r"\(request_id:\s*[0-9a-fA-F-]+\)\s*$")
+
+
+def _clip_card_error(text: str, limit: int = _MAX_NATIVE_CARD_ERROR) -> str:
+    """Clip *text* to *limit* characters, keeping any trailing request id."""
+    if len(text) <= limit:
+        return text
+    match = _RE_TRAILING_REQUEST_ID.search(text)
+    if not match:
+        return text[:limit]
+    suffix = match.group(0).strip()
+    head = limit - len(suffix) - 4  # room for the elision marker and a space
+    if head <= 0:
+        return text[:limit]
+    return f"{text[:head]}... {suffix}"
+
+
 def _emit_mcp_oauth_request(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -1570,7 +1596,7 @@ def _native_subagent_sync(state, slot, subagents, tracker, card_output=None) -> 
             if stype in ("failed", "error") and smsg:
                 err, _ = redact_exfiltration_urls(smsg)
                 err, _ = redact_credentials(err)
-                err = err[:200]
+                err = _clip_card_error(err)
             info["done"] = True
             _feed = _native_card_feed(card_output, card_id)
             _elapsed = time.time() - info["started"]
@@ -1910,32 +1936,65 @@ _BROWSER_CLI_PAGE_VERBS = frozenset(
         # Core / lifecycle. `close` is deliberately absent -- see the
         # exclusion note below. `detach` stays: it releases the session
         # without taking the operator's window with it.
-        "open", "attach", "detach", "goto", "resize",
+        "open",
+        "attach",
+        "detach",
+        "goto",
+        "resize",
         # Interaction
-        "type", "click", "dblclick", "fill", "drag", "drop", "hover",
-        "select", "check", "uncheck",
+        "type",
+        "click",
+        "dblclick",
+        "fill",
+        "drag",
+        "drop",
+        "hover",
+        "select",
+        "check",
+        "uncheck",
         # Reading the page
-        "snapshot", "find", "generate-locator", "highlight",
+        "snapshot",
+        "find",
+        "generate-locator",
+        "highlight",
         # Dialogs
-        "dialog-accept", "dialog-dismiss",
+        "dialog-accept",
+        "dialog-dismiss",
         # Navigation
-        "go-back", "go-forward", "reload",
+        "go-back",
+        "go-forward",
+        "reload",
         # Keyboard / mouse
-        "press", "keydown", "keyup",
-        "mousemove", "mousedown", "mouseup", "mousewheel",
+        "press",
+        "keydown",
+        "keyup",
+        "mousemove",
+        "mousedown",
+        "mouseup",
+        "mousewheel",
         # Capture (writes only into the service's own output dir)
-        "screenshot", "pdf",
+        "screenshot",
+        "pdf",
         # Tabs. `tab-close` is absent for the same reason as `close`.
-        "tab-list", "tab-new", "tab-select",
+        "tab-list",
+        "tab-new",
+        "tab-select",
         # Read-only request metadata: route-list prints the mock table
         # (pattern strings, no URLs) and config-print prints the session's
         # launch configuration.
         "route-list",
         # DevTools / diagnostics
-        "console", "tracing-start", "tracing-stop",
-        "video-stop", "video-chapter", "video-show-actions",
+        "console",
+        "tracing-start",
+        "tracing-stop",
+        "video-stop",
+        "video-chapter",
+        "video-show-actions",
         "video-hide-actions",
-        "show", "pause-at", "resume", "step-over",
+        "show",
+        "pause-at",
+        "resume",
+        "step-over",
         # Session management. The listing only; `close-all` / `kill-all`
         # are absent -- they are the widest-blast-radius verbs the CLI has.
         "list",
@@ -2047,13 +2106,25 @@ _BROWSER_CLI_SAFE_FLAGS = frozenset(
         # so the named-session form this repo's own prompt.md tells the agent to
         # use (`--s=chrome`) fell through to interactive approval on EVERY
         # command after `attach` -- the documented primary workflow.
-        "-s", "--s", "--session",
-        "--json", "--raw", "--help", "--version",
-        "--headed", "--browser", "--persistent",
-        "--extension", "--cdp", "--endpoint",
-        "--domain", "--hide",
+        "-s",
+        "--s",
+        "--session",
+        "--json",
+        "--raw",
+        "--help",
+        "--version",
+        "--headed",
+        "--browser",
+        "--persistent",
+        "--extension",
+        "--cdp",
+        "--endpoint",
+        "--domain",
+        "--hide",
         # Shape-only capture options: they change the image, not its location.
-        "--type", "--full-page", "--hires",
+        "--type",
+        "--full-page",
+        "--hires",
     }
 )
 
@@ -3639,6 +3710,11 @@ async def _run_chat(
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
 
+    # Capture before any await: a Stop can complete while pre-turn setup is
+    # suspended and reset _stop_state to idle before continuation processing.
+    # The monotonic generation preserves that user intent across the whole call.
+    _stop_gen_at_entry = slot._stop_generation
+
     session_key = effective_session_key(slot)
     sessions = getattr(state, "sessions", None)
 
@@ -3673,6 +3749,7 @@ async def _run_chat(
         tool_name: str = "",
         tool_input: dict | None = None,
         tool_response: dict | None = None,
+        hook_continuation_count: int = 0,
     ) -> list[str]:
         """Fire script hooks. Returns stdout texts from exit-0 hooks (for context injection)."""
         injected: list[str] = []
@@ -3689,6 +3766,7 @@ async def _run_chat(
                 tool_input=tool_input,
                 tool_response=tool_response,
                 parent_session_key=session_key,
+                hook_continuation_count=hook_continuation_count,
             )
             for r in results:
                 if r.exit_code == 0 and r.stdout:
@@ -3913,6 +3991,17 @@ async def _run_chat(
     # the turn ends — and the user did not stop it — a recovery continuation is
     # enqueued so the model learns why and can adapt instead of stalling.
     _refusal_reasons: list[tuple[str, str]] = []
+    # Track how deep an unbroken hook-continuation run is, so the Stop hook can
+    # see it: each consecutive hook continuation is one deeper; any other turn
+    # (a real user message, a refusal recovery) breaks the run and resets it.
+    # Gate on synthetic provenance, not the marker text alone: a real dequeued
+    # continuation carries _synthetic_payload, but a user who types the marker
+    # verbatim is ordinary speech and must not inflate the depth a gate hook
+    # sees (would let a spoofed message drive the hook's self-limit).
+    if _synthetic_payload and message.startswith(HOOK_CONTINUATION_RECOVERY_PREFIX):
+        slot._hook_continuation_depth += 1
+    else:
+        slot._hook_continuation_depth = 0
     # Runner-authored continuations are orchestration, not user input, and the
     # post-fan-out synthesis prompt is one too: never mirror either to linked
     # surfaces (Slack/Telegram) as if the user typed it — only the assistant reply
@@ -4757,11 +4846,7 @@ async def _run_chat(
         # stream, the assistant reply and the stream teardown together. Disconnect
         # is the user saying "not into this conversation", which applies to the
         # answer as much as to the echo — so it is one gate, not four.
-        if (
-            state.slack_client
-            and not is_slash
-            and not slack_mirror_is_paused(state, session_key)
-        ):
+        if state.slack_client and not is_slash and not slack_mirror_is_paused(state, session_key):
             _mirror_thread, _mirror_chan = state.sessions.get_slack_link(session_key)
             if _mirror_thread and _mirror_chan:
                 try:
@@ -5305,9 +5390,7 @@ async def _run_chat(
                                 # this same tool_call_id (which no longer
                                 # resolves _dir_tool).
                                 _pending_dir_tool.pop(event.tool_call_id, None)
-                                _out = _redact_tool_field(
-                                    session_directive.strip_marker(_out)
-                                )
+                                _out = _redact_tool_field(session_directive.strip_marker(_out))
                                 _dir_consumed_out[event.tool_call_id] = _out
                             else:
                                 # The gate already AUTHENTICATED this as a
@@ -5636,9 +5719,10 @@ async def _run_chat(
                 # parent turn. Deny-by-default (CWE-1188): with no active crew this
                 # predicate is False no matter the trust flags, so the tool falls
                 # through to the normal interactive/trust gate below.
-                if _native_crew_should_auto_approve(
-                    _native_tracker, state, slot
-                ) and not _child_low_fidelity:
+                if (
+                    _native_crew_should_auto_approve(_native_tracker, state, slot)
+                    and not _child_low_fidelity
+                ):
                     logger.debug(
                         "Native crew auto-approve: %r (request_id=%s)",
                         _safe_native_crew_debug_title(event.title),
@@ -6022,7 +6106,11 @@ async def _run_chat(
                             slot._slack_thread_ts,
                             event.request_id,
                             session_key,
-                            f"{_child_lf_warning}{event.title}" if _child_lf_warning else event.title,
+                            (
+                                f"{_child_lf_warning}{event.title}"
+                                if _child_lf_warning
+                                else event.title
+                            ),
                             event.tool_input or "",
                         )
                         if _slack_approval_ts is None:
@@ -6127,6 +6215,24 @@ async def _run_chat(
                             "retrying the same call.",
                             "msg msg-a",
                         )
+                    # Tell any monitoring loop bound to this slot that a cycle
+                    # could not obtain approval. This branch IS the evidence a
+                    # reactive stop needs: the prompt ran its full window with no
+                    # decision, which an auto-approved tool never reaches. The
+                    # loop stops on its next wake instead of spending the rest of
+                    # its cap on cycles that cannot act. Best-effort and
+                    # non-blocking — a monitoring convenience must never change
+                    # how this turn's denial is reported.
+                    try:
+                        from kiro_crew.autonudge import (
+                            get_instance as _autonudge_get,  # circular: autonudge -> dashboard.chat -> chat_runner
+                        )
+
+                        _autonudge = _autonudge_get()
+                        if _autonudge is not None:
+                            _autonudge.notify_approval_stalled(slot.key)
+                    except Exception:
+                        logger.debug("autonudge.notify_approval_stalled failed", exc_info=True)
                 finally:
                     if _approval_card is not None:
                         try:
@@ -6380,11 +6486,7 @@ async def _run_chat(
                 # them here would leave the user watching a child tool fail
                 # with no explanation. When the card cannot exist yet, persist
                 # the explanation as a slot notice instead.
-                if (
-                    _sid not in _native_tracker
-                    and event.text
-                    and event.text.startswith("⛔")
-                ):
+                if _sid not in _native_tracker and event.text and event.text.startswith("⛔"):
                     _txt, _ = redact_exfiltration_urls(event.text)
                     _txt, _ = redact_credentials(_txt)
                     slot.append("notice", _txt, "msg msg-info")
@@ -6615,9 +6717,7 @@ async def _run_chat(
                 # recovery cycle); the emitted flag dedups the metric and
                 # blocks a later "recovered" mis-emit.
                 if not slot._tool_stall_exhausted_emitted:
-                    _emit_recovery_outcome(
-                        "tool_stall", "exhausted", slot._tool_stall_retries
-                    )
+                    _emit_recovery_outcome("tool_stall", "exhausted", slot._tool_stall_retries)
                     slot._tool_stall_exhausted_emitted = True
                 _emit_stall("Session stuck — please start a new chat.")
             else:
@@ -6965,9 +7065,7 @@ async def _run_chat(
                         "stale_recover", "recovered", slot._stale_recovery_retries
                     )
                 if slot._tool_stall_retries > 0 and not slot._tool_stall_exhausted_emitted:
-                    _emit_recovery_outcome(
-                        "tool_stall", "recovered", slot._tool_stall_retries
-                    )
+                    _emit_recovery_outcome("tool_stall", "recovered", slot._tool_stall_retries)
             slot._empty_response_retries = 0
             slot._prompt_busy_retries = 0
             slot._acp_pipe_death_retries = 0
@@ -7041,7 +7139,97 @@ async def _run_chat(
         # [:500]) so the tail — e.g. the harness [OPTIONS:] line — reaches both
         # the matcher and the hook body.
         _final = redact_credentials(redact_exfiltration_urls(assistant_text)[0])[0]
-        await _fire(HOOK_EVENT_STOP, _final)
+        # Report how deep this hook-continuation run is so a gate hook can
+        # diagnose or apply a stricter limit than the configurable backstop.
+        _stop_hook_out = await _fire(
+            HOOK_EVENT_STOP,
+            _final,
+            hook_continuation_count=slot._hook_continuation_depth,
+        )
+
+        # ── Stop-hook continuation ─────────────────────────────────────────
+        # A Stop hook that exits 0 and prints {"decision": "block", "reason":
+        # ...} asks the harness to continue with `reason` as the next message
+        # (https://kiro.dev/docs/hooks/types#agent-stop), so a hook can judge the
+        # finished turn and keep the session going — a test-gate hook, or one that
+        # auto-continues a trivial read — without a round-trip to the user.
+        # Suppressed on a user stop or a pending reset so a hook can never
+        # override the Stop button. A configurable consecutive-turn backstop
+        # bounds faulty always-block hooks; 0 explicitly disables that backstop.
+        # The finally block's dequeue loop dispatches accepted continuations.
+        if should_queue_hook_continuation(slot._stopping, needs_session_reset, _stop_reason) and (
+            # Suppress if any user stop was initiated during this turn (streaming,
+            # completion persistence, or the hook _fire above): stop_turn()
+            # reporting "idle" resets _stop_state before this guard reads
+            # _stopping, but _stop_generation counts stop INITIATIONS and never
+            # rewinds, so an entry-vs-now delta is the durable signal.
+            slot._stop_generation
+            == _stop_gen_at_entry
+        ):
+            _hook_reasons = parse_hook_continuations(_stop_hook_out)
+            # No block decision -> nothing to queue; skip the cap load and
+            # arithmetic on the common empty path (also what the old
+            # `_hook_reasons and _nudge_cap` short-circuit did).
+            if _hook_reasons:
+                _nudge_cap = (
+                    await asyncio.to_thread(KiroCrewConfig.load)
+                ).agent.max_stop_hook_nudges
+                # Config loading yields to the event loop. Recheck the Stop
+                # boundary before mutating the queue so a Stop that lands during
+                # that await cannot be bypassed by the stale outer guard.
+                if (
+                    not should_queue_hook_continuation(
+                        slot._stopping, needs_session_reset, _stop_reason
+                    )
+                    or slot._stop_generation != _stop_gen_at_entry
+                ):
+                    _hook_reasons = []
+            else:
+                _nudge_cap = 0
+            # The cap bounds TOTAL consecutive continuation turns, and one Stop
+            # event can carry several block reasons, so clamp to the remaining
+            # budget rather than checking depth once and queueing all of them.
+            # _hook_continuation_depth only counts turns that have RUN, so also
+            # subtract continuations already sitting in the queue from an earlier
+            # multi-reason event: they will run and add depth, and ignoring them
+            # lets each event recompute room from depth alone and overshoot.
+            _pending = sum(
+                1
+                for _it in slot._queue
+                if is_synthetic_recovery_item(_it)
+                and _it["content"].startswith(HOOK_CONTINUATION_RECOVERY_PREFIX)
+            )
+            _room = (
+                len(_hook_reasons)
+                if not _nudge_cap
+                else max(0, _nudge_cap - slot._hook_continuation_depth - _pending)
+            )
+            # queue_insert(0, …) prepends, so insert in reverse to keep several
+            # hooks' instructions in firing order.
+            for _reason in reversed(_hook_reasons[:_room]):
+                slot.queue_insert(
+                    0,
+                    f"{HOOK_CONTINUATION_RECOVERY_PREFIX}\n{_reason}",
+                    kind=SYNTHETIC_RECOVERY_KIND,
+                )
+            if _hook_reasons and _room < len(_hook_reasons):
+                # The run reached the cap: some (or all) reasons were refused.
+                # Surface an inject row (renders as a halt card carrying the
+                # reached depth) but dispatch nothing for the excess. This is the
+                # backstop against a buggy always-block hook looping an
+                # unattended session. `0` disables the cap entirely.
+                _dropped = len(_hook_reasons) - _room
+                slot.append(
+                    "inject",
+                    f"{HOOK_HALTED_RECOVERY_PREFIX} #{slot._hook_continuation_depth}\n"
+                    f"A Stop hook asked to continue, but this run reached "
+                    f"agent.max_stop_hook_nudges = {_nudge_cap} "
+                    f"(depth {slot._hook_continuation_depth}); {_dropped} nudge(s) "
+                    f"were dropped and the run was halted. Raise or disable the "
+                    f"cap in config to allow more.",
+                    "msg msg-inject",
+                )
+                state.push_slots_update()
 
         # ── Tool-refusal recovery ──────────────────────────────────────────
         # A recoverable refusal (host-gate policy deny or the read-only bash
@@ -7092,9 +7280,7 @@ async def _run_chat(
                     # from the thread would name whoever owns the thread at mint
                     # time, so a relink landing mid-turn would stamp the control
                     # with a conversation that never asked the question.
-                    _mirror_token = await asyncio.to_thread(
-                        mint_options_token, state, session_key
-                    )
+                    _mirror_token = await asyncio.to_thread(mint_options_token, state, session_key)
                     _mirror_blocks = build_options_blocks(
                         _mirror_options, staleness_token=_mirror_token
                     )
