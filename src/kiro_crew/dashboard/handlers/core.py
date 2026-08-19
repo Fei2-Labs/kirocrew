@@ -24,6 +24,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
 from kiro_crew import beacon, platform_compat
+from kiro_crew.acp.types import ACP_BACKENDS_SELECTABLE
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
@@ -1556,6 +1557,13 @@ _MOVED_CONFIG_FIELDS: dict[str, str] = {
 
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
+    # Which ACP agent binary actually drives sessions: "" (kiro-cli, the
+    # default), "copilot" (GitHub Copilot CLI's own `--acp` server mode), or
+    # "kas" (kiro-agent). Editable here because switching it is a config-only
+    # change with no destructive side effect — the next spawned session simply
+    # launches a different binary (see acp.client._spawn / acp.types
+    # ACP_BACKENDS_SELECTABLE, the single source of truth for this set).
+    "agent.acp_backend": {"type": "enum", "values": sorted(ACP_BACKENDS_SELECTABLE)},
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry

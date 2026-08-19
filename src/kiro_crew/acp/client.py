@@ -46,6 +46,7 @@ from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOra
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_STEER,
@@ -143,6 +144,16 @@ DEFAULT_MODEL = "auto"
 
 KIRO_CLI_BIN = "kiro-cli"
 KIRO_CLI_SUBCMD = "acp"
+
+# GitHub Copilot CLI's own ACP server mode, verified against a live process:
+# `copilot --acp` answers `initialize` with protocolVersion 1 and a normal
+# ACP agentCapabilities/authMethods payload (agentInfo.name == "Copilot").
+# Unlike claude-agent-acp/KAS, this is a single first-party binary with no
+# separate npm package or native-binary side-install, so resolution is just
+# "find the `copilot` executable" (env override, PATH, then the per-user
+# github-copilot-sdk install dir the GitHub Copilot CLI installer/updater uses).
+COPILOT_BIN = "copilot"
+COPILOT_ACP_ARG = "--acp"
 
 CLAUDE_ACP_BIN = "claude-agent-acp"
 # On-disk name of the Claude backend CLI.  The claude-agent-acp adapter
@@ -297,6 +308,43 @@ async def _resolve_kiro_bin_for_spawn() -> str | None:
     """
 
     return await asyncio.to_thread(_resolve_kiro_bin)
+
+
+def _resolve_copilot_bin() -> str | None:
+    """Find the GitHub Copilot CLI executable for the ``copilot`` ACP backend.
+
+    Resolution order:
+      1. ``COPILOT_ACP_BIN`` env var (explicit override).
+      2. Augmented PATH (covers a plain ``npm i -g @github/copilot``, winget,
+         Homebrew, or the install-script layouts).
+      3. The per-user install dir the GitHub Copilot CLI's own
+         installer/updater uses (``github-copilot-sdk/cli/<version>/``), newest
+         version first — present even when the CLI was launched via a desktop
+         app wrapper that never put it on PATH.
+    """
+    override = os.environ.get("COPILOT_ACP_BIN")
+    if override and Path(override).is_file():
+        return override
+
+    search_path = augmented_path(os.environ.get("PATH", ""))
+    on_path = shutil.which(COPILOT_BIN, path=search_path)
+    if on_path:
+        return on_path
+
+    sdk_root = Path(
+        os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+    ) / "github-copilot-sdk" / "cli"
+    if sdk_root.is_dir():
+        exe_name = "copilot.exe" if platform_compat.IS_WINDOWS else "copilot"
+        candidates = sorted(
+            (p for p in sdk_root.glob(f"*/{exe_name}") if p.is_file()),
+            key=lambda p: p.parent.name,
+            reverse=True,
+        )
+        if candidates:
+            return str(candidates[0])
+
+    return None
 
 
 def _mise_which(tool: str) -> str | None:
@@ -2125,13 +2173,29 @@ class AcpClient:
         return self.backend == ACP_BACKEND_CLAUDE
 
     @property
+    def _is_copilot(self) -> bool:
+        """True when this client drives GitHub Copilot CLI's ``--acp`` server.
+
+        Copilot runs one process per session like claude-agent-acp (no shared
+        AcpRuntime demux), and answers ``initialize`` with the same numeric
+        ACP protocol version — so it shares claude's generic-external-agent
+        branches (protocol version, session/new & session/load meta shape)
+        rather than kiro-cli's ``--agent``/session-file-specific ones. It is
+        its own backend, not folded into ``_is_claude``, because claude-only
+        behaviors (settings.local.json seeding, CLAUDE_CODE_EXECUTABLE,
+        model-substitution retry) must stay claude-only.
+        """
+        return self.backend == ACP_BACKEND_COPILOT
+
+    @property
     def _is_kiro(self) -> bool:
         """True when this client drives kiro-cli (the AcpClient default).
 
-        AcpClient serves exactly two backends — kiro-cli and the dormant claude
-        seam — so this is the positive spelling of the sites that used to read
-        ``not self._is_claude`` (harness-parity H5). KAS runs on AcpRuntime, not
-        AcpClient, so it never reaches this property.
+        AcpClient serves kiro-cli plus two external-agent seams (the dormant
+        claude one and the copilot one) — so this is the positive spelling of
+        the sites that used to read ``not self._is_claude`` (harness-parity
+        H5). KAS runs on AcpRuntime, not AcpClient, so it never reaches this
+        property.
         """
         return self.backend == ACP_BACKEND_KIRO
 
@@ -2532,8 +2596,10 @@ class AcpClient:
     async def _spawn(self) -> None:
         """Start the ACP backend subprocess with stdio pipes.
 
-        KiroCrew's public core only ever drives the kiro-cli backend. The
-        claude-agent-acp branch below is the dormant protocol seam (see
+        KiroCrew's public core drives kiro-cli by default and GitHub Copilot
+        CLI when ``agent.acp_backend`` selects it (see ``ACP_BACKEND_COPILOT``
+        — a real, always-available seam, unlike the dormant claude one below).
+        The claude-agent-acp branch is the dormant protocol seam (see
         ``ACP_BACKEND_CLAUDE``): the public provider factory never selects it,
         so it is unreachable here, but an internal companion that re-registers
         a Claude backend reuses this same client over the seam.
@@ -2573,6 +2639,16 @@ class AcpClient:
                     f"script."
                 )
             argv: list[str] = claude_argv
+        elif self._is_copilot:
+            copilot_bin = await asyncio.to_thread(_resolve_copilot_bin)
+            if not copilot_bin:
+                raise AcpError(
+                    f"{COPILOT_BIN} not found. Install GitHub Copilot CLI "
+                    f"(https://docs.github.com/copilot/how-tos/copilot-cli/"
+                    f"set-up-copilot-cli/install-copilot-cli) and make sure it "
+                    f"is on PATH, or set COPILOT_ACP_BIN to its executable path."
+                )
+            argv = [copilot_bin, COPILOT_ACP_ARG]
         else:
             try:
                 kiro_bin = await _resolve_kiro_bin_for_spawn()
@@ -2589,6 +2665,7 @@ class AcpClient:
             except Exception:
                 logger.warning("pre-spawn agent materialization failed", exc_info=True)
             argv = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
+
 
         # OS-level sandbox: wrap the command to hide sensitive paths.
         # strip_python_env keeps the host PYTHONPATH/PYTHONHOME out of kiro-cli's
@@ -2713,7 +2790,11 @@ class AcpClient:
             subprocess_executor(), _get_start_time, self._pid
         )
         _spawn_label = (
-            "claude-agent-acp" if self._is_claude else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+            "claude-agent-acp"
+            if self._is_claude
+            else f"{COPILOT_BIN} {COPILOT_ACP_ARG}"
+            if self._is_copilot
+            else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
         )
         logger.info("Spawned %s (PID %d)", _spawn_label, self._pid)
         # Track root PID and do an early descendant scan.  kiro-cli forks
@@ -2784,7 +2865,9 @@ class AcpClient:
             self._stderr_lines.append(text)
             redacted, _ = redact_exfiltration_urls(text)
             redacted, _ = redact_credentials(redacted)
-            _bin_label = "claude-acp" if self._is_claude else KIRO_CLI_BIN
+            _bin_label = (
+                "claude-acp" if self._is_claude else COPILOT_BIN if self._is_copilot else KIRO_CLI_BIN
+            )
             logger.warning("%s stderr: %s", _bin_label, redacted)
         if suppressed:
             # Flush the residual count once the stream closes so the final burst
@@ -3105,7 +3188,7 @@ class AcpClient:
         """Handshake: initialize → session/load or session/new → set_mode → set_model."""
         # 1. Initialize
         protocol_version: int | str = (
-            PROTOCOL_VERSION_CLAUDE if self._is_claude else PROTOCOL_VERSION
+            PROTOCOL_VERSION_CLAUDE if (self._is_claude or self._is_copilot) else PROTOCOL_VERSION
         )
         init_id = await self._send_request(
             METHOD_INITIALIZE,
@@ -3135,11 +3218,11 @@ class AcpClient:
             # ~38% on turn 1. kiro-cli stores transcripts at ~/.kiro/sessions/
             # cli/<sid>.json; a missing transcript falls back to session/new
             # (a genuinely fresh start).
-            if self._is_claude:
-                # Dormant seam: claude session/load takes no file path, and the
-                # SDK transcript-path resolver lived in the deleted cc cleanup
-                # helper. The internal companion re-adds it; the public core
-                # simply attempts the load.
+            if self._is_claude or self._is_copilot:
+                # Neither seam takes a kiro-cli-style transcript file path:
+                # claude's SDK resolves its own transcript, and Copilot's
+                # `session/load` (it advertised loadSession=true) is keyed by
+                # sessionId alone. The public core simply attempts the load.
                 session_file = ""
                 file_ok = True
             else:
@@ -3165,8 +3248,10 @@ class AcpClient:
                     }
                     if self._is_claude:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}
-                    else:
+                    elif self._is_kiro:
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
+                    # copilot: no `_meta` — plain ACP session/load, nothing
+                    # backend-specific to attach.
                     load_id = await self._send_request(METHOD_SESSION_LOAD, load_params)
                     load_resp = await self._wait_for_response(load_id, timeout=_INIT_TIMEOUT)
                     if "modes" in load_resp:

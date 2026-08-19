@@ -115,6 +115,14 @@ ACP_CLIENT_CAPABILITIES: dict = {
 
 ACP_BACKEND_CLAUDE = "claude"
 ACP_BACKEND_KAS = "kas"
+# GitHub Copilot CLI, driven via its own `--acp` flag (Copilot's official ACP
+# server mode — verified against a live `copilot --acp` process: it answers
+# `initialize` with protocolVersion 1, the same numeric ACP scheme claude-agent-acp
+# uses, not kiro-cli's date-stamped one). Copilot runs one process per session
+# (like claude), so it is deliberately NOT added to ACP_BACKENDS_ACP_RUNTIME /
+# ACP_BACKENDS_SESSION_SHARING / ACP_BACKENDS_INTERNAL_SANDBOX below — those stay
+# opt-in memberships earned with evidence, not inherited from "not claude".
+ACP_BACKEND_COPILOT = "copilot"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -126,14 +134,17 @@ ACP_BACKENDS_KNOWN = frozenset(
         ACP_BACKEND_KIRO,
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_KAS,
+        ACP_BACKEND_COPILOT,
     }
 )
 # What an operator may actually persist in ``agent.acp_backend``, which is a
 # narrower question than what the code understands: ``ACP_BACKEND_CLAUDE`` is a
 # dormant seam reached by its own provider, not something to select here. Config
 # resolution degrades an unselectable value to the default, so a typo costs a log
-# line rather than a gateway that will not start.
-ACP_BACKENDS_SELECTABLE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+# line rather than a gateway that will not start. ``ACP_BACKEND_COPILOT`` IS
+# selectable here — unlike claude, it is not a dormant/companion-only seam: the
+# public core resolves and spawns `copilot --acp` directly (see acp.client._spawn).
+ACP_BACKENDS_SELECTABLE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_COPILOT})
 
 # ── Capability membership (harness-parity H6, H7) ──
 # Every capability a backend may claim is an OPT-IN set here, never a negation at
@@ -190,6 +201,7 @@ ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 PROVIDER_LABEL_DEFAULT = "acp"
 PROVIDER_LABEL_CLAUDE = "claude_code"
 PROVIDER_LABEL_KAS = "kas"
+PROVIDER_LABEL_COPILOT = "copilot"
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under

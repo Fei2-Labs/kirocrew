@@ -154,6 +154,7 @@ export function ChatPanel() {
     session_summary?: { enabled?: boolean }
     agent?: {
       model?: string
+      acp_backend?: string
       role_models?: { background?: string; subagent?: string }
       role_efforts?: { background?: string; subagent?: string }
       reasoning_effort?: string
@@ -294,6 +295,24 @@ export function ChatPanel() {
     mutationFn: (v: string) => api.patchConfig('agent.reasoning_effort', v),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_default_reasoning_effort')),
+  })
+
+  // ── Agent backend (agent.acp_backend) ──
+  // Which ACP agent binary actually drives sessions. '' = kiro-cli (default);
+  // the option set mirrors the backend's ACP_BACKENDS_SELECTABLE (the single
+  // source of truth — see acp.types), so a backend that adds a new selectable
+  // seam only needs this array updated to expose it here.
+  const acpBackend = mcCfg?.agent?.acp_backend ?? ''
+  const ACP_BACKEND_OPTIONS = ['', 'copilot', 'kas']
+  const acpBackendLabels = [
+    i18nT('pages.settings.chatPanel.backend_kiro_cli'),
+    i18nT('pages.settings.chatPanel.backend_copilot'),
+    i18nT('pages.settings.chatPanel.backend_kas'),
+  ]
+  const acpBackendMut = useMutation({
+    mutationFn: (v: string) => api.patchConfig('agent.acp_backend', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_agent_backend')),
   })
 
   // ── Per-role model defaults (agent.role_models) ──
@@ -453,8 +472,22 @@ export function ChatPanel() {
         </SettingsCard>
       </SettingsSection>
 
-      <SettingsSection title={i18nT('pages.settings.chatPanel.about_you')}>
+      <SettingsSection title={i18nT('pages.settings.chatPanel.agent_backend')}>
         <SettingsCard index={3}>
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.agent_backend')}
+            description={i18nT('pages.settings.chatPanel.agent_backend_description')}
+            value={acpBackend}
+            options={ACP_BACKEND_OPTIONS}
+            optionLabels={acpBackendLabels}
+            onChange={v => acpBackendMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+          />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection title={i18nT('pages.settings.chatPanel.about_you')}>
+        <SettingsCard index={4}>
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.your_role')}
             description={i18nT('pages.settings.chatPanel.kiro_matches_vocabulary_and_examples_to_your_pro')}
