@@ -94,7 +94,14 @@ _DENIED_BUNDLE_PREFIXES: tuple[DeniedApp, ...] = (
         # title is the only signal that survives that hosting, so it carries the
         # same rule. Substrings, not exact strings: the tab title takes a badge
         # prefix ("(3) Kiro Crew") and popouts a "<label> — Kiro Crew" suffix.
-        title_substrings=("kiro crew", "kirocrew"),
+        #
+        # Only the SPACED form ("kiro crew") is matched here. The unspaced
+        # "kirocrew" caused false positives on Terminal windows whose title
+        # includes the working-directory path (e.g. "~/kirocrew — zsh") — a
+        # common scenario when developing this repo. The dashboard tab title
+        # always renders the product name with a space, so the spaced variant
+        # alone covers the browser-tab threat without refusing terminals.
+        title_substrings=("kiro crew",),
     ),
 )
 
