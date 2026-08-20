@@ -708,6 +708,7 @@ make this tool possible:
 <a href="https://github.com/Christian-Sidak" title="Christian Sidak"><img src="https://github.com/Christian-Sidak.png?size=64" width="64" height="64" alt="Christian Sidak" /></a>
 <a href="https://github.com/cixuuz" title="cixuuuuuuuuz"><img src="https://github.com/cixuuz.png?size=64" width="64" height="64" alt="cixuuuuuuuuz" /></a>
 <a href="https://github.com/clareliguori" title="Clare Liguori"><img src="https://github.com/clareliguori.png?size=64" width="64" height="64" alt="Clare Liguori" /></a>
+<a href="https://github.com/clarezoe" title="clarezoe"><img src="https://github.com/clarezoe.png?size=64" width="64" height="64" alt="clarezoe" /></a>
 <a href="https://github.com/cohilla" title="Cody Hill"><img src="https://github.com/cohilla.png?size=64" width="64" height="64" alt="Cody Hill" /></a>
 <a href="https://github.com/colewhitley" title="Cole Whitley"><img src="https://github.com/colewhitley.png?size=64" width="64" height="64" alt="Cole Whitley" /></a>
 <a href="https://github.com/ConnorLoP" title="Connor LoPresti"><img src="https://github.com/ConnorLoP.png?size=64" width="64" height="64" alt="Connor LoPresti" /></a>
