@@ -4,7 +4,7 @@
     "environment": {
       "numpy": "2.5.2",
       "platform": "linux-x86_64",
-      "python": "3.12.13",
+      "python": "3.12.14",
       "sqlite": "3.45.1"
     },
     "ingest": {
@@ -39,7 +39,7 @@
     "turns": 2760,
     "variant": "locomo10[5i/allq]"
   },
-  "elapsed_s": 1439.74,
+  "elapsed_s": 1554.09,
   "ingest_totals": {
     "attempted": 2760,
     "dropped_fragments": 3,
