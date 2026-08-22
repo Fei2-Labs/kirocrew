@@ -804,6 +804,43 @@ class TestWaveDigest:
         assert payload["err"] == 2 and payload["stopped"] == 0
 
     @pytest.mark.asyncio
+    async def test_recovered_interrupted_batch_member_is_neutral(self):
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = True
+        slot.task = asyncio.ensure_future(asyncio.sleep(0))
+        await slot.task
+        slot._orch_tracker = None
+        slot._subagent_deliveries_inflight = 0
+        slot._subagents_inline_collected = set()
+        slot.queue_append = MagicMock()
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        mgr, on_done = self._capture_on_done(orch)
+        members = [self._member(index, 2) for index in range(2)]
+        members[0]._recovered_outcome = "interrupted"
+        members[0].error = "interrupted by gateway restart"
+
+        with patch("kiro_crew.slack.gateway._run_chat", new_callable=AsyncMock):
+            for index, member in enumerate(members):
+                mgr.batch_members_pending = MagicMock(return_value=index == 0)
+                await on_done(member)
+
+        finished = [
+            call
+            for call in orch.dashboard_state.broadcast_ws.call_args_list
+            if call.args and call.args[0] == "batch_finished"
+        ]
+        assert len(finished) == 1
+        payload = finished[0].args[1]
+        assert payload["total"] == 2 and payload["ok"] == 1
+        assert payload["err"] == 0 and payload["stopped"] == 0
+
+    @pytest.mark.asyncio
     async def test_held_members_marked_delivered_only_at_digest(self):
         """Restart safety (Arbiter item 1 + GPT round-5 HIGH): held members
         are flagged ``_digest_held`` (the run loop skips its own

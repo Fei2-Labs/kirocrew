@@ -35,12 +35,16 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kiro_crew.run_coordinator import MemoryRunCoordinator
 from kiro_crew.subagent import SubagentInfo, SubagentManager
 
 
 def _make_manager(max_concurrent: int = 4) -> SubagentManager:
     mgr = SubagentManager(
-        sessions=MagicMock(), ctx_builder=MagicMock(), max_concurrent=max_concurrent
+        sessions=MagicMock(),
+        ctx_builder=MagicMock(),
+        max_concurrent=max_concurrent,
+        coordinator=MemoryRunCoordinator(),
     )
     mgr._fire_event = AsyncMock()
     mgr._write_tombstone = MagicMock()
@@ -759,7 +763,7 @@ async def test_run_does_not_block_on_its_report_during_shutdown():
     # Must return promptly even though the injection is wedged.
     await asyncio.wait_for(mgr._run(info), timeout=5)
 
-    assert wedged.is_set(), "report never started"
+    await asyncio.wait_for(wedged.wait(), timeout=1)
     pending = [t for t in mgr._report_tasks if not t.done()]
     assert pending, "report should still be pending, owned by cancel_all's drain"
     for t in pending:

@@ -3041,6 +3041,45 @@ class TestSubagentDone:
         slot.queue_append.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_recovered_interruption_keeps_neutral_outcome_and_result_path(self):
+        from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY
+        from kiro_crew.subagent import SubagentInfo
+
+        orch, mock_sm = self._setup_orch_with_subagent_mgr()
+        on_done = mock_sm.call_args[1]["on_done"]
+
+        slot = MagicMock()
+        slot.running = True
+        slot.task = asyncio.ensure_future(asyncio.sleep(0))
+        await slot.task
+        slot.key = "busy-slot"
+        slot.mode = ""
+        slot._recovery_chat_triggered = False
+        slot._pending_subagent_failures = []
+        slot._subagents_inline_collected = set()
+        slot.queue_append = MagicMock()
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+
+        info = SubagentInfo(
+            id="recovered-1",
+            task="recover work",
+            parent_session_key="dashboard:busy-slot",
+            done=True,
+            error="interrupted by gateway restart",
+            result_path="/results/recovered-1.txt",
+            result_truncated=True,
+        )
+        info._recovered_outcome = "interrupted"
+
+        await on_done(info)
+
+        announce = slot.queue_append.call_args.args[0]
+        meta = slot.queue_append.call_args.kwargs["meta"][SUBAGENT_COMPLETION_META_KEY]
+        assert "interrupted by gateway restart" in announce
+        assert "/results/recovered-1.txt" in announce
+        assert meta["outcome"] == "interrupted"
+
+    @pytest.mark.asyncio
     async def test_cron_parent_injects_result(self):
         """Subagent done → cron parent → injects into session."""
         orch, mock_sm = self._setup_orch_with_subagent_mgr()

@@ -16,8 +16,11 @@ from .models import (
     CoordinatorDecision,
     CoordinatorResult,
     DeliveryFence,
+    LegacyImportReceipt,
+    LegacyRunImport,
     OutboxEvent,
     OwnerLease,
+    RecoveryClaim,
     RunCommand,
     RunCompletion,
     RunCoordinator,
@@ -148,6 +151,14 @@ class ShadowRunCoordinator:
             await self._mirror("submit_control", request),
         )
 
+    async def import_legacy(
+        self, request: LegacyRunImport
+    ) -> CoordinatorResult[LegacyImportReceipt]:
+        return cast(
+            CoordinatorResult[LegacyImportReceipt],
+            await self._mirror("import_legacy", request),
+        )
+
     async def get_command_by_key(self, idempotency_key: str) -> CommandReceipt | None:
         return cast(
             CommandReceipt | None,
@@ -169,6 +180,17 @@ class ShadowRunCoordinator:
         return cast(
             CommandClaim | None,
             await self._mirror("claim_command", command_id, owner),
+        )
+
+    async def claim_recovery(
+        self,
+        owner: OwnerLease,
+        limit: int,
+        exclude_run_ids: frozenset[str] = frozenset(),
+    ) -> list[RecoveryClaim]:
+        return cast(
+            list[RecoveryClaim],
+            await self._mirror("claim_recovery", owner, limit, exclude_run_ids),
         )
 
     async def finish_command(
@@ -221,6 +243,28 @@ class ShadowRunCoordinator:
         return cast(
             CoordinatorResult[RunRecord],
             await self._mirror("mark_running", run_id, fence, expected_version),
+        )
+
+    async def record_process(
+        self,
+        run_id: str,
+        fence: RunFence,
+        expected_version: int,
+        process_id: int,
+        process_start_id: str,
+        process_owned: bool,
+    ) -> CoordinatorResult[RunRecord]:
+        return cast(
+            CoordinatorResult[RunRecord],
+            await self._mirror(
+                "record_process",
+                run_id,
+                fence,
+                expected_version,
+                process_id,
+                process_start_id,
+                process_owned,
+            ),
         )
 
     async def complete(

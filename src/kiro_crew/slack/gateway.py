@@ -268,6 +268,7 @@ from kiro_crew.subagent import (
 )
 from kiro_crew.subagent_completion_meta import (
     OUTCOME_FAILED,
+    OUTCOME_INTERRUPTED,
     OUTCOME_OK,
     OUTCOME_STOPPED,
     single_completion_meta,
@@ -6340,7 +6341,13 @@ class GatewayOrchestrator:
             # a failure. The record contract keeps ``error`` unset for stops, so
             # every consumer below must branch on ``user_stopped`` explicitly
             # rather than inferring success from an empty error.
-            if info.user_stopped:
+            if info.outcome == OUTCOME_INTERRUPTED:
+                status, emoji, single_outcome = (
+                    "interrupted by gateway restart",
+                    "⚠",
+                    OUTCOME_INTERRUPTED,
+                )
+            elif info.user_stopped:
                 status, emoji, single_outcome = "stopped by user", "⏹", OUTCOME_STOPPED
             elif info.error:
                 status, emoji, single_outcome = "failed", "❌", OUTCOME_FAILED
@@ -6392,6 +6399,8 @@ class GatewayOrchestrator:
                         # skew success stats; recording it as failure would
                         # trigger retry-guidance guards for a deliberate act.
                         pass
+                    elif info.outcome == OUTCOME_INTERRUPTED:
+                        pass
                     elif info.error:
                         if tracker.record_failure(task_key):
                             guard_msg = (
@@ -6433,7 +6442,14 @@ class GatewayOrchestrator:
             # transcript on demand (read / grep / spawn_status) instead of re-running
             # the subagent.
             result_path = info.result_path or ""
-            if info.user_stopped:
+            if info.outcome == OUTCOME_INTERRUPTED:
+                detail = info.error or "Interrupted by gateway restart."
+                if result_path:
+                    detail += (
+                        f"\n\nPartial result saved at: `{result_path}`\n"
+                        "Use the read tool to retrieve it."
+                    )
+            elif info.user_stopped:
                 _partial = info.result or ""
                 detail = (
                     "Stopped by the user before completing. Do NOT treat this as "
@@ -6572,7 +6588,7 @@ class GatewayOrchestrator:
                     bp["stopped"] += 1
                 elif _oc == "failed":
                     bp["err"] += 1
-                else:
+                elif _oc == "completed":
                     bp["ok"] += 1
                 # Exception-first digest content: failures/stops carry detail,
                 # successes are one pointer line (full output stays on disk).

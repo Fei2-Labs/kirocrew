@@ -92,7 +92,7 @@ async def test_sqlite_schema_enables_durability_pragmas(tmp_path: Path) -> None:
         inspect_owned_connection
     )
 
-    assert version == ("3",)
+    assert version == ("5",)
     assert journal_mode == "wal"
     assert synchronous == 2
     assert foreign_keys == 1
@@ -175,7 +175,7 @@ async def test_corrupt_database_is_refused_without_deletion(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_v1_database_migrates_to_v3_once(tmp_path: Path) -> None:
+async def test_v1_database_migrates_to_v4_once(tmp_path: Path) -> None:
     path = tmp_path / "coordinator.db"
     coordinator = SQLiteRunCoordinator(path)
     await coordinator.submit(_request())
@@ -210,9 +210,43 @@ async def test_v1_database_migrates_to_v3_once(tmp_path: Path) -> None:
             """)
         connection.execute("DROP TABLE commands")
         connection.execute("ALTER TABLE commands_v1 RENAME TO commands")
+        connection.execute("""
+            CREATE TABLE runs_v1 (
+                run_id TEXT PRIMARY KEY,
+                parent_session TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                task TEXT NOT NULL,
+                conversation_key TEXT NOT NULL,
+                desired_state TEXT NOT NULL,
+                observed_state TEXT NOT NULL,
+                outcome TEXT,
+                result_path TEXT NOT NULL,
+                error TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                owner_id TEXT NOT NULL,
+                lease_expires_at REAL NOT NULL,
+                lease_epoch INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                terminal_at REAL
+            )
+            """)
+        connection.execute("""
+            INSERT INTO runs_v1
+            SELECT run_id, parent_session, agent, task, conversation_key,
+                   desired_state, observed_state, outcome, result_path, error,
+                   attempt, version, owner_id, lease_expires_at, lease_epoch,
+                   created_at, updated_at, terminal_at
+            FROM runs
+            """)
+        connection.execute("DROP TABLE runs")
+        connection.execute("ALTER TABLE runs_v1 RENAME TO runs")
         connection.execute("UPDATE metadata SET value = '1' WHERE key = 'schema_version'")
         connection.execute("DELETE FROM metadata WHERE key = 'migration.2.applied_at'")
         connection.execute("DELETE FROM metadata WHERE key = 'migration.3.applied_at'")
+        connection.execute("DELETE FROM metadata WHERE key = 'migration.4.applied_at'")
+        connection.execute("DELETE FROM metadata WHERE key = 'migration.5.applied_at'")
 
     migrated = await SQLiteRunCoordinator(path).submit(_request())
     reopened = await SQLiteRunCoordinator(path).submit(_request())
@@ -224,15 +258,23 @@ async def test_v1_database_migrates_to_v3_once(tmp_path: Path) -> None:
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone() == ("3",)
+        ).fetchone() == ("5",)
         assert connection.execute(
             "SELECT COUNT(*) FROM metadata WHERE key = 'migration.2.applied_at'"
         ).fetchone() == (1,)
         assert connection.execute(
             "SELECT COUNT(*) FROM metadata WHERE key = 'migration.3.applied_at'"
         ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM metadata WHERE key = 'migration.4.applied_at'"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM metadata WHERE key = 'migration.5.applied_at'"
+        ).fetchone() == (1,)
         command_columns = {row[1] for row in connection.execute("PRAGMA table_info(commands)")}
         assert {"claim_expires_at", "claim_epoch", "result_json"} <= command_columns
+        run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+        assert {"source_version", "process_id", "process_start_id", "process_owned"} <= run_columns
         assert connection.execute("PRAGMA foreign_key_list(commands)").fetchall() == []
 
 
@@ -243,14 +285,14 @@ async def test_failed_migration_rolls_back_and_can_retry(
     path = tmp_path / "coordinator.db"
     await SQLiteRunCoordinator(path).get_run("missing")
     migrations = sqlite_module._MIGRATIONS
-    monkeypatch.setattr(sqlite_module, "_SCHEMA_VERSION", 4)
+    monkeypatch.setattr(sqlite_module, "_SCHEMA_VERSION", 6)
     monkeypatch.setattr(
         sqlite_module,
         "_MIGRATIONS",
         migrations
         + (
             (
-                4,
+                6,
                 (
                     "CREATE TABLE migration_probe (value TEXT NOT NULL)",
                     "THIS IS NOT SQL",
@@ -265,7 +307,7 @@ async def test_failed_migration_rolls_back_and_can_retry(
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone() == ("3",)
+        ).fetchone() == ("5",)
         assert (
             connection.execute(
                 "SELECT name FROM sqlite_master "  # wokeignore:rule=master
@@ -277,13 +319,13 @@ async def test_failed_migration_rolls_back_and_can_retry(
     monkeypatch.setattr(
         sqlite_module,
         "_MIGRATIONS",
-        migrations + ((4, ("CREATE TABLE migration_probe (value TEXT NOT NULL)",)),),
+        migrations + ((6, ("CREATE TABLE migration_probe (value TEXT NOT NULL)",)),),
     )
     await SQLiteRunCoordinator(path).get_run("missing")
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone() == ("4",)
+        ).fetchone() == ("6",)
         assert connection.execute(
             "SELECT name FROM sqlite_master "  # wokeignore:rule=master
             "WHERE name = 'migration_probe'"
