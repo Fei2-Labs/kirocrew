@@ -10,6 +10,8 @@ No spawn recursion: subagents cannot spawn other subagents.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import math
 import os
@@ -85,7 +87,12 @@ from kiro_crew.providers.base import (
     LLMEvent,
 )
 from kiro_crew.resource_status import cached_admission_check
-from kiro_crew.run_coordinator import MemoryRunCoordinator, RunCoordinator
+from kiro_crew.run_coordinator import (
+    CommandOperation,
+    CoordinatorDecision,
+    RunCoordinator,
+    SubmitRun,
+)
 from kiro_crew.security import (
     redact_and_truncate,
     redact_credentials,
@@ -1095,6 +1102,11 @@ _SYSTEM_PREFIX = (
     "Only output meaningful, actionable results. Never output greetings or filler.\n\n"
 )
 
+# Shadow persistence is observational until coordinator authority lands. A
+# locked or unhealthy ledger must therefore add only a small, bounded delay to
+# a run the legacy path has already accepted.
+_COORDINATOR_SHADOW_TIMEOUT_SECS = 1.0
+
 
 @dataclass
 class SubagentInfo:
@@ -1460,9 +1472,9 @@ class SubagentManager:
         self._completion_keep = completion_keep
         self._completion_keep_chars = completion_keep_chars
         # This seam is deliberately pre-authority: spawn is synchronous while
-        # coordinator mutation is async, so merely storing the adapter preserves
-        # the existing admission and terminal ordering in this phase.
-        self._coordinator = coordinator or MemoryRunCoordinator()
+        # coordinator mutation is async. The accepted run is mirrored only at
+        # async _run entry, after the legacy admission/approval path has won.
+        self._coordinator = coordinator
         self._lifecycle: SubagentLifecycle[SubagentInfo] = SubagentLifecycle()
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
@@ -4913,10 +4925,130 @@ class SubagentManager:
             except Exception:
                 logger.exception("Subagent %s: reset failed", info.id)
 
+    async def _shadow_submit_accepted_run(self, info: SubagentInfo) -> None:
+        """Best-effort mirror of a legacy-accepted run into the coordinator.
+
+        The legacy manager and run folder remain authoritative in this phase.
+        This method runs only after admission and approval have succeeded, and
+        any coordinator failure is diagnostic rather than an execution failure.
+        """
+        if self._coordinator is None:
+            return
+        try:
+            await self._shadow_submit_accepted_run_unchecked(info)
+        except Exception:
+            # Request construction, injected adapters, and result inspection
+            # are all outside the legacy lifecycle contract. None may turn an
+            # already accepted run into a terminal failure during shadow mode.
+            logger.warning(
+                "run coordinator shadow submission failed for run=%s boundary=submit",
+                info.id,
+                exc_info=True,
+            )
+
+    async def _shadow_submit_accepted_run_unchecked(self, info: SubagentInfo) -> None:
+        coordinator = self._coordinator
+        if coordinator is None:
+            return
+        operation = CommandOperation.CONTINUE if info.conversation_key else CommandOperation.SPAWN
+        raw_task = info._raw_task or info.task
+        payload_json = json.dumps(
+            {
+                "agent": info.agent,
+                "allowed_tools": info.allowed_tools,
+                "app": info.app,
+                "bare": info.bare,
+                "batch_id": info.batch_id,
+                "batch_total": info.batch_total,
+                "conversation_key": info.conversation_key,
+                "cwd": info.cwd,
+                "include_lessons": info.include_lessons,
+                "include_memory": info.include_memory,
+                "include_project": info.include_project,
+                "keep": info.keep,
+                "max_turns": info.max_turns,
+                "model": info.model,
+                "operation": operation.value,
+                "parent_session": info.parent_session_key,
+                "reasoning_effort": info.reasoning_effort,
+                "run_id": info.id,
+                "silent": info.silent,
+                "task": raw_task,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        command_id = f"{operation.value}:{info.id}"
+        request = SubmitRun(
+            run_id=info.id,
+            command_id=command_id,
+            idempotency_key=command_id,
+            payload_hash=hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+            payload_json=payload_json,
+            parent_session=info.parent_session_key,
+            agent=info.agent,
+            task=raw_task,
+            conversation_key=info.conversation_key,
+            operation=operation,
+        )
+        result = await asyncio.wait_for(
+            coordinator.submit(request),
+            timeout=_COORDINATOR_SHADOW_TIMEOUT_SECS,
+        )
+
+        if result is None:
+            # Injected adapters are expected to honor the typed port. Keep this
+            # phase primary-preserving even when an integration violates it.
+            logger.warning(
+                "run coordinator shadow returned no result for run=%s boundary=submit",
+                info.id,
+            )
+            return
+        if result.decision is CoordinatorDecision.REJECTED:
+            logger.warning(
+                "run coordinator shadow rejected legacy run=%s boundary=submit reason=%s",
+                info.id,
+                result.reason.value,
+            )
+            return
+        if result.value is None:
+            logger.warning(
+                "run coordinator shadow omitted receipt for run=%s boundary=submit",
+                info.id,
+            )
+            return
+
+        run = result.value.run
+        command = result.value.command
+        mismatches = {
+            field_name
+            for field_name, matches in (
+                ("run.identity", run.run_id == info.id),
+                ("run.parent", run.parent_session == info.parent_session_key),
+                ("run.agent", run.agent == info.agent),
+                ("run.task", run.task == raw_task),
+                ("run.conversation", run.conversation_key == info.conversation_key),
+                ("command.identity", command.command_id == command_id),
+                ("command.operation", command.operation is operation),
+                (
+                    "command.payload",
+                    command.payload_hash == request.payload_hash
+                    and command.payload_json == request.payload_json,
+                ),
+            )
+            if not matches
+        }
+        if mismatches:
+            logger.warning(
+                "run coordinator legacy mismatch at boundary=submit fields=%s",
+                ",".join(sorted(mismatches)),
+            )
+
     async def _run(self, info: SubagentInfo) -> None:
         """Execute a subagent task in its own session."""
         session_key = info.conversation_key or f"subagent:{info.id}"
         try:
+            await self._shadow_submit_accepted_run(info)
             await asyncio.wait_for(
                 self._run_inner(info, session_key), timeout=self._default_timeout
             )
