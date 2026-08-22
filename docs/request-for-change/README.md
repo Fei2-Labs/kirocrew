@@ -22,7 +22,7 @@ verified against `6d3e30bbbd`.
 
 | Document | Status | What is actually on main |
 |---|---|---|
-| [rfc-durable-run-coordinator.md](rfc-durable-run-coordinator.md) | `in-progress` | PR 2 is prepared locally: typed coordinator records, an in-memory contract implementation, and facade injection exist. The manager and run folders remain authoritative; lifecycle extraction and durable SQLite phases are unimplemented |
+| [rfc-durable-run-coordinator.md](rfc-durable-run-coordinator.md) | `in-progress` | PRs 1–2 are committed locally and PR 3 is prepared: typed coordinator records, memory contract, scheduler policy, and terminal arbitration now have narrow boundaries. The manager and run folders remain authoritative; durable SQLite is unimplemented |
 | [rfc-issue-radar-crews.md](rfc-issue-radar-crews.md) | `draft` | Nothing. Design of record only; `crew_brief.md` and `crew_ledger_spec.md` sit beside the Issue Radar backend as companion specs, also unimplemented |
 | [rfc-orchestrator-chat-sessions.md](rfc-orchestrator-chat-sessions.md) | `partial` | Crew Mode shipped in [#1295](https://github.com/kirodotdev/KiroCrew/pull/1295) and has since received store and routing fixes. The implementation deliberately diverges from the RFC in at least three places: no snapshot-generation CAS, no `release` decision action, and immediate per-result delivery instead of burst coalescing |
 | [rfc-channel-plugin-architecture.md](rfc-channel-plugin-architecture.md) | `partial` | Shared turn pipeline shipped; **4 of 7** channels adopted. Registry/seam collapse, telegram+discord, Feishu unstarted. Its §9 address rule is separately half-shipped — audit this row alongside [rfc-session-address-model.md](rfc-session-address-model.md) |

@@ -107,6 +107,7 @@ from kiro_crew.subagent_cost import (
     compact_cost_log,
     read_learned_cost,
 )
+from kiro_crew.subagent_lifecycle import SubagentLifecycle
 from kiro_crew.subagent_persistence import (
     _agent_dir,
     _cleanup_session_files_sync,
@@ -123,6 +124,7 @@ from kiro_crew.subagent_persistence import (
     write_result_chunk,
     write_tombstone,
 )
+from kiro_crew.subagent_scheduler import SubagentScheduler
 from kiro_crew.validation import _AGENT_NAME_RE
 
 # Standalone ClaudeCodeProvider removed (KiroACP-only). Name kept as None so the
@@ -1434,7 +1436,10 @@ class SubagentManager:
         self._sessions = sessions
         self._ctx_builder = ctx_builder
         self._on_done = on_done
-        self._max_concurrent = max_concurrent
+        self._scheduler = SubagentScheduler(
+            max_concurrent=max_concurrent,
+            stagger_seconds=0.0,
+        )
         self._default_turn_limit = default_turn_limit
         self._default_timeout = default_timeout if default_timeout > 0 else _TIMEOUT_SECS
         self._startup_deadline = startup_timeout if startup_timeout > 0 else _STARTUP_TIMEOUT_SECS
@@ -1458,10 +1463,7 @@ class SubagentManager:
         # coordinator mutation is async, so merely storing the adapter preserves
         # the existing admission and terminal ordering in this phase.
         self._coordinator = coordinator or MemoryRunCoordinator()
-        self._running_count = 0
-        # Strong refs to in-flight shielded terminal reports (see
-        # `_spawn_terminal_report`); drained in `cancel_all`.
-        self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        self._lifecycle: SubagentLifecycle[SubagentInfo] = SubagentLifecycle()
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
         # (continue_conversation), so per this module's containment contract
@@ -1469,9 +1471,6 @@ class SubagentManager:
         # cancel_all() — a watcher parked in the global _safe_fire set would
         # survive shutdown and dispatch against a closing SessionManager.
         self._followup_watchers: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
-        # task -> the agent whose terminal report it is delivering
-        self._report_owners: dict[asyncio.Task, SubagentInfo] = {}  # type: ignore[type-arg]
-        self._last_spawn_ts: float = 0.0  # monotonic time of the last actual start (stagger gate)
         self.hook_store: Any = None  # Optional ScriptHookStore, set by server.py
         self._agents: dict[str, SubagentInfo] = {}
         # Continuable conversations: session_key ("subagent:<conv-id>") →
@@ -1490,22 +1489,6 @@ class SubagentManager:
         except AttributeError:
             pass  # test doubles without the setter
         self._tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
-        # Teardown gates for runs whose terminal report has started, keyed by id and
-        # OUTLIVING both dicts above. A "delivered" tombstone excludes a folder from
-        # restart orphan reconciliation, so it must never be written while the run's
-        # child is still being killed -- and the settlement that writes it can happen
-        # outside the run (the parent's queue drain; issue #4839), long after a
-        # dashboard "clear completed" / "cancel" has popped BOTH ``_agents`` and
-        # ``_tasks`` for a done-but-still-tearing-down run. Reading the gate from
-        # here, rather than inferring "record gone means teardown finished", is what
-        # makes that inference unnecessary. Removed by the same ``finally`` that sets
-        # the event, so a missing entry always means "nothing left to wait for".
-        self._teardown_gates: dict[str, asyncio.Event] = {}
-        # Queued spawns store the FULL spawn() kwarg set (not just a 5-tuple), so a
-        # drained spawn preserves approval_mode / silent / model / allowed_tools / bare —
-        # dropping them made a queued headless/auto spawn hit the deny-by-default gate and
-        # a queued silent spawn emit output. See _drain_queue.
-        self._queue: list[dict[str, Any]] = []
         # Batch ids whose spawn_batch_started event has already fired.
         self._seen_batches: set[str] = set()
         # Submission accounting per wave: batch_id -> (submitted, expected).
@@ -1545,6 +1528,61 @@ class SubagentManager:
             )
         except Exception:
             self._spawn_stagger_secs = 2.0
+
+    # Compatibility views for integrations and older tests that inspect the
+    # manager's private state. The scheduler and lifecycle own these values;
+    # production policy is implemented at those boundaries.
+    @property
+    def _max_concurrent(self) -> int:
+        return self._scheduler.max_concurrent
+
+    @_max_concurrent.setter
+    def _max_concurrent(self, value: int) -> None:
+        self._scheduler.max_concurrent = value
+
+    @property
+    def _running_count(self) -> int:
+        return self._scheduler.running_count
+
+    @_running_count.setter
+    def _running_count(self, value: int) -> None:
+        self._scheduler.running_count = value
+
+    @property
+    def _last_spawn_ts(self) -> float:
+        return self._scheduler.last_start
+
+    @_last_spawn_ts.setter
+    def _last_spawn_ts(self, value: float) -> None:
+        self._scheduler.last_start = value
+
+    @property
+    def _spawn_stagger_secs(self) -> float:
+        return self._scheduler.stagger_seconds
+
+    @_spawn_stagger_secs.setter
+    def _spawn_stagger_secs(self, value: float) -> None:
+        self._scheduler.stagger_seconds = max(0.0, value)
+
+    @property
+    def _queue(self) -> list[dict[str, Any]]:
+        return self._scheduler.queue
+
+    @_queue.setter
+    def _queue(self, value: list[dict[str, Any]]) -> None:
+        self._scheduler.queue = value
+
+    @property
+    def _report_tasks(self) -> set[asyncio.Task[None]]:
+        return self._lifecycle.report_tasks
+
+    @property
+    def _report_owners(self) -> dict[asyncio.Task[None], SubagentInfo]:
+        return self._lifecycle.report_owners
+
+    @property
+    def _teardown_gates(self) -> dict[str, asyncio.Event]:
+        return self._lifecycle.teardown_gates
 
     def _effective_turn_limit(self, info: SubagentInfo) -> int:
         """Resolved turn cap for a run: per-spawn ``max_turns`` → config
@@ -2461,20 +2499,10 @@ class SubagentManager:
         has its own one-shot token (:meth:`_release_slot`); three concerns, three
         guards. Session teardown stays keyed on ``reaped``.
         """
-        if info._recovering and not supersede_recovery:
-            return False
-        if info._finalized:
-            return False
-        if info._recovering:
-            # A terminal reap/stop SUPERSEDES a pending cancel-recovery respawn:
-            # the agent is being killed, so there is nothing left to respawn.
-            # Clearing the flag here is what keeps `False` from meaning two
-            # different things to this caller ("someone else already reported"
-            # vs "withheld for a respawn that will report later") — the exact
-            # conflation this token exists to remove.
-            info._recovering = False
-        info._finalized = True
-        return True
+        return self._lifecycle.claim_report(
+            info,
+            supersede_recovery=supersede_recovery,
+        )
 
     async def _report_terminal(
         self,
@@ -2672,29 +2700,17 @@ class SubagentManager:
         awaiter is cancelled, and so ``cancel_all()`` can drain it) and
         self-removes on completion.
         """
-        task = asyncio.create_task(
-            self._report_terminal(
+        return self._lifecycle.spawn_report(
+            info,
+            lambda: self._report_terminal(
                 info,
                 source=source,
                 injection_timeout_reason=injection_timeout_reason,
                 mark_delivered_on_success=mark_delivered_on_success,
                 settle_digest=settle_digest,
                 teardown_done=teardown_done,
-            )
+            ),
         )
-        self._report_tasks.add(task)
-        # Owner map so `cancel_all()` can identify WHOSE outcome it is about to
-        # abandon (and re-admit it to orphan recovery). Kept alongside the set
-        # rather than replacing it: `_report_tasks` is the strong reference that
-        # keeps the task alive, and both are cleared by the one done callback.
-        self._report_owners[task] = info
-
-        def _forget(t: "asyncio.Task") -> None:  # type: ignore[type-arg]
-            self._report_tasks.discard(t)
-            self._report_owners.pop(t, None)
-
-        task.add_done_callback(_forget)
-        return task
 
     @staticmethod
     async def _await_report(task: "asyncio.Task") -> None:  # type: ignore[type-arg]
@@ -2706,14 +2722,14 @@ class SubagentManager:
         still receives ``CancelledError`` — teardown semantics are unchanged and
         the outcome is never stranded.
         """
-        await asyncio.shield(task)
+        await SubagentLifecycle.await_report(task)
 
     def _release_slot(self, info: SubagentInfo) -> bool:
-        """Claim the exclusive right to free ``info``'s concurrency slot.
+        """Compatibility wrapper for the historical claim-only contract.
 
-        Returns True for exactly one caller; that caller decrements
-        ``_running_count`` once and drains the queue. Contains no ``await``, so
-        the check-and-set is atomic with respect to other tasks on the loop.
+        New production paths call ``SubagentScheduler.release`` so claiming and
+        decrementing live at one boundary. This wrapper remains for integrations
+        that claim first and apply their legacy decrement separately.
 
         Why this is its OWN token rather than a side effect of ``done`` or
         ``reaped``: both terminal paths (`_force_reap` and `_run`'s ``finally``)
@@ -2724,14 +2740,10 @@ class SubagentManager:
         ``_running_count`` and permanently starving the spawn queue. An explicit
         one-shot token makes the count independent of report and record ordering.
 
-        Note the recovery respawn's own ``_running_count += 1`` re-admit is
-        unaffected: it runs after the interrupted run's ``finally`` has already
-        released, and this token is per-``SubagentInfo``.
+        Recovery uses the scheduler's atomic capacity check and reoccupation
+        after the interrupted run's ``finally`` has released its old slot.
         """
-        if info._slot_released:
-            return False
-        info._slot_released = True
-        return True
+        return self._scheduler.claim_release(info)
 
     async def _force_reap(
         self, agent_id: str, info: SubagentInfo, elapsed: float, *, reason: str = ""
@@ -2748,7 +2760,7 @@ class SubagentManager:
         # `_reap_started`, NOT `reaped`: setting `reaped` this early makes a run
         # woken by our own session reset skip its error synthesis and report a
         # false SUCCESS before we own the record. See `_reap_started`.
-        info._reap_started = True
+        self._lifecycle.begin_reap(info)
         # A pending cancel-recovery respawn is moot — this agent is being killed.
         # Cancel it rather than letting it sit in its bounded handshake wait
         # (_RESET_TIMEOUT + 60s) only to discover `reaped` and bare-return.
@@ -2812,16 +2824,15 @@ class SubagentManager:
             # intentional-cancel contract: visible when the task's
             # CancelledError arm runs. The recovery scheduler reads the earlier
             # `_reap_started` instead, so it is not affected by this placement.
-            info.reaped = True
+            self._lifecycle.mark_reaped(info)
             self._cancel_task_intentionally(task, info, reason=reason or "reaped")
 
         # No live task to cancel above (already exited) — the reap still owns
         # teardown bookkeeping from here, so mark it now.
-        info.reaped = True
+        self._lifecycle.mark_reaped(info)
         # Guard 1 of 3 — the terminal RECORD (done/error/stat/tombstone/cost) is
         # first-arrival-wins on `info.done`, so it is never written twice.
-        if not info.done:
-            info.done = True
+        if self._lifecycle.claim_record(info):
             if not info.error and not info.user_stopped:
                 # A user stop is neutral — never synthesize a reap error for it.
                 if reason == "startup_timeout":
@@ -2838,8 +2849,7 @@ class SubagentManager:
         # slot but — unlike normal completion — does NOT otherwise pump the queue,
         # so queued spawns would sit stranded until an unrelated agent finished.
         # Drain here so the freed slot is used immediately.
-        if self._release_slot(info):
-            self._running_count = max(0, self._running_count - 1)
+        if self._scheduler.release(info):
             self._drain_queue()
 
         try:
@@ -3373,7 +3383,8 @@ class SubagentManager:
             )
 
         now = time.monotonic()
-        should_queue, slot_free = self._should_stagger_queue(now)
+        decision = self._scheduler.admission(now)
+        should_queue, slot_free = decision.should_queue, decision.slot_free
         if should_queue:
             # A prevalidated app spawn must NOT sit in the queue. _agent_prevalidated
             # skips the agent-directory ownership scan on drain (it was validated
@@ -3418,7 +3429,7 @@ class SubagentManager:
             # the default 2s stagger that is EVERY member after the first, so a
             # 2-agent wave permanently rendered "1 agent running" while the
             # sidebar and Subagents panel correctly showed 2.
-            self._queue.append(
+            self._scheduler.enqueue(
                 {
                     "task": task,
                     "parent_session_key": parent_session_key,
@@ -3457,7 +3468,7 @@ class SubagentManager:
             # completion — schedule the staggered pump at the interval boundary
             # so the queued spawn still launches.
             if slot_free:
-                delay = max(0.0, self._spawn_stagger_secs - (now - self._last_spawn_ts))
+                delay = decision.retry_after or 0.0
                 try:
                     asyncio.get_event_loop().call_later(delay, self._drain_queue)
                 except RuntimeError:
@@ -3527,8 +3538,7 @@ class SubagentManager:
         )
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         self._agents[agent_id] = info
-        self._running_count += 1
-        self._last_spawn_ts = time.monotonic()  # stagger gate: one start per interval
+        self._scheduler.occupy(info, time.monotonic())
         # Batch lifecycle: announce the wave ONCE, on its first member to
         # actually start (queued members haven't started yet — the event marks
         # execution begin, and the UI uses it to key batch progress).
@@ -3590,7 +3600,7 @@ class SubagentManager:
             else:
                 info.done = True
                 info.error = "spawn rejected: no approval mechanism configured"
-                self._running_count -= 1
+                self._scheduler.release(info)
                 self._drain_queue()
                 sel().log_tool_invocation(
                     session_key=info.parent_session_key,
@@ -3611,7 +3621,7 @@ class SubagentManager:
         else:
             info.done = True
             info.error = "spawn rejected: no approval mechanism configured"
-            self._running_count -= 1
+            self._scheduler.release(info)
             self._drain_queue()
             sel().log_tool_invocation(
                 session_key=info.parent_session_key,
@@ -3672,9 +3682,8 @@ class SubagentManager:
         (``subagent_spawn_stagger_secs``) — so the initial fill never bursts and
         no two agents start within the interval (dynamic-subagent-sizing.md §5.3).
         """
-        slot_free = self._running_count < self._max_concurrent
-        too_soon = (now - self._last_spawn_ts) < self._spawn_stagger_secs
-        return (not slot_free or too_soon, slot_free)
+        decision = self._scheduler.admission(now)
+        return decision.should_queue, decision.slot_free
 
     # ── Continuable conversations (keep=True) ─────────────────────────────
 
@@ -3690,16 +3699,13 @@ class SubagentManager:
         for a in self._agents.values():
             if not a.done and (a.conversation_key or f"subagent:{a.id}") == conv_key:
                 return a
-        for p in self._queue:
-            pkey = str(p.get("conversation_key") or "") or (
-                f"subagent:{p.get('_preassigned_id', '')}"
+        queued = self._scheduler.find_conversation(conv_key)
+        if queued is not None:
+            return SubagentInfo(
+                id=str(queued.get("_preassigned_id") or "queued"),
+                task="",
+                queued=True,
             )
-            if pkey == conv_key:
-                return SubagentInfo(
-                    id=str(p.get("_preassigned_id") or "queued"),
-                    task="",
-                    queued=True,
-                )
         return None
 
     def _keep_recorded_on_disk(self, key: str) -> bool:
@@ -4363,19 +4369,20 @@ class SubagentManager:
         slot is free but a spawn started too recently, it reschedules itself at
         the interval boundary rather than bursting.
         """
-        if not self._queue or self._running_count >= self._max_concurrent:
-            return
-        elapsed = time.monotonic() - self._last_spawn_ts
-        if elapsed < self._spawn_stagger_secs:
-            # Too soon since the last start — reschedule at the boundary.
+        decision = self._scheduler.take_ready(time.monotonic())
+        if decision.entry is None:
+            # Capacity releases call this pump again. A stagger-only delay has
+            # no such future trigger, so schedule exactly at its boundary.
+            if self._queue and decision.retry_after is not None:
+                delay = decision.retry_after
+            else:
+                return
             try:
-                asyncio.get_event_loop().call_later(
-                    self._spawn_stagger_secs - elapsed, self._drain_queue
-                )
+                asyncio.get_event_loop().call_later(delay, self._drain_queue)
             except RuntimeError:
                 pass  # no running loop (sync/test context)
             return
-        params = self._queue.pop(0)
+        params = decision.entry
         # A run can be cancelled WHILE it waits here — a user stop, or a session
         # deleted out from under it. Starting it anyway would execute tools for
         # work already reported as stopped, so skip it and drain the next one
@@ -4434,9 +4441,10 @@ class SubagentManager:
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)
-        if self._queue and self._running_count < self._max_concurrent:
+        continuation_delay = self._scheduler.continuation_delay()
+        if continuation_delay is not None:
             try:
-                asyncio.get_event_loop().call_later(self._spawn_stagger_secs, self._drain_queue)
+                asyncio.get_event_loop().call_later(continuation_delay, self._drain_queue)
             except RuntimeError:
                 pass
 
@@ -4476,8 +4484,7 @@ class SubagentManager:
             # `_force_reap` releases the slot and reports. A bare decrement here
             # would double-release — driving `_running_count` negative — and the
             # announce below would double-report the completion.
-            if self._release_slot(info):
-                self._running_count -= 1
+            if self._scheduler.release(info):
                 self._drain_queue()
             self._tasks.pop(info.id, None)
             sel().log_tool_invocation(
@@ -4556,7 +4563,7 @@ class SubagentManager:
             return True  # submissions still in flight
         if any(a.batch_id == batch_id and not a.done for a in self._agents.values()):
             return True
-        return any(p.get("batch_id") == batch_id for p in self._queue)
+        return self._scheduler.contains_batch(batch_id)
 
     def finalize_batch(self, batch_id: str) -> None:
         """Prune per-wave bookkeeping once the wave digest has fired.
@@ -4647,7 +4654,7 @@ class SubagentManager:
             members = [a for a in self._agents.values() if a.batch_id == batch_id]
             if any(not a.done for a in members):
                 continue  # live members will re-evaluate the wave on completion
-            if any(p.get("batch_id") == batch_id for p in self._queue):
+            if self._scheduler.contains_batch(batch_id):
                 continue  # queued members still pending — not stuck
             parent = members[0].parent_session_key if members else ""
             logger.warning(
@@ -4813,7 +4820,7 @@ class SubagentManager:
         gateway event loop.
         """
         for agent_id in agent_ids:
-            gate = self._teardown_gates.get(agent_id)
+            gate = self._lifecycle.gate_for(agent_id)
             if gate is not None and not gate.is_set():
                 try:
                     await asyncio.wait_for(gate.wait(), timeout=_RESET_TIMEOUT + 30)
@@ -4998,13 +5005,12 @@ class SubagentManager:
             # Set once this finally's session teardown has finished, so the
             # already-spawned report holds its "delivered" tombstone until the
             # child is provably gone (see `_report_terminal`).
-            teardown_done = asyncio.Event()
+            teardown_done = self._lifecycle.open_teardown(info.id)
             # Published where it survives this record being evicted: a settlement
             # that happens OUTSIDE this report (the parent's queue drain, issue
             # #4839) can come due after a dashboard clear/cancel has removed the run
             # from _agents AND _tasks, and it still must not tombstone a child that
             # is being killed.
-            self._teardown_gates[info.id] = teardown_done
             if self._claim_finalize(info):
                 info.elapsed = time.time() - info.started
                 self._record_cost(info)
@@ -5028,18 +5034,13 @@ class SubagentManager:
                 # the count is released exactly once whichever terminal path
                 # arrives first (and is NOT skipped just because the reaper set
                 # `reaped`, which is how an earlier revision leaked slots).
-                if self._release_slot(info):
-                    self._running_count -= 1
+                if self._scheduler.release(info):
                     self._drain_queue()
                 self._tasks.pop(info.id, None)
                 # Teardown is done (or was skipped because the reaper did it) —
                 # release the report's delivered-tombstone gate. Unconditional,
                 # so the report can never wedge on a cancelled teardown.
-                teardown_done.set()
-                # Set BEFORE the entry is dropped: a waiter that already holds the
-                # event is released by the line above, and one arriving after finds
-                # no entry, which now means exactly "nothing left to wait for".
-                self._teardown_gates.pop(info.id, None)
+                self._lifecycle.close_teardown(info.id, teardown_done)
 
         # The report itself already ran (or is running) on the shielded task
         # spawned in the finally above; block until it completes so sequencing is
@@ -5116,13 +5117,15 @@ class SubagentManager:
                 # spawn into it. Wait (bounded) for a free slot so recovery
                 # never pushes the pool past max_concurrent.
                 deadline = time.time() + _RECOVERY_SLOT_WAIT_SECS
-                while self._running_count >= self._max_concurrent:
+                while True:
+                    if info.done or info._reap_started or info.reaped or self._shutting_down:
+                        info._recovering = False
+                        return
+                    if self._scheduler.try_reoccupy(info):
+                        break
                     if time.time() >= deadline or self._shutting_down:
                         raise RuntimeError("no free slot for recovery respawn")
                     await asyncio.sleep(0.25)
-                if info.done or info._reap_started or info.reaped or self._shutting_down:
-                    info._recovering = False
-                    return
                 info._recovering = False
                 # Claim the slot and launch the respawn ATOMICALLY (no await
                 # between capacity check, increment, and create_task). An await
@@ -5132,12 +5135,6 @@ class SubagentManager:
                 # here (its finally decrements). The informational
                 # subagent_recovering emit happens after, where a cancellation
                 # can no longer leak the counter.
-                self._running_count += 1
-                # The interrupted run's finally already consumed this info's
-                # slot token to free its slot. The respawn occupies a FRESH slot,
-                # so re-arm the token or the respawned run's finally would no-op
-                # and leave `_running_count` permanently inflated.
-                info._slot_released = False
                 self._tasks[info.id] = asyncio.create_task(self._run(info))
                 try:
                     await self._fire_event("subagent_recovering", info, {"attempt": 1})
@@ -5255,7 +5252,7 @@ class SubagentManager:
     def _queued_depth(self, parent_session_key: str) -> int:
         """Number of spawns currently queued for *parent_session_key* (waiting
         behind the concurrency cap / stagger gate, not yet started)."""
-        return sum(1 for q in self._queue if q.get("parent_session_key", "") == parent_session_key)
+        return self._scheduler.queued_depth(parent_session_key)
 
     def queued_count_for(self, parent_session_key: str) -> int:
         """Public queued-spawn count for *parent_session_key*.
@@ -6485,11 +6482,9 @@ class SubagentManager:
         parent's queued depth, or the chip keeps counting an agent that will never
         run.
         """
-        keep = [p for p in self._queue if str(p.get("_preassigned_id") or "") != agent_id]
-        if len(keep) == len(self._queue):
+        dropped = self._scheduler.remove(agent_id)
+        if not dropped:
             return False
-        dropped = [p for p in self._queue if str(p.get("_preassigned_id") or "") == agent_id]
-        self._queue = keep
         for p in dropped:
             try:
                 self._emit_queue_depth(
@@ -6595,7 +6590,7 @@ class SubagentManager:
         # cancelled (that is the point). Drain them with a BOUNDED wait so a
         # report is not orphaned by a closing event loop, without letting a
         # wedged injection block shutdown indefinitely.
-        pending_reports = [t for t in self._report_tasks if not t.done()]
+        pending_reports = self._lifecycle.pending_reports()
         if pending_reports:
             try:
                 await asyncio.wait(pending_reports, timeout=_REPORT_DRAIN_TIMEOUT)
@@ -6617,7 +6612,7 @@ class SubagentManager:
                     len(stragglers),
                     _REPORT_DRAIN_TIMEOUT,
                 )
-                abandoned = [self._report_owners.get(t) for t in stragglers]
+                abandoned = [self._lifecycle.owner_for(t) for t in stragglers]
                 for report_task in stragglers:
                     report_task.cancel()
                 try:
