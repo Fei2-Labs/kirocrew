@@ -280,7 +280,13 @@ class RunCoordinator(Protocol):
 
     async def renew(self, run_id: str, fence: RunFence, until: float) -> bool: ...
 
-    async def claim_outbox(self, owner: OwnerLease, limit: int) -> list[OutboxEvent]: ...
+    async def claim_outbox(
+        self,
+        owner: OwnerLease,
+        limit: int,
+        event_id: str = "",
+        acknowledgement: bool = False,
+    ) -> list[OutboxEvent]: ...
 
     async def release_outbox(
         self, fence: DeliveryFence, available_at: float

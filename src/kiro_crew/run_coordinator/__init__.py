@@ -1,5 +1,6 @@
 """Typed run coordination boundary for subagent lifecycle state."""
 
+from .delivery import DeliveryAttempt, OutboxDeliveryAdapter
 from .memory import MemoryRunCoordinator
 from .models import (
     CommandClaim,
@@ -38,11 +39,13 @@ __all__ = [
     "CoordinatorDecision",
     "CoordinatorReason",
     "CoordinatorResult",
+    "DeliveryAttempt",
     "DeliveryFence",
     "DeliveryState",
     "DesiredState",
     "MemoryRunCoordinator",
     "ObservedState",
+    "OutboxDeliveryAdapter",
     "OutboxEvent",
     "OwnerLease",
     "RunCommand",

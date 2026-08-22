@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.run_coordinator import MemoryRunCoordinator
+from kiro_crew.run_coordinator import CommandStatus, MemoryRunCoordinator
 from kiro_crew.subagent import _TURN_LIMIT, SubagentManager
 from kiro_crew.subagent_command_authority import (
     AuthorityOutcomeUncertain,
@@ -398,7 +398,10 @@ class TestSpawnWithApprovalCallback:
 
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             info = await manager.command_authority.spawn(identity, "rejected task")
-            await manager._tasks[info.id]
+            for _ in range(20):
+                if info.done and info.id not in manager._tasks:
+                    break
+                await asyncio.sleep(0)
 
         assert await manager.command_authority.lookup_response(identity.idempotency_key) == {
             "found": True,
@@ -407,6 +410,11 @@ class TestSpawnWithApprovalCallback:
             "code": "spawn_rejected",
             "counted": True,
         }
+        receipt = await coordinator.get_command_by_key(identity.idempotency_key)
+        assert receipt is not None
+        assert receipt.command.status is CommandStatus.REJECTED
+        assert receipt.command.rejection_reason == "spawn rejected"
+        assert receipt.command.result_json
 
     @pytest.mark.asyncio
     async def test_approval_denial_keeps_retry_state_when_settlement_fails(self) -> None:
@@ -425,6 +433,7 @@ class TestSpawnWithApprovalCallback:
         )
         info = SubagentInfo(id="approval-retry", task="rejected task")
         info._coordinator_waiting = True
+        info._coordinator_fence = MagicMock()
         manager._agents[info.id] = info
         manager.command_authority.reject_waiting_execution = AsyncMock(side_effect=reject)
         manager._scheduler.release = MagicMock(return_value=False)
@@ -471,21 +480,27 @@ class TestSpawnWithApprovalCallback:
 
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             first = await manager.command_authority.spawn(first_identity, "hold the slot")
+            first_task = manager._tasks[first.id]
             queued = await manager.command_authority.spawn(queued_identity, "cancel me")
             assert queued.queued is True
             assert await manager.cancel(queued.id) is True
             approval_gate.set()
-            await manager._tasks[first.id]
+            await first_task
 
         assert await manager.command_authority.lookup_response(
             queued_identity.idempotency_key
         ) == {
             "found": True,
             "id": queued_identity.run_id,
-            "error": "spawn cancelled before start",
+            "error": "run stopped before execution",
             "code": "spawn_rejected",
             "counted": True,
         }
+        receipt = await coordinator.get_command_by_key(queued_identity.idempotency_key)
+        assert receipt is not None
+        assert receipt.command.status is CommandStatus.REJECTED
+        assert receipt.command.rejection_reason == "run stopped before execution"
+        assert receipt.command.result_json
 
     @pytest.mark.asyncio
     async def test_queued_cancel_failure_retains_non_runnable_entry_for_retry(self) -> None:
@@ -526,12 +541,14 @@ class TestSpawnWithApprovalCallback:
             on_done=on_done,
         )
         manager.command_authority.reject_waiting_execution = AsyncMock()
+        manager._report_terminal = AsyncMock()
         manager._scheduler.enqueue(
             {
                 "task": "cancel safely",
                 "parent_session_key": "parent-session",
                 "_preassigned_id": "queued-batch-cancel",
                 "_coordinator_admitted": True,
+                "_coordinator_fence": MagicMock(),
                 "batch_id": "wave-cancel",
                 "batch_total": 2,
             }
@@ -541,15 +558,18 @@ class TestSpawnWithApprovalCallback:
 
         manager.command_authority.reject_waiting_execution.assert_awaited_once_with(
             "queued-batch-cancel",
-            "spawn cancelled before start",
+            "run stopped before execution",
+            stop_heartbeat=False,
         )
-        on_done.assert_awaited_once()
-        announced = on_done.await_args.args[0]
+        on_done.assert_not_awaited()
+        manager._report_terminal.assert_awaited_once()
+        announced = manager._report_terminal.await_args.args[0]
         assert announced.id == "queued-batch-cancel"
         assert announced.batch_id == "wave-cancel"
         assert announced.batch_total == 2
         assert announced.done is True
-        assert announced.error == "spawn cancelled before start"
+        assert announced.user_stopped is True
+        assert announced.error == ""
 
     @pytest.mark.asyncio
     async def test_rejected_spawn_decrements_running_count(self) -> None:

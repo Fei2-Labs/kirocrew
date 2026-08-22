@@ -234,8 +234,17 @@ class ShadowRunCoordinator:
     async def renew(self, run_id: str, fence: RunFence, until: float) -> bool:
         return cast(bool, await self._mirror("renew", run_id, fence, until))
 
-    async def claim_outbox(self, owner: OwnerLease, limit: int) -> list[OutboxEvent]:
-        return cast(list[OutboxEvent], await self._mirror("claim_outbox", owner, limit))
+    async def claim_outbox(
+        self,
+        owner: OwnerLease,
+        limit: int,
+        event_id: str = "",
+        acknowledgement: bool = False,
+    ) -> list[OutboxEvent]:
+        return cast(
+            list[OutboxEvent],
+            await self._mirror("claim_outbox", owner, limit, event_id, acknowledgement),
+        )
 
     async def release_outbox(
         self, fence: DeliveryFence, available_at: float

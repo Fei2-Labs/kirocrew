@@ -111,6 +111,15 @@ resolves the stable idempotency key. A lookup distinguishes an unclaimed
 request once only for `PENDING`, while `CLAIMED` remains outcome-uncertain and is
 never recorded as a lost submission.
 
+An exact execution claim also acquires the run lease. The authority passes its
+run fence, command, and optimistic version through the synchronous facade and
+queue payload. `_run` commits `starting` before child startup, `_run_inner`
+commits `running` after session creation and before the prompt, and a 30-second
+heartbeat renews the 90-second lease. A terminal failed, stopped, or interrupted
+run wins lookup reconstruction when its execution command has no stored facade
+result, so pre-start cancellation cannot replay as a successful spawn. Control
+claims still never touch the execution lease.
+
 The port defines typed desired/observed state, terminal outcomes, idempotent
 commands, execution leases with fencing epochs, optimistic lifecycle versions,
 and delivery claims with an independent fencing epoch. The in-memory adapter is
@@ -131,8 +140,12 @@ existing spawn option survives a queue round trip unchanged.
 shielded report tasks, report-to-agent lookup during bounded shutdown, and
 teardown gates that outlive manager registries. It uses a structural protocol
 instead of importing `SubagentInfo`, keeping the manager dependency one-way.
-The effectful delivery coroutine remains on `SubagentManager` until the durable
-outbox migration.
+`SubagentManager` owns the effectful delivery adapter while depending only on
+the coordinator port. The winning terminal reporter commits the outcome and
+outbox row before any WebSocket or parent callback. It keeps its execution
+lease and shielded report alive across transient commit failures, then retries
+the exact outbox event until delivery succeeds or the destination durably
+defers it to its queue/digest.
 
 Private manager views for the old counter, queue, report-task, and teardown-gate
 fields remain as compatibility adapters. They delegate to these boundaries and
@@ -170,8 +183,86 @@ preflight; a surviving sidecar or primary-database ACL failure remains fatal.
 It always returns the primary result. It calls the shadow
 only after primary completion, swallows shadow failures, compares normalized
 stable field classes without logging payload values, and never repairs the
-primary. Terminal state and delivery move to coordinator authority in the next
-migration phases.
+primary. Keyed execution lifecycle and terminal delivery now use the durable
+coordinator directly; legacy unkeyed runs retain their file-backed report path
+until the restart importer lands.
+
+### Transactional completion outbox
+
+`mark_starting` and `mark_running` accept an exact one-version-ahead replay
+under the same owner and lease epoch when the first SQLite commit succeeded but
+its response was lost. Older versions and different fences still reject, so the
+retry can recover the committed lifecycle version without widening ownership.
+The manager retries each transition once with the same fence and expected
+version, then records the returned version before advancing the lifecycle. If
+both STARTING attempts fail, it leaves the command claimed for recovery and
+does not apply command settlement against an unknown lifecycle state.
+
+For a coordinator-admitted run, `complete()` verifies the execution fence and
+optimistic version, writes the terminal outcome, and inserts one pending outbox
+event in the same SQLite transaction. The payload contains bounded, redacted
+routing metadata, a 4,000-character result summary, and `result_path`; it never
+copies the full transcript. Replaying the completion returns the same
+`event_id`; a conflicting outcome is rejected. Lease expiry makes the run
+eligible for takeover but does not itself invalidate the monotonic fence, so
+the current epoch may still commit its terminal result after host suspend if no
+recovery owner has advanced the epoch first.
+
+`OutboxDeliveryAdapter` claims one FIFO event immediately before each delivery,
+increments the delivery claim epoch, and invokes existing gateway routing. Its
+accepted path retains the stable event identity and retries transient
+durable-ack failures without invoking the destination again. If the original
+claim expires, it reclaims that identity for acknowledgement only, so a
+prolonged coordinator outage cannot redeliver an already accepted completion.
+Its 22-minute lease covers the bounded parent-injection and teardown budgets, so a
+valid slow callback cannot be claimed concurrently. It acknowledges only after
+that callback accepts the event; an injection callback that records a routing
+failure leaves the event pending even when it returns normally. Exceptions
+release the matching claim with bounded, overflow-safe exponential backoff. A
+permanently rejected execution fence stops its
+reporter; periodic recovery owns the nonterminal run rather than an impossible
+retry loop or a duplicate legacy delivery. A queued or immediately dispatched
+dashboard turn and a wave-digest hold defer acknowledgement instead: the event
+remains unavailable to background drainers for one lease window, and the
+consumption/digest-settlement hooks retry transient coordinator errors before
+returning and acknowledge every terminal outcome only after the parent consumes
+it. A failed or rejected release retains the original delivery fence so an
+immediate consumer acknowledgement can still settle the claimed event. If that
+acknowledgement races a successful release of the original claim,
+it reclaims the stable event identity and settles the new fence. Legacy delivered
+tombstones remain limited to successful runs, while teardown gates retain their
+compatibility role.
+
+Delivery retries retain their manager context. Lifecycle events, orchestration
+tracking, and wave accounting run once; every composed wave chunk keeps a
+detached retry snapshot, so a failed non-final or final route cannot recount a
+member, discard the composed chunk, or mutate later live wave progress. Cron
+injection exceptions explicitly record a routing failure before returning, so
+the outbox claim remains pending. The execution heartbeat remains active across
+transient terminal commit failures and stops only after the terminal event is
+durable (or the coordinator permanently rejects the fence).
+
+The durable completion payload retains the `silent` delivery policy and live
+batch labels. Restart rehydration restores `silent` but clears the batch
+identity: digest progress is volatile, so recovered events route independently
+instead of synthesizing misleading one-member wave completions.
+
+After the dashboard or headless API destination registry is initialized,
+startup reconciliation drains every currently eligible bounded batch of
+coordinator completions before scanning legacy folders, including when no
+legacy orphan exists. Starting the reaper earlier could misroute and acknowledge
+a dashboard completion before its slot exists. The periodic reaper retries the
+same drain so transient startup delivery failures remain recoverable without
+another process restart.
+Manager shutdown cancels and gathers the one-shot reconciliation task before
+tearing down live agents.
+
+Coordinator-backed injected envelopes include `Event: <event_id>` and
+`meta.subagentCompletion.eventId`. Wave digests carry one `Event:` line for each
+member and all of those identifiers in the additive `eventIds` list, while
+retaining `eventId` for compatibility. Consumers may deduplicate with these
+identifiers; consumers that ignore the additive fields retain at-least-once
+behavior.
 
 ## Constants
 
@@ -241,7 +332,21 @@ Spawn flow:
    approval with a 2-minute timeout. Timeout or rejection frees the
    concurrency slot. For coordinator-admitted work, approval rejection and
    cancellation while queued finish the durable command as rejected before
-   dropping its lease, so lookup and exact replay cannot remain pending.
+   terminal delivery, while retaining the run lease until the terminal outbox
+   event commits, so lookup and exact replay cannot remain pending and recovery
+   cannot race the delivery handoff. Rejecting the command does not itself
+   terminalize the run; the fenced `complete()` transition remains the single
+   authority that records the terminal outcome and creates its outbox event.
+   A queue-drain policy exception or returned rejection uses this same handoff:
+   it retains the command claim, records the rejection, installs live batch
+   routing context before the event becomes claimable, and then commits and
+   delivers the terminal event. Any winning drainer attaches the stable event
+   identity to that live context before invoking a callback, so a deferred
+   destination can record and later settle its acknowledgement debt.
+   Policy failures before task ownership also roll back provisional manager
+   registration, capacity, and stagger state before this terminal handoff.
+   A legacy queued entry has no durable fence, so the timer synthesizes and
+   announces its terminal rejection instead of re-raising after dequeue.
 
 ### Tool Approval Cascade
 
@@ -518,7 +623,7 @@ Large waves must not flood the WS socket, the parent LLM's context, or the UI. F
 
 - **Batch identity**: `spawn(batch_id=..., batch_total=...)` (threaded from `spawn_run tasks=[...]` — one 12-hex id per multi-task call — via `POST /api/spawn` transport params; survives the stagger queue). `spawn_batch_started {batch_id, count}` fires once per batch on its first started member; the id rides every WS frame (`base["batch_id"]`).
 - **Event coalescing** (`subagent_scale.SubagentEventCoalescer`, wired in the gateway's `_subagent_event`): above 8 active agents, `subagent_tool`/`subagent_stalled`/`subagent_retrying` buffer per-agent (latest state wins, merged) and flush every ~1s as ONE `subagent_batch_update {updates:[...]}` frame to all clients; `subagent_chunk` text buffers append-concatenated (16KB/agent cap) and flushes as `subagent_batch_chunks {chunks:[...]}` to subagent subscribers only. Lifecycle events (`spawn`/`done`/`recovering`/`injection_failed`/`batch_*`) are NEVER coalesced, and a `done`/`spawn` flushes buffered state first so ordering is preserved. Non-int active-count fails open to pass-through.
-- **Chunked wave-digest completion injection** (gateway `_subagent_done`): every batch member is accounted per `batch_id` (this is the single completion consumer for all terminal paths). Every multi-task wave (`batch_total > 1`) delivers results to the parent queue-style: completed members are HELD, and every `SUBAGENT_DIGEST_CHUNK_SIZE` completions (default 10, env `KIROCREW_SUBAGENT_DIGEST_CHUNK_SIZE`, clamped 1..1000) flush ONE `[Subagent batch completion event]` chunk digest — failures first with detail, successes as one-line `result_path` pointers (60KB cap per chunk); the final member flushes the remaining partial chunk. A 60-agent wave = 6 digest turns spread across the wave's runtime — bounded chunk size, incremental signal, and no straggler-gated mega-digest. Chunk buffers (`fail_lines`/`ok_lines`/`guard_msgs`/`held_ok_ids`) reset per flush; cumulative `ok`/`err`/`stopped` counts ride the final chunk's summary. **Spawn discipline**: non-final chunks instruct the parent NOT to spawn new sub-agents while batches are still arriving; the final chunk releases the gate ("finish processing all results before spawning follow-ups") — mirrored by a line in the `spawn_run` tool description. **Chunk order is FIFO**: the injection busy-check (`_injection_slot_busy`) treats a live `slot.task` — the claim assigned synchronously at dispatch — as busy in addition to `slot.running`, so a later chunk waits behind an injection that is dispatched but still inside `bounded_chat_turn`'s off-loop timeout resolution, instead of racing ahead of it or assigning `slot.task` over the earlier chunk's still-pending task. Single-task spawns have no batch identity and keep the plain per-agent injection. A batch member rejected at spawn (empty task, low memory, cwd, governance, bad agent) is counted as submitted AND announced through the done callback with its batch identity (`_announce_rejection`) — so a rejection that closes the wave still reaches the consumer and releases held sibling results (non-batch rejections do not announce; the caller gets the error synchronously). `batch_finished {batch_id, total, ok, err, stopped}` broadcasts for every batch regardless of size. **Wave liveness (lost-submission backstop)**: a member rejected before reaching `spawn()` or lost during transport is counted in every sibling's `batch_total` but never in `submitted` — un-reconciled, the count-driven `batch_members_pending()` wedges the wave forever. Three layers close it: (1) `api_spawn` marks only rejections/capacity reached after manager admission with `counted: true` (preserved through the MCP client's error flattening); coordinator identity conflicts occur before manager admission and remain uncounted; (2) `spawn_run` best-effort POSTs `/api/spawn/lost` for each explicit UNcounted rejection, which calls `record_lost_submission` — counts the member as submitted and announces a synthetic terminal failure through the completion consumer so the wave closes; uncertain transport failures are not immediately reconciled because the gateway may have accepted them; (3) the reaper's `_sweep_stuck_waves` (every sweep) force-reconciles uncertain or lost submissions when `submitted < expected`, all registered members are terminal, nothing is queued, and no submission progress occurred for `_WAVE_STUCK_SECS` (1800s / 30 minutes — deliberately generous, symmetric with the per-agent hard ceiling) — one lost member per sweep, converging across sweeps; this also bounds the `_batch_submitted`/`_batch_progress_ts` leak. Straggler-held partial chunks are bounded by the **hold deadline** (below), not by the member's 30-minute hard ceiling.
+- **Chunked wave-digest completion injection** (gateway `_subagent_done`): every batch member is accounted per `batch_id` (this is the single completion consumer for all terminal paths). Every multi-task wave (`batch_total > 1`) delivers results to the parent queue-style: completed members are HELD, and every `SUBAGENT_DIGEST_CHUNK_SIZE` completions (default 10, env `KIROCREW_SUBAGENT_DIGEST_CHUNK_SIZE`, clamped 1..1000) flush ONE `[Subagent batch completion event]` chunk digest — failures first with detail, successes as one-line `result_path` pointers (60KB cap per chunk); the final member flushes the remaining partial chunk. A 60-agent wave = 6 digest turns spread across the wave's runtime — bounded chunk size, incremental signal, and no straggler-gated mega-digest. Chunk buffers (`fail_lines`/`ok_lines`/`guard_msgs`/`held_delivery_ids`) reset per flush; cumulative `ok`/`err`/`stopped` counts ride the final chunk's summary. **Spawn discipline**: non-final chunks instruct the parent NOT to spawn new sub-agents while batches are still arriving; the final chunk releases the gate ("finish processing all results before spawning follow-ups") — mirrored by a line in the `spawn_run` tool description. **Chunk order is FIFO**: the injection busy-check (`_injection_slot_busy`) treats a live `slot.task` — the claim assigned synchronously at dispatch — as busy in addition to `slot.running`, so a later chunk waits behind an injection that is dispatched but still inside `bounded_chat_turn`'s off-loop timeout resolution, instead of racing ahead of it or assigning `slot.task` over the earlier chunk's still-pending task. Single-task spawns have no batch identity and keep the plain per-agent injection. A batch member rejected at spawn (empty task, low memory, cwd, governance, bad agent) is counted as submitted AND announced through the done callback with its batch identity (`_announce_rejection`) — so a rejection that closes the wave still reaches the consumer and releases held sibling results (non-batch rejections do not announce; the caller gets the error synchronously). `batch_finished {batch_id, total, ok, err, stopped}` broadcasts for every batch regardless of size. **Wave liveness (lost-submission backstop)**: a member rejected before reaching `spawn()` or lost during transport is counted in every sibling's `batch_total` but never in `submitted` — un-reconciled, the count-driven `batch_members_pending()` wedges the wave forever. Three layers close it: (1) `api_spawn` marks only rejections/capacity reached after manager admission with `counted: true` (preserved through the MCP client's error flattening); coordinator identity conflicts occur before manager admission and remain uncounted; (2) `spawn_run` best-effort POSTs `/api/spawn/lost` for each explicit UNcounted rejection, which calls `record_lost_submission` — counts the member as submitted and announces a synthetic terminal failure through the completion consumer so the wave closes; uncertain transport failures are not immediately reconciled because the gateway may have accepted them; (3) the reaper's `_sweep_stuck_waves` (every sweep) force-reconciles uncertain or lost submissions when `submitted < expected`, all registered members are terminal, nothing is queued, and no submission progress occurred for `_WAVE_STUCK_SECS` (1800s / 30 minutes — deliberately generous, symmetric with the per-agent hard ceiling) — one lost member per sweep, converging across sweeps; this also bounds the `_batch_submitted`/`_batch_progress_ts` leak. Straggler-held partial chunks are bounded by the **hold deadline** (below), not by the member's 30-minute hard ceiling.
 
 - **Digest hold deadline (straggler escape hatch)**: both chunk triggers are event-driven — a COUNT trigger (`SUBAGENT_DIGEST_CHUNK_SIZE` pending completions) and wave close — so neither can fire while a straggler is simply *not finishing*. With the default count (10) above any wave size the concurrency cap realistically produces (2–5), the count trigger is unreachable and wave close becomes the ONLY flush: every sibling's finished result is withheld for the slowest member's entire remaining runtime, and a member that HANGS rather than fails withholds them for the full `_TIMEOUT_SECS` reap — up to 30 minutes of total silence, indistinguishable from a dead session (issue #2215). The reaper's `_sweep_digest_holds` supplies the LATENCY trigger the count lacks: when the OLDEST outstanding hold in a live wave ages past `DIGEST_HOLD_SECS` (default 120s, env `KIROCREW_SUBAGENT_DIGEST_HOLD_SECS`, clamped to `_TIMEOUT_SECS`; `0` opts back out to count-trigger-only), `force_digest_flush` announces a synthetic **flush-only** record through the single completion consumer — the same re-entry mechanism `record_lost_submission` uses, so digest composition, routing, and the held-tombstone settle contract stay in one place. The record carries the wave's `batch_id` but is NOT a member: `_digest_flush_only` makes the gateway skip every per-member side effect (terminal WS event, orchestration tracker accounting, `done`/`ok`/`err` counters, digest lines) and only force the pending chunk out. **One knob, two jobs, now split**: the count keeps bounding digest SIZE for large waves; the deadline caps worst-case delivery LATENCY at every wave size. A wave whose members all finish within the deadline of each other still delivers ONE consolidated digest, so the deliberate small-wave behavior is unchanged. The forced chunk is labelled honestly as a PARTIAL release (`k/k+1`, "N of M delivered, R still running") and tells the parent to synthesize what it has rather than keep waiting. Hold bookkeeping: the gateway stamps `_digest_held_at` when it holds a member and clears it when that member's chunk fires — deliberately separate from `_digest_held`, which is the restart-safety flag the run loop reads and which the sweep must never mutate. The sweep is skipped entirely when `batch_members_pending()` is False, so it can never race the real wave-close digest into a duplicate delivery.
 - **Reconnect replay batching** (`ws.py`): more than `SUBAGENT_REPLAY_BATCH_THRESHOLD` (8) replay frames collapse into ONE `subagent_snapshot_batch {items:[{type, data}]}` frame; the client fans items into the per-frame reducers.

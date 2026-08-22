@@ -816,12 +816,16 @@ def test_no_raw_cancel_outside_chokepoint():
     allowed_substrings = (
         "task.cancel()",  # chokepoint body — verified below to be unique
         "self._reaper_task.cancel()",
+        "reconcile_task.cancel()",
         # A reap supersedes a pending respawn; the recovery task schedules the
         # respawn and is NOT a managed run, so no terminal marker applies.
         "recovery_task.cancel()",
         # Shielded terminal-report tasks drained at shutdown — also not managed
         # runs; cancelling them cannot trigger a respawn.
         "report_task.cancel()",
+        # Coordinator lease-heartbeat tasks are observers, not managed runs.
+        # Cancelling them cannot trigger run recovery.
+        "lease_task.cancel()",
         # follow_up watchers (spawn_steer mode="follow_up") — observers, not
         # managed runs: no terminal marker applies, and cancelling one cannot
         # trigger a respawn (it only ever DISPATCHES via continue_conversation,
@@ -841,8 +845,10 @@ def test_no_raw_cancel_outside_chokepoint():
         for n, l in raw_sites
         if "task.cancel()" in l
         and "_reaper_task" not in l
+        and "reconcile_task" not in l
         and "recovery_task" not in l
         and "report_task" not in l
+        and "lease_task" not in l
     ]
     assert len(generic) == 1, (
         f"expected exactly one raw task.cancel() (the chokepoint body), " f"found: {generic}"

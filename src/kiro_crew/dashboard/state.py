@@ -4350,11 +4350,10 @@ class _ChatSlot:
     def note_pending_subagent_delivery(self, content: str, agent_ids: list[str]) -> None:
         """Record that a queued completion still owes *agent_ids* a delivery mark.
 
-        Called by the gateway when a sub-agent completion could not be injected
-        because the slot was busy. Until the row drains AND its turn consumes the
-        prompt, the result is not in the parent's context, so no ``delivered``
-        tombstone is written for those agents -- which is also what keeps their
-        ``result.txt`` alive across an arbitrarily long queue wait (issue #4839).
+        Called by the gateway before a sub-agent completion is queued or
+        dispatched into a dashboard turn. Until that turn consumes the prompt,
+        the result is not in the parent's context, so no durable acknowledgement
+        or ``delivered`` tombstone is written.
 
         Keyed on the ANNOUNCE CONTENT, not the queue-entry id: a turn that fails
         before the model consumed the prompt re-queues that same announce under a
@@ -4363,8 +4362,9 @@ class _ChatSlot:
         be claimed by the retry that actually delivers it. The content embeds the
         agent ids and their result paths, so it is the identity that survives.
 
-        An empty *agent_ids* records nothing: a stopped or failed member keeps the
-        tombstone its own terminal path wrote, and there is nothing to settle.
+        An empty *agent_ids* records nothing. Legacy stopped/failed members have
+        no delivered tombstone debt; coordinator-backed events still appear in
+        this ledger so their outbox acknowledgement follows consumption.
 
         Entries are only ever removed by the row that settles them, because
         anything cleverer races the drain: a turn's tail-drain pops the NEXT row
