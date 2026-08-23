@@ -7059,5 +7059,16 @@ class TestRunCoordinatorProtection:
         ):
             assert is_sensitive_bash_command(command) is not None, command
 
+    def test_directory_is_hidden_by_every_os_sandbox_mode(self) -> None:
+        from kiro_crew import sandbox
+
+        for mode_dirs in (
+            sandbox._STRICT_DIRS,
+            sandbox._STANDARD_DIRS,
+            sandbox._CC_DIRS,
+        ):
+            assert ".kiro/crew/run-coordinator" in mode_dirs
+            assert ".kirocrew/run-coordinator" in mode_dirs
+
     def test_subagent_results_remain_readable(self) -> None:
         assert is_sensitive_path("~/.kiro/crew/subagents/run-1/result.txt") is False

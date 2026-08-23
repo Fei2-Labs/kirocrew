@@ -210,7 +210,9 @@ class TestVerbHelpers:
     ):
         fn = getattr(mcp_core, verb)
         monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat—1")
-        with patch("kiro_crew.mcp_core.loopback_urlopen", side_effect=AssertionError("must not be called")):
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", side_effect=AssertionError("must not be called")
+        ):
             out = fn("/api/thing")
         assert "invalid in HTTP headers" in out["error"]
 
@@ -229,14 +231,18 @@ class TestVerbHelperBodies:
             assert req.headers["Content-type"] == "application/json"
 
     def test_delete_without_body_sends_no_content_type(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})) as m:
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})
+        ) as m:
             mcp_core._delete("/api/thing")
         req = m.call_args[0][0]
         assert req.data is None
         assert "Content-type" not in req.headers
 
     def test_delete_with_body_sends_json(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})) as m:
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})
+        ) as m:
             mcp_core._delete("/api/thing", {"rule": "x"})
         req = m.call_args[0][0]
         assert json.loads(req.data.decode()) == {"rule": "x"}
@@ -262,7 +268,10 @@ class TestPostTransportClassification:
         assert out == {"error": "read timeout", "transport_error": True}
 
     def test_http_error_is_not_flagged_transport_error(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", side_effect=_http_error(400, b'{"error": "nope"}')):
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen",
+            side_effect=_http_error(400, b'{"error": "nope"}'),
+        ):
             out = mcp_core._post("/api/spawn", {})
         assert out == {"error": "nope"}
 
@@ -411,9 +420,7 @@ class TestDoSelectCrew:
         assert [c["name"] for c in out["crews"]] == ["docs"]
         assert "high confidence" in out["guidance"]
 
-    def test_unknown_crew_returns_error_with_available_names(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_unknown_crew_returns_error_with_available_names(self, monkeypatch: pytest.MonkeyPatch):
         cfg = _crew_config({"main": SimpleNamespace(triggers="", model="auto")}, "main")
         self._patch_cfg(monkeypatch, cfg)
         out = json.loads(_do_select_crew("ghost"))
@@ -424,9 +431,7 @@ class TestDoSelectCrew:
         self._patch_cfg(monkeypatch, _crew_config({}, ""))
         assert json.loads(_do_select_crew("ghost"))["available"] == "(none)"
 
-    def test_named_crew_returns_resolved_bindings(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path
-    ):
+    def test_named_crew_returns_resolved_bindings(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
         cfg = _crew_config({"docs": SimpleNamespace(triggers="d", model="opus")}, "main")
         self._patch_cfg(monkeypatch, cfg)
         monkeypatch.setattr(
@@ -445,9 +450,7 @@ class TestDoSelectCrew:
             "model": "opus",
         }
 
-    def test_select_crew_tool_routes_through_do_select_crew(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_select_crew_tool_routes_through_do_select_crew(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(mcp_core, "_do_select_crew", lambda crew: f"crew={crew!r}")
         assert _call_tool("select_crew", {"crew": "docs"}) == "crew='docs'"
 
@@ -505,6 +508,69 @@ class TestSpawnRunArgumentHandling:
         assert "Do not retry automatically" in out
         # A transport failure must NOT be reconciled as a lost wave member.
         assert all("/api/spawn/lost" not in c[0][0] for c in m.call_args_list)
+
+    def test_unclaimed_durable_spawn_replays_the_exact_request(self):
+        responses = [
+            {"error": "read timeout", "transport_error": True},
+            {"id": "ag1", "status": "spawned"},
+        ]
+        with (
+            patch.object(mcp_core, "_post", side_effect=responses) as post,
+            patch.object(
+                mcp_core,
+                "_get",
+                return_value={
+                    "found": True,
+                    "id": "ag1",
+                    "error": "command outcome is still pending",
+                    "status": "pending",
+                    "code": "command_pending",
+                    "command_status": "pending",
+                },
+            ),
+        ):
+            out = _call_tool("spawn_run", {"task": "one"})
+
+        assert "ag1" in out
+        assert post.call_count == 2
+        assert post.call_args_list[0] == post.call_args_list[1]
+
+    def test_unclaimed_durable_spawn_replays_at_most_once(self):
+        uncertain = {
+            "error": "coordinator result unavailable",
+            "code": "coordinator_outcome_uncertain",
+        }
+        pending = {
+            "found": True,
+            "error": "command outcome is still pending",
+            "status": "pending",
+            "code": "command_pending",
+            "command_status": "pending",
+        }
+        with (
+            patch.object(mcp_core, "_post", return_value=uncertain) as post,
+            patch.object(mcp_core, "_get", return_value=pending) as get,
+        ):
+            out = _call_tool("spawn_run", {"task": "one"})
+
+        assert "acceptance status is unknown" in out
+        assert post.call_count == 2
+        assert get.call_count == 2
+
+    def test_coordinator_uncertainty_survives_failed_lookup(self):
+        uncertain = {
+            "error": "coordinator result unavailable",
+            "code": "coordinator_outcome_uncertain",
+        }
+        with (
+            patch.object(mcp_core, "_post", return_value=uncertain) as post,
+            patch.object(mcp_core, "_get", side_effect=OSError("gateway unavailable")),
+        ):
+            out = _call_tool("spawn_run", {"task": "one"})
+
+        assert "acceptance status is unknown" in out
+        assert "Do not retry automatically" in out
+        assert all("/api/spawn/lost" not in call.args[0] for call in post.call_args_list)
 
     def test_explicit_rejection_in_a_batch_is_reconciled_as_lost(self):
         with patch.object(mcp_core, "_post", return_value={"error": "at capacity"}) as m:
@@ -588,6 +654,10 @@ class TestSpawnLifecycleTools:
         assert body["agent"] == "kirocrew"
         assert body["model"] == "claude-opus-5"
         assert body["max_turns"] == 3
+        assert len(body["run_id"]) == 8
+        assert len(body["command_id"]) == 32
+        assert len(body["idempotency_key"]) == 32
+        assert len(body["payload_hash"]) == 64
         assert "run9" in out and "END YOUR TURN" in out
 
     def test_continue_propagates_backend_error(self):
@@ -595,13 +665,50 @@ class TestSpawnLifecycleTools:
             out = _call_tool("spawn_continue", {"conversation": "c", "task": "t"})
         assert out == "Error: conversation_gone"
 
+    @pytest.mark.parametrize(
+        ("tool", "args"),
+        [
+            ("spawn_continue", {"conversation": "c", "task": "t"}),
+            ("spawn_steer", {"agent_id": "a1", "message": "adjust"}),
+            ("spawn_release", {"conversation": "c"}),
+        ],
+    )
+    def test_lifecycle_transport_uncertainty_warns_against_retry(self, tool, args):
+        with (
+            patch.object(
+                mcp_core,
+                "_post",
+                return_value={"error": "timed out", "transport_error": True},
+            ) as post,
+            patch.object(
+                mcp_core,
+                "_get",
+                return_value={
+                    "found": True,
+                    "error": "command outcome is still pending",
+                    "code": "command_pending",
+                    "command_status": "claimed",
+                },
+            ),
+        ):
+            out = _call_tool(tool, args)
+
+        assert "outcome is unknown" in out
+        assert "Do not retry automatically" in out
+        assert post.call_count == 1
+
     def test_steer_posts_the_message_and_confirms(self):
         with patch.object(mcp_core, "_post", return_value={"ok": True}) as m:
             out = _call_tool("spawn_steer", {"agent_id": "a1", "message": "stop that"})
         assert m.call_args[0][0] == "/api/spawn/a1/steer"
         # mode defaults to "interrupt" (spawn_steer's original semantics);
         # "follow_up" queues for delivery after the run's turn completes.
-        assert m.call_args[0][1] == {"message": "stop that", "mode": "interrupt"}
+        body = m.call_args[0][1]
+        assert body["message"] == "stop that"
+        assert body["mode"] == "interrupt"
+        assert len(body["command_id"]) == 32
+        assert len(body["idempotency_key"]) == 32
+        assert len(body["payload_hash"]) == 64
         assert "Steered run a1" in out
 
     def test_steer_propagates_backend_error(self):
@@ -613,6 +720,10 @@ class TestSpawnLifecycleTools:
         with patch.object(mcp_core, "_post", return_value={"ok": True}) as m:
             out = _call_tool("spawn_release", {"conversation": "conv1"})
         assert m.call_args[0][0] == "/api/spawn/conv1/release"
+        body = m.call_args[0][1]
+        assert len(body["command_id"]) == 32
+        assert len(body["idempotency_key"]) == 32
+        assert len(body["payload_hash"]) == 64
         assert "no longer be continued" in out
 
         with patch.object(mcp_core, "_post", return_value={"error": "not_found"}):
@@ -774,7 +885,12 @@ class TestWorkflowStatusAndResult:
         assert secret not in out
 
     def test_result_leaves_non_str_scalars_untouched(self):
-        snap = {"run_id": "r1", "status": "finished", "result": {"n": 3, "flag": True}, "events": []}
+        snap = {
+            "run_id": "r1",
+            "status": "finished",
+            "result": {"n": 3, "flag": True},
+            "events": [],
+        }
         with patch.object(mcp_core, "_get", return_value=snap):
             payload = json.loads(_call_tool("workflow_result", {"run_id": "r1"}))
         assert payload["result"] == {"n": 3, "flag": True}
@@ -1120,6 +1236,7 @@ class TestFileSend:
 
 
 # ── argument validation seam ──────────────────────────────────────────────
+
 
 class TestValidateArgs:
     def test_schema_backed_tool_is_validated_and_cleaned(self):

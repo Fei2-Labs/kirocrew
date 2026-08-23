@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew import platform_compat
-from kiro_crew.config.paths import config_dir
+from kiro_crew.config.paths import CONFIG_DIR_NAME, RUN_COORDINATOR_DIR_NAME, config_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.platform import current_context
 
@@ -52,7 +52,7 @@ except ImportError:  # non-POSIX (Windows)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
-    from typing import Any
+    from typing import Any, NoReturn
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,11 @@ _STRICT_DIRS: list[str] = [
     # ``.vault/.vault_key`` and decrypt the store.
     ".kiro/crew/.vault",
     ".kirocrew/.vault",
+    # Durable run commands contain raw task payloads and must remain hidden
+    # even when a shell command constructs the path dynamically and bypasses
+    # the tool-call path matcher.
+    ".kiro/crew/run-coordinator",
+    ".kirocrew/run-coordinator",
 ]
 
 _STANDARD_DIRS: list[str] = [
@@ -96,6 +101,8 @@ _STANDARD_DIRS: list[str] = [
     # Secret vault — hidden in every mode (see _STRICT_DIRS note above).
     ".kiro/crew/.vault",
     ".kirocrew/.vault",
+    ".kiro/crew/run-coordinator",
+    ".kirocrew/run-coordinator",
 ]
 
 # CC mode: hides all credential dirs including .aws, but selectively exposes
@@ -113,6 +120,8 @@ _CC_DIRS: list[str] = [
     # Secret vault — hidden in every mode (see _STRICT_DIRS note above).
     ".kiro/crew/.vault",
     ".kirocrew/.vault",
+    ".kiro/crew/run-coordinator",
+    ".kirocrew/run-coordinator",
 ]
 
 # CC mode: files to expose read-only inside otherwise-hidden dirs.
@@ -151,6 +160,19 @@ def _hidden_path_contains_visible_path(
         except ValueError:
             continue
     return False
+
+
+def _run_coordinator_hidden_dir() -> str:
+    """Return the active ledger path that every OS sandbox must hide."""
+
+    return os.path.abspath(config_dir() / RUN_COORDINATOR_DIR_NAME)
+
+
+def _run_coordinator_uses_custom_home() -> bool:
+    """Return whether the active ledger lies outside the default data home."""
+
+    default_dir = os.path.abspath(Path.home() / CONFIG_DIR_NAME / RUN_COORDINATOR_DIR_NAME)
+    return _run_coordinator_hidden_dir() != default_dir
 
 
 # Sensitive env var prefixes to scrub from the child environment.
@@ -1479,6 +1501,10 @@ def _build_launcher_script(
         for path in hidden_dirs
         if not _hidden_path_contains_visible_path(path, extra_visible_dirs)
     ]
+    # The active data home may live outside Path.home() via KIROCREW_HOME. This
+    # path is mandatory rather than caller-supplied: no visible-path exception
+    # may expose the durable command, lease, or delivery ledger to an agent.
+    hidden_dirs.append(_run_coordinator_hidden_dir())
     # A caller-supplied hidden path may be a FILE, and the two launcher loops hide
     # each kind differently: a directory gets an empty dir bind-mounted over it, a file
     # gets an empty temp file. The dir loop is guarded by `if os.path.isdir(target)`, so
@@ -2127,6 +2153,14 @@ def _build_seatbelt_profile(
         rules.append(f'(deny file-read* (subpath "{escaped}"))')
         rules.append(f'(deny file-write* (subpath "{escaped}"))')
         rules.append(f'(deny file-link (subpath "{escaped}"))')
+
+    # Unlike the home-relative compatibility entries, the active ledger path
+    # follows a valid KIROCREW_HOME override. It is never eligible for a caller
+    # visibility carve-out and is denied for reads, writes, and hardlinks.
+    coordinator_dir = _run_coordinator_hidden_dir().replace('"', '\\"')
+    rules.append(f'(deny file-read* (subpath "{coordinator_dir}"))')
+    rules.append(f'(deny file-write* (subpath "{coordinator_dir}"))')
+    rules.append(f'(deny file-link (subpath "{coordinator_dir}"))')
 
     # .ssh: deny all access except reading known_hosts (strict only)
     if sandbox_level == "strict":
@@ -3166,6 +3200,40 @@ class SandboxUnavailableError(RuntimeError):
         self.remedy = remedy
 
 
+def _refuse_macos_sandbox_owner_conflict(argv: list[str], detail: str) -> NoReturn:
+    """Refuse a Kiro spawn whose required path policy cannot be delegated.
+
+    Kiro's internal Seatbelt layer and Kiro Crew's ``sandbox-exec`` layer cannot
+    nest. A path deny that only Kiro Crew understands therefore has no safe
+    execution shape while the internal layer is enabled: delegating drops the
+    deny, while wrapping prevents the child from starting.
+    """
+    try:
+        from kiro_crew.sel import sel  # circular import: sandbox is low-level
+
+        sel().log_tool_invocation(
+            session_key="sandbox",
+            agent="system",
+            source="sandbox.wrap_argv",
+            tool_name=argv[0] if argv else "unknown",
+            tool_kind="subprocess",
+            outcome="denied",
+            error=detail,
+        )
+    except Exception:
+        logger.warning("Failed to emit SEL audit event for sandbox denial", exc_info=True)
+    raise SandboxUnavailableError(
+        "Kiro CLI's internal macOS sandbox cannot enforce the active "
+        "KIROCREW_HOME run-coordinator mask, and macOS Seatbelt layers cannot "
+        "be nested. Refusing to start the agent rather than expose the coordinator "
+        'ledger. Set {"sandbox": false} in '
+        "~/.kiro/settings/amazon-internal.json so Kiro Crew's sandbox owns "
+        "isolation, then restart the gateway.",
+        kind="foreign_sandbox",
+        detail=detail,
+    )
+
+
 def reset_backend() -> None:
     """Reset cached backend (for testing or config change)."""
     global _backend, _last_unshare_failure
@@ -3330,6 +3398,17 @@ def wrap_argv(
     governance_floor = _governance_sandbox_floor()
     mode = _clamp_sandbox_mode_to_floor(mode, governance_floor)
 
+    kiro_spawn = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
+    darwin_kiro_internal_sandbox = (
+        sys.platform == "darwin" and kiro_spawn and kiro_internal_sandbox_enabled()
+    )
+    if darwin_kiro_internal_sandbox and _run_coordinator_uses_custom_home():
+        _refuse_macos_sandbox_owner_conflict(
+            argv,
+            "the active run-coordinator ledger is outside the default data home: "
+            + _run_coordinator_hidden_dir(),
+        )
+
     if mode == "off":
         # Fix #2: verify kiro-cli delegation before honoring "off". The
         # documented invariant (sandbox.py:1680-1681) requires that when
@@ -3337,8 +3416,8 @@ def wrap_argv(
         # but the old early return never checked. Now we verify the delegation
         # on macOS kiro-cli spawns; on Linux (where kiro's internal sandbox
         # doesn't apply) or non-kiro spawns, "off" means genuinely unconfined.
-        kiro_spawn_off = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
-        if sys.platform == "darwin" and kiro_spawn_off and kiro_internal_sandbox_enabled():
+        kiro_spawn_off = kiro_spawn
+        if darwin_kiro_internal_sandbox:
             # Delegation is valid: kiro-cli's sandbox IS active. Apply env scrub
             # (same as _delegate_to_kiro_internal_sandbox) but WITHOUT the
             # seatbelt fallback on SEL failure — mode="off" must never produce a
@@ -3541,22 +3620,21 @@ def wrap_argv(
     # no-backend fail-closed path. Checked before backend detection so this is a
     # deterministic capability decision, never a fallback after a probe failure.
     # Linux namespace isolation is unaffected.
-    kiro_spawn = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
-    delegate_to_kiro = (
-        sys.platform == "darwin" and kiro_spawn and kiro_internal_sandbox_enabled()
-    ) or (sys.platform == "win32" and is_kiro_cli is True)
+    delegate_to_kiro = darwin_kiro_internal_sandbox or (
+        sys.platform == "win32" and is_kiro_cli is True
+    )
     if delegate_to_kiro:
-        if extra_hidden_dirs or extra_visible_dirs:
+        delegated_hidden_dirs = extra_hidden_dirs
+        if delegated_hidden_dirs or extra_visible_dirs:
             # A delegated sandbox cannot enforce KiroCrew-specific path hides.
-            # macOS keeps the outer seatbelt. Windows falls through to its
-            # no-backend policy and fail-closes unless explicitly opted in.
+            # macOS cannot add an outer owner because Seatbelt layers do not
+            # nest. Windows falls through to its no-backend policy and
+            # fail-closes unless explicitly opted in.
             if sys.platform == "darwin":
-                return sandbox_exec_argv(
+                _refuse_macos_sandbox_owner_conflict(
                     argv,
-                    sandbox_level,
-                    strip_python_env=strip_python_env,
-                    extra_hidden_dirs=extra_hidden_dirs,
-                    extra_visible_dirs=extra_visible_dirs,
+                    "caller-specific sandbox paths cannot be delegated to "
+                    "Kiro CLI's internal sandbox",
                 )
         else:
             delegated = _delegate_to_kiro_internal_sandbox(

@@ -91,6 +91,7 @@ from kiro_crew.run_coordinator import (
     CommandOperation,
     CoordinatorDecision,
     RunCoordinator,
+    SQLiteRunCoordinator,
     SubmitRun,
 )
 from kiro_crew.security import (
@@ -104,6 +105,7 @@ from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.session_workspace import result_path as _ws_result_path
 from kiro_crew.slack.format import extract_options
 from kiro_crew.stats import Stats
+from kiro_crew.subagent_command_authority import SubagentCommandAuthority
 from kiro_crew.subagent_completion_meta import (
     OUTCOME_FAILED,
     OUTCOME_INTERRUPTED,
@@ -1244,6 +1246,16 @@ class SubagentInfo:
     streaming_text: str = ""
     elapsed: float = 0.0
     _raw_task: str = ""  # unredacted task for kiro-cli execution prompt
+    # True when the async command authority durably admitted this run before
+    # invoking the legacy executor. The executor must not create a second
+    # shadow command with a different identity at _run entry.
+    _coordinator_admitted: bool = False
+    # True while a keyed run is queued or awaiting approval. The command
+    # authority owns its pre-execution lease until `_run` takes over.
+    _coordinator_waiting: bool = False
+    # The durable start result is unknown, so local terminal delivery must wait
+    # for an explicit cancellation retry or fenced recovery.
+    _coordinator_claim_uncertain: bool = False
     # CC-specific overrides (ignored for ACP)
     model: str = ""
     # The model id the live session ACTUALLY resolved to serve, read back from
@@ -1471,10 +1483,11 @@ class SubagentManager:
         self._shutting_down = False
         self._completion_keep = completion_keep
         self._completion_keep_chars = completion_keep_chars
-        # This seam is deliberately pre-authority: spawn is synchronous while
-        # coordinator mutation is async. The accepted run is mirrored only at
-        # async _run entry, after the legacy admission/approval path has won.
-        self._coordinator = coordinator
+        # Keyed async callers durably admit commands through this coordinator
+        # before invoking the compatibility executor. Legacy synchronous
+        # callers are still mirrored at async _run entry during migration.
+        self._coordinator = coordinator or SQLiteRunCoordinator()
+        self.command_authority = SubagentCommandAuthority(self._coordinator, self)
         self._lifecycle: SubagentLifecycle[SubagentInfo] = SubagentLifecycle()
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
@@ -1492,6 +1505,10 @@ class SubagentManager:
         # the TTL sweep across restarts; a spawn_continue on an unknown key
         # also re-registers it on demand.
         self._conversations: dict[str, float] = {}
+        # A release removes the loop-affine registry before its filesystem
+        # cleanup runs off-loop. Keep that interval busy so a continuation
+        # cannot reseed the same session and then lose its files to the cleanup.
+        self._releasing_conversations: set[str] = set()
         self._conv_registry_rebuilt = False
         # state.json is the source of truth for retention (#1115): give the
         # SessionManager's in-memory continuable cache a disk fallback so a
@@ -3159,6 +3176,7 @@ class SubagentManager:
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _coordinator_admitted: bool = False,
     ) -> SubagentInfo | None:
         """Spawn a subagent for *task*.
 
@@ -3256,7 +3274,8 @@ class SubagentManager:
                     error="spawn refused: task must be a non-empty string",
                     batch_id=batch_id,
                     batch_total=max(0, int(batch_total)),
-                )
+                ),
+                coordinator_admitted=_coordinator_admitted,
             )
 
         # --- Redact task once for all SubagentInfo storage (raw task kept for kiro-cli prompt) ---
@@ -3295,7 +3314,7 @@ class SubagentManager:
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
-            return self._announce_rejection(info)
+            return self._announce_rejection(info, coordinator_admitted=_coordinator_admitted)
 
         # --- Admission gate: refuse NEW spawns while host memory posture is
         # critical. Complements the absolute spawn_min_memory_gb floor above
@@ -3330,7 +3349,7 @@ class SubagentManager:
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
-            return self._announce_rejection(info)
+            return self._announce_rejection(info, coordinator_admitted=_coordinator_admitted)
 
         # --- CWD validation: reject bad paths before consuming a slot ---
         resolved_cwd = ""
@@ -3363,7 +3382,7 @@ class SubagentManager:
                     batch_id=batch_id,
                     batch_total=max(0, int(batch_total)),
                 )
-                return self._announce_rejection(info)
+                return self._announce_rejection(info, coordinator_admitted=_coordinator_admitted)
 
         # --- Governance: spawn capability gate (blast-radius containment) ---
         # A policy/profile may disable sub-agent spawning entirely, or bound it
@@ -3391,7 +3410,8 @@ class SubagentManager:
                     error=f"spawn refused by governance: {gov_spawn_err}",
                     batch_id=batch_id,
                     batch_total=max(0, int(batch_total)),
-                )
+                ),
+                coordinator_admitted=_coordinator_admitted,
             )
 
         now = time.monotonic()
@@ -3428,7 +3448,8 @@ class SubagentManager:
                         ),
                         batch_id=batch_id,
                         batch_total=max(0, int(batch_total)),
-                    )
+                    ),
+                    coordinator_admitted=_coordinator_admitted,
                 )
             # Carry this spawn's id (assigned at the top) in the queue entry so
             # the drained spawn runs under it. The identity must survive the
@@ -3464,6 +3485,7 @@ class SubagentManager:
                     "include_project": include_project,
                     "_agent_prevalidated": _agent_prevalidated,
                     "_preassigned_id": agent_id,
+                    "_coordinator_admitted": _coordinator_admitted,
                 }
             )
             logger.info(
@@ -3496,6 +3518,8 @@ class SubagentManager:
                 include_memory=include_memory,
                 include_lessons=include_lessons,
                 include_project=include_project,
+                _coordinator_admitted=_coordinator_admitted,
+                _coordinator_waiting=_coordinator_admitted,
             )
             return info
 
@@ -3524,7 +3548,7 @@ class SubagentManager:
                     batch_id=batch_id,
                     batch_total=max(0, int(batch_total)),
                 )
-                return self._announce_rejection(info)
+                return self._announce_rejection(info, coordinator_admitted=_coordinator_admitted)
 
         info = SubagentInfo(
             id=agent_id,
@@ -3549,6 +3573,7 @@ class SubagentManager:
             include_project=include_project,
         )
         info._raw_task = task  # unredacted prompt for kiro-cli execution
+        info._coordinator_admitted = _coordinator_admitted
         self._agents[agent_id] = info
         self._scheduler.occupy(info, time.monotonic())
         # Batch lifecycle: announce the wave ONCE, on its first member to
@@ -3608,6 +3633,7 @@ class SubagentManager:
                     metadata={"subagent_id": agent_id, "reason": "tool_calls_gated"},
                 )
             elif self._on_spawn_approval:
+                info._coordinator_waiting = info._coordinator_admitted
                 self._tasks[agent_id] = asyncio.create_task(self._spawn_with_approval(info))
             else:
                 info.done = True
@@ -3627,8 +3653,9 @@ class SubagentManager:
                 # counts it as complete — without an announce, a wave whose
                 # final member lands here closes with no event and every held
                 # sibling digest strands forever.
-                return self._announce_rejection(info)
+                return self._announce_rejection(info, coordinator_admitted=_coordinator_admitted)
         elif self._on_spawn_approval:
+            info._coordinator_waiting = info._coordinator_admitted
             self._tasks[agent_id] = asyncio.create_task(self._spawn_with_approval(info))
         else:
             info.done = True
@@ -3660,7 +3687,12 @@ class SubagentManager:
         except Exception:
             logger.exception("Subagent announce failed for %s", info.id)
 
-    def _announce_rejection(self, info: SubagentInfo) -> SubagentInfo:
+    def _announce_rejection(
+        self,
+        info: SubagentInfo,
+        *,
+        coordinator_admitted: bool = False,
+    ) -> SubagentInfo:
         """Route a terminal spawn rejection through the done callback.
 
         A rejected batch member is counted as submitted (top of ``spawn``)
@@ -3679,12 +3711,21 @@ class SubagentManager:
         those itself off the returned info, so announcing here as well would
         inject the completion twice.
         """
-        if info.batch_id and self._on_done:
+        # A keyed command must finish its durable rejection before its batch
+        # consumer can count it. Its authority or queue-drain settlement owns
+        # that later announcement.
+        if info.batch_id and self._on_done and not coordinator_admitted:
             try:
                 self._tasks[f"reject-{info.id}"] = asyncio.ensure_future(self._safe_announce(info))
             except RuntimeError:
                 pass  # no running loop (sync/test context)
         return info
+
+    async def announce_durable_rejection(self, info: SubagentInfo) -> None:
+        """Announce a keyed batch rejection after command settlement succeeds."""
+
+        if info.batch_id and self._on_done:
+            await self._safe_announce(info)
 
     def _should_stagger_queue(self, now: float) -> tuple[bool, bool]:
         """Decide whether a spawn arriving at *now* must be queued.
@@ -3708,6 +3749,8 @@ class SubagentManager:
         would then die with ``resume_failed``), or let a second continue race
         the same conversation.
         """
+        if conv_key in self._releasing_conversations:
+            return SubagentInfo(id="release", task="", queued=True)
         for a in self._agents.values():
             if not a.done and (a.conversation_key or f"subagent:{a.id}") == conv_key:
                 return a
@@ -3857,6 +3900,7 @@ class SubagentManager:
         max_turns: int = 0,
         cwd: str = "",
         _preassigned_id: str = "",
+        _coordinator_admitted: bool = False,
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id*.
 
@@ -3885,7 +3929,7 @@ class SubagentManager:
         busy = self._conversation_busy(conv_key)
         if busy is not None:
             info = SubagentInfo(
-                id=uuid.uuid4().hex[:8],
+                id=_preassigned_id or uuid.uuid4().hex[:8],
                 task=_redact(task),
                 done=True,
                 parent_session_key=parent_session_key,
@@ -3922,7 +3966,7 @@ class SubagentManager:
             except Exception:
                 pass
             info = SubagentInfo(
-                id=uuid.uuid4().hex[:8],
+                id=_preassigned_id or uuid.uuid4().hex[:8],
                 task=_redact(task),
                 done=True,
                 parent_session_key=parent_session_key,
@@ -3956,6 +4000,7 @@ class SubagentManager:
         return self.spawn(
             task,
             _preassigned_id=_preassigned_id,
+            _coordinator_admitted=_coordinator_admitted,
             parent_session_key=parent_session_key,
             agent=agent,
             model=model,
@@ -4326,19 +4371,27 @@ class SubagentManager:
         except Exception:
             logger.debug("follow_up audit failed", exc_info=True)
 
-    def release_conversation(self, conv_id: str) -> tuple[bool, str]:
-        """Release conversation *conv_id*: forget the sid and delete files.
+    def _prepare_conversation_release(
+        self,
+        conv_id: str,
+    ) -> tuple[tuple[bool, str], tuple[str, str, str] | None]:
+        """Mutate loop-affine release state before any filesystem cleanup."""
 
-        Refuses (``conversation_busy``) while a run is in flight. Returns
-        ``(ok, detail)``.
-        """
         conv_key = f"subagent:{conv_id}"
         busy = self._conversation_busy(conv_key)
         if busy is not None:
-            return False, f"conversation_busy: run {busy.id} is in flight"
+            return (False, f"conversation_busy: run {busy.id} is in flight"), None
         provider_label = self._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
         sid = self._sessions.forget_conversation(conv_key)
         self._conversations.pop(conv_key, None)
+        self._releasing_conversations.add(conv_key)
+        result = (True, "released") if sid else (False, "conversation_gone: nothing to release")
+        return result, (conv_id, sid or "", provider_label)
+
+    @staticmethod
+    def _finish_conversation_release(conv_id: str, sid: str, provider_label: str) -> None:
+        """Persist release state and remove files after registry ownership changes."""
+
         # Demote the persisted source of truth too (#1115): with the disk
         # fallback in place, a stale keep=True would re-warm the continuable
         # cache after release and resurrect the conversation on the next
@@ -4348,12 +4401,33 @@ class SubagentManager:
         except Exception:
             logger.debug("release: failed to demote state for %s", conv_id, exc_info=True)
         if not sid:
-            return False, "conversation_gone: nothing to release"
+            return
         try:
             _cleanup_session_files_sync(sid, provider_label)
         except Exception:
             logger.debug("release_conversation: file cleanup failed", exc_info=True)
-        return True, "released"
+
+    def release_conversation(self, conv_id: str) -> tuple[bool, str]:
+        """Release conversation *conv_id* for synchronous compatibility callers."""
+
+        result, cleanup = self._prepare_conversation_release(conv_id)
+        if cleanup is not None:
+            try:
+                self._finish_conversation_release(*cleanup)
+            finally:
+                self._releasing_conversations.discard(f"subagent:{conv_id}")
+        return result
+
+    async def release_conversation_async(self, conv_id: str) -> tuple[bool, str]:
+        """Release loop-affine state, then perform filesystem cleanup off-loop."""
+
+        result, cleanup = self._prepare_conversation_release(conv_id)
+        if cleanup is not None:
+            try:
+                await asyncio.to_thread(self._finish_conversation_release, *cleanup)
+            finally:
+                self._releasing_conversations.discard(f"subagent:{conv_id}")
+        return result
 
     def _sweep_conversations(self, now: float) -> None:
         """Reaper hook: expire continuable conversations idle past TTL."""
@@ -4395,6 +4469,14 @@ class SubagentManager:
                 pass  # no running loop (sync/test context)
             return
         params = decision.entry
+        if bool(params.get("_coordinator_cancel_pending")):
+            # A failed durable cancellation must not turn into a later local
+            # start. Move the retained entry behind runnable work; only an
+            # explicit cancellation retry may remove it.
+            self._scheduler.enqueue(params)
+            if any(not bool(entry.get("_coordinator_cancel_pending")) for entry in self._queue):
+                self._drain_queue()
+            return
         # A run can be cancelled WHILE it waits here — a user stop, or a session
         # deleted out from under it. Starting it anyway would execute tools for
         # work already reported as stopped, so skip it and drain the next one
@@ -4429,6 +4511,51 @@ class SubagentManager:
         # start under the id its caller was already told (and, if the gate re-queues
         # it, keeps that id across the second round-trip too).
         drained = self.spawn(**params, _from_queue=True)
+        coordinator_rejection = bool(
+            drained is not None
+            and drained.done
+            and drained.error
+            and bool(params.get("_coordinator_admitted"))
+        )
+        if coordinator_rejection and drained is not None:
+            # The original HTTP caller returned when this entry was queued.
+            # If revalidation now rejects it, no authority call remains on the
+            # stack to finish the durable command, so lookup would report an
+            # outcome-uncertain claim forever.
+            async def _finish_rejected_command() -> None:
+                try:
+                    await self.command_authority.reject_waiting_execution(
+                        drained.id,
+                        drained.error,
+                    )
+                except Exception:
+                    params["_coordinator_cancel_pending"] = True
+                    self._scheduler.enqueue(params)
+                    self._emit_queue_depth(
+                        str(params.get("parent_session_key", "")),
+                        str(params.get("batch_id", "")),
+                    )
+                    logger.warning(
+                        "Queued subagent %s rejection was not durably recorded",
+                        drained.id,
+                        exc_info=True,
+                    )
+                    raise
+                if self._on_done:
+                    await self._safe_announce(drained)
+
+            try:
+                task = asyncio.ensure_future(_finish_rejected_command())
+                self._tasks[f"command-reject-{drained.id}"] = task
+
+                def _forget_rejection(done: asyncio.Task[None]) -> None:
+                    self._tasks.pop(f"command-reject-{drained.id}", None)
+                    if not done.cancelled():
+                        done.exception()
+
+                task.add_done_callback(_forget_rejection)
+            except RuntimeError:
+                pass  # no running loop (sync/test context)
         # A drained spawn has NO synchronous reader: this call site is a timer
         # callback, and the original caller was handed a queued info long ago. So a
         # terminal rejection here — the cwd was deleted while the run waited, the
@@ -4444,6 +4571,7 @@ class SubagentManager:
             drained is not None
             and drained.done
             and drained.error
+            and not coordinator_rejection
             and not drained.batch_id
             and self._on_done
         ):
@@ -4488,8 +4616,21 @@ class SubagentManager:
             approved = False
 
         if not approved:
+            rejection_error = "spawn rejected"
+            try:
+                await self.command_authority.reject_waiting_execution(
+                    info.id,
+                    rejection_error,
+                )
+            except Exception:
+                logger.warning(
+                    "Subagent %s approval rejection was not durably recorded",
+                    info.id,
+                    exc_info=True,
+                )
+                return
             info.done = True
-            info.error = "spawn rejected"
+            info.error = rejection_error
             # Slot accounting through the one-shot token, NOT a bare decrement.
             # A user Stop funnels into `_force_reap` and can land while this
             # approval is still pending (a human prompt has no deadline), and
@@ -4932,8 +5073,6 @@ class SubagentManager:
         This method runs only after admission and approval have succeeded, and
         any coordinator failure is diagnostic rather than an execution failure.
         """
-        if self._coordinator is None:
-            return
         try:
             await self._shadow_submit_accepted_run_unchecked(info)
         except Exception:
@@ -4992,7 +5131,7 @@ class SubagentManager:
             operation=operation,
         )
         result = await asyncio.wait_for(
-            coordinator.submit(request),
+            self._coordinator.submit(request),
             timeout=_COORDINATOR_SHADOW_TIMEOUT_SECS,
         )
 
@@ -5048,7 +5187,29 @@ class SubagentManager:
         """Execute a subagent task in its own session."""
         session_key = info.conversation_key or f"subagent:{info.id}"
         try:
-            await self._shadow_submit_accepted_run(info)
+            if info._coordinator_admitted:
+                try:
+                    await self.command_authority.execution_started(info.id)
+                except Exception:
+                    try:
+                        # The command fence makes the same result idempotent.
+                        # Reconcile a commit whose response was lost before
+                        # deciding that recovery must own the accepted run.
+                        await self.command_authority.execution_started(info.id)
+                    except Exception:
+                        # The claimed command remains the only safe retry path.
+                        # Keep the live record cancellable and suppress terminal
+                        # delivery until cancellation or recovery settles it.
+                        info._coordinator_claim_uncertain = True
+                        logger.warning(
+                            "Subagent %s start settlement is uncertain",
+                            info.id,
+                            exc_info=True,
+                        )
+                        return
+                info._coordinator_waiting = False
+            else:
+                await self._shadow_submit_accepted_run(info)
             await asyncio.wait_for(
                 self._run_inner(info, session_key), timeout=self._default_timeout
             )
@@ -5143,7 +5304,7 @@ class SubagentManager:
             # #4839) can come due after a dashboard clear/cancel has removed the run
             # from _agents AND _tasks, and it still must not tombstone a child that
             # is being killed.
-            if self._claim_finalize(info):
+            if not info._coordinator_claim_uncertain and self._claim_finalize(info):
                 info.elapsed = time.time() - info.started
                 self._record_cost(info)
                 report_task = self._spawn_terminal_report(
@@ -6605,8 +6766,8 @@ class SubagentManager:
                 info._cancel_retry_used = True
         task.cancel()
 
-    def _unqueue(self, agent_id: str) -> bool:
-        """Drop a not-yet-started spawn from the stagger queue. True if removed.
+    def _unqueue(self, agent_id: str) -> list[dict[str, Any]]:
+        """Drop and return matching entries from the stagger queue.
 
         The queue is the only record of a waiting run — `spawn` returns its queued
         SubagentInfo without registering it in ``_agents`` — so removing the entry
@@ -6616,7 +6777,7 @@ class SubagentManager:
         """
         dropped = self._scheduler.remove(agent_id)
         if not dropped:
-            return False
+            return []
         for p in dropped:
             try:
                 self._emit_queue_depth(
@@ -6624,7 +6785,29 @@ class SubagentManager:
                 )
             except Exception:
                 logger.debug("queue-depth re-emit failed after unqueue", exc_info=True)
-        return True
+        return dropped
+
+    async def _finalize_queued_cancel(self, params: dict[str, Any]) -> None:
+        """Durably reject one coordinator-backed queue entry."""
+
+        rejection_error = "spawn cancelled before start"
+        await self.command_authority.reject_waiting_execution(
+            str(params.get("_preassigned_id") or ""),
+            rejection_error,
+        )
+        await self.announce_durable_rejection(
+            SubagentInfo(
+                id=str(params.get("_preassigned_id") or ""),
+                task=_redact(str(params.get("task") or "")),
+                parent_session_key=str(params.get("parent_session_key") or ""),
+                agent=str(params.get("agent") or ""),
+                silent=bool(params.get("silent")),
+                done=True,
+                error=rejection_error,
+                batch_id=str(params.get("batch_id") or ""),
+                batch_total=int(params.get("batch_total") or 0),
+            )
+        )
 
     async def cancel(self, agent_id: str) -> bool:
         """Cancel a single running subagent. Returns True if found and cancelled.
@@ -6642,10 +6825,43 @@ class SubagentManager:
             # queue, which the drain later started — the stop was reported as
             # ineffective while the work ran anyway, and a purge on a deleted
             # session could not reach it. Unqueueing IS the cancel for that state.
-            if self._unqueue(agent_id):
+            dropped = self._unqueue(agent_id)
+            if dropped:
+                remaining = list(dropped)
+                try:
+                    while remaining:
+                        await self._finalize_queued_cancel(remaining[0])
+                        remaining.pop(0)
+                except Exception:
+                    # The command still owns a durable claim. Keep its local
+                    # queue record, but mark it non-runnable until a caller
+                    # retries cancellation and commits the rejection.
+                    for entry in remaining:
+                        entry["_coordinator_cancel_pending"] = True
+                        self._scheduler.enqueue(entry)
+                        self._emit_queue_depth(
+                            str(entry.get("parent_session_key", "")),
+                            str(entry.get("batch_id", "")),
+                        )
+                    logger.warning(
+                        "Queued subagent %s cancellation was not durably recorded",
+                        agent_id,
+                        exc_info=True,
+                    )
+                    raise
                 logger.info("Cancelled queued subagent %s before it started", agent_id)
                 return True
             return False
+        if info._coordinator_waiting:
+            # The approval gate registers the local info before the durable
+            # execution command is settled. Keep that record and its lease
+            # retryable unless the rejection commits first.
+            await self.command_authority.reject_waiting_execution(
+                agent_id,
+                "spawn cancelled before start",
+            )
+            info._coordinator_waiting = False
+            info._coordinator_claim_uncertain = False
         info.user_stopped = True
         # Neutral semantics live in the RECORD, not just the live event: a user
         # stop leaves ``error`` unset so every consumer (reconnect snapshots,
@@ -6786,3 +7002,4 @@ class SubagentManager:
                             owner.id,
                             exc_info=True,
                         )
+        await self.command_authority.close()

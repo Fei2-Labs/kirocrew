@@ -124,6 +124,30 @@ def _info(**kw: Any) -> Any:
     return SimpleNamespace(**base)
 
 
+def test_post_effect_authority_failure_preserves_transport_uncertainty() -> None:
+    response = mod._authority_failure_response(
+        mod.AuthorityOutcomeUncertain("execution result was not durably finished")
+    )
+
+    assert response.status == 503
+    assert _payload(response) == {
+        "error": "execution result was not durably finished",
+        "code": "coordinator_outcome_uncertain",
+        "transport_error": True,
+        "counted": True,
+    }
+
+
+def test_pre_effect_authority_conflict_is_not_counted() -> None:
+    response = mod._authority_failure_response(mod.AuthorityConflict("idempotency_conflict"))
+
+    assert response.status == 409
+    assert _payload(response) == {
+        "error": "idempotency_conflict",
+        "code": "idempotency_conflict",
+    }
+
+
 def _mgr(**kw: Any) -> Any:
     mgr = MagicMock()
     mgr.max_concurrent = 4
@@ -185,7 +209,26 @@ class TestApiSpawn:
         mgr.spawn.return_value = _info(done=True, error="cwd not allowed")
         resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"}))
         assert resp.status == 400
-        assert _payload(resp) == {"error": "cwd not allowed", "counted": True}
+        assert _payload(resp) == {
+            "error": "cwd not allowed",
+            "code": "spawn_rejected",
+            "counted": True,
+        }
+
+    def test_pre_manager_run_id_conflict_is_not_counted(self) -> None:
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(
+            done=True,
+            error="run_id_conflict: an active legacy run already owns this id",
+            counted=False,
+        )
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"}))
+
+        assert resp.status == 400
+        assert _payload(resp) == {
+            "error": "run_id_conflict: an active legacy run already owns this id",
+            "code": "spawn_rejected",
+        }
 
     def test_success_coerces_string_flags_and_bounds_batch_total(self) -> None:
         mgr = _mgr()

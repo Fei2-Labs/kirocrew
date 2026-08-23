@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.config.paths import data_home
+from kiro_crew.config.paths import RUN_COORDINATOR_DIR_NAME, data_home
 from kiro_crew.executors import coordinator_executor
 from kiro_crew.platform_compat import (
     is_link_or_junction,
@@ -24,7 +24,9 @@ from kiro_crew.platform_compat import (
 from .memory import MemoryRunCoordinator
 from .models import (
     CommandClaim,
+    CommandFence,
     CommandOperation,
+    CommandReceipt,
     CommandStatus,
     CoordinatorResult,
     DeliveryFence,
@@ -38,14 +40,14 @@ from .models import (
     RunFence,
     RunOutcome,
     RunRecord,
+    SubmitControl,
     SubmitReceipt,
     SubmitRun,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_MS = 5000
 _JOURNAL_MODE_LOCK = threading.Lock()
-_DATABASE_DIR = "run-coordinator"
 _DATABASE_NAME = "coordinator.db"
 
 _SCHEMA_V1 = (
@@ -119,6 +121,47 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         2,
         ("ALTER TABLE commands ADD COLUMN payload_json TEXT NOT NULL DEFAULT ''",),
     ),
+    (
+        3,
+        (
+            "ALTER TABLE commands RENAME TO commands_v2",
+            """
+            CREATE TABLE commands (
+                command_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                owner_id TEXT NOT NULL,
+                lease_epoch INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                rejection_reason TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                claim_expires_at REAL NOT NULL,
+                claim_epoch INTEGER NOT NULL,
+                result_json TEXT NOT NULL
+            )
+            """,
+            """
+            INSERT INTO commands (
+                command_id, idempotency_key, run_id, operation, payload_hash,
+                status, attempt, owner_id, lease_epoch, created_at, updated_at,
+                rejection_reason, payload_json, claim_expires_at, claim_epoch,
+                result_json
+            )
+            SELECT command_id, idempotency_key, run_id, operation, payload_hash,
+                   status, attempt, owner_id, lease_epoch, created_at, updated_at,
+                   rejection_reason, payload_json, 0.0, 0, ''
+            FROM commands_v2
+            """,
+            "DROP TABLE commands_v2",
+            "CREATE INDEX commands_status_created ON commands(status, created_at)",
+            "CREATE INDEX commands_run_created ON commands(run_id, created_at)",
+        ),
+    ),
 )
 
 
@@ -139,7 +182,7 @@ class SQLiteRunCoordinator:
     def _database_path(self) -> Path:
         if self._path is not None:
             return self._path
-        return data_home() / _DATABASE_DIR / _DATABASE_NAME
+        return data_home() / RUN_COORDINATOR_DIR_NAME / _DATABASE_NAME
 
     def _prepare_path(self) -> Path:
         path = self._database_path()
@@ -288,6 +331,9 @@ class SQLiteRunCoordinator:
                 updated_at=row["updated_at"],
                 rejection_reason=row["rejection_reason"],
                 payload_json=row["payload_json"],
+                claim_expires_at=row["claim_expires_at"],
+                claim_epoch=row["claim_epoch"],
+                result_json=row["result_json"],
             )
             memory._commands[command.command_id] = command
             memory._command_by_key[command.idempotency_key] = command.command_id
@@ -352,8 +398,9 @@ class SQLiteRunCoordinator:
             INSERT INTO commands (
                 command_id, idempotency_key, run_id, operation, payload_hash,
                 status, attempt, owner_id, lease_epoch, created_at, updated_at,
-                rejection_reason, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                rejection_reason, payload_json, claim_expires_at, claim_epoch,
+                result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -370,6 +417,9 @@ class SQLiteRunCoordinator:
                     command.updated_at,
                     command.rejection_reason,
                     command.payload_json,
+                    command.claim_expires_at,
+                    command.claim_epoch,
+                    command.result_json,
                 )
                 for command in memory._commands.values()
             ],
@@ -427,8 +477,52 @@ class SQLiteRunCoordinator:
     async def submit(self, request: SubmitRun) -> CoordinatorResult[SubmitReceipt]:
         return await self._offload("submit", request)
 
+    async def submit_control(self, request: SubmitControl) -> CoordinatorResult[CommandReceipt]:
+        return await self._offload("submit_control", request)
+
+    async def get_command_by_key(self, idempotency_key: str) -> CommandReceipt | None:
+        return await self._offload("get_command_by_key", idempotency_key, persist=False)
+
     async def claim_commands(self, owner: OwnerLease, limit: int) -> list[CommandClaim]:
         return await self._offload("claim_commands", owner, limit)
+
+    async def claim_controls(
+        self, owner: OwnerLease, limit: int, command_id: str = ""
+    ) -> list[CommandClaim]:
+        return await self._offload("claim_controls", owner, limit, command_id)
+
+    async def claim_command(self, command_id: str, owner: OwnerLease) -> CommandClaim | None:
+        return await self._offload("claim_command", command_id, owner)
+
+    async def finish_command(
+        self,
+        fence: CommandFence,
+        status: CommandStatus,
+        rejection_reason: str = "",
+        result_json: str = "",
+    ) -> CoordinatorResult[RunCommand]:
+        return await self._offload(
+            "finish_command",
+            fence,
+            status,
+            rejection_reason,
+            result_json,
+        )
+
+    async def finish_control(
+        self,
+        fence: CommandFence,
+        status: CommandStatus,
+        rejection_reason: str = "",
+        result_json: str = "",
+    ) -> CoordinatorResult[RunCommand]:
+        return await self._offload(
+            "finish_control",
+            fence,
+            status,
+            rejection_reason,
+            result_json,
+        )
 
     async def mark_starting(
         self, command: RunCommand, fence: RunFence, expected_version: int
