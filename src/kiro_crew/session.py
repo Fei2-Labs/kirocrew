@@ -879,6 +879,22 @@ class SessionManager:
         sess = self._sessions.get(self._fold_key(key))
         return sess.provider if sess else None
 
+    def provider_label_for(self, key: str) -> str:
+        """Return the backend identity bound to *key*, or ``""`` if unbound.
+
+        A live provider is authoritative while a restored session falls back to
+        ``SessionMap``, the same store used by provider-switch detection. Legacy
+        Kiro entries omit their provider field, so an existing entry normalizes
+        to the default label instead of looking like a brand-new slot.
+        """
+        key = self._fold_key(key)
+        provider = self.get_provider(key)
+        if provider is not None:
+            return _provider_label(provider)
+        if not self._session_map.has_hint(key):
+            return ""
+        return self._session_map.get_provider(key) or PROVIDER_LABEL_DEFAULT
+
     async def try_acquire(self, key: str) -> bool:
         """Atomically take *key*'s turn semaphore iff a session exists and is idle.
 

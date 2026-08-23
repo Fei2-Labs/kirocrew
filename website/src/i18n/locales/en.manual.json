@@ -4120,6 +4120,7 @@
         "agent_backend": "Agent Backend",
         "agent_backend_description": "Which command-line agent actually drives your sessions. Kiro CLI is the default; GitHub Copilot CLI, KAS, and OpenCode are alternate backends — switching requires that CLI to already be installed and signed in on this machine. OpenCode serves any OpenAI-compatible endpoint you configure in it (BYOK).",
         "backend_kiro_cli": "Kiro CLI (default)",
+        "backend_claude_code": "Claude Code",
         "backend_copilot": "GitHub Copilot CLI",
         "backend_kas": "KAS (kiro-agent)",
         "backend_opencode": "OpenCode (BYOK)",

@@ -6432,9 +6432,26 @@ class DashboardState:
                 "slack_linked": slack_linked,
                 "slack_channel": slack_channel,
                 "slack_thread_ts": slack_thread_ts,
+                "provider_label": self._resolve_provider_label(slot),
             }
         )
         return payload
+
+    def _resolve_provider_label(self, slot: _ChatSlot) -> str:
+        """Return the ACP backend identity actually bound to *slot*.
+
+        The session map is authoritative: a resumed opencode session stays
+        labelled "opencode" after the operator changes the global default,
+        because changing the default does not move a live session. A brand-new
+        slot has no backend until its first turn spawns one, so it deliberately
+        returns an empty label instead of guessing from mutable configuration.
+        """
+        if not getattr(self, "sessions", None):
+            return ""
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        label = self.sessions.provider_label_for(effective_session_key(slot))
+        return label if isinstance(label, str) else ""
 
     def serialize_slots(self, *, include_check_status: bool = False) -> list:
         """Serialize slots, optionally including owner-only provider status.

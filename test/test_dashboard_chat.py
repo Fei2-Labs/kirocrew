@@ -114,6 +114,22 @@ class TestChatSlot:
         assert d["running"] is False
         assert d["pending_approval"] is False
 
+    def test_state_serialization_includes_actual_provider_label(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.provider_label_for.return_value = "opencode"
+        slot = _ChatSlot("s1")
+
+        payload = state.serialize_slot(slot)
+
+        assert payload["provider_label"] == "opencode"
+        state.sessions.provider_label_for.assert_called_once_with("dashboard:s1")
+
+    def test_state_serialization_omits_provider_for_partial_state(self):
+        state = DashboardState.__new__(DashboardState)
+        state._slot_links = MagicMock(return_value=([], False, "", ""))
+
+        assert state.serialize_slot(_ChatSlot("s1"))["provider_label"] == ""
+
     def test_issue_links_do_not_crowd_out_pr_chips(self):
         """Each kind gets its own chip budget, so a PR chip is never starved.
 

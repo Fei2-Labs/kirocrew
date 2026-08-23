@@ -37,6 +37,26 @@ describe('ChatInput', () => {
       expect(screen.getByLabelText('Message input')).toBeInTheDocument()
     })
 
+    it('renders the session ACP backend beside the agent', () => {
+      renderWithProviders(<ChatInput {...defaultProps} providerLabel="opencode" />)
+      expect(screen.getByTestId('provider-label')).toHaveTextContent('OpenCode (BYOK)')
+    })
+
+    it('renders the default Kiro backend for a bound Kiro session', () => {
+      renderWithProviders(<ChatInput {...defaultProps} providerLabel="acp" />)
+      expect(screen.getByTestId('provider-label')).toHaveTextContent('Kiro CLI (default)')
+    })
+
+    it('renders the dormant Claude Code backend without exposing its internal label', () => {
+      renderWithProviders(<ChatInput {...defaultProps} providerLabel="claude_code" />)
+      expect(screen.getByTestId('provider-label')).toHaveTextContent('Claude Code')
+    })
+
+    it('falls back to an unknown provider label', () => {
+      renderWithProviders(<ChatInput {...defaultProps} providerLabel="custom-acp" />)
+      expect(screen.getByTestId('provider-label')).toHaveTextContent('custom-acp')
+    })
+
     it('renders Send button', () => {
       renderWithProviders(<ChatInput {...defaultProps} />)
       expect(screen.getByRole('button', { name: 'Send' })).toBeInTheDocument()
