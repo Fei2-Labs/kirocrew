@@ -21,11 +21,13 @@ approval-ladder work.
 
 from __future__ import annotations
 
+import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
 from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -101,6 +103,24 @@ def cap_choices(
     if n <= 0:
         return [], choices
     return choices[:n], choices[n:]
+
+
+def new_approval_nonce() -> str:
+    """A per-prompt token that makes a STALE widget's press unusable.
+
+    Shared because the hazard is: ACP request ids restart at 1 in every provider
+    process, so an approve/deny control still sitting in a chat from a previous run
+    names a request id that is live again for a DIFFERENT tool. Every channel with a
+    clickable approval has to mint one, compare it on resolve, and retire it with the
+    prompt -- and three independent copies of that is how one of them ends up with a
+    weaker token or none at all. The session picker (``PickerRegistry.mint``) mints
+    from here too: a press on a stale list of sessions is the same hazard wearing a
+    different label, so it is not a reason for a second generator.
+
+    ``token_urlsafe(8)`` is ~11 chars of 64 bits, which fits inside Telegram's
+    64-BYTE ``callback_data`` cap alongside the request id and the decision.
+    """
+    return secrets.token_urlsafe(8)
 
 
 def _default_redactor(text: str) -> str:
@@ -210,6 +230,82 @@ class Renderer(ABC):
     def __init__(self, capabilities: TransportCapabilities) -> None:
         self.capabilities = capabilities
 
+    def redact_for_target(self, text: str) -> str:
+        """Redact text against the form a target will display."""
+        safe, _ = redact_for_display(text, _default_redactor)
+        return safe
+
+    def render_tables_for_target(
+        self,
+        text: str,
+        *,
+        final: bool = True,
+        policy: str | None = None,
+    ) -> str:
+        """Apply a table policy to text about to be sent to this target.
+
+        Call it on outbound bytes only. The turn's canonical text (what
+        ``TurnDriver.run`` returns, and what the transcript and dashboard show)
+        must not pass through here, or the conversion stops being a
+        per-target presentation choice and becomes a rewrite of the answer.
+
+        ``policy`` normally defaults to this target's declared ``table_mode``.
+        A channel may override it for delivery framing (for example, changing
+        an over-cap generated grid to cards), but must keep that fallback in
+        this helper so post-transform display redaction cannot be bypassed.
+
+        ``final=False`` while a turn is still streaming: a table whose last row
+        may not have arrived yet is left raw rather than frozen half-built.
+        """
+        rendered, _ = self.render_tables_for_target_with_metadata(
+            text,
+            final=final,
+            policy=policy,
+        )
+        return rendered
+
+    def render_tables_for_target_with_metadata(
+        self,
+        text: str,
+        *,
+        final: bool = True,
+        policy: str | None = None,
+    ) -> tuple[str, bool]:
+        """Render tables and report whether conversion generated a grid."""
+        rendered, generated_grid = render_tables_with_metadata(
+            text,
+            policy=self.capabilities.table_mode if policy is None else policy,
+            native_tables=self.capabilities.native_tables,
+            final=final,
+        )
+        if rendered == text:
+            return rendered, generated_grid
+
+        # Cards join headers and values that the stream redactor saw on
+        # separate table lines. Re-scan the display form at this last outbound
+        # transform so a label/value pair cannot assemble an Authorization
+        # header (or a formatted URL) after the channel-neutral pass.
+        return self.redact_for_target(rendered), generated_grid
+
+    def safe_raw_table_fallback(
+        self,
+        text: str,
+        *,
+        final: bool = True,
+        policy: str | None = None,
+    ) -> str | None:
+        """Return display-safe raw text only when rendering reveals no new secret."""
+        safe_raw = self.redact_for_target(text)
+        rendered_safe_raw = render_tables(
+            safe_raw,
+            policy=self.capabilities.table_mode if policy is None else policy,
+            native_tables=self.capabilities.native_tables,
+            final=final,
+        )
+        if self.redact_for_target(rendered_safe_raw) != rendered_safe_raw:
+            return None
+        return safe_raw
+
     async def on_turn_start(self) -> None:
         """Called once before the provider stream begins. Default no-op."""
         return None
@@ -258,9 +354,7 @@ class Renderer(ABC):
         """
 
     @abstractmethod
-    async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
-    ) -> None:
+    async def on_prompt_choice(self, options: list[dict[str, Any]], request_id: str | int) -> None:
         """Render an interactive approval/choice prompt (first-class)."""
 
     @abstractmethod
@@ -360,9 +454,7 @@ class SilentRenderer(Renderer):
     ) -> None:
         return None
 
-    async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
-    ) -> None:
+    async def on_prompt_choice(self, options: list[dict[str, Any]], request_id: str | int) -> None:
         return None
 
     async def on_compaction(self, context_usage_pct: float) -> None:

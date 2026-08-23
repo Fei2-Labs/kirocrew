@@ -5,6 +5,8 @@
       "rate_limited_by_the_tunnel_edge_http_429_too_man": "Vom Tunnel-Edge gedrosselt (HTTP 429) — zu viele Anfragen in kurzer Folge. Das Dashboard versucht es automatisch erneut; falls das anhält, warte ein paar Sekunden und lade die Seite neu.",
       "session_expired": "Sitzung abgelaufen.",
       "session_expired_sign_in_again": "Die Sitzung ist abgelaufen. Führen Sie kirocrew token in einem Terminal aus und fügen Sie die URL in das Banner oben auf dieser Seite ein, um sich erneut anzumelden.",
+      "stale_owner_session": "Diese Sitzung stammt aus der Zeit vor dem konfigurierten Besitzer. Melden Sie sich erneut an.",
+      "stale_owner_session_sign_in_again": "Diese Sitzung stammt aus der Zeit vor dem konfigurierten Besitzer (die Anmeldung erfolgte, bevor KIROCREW_OWNER_ID gesetzt wurde). Führen Sie kirocrew token in einem Terminal aus und fügen Sie die URL in das Banner oben auf dieser Seite ein, um sich erneut anzumelden.",
       "stream_ended_without_completion": "Stream endete ohne Abschluss",
       "unexpected_server_response": "Unerwartete Serverantwort"
     }
@@ -4775,6 +4777,7 @@
       "more_actions": "Weitere Aktionen"
     },
     "chatInput": {
+      "drop_to_attach": "Loslassen zum Anhängen",
       "add_files_options": "Dateien & Optionen hinzufügen",
       "agent": "Agent: {{name}}",
       "allow_once": "Einmal erlauben",
@@ -5335,7 +5338,8 @@
       "stopped": "gestoppt",
       "pin_crew": "{{name}} an die Kopfzeile anpinnen",
       "unpin_crew": "{{name}} von der Kopfzeile loslösen",
-      "pinned_no_room": "angepinnt, kein Platz in der Kopfzeile"
+      "pinned_no_room": "angepinnt, kein Platz in der Kopfzeile",
+      "keep_tab_order_fixed": "Tab-Reihenfolge beibehalten"
     },
     "instancesViewport": {
       "connecting": "Wird verbunden…",
@@ -5510,8 +5514,10 @@
       "set_up_kiro": "Kiro einrichten",
       "setup": "Einrichtung",
       "setup_check_unavailable": "Einrichtungsprüfung nicht verfügbar",
+      "sign_in_again_to_continue": "Melden Sie sich erneut an, um fortzufahren.",
       "sign_in_method_note": "Beide öffnen zum Abschluss der Anmeldung einen Browser. Wählen Sie die Variante, die zu Ihrem Tarif passt — die Anmeldeseite bietet eine persönliche Builder ID neben dem Organisations-SSO an, und eine Builder ID umfasst weniger Modelle.",
       "sign_in_personal_label": "Persönliches Konto — Builder ID, Google oder GitHub",
+      "sign_in_required": "Anmeldung erforderlich",
       "sign_in_sso_hint": "Fragt die Start-URL und die Region Ihrer Organisation ab.",
       "sign_in_sso_label": "Organisations-SSO — IAM Identity Center",
       "sign_in_to_kiro": "Bei Kiro anmelden",
@@ -5755,7 +5761,7 @@
       "pin_model_unavailable": "<model/> wird derzeit nicht angeboten",
       "reasoning": "Reasoning",
       "set_default_for_agent": "<model/> als Standardmodell für <agent/> festlegen",
-      "set_default_for_new_sessions": "Globaler Fallback für neue Sitzungen…",
+      "set_default_for_new_sessions": "Globaler Standard für neue Sitzungen…",
       "type_to_filter": "Zum Filtern tippen…"
     },
     "monacoCodeBlock": {
@@ -6801,8 +6807,7 @@
       "stat_unknown": "Unbekannt",
       "tag_shared": "Geteilt",
       "unsaved_changes": "Nicht gespeicherte Änderungen",
-      "webhook_unbound_reason": "Webhook-Token sind noch nicht an eine Crew gebunden, daher kann jedes Token jede Crew wecken.",
-      "webhook_unbound_short": "Nicht an eine Crew gebunden",
+      "webhook_unbound_short": "Keine Tokens gebunden",
       "wire_what_it_works_with": "Womit sie arbeitet"
     },
     "awsConsentGate": {
@@ -6818,6 +6823,21 @@
       "billing_notice": "Dies ist ein kostenpflichtiger AWS-Dienst. Bis zur Bestaetigung wird keine Anfrage gesendet.",
       "confirm_button": "Bestaetigen und aktivieren",
       "withdraw": "Bestaetigung zuruecknehmen"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Webhooks konnten nicht geladen werden, daher ist gerade unbekannt, was diese Crew weckt.",
+      "inbound_webhooks_are_switched_off": "Eingehende Webhooks sind abgeschaltet — nichts kann anrufen, gebundene Tokens eingeschlossen.",
+      "last_used_ago": "benutzt {{time}}",
+      "no_tokens_are_bound_to_this_crew": "Keine Webhook-Tokens sind an diese Crew gebunden.",
+      "off": "Aus",
+      "open_webhooks": "Webhooks öffnen",
+      "outside_systems_holding_one_of_these_credentials": "Externe Systeme mit einem dieser Tokens können als diese Crew einen Turn starten. Erstellen und widerrufen auf der Webhooks-Seite.",
+      "retry": "Erneut versuchen",
+      "signed": "Signiert",
+      "unbound_tokens_can_wake_any_crew_one": "Außerdem existiert {{count}} Token ohne Crew-Bindung; es kann jede Crew wecken, diese eingeschlossen.",
+      "unbound_tokens_can_wake_any_crew_other": "Außerdem existieren {{count}} Tokens ohne Crew-Bindung; sie können jede Crew wecken, diese eingeschlossen.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhooks, die diese Crew wecken"
     }
   },
   "hooks": {
@@ -8130,6 +8150,7 @@
         "no_pinned_messages": "Noch keine angehefteten Nachrichten. Zeige auf eine Nachricht im Chat und klicke auf das Stecknadel-Symbol, um sie hier zu speichern.",
         "message_unavailable": "Diese angeheftete Nachricht ist im geladenen Verlauf nicht mehr verfügbar.",
         "pin_failed": "Die Nachricht konnte nicht angeheftet werden. Versuche es erneut.",
+        "pin_limit_reached": "Pin-Limit erreicht — Hefte eine Nachricht ab, um eine weitere hinzuzufügen.",
         "unpin_failed": "Die Nachricht konnte nicht gelöst werden. Versuche es erneut.",
         "you": "Du",
         "assistant": "Assistent",
@@ -10341,6 +10362,10 @@
       "in_use": "in Verwendung",
       "move_to_trash_bulk": "In den Papierkorb verschieben",
       "move_to_trash_single": "In den Papierkorb verschieben",
+      "next_page": "Weiter",
+      "no_matches": "Keine Unterhaltungen entsprechen dieser Suche.",
+      "page_of": "Seite {{page}} von {{pages}}",
+      "prev_page": "Zurück",
       "preview_sweep": "Durchlauf vorschauen",
       "reclaim_by_age": "Nach Alter freigeben",
       "refused_heading": "{{count}} Sitzungen konnten nicht verschoben werden",
@@ -10351,6 +10376,7 @@
       "restore": "Wiederherstellen",
       "resumable": "Fortsetzbar",
       "search_placeholder": "Sitzungen durchsuchen",
+      "showing_range": "{{from}}–{{to}} von {{total}} werden angezeigt",
       "sort_largest": "Größte zuerst",
       "sort_name": "Name",
       "sort_oldest": "Älteste zuerst",
@@ -10601,6 +10627,10 @@
       },
       "channels": {
         "get_your_bot_credentials": "Bot-Anmeldedaten abrufen",
+        "hard_below_soft_error": "Der harte Kontextschwellenwert muss mindestens so hoch sein wie der weiche",
+        "hard_threshold_description": "Bei diesem Prozentsatz automatisch komprimieren, auch ohne Antwort, damit das Kontextfenster nie überläuft.",
+        "hard_threshold_label": "Harter Kontextschwellenwert %",
+        "hard_threshold_range_error": "Der harte Kontextschwellenwert muss eine Zahl zwischen 1 und 100 sein",
         "threshold_description": "Zu {{compact}} oder {{new}} auffordern, wenn der Sitzungskontext diesen Prozentsatz überschreitet."
       },
       "channelsPanel": {
@@ -10647,8 +10677,8 @@
         "context_usage_at_which_auto_compaction_triggers": "Kontextnutzung in %, bei der die automatische Verdichtung ausgelöst wird. Niedriger = häufigere Verdichtung, längere Sitzungen",
         "data_ml": "Daten / ML",
         "default_auto": "Standard (auto)",
-        "default_defers_to_your_agent_config_and_then_to": "Nur als Fallback: Agenten mit einem konfigurierten Modell ignorieren diese Einstellung. „Standard“ verwendet das Modell aus der Agentenkonfiguration oder den Systemstandard, wenn keines konfiguriert ist. Änderungen wirken sich nicht auf bereits geöffnete Sitzungen aus.",
-        "default_model": "Fallback-Modell",
+        "default_defers_to_your_agent_config_and_then_to": "Agenten mit einem eigenen konfigurierten Modell ignorieren diese Einstellung. „Standard“ verwendet das Modell aus der Agentenkonfiguration oder den Systemstandard, wenn keines konfiguriert ist. Änderungen wirken sich nicht auf bereits geöffnete Sitzungen aus.",
+        "default_model": "Standardmodell",
         "default_normal_length": "Standard – normale Länge",
         "default_reasoning_effort": "Standard-Denkaufwand",
         "default_to_autopilot_mode": "Standardmäßig Autopilot-Modus",
@@ -10659,6 +10689,7 @@
         "display_usage_percentage_next_to_the_context_pro": "Verbrauchsprozentsatz neben dem Kontext-Fortschrittsbalken anzeigen",
         "display_used_and_total_tokens_next_to_the_contex": "Verwendete und gesamte Token neben dem Kontext-Fortschrittsbalken anzeigen",
         "e_g_solutions_architect_sre_founder": "z. B. Solutions Architect, SRE, Gründer",
+        "effort_needs_reasoning_model": "Gilt nur für Modelle mit Reasoning und hat daher keine Wirkung auf das oben gewählte Modell.",
         "enter_for_newline": "Enter für Zeilenumbruch",
         "enter_sends": "Enter sendet",
         "enter_sends_mod_enter_newline": "Enter sendet, {{mod}}+Enter für Zeilenumbruch",
@@ -10744,8 +10775,9 @@
         "retry": "Wiederholen",
         "role_background": "Hintergrund",
         "role_chat": "Chat",
-        "role_effort_hint": "Gilt nur bei Reasoning-fähigen Modellen; leer erbt den Chat-Standardaufwand.",
-        "role_model_auto_hint": "„Standard“ überlässt die Wahl dem Anbieter — das Chat-Modell wird nicht übernommen. Fixieren Sie ein Modell, um diese Arbeit darauf auszuführen.",
+        "role_effort_hint": "Gilt nur für Modelle mit Reasoning. „Modellstandard“ überschreibt nichts — diese Arbeit übernimmt nicht deinen Standard-Reasoning-Aufwand.",
+        "role_model_auto": "Automatisch (Anbieter wählt)",
+        "role_model_auto_hint": "Bei „Automatisch“ wählt der Anbieter — das Standardmodell wird nicht übernommen. Fixiere ein Modell, damit diese Arbeit darauf läuft.",
         "role_subagents": "Subagenten",
         "send_shortcut": "Tastenkürzel zum Senden",
         "session_summaries": "Sitzungszusammenfassungen",
@@ -10993,7 +11025,6 @@
         "home_you_local_bin_kirocrew_leave_blank_for_stan": "/home/you/.local/bin/kirocrew  —  für Standardinstallationen leer lassen",
         "host_1_alias": "host-1-alias",
         "instances_stay_warm_live_tunnel_at_once_the_rest": "Remote-Crews bleiben gleichzeitig warm (aktiver Tunnel); die übrigen verbinden sich bei\n                Bedarf neu. Anpassen mit",
-        "is_already_used_by_another_instance_choose_a_dif": "wird bereits von einer anderen Remote-Crew verwendet — wählen Sie einen anderen\n              (und konfigurieren Sie diesen Port auf dem Remote-Host).",
         "is_installed_somewhere_non_standard_on_the_remot": "an einem nicht standardmäßigen Ort\n            auf dem Remote installiert ist. Für eine normale pip-Installation in PATH leer lassen. Um es zu finden,\n            führen Sie auf dem Remote-Host aus:",
         "kirocrew": "kirocrew",
         "kirocrew_restart": "kirocrew restart",
@@ -11001,15 +11032,13 @@
         "local_bin_kirocrew": "~/.local/bin/kirocrew",
         "multi_instance_management_is": "Die Remote-Crew-Verwaltung ist",
         "multi_instance_management_is_off": "Die Remote-Crew-Verwaltung ist deaktiviert",
-        "must_match_the_port_the_remote_gateway_serves_on": "Verwenden Sie den Port, auf dem das Remote-Gateway lauscht. Ports müssen eindeutig sein; verwenden Sie Ports nicht für mehrere Remote-Crews.",
+        "must_match_the_port_the_remote_gateway_serves_on": "Verwenden Sie den Port, auf dem das Remote-Gateway lauscht. Crews dürfen sich einen Port teilen — der lokale Weiterleitungsport wird separat zugewiesen.",
         "name": "Name",
         "no_instances_configured_yet_add_one_below_to_man": "Noch keine Remote-Crews konfiguriert. Fügen Sie unten eine hinzu, um eine Remote-Crew zu verwalten.",
         "only_needed_if": "Nur erforderlich, wenn",
         "opens_ssh_n_l_to_the_host_requires_non_interacti": "Öffnet ssh -N -L zum Host. Erfordert nicht-interaktiven SSH-Zugriff (Schlüssel im ssh-agent).",
         "optional": "(optional)",
-        "port": "Port",
-        "port_2": "· Port",
-        "port_the_local_forward_mirrors_it": "Port — die lokale Weiterleitung spiegelt ihn.",
+        "port_2": "· Remote-Port",
         "refresh": "Aktualisieren",
         "remote_host_1": "Remote-Host 1",
         "remote_kirocrew_path": "Remote-kirocrew-Pfad",
@@ -11021,7 +11050,7 @@
         "ssh_host_alias": "SSH-Host / Alias",
         "ssh_tunnel": "SSH-Tunnel",
         "ssm_target_instance_id": "SSM-Ziel (Instanz-ID)",
-        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "Das Gateway öffnet beim Verbinden einen Tunnel (SSH oder AWS SSM) und erzeugt ein kurzlebiges Token.\n        Der lokale Weiterleitungsport spiegelt den Remote-Port, daher muss jede verbundene Remote-Crew\n        einen eigenen Remote-Port verwenden.",
+        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "Das Gateway öffnet beim Verbinden einen Tunnel (SSH oder AWS SSM) und erzeugt ein kurzlebiges Token.",
         "the_user_the_remote_gateway_runs_as_sudo_u_for_s": "Der Benutzer, unter dem das Remote-Gateway läuft — SSM-Befehle laufen über sudo -u. Auf Ubuntu-AMIs ubuntu verwenden.",
         "to_fully_tear_down_any_tunnels_still_running_fro": "um alle noch von vorher laufenden Tunnel vollständig abzubauen.",
         "to_start_the_ssh_tunnel_manager_and_activate_ins": "um den Tunnel-Manager zu starten und den Remote-Crew-Wechsel zu aktivieren.",
@@ -11504,6 +11533,7 @@
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "oben. Im Gegensatz zu Slack hat das Bot Framework keinen\n              rein ausgehenden Modus.",
         "access": "Zugriff",
+        "active": "Aktiv",
         "add_the": ", fügen Sie das",
         "allowed_users_email_or_aad_object_id": "Erlaubte Benutzer (E-Mail oder AAD-Objekt-ID)",
         "and_save": " und Speichern.",
@@ -11536,6 +11566,7 @@
         "if_single_tenant": "falls Single-Tenant).",
         "in_the_bot_s": "In den",
         "is_your_app_id_then_dm_the_bot_full_manifest_ste": "Ihre App-ID ist, senden Sie dann eine Direktnachricht an den\n              Bot — vollständige Manifest-Schritte in der Einrichtungsanleitung oben.",
+        "jwt_required": "<strong>Microsoft Teams braucht die Abhängigkeit PyJWT.</strong> Eingehende Bot-Framework-Anfragen tragen ein signiertes Token, das geprüft werden muss, deshalb startet der Kanal ohne sie nicht. Führe <mono>pip install \"kirocrew[teams]\"</mono> in der Umgebung aus, in der das Gateway läuft, und starte es dann neu.",
         "leave_empty_for_a_multi_tenant_bot": "Für einen Multi-Tenant-Bot leer lassen",
         "loading_teams_config": "Teams-Konfiguration wird geladen…",
         "localhost": "localhost",
@@ -11544,6 +11575,8 @@
         "microsoft_app_id": "Microsoft App-ID",
         "microsoft_teams": "Microsoft Teams",
         "multi_tenant": "Multi-Tenant",
+        "needs_setup": "Einrichtung nötig",
+        "not_active": "Nicht aktiv",
         "optional_only_for_single_tenant_bots": "Optional — nur für Single-Tenant-Bots.",
         "or_single_tenant_if_you_ll_pin_a_tenant_id": " oder Single-Tenant, wenn Sie eine Tenant-ID festlegen.",
         "or_ssh_tunneled_address_won_t_work_expose_the_ga": "oder\n              eine SSH-getunnelte Adresse funktioniert nicht. Machen Sie das Gateway über einen Tunnel\n              (ngrok / cloudflared) oder einen Reverse Proxy zugänglich und verwenden Sie dann diesen öffentlichen Host als",
@@ -11553,6 +11586,7 @@
         "required": "Erforderlich",
         "requires_a_public_https_url": "Erfordert eine öffentliche HTTPS-URL.",
         "save_failed_is_the_gateway_running": "Speichern fehlgeschlagen. Läuft das Gateway?",
+        "save_rejected": "Das Gateway hat diese Einstellungen abgelehnt ({{code}}).",
         "save_teams_settings": "Teams-Einstellungen speichern",
         "saved": "Gespeichert.",
         "saved_restart_the_gateway_to_apply": "Gespeichert. Starte das Gateway neu, um dies anzuwenden.",
@@ -11811,6 +11845,11 @@
     },
     "settingsPage": {
       "kirocrew_v": "Kiro Crew v",
+      "search": {
+        "aria_label": "Einstellungen durchsuchen",
+        "no_results": "Keine passenden Einstellungen",
+        "placeholder": "Einstellungen durchsuchen…"
+      },
       "settings": "Einstellungen"
     },
     "systemPage": {

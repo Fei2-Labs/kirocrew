@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import fields
 
+import pytest
+
 from kiro_crew.messaging.transport import TransportCapabilities
 
 #: Something behaves differently when the value changes. Cite the behaviour.
@@ -51,6 +53,12 @@ ENFORCED = {
     # client.send_message_with_files). A channel declaring False keeps printing
     # the markdown path, which is the honest degradation -- never a silent drop.
     "files_outbound",
+    # Read by Renderer.render_tables_for_target at every opted-in outbound
+    # boundary. ``table_mode`` selects off/cards/grid/native/auto and
+    # ``native_tables`` prevents an unsupported native claim from leaking raw
+    # pipes. Pinned per channel by test_channel_table_rendering.py.
+    "table_mode",
+    "native_tables",
 }
 
 #: Declared honestly, read by nothing yet. The capability-gated interface
@@ -119,6 +127,49 @@ class TestCorrectedDeclarations:
         from kiro_crew.webex.transport import WEBEX_CAPABILITIES
 
         assert WEBEX_CAPABILITIES.max_message_chars * 4 <= WEBEX_MAX_TEXT
+
+    def test_teams_char_declaration_is_safe_under_its_byte_cap(self) -> None:
+        # A Teams activity is JSON on the wire, so the cap is effectively in BYTES.
+        # The declared CHAR count must survive the worst case (an astral codepoint
+        # is 4 UTF-8 bytes) or the mirror leg silently loses a long non-ASCII reply
+        # and a renderer chunk comes back 413.
+        from kiro_crew.teams.client import (
+            _MAX_UTF8_BYTES_PER_CHAR,
+            TEAMS_MAX_ACTIVITY_TEXT_BYTES,
+        )
+        from kiro_crew.teams.transport import TEAMS_CAPABILITIES
+
+        assert (
+            TEAMS_CAPABILITIES.max_message_chars * _MAX_UTF8_BYTES_PER_CHAR
+            <= TEAMS_MAX_ACTIVITY_TEXT_BYTES
+        )
+
+    @pytest.mark.asyncio
+    async def test_teams_serializes_without_ascii_escaping(self) -> None:
+        # The multiplier above is only true with ensure_ascii=False. aiohttp's
+        # default escapes every non-ASCII codepoint to \\uXXXX -- 6 bytes each, 12
+        # for an astral pair -- which triples the worst case and breaks the pin
+        # above without changing any number it reads. Asserted on the session the
+        # client really builds, not on the literal passed to it.
+        from kiro_crew.teams.client import TeamsClient
+
+        client = TeamsClient(app_id="a", app_password="p")
+        try:
+            session = await client._ensure_session()
+            assert session._json_serialize("✅🙂") == '"✅🙂"'
+        finally:
+            await client.close()
+
+    def test_wecom_char_declaration_is_safe_under_its_byte_cap(self) -> None:
+        # WeCom caps `stream.content` / `markdown.content` in UTF-8 BYTES
+        # (20480). The declared CHARACTER count must be safe at 4 bytes/char, or
+        # a CJK reply sits under the character cap and ~3x over the byte cap --
+        # and WeCom rejects the whole frame, so the user gets nothing at all.
+        # Declared 20000 CHARS until this was corrected.
+        from kiro_crew.wecom.client import WECOM_MAX_REPLY_BYTES
+        from kiro_crew.wecom.transport import WECOM_CAPABILITIES
+
+        assert WECOM_CAPABILITIES.max_message_chars * 4 <= WECOM_MAX_REPLY_BYTES
 
     def test_the_file_directions_are_declared_separately(self) -> None:
         # One boolean was undecidable: the two directions land per channel and in

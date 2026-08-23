@@ -298,8 +298,6 @@ interface ChatInputProps {
   isMac?: boolean
   /** Drag-and-drop handler for the entire input bar */
   onDrop?: (e: React.DragEvent) => void
-  /** Whether drag-over styling is active */
-  dragOver?: boolean
   /** Drag-over event handler */
   onDragOver?: (e: React.DragEvent) => void
   /** Drag-leave event handler */
@@ -633,7 +631,6 @@ function ChatInput({
   onRemoveSessionRef,
   isMac = false,
   onDrop,
-  dragOver = false,
   onDragOver,
   onDragLeave,
   voiceRecording = false,
@@ -2507,7 +2504,7 @@ function ChatInput({
       <div
         data-testid="input-wrapper"
         ref={wrapperRef}
-        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(cleanMode || memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${dragOver ? 'border-accent bg-accent/10' : cleanMode ? 'border-accent bg-bg-elevated' : memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
+        className={`${hasApproval ? 'rounded-b-2xl rounded-t-none' : 'rounded-2xl'} relative transition-colors overflow-hidden ${manualHeight !== null ? 'flex flex-col min-h-0' : ''} ${(cleanMode || memoryMode === 'incognito' || memoryMode === 'temporary') ? 'border-2' : 'border'} ${cleanMode ? 'border-accent bg-bg-elevated' : memoryMode === 'temporary' ? 'border-aim bg-bg-elevated' : memoryMode === 'incognito' ? 'border-warn bg-bg-elevated' : 'border-border bg-bg-elevated focus-within:border-accent/50'}`}
 
         onDragOver={onDragOver}
         onDragLeave={onDragLeave}
@@ -2561,14 +2558,14 @@ function ChatInput({
           onKeyDown={handleKeyDown}
           {...ime.bindComposition<HTMLTextAreaElement>({
             // The paste-hover preview dismisses on blur; the guard's latch reset rides
-            // in the binding itself, so this handler only carries what is local here.
+            // in the binding itself, so these handlers only carry what is local here.
+            onFocus: prefetchSkills,
             onBlur: () => { if (hoverRef.current) hoverRef.current.handleMouseLeave() },
           })}
           onPaste={handlePaste}
           onCopy={handleCopy}
           onCut={handleCut}
           onClick={handleTextareaClick}
-          onFocus={prefetchSkills}
           onMouseUp={handleSelectSnap}
           onSelect={handleSelectSnap}
           onInput={handleInput}

@@ -61,7 +61,10 @@ from kiro_crew.dashboard.handlers._shared import (
     apply_skill_mapping,
 )
 from kiro_crew.dashboard.handlers.discover import _redact_external
-from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.dashboard.handlers.source_providers import (
+    is_owner_dashboard_request,
+    stale_owner_session_response,
+)
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
@@ -153,6 +156,11 @@ async def _require_owner(request: web.Request, operation: str) -> web.Response |
         )
     except Exception:  # pragma: no cover — audit must never change the outcome
         logger.debug("SEL audit for non-owner %s failed", operation, exc_info=True)
+    # Deny decision made above; only the response label changes for a signed
+    # pre-owner bootstrap subject (see stale_owner_session_response).
+    stale = stale_owner_session_response(request)
+    if stale is not None:
+        return stale
     return web.json_response(
         {"error": "owner authorization required", "code": "owner_only"},
         status=403,
@@ -264,7 +272,13 @@ async def api_agent_config(request: web.Request) -> web.Response:
                     "Stripped Kiro Crew bookkeeping keys from a PUT to agent config for %r",
                     name,
                 )
-            installed_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+            # Offloaded + atomic: a crash or disk-full mid-write on a bare
+            # write_text would leave the spec truncated and break every
+            # subsequent session start (kiro-cli reads this file at spawn).
+            # write_config_atomically writes to a temp file then os.replace,
+            # matching the same pattern already used for the mc_cfg sidecar
+            # above (line 239) and the other config writes in this file.
+            await asyncio.to_thread(write_config_atomically, installed_path, config)
             # Restart kiro-cli sessions so new config takes effect
             await _h._reset_all_sessions(request)
             return web.json_response({"ok": True, "applied": True})
@@ -1276,12 +1290,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
         denied = await _require_owner(request, f"agent_detail.{request.method.lower()}")
         if denied is not None:
             return denied
-    # Parse body early so JSONDecodeError returns 400, not 404 from the file loop.
+    # Parse body early so a malformed body returns 400, not 404 from the file loop.
     patch_body = None
     if request.method == "PATCH":
         try:
             patch_body = await request.json()
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             return web.json_response({"error": "invalid JSON"}, status=400)
         # Valid JSON is not necessarily an object. A top-level array makes
         # ``"skills" in patch_body`` a LIST-membership test (true for

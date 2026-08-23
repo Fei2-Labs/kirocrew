@@ -44,6 +44,7 @@ from kiro_crew.config.paths import (
     kiro_agents_dir,
     project_agents_dir,
 )
+from kiro_crew.config.superseded_defaults import render_doctor_section
 from kiro_crew.constants import MIN_NODE_MAJOR
 from kiro_crew.dashboard.crash_dump_store import (
     dump_age_seconds,
@@ -486,10 +487,21 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
        the error head plus any captured stderr tail from the child — which
        usually contains the real cause (FindupException, ImportError, etc.)
        that would otherwise only exist in kiro-cli's per-session log.
+
+    A spec that cannot be read as a JSON object — unreadable, unparseable,
+    or valid JSON that is not an object — degrades to an empty config: every
+    managed server then reports as missing and the file is never rewritten.
     """
     try:
         agent_data = json.loads(agent_path.read_text(encoding="utf-8"))
     except Exception:
+        agent_data = {}
+    if not isinstance(agent_data, dict):
+        # Valid JSON that is not an object (a list, a scalar) parses fine but
+        # every .get() below would raise. Doctor exists to diagnose a broken
+        # config, not die on one — treat it like the unparseable case, but say
+        # what is actually wrong so the missing-server lines below make sense.
+        print("  ❌ agent spec is not a JSON object — re-run `kirocrew setup`")
         agent_data = {}
 
     tools = agent_data.get("tools", [])
@@ -2022,6 +2034,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # agent.model, and the whole point here is that the global is not
     # necessarily what a new session gets.
     _doctor_effective_model(cfg, proj, issues)
+
+    # ── Stored defaults a release has since changed (#5244) ──
+    render_doctor_section(issues)
 
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()

@@ -5,6 +5,8 @@
       "rate_limited_by_the_tunnel_edge_http_429_too_man": "टनल एज ने रेट-लिमिट लगा दिया (HTTP 429) — कम समय में बहुत ज़्यादा अनुरोध। डैशबोर्ड अपने आप फिर कोशिश करता है; अगर यह बना रहे, तो कुछ सेकंड रुककर रीलोड करें।",
       "session_expired": "सत्र समाप्त हो गया।",
       "session_expired_sign_in_again": "सत्र समाप्त हो गया। टर्मिनल में kirocrew token चलाएँ, फिर फिर से साइन इन करने के लिए इस पृष्ठ के शीर्ष पर बैनर में URL पेस्ट करें।",
+      "stale_owner_session": "यह सत्र कॉन्फ़िगर किए गए स्वामी से पहले का है। फिर से साइन इन करें।",
+      "stale_owner_session_sign_in_again": "यह सत्र कॉन्फ़िगर किए गए स्वामी से पहले का है (साइन इन KIROCREW_OWNER_ID सेट होने से पहले हुआ था)। टर्मिनल में kirocrew token चलाएँ, फिर फिर से साइन इन करने के लिए इस पृष्ठ के शीर्ष पर बैनर में URL पेस्ट करें।",
       "stream_ended_without_completion": "स्ट्रीम पूरी होने से पहले समाप्त हो गई",
       "unexpected_server_response": "सर्वर से अनपेक्षित प्रतिक्रिया"
     }
@@ -4775,6 +4777,7 @@
       "more_actions": "और कार्रवाइयां"
     },
     "chatInput": {
+      "drop_to_attach": "छोड़कर अटैच करें",
       "add_files_options": "फ़ाइलें और विकल्प जोड़ें",
       "agent": "एजेंट: {{name}}",
       "allow_once": "एक बार अनुमति दें",
@@ -5335,7 +5338,8 @@
       "stopped": "रुका हुआ",
       "pin_crew": "{{name}} को हेडर में पिन करें",
       "unpin_crew": "{{name}} को अनपिन करें",
-      "pinned_no_room": "पिन किया गया, हेडर में जगह नहीं"
+      "pinned_no_room": "पिन किया गया, हेडर में जगह नहीं",
+      "keep_tab_order_fixed": "टैब क्रम स्थिर रखें"
     },
     "instancesViewport": {
       "connecting": "कनेक्ट हो रहा है…",
@@ -5510,8 +5514,10 @@
       "set_up_kiro": "Kiro सेट अप करें",
       "setup": "सेटअप",
       "setup_check_unavailable": "सेटअप जाँच उपलब्ध नहीं",
+      "sign_in_again_to_continue": "जारी रखने के लिए फिर से साइन इन करें।",
       "sign_in_method_note": "दोनों साइन-इन पूरा करने के लिए ब्राउज़र खोलते हैं। वही चुनें जो तुम्हारे प्लान से मेल खाता हो — साइन-इन पेज पर व्यक्तिगत Builder ID संगठन के SSO के साथ ही दिखती है, और Builder ID में कम मॉडल शामिल होते हैं।",
       "sign_in_personal_label": "व्यक्तिगत खाता — Builder ID, Google या GitHub",
+      "sign_in_required": "साइन इन आवश्यक",
       "sign_in_sso_hint": "तुम्हारे संगठन का आरंभिक URL और क्षेत्र पूछा जाता है।",
       "sign_in_sso_label": "संगठन का SSO — IAM Identity Center",
       "sign_in_to_kiro": "Kiro में साइन इन करें",
@@ -5755,7 +5761,7 @@
       "pin_model_unavailable": "<model/> अभी पेश नहीं किया जा रहा है",
       "reasoning": "रीज़निंग",
       "set_default_for_agent": "<model/> को <agent/> का डिफ़ॉल्ट मॉडल बनाओ",
-      "set_default_for_new_sessions": "नए सेशन के लिए ग्लोबल फ़ॉलबैक…",
+      "set_default_for_new_sessions": "नए सेशन के लिए ग्लोबल डिफ़ॉल्ट…",
       "type_to_filter": "फ़िल्टर करने के लिए टाइप करें…"
     },
     "monacoCodeBlock": {
@@ -6801,8 +6807,7 @@
       "stat_unknown": "अज्ञात",
       "tag_shared": "साझा",
       "unsaved_changes": "सहेजे नहीं गए बदलाव",
-      "webhook_unbound_reason": "वेबहुक टोकन अभी किसी Crew से बंधे नहीं हैं, इसलिए कोई भी टोकन किसी भी Crew को जगा सकता है।",
-      "webhook_unbound_short": "किसी Crew से बंधा नहीं",
+      "webhook_unbound_short": "कोई टोकन बंधा नहीं",
       "wire_what_it_works_with": "यह किसके साथ काम करता है"
     },
     "awsConsentGate": {
@@ -6818,6 +6823,21 @@
       "billing_notice": "यह एक सशुल्क AWS सेवा है। पुष्टि होने तक कोई अनुरोध नहीं भेजा जाता।",
       "confirm_button": "पुष्टि करें और चालू करें",
       "withdraw": "पुष्टि वापस लें"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Webhooks लोड नहीं हो सके, इसलिए अभी पता नहीं कि इस crew को क्या जगाता है।",
+      "inbound_webhooks_are_switched_off": "इनबाउंड webhooks बंद हैं — बंधे टोकन समेत कोई कॉल नहीं आ सकती।",
+      "last_used_ago": "{{time}} इस्तेमाल हुआ",
+      "no_tokens_are_bound_to_this_crew": "इस crew से कोई webhook टोकन बंधा नहीं है।",
+      "off": "बंद",
+      "open_webhooks": "Webhooks खोलें",
+      "outside_systems_holding_one_of_these_credentials": "इनमें से कोई टोकन रखने वाले बाहरी सिस्टम इस crew के रूप में एक टर्न शुरू कर सकते हैं। बनाना और रद्द करना Webhooks पेज पर करें।",
+      "retry": "फिर कोशिश करें",
+      "signed": "हस्ताक्षरित",
+      "unbound_tokens_can_wake_any_crew_one": "बिना crew बंधन वाला {{count}} टोकन भी मौजूद है; वह किसी भी crew को जगा सकता है, यह भी शामिल।",
+      "unbound_tokens_can_wake_any_crew_other": "बिना crew बंधन वाले {{count}} टोकन भी मौजूद हैं; वे किसी भी crew को जगा सकते हैं, यह भी शामिल।",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "इस crew को जगाने वाले Webhook"
     }
   },
   "hooks": {
@@ -8130,6 +8150,7 @@
         "no_pinned_messages": "अभी कोई पिन किया गया संदेश नहीं है। चैट में किसी संदेश पर कर्सर ले जाकर पिन आइकन पर क्लिक करने से वह यहाँ सहेजा जाएगा।",
         "message_unavailable": "यह पिन किया गया संदेश लोड किए गए इतिहास में अब उपलब्ध नहीं है।",
         "pin_failed": "संदेश पिन नहीं किया जा सका। फिर से कोशिश करें।",
+        "pin_limit_reached": "पिन सीमा पहुँच गई — एक और जोड़ने के लिए किसी संदेश को अनपिन करें।",
         "unpin_failed": "संदेश से पिन नहीं हटाया जा सका। फिर से कोशिश करें।",
         "you": "तुम",
         "assistant": "सहायक",
@@ -10342,6 +10363,10 @@
       "in_use": "उपयोग में",
       "move_to_trash_bulk": "ट्रैश में ले जाएं",
       "move_to_trash_single": "ट्रैश में ले जाएं",
+      "next_page": "आगे",
+      "no_matches": "इस खोज से कोई बातचीत मेल नहीं खाती।",
+      "page_of": "{{pages}} में से पेज {{page}}",
+      "prev_page": "पीछे",
       "preview_sweep": "सफ़ाई का पूर्वावलोकन",
       "reclaim_by_age": "पुरानेपन के अनुसार खाली करें",
       "refused_heading": "{{count}} सत्र नहीं ले जाए जा सके",
@@ -10352,6 +10377,7 @@
       "restore": "पुनर्स्थापित करें",
       "resumable": "फिर शुरू करने योग्य",
       "search_placeholder": "सत्र खोजें",
+      "showing_range": "{{total}} में से {{from}}–{{to}} दिखा रहे हैं",
       "sort_largest": "सबसे बड़ा पहले",
       "sort_name": "नाम",
       "sort_oldest": "सबसे पुराना पहले",
@@ -10602,6 +10628,10 @@
       },
       "channels": {
         "get_your_bot_credentials": "अपने बॉट के क्रेडेंशियल लें",
+        "hard_below_soft_error": "हार्ड कॉन्टेक्स्ट थ्रेशोल्ड सॉफ़्ट कॉन्टेक्स्ट थ्रेशोल्ड के बराबर या उससे ज़्यादा होना चाहिए",
+        "hard_threshold_description": "इस प्रतिशत पर जवाब का इंतज़ार किए बिना अपने आप कॉम्पैक्ट करें, ताकि कॉन्टेक्स्ट विंडो कभी न भरे।",
+        "hard_threshold_label": "हार्ड कॉन्टेक्स्ट थ्रेशोल्ड %",
+        "hard_threshold_range_error": "हार्ड कॉन्टेक्स्ट थ्रेशोल्ड 1 और 100 के बीच की संख्या होनी चाहिए",
         "threshold_description": "जब सत्र का कॉन्टेक्स्ट इस प्रतिशत से आगे बढ़े, तो {{compact}} या {{new}} करने के लिए पूछें।"
       },
       "channelsPanel": {
@@ -10648,8 +10678,8 @@
         "context_usage_at_which_auto_compaction_triggers": "कॉन्टेक्स्ट उपयोग का वह % जिस पर ऑटो-कॉम्पैक्शन शुरू होता है। कम = अधिक बार कॉम्पैक्शन, लंबे सेशन",
         "data_ml": "डेटा / ML",
         "default_auto": "डिफ़ॉल्ट (ऑटो)",
-        "default_defers_to_your_agent_config_and_then_to": "केवल फ़ॉलबैक: कॉन्फ़िगर किए गए मॉडल वाले एजेंट इस सेटिंग को अनदेखा करते हैं। 'डिफ़ॉल्ट' एजेंट कॉन्फ़िगरेशन का मॉडल इस्तेमाल करता है, या कोई मॉडल कॉन्फ़िगर न होने पर सिस्टम डिफ़ॉल्ट का। इसे बदलने से पहले से खुले सेशन प्रभावित नहीं होते।",
-        "default_model": "फ़ॉलबैक मॉडल",
+        "default_defers_to_your_agent_config_and_then_to": "अपना कॉन्फ़िगर किया गया मॉडल रखने वाले एजेंट इस सेटिंग को अनदेखा करते हैं। 'डिफ़ॉल्ट' एजेंट कॉन्फ़िगरेशन का मॉडल इस्तेमाल करता है, या कोई मॉडल कॉन्फ़िगर न होने पर सिस्टम डिफ़ॉल्ट का। इसे बदलने से पहले से खुले सेशन प्रभावित नहीं होते।",
+        "default_model": "डिफ़ॉल्ट मॉडल",
         "default_normal_length": "डिफ़ॉल्ट — सामान्य लंबाई",
         "default_reasoning_effort": "डिफ़ॉल्ट रीज़निंग प्रयास",
         "default_to_autopilot_mode": "डिफ़ॉल्ट रूप से ऑटोपायलट मोड रखें",
@@ -10660,6 +10690,7 @@
         "display_usage_percentage_next_to_the_context_pro": "कॉन्टेक्स्ट प्रोग्रेस बार के आगे उपयोग प्रतिशत दिखाएँ",
         "display_used_and_total_tokens_next_to_the_contex": "कॉन्टेक्स्ट प्रोग्रेस बार के आगे उपयोग किए गए और कुल टोकन दिखाएँ",
         "e_g_solutions_architect_sre_founder": "जैसे सॉल्यूशंस आर्किटेक्ट, SRE, फ़ाउंडर",
+        "effort_needs_reasoning_model": "सिर्फ़ रीज़निंग-सक्षम मॉडल पर लागू होता है, इसलिए ऊपर चुने गए मॉडल पर इसका कोई असर नहीं है।",
         "enter_for_newline": "नई लाइन के लिए Enter",
         "enter_sends": "Enter भेजता है",
         "enter_sends_mod_enter_newline": "Enter भेजता है, {{mod}}+Enter नई लाइन",
@@ -10745,8 +10776,9 @@
         "retry": "फिर कोशिश करें",
         "role_background": "बैकग्राउंड",
         "role_chat": "चैट",
-        "role_effort_hint": "केवल रीज़निंग-सक्षम मॉडल पर लागू; खाली रखने पर चैट डिफ़ॉल्ट एफ़र्ट लिया जाता है।",
-        "role_model_auto_hint": "'डिफ़ॉल्ट' पर प्रदाता स्वयं मॉडल चुनता है — यह आपके चैट मॉडल को इनहेरिट नहीं करता। इस कार्य को किसी मॉडल पर चलाने के लिए उसे पिन करें।",
+        "role_effort_hint": "सिर्फ़ रीज़निंग-सक्षम मॉडल पर लागू होता है। 'मॉडल डिफ़ॉल्ट' कोई ओवरराइड लागू नहीं करता — यह काम डिफ़ॉल्ट रीज़निंग एफ़र्ट को नहीं अपनाता।",
+        "role_model_auto": "स्वतः (प्रदाता चुनता है)",
+        "role_model_auto_hint": "'स्वतः' में प्रदाता चुनता है — यह डिफ़ॉल्ट मॉडल को नहीं अपनाता। इस काम को किसी मॉडल पर चलाने के लिए उसे पिन करें।",
         "role_subagents": "सब-एजेंट",
         "send_shortcut": "भेजने का शॉर्टकट",
         "session_summaries": "सत्र सारांश",
@@ -10994,7 +11026,6 @@
         "home_you_local_bin_kirocrew_leave_blank_for_stan": "/home/you/.local/bin/kirocrew  —  मानक इंस्टॉल के लिए खाली छोड़ें",
         "host_1_alias": "host-1-alias",
         "instances_stay_warm_live_tunnel_at_once_the_rest": "रिमोट क्रू एक साथ वार्म (लाइव टनल) रहते हैं; बाकी मांग पर पुनः कनेक्ट होते\n                हैं। ट्यून करने के लिए उपयोग करें:",
-        "is_already_used_by_another_instance_choose_a_dif": "पहले से किसी अन्य रिमोट क्रू द्वारा उपयोग में है — कोई दूसरा चुनें\n              (और उस पोर्ट को रिमोट होस्ट पर कॉन्फ़िगर करें)।",
         "is_installed_somewhere_non_standard_on_the_remot": "रिमोट पर किसी\n            गैर-मानक जगह इंस्टॉल है। PATH पर सामान्य pip इंस्टॉल के लिए खाली छोड़ें। इसे खोजने के\n            लिए, रिमोट होस्ट पर चलाएँ:",
         "kirocrew": "kirocrew",
         "kirocrew_restart": "kirocrew restart",
@@ -11002,15 +11033,13 @@
         "local_bin_kirocrew": "~/.local/bin/kirocrew",
         "multi_instance_management_is": "रिमोट क्रू प्रबंधन",
         "multi_instance_management_is_off": "रिमोट क्रू प्रबंधन बंद है",
-        "must_match_the_port_the_remote_gateway_serves_on": "वही पोर्ट उपयोग करें जिस पर रिमोट गेटवे सुनता है। पोर्ट अलग-अलग होने चाहिए; रिमोट क्रू के बीच पोर्ट दोबारा उपयोग न करें।",
+        "must_match_the_port_the_remote_gateway_serves_on": "वही पोर्ट उपयोग करें जिस पर रिमोट गेटवे सुनता है। कई क्रू एक ही पोर्ट साझा कर सकते हैं — स्थानीय फ़ॉरवर्ड पोर्ट अलग से आवंटित होता है।",
         "name": "नाम",
         "no_instances_configured_yet_add_one_below_to_man": "अभी कोई रिमोट क्रू कॉन्फ़िगर नहीं है। रिमोट क्रू प्रबंधित करने के लिए नीचे एक जोड़ें।",
         "only_needed_if": "यह केवल तब आवश्यक है जब",
         "opens_ssh_n_l_to_the_host_requires_non_interacti": "होस्ट तक ssh -N -L खोलता है। गैर-संवादात्मक SSH पहुँच आवश्यक है (कुंजी ssh-agent में)।",
         "optional": "(वैकल्पिक)",
-        "port": "पोर्ट",
-        "port_2": "· पोर्ट",
-        "port_the_local_forward_mirrors_it": "पोर्ट — स्थानीय फ़ॉरवर्ड उसे मिरर करता है।",
+        "port_2": "· रिमोट पोर्ट",
         "refresh": "रीफ़्रेश करें",
         "remote_host_1": "रिमोट होस्ट 1",
         "remote_kirocrew_path": "रिमोट kirocrew पथ",
@@ -11022,7 +11051,7 @@
         "ssh_host_alias": "SSH होस्ट / उपनाम",
         "ssh_tunnel": "SSH टनल",
         "ssm_target_instance_id": "SSM लक्ष्य (इंस्टेंस id)",
-        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "कनेक्ट करते समय गेटवे एक टनल (SSH या AWS SSM) खोलता है और अल्पकालिक टोकन बनाता है।\n        स्थानीय फ़ॉरवर्ड पोर्ट रिमोट पोर्ट को मिरर करता है, इसलिए प्रत्येक कनेक्टेड रिमोट क्रू को\n        एक अलग रिमोट पोर्ट उपयोग करना चाहिए।",
+        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "कनेक्ट करते समय गेटवे एक टनल (SSH या AWS SSM) खोलता है और अल्पकालिक टोकन बनाता है।",
         "the_user_the_remote_gateway_runs_as_sudo_u_for_s": "वह उपयोगकर्ता जिसके रूप में रिमोट गेटवे चलता है — SSM कमांड sudo -u से चलते हैं। Ubuntu AMI पर ubuntu उपयोग करें।",
         "to_fully_tear_down_any_tunnels_still_running_fro": "ताकि पहले से चल रही सभी टनल पूरी तरह बंद हो जाएँ।",
         "to_start_the_ssh_tunnel_manager_and_activate_ins": "टनल मैनेजर शुरू करने और रिमोट क्रू स्विचिंग सक्रिय करने के लिए।",
@@ -11505,6 +11534,7 @@
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "ऊपर। Slack के विपरीत, Bot Framework में कोई\n              केवल-आउटबाउंड मोड नहीं है।",
         "access": "एक्सेस",
+        "active": "सक्रिय",
         "add_the": ", जोड़ें",
         "allowed_users_email_or_aad_object_id": "अनुमत उपयोगकर्ता (ईमेल या AAD object id)",
         "and_save": ", और सहेजें।",
@@ -11537,6 +11567,7 @@
         "if_single_tenant": "यदि सिंगल-टेनेंट हो)।",
         "in_the_bot_s": "बॉट के",
         "is_your_app_id_then_dm_the_bot_full_manifest_ste": "आपका App ID हो, फिर बॉट को DM करें —\n              पूरे manifest चरण ऊपर दी गई सेटअप गाइड में हैं।",
+        "jwt_required": "<strong>Microsoft Teams को PyJWT डिपेंडेंसी चाहिए।</strong> इनबाउंड Bot Framework अनुरोध एक साइन किया हुआ टोकन लाते हैं जिसे वेरिफ़ाई करना ज़रूरी है, इसलिए इसके बिना चैनल शुरू नहीं होगा। gateway चलाने वाले एनवायरनमेंट में <mono>pip install \"kirocrew[teams]\"</mono> चलाएँ, फिर gateway रीस्टार्ट करें।",
         "leave_empty_for_a_multi_tenant_bot": "मल्टी-टेनेंट बॉट के लिए खाली छोड़ें",
         "loading_teams_config": "Teams कॉन्फ़िग लोड हो रहा है…",
         "localhost": "localhost",
@@ -11545,6 +11576,8 @@
         "microsoft_app_id": "Microsoft App ID",
         "microsoft_teams": "Microsoft Teams",
         "multi_tenant": "मल्टी-टेनेंट",
+        "needs_setup": "सेटअप चाहिए",
+        "not_active": "सक्रिय नहीं",
         "optional_only_for_single_tenant_bots": "वैकल्पिक — केवल सिंगल-टेनेंट बॉट्स के लिए।",
         "or_single_tenant_if_you_ll_pin_a_tenant_id": ", या सिंगल-टेनेंट अगर आप कोई टेनेंट ID पिन करेंगे।",
         "or_ssh_tunneled_address_won_t_work_expose_the_ga": "या\n              SSH-टनल किया गया पता काम नहीं करेगा। गेटवे को किसी टनल\n              (ngrok / cloudflared) या रिवर्स प्रॉक्सी से एक्सपोज़ करें, फिर उस सार्वजनिक होस्ट को इस रूप में उपयोग करें:",
@@ -11554,6 +11587,7 @@
         "required": "आवश्यक",
         "requires_a_public_https_url": "एक सार्वजनिक HTTPS URL आवश्यक है।",
         "save_failed_is_the_gateway_running": "सहेजना विफल। क्या गेटवे चल रहा है?",
+        "save_rejected": "gateway ने ये सेटिंग अस्वीकार कर दीं ({{code}})।",
         "save_teams_settings": "Teams सेटिंग सहेजें",
         "saved": "सहेजा गया।",
         "saved_restart_the_gateway_to_apply": "सहेजा गया। लागू करने के लिए गेटवे रीस्टार्ट करें।",
@@ -11812,6 +11846,11 @@
     },
     "settingsPage": {
       "kirocrew_v": "Kiro Crew v",
+      "search": {
+        "aria_label": "सेटिंग्स खोजें",
+        "no_results": "कोई मेल खाती सेटिंग नहीं",
+        "placeholder": "सेटिंग्स खोजें…"
+      },
       "settings": "सेटिंग्स"
     },
     "systemPage": {

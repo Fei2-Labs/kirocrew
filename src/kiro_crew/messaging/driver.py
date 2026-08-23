@@ -425,22 +425,17 @@ class TurnDriver:
                     )
                 )
                 # Forgery gate: record the directive-tool name ONLY from the
-                # trusted ``_meta.kiro`` identity and ONLY for a genuine call
-                # served by Kiro Crew's OWN core MCP server — never the
-                # LLM-authored title, and never another (possibly third-party)
-                # MCP server that merely exposes a tool named e.g.
-                # "monitor_start". A shell tool has no mcp_server_name and a
-                # canonical tool_name like "execute_bash", so it can never
-                # register here. (Mirrors the dashboard consumer in
-                # chat_runner.)
-                if (
-                    self.directive_consumer is not None
-                    and event.tool_call_id
-                    and getattr(event, "mcp_server_name", "")
-                    == session_directive.CORE_MCP_SERVER
-                ):
-                    canonical = session_directive.match_tool(
-                        getattr(event, "tool_name", "") or ""
+                # trusted ``_meta.kiro`` identity — never the LLM-authored
+                # title. The single shared predicate (also used by the
+                # dashboard consumer in chat_runner) requires Kiro Crew's OWN
+                # core MCP server and a canonical directive-tool name; a shell
+                # tool (no mcp_server_name, canonical tool_name like
+                # "execute_bash") or a third-party server exposing a same-named
+                # tool can never register here.
+                if self.directive_consumer is not None and event.tool_call_id:
+                    canonical = session_directive.directive_tool_for(
+                        getattr(event, "mcp_server_name", "") or "",
+                        getattr(event, "tool_name", "") or "",
                     )
                     if canonical:
                         pending_directives[event.tool_call_id] = canonical

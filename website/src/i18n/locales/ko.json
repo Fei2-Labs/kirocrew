@@ -5,6 +5,8 @@
       "rate_limited_by_the_tunnel_edge_http_429_too_man": "터널 엣지에서 요청 수가 제한되었습니다 (HTTP 429) — 짧은 시간에 요청이 너무 많습니다. 대시보드가 자동으로 재시도합니다. 계속되면 몇 초 기다린 후 새로고침하세요.",
       "session_expired": "세션이 만료되었습니다.",
       "session_expired_sign_in_again": "세션이 만료되었습니다. 터미널에서 kirocrew token 을 실행한 뒤 이 페이지 상단 배너에 URL을 붙여넣어 다시 로그인하세요.",
+      "stale_owner_session": "이 세션은 소유자 설정 이전에 만들어졌습니다. 다시 로그인하세요.",
+      "stale_owner_session_sign_in_again": "이 세션은 소유자 설정 이전에 만들어졌습니다(KIROCREW_OWNER_ID 설정 전에 로그인됨). 터미널에서 kirocrew token 을 실행한 뒤 이 페이지 상단 배너에 URL을 붙여넣어 다시 로그인하세요.",
       "stream_ended_without_completion": "스트림이 완료되지 않은 채 종료되었습니다",
       "unexpected_server_response": "예기치 않은 서버 응답"
     }
@@ -4701,6 +4703,7 @@
       "more_actions": "추가 작업"
     },
     "chatInput": {
+      "drop_to_attach": "놓아서 첨부",
       "add_files_options": "파일 및 옵션 추가",
       "agent": "에이전트: {{name}}",
       "allow_once": "한 번만 허용",
@@ -5252,7 +5255,8 @@
       "stopped": "중지됨",
       "pin_crew": "{{name}}을(를) 헤더에 고정",
       "unpin_crew": "{{name}} 고정 해제",
-      "pinned_no_room": "고정됨, 헤더에 공간 없음"
+      "pinned_no_room": "고정됨, 헤더에 공간 없음",
+      "keep_tab_order_fixed": "탭 순서 고정"
     },
     "instancesViewport": {
       "connecting": "연결 중…",
@@ -5427,8 +5431,10 @@
       "set_up_kiro": "Kiro 설정",
       "setup": "설정",
       "setup_check_unavailable": "설정 확인을 사용할 수 없음",
+      "sign_in_again_to_continue": "계속하려면 다시 로그인하세요.",
       "sign_in_method_note": "둘 다 브라우저를 열어 로그인을 완료합니다. 플랜에 맞는 방식을 선택하세요 — 로그인 페이지에서는 조직 SSO와 함께 개인용 Builder ID를 제공하며, Builder ID로 사용할 수 있는 모델은 더 적습니다.",
       "sign_in_personal_label": "개인 계정 — Builder ID, Google 또는 GitHub",
+      "sign_in_required": "로그인 필요",
       "sign_in_sso_hint": "조직의 시작 URL과 리전을 입력하라는 메시지가 표시됩니다.",
       "sign_in_sso_label": "조직 SSO — IAM Identity Center",
       "sign_in_to_kiro": "Kiro에 로그인",
@@ -5672,7 +5678,7 @@
       "pin_model_unavailable": "<model/>은(는) 현재 제공되지 않습니다",
       "reasoning": "추론",
       "set_default_for_agent": "<model/>을(를) <agent/>의 기본 모델로 설정",
-      "set_default_for_new_sessions": "새 세션의 전역 대체 값…",
+      "set_default_for_new_sessions": "새 세션의 전역 기본값…",
       "type_to_filter": "입력하여 필터…"
     },
     "monacoCodeBlock": {
@@ -6711,8 +6717,7 @@
       "stat_unknown": "알 수 없음",
       "tag_shared": "공유됨",
       "unsaved_changes": "저장되지 않은 변경",
-      "webhook_unbound_reason": "웹훅 토큰은 아직 크루에 연결되지 않으므로 어떤 토큰으로도 아무 크루를 깨울 수 있습니다.",
-      "webhook_unbound_short": "크루에 연결되지 않음",
+      "webhook_unbound_short": "바인딩된 토큰 없음",
       "wire_what_it_works_with": "무엇으로 작동하는지"
     },
     "awsConsentGate": {
@@ -6728,6 +6733,20 @@
       "billing_notice": "유료 AWS 서비스입니다. 확인하기 전에는 요청이 전송되지 않습니다.",
       "confirm_button": "확인하고 사용",
       "withdraw": "확인 취소"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Webhook을 불러오지 못해 지금은 무엇이 이 크루를 깨우는지 알 수 없습니다.",
+      "inbound_webhooks_are_switched_off": "인바운드 webhook이 꺼져 있어 바인딩된 토큰을 포함해 아무것도 호출할 수 없습니다.",
+      "last_used_ago": "{{time}} 사용",
+      "no_tokens_are_bound_to_this_crew": "이 크루에 바인딩된 webhook 토큰이 없습니다.",
+      "off": "꺼짐",
+      "open_webhooks": "Webhooks 열기",
+      "outside_systems_holding_one_of_these_credentials": "이 토큰을 가진 외부 시스템은 이 크루로 턴을 시작할 수 있습니다. 생성과 폐기는 Webhooks 페이지에서 하세요.",
+      "retry": "다시 시도",
+      "signed": "서명 필수",
+      "unbound_tokens_can_wake_any_crew_other": "크루에 바인딩되지 않은 토큰이 {{count}}개 있으며, 이 크루를 포함한 모든 크루를 깨울 수 있습니다.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "이 크루를 깨우는 Webhook"
     }
   },
   "hooks": {
@@ -8026,6 +8045,7 @@
         "no_pinned_messages": "고정된 메시지가 없습니다. 채팅에서 메시지에 커서를 올린 뒤 핀 아이콘을 클릭하면 여기에 저장됩니다.",
         "message_unavailable": "This pinned message is no longer available in the loaded history.",
         "pin_failed": "Could not pin the message. Try again.",
+        "pin_limit_reached": "핀 한도에 도달했습니다 — 다른 메시지를 고정하려면 기존 핀을 해제하세요.",
         "unpin_failed": "Could not unpin the message. Try again.",
         "you": "You",
         "assistant": "Assistant",
@@ -10217,6 +10237,10 @@
       "in_use": "사용 중",
       "move_to_trash_bulk": "휴지통으로 이동",
       "move_to_trash_single": "휴지통으로 이동",
+      "next_page": "다음",
+      "no_matches": "검색 조건에 일치하는 대화가 없습니다.",
+      "page_of": "{{pages}}페이지 중 {{page}}페이지",
+      "prev_page": "이전",
       "preview_sweep": "정리 미리 보기",
       "reclaim_by_age": "기간별 정리",
       "refused_heading": "세션 {{count}}개를 이동하지 못했습니다",
@@ -10227,6 +10251,7 @@
       "restore": "복원",
       "resumable": "재개 가능",
       "search_placeholder": "세션 검색",
+      "showing_range": "{{total}}개 중 {{from}}–{{to}}개 표시",
       "sort_largest": "큰순",
       "sort_name": "이름",
       "sort_oldest": "오래된순",
@@ -10474,6 +10499,10 @@
       },
       "channels": {
         "get_your_bot_credentials": "봇 자격 증명 발급받기",
+        "hard_below_soft_error": "하드 컨텍스트 임계값은 소프트 컨텍스트 임계값보다 크거나 같아야 합니다",
+        "hard_threshold_description": "이 비율에 도달하면 응답을 기다리지 않고 자동으로 압축해 컨텍스트 윈도가 넘치지 않도록 합니다.",
+        "hard_threshold_label": "하드 컨텍스트 임계값 %",
+        "hard_threshold_range_error": "하드 컨텍스트 임계값은 1에서 100 사이의 숫자여야 합니다",
         "threshold_description": "세션 컨텍스트가 이 비율을 넘으면 {{compact}} 또는 {{new}}을(를) 안내합니다."
       },
       "channelsPanel": {
@@ -10520,8 +10549,8 @@
         "context_usage_at_which_auto_compaction_triggers": "자동 압축이 시작되는 컨텍스트 사용률 %. 낮을수록 압축이 잦아지고 세션이 길어집니다",
         "data_ml": "데이터 / ML",
         "default_auto": "기본값 (자동)",
-        "default_defers_to_your_agent_config_and_then_to": "폴백 전용: 모델이 구성된 에이전트는 이 설정을 무시합니다. ‘기본값’은 에이전트 구성의 모델을 사용하며, 구성된 모델이 없으면 시스템 기본값을 사용합니다. 이를 변경해도 이미 열린 세션에는 영향이 없습니다.",
-        "default_model": "폴백 모델",
+        "default_defers_to_your_agent_config_and_then_to": "자체 구성된 모델이 있는 에이전트는 이 설정을 무시합니다. ‘기본값’은 에이전트 구성의 모델을 사용하며, 구성된 모델이 없으면 시스템 기본값을 사용합니다. 이를 변경해도 이미 열린 세션에는 영향이 없습니다.",
+        "default_model": "기본 모델",
         "default_normal_length": "기본 — 보통 길이",
         "default_reasoning_effort": "기본 추론 강도",
         "default_to_autopilot_mode": "오토파일럿 모드를 기본값으로",
@@ -10532,6 +10561,7 @@
         "display_usage_percentage_next_to_the_context_pro": "컨텍스트 진행 표시줄 옆에 사용률 %를 표시합니다",
         "display_used_and_total_tokens_next_to_the_contex": "컨텍스트 진행 표시줄 옆에 사용된 토큰과 전체 토큰을 표시합니다",
         "e_g_solutions_architect_sre_founder": "예: 솔루션 아키텍트, SRE, 창업자",
+        "effort_needs_reasoning_model": "추론 가능한 모델에만 적용되므로 위에서 선택한 모델에는 영향이 없습니다.",
         "enter_for_newline": "Enter로 줄바꿈",
         "enter_sends": "Enter로 전송",
         "enter_sends_mod_enter_newline": "Enter로 전송, {{mod}}+Enter로 줄바꿈",
@@ -10617,8 +10647,9 @@
         "retry": "다시 시도",
         "role_background": "백그라운드",
         "role_chat": "채팅",
-        "role_effort_hint": "추론을 지원하는 모델에서만 적용됩니다. 비워 두면 채팅의 기본 추론 강도를 따릅니다.",
-        "role_model_auto_hint": "‘기본값’은 공급자가 선택하도록 맡깁니다 — 채팅 모델을 따르지 않습니다. 특정 모델에서 이 작업을 실행하려면 모델을 고정하세요.",
+        "role_effort_hint": "추론 가능한 모델에만 적용됩니다. ‘모델 기본값’은 아무것도 재정의하지 않으며, 이 작업은 기본 추론 강도를 상속하지 않습니다.",
+        "role_model_auto": "자동(공급자가 선택)",
+        "role_model_auto_hint": "‘자동’은 공급자가 선택하며, 기본 모델을 상속하지 않습니다. 이 작업을 특정 모델에서 실행하려면 해당 모델을 고정하세요.",
         "role_subagents": "서브에이전트",
         "send_shortcut": "전송 단축키",
         "session_summaries": "세션 요약",
@@ -10866,7 +10897,6 @@
         "home_you_local_bin_kirocrew_leave_blank_for_stan": "/home/you/.local/bin/kirocrew — 표준 설치라면 비워 두세요",
         "host_1_alias": "host-1-alias",
         "instances_stay_warm_live_tunnel_at_once_the_rest": "개의 리모트 크루가 동시에 웜 상태(활성 터널)로 유지되고, 나머지는 필요할 때\n 다시 연결합니다. 조정 방법:",
-        "is_already_used_by_another_instance_choose_a_dif": "이미 다른 리모트 크루가 사용 중입니다 — 다른 값을 선택하세요\n (그리고 리모트 호스트에서 해당 포트를 설정하세요).",
         "is_installed_somewhere_non_standard_on_the_remot": "— 리모트에서 표준이 아닌\n 위치에 설치된 경우입니다. PATH에 일반 pip 설치로 있다면 비워 두세요. 위치를\n 찾으려면 리모트 호스트에서 실행하세요:",
         "kirocrew": "kirocrew",
         "kirocrew_restart": "kirocrew restart",
@@ -10874,15 +10904,13 @@
         "local_bin_kirocrew": "~/.local/bin/kirocrew",
         "multi_instance_management_is": "리모트 크루 관리는",
         "multi_instance_management_is_off": "리모트 크루 관리가 꺼져 있습니다",
-        "must_match_the_port_the_remote_gateway_serves_on": "리모트 게이트웨이가 수신하는 포트를 사용하세요. 포트는 서로 달라야 하며, 리모트 크루끼리 포트를 재사용하지 마세요.",
+        "must_match_the_port_the_remote_gateway_serves_on": "리모트 게이트웨이가 수신하는 포트를 사용하세요. 여러 크루가 같은 포트를 공유할 수 있으며, 로컬 포워딩 포트는 별도로 할당됩니다.",
         "name": "이름",
         "no_instances_configured_yet_add_one_below_to_man": "설정된 리모트 크루가 아직 없습니다. 아래에서 추가해 리모트 크루를 관리하세요.",
         "only_needed_if": "다음 경우에만 필요합니다:",
         "opens_ssh_n_l_to_the_host_requires_non_interacti": "호스트로 ssh -N -L을 엽니다. 대화형 입력 없는 SSH 액세스가 필요합니다(ssh-agent에 등록된 키).",
         "optional": "(선택 사항)",
-        "port": "포트",
-        "port_2": "· 포트",
-        "port_the_local_forward_mirrors_it": "포트 — 로컬 포워드가 이를 그대로 따릅니다.",
+        "port_2": "· 리모트 포트",
         "refresh": "새로 고침",
         "remote_host_1": "리모트 호스트 1",
         "remote_kirocrew_path": "리모트 kirocrew 경로",
@@ -10894,7 +10922,7 @@
         "ssh_host_alias": "SSH 호스트 / 별칭",
         "ssh_tunnel": "SSH 터널",
         "ssm_target_instance_id": "SSM 대상(인스턴스 ID)",
-        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "게이트웨이는 연결할 때 터널(SSH 또는 AWS SSM)을 열고 짧은 수명의 토큰을 발급합니다.\n 로컬 포워드 포트가 리모트 포트를 그대로 따르므로, 연결된 리모트 크루는 각각\n 서로 다른 리모트 포트를 사용해야 합니다.",
+        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "게이트웨이는 연결할 때 터널(SSH 또는 AWS SSM)을 열고 짧은 수명의 토큰을 발급합니다.",
         "the_user_the_remote_gateway_runs_as_sudo_u_for_s": "리모트 게이트웨이가 실행되는 사용자입니다 — SSM 명령은 sudo -u를 통해 실행됩니다. Ubuntu AMI에서는 ubuntu를 사용하세요.",
         "to_fully_tear_down_any_tunnels_still_running_fro": "이전부터 실행 중인 터널을 완전히 정리하려면 이렇게 하세요.",
         "to_start_the_ssh_tunnel_manager_and_activate_ins": "터널 관리자를 시작하고 리모트 크루 전환을 활성화하려면 이렇게 하세요.",
@@ -11377,6 +11405,7 @@
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "위. Slack과 달리 Bot Framework에는\n 발신 전용 모드가 없습니다.",
         "access": "액세스",
+        "active": "활성",
         "add_the": ", 다음을 추가",
         "allowed_users_email_or_aad_object_id": "허용된 사용자(이메일 또는 AAD 개체 ID)",
         "and_save": ", 저장하세요.",
@@ -11409,6 +11438,7 @@
         "if_single_tenant": "단일 테넌트인 경우).",
         "in_the_bot_s": "봇의",
         "is_your_app_id_then_dm_the_bot_full_manifest_ste": "앱 ID입니다. 그다음 봇에 DM을 보내세요 —\n 전체 매니페스트 단계는 위 설정 가이드에 있습니다.",
+        "jwt_required": "<strong>Microsoft Teams에는 PyJWT 종속성이 필요합니다.</strong> 수신되는 Bot Framework 요청에는 검증해야 하는 서명된 토큰이 포함되므로 이 종속성이 없으면 채널이 시작되지 않습니다. gateway를 실행하는 환경에서 <mono>pip install \"kirocrew[teams]\"</mono>을 실행한 다음 gateway를 다시 시작하세요.",
         "leave_empty_for_a_multi_tenant_bot": "다중 테넌트 봇의 경우 비워 두세요",
         "loading_teams_config": "Teams 설정을 불러오는 중…",
         "localhost": "localhost",
@@ -11417,6 +11447,8 @@
         "microsoft_app_id": "Microsoft 앱 ID",
         "microsoft_teams": "Microsoft Teams",
         "multi_tenant": "다중 테넌트",
+        "needs_setup": "설정 필요",
+        "not_active": "활성 아님",
         "optional_only_for_single_tenant_bots": "선택 사항 — 단일 테넌트 봇에만 해당합니다.",
         "or_single_tenant_if_you_ll_pin_a_tenant_id": ", 테넌트 ID를 고정하려면 단일 테넌트를 선택하세요.",
         "or_ssh_tunneled_address_won_t_work_expose_the_ga": "또는\n SSH 터널 주소는 동작하지 않습니다. 터널(ngrok / cloudflared)이나\n 리버스 프록시로 게이트웨이를 공개한 다음, 그 공개 호스트를 다음으로 사용하세요",
@@ -11426,6 +11458,7 @@
         "required": "필수",
         "requires_a_public_https_url": "공개 HTTPS URL이 필요합니다.",
         "save_failed_is_the_gateway_running": "저장하지 못했습니다. 게이트웨이가 실행 중인가요?",
+        "save_rejected": "gateway가 이 설정을 거부했습니다({{code}}).",
         "save_teams_settings": "Teams 설정 저장",
         "saved": "저장되었습니다.",
         "saved_restart_the_gateway_to_apply": "저장되었습니다. 적용하려면 게이트웨이를 재시작하세요.",
@@ -11683,6 +11716,11 @@
     },
     "settingsPage": {
       "kirocrew_v": "Kiro Crew v",
+      "search": {
+        "aria_label": "설정 검색",
+        "no_results": "일치하는 설정 없음",
+        "placeholder": "설정 검색…"
+      },
       "settings": "설정"
     },
     "systemPage": {

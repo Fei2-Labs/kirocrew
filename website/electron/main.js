@@ -21,6 +21,7 @@ const { createRendererRecovery } = require("./renderer-recovery");
 const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
 const { exitImmersiveModes } = require("./blocking-prompt");
 const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
+const { attachHtmlFullScreen } = require("./html-fullscreen");
 const { shouldRetryLocalTokenMint, tokenMintRetryDelayMs, TOKEN_MINT_MAX_RETRIES } = require("./token-acquire");
 const { createDisplayMediaHandler } = require("./display-media");
 const { applyFocusModeChrome } = require("./focus-chrome");
@@ -993,6 +994,23 @@ function spawnGateway(resolve) {
             // that deliberately scrub Python env rely on the bundled
             // launcher's interpreter-level -B floor instead.
             PYTHONPYCACHEPREFIX: path.join(kirocrewDir, "cache", "pycache"),
+            // The kiro-cli copy staged into the app's resources at build
+            // time (packaging/build-desktop.sh, BUNDLE_KIRO_CLI). Spread
+            // only when the directory actually shipped: the backend ranks
+            // it above system installs but below the KIROCREW_KIRO_BIN
+            // operator override (kiro_cli.known_kiro_cli_dirs). A build
+            // without the payload leaves the env unset, so discovery falls
+            // through to the user's own install exactly as before.
+            ...(() => {
+              const bundledKiro = path.join(process.resourcesPath || "", "backend-dist", "kiro-cli");
+              try {
+                return fs.statSync(bundledKiro).isDirectory()
+                  ? { KIROCREW_BUNDLED_KIRO_DIR: bundledKiro }
+                  : {};
+              } catch {
+                return {};
+              }
+            })(),
           },
         });
         gatewayProcess = child;
@@ -1454,8 +1472,40 @@ function setupWindowContents(win, backendUrl) {
     if (win.isDestroyed() || view.webContents.isDestroyed()) return;
     view.webContents.send("fullscreen-changed", win.isFullScreen());
   };
-  win.on("enter-full-screen", () => { updateViewBounds(); sendFullScreen(); });
-  win.on("leave-full-screen", () => { updateViewBounds(); sendFullScreen(); });
+  // Fullscreen transitions fire before the window finishes reflowing, so the
+  // synchronous updateViewBounds() in the handlers below can read a pre-reflow
+  // content rect — the same stale-getContentBounds hazard the did-finish-load
+  // settle pass below documents. Observed on Linux, where the in-window menu
+  // bar's ~28px is reclaimed only after `leave-full-screen`, leaving the view
+  // taller than the window and clipping bottom-anchored rows until some other
+  // resize. Keep the synchronous call (already correct where reflow is
+  // immediate) and follow it with bounded deferred recomputes so the settled
+  // bounds win: a quick pass for the common fast reflow and a late backstop
+  // matching the startup settle delay for slow window managers. Re-reading
+  // bounds on an already-correct window is a no-op, so this runs on every
+  // platform rather than behind a process.platform gate. updateViewBounds()
+  // itself no-ops on a destroyed window; the timers are also cleared on
+  // "closed" so nothing fires into a torn-down window.
+  let fullscreenSettleTimers = [];
+  const scheduleFullscreenSettle = () => {
+    for (const t of fullscreenSettleTimers) clearTimeout(t);
+    fullscreenSettleTimers = [250, 1500].map((ms) => setTimeout(updateViewBounds, ms));
+  };
+  win.on("closed", () => { for (const t of fullscreenSettleTimers) clearTimeout(t); });
+  win.on("enter-full-screen", () => { updateViewBounds(); sendFullScreen(); scheduleFullscreenSettle(); });
+  win.on("leave-full-screen", () => { updateViewBounds(); sendFullScreen(); scheduleFullscreenSettle(); });
+  // DOM fullscreen (an inline <video>'s fullscreen button, the media viewer) is
+  // a SEPARATE pair of events from the two above, raised on the WebContents
+  // rather than the window. Without this bridge the element goes :fullscreen
+  // inside a WebContentsView still clamped to the un-fullscreened window, so
+  // nothing visibly happens. `enter-full-screen` above then re-runs
+  // updateViewBounds() so the view grows into the new content rect.
+  //
+  // Parked on the window (same pattern as _mcBrowserPanels) because
+  // persistMainWindowState() must ask whether the CURRENT fullscreen is one the
+  // bridge raised: a video's fullscreen is not a window preference and must not
+  // be what a quit mid-playback relaunches into.
+  win._mcHtmlFullScreen = attachHtmlFullScreen({ win, webContents: view.webContents });
   // The initial updateViewBounds() above runs before win.show() and before the
   // dashboard finishes loading, so getContentBounds() can return a pre-layout
   // size — leaving the WebContentsView mis-sized (content overflows / gets cut
@@ -2084,7 +2134,13 @@ function syncLinuxMaximizeState(win, view) {
 // menu's Keep on Top toggle can trigger a save. No-op while mainWindow is
 // absent/destroyed (captureWindowState returns null).
 function persistMainWindowState() {
-  const s = captureWindowState(mainWindow);
+  const s = captureWindowState(mainWindow, {
+    // A fullscreen the DOM-fullscreen bridge raised for a `<video>` is the app's
+    // doing, not the user's preference, so it must never be the state we relaunch
+    // into after a quit or crash mid-playback. The bridge is the only thing that
+    // knows which transitions are its own.
+    transientFullScreen: mainWindow?._mcHtmlFullScreen?.raisedWindow() === true,
+  });
   if (s) store.set("windowState", s);
 }
 

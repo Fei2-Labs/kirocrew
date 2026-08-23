@@ -5,6 +5,8 @@
       "rate_limited_by_the_tunnel_edge_http_429_too_man": "隧道边缘已限流（HTTP 429）— 短时间内请求过多。仪表板会自动重试；如果持续出现，等待几秒后重新加载。",
       "session_expired": "会话已过期。",
       "session_expired_sign_in_again": "会话已过期。请在终端运行 kirocrew token，然后将 URL 粘贴到本页顶部的横幅中重新登录。",
+      "stale_owner_session": "此会话早于已配置的所有者。请重新登录。",
+      "stale_owner_session_sign_in_again": "此会话早于已配置的所有者（登录发生在设置 KIROCREW_OWNER_ID 之前）。请在终端运行 kirocrew token，然后将 URL 粘贴到本页顶部的横幅中重新登录。",
       "stream_ended_without_completion": "流在完成前结束",
       "unexpected_server_response": "服务器响应异常"
     }
@@ -4701,6 +4703,7 @@
       "more_actions": "更多操作"
     },
     "chatInput": {
+      "drop_to_attach": "松开即可附加",
       "add_files_options": "添加文件与选项",
       "agent": "代理：{{name}}",
       "allow_once": "允许一次",
@@ -5252,7 +5255,8 @@
       "stopped": "已停止",
       "pin_crew": "将 {{name}} 置顶到顶栅",
       "unpin_crew": "取消置顶 {{name}}",
-      "pinned_no_room": "已置顶，顶栅空间不足"
+      "pinned_no_room": "已置顶，顶栅空间不足",
+      "keep_tab_order_fixed": "固定标签页顺序"
     },
     "instancesViewport": {
       "connecting": "正在连接…",
@@ -5427,8 +5431,10 @@
       "set_up_kiro": "设置 Kiro",
       "setup": "安装设置",
       "setup_check_unavailable": "无法检查安装状态",
+      "sign_in_again_to_continue": "请重新登录以继续。",
       "sign_in_method_note": "两者都会打开浏览器以完成登录。请选择适合你套餐的方式：登录页面将个人 Builder ID 与组织 SSO 并列显示，而 Builder ID 可用模型更少。",
       "sign_in_personal_label": "个人账户 — Builder ID、Google 或 GitHub",
+      "sign_in_required": "需要重新登录",
       "sign_in_sso_hint": "会提示输入组织的起始 URL 和区域。",
       "sign_in_sso_label": "组织 SSO — IAM Identity Center",
       "sign_in_to_kiro": "登录 Kiro",
@@ -5672,7 +5678,7 @@
       "pin_model_unavailable": "<model/> 目前未提供",
       "reasoning": "推理",
       "set_default_for_agent": "将 <model/> 设为 <agent/> 的默认模型",
-      "set_default_for_new_sessions": "新会话的全局后备…",
+      "set_default_for_new_sessions": "新会话的全局默认…",
       "type_to_filter": "输入以筛选…"
     },
     "monacoCodeBlock": {
@@ -6711,8 +6717,7 @@
       "stat_unknown": "未知",
       "tag_shared": "共享",
       "unsaved_changes": "未保存的改动",
-      "webhook_unbound_reason": "Webhook 令牌目前不携带 Crew 绑定，因此任何令牌都能唤醒任何 Crew。",
-      "webhook_unbound_short": "未绑定到 Crew",
+      "webhook_unbound_short": "没有绑定的 token",
       "wire_what_it_works_with": "它用什么工作"
     },
     "awsConsentGate": {
@@ -6728,6 +6733,20 @@
       "billing_notice": "这是付费 AWS 服务。在你确认之前不会发送任何请求。",
       "confirm_button": "确认并启用",
       "withdraw": "撤销确认"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "无法加载 Webhook，暂时不知道什么会唤醒这个 crew。",
+      "inbound_webhooks_are_switched_off": "入站 webhook 已关闭，任何调用都进不来——包括已绑定的 token。",
+      "last_used_ago": "{{time}}用过",
+      "no_tokens_are_bound_to_this_crew": "没有绑定到这个 crew 的 webhook token。",
+      "off": "已停用",
+      "open_webhooks": "打开 Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "持有这些 token 的外部系统可以以这个 crew 的身份发起一轮工作。到 Webhooks 页面创建或吊销。",
+      "retry": "重试",
+      "signed": "已签名",
+      "unbound_tokens_can_wake_any_crew_other": "另有 {{count}} 个未绑定 crew 的 token，它能唤醒任何 crew，包括这个。",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "能唤醒这个 crew 的 Webhook"
     }
   },
   "hooks": {
@@ -8026,6 +8045,7 @@
         "no_pinned_messages": "还没有置顶消息。把鼠标移到聊天中的某条消息上，点击图钉图标即可保存到这里。",
         "message_unavailable": "此置顶消息在已加载的历史记录中不再可用。",
         "pin_failed": "无法置顶消息，请重试。",
+        "pin_limit_reached": "已达到置顶消息上限——请取消置顶一条消息以添加新的。",
         "unpin_failed": "无法取消置顶消息，请重试。",
         "you": "你",
         "assistant": "助手",
@@ -10217,6 +10237,10 @@
       "in_use": "使用中",
       "move_to_trash_bulk": "移入回收站",
       "move_to_trash_single": "移入回收站",
+      "next_page": "下一页",
+      "no_matches": "没有对话符合该搜索条件。",
+      "page_of": "第 {{page}} 页，共 {{pages}} 页",
+      "prev_page": "上一页",
       "preview_sweep": "预览清理",
       "reclaim_by_age": "按时间回收",
       "refused_heading": "{{count}} 个会话无法移动",
@@ -10227,6 +10251,7 @@
       "restore": "恢复",
       "resumable": "可继续",
       "search_placeholder": "搜索会话",
+      "showing_range": "显示第 {{from}}–{{to}} 项，共 {{total}} 项",
       "sort_largest": "最大优先",
       "sort_name": "名称",
       "sort_oldest": "最旧优先",
@@ -10474,6 +10499,10 @@
       },
       "channels": {
         "get_your_bot_credentials": "获取你的机器人凭证",
+        "hard_below_soft_error": "硬上下文阈值必须大于或等于软上下文阈值",
+        "hard_threshold_description": "达到此百分比时自动压缩，即使没有回复，上下文窗口也不会溢出。",
+        "hard_threshold_label": "硬上下文阈值 %",
+        "hard_threshold_range_error": "硬上下文阈值必须是 1 到 100 之间的数字",
         "threshold_description": "会话上下文超过此百分比时，提示使用 {{compact}} 或 {{new}}。"
       },
       "channelsPanel": {
@@ -10520,8 +10549,8 @@
         "context_usage_at_which_auto_compaction_triggers": "触发自动压缩的上下文使用率 %。越低 = 压缩越频繁，会话越长",
         "data_ml": "数据 / 机器学习",
         "default_auto": "默认（自动）",
-        "default_defers_to_your_agent_config_and_then_to": "仅作后备：配置了模型的代理会忽略此设置。\"默认\"使用代理配置中的模型；若未配置，则使用系统默认模型。更改此设置不会影响已打开的会话。",
-        "default_model": "后备模型",
+        "default_defers_to_your_agent_config_and_then_to": "配置了自己模型的代理会忽略此设置。“默认”使用代理配置中的模型；若未配置，则使用系统默认模型。更改此设置不会影响已打开的会话。",
+        "default_model": "默认模型",
         "default_normal_length": "默认 — 正常长度",
         "default_reasoning_effort": "默认推理强度",
         "default_to_autopilot_mode": "默认使用自动驾驶模式",
@@ -10532,6 +10561,7 @@
         "display_usage_percentage_next_to_the_context_pro": "在上下文进度条旁显示使用百分比",
         "display_used_and_total_tokens_next_to_the_contex": "在上下文进度条旁显示已用和总令牌数",
         "e_g_solutions_architect_sre_founder": "例如：解决方案架构师、SRE、创始人",
+        "effort_needs_reasoning_model": "仅对具备推理能力的模型生效，因此对上面选择的模型没有影响。",
         "enter_for_newline": "Enter 换行",
         "enter_sends": "Enter 发送",
         "enter_sends_mod_enter_newline": "Enter 发送，{{mod}}+Enter 换行",
@@ -10617,8 +10647,9 @@
         "retry": "重试",
         "role_background": "后台",
         "role_chat": "对话",
-        "role_effort_hint": "仅在支持推理的模型上生效；留空则沿用对话默认强度。",
-        "role_model_auto_hint": "“默认”由提供方自行选择——不会继承你的对话模型。固定一个模型即可让此类工作使用它。",
+        "role_effort_hint": "仅对具备推理能力的模型生效。“模型默认”不应用任何覆盖——此类工作不会继承你的默认推理强度。",
+        "role_model_auto": "自动（由提供方选择）",
+        "role_model_auto_hint": "“自动”由提供方自行选择——它不会继承你的默认模型。固定一个模型即可让此类工作使用它。",
         "role_subagents": "子代理",
         "send_shortcut": "发送快捷键",
         "session_summaries": "会话摘要",
@@ -10866,7 +10897,6 @@
         "home_you_local_bin_kirocrew_leave_blank_for_stan": "/home/you/.local/bin/kirocrew  —  标准安装请留空",
         "host_1_alias": "host-1-alias",
         "instances_stay_warm_live_tunnel_at_once_the_rest": "个远程 Crew 可同时保持预热（活动隧道）；其余按需重连。可通过\n                以下命令调整",
-        "is_already_used_by_another_instance_choose_a_dif": "已被另一个远程 Crew 使用 — 请换一个\n              （并在远程主机上配置该端口）。",
         "is_installed_somewhere_non_standard_on_the_remot": "安装在远程主机的\n            非标准位置时才需要。若为 PATH 上的常规 pip 安装，请留空。要查找路径，\n            请在远程主机上运行：",
         "kirocrew": "kirocrew",
         "kirocrew_restart": "kirocrew restart",
@@ -10874,15 +10904,13 @@
         "local_bin_kirocrew": "~/.local/bin/kirocrew",
         "multi_instance_management_is": "远程 Crew 管理",
         "multi_instance_management_is_off": "远程 Crew 管理已关闭",
-        "must_match_the_port_the_remote_gateway_serves_on": "使用远程网关所监听的端口。各端口必须唯一；请勿在多个远程 Crew 之间重复使用端口。",
+        "must_match_the_port_the_remote_gateway_serves_on": "使用远程网关所监听的端口。多个远程 Crew 可以共用同一端口——本地转发端口会单独分配。",
         "name": "名称",
         "no_instances_configured_yet_add_one_below_to_man": "尚未配置远程 Crew。在下方添加一个以管理远程 Crew。",
         "only_needed_if": "仅当",
         "opens_ssh_n_l_to_the_host_requires_non_interacti": "对主机执行 ssh -N -L。需要非交互式 SSH 访问（密钥已加入 ssh-agent）。",
         "optional": "（可选）",
-        "port": "端口",
-        "port_2": "· 端口",
-        "port_the_local_forward_mirrors_it": "端口 — 本地转发会与之保持一致。",
+        "port_2": "· 远程端口",
         "refresh": "刷新",
         "remote_host_1": "远程主机 1",
         "remote_kirocrew_path": "远程 kirocrew 路径",
@@ -10894,7 +10922,7 @@
         "ssh_host_alias": "SSH 主机 / 别名",
         "ssh_tunnel": "SSH 隧道",
         "ssm_target_instance_id": "SSM 目标（实例 id）",
-        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "网关在连接时会打开隧道（SSH 或 AWS SSM）并签发一个短期令牌。\n        本地转发端口与远程端口保持一致，因此每个已连接的远程 Crew\n        必须使用不同的远程端口。",
+        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "网关在连接时会打开隧道（SSH 或 AWS SSM）并签发一个短期令牌。",
         "the_user_the_remote_gateway_runs_as_sudo_u_for_s": "远程网关运行所用的用户 —— SSM 命令通过 sudo -u 执行。Ubuntu AMI 请使用 ubuntu。",
         "to_fully_tear_down_any_tunnels_still_running_fro": "以彻底关闭此前仍在运行的隧道。",
         "to_start_the_ssh_tunnel_manager_and_activate_ins": "以启动隧道管理器并启用远程 Crew 切换。",
@@ -11377,6 +11405,7 @@
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "。与 Slack 不同，Bot Framework 没有\n              仅出站模式。",
         "access": "访问",
+        "active": "已启用",
         "add_the": "，添加",
         "allowed_users_email_or_aad_object_id": "允许的用户（邮箱或 AAD 对象 ID）",
         "and_save": "，然后保存。",
@@ -11409,6 +11438,7 @@
         "if_single_tenant": "若为单租户）。",
         "in_the_bot_s": "在机器人的",
         "is_your_app_id_then_dm_the_bot_full_manifest_ste": "为你的应用 ID，然后私聊\n              机器人 — 完整清单步骤见上方设置指南。",
+        "jwt_required": "<strong>Microsoft Teams 需要 PyJWT 依赖。</strong>入站的 Bot Framework 请求带有必须校验的签名令牌，因此缺少该依赖时通道不会启动。请在运行 gateway 的环境中执行 <mono>pip install \"kirocrew[teams]\"</mono>，然后重启 gateway。",
         "leave_empty_for_a_multi_tenant_bot": "多租户机器人请留空",
         "loading_teams_config": "正在加载 Teams 配置…",
         "localhost": "localhost",
@@ -11417,6 +11447,8 @@
         "microsoft_app_id": "Microsoft 应用 ID",
         "microsoft_teams": "Microsoft Teams",
         "multi_tenant": "多租户",
+        "needs_setup": "需要设置",
+        "not_active": "未启用",
         "optional_only_for_single_tenant_bots": "可选 — 仅用于单租户机器人。",
         "or_single_tenant_if_you_ll_pin_a_tenant_id": "，若要固定租户 ID 则选单租户。",
         "or_ssh_tunneled_address_won_t_work_expose_the_ga": "或\n              SSH 隧道地址都不可用。请通过隧道（ngrok / cloudflared）或反向代理\n              暴露网关，然后将该公网主机用作",
@@ -11426,6 +11458,7 @@
         "required": "必填",
         "requires_a_public_https_url": "需要公网 HTTPS URL。",
         "save_failed_is_the_gateway_running": "保存失败。网关是否正在运行？",
+        "save_rejected": "gateway 拒绝了这些设置（{{code}}）。",
         "save_teams_settings": "保存 Teams 设置",
         "saved": "已保存。",
         "saved_restart_the_gateway_to_apply": "已保存。重启网关后生效。",
@@ -11683,6 +11716,11 @@
     },
     "settingsPage": {
       "kirocrew_v": "Kiro Crew v",
+      "search": {
+        "aria_label": "搜索设置",
+        "no_results": "无匹配的设置",
+        "placeholder": "搜索设置…"
+      },
       "settings": "设置"
     },
     "systemPage": {

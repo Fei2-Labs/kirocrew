@@ -133,9 +133,19 @@ describe('TrustDropdown', () => {
     expect(screen.getByText('Trust').closest('button')).toBeDisabled()
   })
 
-  it('truncates long command labels', () => {
-    const longCmd = 'find /very/long/path/to/directory -name "*.tsx" -exec grep -l something'
-    render(<TrustDropdown fullCommand={longCmd} baseCommand="find" isShell className={btnClass} onAction={() => {}} />)
+  it('truncates only PATHOLOGICAL command labels — ordinary long ones render whole', () => {
+    // The 256 ceiling only guards the menu layout against pathological input
+    // (a base64 blob, a megabyte one-liner); a realistic long command renders
+    // in full so the user can read exactly what they are trusting.
+    const ordinary = 'find /very/long/path/to/directory -name "*.tsx" -exec grep -l something'
+    const { unmount } = render(<TrustDropdown fullCommand={ordinary} baseCommand="find" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    expect(screen.queryByText(/…/)).not.toBeInTheDocument()
+    unmount()
+
+    const pathological = `find ${'/very/long/path/segment'.repeat(12)} -name "*.tsx" -exec grep -l something`
+    expect(pathological.length).toBeGreaterThan(256)
+    render(<TrustDropdown fullCommand={pathological} baseCommand="find" isShell className={btnClass} onAction={() => {}} />)
     fireEvent.click(screen.getByText('Trust'))
     expect(screen.getByText(/…/)).toBeInTheDocument()
   })
@@ -205,6 +215,45 @@ describe('TrustDropdown', () => {
     const cmdBtn = buttons.find(b => b.textContent?.includes('grep'))!
     fireEvent.click(cmdBtn)
     expect(onAction).toHaveBeenCalledWith('trust_command', "grep -r 'search term' /path/to/dir")
+  })
+})
+
+describe('TrustDropdown without a command (hasCommand=false)', () => {
+  // The channels surface titles its approval with an agent ROLE, not a
+  // command, and its backend accepts only approved/rejected/trust — so the
+  // command-scoped tiers must disappear entirely there.
+  it('offers only the plain session-trust action', () => {
+    render(<TrustDropdown fullCommand="Researcher" baseCommand="Researcher" isShell={false} hasCommand={false} className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0].textContent).toContain('Trust all tools')
+  })
+
+  it('hides trust_base even when the title happens to look like a shell command', () => {
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell hasCommand={false} className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0].textContent).not.toContain('commands')
+    expect(items[0].textContent).toContain('Trust all tools')
+  })
+
+  it('emits the plain trust decision with no pattern', () => {
+    const onAction = vi.fn()
+    render(<TrustDropdown fullCommand="Researcher" baseCommand="Researcher" isShell={false} hasCommand={false} className={btnClass} onAction={onAction} />)
+    fireEvent.click(screen.getByText('Trust'))
+    fireEvent.click(screen.getByText('Trust all tools'))
+    expect(onAction).toHaveBeenCalledTimes(1)
+    expect(onAction).toHaveBeenCalledWith('trust')
+  })
+
+  it('keeps every tier when hasCommand is not passed (command-bearing surfaces)', () => {
+    // Regression guard for the chat surface, which omits the prop: the
+    // default must stay true so all tiers keep rendering there.
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    expect(screen.getAllByRole('menuitem')).toHaveLength(3)
   })
 })
 

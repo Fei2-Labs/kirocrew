@@ -5,6 +5,8 @@
       "rate_limited_by_the_tunnel_edge_http_429_too_man": "Ограничение частоты на границе туннеля (HTTP 429) — слишком много запросов за короткое время. Панель повторяет запросы автоматически; если ошибка не исчезает, подождите несколько секунд и перезагрузите страницу.",
       "session_expired": "Срок сессии истёк.",
       "session_expired_sign_in_again": "Сессия истекла. Выполните kirocrew token в терминале, затем вставьте URL в баннер в верхней части страницы, чтобы войти снова.",
+      "stale_owner_session": "Эта сессия создана до настройки владельца. Войдите снова.",
+      "stale_owner_session_sign_in_again": "Эта сессия создана до настройки владельца (вход выполнен до установки KIROCREW_OWNER_ID). Выполните kirocrew token в терминале, затем вставьте URL в баннер в верхней части страницы, чтобы войти снова.",
       "stream_ended_without_completion": "Поток прервался до завершения",
       "unexpected_server_response": "Неожиданный ответ сервера"
     }
@@ -4923,6 +4925,7 @@
       "more_actions": "Другие действия"
     },
     "chatInput": {
+      "drop_to_attach": "Отпустите, чтобы прикрепить",
       "add_files_options": "Добавить файлы и параметры",
       "agent": "Агент: {{name}}",
       "allow_once": "Разрешить один раз",
@@ -5501,7 +5504,8 @@
       "stopped": "остановлен",
       "pin_crew": "Закрепить {{name}} в заголовке",
       "unpin_crew": "Открепить {{name}}",
-      "pinned_no_room": "закреплено, нет места в заголовке"
+      "pinned_no_room": "закреплено, нет места в заголовке",
+      "keep_tab_order_fixed": "Сохранять порядок вкладок"
     },
     "instancesViewport": {
       "connecting": "Подключение…",
@@ -5676,8 +5680,10 @@
       "set_up_kiro": "Настроить Kiro",
       "setup": "Настройка",
       "setup_check_unavailable": "Проверка настройки недоступна",
+      "sign_in_again_to_continue": "Войдите снова, чтобы продолжить.",
       "sign_in_method_note": "Оба варианта открывают браузер для завершения входа. Выберите тот, который соответствует вашему плану: на странице входа личный Builder ID предлагается рядом с SSO организации, а Builder ID даёт доступ к меньшему набору моделей.",
       "sign_in_personal_label": "Личная учётная запись — Builder ID, Google или GitHub",
+      "sign_in_required": "Требуется вход",
       "sign_in_sso_hint": "Запрашивает начальный URL и регион вашей организации.",
       "sign_in_sso_label": "SSO организации — IAM Identity Center",
       "sign_in_to_kiro": "Войти в Kiro",
@@ -5921,7 +5927,7 @@
       "pin_model_unavailable": "<model/> сейчас не предлагается",
       "reasoning": "Рассуждения",
       "set_default_for_agent": "Сделать <model/> моделью по умолчанию для <agent/>",
-      "set_default_for_new_sessions": "Глобальный запасной вариант для новых сессий…",
+      "set_default_for_new_sessions": "Глобальное значение по умолчанию для новых сессий…",
       "type_to_filter": "Введите для фильтрации…"
     },
     "monacoCodeBlock": {
@@ -6981,8 +6987,7 @@
       "stat_unknown": "Неизвестно",
       "tag_shared": "Общее",
       "unsaved_changes": "Несохранённые изменения",
-      "webhook_unbound_reason": "Токены вебхуков пока не привязаны к crew, поэтому любой токен может запустить любую crew.",
-      "webhook_unbound_short": "Не привязан к crew",
+      "webhook_unbound_short": "Нет привязанных токенов",
       "wire_what_it_works_with": "С чем работает"
     },
     "awsConsentGate": {
@@ -6998,6 +7003,23 @@
       "billing_notice": "Это платный сервис AWS. До подтверждения запросы не отправляются.",
       "confirm_button": "Подтвердить и включить",
       "withdraw": "Отозвать подтверждение"
+    },
+    "crewWebhookSection": {
+      "could_not_load_webhooks": "Не удалось загрузить webhooks, поэтому сейчас неизвестно, что будит эту команду.",
+      "inbound_webhooks_are_switched_off": "Входящие webhooks выключены: ни один вызов не пройдёт, включая привязанные токены.",
+      "last_used_ago": "использован {{time}}",
+      "no_tokens_are_bound_to_this_crew": "К этой команде не привязано ни одного webhook-токена.",
+      "off": "Выключен",
+      "open_webhooks": "Открыть Webhooks",
+      "outside_systems_holding_one_of_these_credentials": "Внешние системы с одним из этих токенов могут запускать ход от имени этой команды. Создание и отзыв — на странице Webhooks.",
+      "retry": "Повторить",
+      "signed": "С подписью",
+      "unbound_tokens_can_wake_any_crew_few": "Существуют ещё {{count}} токена без привязки к команде; они могут разбудить любую команду, включая эту.",
+      "unbound_tokens_can_wake_any_crew_many": "Существует ещё {{count}} токенов без привязки к команде; они могут разбудить любую команду, включая эту.",
+      "unbound_tokens_can_wake_any_crew_one": "Существует ещё {{count}} токен без привязки к команде; он может разбудить любую команду, включая эту.",
+      "unbound_tokens_can_wake_any_crew_other": "Существуют ещё {{count}} токена без привязки к команде; они могут разбудить любую команду, включая эту.",
+      "webhook": "Webhook",
+      "webhooks_that_wake_this_crew": "Webhook, которые будят эту команду"
     }
   },
   "hooks": {
@@ -8338,6 +8360,7 @@
         "no_pinned_messages": "Закреплённых сообщений пока нет. Наведите курсор на сообщение в чате и нажмите значок булавки, чтобы сохранить его здесь.",
         "message_unavailable": "Это закреплённое сообщение больше недоступно в загруженной истории.",
         "pin_failed": "Не удалось закрепить сообщение. Повторите попытку.",
+        "pin_limit_reached": "Достигнут лимит закреплённых сообщений — открепите одно, чтобы добавить новое.",
         "unpin_failed": "Не удалось открепить сообщение. Повторите попытку.",
         "you": "Вы",
         "assistant": "Ассистент",
@@ -10590,6 +10613,10 @@
       "in_use": "используется",
       "move_to_trash_bulk": "Переместить в корзину",
       "move_to_trash_single": "Переместить в корзину",
+      "next_page": "Далее",
+      "no_matches": "Нет диалогов, соответствующих этому поиску.",
+      "page_of": "Страница {{page}} из {{pages}}",
+      "prev_page": "Назад",
       "preview_sweep": "Предпросмотр очистки",
       "reclaim_by_age": "Освободить по давности",
       "refused_heading": "Не удалось переместить {{count}} сессий",
@@ -10600,6 +10627,7 @@
       "restore": "Восстановить",
       "resumable": "Можно продолжить",
       "search_placeholder": "Поиск сессий",
+      "showing_range": "Показаны {{from}}–{{to}} из {{total}}",
       "sort_largest": "Сначала крупные",
       "sort_name": "Имя",
       "sort_oldest": "Сначала старые",
@@ -10856,6 +10884,10 @@
       },
       "channels": {
         "get_your_bot_credentials": "Получи учётные данные бота",
+        "hard_below_soft_error": "Жёсткий порог контекста должен быть не меньше мягкого порога",
+        "hard_threshold_description": "Автоматически сжимать контекст при этом проценте, даже без ответа, чтобы окно контекста никогда не переполнялось.",
+        "hard_threshold_label": "Жёсткий порог контекста, %",
+        "hard_threshold_range_error": "Жёсткий порог контекста должен быть числом от 1 до 100",
         "threshold_description": "Предлагать {{compact}} или {{new}}, когда контекст сессии превысит этот процент."
       },
       "channelsPanel": {
@@ -10902,8 +10934,8 @@
         "context_usage_at_which_auto_compaction_triggers": "Процент использования контекста, при котором срабатывает автосжатие. Меньше = чаще сжатие, длиннее сессии",
         "data_ml": "Данные / ML",
         "default_auto": "По умолчанию (авто)",
-        "default_defers_to_your_agent_config_and_then_to": "Только резервный вариант: агенты с настроенной моделью игнорируют эту настройку. «По умолчанию» использует модель из конфигурации агента или системную модель по умолчанию, если ничего не настроено. Изменение не влияет на уже открытые сеансы.",
-        "default_model": "Запасная модель",
+        "default_defers_to_your_agent_config_and_then_to": "Агенты с собственной настроенной моделью игнорируют эту настройку. «По умолчанию» использует модель из конфигурации агента или системную модель по умолчанию, если ничего не настроено. Изменение не влияет на уже открытые сеансы.",
+        "default_model": "Модель по умолчанию",
         "default_normal_length": "По умолчанию — обычная длина",
         "default_reasoning_effort": "Уровень рассуждений по умолчанию",
         "default_to_autopilot_mode": "Автопилот по умолчанию",
@@ -10914,6 +10946,7 @@
         "display_usage_percentage_next_to_the_context_pro": "Показывать процент использования рядом с индикатором контекста",
         "display_used_and_total_tokens_next_to_the_contex": "Показывать использованные и общие токены рядом с индикатором контекста",
         "e_g_solutions_architect_sre_founder": "например: архитектор решений, SRE, основатель",
+        "effort_needs_reasoning_model": "Применяется только к моделям с рассуждением, поэтому не влияет на выбранную выше модель.",
         "enter_for_newline": "Enter — перенос строки",
         "enter_sends": "Enter отправляет",
         "enter_sends_mod_enter_newline": "Enter отправляет, {{mod}}+Enter — перенос строки",
@@ -10999,8 +11032,9 @@
         "retry": "Повторить",
         "role_background": "Фон",
         "role_chat": "Чат",
-        "role_effort_hint": "Действует только на моделях с рассуждением; пустое значение наследует усилие чата по умолчанию.",
-        "role_model_auto_hint": "«По умолчанию» выбор делает провайдер — модель чата не наследуется. Закрепите модель, чтобы выполнять эту работу на ней.",
+        "role_effort_hint": "Применяется только к моделям с рассуждением. «По умолчанию для модели» ничего не переопределяет — эта работа не наследует ваши усилия на рассуждение по умолчанию.",
+        "role_model_auto": "Автоматически (выбирает провайдер)",
+        "role_model_auto_hint": "При «Автоматически» выбирает провайдер — модель по умолчанию не наследуется. Закрепите модель, чтобы эта работа выполнялась на ней.",
         "role_subagents": "Субагенты",
         "send_shortcut": "Сочетание для отправки",
         "session_summaries": "Сводки сессий",
@@ -11248,7 +11282,6 @@
         "home_you_local_bin_kirocrew_leave_blank_for_stan": "/home/you/.local/bin/kirocrew  —  оставьте пустым для стандартной установки",
         "host_1_alias": "host-1-alias",
         "instances_stay_warm_live_tunnel_at_once_the_rest": "удалённых команд остаются «тёплыми» (живой туннель) одновременно; остальные подключаются по\n                требованию. Настройте через",
-        "is_already_used_by_another_instance_choose_a_dif": "уже используется другой удалённой командой — выберите другой\n              (и настройте этот порт на удалённом хосте).",
         "is_installed_somewhere_non_standard_on_the_remot": "установлен в нестандартном\n            месте на удалённом хосте. Оставьте пустым для обычной установки через pip в PATH. Чтобы найти\n            его, выполните на удалённом хосте:",
         "kirocrew": "kirocrew",
         "kirocrew_restart": "kirocrew restart",
@@ -11256,15 +11289,13 @@
         "local_bin_kirocrew": "~/.local/bin/kirocrew",
         "multi_instance_management_is": "Управление удалёнными командами",
         "multi_instance_management_is_off": "Управление удалёнными командами отключено",
-        "must_match_the_port_the_remote_gateway_serves_on": "Укажите порт, который слушает удалённый шлюз. Порты должны быть уникальными; не используйте один порт для разных удалённых команд.",
+        "must_match_the_port_the_remote_gateway_serves_on": "Укажите порт, который слушает удалённый шлюз. Разные команды могут использовать один и тот же порт — локальный порт переадресации назначается отдельно.",
         "name": "Название",
         "no_instances_configured_yet_add_one_below_to_man": "Удалённые команды пока не настроены. Добавьте одну ниже, чтобы управлять удалённой командой.",
         "only_needed_if": "Нужно только если",
         "opens_ssh_n_l_to_the_host_requires_non_interacti": "Открывает ssh -N -L к хосту. Требуется неинтерактивный SSH-доступ (ключ в ssh-agent).",
         "optional": "(необязательно)",
-        "port": "Порт",
-        "port_2": "· порт",
-        "port_the_local_forward_mirrors_it": "порт — локальная переадресация повторяет его.",
+        "port_2": "· удалённый порт",
         "refresh": "Обновить",
         "remote_host_1": "Удалённый хост 1",
         "remote_kirocrew_path": "Путь к kirocrew на удалённом хосте",
@@ -11276,7 +11307,7 @@
         "ssh_host_alias": "SSH-хост / алиас",
         "ssh_tunnel": "SSH-туннель",
         "ssm_target_instance_id": "Цель SSM (id инстанса)",
-        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "При подключении шлюз открывает туннель (SSH или AWS SSM) и выдаёт короткоживущий токен.\n        Локальный порт переадресации повторяет удалённый, поэтому каждая подключённая удалённая команда\n        должна использовать свой удалённый порт.",
+        "the_gateway_opens_an_ssh_tunnel_and_mints_a_shor": "При подключении шлюз открывает туннель (SSH или AWS SSM) и выдаёт короткоживущий токен.",
         "the_user_the_remote_gateway_runs_as_sudo_u_for_s": "Пользователь, от имени которого работает удалённый шлюз — команды SSM выполняются через sudo -u. На AMI Ubuntu укажите ubuntu.",
         "to_fully_tear_down_any_tunnels_still_running_fro": "чтобы полностью закрыть туннели, оставшиеся с прошлого раза.",
         "to_start_the_ssh_tunnel_manager_and_activate_ins": "чтобы запустить менеджер туннелей и включить переключение между удалёнными командами.",
@@ -11759,6 +11790,7 @@
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "выше. В отличие от Slack, у Bot Framework нет\n              режима только для исходящих сообщений.",
         "access": "Доступ",
+        "active": "Активно",
         "add_the": ", добавьте",
         "allowed_users_email_or_aad_object_id": "Разрешённые пользователи (email или object id в AAD)",
         "and_save": ", затем нажмите «Сохранить».",
@@ -11791,6 +11823,7 @@
         "if_single_tenant": "если однотенантный).",
         "in_the_bot_s": "В разделе бота",
         "is_your_app_id_then_dm_the_bot_full_manifest_ste": "— это ваш App ID, затем напишите боту\n              в личные сообщения — полные шаги по манифесту в руководстве по настройке выше.",
+        "jwt_required": "<strong>Для Microsoft Teams нужна зависимость PyJWT.</strong> Входящие запросы Bot Framework содержат подписанный токен, который необходимо проверять, поэтому без неё канал не запустится. Выполните <mono>pip install \"kirocrew[teams]\"</mono> в окружении, где работает gateway, и перезапустите его.",
         "leave_empty_for_a_multi_tenant_bot": "Оставьте пустым для мультитенантного бота",
         "loading_teams_config": "Загрузка конфигурации Teams…",
         "localhost": "localhost",
@@ -11799,6 +11832,8 @@
         "microsoft_app_id": "ID приложения Microsoft",
         "microsoft_teams": "Microsoft Teams",
         "multi_tenant": "Мультитенантный",
+        "needs_setup": "Требуется настройка",
+        "not_active": "Не активно",
         "optional_only_for_single_tenant_bots": "Необязательно — только для однотенантных ботов.",
         "or_single_tenant_if_you_ll_pin_a_tenant_id": ", или однотенантный, если вы закрепите ID тенанта.",
         "or_ssh_tunneled_address_won_t_work_expose_the_ga": "или\n              адрес через SSH-туннель не подойдёт. Откройте шлюз через туннель\n              (ngrok / cloudflared) или обратный прокси, затем используйте этот публичный хост как",
@@ -11808,6 +11843,7 @@
         "required": "Обязательно",
         "requires_a_public_https_url": "Требуется публичный HTTPS-URL.",
         "save_failed_is_the_gateway_running": "Не удалось сохранить. Шлюз запущен?",
+        "save_rejected": "Gateway отклонил эти настройки ({{code}}).",
         "save_teams_settings": "Сохранить настройки Teams",
         "saved": "Сохранено.",
         "saved_restart_the_gateway_to_apply": "Сохранено. Перезапусти шлюз, чтобы применить.",
@@ -12068,6 +12104,11 @@
     },
     "settingsPage": {
       "kirocrew_v": "Kiro Crew v",
+      "search": {
+        "aria_label": "Поиск в настройках",
+        "no_results": "Нет подходящих настроек",
+        "placeholder": "Поиск в настройках…"
+      },
       "settings": "Настройки"
     },
     "systemPage": {
