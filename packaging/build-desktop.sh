@@ -283,7 +283,9 @@ while [ -h "$SOURCE" ]; do
   [ "${SOURCE:0:1}" != "/" ] && SOURCE="$DIR/$SOURCE"
 done
 DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-exec "$DIR/python3.12" -s -m kiro_crew "$@"
+# The bundle is code-signed and immutable at runtime. -B is an interpreter-level
+# floor that survives environment scrubbing in managed MCP probe/pool paths.
+exec "$DIR/python3.12" -B -s -m kiro_crew "$@"
 LAUNCH
   chmod +x "$out/bin/kirocrew"
 
@@ -355,7 +357,7 @@ build_backend_windows() {
   # Relocatable launcher shim: %~dp0 is the .cmd's own directory (bin\),
   # so the interpreter resolves relative to the bundle wherever it lands.
   mkdir -p "$out/bin"
-  printf '@echo off\r\n"%%~dp0..\\python.exe" -s -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
+  printf '@echo off\r\n"%%~dp0..\\python.exe" -B -s -m kiro_crew %%*\r\n' > "$out/bin/kirocrew.cmd"
 
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/python.exe" -s -m kiro_crew --version >/dev/null \

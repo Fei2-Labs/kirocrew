@@ -1049,3 +1049,46 @@ print(before, after, spawned)
         for line in sb._PROBE_SHIM_CODE.splitlines():
             if line.startswith(("import ", "from ")):
                 assert "kiro_crew" not in line, line
+
+
+def test_spawned_probe_disables_bytecode_writes(monkeypatch):
+    """Isolated mode ignores PYTHONPYCACHEPREFIX, so the child also needs -B."""
+    captured: dict[str, object] = {}
+
+    class _Stream:
+        def fileno(self):
+            return 10
+
+        def close(self):
+            pass
+
+    class _Proc:
+        pid = 4242
+        stdin = _Stream()
+        stdout = _Stream()
+
+        def wait(self, timeout):
+            captured["wait_timeout"] = timeout
+            return 0
+
+    def _popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return _Proc()
+
+    monkeypatch.setattr(sb.subprocess, "Popen", _popen)
+    monkeypatch.setattr(
+        sb,
+        "_probe_parent_sequence",
+        lambda *_args, **_kwargs: (True, False, "ok", ""),
+    )
+
+    assert sb._probe_unshare_via_spawn() == (True, False, "ok", "")
+    assert captured["argv"] == [
+        sys.executable,
+        "-I",
+        "-B",
+        "-S",
+        "-c",
+        sb._PROBE_SHIM_CODE,
+    ]

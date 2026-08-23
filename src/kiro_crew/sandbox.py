@@ -955,7 +955,7 @@ def _probe_unshare_via_spawn() -> tuple[bool, bool, str, str] | None:
         # by hand: the child gets only its standard streams, so an orphaned probe
         # cannot hold the gateway lock fd or the dashboard listen socket open (#3150).
         proc = subprocess.Popen(
-            [sys.executable, "-I", "-S", "-c", _PROBE_SHIM_CODE],
+            [sys.executable, "-I", "-B", "-S", "-c", _PROBE_SHIM_CODE],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -5164,7 +5164,7 @@ def spawn_shim_argv(profile: str = RLIMIT_PROFILE_TOOL) -> tuple[str, ...]:
         # pay ~10ms to exec a shim that would only exec again.
         _SHIM_ARGV_CACHE[key] = ()
         return ()
-    argv = [sys.executable, "-I", "-S", "-c", _SPAWN_SHIM_CODE]
+    argv = [sys.executable, "-I", "-B", "-S", "-c", _SPAWN_SHIM_CODE]
     if spec:
         argv.append(f"--rlimits={spec}")
     if bias:

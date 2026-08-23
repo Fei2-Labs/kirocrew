@@ -1504,6 +1504,7 @@ async def _run_process(
             spawn_argv = [
                 sys.executable,
                 "-I",
+                "-B",
                 "-c",
                 _PROCESS_GROUP_SUPERVISOR_CODE,
                 *resource_limit_supervisor_argv(),

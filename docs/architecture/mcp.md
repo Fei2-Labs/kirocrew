@@ -303,6 +303,15 @@ Probes run from `POST /api/mcp/probe`:
   the HOST, it recurs identically for every server on every discovery cycle, so the
   remedy paragraph warns once per server name
   (`_warn_probe_sandbox_unavailable_once`) and demotes repeats to DEBUG.
+  - **Python environment scrubbing remains fail-closed for every probe.** Every
+    stdio probe passes `strip_python_env=True`, removing inherited `PYTHONPATH`,
+    `PYTHONHOME`, `PYTHONPYCACHEPREFIX`, and related keys before the child starts.
+    Managed server identity changes only the sandbox-backend carve-out below; it
+    does not weaken this environment scrub. Desktop-managed servers remain safe
+    after the scrub because the package-derived bundled launcher starts its
+    interpreter with `-B`, an interpreter-level no-bytecode floor that does not
+    depend on inherited environment variables. Customized and third-party commands
+    receive neither that trusted launcher contract nor any restored Python key.
   - **A managed server FALLS BACK to its declared tool list when — and only when —
     the sandbox refuses.** `kirocrew-core` / `-cron` / `-computer` declare their
     tools statically in this package (`mcp_core._list_tools()` and friends, the very
