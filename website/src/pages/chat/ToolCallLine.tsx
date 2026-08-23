@@ -12,11 +12,16 @@ import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
 import type { ChatMessage } from '../../types'
 import { ToolDetails } from './ToolDetails'
 import { registerToolPill } from '../../store/toolPillRegistry'
+import { ROW_PILL_BUTTON_CLASS, ROW_PILL_WRAPPER_CLASS } from './rowPill'
 import { extractToolFilePath } from '../../utils/toolFilePath'
+import { countDiffStats } from '../../utils/diffLineCounts'
 import { isWaitToolTitle } from '../../utils/waitToolTitle'
 import { isSafePath } from '../../utils/safePath'
 import { fileReadUrl } from '../../utils/fileReadUrl'
 import McpAppFrame from '../../components/McpAppFrame'
+import DiffBlock, { extractFilePath as extractDiffHeaderPath } from '../../components/DiffBlock'
+import { presentToolDiff } from './toolDiff'
+import { FileDiff } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
 import { fmtDateFields, fmtDuration as fmtDurationParts, fmtUnit } from '../../i18n/format'
 import { api } from '../../api/client'
@@ -34,6 +39,10 @@ import { api } from '../../api/client'
 // (Same philosophy as the `.ft-word` streaming reveal: already-revealed nodes
 // don't re-fire.)
 const revealedToolIds = new Set<string>()
+
+// Diff cards the reader folded, by tool_call_id — survives virtualizer
+// unmounts for the page lifetime so folds persist across scrolling.
+const foldedDiffCards = new Set<string>()
 
 // ── Row slide (height easing) ──
 // The transcript is pinned to the bottom, and the virtualizer's pin is
@@ -105,7 +114,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
 
   // Pull the matching toolLog entry. Returns purpose/input/output for the inline
   // expansion as well as completion status for the icon.
-  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, purpose, input, output, auto, ts, executionStartedAt, hasEntry, isShell, toolName, fromLog } = useAppSelector(s => {
+  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, purpose, input, output, auto, ts, executionStartedAt, hasEntry, isShell, toolKind, toolName, fromLog } = useAppSelector(s => {
     // Slot-aware: for a non-active slot (split-view pane) read that slot's
     // per-slot tool log / messages / running state; `slot` undefined or equal to
     // the active slot → active-slot globals.
@@ -172,6 +181,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           // Older ACP update frames may omit is_shell; execute is the stable
           // tool-kind value used by the transport and keeps those frames live.
           isShell: e.is_shell === true || e.kind === 'execute' || e.text.startsWith('Running:'),
+          // Raw ACP tool kind — gates the inline diff-card promotion below
+          // (only kind === 'edit' rows promote).
+          toolKind: e.kind || '',
           // Raw transport tool name, kept separate from the display `label`:
           // the label is simplified/localized for humans, so gating behaviour on
           // it would break under `useSimplifiedToolNames` or a translated UI.
@@ -204,6 +216,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       // so the empty-state copy only shows for truly bare historical messages.
       hasEntry: !!(metaInput || metaOutput),
       isShell: false,
+      // Persisted ACP tool kind (see _tool_meta in chat_runner.py). Rows
+      // written before the field existed read '' and never promote a card.
+      toolKind: (message.meta?.kind as string | undefined) || '',
       // Historical rows have no log entry; the message content is the only
       // carrier. Harmless either way — a replayed wait is never in flight.
       toolName: message.content.replace(/^🔧\s*/, ''),
@@ -469,6 +484,78 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // safe path AND an onFileOpen handler AND a successful HEAD probe (the file
   // still exists on disk).
   const filePath = useMemo(() => extractToolFilePath(input), [input])
+  // Inline diff presentation: an edit tool's input IS a unified diff
+  // (backend-derived from the ACP diff content block, see acp/_dispatch.py).
+  // Small diffs promote to an always-visible DiffBlock card below the pill;
+  // over-cap diffs degrade to a summary chip (filename, −N +M) that expands
+  // the details panel — never to nothing, because under the relaxed prompt
+  // the model no longer restates tool edits as ```diff blocks. Null for every
+  // non-edit tool and for rows predating meta.kind — those keep the
+  // collapsed-details rendering.
+  //
+  // A REJECTED or auto-denied call never promotes: the edit was not applied,
+  // and a first-class diff card visually dominates the pill's small red/amber
+  // status icon — a reader scanning history would believe the file changed.
+  // The full diff stays readable in the expanded details panel.
+  //
+  // The card renders REGARDLESS of the collapse-all-steps preference: a file
+  // change is a result, not a working step — the same class as the prose
+  // ```diff the final summary used to carry, which that preference never
+  // folded either. Density relief is per-card (the fold chip below) plus the
+  // size caps in presentToolDiff.
+  const denied = isRejected || isAutoDenied
+  const diffView = useMemo(
+    () => (denied ? null : presentToolDiff(toolKind, input)),
+    [denied, toolKind, input],
+  )
+  // Per-card density control: a promoted card can be folded back to its chip
+  // after reading (multi-edit turns stack several large cards otherwise, and
+  // the only other relief is the GLOBAL collapse-all preference). Folds are
+  // remembered at module scope by tool_call_id (same lifetime pattern as
+  // revealedToolIds above) so a virtualizer unmount does not silently reopen
+  // every card the reader closed.
+  const [cardFolded, setCardFolded] = useState(
+    () => !!(toolCallId && foldedDiffCards.has(toolCallId)),
+  )
+  const diffTogglePendingFocus = useRef(false)
+  const toggleCardFolded = useCallback(() => {
+    setCardFolded(prev => {
+      const next = !prev
+      if (toolCallId) {
+        if (next) foldedDiffCards.add(toolCallId)
+        else foldedDiffCards.delete(toolCallId)
+      }
+      return next
+    })
+    // The two halves of the toggle unmount each other, so the activated
+    // control disappears and focus would fall to <body>. Hand focus to the
+    // counterpart once it mounts — both carry data-diff-toggle.
+    diffTogglePendingFocus.current = true
+  }, [toolCallId])
+  useEffect(() => {
+    if (!diffTogglePendingFocus.current) return
+    diffTogglePendingFocus.current = false
+    const el = containerRef.current?.querySelector<HTMLElement>('[data-diff-toggle]')
+    el?.focus()
+  }, [cardFolded])
+  const cardStats = useMemo(
+    () => (diffView?.mode === 'card' ? countDiffStats(diffView.code) : null),
+    [diffView],
+  )
+  const showCard = diffView?.mode === 'card' && !cardFolded
+  // The chip is the one-line handle for COMPACT states only: the folded
+  // card's re-open handle, and the summary / pathname rows. An OPEN card
+  // shows no chip — DiffBlock's own header row already carries the file
+  // icon, basename and ±counts, and its fold control lives there (onFold),
+  // so the facts never render twice.
+  const chipView: { path: string | null; added: number; removed: number; truncated: boolean; opensCard: boolean } | null =
+    diffView?.mode === 'card'
+      ? (cardFolded
+        ? { path: extractDiffHeaderPath(diffView.code)?.path ?? filePath, added: cardStats?.added ?? 0, removed: cardStats?.removed ?? 0, truncated: false, opensCard: true }
+        : null)
+      : diffView?.mode === 'summary'
+        ? { ...diffView, opensCard: false }
+        : null
   const probeEnabled = !!filePath && isSafePath(filePath) && !!onFileOpen
   // HEAD-probe via React Query (project guideline: no manual useState/useEffect
   // fetch for server state). Gives request dedup across pills touching the same
@@ -647,14 +734,14 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         ? (e) => { if (e.target === e.currentTarget) setRevealPlayed(true) }
         : undefined}
     >
-      <div className="inline-flex items-start gap-1 group/toolpill max-w-full min-w-0 -ml-2">
+      <div className={`inline-flex items-start gap-1 group/toolpill ${ROW_PILL_WRAPPER_CLASS}`}>
       {/* No `font-mono`: the pill's label is prose with the odd argument spliced
           in ("Searching for 'YOLO' in src"), not code, and Tailwind's
           `font-mono` pins `var(--mono)` — which the Font Family setting never
           writes. The file-path chip below keeps mono, where it is earned. */}
       <button
         ref={pillButtonRef}
-        className={`inline-flex items-start gap-1 min-w-0 max-w-full text-[13px] px-2 py-0.5 rounded-md transition-all text-left focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
+        className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
         aria-expanded={effectivelyExpanded}
         aria-label={hasPendingPerm
           ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label })
@@ -695,7 +782,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           on hover; the icon inherits the button's currentColor. */}
       {showFileOpen && filePath && (
         <button
-          className="pi-morph shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[12px] leading-tight bg-bg-hover text-muted hover:text-accent hover:bg-accent/10 cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
+          className="pi-morph shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[12px] leading-5 bg-bg-hover text-muted hover:text-accent hover:bg-accent/10 cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
           style={{ marginTop: '1px' }}
           onClick={(e) => { e.stopPropagation(); onFileOpen!(filePath) }}
           title={i18nT('pages.chat.toolCallLine.open_in_side_panel', { path: filePath })}
@@ -707,8 +794,55 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       )}
       </div>
 
+      {/* Diff chip: the one-line handle for every diff presentation. For a
+          promoted card it folds/unfolds the card below; for a summary /
+          pathname row it expands the details panel. Full path in the native
+          tooltip — the visible basename alone cannot tell two same-named
+          files apart. Truncated transports prefix counts with ≥ (lower
+          bounds) next to a visible localized note. */}
+      {chipView && (
+        <button
+          type="button"
+          className="mt-1 ml-3 inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-border bg-bg-elevated text-[12px] leading-5 text-muted hover:text-text hover:border-border-strong cursor-pointer transition-colors focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
+          title={chipView.path ?? undefined}
+          aria-expanded={chipView.opensCard ? showCard : effectivelyExpanded}
+          data-diff-toggle={chipView.opensCard ? true : undefined}
+          onClick={e => {
+            e.stopPropagation()
+            if (chipView.opensCard) toggleCardFolded()
+            else onToggle()
+          }}
+        >
+          <FileDiff size={12} className="shrink-0" aria-hidden />
+          {chipView.path && <span className="font-mono max-w-[240px] truncate">{chipView.path.split('/').pop()}</span>}
+          <span className="tabular-nums">
+            {chipView.removed > 0 && <span className="text-danger">{chipView.truncated ? '≥' : ''}-{chipView.removed}</span>}
+            {chipView.removed > 0 && chipView.added > 0 && ' '}
+            {chipView.added > 0 && <span className="text-ok">{chipView.truncated ? '≥' : ''}+{chipView.added}</span>}
+          </span>
+          {chipView.truncated && (
+            <span className="text-warn">· {i18nT('pages.chat.toolCallLine.diff_truncated')}</span>
+          )}
+        </button>
+      )}
+      {/* Diff card: the full inline diff, foldable via the chip above. A
+          sibling of the pill (not inside the expanded panel) — the primary
+          display of the change; the details panel keeps the raw copy. The
+          wrapper is a pointer-only event fence (role="presentation"): clicks
+          inside the card must never toggle a surrounding TurnBlock /
+          collapsed-group wrapper. */}
+      {showCard && diffView?.mode === 'card' && (
+        <div className="mt-1.5" role="presentation" onClick={e => e.stopPropagation()}>
+          <DiffBlock code={diffView.code} complete onFileOpen={onFileOpen} onFold={toggleCardFolded} />
+        </div>
+      )}
+
       <StatusRow show={showShellActivity}>
-        <div className="ml-3 mt-1 text-[12px] text-muted">
+        {/* ml-5 = the pill's icon (12px) + the pill BUTTON's gap-2 (8px), so
+            this secondary line starts exactly where the pill's label text
+            does. (The outer wrapper's gap-1 is between pill and file chip —
+            not the icon-to-label gap.) */}
+        <div className="ml-5 mt-1 text-[12px] leading-5 text-muted" data-testid="shell-activity">
           <span className="sr-only" aria-live="polite">{i18nT('pages.chat.activityViewer.running')}</span>
           <span aria-hidden="true" className="tabular-nums font-mono">
             {i18nT('pages.chat.activityViewer.running')} · {elapsedLabel}
@@ -716,7 +850,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         </div>
       </StatusRow>
       <StatusRow show={showWaitCountdown}>
-        <div className="ml-3 mt-1 flex items-center gap-2 text-[12px] text-muted" data-testid="wait-countdown">
+        {/* Same ml-5 anchor as the shell-activity line above: the countdown is
+            a continuation of the pill's label text, not of its icon column. */}
+        <div className="ml-5 mt-1 flex items-center gap-2 text-[12px] leading-5 text-muted" data-testid="wait-countdown">
           {/* The status word is announced once; the digits are aria-hidden so a
               screen reader is not re-read every second. Same split as the shell
               activity row above. */}
@@ -736,7 +872,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             type="button"
             disabled={endingWait}
             data-testid="wait-end-now"
-            className="px-2 py-0.5 rounded-md border border-border bg-transparent text-muted text-[12px] cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            className="px-2 py-0.5 rounded-md border border-border bg-transparent text-muted text-[12px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             onClick={e => { e.stopPropagation(); endWaitNow() }}
           >
             {endingWait
@@ -775,7 +911,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           <button
             type="button"
             onClick={() => { if (toolCallId) onOpenApp?.(toolCallId) }}
-            className="mt-1.5 flex items-center gap-1.5 px-1.5 py-0.5 -ml-1.5 rounded text-[12px] text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+            className="mt-1.5 flex items-center gap-2 px-1.5 py-0.5 -ml-1.5 rounded text-[12px] leading-5 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
           >
             <PanelRight size={13} aria-hidden />
             <span>{i18nT('pages.chat.toolCallLine.opened_in_the_side_panel')}</span>

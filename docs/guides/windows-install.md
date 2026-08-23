@@ -15,15 +15,12 @@ build — the installer compresses its own already-signed executable — so that
 needs AWS credentials the shared build workflow deliberately does not hold.
 Current status:
 
-- **Published on nightly and insider** — `publish-windows.yml` writes the
-  installer, its `.blockmap` and the `latest.yml` feed to the download CDN. The
-  `latest/` alias is the human download:
+- **Published on every channel — nightly, insider and stable.** The `latest/`
+  alias is the human download:
   `https://download.crew.kiro.dev/desktop/<channel>/latest/KiroCrew-Setup.exe`.
-  **Stable has no Windows lane yet**: the stable release republishes the
-  immutable promotion bundle, whose artifact roles include no Windows installer,
-  so `WINDOWS_CHANNELS` in `auto-update.js` admits only `nightly` and `insider`
-  and a stable Windows client reports updates as unavailable rather than
-  resolving a feed nobody wrote.
+  A stable release republishes the already-signed installer it verified at
+  insider time rather than rebuilding it. If a Windows build fails, that release
+  simply ships without an installer instead of holding up the other platforms.
 - **Authenticode-signed** — signing runs during the build through AWS Signer and
   the publish lane refuses to publish bytes whose certificate table is empty,
   whose signer is not the pinned publisher, or which carry no RFC3161
@@ -45,7 +42,15 @@ Current status:
   elevated install under Program Files instead. The per-user default is what
   keeps a nightly install (`KiroCrew Nightly`) side by side with a stable one
   rather than replacing it; nightly additionally pins its own `nsis.guid` so
-  the two channels do not share an uninstall registry key. Either mode leaves
+  the two channels do not share an uninstall registry key, and its own
+  `win.appId` so they do not share a shortcut **AppUserModelID**. That last one
+  is Windows-only on purpose: the shared `appId` is required on macOS, where
+  Squirrel.Mac validates an update against the host's designated requirement,
+  but on Windows it reaches `${APP_ID}`, which the NSIS uninstaller passes to
+  `WinShell::UninstAppUserModelId`. Shared, uninstalling one channel
+  deregisters the identity the *other* channel's desktop and Start Menu
+  shortcuts still carry, and the shell then reports that app as relocated or
+  missing even though its `.exe` is untouched. Either mode leaves
   the Kiro Crew home alone (`deleteAppDataOnUninstall` stays false, and
   `~/.kiro/crew` is outside the install directory).
 - **Guided Kiro Crew artwork** — the welcome and finish pages use the existing
@@ -66,7 +71,11 @@ Current status:
   channel cannot touch the other's pending download or window state. An install
   predating that split leaves a shared `kirocrew-electron-mac-updater` behind,
   which is deliberately NOT removed for the same reason — it may still belong to
-  the other channel. **Deliberately kept:** `~/.kiro/crew` — sessions, memory,
+  the other channel. **Your settings survive that rename**: the first launch after
+  it carries over your update channel, remote hosts, hotkey and window position,
+  so an Insider install is not quietly moved to Stable. A preference you have
+  already changed is never overwritten.
+  **Deliberately kept:** `~/.kiro/crew` — sessions, memory,
   the database and config. Delete it by hand to remove Kiro Crew's data too.
   Also kept, because it belongs to a different product:
   `%LOCALAPPDATA%\Kiro-Cli`.
@@ -214,7 +223,9 @@ while the other 503s. Concretely:
 | Script cron jobs | need the `agent.sandbox_allow_unsandboxed_exec` opt-in above — they run through `wrap_argv`, which fail-closes where no OS sandbox backend exists. Without it the job fails with a message naming that setting (it no longer raises an uncaught error) |
 | Command cron jobs (`sh -c "…"`) | not supported on Windows — the stored command is vetted under POSIX-sh semantics, and Windows ships no shell whose language matches: cmd.exe is not POSIX at all, and Git-for-Windows's `sh.exe` is bash and performs brace expansion that hides `cat ~/.a{w,w}s/credentials` from the vet. The job fails-closed with an explanation. Use a **script cron** or an LLM `message` cron on this platform |
 | Script hooks (Settings → Hooks) | need the `agent.sandbox_allow_unsandboxed_exec` opt-in above (like script crons — the hook command routes through `wrap_argv`, which fail-closes where no OS sandbox backend exists; without it the hook returns that message as its `error`). With the opt-in they run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
-| Pull-request source drawer provider fetch/check/resolve | not yet — provider CLIs require the POSIX OS-level sandbox and fail closed with a clear unsupported response |
+| Pull-request source drawer provider fetch/check/resolve | not yet — and for a different reason than it used to be. The provider-CLI **trust** check now works here (see Issue Radar below), but the drawer does not share Issue Radar's spawn: it keeps its own async, sandbox-routed one (`source_providers._run_json`), which refuses on Windows because no OS sandbox backend exists. So the blocker is the sandbox, not the binary check |
+| Issue Radar | works — its `gh` spawn is not sandbox-routed, so the trust check is the only gate, and that is answered by reading the binary's Windows ACL (`kiro_crew.windows_acl`) in place of the POSIX `st_uid` + write-bit walk, which reports nothing on this platform. Refused when any principal outside `{you, SYSTEM, Administrators, TrustedInstaller}` can replace the binary or a parent directory, when the security descriptor is unreadable, or when the gateway token is **elevated** (an elevated gateway spawns elevated children, which makes the walk vacuous). GitHub only on this platform unless `glab` is installed. **If a `gh` you trust is refused**, the override variables (`KIROCREW_ISSUE_RADAR_GH`, `KIROCREW_GH_BIN`) re-enter the same check rather than bypassing it, so the recourse is to install `gh` somewhere only you and the system can write — a per-user `%LOCALAPPDATA%` install is accepted — or to file an issue quoting the refusal, which names the offending principal or the ACE type it could not evaluate |
+| Code Review Sage | not yet — the provider-CLI trust check now passes, but its review worker hands the session `python3 sage_lib/…` commands and `python3` is not an interpreter on Windows (the name resolves to the Microsoft Store app-execution alias, or to nothing). It refuses with that reason rather than starting a review that produces no result |
 | Browser automation (`playwright-cli`) | works (`npm install -g @playwright/cli@latest`, needs Node.js 20 or newer) |
 | Vector memory / embeddings | works — embeddings run **in-process** through the vendored llama-cpp-python (`_vendor/llama_cpp_libs/win_amd64`), which loads the Qwen3-Embedding-0.6B GGUF from `~/.kiro/crew/models`. No remote endpoint, no Docker and no Ollama server is involved on any platform |
 | STT (whisper / optional cloud transcription) | works |
@@ -223,6 +234,8 @@ while the other 503s. Concretely:
 | MCP server tool listing (dashboard MCP page, `kirocrew doctor`) | **built-in servers work, no opt-in** — `kirocrew-core` / `-cron` / `-computer` are probed for real: their command line is derived entirely inside the package (never user-config text), so the first-party carve-out spawns the handshake probe unconfined (env-scrubbed, SEL-audited as `unconfined`) even with no sandbox backend. When that probe cannot run (a transient sandbox failure, a governance sandbox floor, or a customized command for the server), the listing falls back to reading the package's own tool declaration and logs a WARNING noting that `ok` then means "declared" rather than "handshake succeeded". A **third-party** server has no declaration to read and never gets the carve-out, so its listing needs the `agent.sandbox_allow_unsandboxed_exec` opt-in — its binary is named by config and spawning it is what the sandbox exists to confine. The third-party server itself is unaffected: kiro-cli launches it from the agent config without this probe, so its tools still work in chat |
 | MCP gateway (opt-in, OFF by default) | works — a named-pipe transport replaces the AF_UNIX socket, and the peer check uses `GetNamedPipeClientProcessId` + a SID comparison in place of `SO_PEERCRED`. Still opt-in: set `mcp_gateway.enabled` to turn it on |
 | Papyrus (LaTeX editor, opt-in builtin) | works, **but compiling and git need the `agent.sandbox_allow_unsandboxed_exec` opt-in above** — like chat, its spawns route through `wrap_argv`, which fail-closes where no OS sandbox backend exists. Without it, compile and clone/commit/push/pull answer a clear 422 (`compiler_sandbox_unavailable` / `git_sandbox_unavailable`) naming the remedy rather than a bare "internal error". The managed Tectonic compiler is Windows-pinned (`x86_64-pc-windows-msvc`); Windows-on-ARM has no upstream asset and keeps the manual install path |
+| Computer use — **reading** (`computer_list_apps`, `computer_get_state`) | works, still behind the operator's one keystone opt-in (Settings → Computer Use). Reads the UI Automation tree of a window and can attach a `PrintWindow` screenshot. Two Windows-specific limits: a **non-elevated gateway cannot see an elevated window** (UIPI, and the secure desktop is unreachable to any application — a security property, not a gap), and a window drawn on a swapchain surface **cannot be captured**, so WindowsTerminal returns a tree with no screenshot rather than a blank image. Walking is also markedly slower than macOS — a large Chromium window costs hundreds of milliseconds at the node budget — so raise `max_tree_nodes` deliberately |
+| Computer use — **input** (click, drag, type, key, set value, scroll, action) | works, behind the same keystone opt-in. **Element-addressed actions touch neither your cursor nor your focus** — they go through UI Automation control patterns, so the provider performs them inside the target application; prefer them, and they are what `click_method: "auto"` resolves to. The exceptions are forced by the platform: Windows has no per-process input delivery (no `CGEventPostToPid` analogue), so `type_text` / `press_key` TAKE your keyboard focus (the result says so), and a coordinate click needs `click_method: "global"` named explicitly because it moves your real cursor — `auto` refuses to resolve onto it. Every pointer gesture is confined to the authorized window first, comparing top-level handles rather than pids (one broker process fronts many packaged apps), and a drag confines every point of its path since the release is where a drop lands |
 
 The not-yet items are tracked as Windows feature-parity follow-ups.
 
@@ -238,6 +251,22 @@ routes to `os.chmod(..., 0o600)` on POSIX and `icacls /inheritance:r /grant:r
 security-warning handlers in each caller fire — a naive `if IS_POSIX: os.chmod`
 guard would silently no-op on Windows, leaving secrets group/world-readable
 under NTFS.
+
+`restrict_to_owner` is file-shaped by design: its grants are deliberately
+non-inheritable (inheritance flags mean nothing on a file). A **directory**
+holding secrets must instead go through `platform_compat.restrict_dir_to_owner`
+— the directory twin — whose grants carry `(OI)(CI)` so files and
+subdirectories created inside it inherit the owner-only DACL, and which uses
+`0o700` on POSIX (a directory needs the execute bit to be traversable, which
+the file helper's `0o600` drops). `make_owner_only_dir` wraps creation
+(with parents) plus a best-effort tighten for the common case. Calling the
+file helper on a directory tightens only the directory node itself and leaves
+every file later created inside on the creating token's default DACL — the
+runtime logs a warning when it detects that misuse. Inheritance governs only
+what is created from then on: a file that already existed inside keeps its own
+DACL and — because Windows grants *Bypass Traverse Checking* to Everyone by
+default — stays reachable through the tightened parent, so repairing an
+existing install needs a per-file pass, not a parent tighten.
 
 ## File locking on Windows
 

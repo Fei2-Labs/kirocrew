@@ -27,8 +27,24 @@ const withAlpha = (cssVar) => ({ opacityValue }) =>
     : `color-mix(in srgb, var(${cssVar}) calc(${opacityValue} * 100%), transparent)`
 
 /** @type {import('tailwindcss').Config} */
+
+/**
+ * Content sources. The core app is always scanned. When a downstream edition is
+ * composed through the `KIROCREW_EDITION_DIR` seam (see `editionExtensionPlugin`
+ * in vite.config.ts), the edition's OWN sources must be scanned too — otherwise
+ * any utility class used only by edition components (e.g. `z-[95]`) is silently
+ * absent from the generated stylesheet, and the edition UI renders unstyled with
+ * no build error. Gated on the same `KIROCREW_ALLOW_EDITION=1` opt-in as the
+ * vite plugin (which fails the build on a dir without the opt-in), so a stray
+ * env var can never widen the scan of a stock build.
+ */
+const content = ['./index.html', './src/**/*.{ts,tsx}']
+if (process.env.KIROCREW_EDITION_DIR && process.env.KIROCREW_ALLOW_EDITION === '1') {
+  content.push(`${process.env.KIROCREW_EDITION_DIR}/**/*.{ts,tsx}`)
+}
+
 export default {
-  content: ['./index.html', './src/**/*.{ts,tsx}'],
+  content,
   darkMode: ['selector', '[data-theme="dark"]'],
   theme: {
     extend: {
@@ -104,6 +120,17 @@ export default {
         'slide-in-right': { from: { opacity: '0', transform: 'translateX(16px)' }, to: { opacity: '1', transform: 'translateX(0)' } },
         'slide-in-left': { from: { opacity: '0', transform: 'translateX(-16px)' }, to: { opacity: '1', transform: 'translateX(0)' } },
         'scale-in': { from: { opacity: '0', transform: 'scale(.92)' }, to: { opacity: '1', transform: 'scale(1)' } },
+        /* Entrance for the follow-up option chips. The midpoint is explicit
+           because the overshoot is the point: the chip rises past its resting
+           line and settles back, which is what makes a row of them read as
+           arriving rather than blinking into place. Carrying the overshoot in
+           the keyframe rather than only in the easing keeps its size fixed at
+           4px instead of scaling with the travel distance. */
+        'chip-hop': {
+          '0%': { opacity: '0', transform: 'translateY(12px)' },
+          '55%': { opacity: '1', transform: 'translateY(-4px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
         shimmer: { '0%': { backgroundPosition: '-200% 0' }, '100%': { backgroundPosition: '200% 0' } },
         /* Indeterminate progress: a review that is genuinely at 0% for minutes
            needs to read as working, not stalled. */
@@ -132,6 +159,12 @@ export default {
         'slide-in-right': 'slide-in-right .3s cubic-bezier(.16,1,.3,1) backwards',
         'slide-in-left': 'slide-in-left .25s cubic-bezier(.16,1,.3,1) backwards',
         'scale-in': 'scale-in .2s cubic-bezier(.16,1,.3,1) backwards',
+        /* `backwards` holds the 0% state through the stagger delay, so a chip
+           further down the ladder stays invisible until its turn instead of
+           appearing at rest and then jumping. Under prefers-reduced-motion the
+           delay is zeroed in index.css — the global rule only zeroes duration,
+           and a held 0% state would otherwise keep the chip hidden. */
+        'chip-hop': 'chip-hop .42s cubic-bezier(.34,1.56,.64,1) backwards',
         shimmer: 'shimmer 1.5s ease-in-out infinite',
         blink: 'blink .6s step-end infinite',
         'dot-breathe': 'dot-breathe 2s ease-in-out infinite',

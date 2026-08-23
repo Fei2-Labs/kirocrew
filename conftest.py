@@ -6,14 +6,14 @@ to ``test/``. ``[tool:pytest] testpaths`` also collects ``transfer`` and
 next to the code they cover), and those get no ``test/conftest.py`` fixtures at
 all -- only this file, plus that app's own ``tests/conftest.py`` where one exists.
 Anything that must hold for EVERY test therefore has to live here, at the
-rootdir, which is the one conftest pytest applies to all three testpaths.
+rootdir, which is the one conftest pytest applies to every testpath.
 
 Only the HOST-MUTATION FLOOR belongs in this file: the guards that must hold for a
-test collected from any of the three testpaths, because what they protect is the
+test collected from any testpath, because what they protect is the
 developer's machine rather than the correctness of one suite. Everything that is
 merely suite-specific isolation stays in ``test/conftest.py``.
 
-The floor has four parts, and each one exists because the "remember to isolate
+The floor has five parts, and each one exists because the "remember to isolate
 this" contract failed at least once:
 
 * **Services.** ``$XDG_CONFIG_HOME`` is redirected and the stdlib spawn funnels
@@ -25,6 +25,12 @@ this" contract failed at least once:
   under ``src/kiro_crew/apps/builtins/*/tests/`` -- which see this conftest and no
   other -- write the operator's live ``~/.kiro/crew`` the moment they touch
   ``config_dir()``.
+* **The agent-spec home.** ``kiro_agents_dir()`` is a LAZY resolver, so neither of
+  the two above reaches it, and a test that reaches the spec write path rewrites
+  the machine-wide ``<kiro home>/agents/kirocrew.json`` -- the file that decides
+  which MCP servers the operator's real agent has (issue #4912). The per-module
+  override seams are pinned instead of ``KIRO_HOME``, which cannot be pinned
+  without overriding ~35 tests' own ``Path.home()`` isolation.
 * **The system temp directory.** ``tempfile``'s base is redirected to a per-run
   directory for the whole process, so a bare ``mkdtemp()`` whose cleanup is missing
   or skipped leaves its directory somewhere this run owns and removes, instead of
@@ -69,10 +75,15 @@ and tolerate an ImportError so a partial checkout cannot break collection.
 
 from __future__ import annotations
 
+import asyncio
 import asyncio.base_events
+import atexit
 import contextlib
+import gc
 import getpass
 import importlib
+import linecache
+import logging
 import os
 import pathlib
 import shutil
@@ -212,7 +223,7 @@ def _refusal_reason(argv: object, *, shell: bool = False) -> str | None:
             return f"{name!r} rewrites host security policy"
         if name not in _SERVICE_MANAGERS:
             continue
-        for candidate in tokens[index + 1:]:
+        for candidate in tokens[index + 1 :]:
             if _basename(candidate) in _MUTATING_VERBS:
                 return f"{name} {candidate!r} changes host service state"
     return None
@@ -446,6 +457,18 @@ def _block_host_service_mutation(request, monkeypatch):
 #: certain to still exist, and it is where every test expects to begin.
 _SESSION_CWD: str | None = None
 
+#: Tests between ``linecache`` clears. Measured on a 1,266-test slice: 500 saves
+#: 22.8 MiB and 100 saves 28.0 MiB, with no measurable difference in wall time, so the
+#: CPU side of this trade is flat enough to take the memory. The cache is per-process,
+#: so under ``-n auto`` each worker clears on its own count.
+_LINECACHE_CLEAR_EVERY = 100
+_TESTS_SINCE_LINECACHE_CLEAR = 0
+
+#: How many objects ``pytest_collection_finish`` moved into the permanent generation.
+#: ``None`` until it has run, which is what distinguishes "this hook did its job" from
+#: the few hundred objects the interpreter had already frozen on its own.
+_FROZEN_AT_COLLECTION: int | None = None
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Record the working directory pytest started in, before any test can move it."""
@@ -454,6 +477,155 @@ def pytest_configure(config: pytest.Config) -> None:
         _SESSION_CWD = os.getcwd()
     except OSError:  # pragma: no cover - pytest could not have started here
         _SESSION_CWD = str(_REPO_ROOT)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_warning_recorded(warning_message, when, nodeid, location) -> None:
+    """Drop a recorded warning's ``source`` object once the warning has been rendered.
+
+    Every warning this suite emits is retained for the whole session, and one kind of
+    warning brings a whole test's object graph with it.
+
+    The chain: ``_pytest/warnings.py`` records each warning with
+    ``pytest_warning_recorded.call_historic(...)``, and pluggy appends those kwargs to
+    ``_HookCaller._call_history`` -- a list it never clears, because a historic hook
+    exists precisely to be replayed to plugins registered later. So the
+    ``warnings.WarningMessage`` survives to the end of the run. Ordinarily that is a
+    few hundred bytes. But ``WarningMessage.source`` is the OBJECT the warning is
+    about, and for ``RuntimeWarning: coroutine '...' was never awaited`` that object is
+    the coroutine: it holds its frame, its frame holds every local, and those locals
+    hold whatever the test built. One un-awaited coroutine therefore pins an entire
+    test's graph for the session, in every worker.
+
+    ``trylast`` is what makes this free of diagnostic loss, and it is not a
+    preference. ``TerminalReporter.pytest_warning_recorded`` renders the warning to a
+    plain string IMMEDIATELY -- including ``tracemalloc_message(source)``, the
+    "Object allocated at:" traceback when tracemalloc is tracing and the "Enable
+    tracemalloc" hint when it is not -- and stores that string. Running last means the
+    text is already built before the reference goes, so nothing a reader would have
+    seen is lost. Clearing it ``tryfirst`` WOULD lose that suffix, which is why the
+    ordering is pinned by a test.
+
+    Kept as a BACKSTOP rather than for its average saving, and the distinction is
+    measured. Where un-awaited coroutines cluster it is large: ``test_dashboard_chat.py``
+    emits 60 of them across 590 tests, and clearing ``source`` takes that file from 284
+    to 219 MiB. On a mixed slice it is worth nothing at all -- an AsyncMock-dense
+    3,401-test set emits 11 and measures +1.7 MiB, i.e. noise. So this is not a
+    general-purpose win; it removes a tail risk whose cost is one attribute write per
+    warning, and which scales with however many un-awaited coroutines the suite acquires
+    later.
+
+    The residual edge: a plugin registered AFTER a warning was recorded receives the
+    replay with ``source`` already gone. Conftest plugins are all registered before
+    tests run, so in this repo that is unreachable.
+    """
+    warning_message.source = None
+
+
+def pytest_collection_finish(session: pytest.Session) -> None:
+    """Move the collected item tree out of the garbage collector's reach.
+
+    Collecting every testpath leaves roughly three million objects alive, and they
+    are alive for the rest of the run by design -- the item tree, its fixture closures,
+    the rewritten assertion code. The garbage collector does not know that, so every
+    full pass walks all of them looking for cycles it will never find. Worse, on the
+    interpreters this suite supports the full collection is scheduled from a measure of
+    how much long-lived material exists, so that static population also DELAYS
+    collection: a test's own cyclic garbage waits longer before anything reclaims it.
+    (The exact scheduling differs across 3.10-3.13 -- 3.13 replaced the generational
+    threshold with an incremental collector -- but the static set is unscanned either
+    way, which is the part this depends on.)
+
+    ``gc.freeze()`` moves everything currently tracked into a permanent generation that
+    is never scanned. Measured over 3,798 test executions: full passes went 1 -> 3 and
+    the objects they reclaimed went 61,604 -> 423,380, a 6.9x improvement in how much
+    cyclic garbage is actually collected during a run.
+
+    The end-RSS effect is small on its own (-3.5 MiB) because freed memory stays in the
+    allocator's arena rather than returning to the OS. What it buys is that the garbage
+    is reclaimed at all, which is why it is worth keeping despite the modest number.
+
+    Placed at collection finish, not at configure: before collection there is nothing
+    worth freezing, and after the first test the population is no longer purely static.
+    Freezing is safe here for the same reason it helps -- these objects were going to
+    live for the whole session anyway. Verified rather than assumed: live tracked objects
+    at session end are slightly FEWER with the freeze than without (3,221,373 vs
+    3,235,522), uncollectable stays 0, and the frozen count itself falls during the run,
+    so refcount reclamation still works inside the permanent generation. Only cyclic
+    garbage created BEFORE the freeze could leak, and collection creates none.
+
+    It also helps the sandbox's ``fork``-based probes rather than hurting them: this is
+    the documented pre-fork optimization, and the 16 sandbox suites pass identically
+    with and without it.
+
+    Records the delta rather than leaving the effect to be inferred from
+    ``gc.get_freeze_count()``: the interpreter already has a few hundred objects frozen
+    before this runs, so a bare "is anything frozen" assertion passes with this hook
+    deleted.
+    """
+    global _FROZEN_AT_COLLECTION
+    gc.collect()
+    before = gc.get_freeze_count()
+    gc.freeze()
+    _FROZEN_AT_COLLECTION = gc.get_freeze_count() - before
+
+
+def pytest_runtest_logfinish(nodeid: str, location) -> None:
+    """Periodically drop ``linecache``'s copy of every source file that was read.
+
+    ``linecache`` keeps the full TEXT of every file it is asked for, and nothing evicts
+    it, so a worker accumulates source it will not look at again. Measured on a
+    1,266-test slice: 90 files / 0.8 MiB after collection, growing to 170 files /
+    11.4 MiB by the end of the run, and the ceiling is the 27.7 MiB of text in ``src``.
+
+    The fillers are ``inspect.getsource`` (used by 128 test modules) and traceback
+    rendering, one module at a time -- NOT the source-scanning guard tests, which read
+    with ``Path.read_text()`` and add no linecache entries at all. The biggest single
+    entries are simply the biggest modules (``dashboard/chat_runner.py`` at 408 KiB,
+    ``slack/gateway.py`` at 388 KiB).
+
+    This is the one of the three retention guards that pays on an ORDINARY slice rather
+    than on a particular file, and it grows with the run: measured over 12,660 test
+    executions, end RSS 1025 -> 924 MiB (-101 MiB, -10%), with the repeat-visit slope
+    falling from 19.6 to 12.4 MiB per 1,000 tests.
+
+    ``logfinish`` rather than teardown for tidiness, not safety: a failure report is
+    unaffected either way. ``report.longrepr`` is a string already rendered at
+    ``pytest_runtest_makereport``, and ``inspect.findsource`` calls
+    ``linecache.checkcache()`` before ``getlines``, so a cleared or stale entry is
+    simply re-read. Verified by running a two-failure file with no clearing, clearing at
+    teardown, and clearing here: the ``FAILURES`` sections are byte-identical.
+
+    Every N tests rather than every test because the cache is also what makes the next
+    traceback cheap. The interval is a memory/CPU trade with a very flat CPU side --
+    clearing 5x more often buys another ~5 MiB at no measurable time cost.
+    """
+    global _TESTS_SINCE_LINECACHE_CLEAR
+    _TESTS_SINCE_LINECACHE_CLEAR += 1
+    if _TESTS_SINCE_LINECACHE_CLEAR >= _LINECACHE_CLEAR_EVERY:
+        _TESTS_SINCE_LINECACHE_CLEAR = 0
+        linecache.clearcache()
+
+
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
+    """Budget ``-n auto`` by memory and by what other runs on this host hold.
+
+    Registered HERE, at the rootdir, because a budget that only covers ``test/``
+    is absent from ``transfer`` and from the in-package app suites -- and absent
+    reads exactly like "decided not to clamp", so the gap is silent. Over-spawning
+    workers takes the whole machine down, which makes this a host-protection
+    concern and puts it on the same floor as the rest of them.
+
+    The policy lives in :mod:`xdist_budget`; this is only the registration.
+    Imported in-body to keep this file's module-level imports stdlib + pytest, and
+    returning ``None`` on an ImportError hands the decision back to xdist's own
+    default rather than breaking startup on a partial checkout.
+    """
+    try:
+        import xdist_budget
+    except ImportError:  # pragma: no cover - partial checkout
+        return None
+    return xdist_budget.resolve_workers()
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -520,9 +692,7 @@ def _live_exporter_threads() -> set:
     the same name, so a name-keyed set makes a second leak indistinguishable from the
     first one still running.
     """
-    return {
-        t for t in threading.enumerate() if _OTEL_THREAD_MARKER in t.name and t.is_alive()
-    }
+    return {t for t in threading.enumerate() if _OTEL_THREAD_MARKER in t.name and t.is_alive()}
 
 
 def _stop_leaked_exporter(thread) -> None:
@@ -604,6 +774,67 @@ def _no_leaked_telemetry_exporter():
         "to it -- see "
         "conftest._no_leaked_telemetry_exporter."
     )
+
+
+# ── the logging record factory goes back after every test ─────────────
+
+
+@pytest.fixture(autouse=True)
+def _restore_log_record_factory():
+    """Put ``logging``'s record factory back, so one test cannot rewrite every later record.
+
+    ``logging.setLogRecordFactory`` is ONE process-global slot. The wrapper the suite
+    reaches -- ``log_redaction``'s, installed by ``cli._setup_cli_logging`` for a
+    long-lived command -- is deliberately destructive to every record it then creates: it
+    materializes ``msg`` and clears ``args`` so a handler cannot re-format, and it renders
+    ``exc_info`` into ``exc_text`` and clears ``exc_info`` so a handler cannot re-render an
+    unredacted traceback. Correct for redaction, and invisible to the test that leaves it
+    installed, because the damage lands on whatever unrelated test later asserts on
+    ``record.exc_info``, ``record.args``, or a deferred ``%s``.
+
+    Measured: two tests failed this way in a release run and neither is a logging test --
+    ``test_pid_lifecycle.py::TestFindOrphanMcpCandidates::
+    test_unexpected_probe_error_keeps_traceback`` asserting a probe failure kept its
+    traceback, and ``test_log_redaction`` itself hitting ``RecursionError`` because
+    installing over the already-installed wrapper captured it as its own base factory.
+
+    **Sharding hides this class, so the floor cannot rely on a full-suite run to find it.**
+    ``ci.yml`` slices the suite into duration-balanced pytest-split groups and a leak only
+    damages tests in the SAME process, so PR CI usually cannot observe it at all; the
+    release job runs the suite whole and is otherwise the first place it appears -- as
+    failures in files unrelated to the cause, long after the diff merged. Restoring here
+    removes the class outright rather than improving the odds of noticing it.
+
+    Restoring rather than failing is deliberate, for the same reason the CWD restore in
+    ``pytest_runtest_teardown`` above does not blame either: installing this factory is a
+    legitimate, unavoidable side effect of every test that drives the real ``cli.main()``
+    or ``_setup_cli_logging`` in-process, which production does once per process and never
+    undoes. Blaming them would demand pure bookkeeping with no test value, and the damage
+    is to OTHER tests, so stopping it propagating is the whole job.
+    ``log_redaction.uninstall_log_redaction()`` is there for a test that wants to assert on
+    the uninstalled state itself; the install/uninstall contract is pinned by
+    ``test_log_redaction.py``, not by this floor.
+
+    The restore target is what this test INHERITED, not a pristine ``LogRecord``. That is
+    what lets a higher-scoped fixture install one for the whole class or module without
+    this floor tearing it out from under the second test, and it is also why this is a
+    fixture rather than the cheaper ``pytest_runtest_teardown`` hookimpl the CWD restore
+    uses: a conftest ``pytest_runtest_setup`` runs BEFORE the item's own fixtures, so its
+    snapshot would miss such an installer and the teardown would then rip it out after the
+    class's FIRST test. Measured cost of the fixture protocol over the hookimpl: ~50us per
+    test, ~3s of CPU across the suite, spread over the xdist workers.
+
+    The BOUNDARY that follows from the same choice: a class-, module- or session-scoped
+    fixture that installs a factory and never removes it leaks PAST its own scope, because
+    every later test inherits it and so restores to it. No fixture in this repo does that
+    -- every installer sits in a test body, which is inside this fixture's window -- but a
+    new higher-scoped one has to uninstall itself; the floor cannot tell that case from a
+    deliberate one.
+    """
+    before = logging.getLogRecordFactory()
+    yield
+    if logging.getLogRecordFactory() is not before:
+        logging.setLogRecordFactory(before)
 
 
 # ── the sandbox probe cache is warm for every test, in every testpath ──
@@ -1057,9 +1288,7 @@ def _isolate_tempfile_base_per_test(_isolate_tempfile_base, request):
     """
     if not os.environ.get(_TMP_PER_TEST_ENV):
         return
-    safe = "".join(
-        ch if (ch.isalnum() or ch in "-._") else "_" for ch in request.node.nodeid
-    )
+    safe = "".join(ch if (ch.isalnum() or ch in "-._") else "_" for ch in request.node.nodeid)
     _redirect_tempfile_base(_isolate_tempfile_base / safe[-100:])
 
 
@@ -1329,6 +1558,163 @@ def _isolate_subagents_dir(_isolation_dirs, monkeypatch):
     )
 
 
+#: Modules carrying the documented ``KIRO_AGENTS_DIR`` override hook (``None`` = live).
+#: Each is ``(module, attribute)``; the fixture below points them all at ONE per-test
+#: directory, so the hook production already offers "a caller (test/tooling)" is set
+#: by default instead of per test.
+_AGENT_SPEC_HOOKS: tuple[tuple[str, str], ...] = (
+    ("kiro_crew.agent", "KIRO_AGENTS_DIR"),
+    ("kiro_crew.agent_discovery", "_KIRO_AGENTS_DIR"),
+    ("kiro_crew.apps.bridges", "KIRO_AGENTS_DIR"),
+    ("kiro_crew.cli_doctor", "KIRO_AGENTS_DIR"),
+    ("kiro_crew.doctor_deadpath", "KIRO_AGENTS_DIR"),
+)
+
+#: The real user home, captured at IMPORT -- before any test can patch
+#: ``Path.home``. The pin below compares against it to tell "nobody redirected the
+#: home, so use the per-test dir" from "this test redirected it, so follow the test".
+#: ``patch("<module>.Path.home", ...)`` is the dominant isolation idiom in this suite
+#: and it is global by construction (``from pathlib import Path`` binds the same class
+#: object everywhere, so patching an attribute on it patches it for every module), which
+#: is why the pin can detect it at all.
+_REAL_USER_HOME = pathlib.Path.home()
+
+
+@pytest.fixture(scope="session")
+def _agent_spec_seam_modules():
+    """Import the HOOK modules once per worker process.
+
+    Ordering is what this buys: the per-test fixture below can only patch a module that
+    is already imported, and these four carry the write seams #4912 names, so "whatever
+    collection happened to import" is not a strong enough guarantee for them.
+
+    Scoped to the hook table on purpose. The resolver-binding table is far wider and
+    includes the heaviest modules in the repo (``slack.gateway``), which no worker should
+    import to protect a binding that module cannot reach unless a test imported it
+    anyway. Those keep the patch-if-imported tolerance ``_isolate_shared_kiro_paths``
+    uses.
+
+    ``ImportError`` is tolerated per module, matching the convention the other fixtures
+    here follow: a partial checkout must not break collection, and a module that cannot
+    import has no binding to leak.
+    """
+    for module, _attr in _AGENT_SPEC_HOOKS:
+        try:
+            importlib.import_module(module)
+        except ImportError:  # pragma: no cover - partial checkout
+            continue
+
+
+@pytest.fixture(autouse=True)
+def _isolate_agent_spec_home(_agent_spec_seam_modules, _isolation_dirs, monkeypatch):
+    """Pin the AGENT-SPEC home to a per-test tmp dir, for EVERY testpath.
+
+    A third isolation axis, distinct from both the data home and the import-time
+    ``~/.kiro`` bindings above. The agent specs are the file kiro-cli reads to learn
+    which MCP servers exist, and ``kiro_agents_dir()`` is a LAZY resolver
+    (``kiro_home()`` -> ``$KIRO_HOME`` or ``Path.home()/.kiro``), so neither
+    ``KIROCREW_HOME`` nor ``_SHARED_KIRO_PATHS`` reaches it -- the shared-path ratchet's
+    own docstring records that lazy resolvers are outside its scope.
+
+    Without this, any test reaching the write path (``rebuild_agent_config`` and the
+    per-agent writers around it, ``apps.bridges._register_agents``) rewrites the
+    operator's machine-wide ``<kiro home>/agents/kirocrew.json``. Confirmed live
+    (#4912): a suite run inside a throwaway clone left every managed server's
+    ``command`` pointing into that clone's venv and pinned the per-test data home into
+    their ``env``, because ``_managed_mcp_env`` stamps the WRITER's paths. Both stop
+    existing when the run ends, so afterwards every new session on the machine spawned
+    ``kirocrew-core`` from a deleted venv against a data home recreated empty ->
+    ``read_local_secret()`` returned "" -> every internal HTTP call failed
+    ``internal_auth_mismatch`` (``received=absent``), killing ``spawn_run``,
+    ``learn_add`` and ``cron_*`` while in-process tools kept working. A gateway restart
+    healed it, and the next suite run re-broke it, which is what made it look
+    intermittent and unfixable.
+
+    ``KIRO_HOME`` is NOT the lever used here, deliberately -- see
+    ``_isolate_kirocrew_home`` for why pinning that variable is refused: ~35 tests
+    isolate ``kiro_home()`` the other way round with
+    ``patch("pathlib.Path.home", ...)``, and an env pin overrides their own isolation
+    so they read an empty directory instead of the tree they just built. Pinning the
+    per-module seams instead leaves both of those levers untouched.
+
+    One directory for every entry, not one each: production resolves a single agents
+    dir, so a test that writes a spec through one seam and reads it through another
+    (``rebuild_agent_config`` then ``agent_discovery``) has to see the same tree.
+
+    Unlike ``_isolate_shared_kiro_paths``, the HOOK half does not settle for patching
+    whatever happens to be in ``sys.modules``. That fixture's residual hole -- a module
+    first imported inside a test's own body, after the fixture already ran -- is
+    tolerable for a path that is only read, and not for these: ``rebuild_agent_config``
+    and ``apps.bridges._register_agents`` WRITE, and a test that imports its subject in
+    its own body is a normal shape here. ``_agent_spec_seam_modules`` therefore imports
+    those four once per worker process. MEASURED cold on this tree: agent 177 ms,
+    cli_doctor 87 ms, bridges 33 ms, agent_discovery 19 ms -- ~315 ms per worker for a
+    whole session, against a shard that runs for minutes. Per-TEST import would have
+    been the unaffordable shape, which is what that other fixture's tolerance is really
+    about.
+
+    The resolver-binding half keeps the patch-if-imported tolerance: it is wide and
+    includes the repo's heaviest modules, and a module nobody imported has no bound name
+    for a test to reach.
+
+    Creates nothing -- an absent agents dir is the normal fresh-install state, and
+    every writer ``mkdir(parents=True)`` first.
+
+    A test that sets its own value still wins, through EITHER lever. ``monkeypatch``
+    applied later in setup overrides the seams directly; and a test that sets
+    ``KIRO_HOME`` -- the documented env override, which several tests use to place the
+    agents dir under their own ``tmp_path`` -- is deferred to by the replacement
+    resolver installed here. Deferring is safe because the variable is CLEARED first,
+    so anything visible afterwards was chosen by the test rather than exported by the
+    operator (whose value would name another real home).
+    """
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    root = _isolation_dirs("kiro-agents")
+    paths = sys.modules.get("kiro_crew.config.paths")
+
+    def _pinned_agents_dir() -> pathlib.Path:
+        """The per-test dir, unless this test redirected the home itself."""
+        if paths is None:  # pragma: no cover - defensive: package not importable
+            return root
+        if os.environ.get("KIRO_HOME") or pathlib.Path.home() != _REAL_USER_HOME:
+            return paths.ambient_agents_dir()
+        return root
+
+    for module, attr in _AGENT_SPEC_HOOKS:
+        mod = sys.modules.get(module)
+        if mod is not None:
+            monkeypatch.setattr(mod, attr, root, raising=False)
+    if paths is not None:
+        monkeypatch.setattr(paths, "_agents_dir_override", _pinned_agents_dir)
+    return paths.ambient_agents_dir if paths is not None else None
+
+
+@pytest.fixture
+def unpinned_agent_spec_home(_isolate_agent_spec_home, monkeypatch):
+    """Opt out of the agent-spec pin, for a test that ASSERTS on the real layout.
+
+    Two drift guards need the real resolution rather than an isolated copy: one checks
+    that ``security``'s ``.kiro/agents`` literal is still the home-relative tail of
+    ``kiro_agents_dir()``, the other that ``apps.bridges`` still targets the
+    machine-wide registry (which is why a pod may not run ``app``). Pinned to a tmp
+    path, both assert about a path that does not ship -- weakening the guard to satisfy
+    an isolation fixture, which is backwards. Same call the shared-path ratchet's
+    ``_EXCLUDED`` makes for its security anchors.
+
+    READ-ONLY use only. This hands back the real machine-wide location, so a test that
+    WRITES through it edits the operator's live agent. Nothing here stops that; the
+    two current users only assert.
+    """
+    for module, attr in _AGENT_SPEC_HOOKS:
+        mod = sys.modules.get(module)
+        if mod is not None:
+            monkeypatch.setattr(mod, attr, None, raising=False)
+    paths = sys.modules.get("kiro_crew.config.paths")
+    if paths is not None:
+        monkeypatch.setattr(paths, "_agents_dir_override", None)
+    return _isolate_agent_spec_home
+
+
 @pytest.fixture(autouse=True)
 def _no_model_download(monkeypatch, _isolation_dirs):
     """Never let a test trigger the 610MB embedding-model download.
@@ -1371,6 +1757,7 @@ def _isolate_agent_state_sidecar(_isolation_dirs, monkeypatch):
     """
     sidecar_root = _isolation_dirs("agent-state")
     monkeypatch.setattr("kiro_crew.agent_state.config_dir", lambda: sidecar_root)
+
 
 # ── the repository checkout is host state too ─────────────────────────
 
@@ -1463,6 +1850,61 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     _ROOT_BASELINE = _root_entries()
 
 
+def _drain_windows_proactor_finalizers() -> None:
+    """Suppress 'Event loop is closed' from ProactorEventLoop transport finalizers.
+
+    On Windows with Python 3.12+, ``asyncio.run()`` creates a ProactorEventLoop,
+    runs the coroutine, then CLOSES the loop. The IocpProactor's transport objects
+    store a reference to their own loop (``self._loop``). When those transports are
+    garbage-collected later, their ``__del__`` methods call
+    ``self._loop.call_soon()`` on the *original* closed loop — not whatever loop is
+    currently set. This raises ``RuntimeError: Event loop is closed`` as an
+    unraisable exception.
+
+    On an xdist worker process, unraisable exceptions write to stderr and cause
+    exit code 1 — failing the CI shard with no named test failure (issue #4764).
+
+    The fix: install a ``sys.unraisablehook`` that silences ``RuntimeError: Event
+    loop is closed`` from asyncio transport ``__del__`` methods, and an ``atexit``
+    handler that forces GC while the hook is still active to drain pending
+    finalizers before interpreter shutdown (where unraisablehook itself may be
+    torn down).
+    """
+    _original_unraisablehook = sys.unraisablehook
+
+    def _suppress_closed_loop(unraisable: sys.UnraisableHookArgs) -> None:
+        """Suppress 'Event loop is closed' from transport __del__."""
+        exc = unraisable.exc_value
+        if (
+            isinstance(exc, RuntimeError)
+            and str(exc) == "Event loop is closed"
+        ):
+            # Silently swallow — the transport is being finalized after its loop
+            # closed, which is harmless (the I/O is already done).
+            return
+        # Everything else goes to the original hook.
+        if _original_unraisablehook is not None:
+            _original_unraisablehook(unraisable)
+        else:
+            sys.__unraisablehook__(unraisable)
+
+    sys.unraisablehook = _suppress_closed_loop
+
+    # Force GC while the hook is active to drain finalizers before interpreter
+    # shutdown tears down sys.unraisablehook itself.
+    gc.collect()
+    gc.collect()
+
+    def _final_gc_pass() -> None:
+        """Last-resort GC at interpreter exit while the hook is still installed."""
+        try:
+            gc.collect()
+        except (TypeError, AttributeError):
+            pass
+
+    atexit.register(_final_gc_pass)
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Fail the run when the suite left new, non-ignored entries at the root.
 
@@ -1473,7 +1915,37 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     run, and an empty file produced this way has already been committed and
     shipped. Detected here rather than cleaned: deleting an unexpected file is
     not this guard's call to make.
+
+    Also releases the xdist worker slots this run holds, because a module may
+    define ``pytest_sessionfinish`` only once and appending a second definition
+    silently shadows this guard. Done FIRST, and before the early return below:
+    the kernel would drop the locks at process exit anyway, but returning capacity
+    at the end of the run rather than at interpreter teardown is the whole point,
+    and the early return would otherwise skip it.
     """
+    try:
+        import xdist_budget
+
+        xdist_budget.release_worker_slots()
+    except ImportError:  # pragma: no cover - partial checkout
+        pass
+
+    # ── Windows ProactorEventLoop teardown cleanup (#4764) ─────────────────
+    # On Windows + Python 3.12, asyncio.run() creates and closes a
+    # ProactorEventLoop each call. The closed loop's IocpProactor leaves
+    # pending I/O Completion Port handles whose __del__ methods fire during
+    # interpreter shutdown and call loop.call_soon() on the closed loop,
+    # raising "RuntimeError: Event loop is closed". This unraisable exception
+    # writes to stderr and causes the xdist worker process to exit with code 1
+    # — failing the CI shard with no named test failure.
+    #
+    # Fix: before the worker exits, ensure a FRESH open event loop is set as
+    # current, run a gc.collect() to drain pending finalizers while the loop
+    # is still usable, then install an atexit handler that keeps a usable loop
+    # available during interpreter finalization.
+    if sys.platform == "win32":
+        _drain_windows_proactor_finalizers()
+
     if hasattr(session.config, "workerinput") or _ROOT_BASELINE is None:
         return
     current = _root_entries()

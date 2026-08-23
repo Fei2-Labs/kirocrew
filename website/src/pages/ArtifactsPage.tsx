@@ -20,6 +20,7 @@ import SimpleSelect from '../components/SimpleSelect'
 import RemoteArtifactCard from '../components/RemoteArtifactCard'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '../components/ui/dropdown-menu'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from '../components/MarkdownRenderer'
@@ -666,7 +667,7 @@ function FolderNameInput({ initial = '', placeholder = 'Folder name', onCommit, 
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
-      className="w-full bg-transparent border border-accent rounded px-1.5 py-0.5 text-text-strong outline-none text-sm select-text"
+      className="w-full bg-transparent border border-accent rounded px-1.5 py-0.5 text-text-strong outline-none text-sm select-text focus-ring"
       {...ime.bindEnter<HTMLInputElement>({
         onEnter: () => { (document.activeElement as HTMLInputElement)?.blur() },
         onEscape: () => { cancelledRef.current = true; onCancel() },
@@ -1268,7 +1269,7 @@ function MasonryGridItem({ data, context, index }: { data: GridEntry; context: L
 /** Column headers shared by the flat table and the folder tree table. Data
  * columns sort on click (asc → desc → default); the star and Actions columns
  * are control columns and stay plain. */
-function LibraryTableHead({ sort, onSort }: { sort: SortState; onSort: (key: SortKey) => void }) {
+function LibraryTableHead({ sort, onSort, edgeRight = false }: { sort: SortState; onSort: (key: SortKey) => void; edgeRight?: boolean }) {
   const th = 'text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium'
   const sortable = (key: SortKey, label: string, extra: string) => {
     const active = sort?.key === key
@@ -1301,7 +1302,25 @@ function LibraryTableHead({ sort, onSort }: { sort: SortState; onSort: (key: Sor
         {sortable('version', i18nT('pages.artifactsPage.ver'), 'w-[60px]')}
         {sortable('tags', i18nT('pages.artifactsPage.tags'), 'min-w-[160px]')}
         {sortable('updated', i18nT('pages.artifactsPage.updated'), 'w-[110px]')}
-        <th className={`${th} w-[120px]`}>{i18nT('pages.artifactsPage.actions')}</th>
+        {/* Actions is the last of nine columns, and the declared widths total
+            past a phone (and a rail-narrowed desktop pane), so at rest it
+            starts beyond the scroll edge and every open/delete costs a
+            horizontal scroll. Pinned `sticky right-0` on an OPAQUE `bg-card`
+            (the default cell background is transparent and the scrolling
+            columns would show through the pin). The seam is TWO parts, both
+            gated on the measured overflow flag so a table that fits renders
+            neither: a 1px child div (NOT `border-l` — under Preflight's
+            `border-collapse: collapse` a cell border belongs to the collapsed
+            table grid and paints at the cell's layout slot, so it stays behind
+            while the sticky cell travels) and a `right-full` gradient hung just
+            left of the pin (says "columns continue"). Same treatment as the
+            hooks and schedule tables, adapted for auto layout where a
+            wrapper-anchored cue cannot know the pinned column's left edge. */}
+        <th className={`${th} w-[120px] sticky right-0 bg-card`}>
+          {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
+          {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
+          {i18nT('pages.artifactsPage.actions')}
+        </th>
       </tr>
     </thead>
   )
@@ -1309,7 +1328,7 @@ function LibraryTableHead({ sort, onSort }: { sort: SortState; onSort: (key: Sor
 
 /** One artifact row, shared by the flat table and the folder tree. Draggable
  * onto folder rows / the Unfiled lane (indent nests it under its folder). */
-function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug = null, indent = 0, dropFolderId, dropHighlight = false }: {
+function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug = null, indent = 0, dropFolderId, dropHighlight = false, edgeRight = false }: {
   a: Artifact
   onOpen: (slug: string) => void
   onDelete: (a: Artifact) => void
@@ -1319,6 +1338,9 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
   /** Slug whose pin toggle is in flight (disables its star to avoid double-fire). */
   pinningSlug?: string | null
   indent?: number
+  /** True while the table's scroller hides columns past its right edge — gates
+   * the pinned Actions cell's seam + fade so a table that fits shows neither. */
+  edgeRight?: boolean
   /** When set, the row also accepts drops, filing the dragged item into this
    * folder (''=unfile) — so dropping anywhere over an expanded folder's
    * region (or the Unfiled section) works, not just on the header row. */
@@ -1333,7 +1355,7 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
           ref={(el) => { setNodeRef(el); setDropRef?.(el) }}
           {...listeners}
           style={{ opacity: isDragging ? 0.4 : 1 }}
-          className={`transition-colors cursor-pointer ${dropHighlight ? 'bg-accent/10' : 'hover:bg-bg-hover'}`}
+          className={`group/artrow transition-colors cursor-pointer ${dropHighlight ? 'bg-accent/10' : 'hover:bg-bg-hover'}`}
           onClick={(e) => {
             if (e.metaKey || e.ctrlKey) {
               openPopout(a.slug, a.name)
@@ -1384,7 +1406,20 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
             </div>
           </td>
           <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted">{_timeAgo(isoToTs(a.updated_at))}</td>
-          <td className="px-2.5 py-2 border-b border-border">
+          {/* Pinned like the header cell, on an OPAQUE `bg-card`. The row's
+              states live on the <tr>, which the opaque base would hide, so the
+              overlay re-applies them beneath the controls (`-z-10` inside the
+              stacking context the sticky cell creates): the `.table-striped`
+              zebra keys off the row's REAL DOM position (`nth-child(even)`),
+              which — unlike the hooks/schedule tables' clean `.map` index — is
+              not knowable here (folder rows, artifact rows, and lane rows
+              interleave), so the overlay mirrors it with the ancestor arbitrary
+              variant instead of an index; the drag-file highlight and the hover
+              tint layer on top, matching the <tr>. */}
+          <td className="sticky right-0 bg-card px-2.5 py-2 border-b border-border">
+            <div aria-hidden className={`absolute inset-0 -z-10 transition-colors [.table-striped_tbody_tr:nth-child(even)_&]:bg-[var(--card-hl)] ${dropHighlight ? 'bg-accent/10' : 'group-hover/artrow:bg-bg-hover'}`} />
+            {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
+            {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -1440,10 +1475,10 @@ function SessionDocStar({ d, busy, onMaterialize }: { d: SessionDoc; busy: boole
 /** A single unsaved session-document row (from "your chats"). Leading star
  * materializes it into a real, starred artifact. Shares the same columns as
  * ArtifactRow so both live in one unified table. */
-function SessionDocRow({ d, busy, onMaterialize }: { d: SessionDoc; busy: boolean; onMaterialize: (path: string, sessionKey?: string) => void }) {
+function SessionDocRow({ d, busy, onMaterialize, edgeRight = false }: { d: SessionDoc; busy: boolean; onMaterialize: (path: string, sessionKey?: string) => void; edgeRight?: boolean }) {
   const ftype = docFileType(d.path)
   return (
-    <tr className="transition-colors hover:bg-bg-hover">
+    <tr className="group/docrow transition-colors hover:bg-bg-hover">
       <td className="px-2.5 py-2 border-b border-border text-center">
         <SessionDocStar d={d} busy={busy} onMaterialize={onMaterialize} />
       </td>
@@ -1460,7 +1495,15 @@ function SessionDocRow({ d, busy, onMaterialize }: { d: SessionDoc; busy: boolea
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted">—</td>
       <td className="px-2.5 py-2 border-b border-border"></td>
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted whitespace-nowrap">{_timeAgo(isoToTs(d.updated_at))}</td>
-      <td className="px-2.5 py-2 border-b border-border"></td>
+      {/* This row has no Actions controls, but it shares the pinned column, so
+          its trailing cell must pin too — otherwise the scrolling columns show
+          through where the pin sits. Same opaque base + overlay (zebra by real
+          DOM position + hover) + gated seam as ArtifactRow. */}
+      <td className="sticky right-0 bg-card px-2.5 py-2 border-b border-border">
+        <div aria-hidden className="absolute inset-0 -z-10 transition-colors [.table-striped_tbody_tr:nth-child(even)_&]:bg-[var(--card-hl)] group-hover/docrow:bg-bg-hover" />
+        {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
+        {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
+      </td>
     </tr>
   )
 }
@@ -1604,16 +1647,21 @@ function LibraryTable({
   onMaterialize?: (path: string, sessionKey?: string) => void
   materializingPath?: string | null
 }) {
+  // The pinned Actions column's seam is painted only while the scroller hides
+  // columns. Auto layout means the ROWS set scrollWidth (a filter emptying
+  // rows, a locale switch re-labelling headers, a webfont load), none of which
+  // resize the scroller's own box — so the table is the observed content node.
+  const [attachScroller, edges, , attachTable] = useScrollEdges<HTMLDivElement>()
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full border-collapse table-striped">
-        <LibraryTableHead sort={sort} onSort={onSort} />
+    <div ref={attachScroller} className="overflow-x-auto">
+      <table ref={attachTable} className="w-full border-collapse table-striped">
+        <LibraryTableHead sort={sort} onSort={onSort} edgeRight={edges.right} />
         <tbody>
           {items.map((a) => (
-            <ArtifactRow key={a.slug} a={a} onOpen={onOpen} onDelete={onDelete} deletingSlug={deletingSlug} onTogglePin={onTogglePin} pinningSlug={pinningSlug} />
+            <ArtifactRow key={a.slug} a={a} onOpen={onOpen} onDelete={onDelete} deletingSlug={deletingSlug} onTogglePin={onTogglePin} pinningSlug={pinningSlug} edgeRight={edges.right} />
           ))}
           {onMaterialize && sessionDocs.map((d) => (
-            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} />
+            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} edgeRight={edges.right} />
           ))}
         </tbody>
       </table>
@@ -1706,6 +1754,9 @@ function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand
   onMaterialize?: (path: string, sessionKey?: string) => void
   materializingPath?: string | null
 }) {
+  // See LibraryTable: the pinned Actions seam is gated on measured overflow,
+  // and auto layout makes the table (not the scroller's box) the content node.
+  const [attachScroller, edges, , attachTable] = useScrollEdges<HTMLDivElement>()
   const folderIds = new Set(folders.map(f => f.id))
   const byFolder = new Map<string, Artifact[]>()
   for (const a of items) {
@@ -1747,6 +1798,7 @@ function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand
               indent={depth + 1}
               dropFolderId={f.id}
               dropHighlight={overFolderId === f.id}
+              edgeRight={edges.right}
             />,
           )
         }
@@ -1758,9 +1810,9 @@ function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand
   const unfiled = byFolder.get('') || []
   const unfiledHot = overFolderId === ''
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full border-collapse table-striped">
-        <LibraryTableHead sort={sort} onSort={onSort} />
+    <div ref={attachScroller} className="overflow-x-auto">
+      <table ref={attachTable} className="w-full border-collapse table-striped">
+        <LibraryTableHead sort={sort} onSort={onSort} edgeRight={edges.right} />
         <tbody>
           {rows}
           {folders.length > 0 && (
@@ -1794,10 +1846,11 @@ function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand
               pinningSlug={pinningSlug}
               dropFolderId={folders.length > 0 ? '' : undefined}
               dropHighlight={unfiledHot}
+              edgeRight={edges.right}
             />
           ))}
           {onMaterialize && sessionDocs.map((d) => (
-            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} />
+            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} edgeRight={edges.right} />
           ))}
         </tbody>
       </table>

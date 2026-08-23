@@ -199,7 +199,7 @@ export default function Workspace() {
                 : (
                   <div className="h-full flex flex-col items-center justify-center text-muted gap-2">
                     <CircleDot size={26} strokeWidth={1.5} className="opacity-50" />
-                    <div className="text-[13px]">{i18nT('apps.issueRadar.workspace.select_an_issue_to_see_its_details')}</div>
+                    <div className="text-[13px]">{i18nT(terms.emptyDetailKey)}</div>
                   </div>
                 )}
             </div>

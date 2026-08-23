@@ -998,6 +998,27 @@ def _source_requests_auto(source: object) -> bool:
         return False
 
 
+def read_turn_model(source: object) -> str:
+    """Return what served the turn: a resolved id, ``"auto"``, or ``""``.
+
+    :func:`read_effective_model` alone collapses two different situations into
+    ``""``: a turn whose model the provider never reported, and a turn the user
+    deliberately handed to Auto. They read identically to a consumer, so a
+    display surface that omits a blank model shows nothing for an Auto turn and
+    an absent model becomes indistinguishable from a missing measurement.
+
+    ``"auto"`` is not a model id and is never presented as one — it is the
+    honest answer to "who chose", which is all the backend discloses when
+    Auto routes a turn (the ACP per-turn metadata frame carries context and
+    metering only). Callers that need a concrete id for a pricing or window
+    lookup must keep using :func:`read_effective_model`. Never raises.
+    """
+    resolved = read_effective_model(source)
+    if resolved:
+        return resolved
+    return "auto" if _source_requests_auto(source) else ""
+
+
 def _resolve_model(model: str, model_source: object) -> str:
     """Resolve the model to record, retaining a known Auto selection.
 
@@ -1010,12 +1031,12 @@ def _resolve_model(model: str, model_source: object) -> str:
     requested = (model or "").strip().lower()
     if requested not in ("", "auto"):
         return model
-    resolved = read_effective_model(model_source) if model_source is not None else ""
+    resolved = read_turn_model(model_source) if model_source is not None else ""
     if resolved:
         return resolved
-    if requested == "auto" or _source_requests_auto(model_source):
-        return "auto"
-    return ""
+    # An explicit Auto request stands on its own: the caller named it, so it is
+    # recorded even when the provider chain no longer reports it.
+    return "auto" if requested == "auto" else ""
 
 
 def _coerce_int(value: Any) -> int:

@@ -467,6 +467,12 @@ service installer such as `cloudflared service install`).
 
 `kirocrew token` does the same thing from a shell on the gateway host.
 
+### Using Chat on a phone or tablet
+
+In the Chat composer, tap `+` to open the device's native Files picker and
+attach an image or a regular file. This direct touch path does not open the
+desktop-style command menu first.
+
 ### Session duration
 
 Three clocks. The first two are signed into the access token payload

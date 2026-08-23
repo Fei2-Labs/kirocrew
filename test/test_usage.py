@@ -26,6 +26,7 @@ from kiro_crew.dashboard.handlers.usage import (
     read_context_tokens,
     read_effective_agent,
     read_effective_model,
+    read_turn_model,
 )
 
 # ── _parse_sessions ─────────────────────────────────────────────────────
@@ -1126,6 +1127,42 @@ class TestReadEffectiveModel:
         node._client = node
         node._model = "claude-opus-4.8"
         assert read_effective_model(node) == "claude-opus-4.8"
+
+
+class TestReadTurnModel:
+    """read_turn_model: display attribution — concrete id, `auto`, or blank."""
+
+    def test_concrete_id_outranks_the_sentinel(self):
+        # A resolved id anywhere in the chain wins even while an outer wrapper
+        # still reports the Auto request, so a pinned turn never reads "auto".
+        handle = type("Handle", (), {"_resolved_model_id": "claude-opus-4.8"})()
+        provider = type("P", (), {"_model": "auto", "_handle": handle})()
+        assert read_turn_model(provider) == "claude-opus-4.8"
+
+    def test_auto_request_with_no_resolved_id_reports_auto(self):
+        # The case read_effective_model collapses to "": the user chose Auto and
+        # the backend disclosed no id. Reporting the choice is not guessing.
+        assert read_turn_model(_Inner("auto")) == "auto"
+        assert read_effective_model(_Inner("auto")) == ""
+
+    def test_auto_sentinel_is_matched_case_and_space_insensitively(self):
+        assert read_turn_model(_Inner("  AUTO ")) == "auto"
+
+    def test_auto_found_deeper_in_the_chain(self):
+        inner = type("Handle", (), {"_model": "auto"})()
+        assert read_turn_model(type("P", (), {"_handle": inner})()) == "auto"
+
+    def test_no_model_information_stays_blank(self):
+        # Distinct from the Auto case: nothing is known, so nothing is claimed.
+        assert read_turn_model(object()) == ""
+
+    def test_never_raises_on_a_hostile_source(self):
+        class Boom:
+            @property
+            def _model(self):
+                raise RuntimeError("no")
+
+        assert read_turn_model(Boom()) == ""
 
 
 class TestReadEffectiveAgent:

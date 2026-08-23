@@ -31,6 +31,7 @@ from kiro_crew.hooks import (
 )
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform_compat import is_link_or_junction
+from kiro_crew.project_scope import project_scope_satisfied
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -2030,23 +2031,12 @@ class SkillsLoader:
 
         Fails CLOSED — no project, an unusable one, or any error suppresses the
         skill, so an un-scoped surface never inherits repo-specific rules.
+
+        The rule itself lives in ``kiro_crew.project_scope`` because lessons are
+        scoped by the same key: both are instructions injected into a session, so
+        both must agree on what "in scope" means.
         """
-        rel = relpath.strip().strip("/")
-        if not rel or ".." in rel.split("/"):
-            return False
-        if not project_dir:
-            return False
-        try:
-            root = Path(project_dir).resolve()
-        except (OSError, RuntimeError, ValueError):
-            return False
-        for candidate in (root, *root.parents):
-            try:
-                if (candidate / rel).exists():
-                    return True
-            except OSError:
-                continue
-        return False
+        return project_scope_satisfied(relpath, project_dir)
     # ── Auto skill lifecycle: pin / archive / restore / eviction ──
 
     @staticmethod

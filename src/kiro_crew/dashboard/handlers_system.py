@@ -157,7 +157,6 @@ async def api_status(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers import (
         _UPDATE_CHECK_INTERVAL,
         _do_update_check,
-        _update_info,
     )
     from kiro_crew.dashboard.handlers import updates as _updates_mod
 
@@ -172,13 +171,7 @@ async def api_status(request: web.Request) -> web.Response:
         state._background_tasks.add(_bg)
         _bg.add_done_callback(state._background_tasks.discard)
 
-    data = state.status_snapshot(
-        update_available=bool(_update_info.get("available")),
-        update_self_updatable=bool(_update_info.get("self_updatable")),
-        update_checked=bool(_update_info.get("checked")),
-        update_command=str(_update_info.get("update_command") or ""),
-        update_channel=str(_update_info.get("channel") or ""),
-    )
+    data = state.status_snapshot(**_updates_mod.status_update_fields())  # type: ignore[arg-type]
     static_info = _get_static_system_info()
     if state._owner_hash is not None:
         owner_hash = state._owner_hash
@@ -478,11 +471,18 @@ def _collect_system_metrics() -> dict[str, object]:
     """
     data: dict[str, object] = dict(_get_static_system_info())
 
-    # Process memory (RSS)
+    # Process memory. `proc_mem_mb` is the LIVE resident set (falls when memory
+    # is released); `proc_mem_peak_mb` is the high-water mark since start, kept
+    # as a separate reading so a transient spike stays diagnosable without the
+    # live figure inheriting it.
     try:
         data["proc_mem_mb"] = round(platform_compat.proc_rss_bytes() / (1024 * 1024), 1)
     except Exception:
         data["proc_mem_mb"] = 0
+    try:
+        data["proc_mem_peak_mb"] = round(platform_compat.proc_peak_rss_bytes() / (1024 * 1024), 1)
+    except Exception:
+        data["proc_mem_peak_mb"] = 0
 
     # System-wide memory — cross-platform
     try:

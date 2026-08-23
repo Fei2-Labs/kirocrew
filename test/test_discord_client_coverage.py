@@ -382,6 +382,30 @@ class TestOutboundRest:
         assert await client.send_message("c1", "hi") is None
 
     @pytest.mark.asyncio
+    async def test_create_thread_from_message_uses_root_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _make_client()
+        calls: list[tuple[str, str, Any]] = []
+
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+            calls.append((method, path, payload))
+            return {"id": "t9"}
+
+        monkeypatch.setattr(client, "_api", _api)
+        result = await client.create_thread_from_message("c1", "m2", "Topic")
+
+        assert result == "t9"
+        assert calls == [
+            (
+                "POST",
+                "/channels/c1/messages/m2/threads",
+                {"name": "Topic", "auto_archive_duration": 1440},
+            )
+        ]
+        assert await client.is_thread_channel("t9") is True
+
+    @pytest.mark.asyncio
     async def test_edit_message_omits_components_when_not_supplied(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -1331,6 +1331,50 @@ class TestCgroupScopeArgv:
             assert mem == sb._default_max_memory_mb()
             assert weight == sb._CGROUP_DEFAULT_CPU_WEIGHT
             assert quota == 0
+            # Fractions must not truncate into invalid TasksMax=0 /
+            # MemoryMax=0M properties.
+            with patch(
+                "kiro_crew.config.loader._raw_config",
+                return_value={
+                    "resource_limits": {
+                        "max_processes": 0.5,
+                        "max_memory_mb": 0.9,
+                    }
+                },
+            ):
+                procs, mem, _, _ = sb._cgroup_limits_from_config()
+            assert procs == sb._CGROUP_DEFAULT_MAX_PROCESSES
+            assert mem == sb._default_max_memory_mb()
+            # NaN/Infinity (json.loads accepts both) must fall back to
+            # defaults WITHOUT raising: int(nan)/int(inf) raise inside the
+            # surrounding try/except, which would silently discard an
+            # otherwise-valid stricter limit on a later field in the same
+            # block (e.g. a legitimate max_memory_mb after a bogus
+            # max_processes).
+            with patch(
+                "kiro_crew.config.loader._raw_config",
+                return_value={
+                    "resource_limits": {
+                        "max_processes": float("nan"),
+                        "max_memory_mb": 512,
+                    }
+                },
+            ):
+                procs, mem, _, _ = sb._cgroup_limits_from_config()
+            assert procs == sb._CGROUP_DEFAULT_MAX_PROCESSES
+            assert mem == 512  # must not be discarded by the NaN above it
+            with patch(
+                "kiro_crew.config.loader._raw_config",
+                return_value={
+                    "resource_limits": {
+                        "max_processes": 64,
+                        "max_memory_mb": float("inf"),
+                    }
+                },
+            ):
+                procs, mem, _, _ = sb._cgroup_limits_from_config()
+            assert procs == 64  # must not be discarded by the inf below it
+            assert mem == sb._default_max_memory_mb()
         finally:
             self._reset_probe()
 

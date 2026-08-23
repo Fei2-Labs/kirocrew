@@ -9,9 +9,8 @@
 //
 // Debug-only tooling: nothing here runs in a normal `npm run build`, and no part
 // of it ships in the bundle.
-import { readFileSync, existsSync } from 'fs'
 import path from 'path'
-import { renderReport, diffSummaries, formatBytes } from './lib/bundleReport.mjs'
+import { renderReport, diffSummaries, formatBytes, loadBundleSummary } from './lib/bundleReport.mjs'
 
 const REPORT_PATH = path.resolve('dist', 'bundle-report.json')
 
@@ -20,27 +19,17 @@ function fail(message, code = 1) {
   process.exit(code)
 }
 
+// Exit-code mapping for this renderer: 2 = report missing, 3 = report malformed
+// or unsupported version. The contract itself lives in the shared
+// loadBundleSummary.
 function loadSummary(file) {
-  if (!existsSync(file)) {
-    fail(
-      `No bundle report at ${file}.\n` +
-        'Run `npm run analyze` first -- a plain `npm run build` deliberately does ' +
-        'not write one, so the normal build stays unaffected.',
-      2
-    )
-  }
-  let parsed
-  try {
-    parsed = JSON.parse(readFileSync(file, 'utf-8'))
-  } catch (e) {
-    fail(`${file} is not valid JSON: ${e && e.message}`, 3)
-  }
-  if (!parsed || typeof parsed !== 'object') fail(`${file} does not contain a report object.`, 3)
-  if (parsed.version !== 1) {
-    // Refuse rather than misread a future shape as v1.
-    fail(`${file} has version ${JSON.stringify(parsed.version)}; this build understands 1.`, 3)
-  }
-  return parsed
+  const { summary, error } = loadBundleSummary(file, {
+    hint:
+      'Run `npm run analyze` first -- a plain `npm run build` deliberately does ' +
+      'not write one, so the normal build stays unaffected.',
+  })
+  if (error) fail(error.message, error.code === 'missing' ? 2 : 3)
+  return summary
 }
 
 const args = process.argv.slice(2)

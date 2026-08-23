@@ -57,7 +57,7 @@ import {
   type RepoRef,
 } from '../api'
 import { commitUrlFor, userUrlFor, repoScopeKey } from '../lib/links'
-import { providerTerms } from '../lib/links'
+import { providerTerms, readOnlyHint } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
 import { fmtDateTime, fmtDateTimeNumeric } from '../../../i18n/format'
@@ -134,11 +134,16 @@ function StatePill({ state, reason }: { state?: string; reason?: string | null }
  * sidebar as dashed sparkle chips. Each has a one-click accept (＋) when the
  * user can write; on a read-only repo they show as suggestions only. */
 function AiSuggestions({
-  suggestions, loading, canWrite, pending, onAccept, colorByName,
+  suggestions, loading, canWrite, repoRef, pending, onAccept, colorByName,
 }: {
   suggestions: SuggestedLabel[]
   loading: boolean
   canWrite: boolean
+  /** The active repo, for why a write is refused: on a provider that supports no
+   * writes at all, "get triage/push access" is a remedy that changes nothing.
+   * Both the per-suggestion tooltip and the always-visible caption below need it,
+   * which is why this is the ref rather than one pre-resolved string. */
+  repoRef: RepoRef
   pending: boolean
   onAccept: (name: string) => void
   colorByName: Map<string, string>
@@ -165,7 +170,10 @@ function AiSuggestions({
             ? (s.reason
               ? i18nT('apps.issueRadar.components.issueDetail.add_with_reason', { name: s.name, reason: s.reason })
               : i18nT('apps.issueRadar.components.issueDetail.add', { name: s.name }))
-            : (s.reason || i18nT('apps.issueRadar.components.issueDetail.read_only_connect_with_triage_push_access_to_app_2'))
+            : (s.reason || readOnlyHint(
+              repoRef,
+              i18nT('apps.issueRadar.components.issueDetail.read_only_connect_with_triage_push_access_to_app_2'),
+            ))
           return (
             <motion.button
               key={s.name}
@@ -202,8 +210,15 @@ function AiSuggestions({
           )
         })}
       </div>
+      {/* The caption, unlike the per-suggestion tooltip above, needs no hover -- so
+          on a provider that refuses every write this is the sentence a user
+          actually reads, and telling them to go get access they already hold is the
+          failure this routes around. */}
       {!canWrite && (
-        <div className="text-[10.5px] text-muted mt-1.5">{i18nT('apps.issueRadar.components.issueDetail.read_only_connect_with_triage_push_access_to_app')}</div>
+        <div className="text-[10.5px] text-muted mt-1.5">{readOnlyHint(
+          repoRef,
+          i18nT('apps.issueRadar.components.issueDetail.read_only_connect_with_triage_push_access_to_app'),
+        )}</div>
       )}
     </div>
   )
@@ -1082,6 +1097,7 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
                 suggestions={suggestions}
                 loading={aiQuery.isLoading}
                 canWrite={canWrite}
+                repoRef={active}
                 pending={labelMutation.isPending}
                 onAccept={acceptSuggestion}
                 colorByName={colorByName}

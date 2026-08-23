@@ -250,28 +250,47 @@ class TestLessonsSingleQuery:
         vector_store.get_lessons.assert_not_called()
         assert vector_store.get_lessons_context.call_count == 1
 
-    def test_empty_store_falls_back_to_file_lessons(self, tmp_path: Path) -> None:
-        """An empty vector store still yields the file-backed lessons."""
+    def test_file_lessons_answer_only_when_there_is_no_vector_store(
+        self, tmp_path: Path
+    ) -> None:
+        """The file store is the fallback for HAVING no vector store.
+
+        It is deliberately NOT the fallback for a vector store that returned
+        nothing. Scope filtering gave "empty" a second meaning -- it also means
+        "every lesson is out of scope here" -- so answering from the file store on
+        empty would let it speak for a live vector store and re-inject rows that
+        were deleted from it.
+        """
         from kiro_crew.context import ContextBuilder
         from kiro_crew.learn import Lesson, LessonStore
 
         lessons = LessonStore(base_dir=tmp_path)
         lessons.save(Lesson(ts="1", rule="never force push to mainline", category="knowledge"))
 
+        # No vector store: the file store answers.
+        no_vs = MagicMock()
+        no_vs.vector_store = None
+        no_vs.get_context.return_value = ""
+        builder = self._builder(tmp_path)
+        builder.lessons = lessons
+        with patch.object(ContextBuilder, "get_memory_for", return_value=no_vs):
+            ctx = builder.build_session_context(session_key="sess-lessons-no-vs")
+        assert "never force push to mainline" in ctx
+
+        # Live vector store returning nothing: the file store stays silent.
         vector_store = MagicMock()
         vector_store.get_lessons_context.return_value = ""
         vector_store.get_semantic_context.return_value = ""
         vector_store.get_episodic_context.return_value = ""
-        fake_memory = MagicMock()
-        fake_memory.vector_store = vector_store
-        fake_memory.get_context.return_value = ""
-
-        builder = self._builder(tmp_path)
-        builder.lessons = lessons
-        with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
-            ctx = builder.build_session_context(session_key="sess-lessons-empty")
-
-        assert "never force push to mainline" in ctx
+        with_vs = MagicMock()
+        with_vs.vector_store = vector_store
+        with_vs.get_context.return_value = ""
+        builder2 = self._builder(tmp_path)
+        builder2.lessons = lessons
+        with patch.object(ContextBuilder, "get_memory_for", return_value=with_vs):
+            ctx2 = builder2.build_session_context(session_key="sess-lessons-empty")
+        assert "never force push to mainline" not in ctx2
+        assert vector_store.get_lessons_context.call_count == 1
 
 
 class _ByteCountingOpen:

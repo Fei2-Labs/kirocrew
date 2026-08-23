@@ -4803,3 +4803,24 @@ class TestSetMyCommands:
         assert {"command": "model", "description": "Choose the model from a list"} in sent[0][1][
             "commands"
         ]
+
+
+# ── context thresholds ───────────────────────────────────────────────────
+
+
+class TestContextThresholdNotices:
+    def test_soft_threshold_nudges(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        sess.check_context_usage = lambda key, provider: 85.0  # >= soft (80)
+
+        asyncio.run(d._maybe_notice(7, ("direct", "7"), "key", object()))
+
+        assert any("/compact" in s[0] for s in cli.sent)
+
+    def test_below_soft_threshold_stays_silent(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        sess.check_context_usage = lambda key, provider: 10.0
+
+        asyncio.run(d._maybe_notice(7, ("direct", "7"), "key", object()))
+
+        assert cli.sent == []

@@ -73,6 +73,9 @@ const dnd = vi.hoisted(() => ({
   onDragEnd: undefined as ((e: unknown) => void) | undefined,
   onDragCancel: undefined as (() => void) | undefined,
   collision: undefined as unknown,
+  /** Every `useDraggable` registration, so a row's pickup state is assertable
+   *  (a pointer drag itself cannot be simulated — see the file header). */
+  draggables: [] as Array<{ id: string; disabled: boolean }>,
 }))
 
 vi.mock('@dnd-kit/core', async (importOriginal) => {
@@ -98,6 +101,10 @@ vi.mock('@dnd-kit/core', async (importOriginal) => {
       dnd.onDragEnd = props.onDragEnd
       dnd.onDragCancel = props.onDragCancel
       return props.children as never
+    },
+    useDraggable: (args: Parameters<typeof actual.useDraggable>[0]) => {
+      dnd.draggables.push({ id: String(args.id), disabled: !!args.disabled })
+      return actual.useDraggable(args)
     },
     // The real overlay reads the active item off DndContext's internal store,
     // which the stub above does not provide, so it would render nothing. It is
@@ -135,7 +142,7 @@ Object.defineProperty(window, 'matchMedia', {
 })
 globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) }) as unknown as typeof fetch
 
-import ChatSidebar from '../pages/ChatSidebar'
+import ChatSidebar, { sidebarCollision } from '../pages/ChatSidebar'
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -144,6 +151,7 @@ import ChatSidebar from '../pages/ChatSidebar'
  *  the hover-to-expand fallback branch needs. */
 const HIDDEN_FOLDER_ID = 'f4'
 const HIDDEN_FOLDERS_LS_KEY = 'mc-flat-hidden-folders'
+const FLAT_VIEW_LS_KEY = 'mc-sidebar-flat-view'
 
 const FOLDERS: ChatFolder[] = [
   { id: 'f1', name: 'Alpha', order: 0 },
@@ -195,6 +203,8 @@ interface RenderOpts {
   activeSlot?: string | null
   /** Flip into board (tag-column) view and seed the column/tag caches. */
   board?: boolean
+  /** Flip into flat view (every chat in one lane, no folder tree). */
+  flat?: boolean
 }
 
 let panes: HTMLElement[] = []
@@ -203,6 +213,7 @@ function renderSidebar(opts: RenderOpts = {}) {
   const slots = opts.slots ?? SLOTS
   const folders = opts.folders ?? FOLDERS
   mocks.chatFolders.mockResolvedValue(folders)
+  if (opts.flat) localStorage.setItem(FLAT_VIEW_LS_KEY, '1')
   if (opts.board) {
     cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
     mocks.chatTags.mockResolvedValue(TAGS)
@@ -326,6 +337,10 @@ beforeEach(() => {
   mocks.tagColumns.mockResolvedValue([])
   mocks.reorderTagColumns.mockResolvedValue({ ok: true })
   mocks.dropSlotToColumn.mockResolvedValue({ ok: true })
+  dnd.draggables = []
+  // Reset so an assertion on the detector reads THIS test's render, not a
+  // leftover capture from the previous one (every test renders before it looks).
+  dnd.collision = undefined
   // The sidebar (and the rows it renders) schedule setTimeout / setInterval
   // work; without fake timers those callbacks fire after teardown and surface
   // as unhandled 'window is not defined' errors, which redden the run even
@@ -716,8 +731,42 @@ describe('ChatSidebar — surfaces that exist only during a drag', () => {
     dragStart({ type: 'session', key: SLOT_PRIVATE }, SLOT_PRIVATE)
     const zone = await screen.findByTestId('chat-pane-drop-zone', undefined, { timeout: 5_000 })
     expect(zone.hasAttribute('data-refused')).toBe(true)
+    expect(zone.getAttribute('data-refused')).toBe('private')
     expect(within(zone).getByText("Private sessions can't be referenced")).toBeTruthy()
     expect(within(zone).queryByTestId('chat-pane-drop-target')).toBeNull()
+  })
+
+  /**
+   * Dragging the OPEN session onto its own pane is a no-op, but it is the user's
+   * near-miss rather than a guard firing — so it must not borrow the privacy
+   * refusal's copy (which would state something untrue about the session) nor its
+   * warn tone (which would report a harmless gesture as a problem). It gets its
+   * own recursive line, and the two refusals stay tellable apart in the DOM.
+   */
+  it('answers a session dropped onto its own pane with the recursive line, not the privacy refusal', async () => {
+    renderSidebar({ chatPane: true, onDropSessionRef: vi.fn(), activeSlot: SLOT_LOOSE })
+    await waitFor(() => expect(dnd.onDragStart).toBeTruthy())
+    dragStart({ type: 'session', key: SLOT_LOOSE }, SLOT_LOOSE)
+    const zone = await screen.findByTestId('chat-pane-drop-zone', undefined, { timeout: 5_000 })
+    expect(zone.getAttribute('data-refused')).toBe('self')
+    expect(within(zone).getByText("Can't drop a session into itself… itself… itself…")).toBeTruthy()
+    expect(within(zone).queryByText("Private sessions can't be referenced")).toBeNull()
+    // Still a refusal: no destination is outlined, and the pill is not the invite.
+    expect(within(zone).queryByTestId('chat-pane-drop-target')).toBeNull()
+    expect(within(zone).queryByText('Drop to reference this session')).toBeNull()
+  })
+
+  it('stages nothing when the open session is dropped onto its own pane', async () => {
+    const onDropSessionRef = vi.fn()
+    renderSidebar({ chatPane: true, onDropSessionRef, activeSlot: SLOT_LOOSE })
+    await waitFor(() => expect(dnd.onDragEnd).toBeTruthy())
+    act(() => {
+      dnd.onDragEnd?.({
+        active: { id: SLOT_LOOSE, data: { current: { type: 'session', key: SLOT_LOOSE } } },
+        over: { id: 'chat-pane-ref', data: { current: { type: 'chat-pane-ref' } } },
+      })
+    })
+    expect(onDropSessionRef).not.toHaveBeenCalled()
   })
 
   it('falls back to a centred pill when the pane has no composer to measure', async () => {
@@ -776,6 +825,95 @@ describe('ChatSidebar — surfaces that exist only during a drag', () => {
     await waitFor(() => expect(dnd.onDragStart).toBeTruthy())
     dragStart({ type: 'session', key: SLOT_LOOSE }, SLOT_LOOSE)
     await waitFor(() => expect(screen.getAllByText(SLOT_LOOSE).length).toBeGreaterThan(1))
+  })
+
+  it('renders the preview OUTSIDE the sidebar, where the drawer clip cannot hide it', async () => {
+    // The sidebar rides inside OverlayDrawer's morph clip-path, which clips
+    // fixed-position descendants too — an in-place overlay disappeared the
+    // moment the cursor crossed into the chat pane, i.e. for the whole second
+    // half of the one gesture that aims there.
+    renderSidebar({ slots: [SLOTS[1]] })
+    await waitFor(() => expect(dnd.onDragStart).toBeTruthy())
+    dragStart({ type: 'session', key: SLOT_LOOSE }, SLOT_LOOSE)
+    await waitFor(() => expect(screen.getAllByText('Loose work').length).toBeGreaterThan(1))
+    const ghosts = screen.getAllByText('Loose work').filter(el => !el.closest('.sidebar-inner'))
+    expect(ghosts).toHaveLength(1)
+    expect(ghosts[0].parentElement).toBe(document.body)
+  })
+})
+
+describe('ChatSidebar — flat view', () => {
+  const dragStart = (data: Record<string, unknown>, id: string) => act(() => {
+    dnd.onDragStart?.({ active: { id, data: { current: data } } })
+  })
+  const dragEnd = (
+    active: { id: string; data: Record<string, unknown> },
+    over: { id: string; data: Record<string, unknown> } | null,
+  ) => act(() => {
+    dnd.onDragEnd?.({
+      active: { id: active.id, data: { current: active.data } },
+      over: over ? { id: over.id, data: { current: over.data } } : null,
+    })
+  })
+  /** Most recent registration for a row, since every render re-registers. */
+  const pickup = (slotKey: string) =>
+    dnd.draggables.filter(d => d.id === `session:${slotKey}`).at(-1)
+
+  it('picks a session up with dnd-kit, the same as the folder tree', async () => {
+    renderSidebar({ flat: true })
+    await waitFor(() => expect(screen.getByTestId('flat-view-lane')).toBeTruthy())
+    await waitFor(() => expect(pickup(SLOT_LOOSE)).toBeTruthy())
+    expect(pickup(SLOT_LOOSE)?.disabled).toBe(false)
+    // The board layout's separate native-HTML5 drag stays off here — one
+    // gesture, not two competing ones.
+    const row = document.querySelector(`[data-session-row="${SLOT_LOOSE}"]`) as HTMLElement
+    expect(row.getAttribute('draggable')).not.toBe('true')
+  })
+
+  it('stages a session reference when a flat-lane drag lands on the chat pane', async () => {
+    const onDropSessionRef = vi.fn()
+    renderSidebar({ flat: true, chatPane: true, onDropSessionRef })
+    await waitFor(() => expect(dnd.onDragEnd).toBeTruthy())
+    dragEnd(
+      { id: SLOT_IN_FOLDER, data: { type: 'session', key: SLOT_IN_FOLDER } },
+      { id: 'chat-pane-ref', data: { type: 'chat-pane-ref' } },
+    )
+    expect(onDropSessionRef).toHaveBeenCalledWith({ key: SLOT_IN_FOLDER, title: 'Foldered work', messages: 7 })
+  })
+
+  it('mounts the chat-pane drop zone for a flat-lane drag', async () => {
+    renderSidebar({ flat: true, chatPane: true, onDropSessionRef: vi.fn() })
+    await waitFor(() => expect(dnd.onDragStart).toBeTruthy())
+    expect(screen.queryByTestId('chat-pane-drop-zone')).toBeNull()
+    dragStart({ type: 'session', key: SLOT_LOOSE }, SLOT_LOOSE)
+    const zone = await screen.findByTestId('chat-pane-drop-zone', undefined, { timeout: 5_000 })
+    expect(zone.parentElement).toBe(panes[0])
+  })
+
+  it('registers no in-lane drop target, so the order stays unchangeable by hand', async () => {
+    renderSidebar({ flat: true })
+    await waitFor(() => expect(screen.getByTestId('flat-view-lane')).toBeTruthy())
+    await waitFor(() => expect(pickup(SLOT_LOOSE)).toBeTruthy())
+    // No folder-drop zones and no sortable folder blocks exist in this lane, so
+    // a release inside the sidebar has nothing to resolve to: neither re-filing
+    // nor reordering is reachable. (`sidebarCollision` keeps the chat pane out
+    // of its closestCenter fallback, so it cannot capture the miss either.)
+    expect(document.querySelectorAll('[data-folder-drop]')).toHaveLength(0)
+    dragEnd({ id: SLOT_LOOSE, data: { type: 'session', key: SLOT_LOOSE } }, null)
+    expect(mocks.setSlotFolder).not.toHaveBeenCalled()
+    expect(mocks.updateChatFolder).not.toHaveBeenCalled()
+  })
+
+  it('detects collisions with the sidebar detector, so the pane cannot steal a near miss', async () => {
+    // Pins the DETECTOR, not just the absence of targets. dnd-kit's default
+    // closestCenter would hand a release anywhere in the sidebar to the only
+    // registered droppable — the pane-sized chat zone — turning every near miss
+    // into a staged reference. `sidebarCollision` excludes that zone from its
+    // fallback, and nothing else in the flat lane's assertions can see the swap.
+    renderSidebar({ flat: true })
+    await waitFor(() => expect(screen.getByTestId('flat-view-lane')).toBeTruthy())
+    await waitFor(() => expect(dnd.collision).toBeTruthy())
+    expect(dnd.collision).toBe(sidebarCollision)
   })
 })
 

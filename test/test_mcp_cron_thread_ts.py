@@ -17,6 +17,16 @@ from kiro_crew.validation import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
+
+
 class TestCronAddThreadTs:
     def test_add_with_thread_ts(self, tmp_path: Path) -> None:
         with patch("kiro_crew.mcp_cron.CronService") as mock_svc_cls:
@@ -82,13 +92,18 @@ class TestCronAddThreadTs:
 
 
 class TestCronUpdateThreadTs:
-    def test_update_sets_thread_ts(self, tmp_path: Path) -> None:
+    def test_update_sets_thread_ts(self, tmp_path: Path, named_cron_caller: str) -> None:
         with patch("kiro_crew.mcp_cron.CronService") as mock_svc_cls:
             mock_svc = mock_svc_cls.return_value
             fake_job = MagicMock()
             fake_job.id = "abc"
             fake_job.name = "test-job"
             fake_job.schedule = CronSchedule(kind="every", every_secs=300)
+            # The ownership gate now reaches the stored row, so the mock has to
+            # model an owner. A bare MagicMock attribute compares unequal to the
+            # caller's key and the update would be refused.
+            fake_job.session_key = named_cron_caller
+            mock_svc.get_job.return_value = fake_job
             mock_svc.update_job.return_value = fake_job
             result = _call_tool(
                 "cron_update",

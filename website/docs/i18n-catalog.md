@@ -62,10 +62,12 @@ Adding a language is a **data change**: three edits, no component or test change
 
 1. `locales/<tag>.json`, with the same key set as `en.json` plus `en.manual.json`.
 2. One entry in `SUPPORTED_LANGUAGES` (`src/i18n/languages.ts`).
-3. One line in `CATALOGS` (`src/i18n/index.ts`).
+3. One line in `AUTHORED_CATALOGS` (`src/i18n/catalogs.ts`, the module that owns
+   every catalog import; `src/i18n/all.ts` is the entry that registers them).
 
 The parity tests generate their cases from `SUPPORTED_LANGUAGES` and read catalogs
-from the runtime `CATALOGS` map, so a new language automatically gets its
+from the `CATALOGS` map in `src/i18n/catalogs.ts` (the map registration is fed
+from), so a new language automatically gets its
 key-parity, placeholder-preservation, and no-empty-value coverage. Miss one of the
 three edits and CI fails naming the gap; it cannot silently ship as English. There
 is **no allowlist**, so every language lands in the same commit. That is what makes
@@ -83,6 +85,44 @@ resolving confidently to `en`):
 like "`fr` is unsupported, so it falls back" silently inverts the moment French
 ships. Use a language the project has no plans for for negative cases, and derive
 positive cases from `SUPPORTED_CODES` so a new language is covered automatically.
+
+## The product name is an interpolation variable
+
+Catalog values never hardcode the displayed product name. They interpolate
+`{{productName}}`, which `initI18n()` supplies to i18next as
+`interpolation.defaultVariables` with the stock value `Kiro Crew`, so the stock
+build renders exactly what a literal would. The indirection exists for
+downstream editions: overriding one variable rebrands every catalog string,
+instead of forking 13 locale files through every upstream sync (see
+[extension-seams](extension-seams.md)).
+
+> Transitional note: the mechanical conversion of pre-existing catalog values
+> is landing in follow-up PRs (the full-catalog diff exceeds the reviewable
+> size limit). The rules below bind new copy immediately; the catalog-wide
+> no-literal invariant test ships with the final conversion chunk.
+
+Authoring rules that follow:
+
+- **New copy naming the product writes `{{productName}}`, not the literal.**
+  A translation must carry the same placeholder — `catalogParity.test.ts`
+  placeholder parity fails the catalog that drops it.
+- **The `apps.<id>.manifest.*` keys are the deliberate exception.** They must
+  stay byte-identical to the Python-side `app.json` prose (`[manifest-sync]`
+  is a hard zero), so they keep the literal English name.
+- **Repo-attribution copy keeps the literal too.** A string naming this
+  project as the star/fork/issue target (`app.star_kirocrew_on_github`) wraps
+  a hardcoded upstream URL, so interpolating the product name would make an
+  edition render its own name linking to the upstream repository.
+- **A call-time variable of the same name wins** over the default, per
+  i18next's merge order — useful when a string names a *different* crew.
+- German compounds hyphenate through the placeholder
+  (`{{productName}}-Katalog`), matching how the literal compound was written.
+
+`setProductName()` (exported beside `initI18n`) is the edition override. It
+must run before `initI18n()`; the edition composition root is imported first
+in `main.tsx`, so that ordering holds by construction. A late call throws in
+dev rather than half-applying; in production it returns silently rather
+than crash the shell.
 
 ## Counts: never concatenate a plural suffix
 

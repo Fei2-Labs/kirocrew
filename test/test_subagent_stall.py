@@ -6,10 +6,16 @@ emits a ``subagent_stalled`` UI signal, and records the slow command for
 later analysis — but NEVER terminates the agent) and ``_touch_activity``
 (records activity and clears a prior stalled flag).
 
-The main-agent watchdog stack does not govern spawned subagents, and because
-session-sharing subagents share the parent's runtime PID a per-PID liveness
-oracle cannot isolate one subagent. So this is deliberately surface-only:
-a genuinely-hung subagent is closed by the user from the UX, not auto-reaped.
+The main-agent watchdog stack does not govern spawned subagents, so the flag is
+raised by the reaper. Idle time alone cannot separate a hung tool call from a
+slow silent one, so the flag is gated on a ``LivenessOracle`` consult
+(``_stall_verdict``) that attributes evidence to the subagent's OWN child
+process by cmdline match — which works even on a session-shared runtime, where a
+whole-subtree aggregate would be dominated by kiro-cli's background traffic.
+``WORKING`` suppresses the badge; ``DEAD``/``STUCK_INPUT`` flag immediately
+(positive evidence needs no two-sweep dampening); ``UNKNOWN`` falls back to
+idle-time-only, the pre-existing behaviour. It remains surface-only: a
+genuinely-hung subagent is still closed by the user, never auto-reaped.
 """
 
 from __future__ import annotations

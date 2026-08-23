@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
 
 from kiro_crew.dashboard.handlers import updates
-from kiro_crew.platform import update_layout
+from kiro_crew.platform import update_capability, update_layout, update_provider
+from kiro_crew.platform.update_provider import CommandProvider, UpdateCheckResult
 
 # A well-formed manifest, shaped like the real feed document.
 _FEED_TEMPLATE = {
@@ -36,6 +38,17 @@ _FEED_TEMPLATE = {
     "version": "0.1.3rc2",
     "wheel_url": "https://download.crew.kiro.dev/cli/insider/0.1.3rc2/x.whl",
 }
+
+
+def _init_repo(path) -> None:
+    """Make *path* the top level of a real git working tree.
+
+    Detection asks git and anchors the answer to this exact directory, so a
+    fabricated ``.git`` entry does not stand in for a repository.
+    """
+    subprocess.run(
+        ["git", "init", "-q"], cwd=str(path), check=True, capture_output=True, timeout=30
+    )
 
 
 def _manifest(**overrides: object) -> bytes:
@@ -72,7 +85,7 @@ def _wheel_install(monkeypatch, tmp_path):
     # Pin the packaging stamp rather than inheriting the ambient one: a checkout
     # has no `_build_info.py` and reports `source`, but an installed wheel reports
     # `wheel`, and the suite must not read differently depending on where it runs.
-    monkeypatch.setattr(updates, "distribution", lambda: "wheel")
+    monkeypatch.setattr(update_capability, "distribution", lambda: "wheel")
     original = dict(updates._update_info)
     yield
     updates._update_info.clear()
@@ -143,30 +156,32 @@ class TestChannelResolution:
         monkeypatch.setattr(update_layout, "data_home", lambda: tmp_path)
         assert updates._release_channel() == "stable"
 
-    def test_update_command_always_names_the_channel(self):
+    def test_remediation_command_always_names_the_channel(self, monkeypatch):
         # cli.sh defaults to stable and never reads the channel file, so a bare
         # re-run would silently move an insider install onto the stable lane.
-        # Asserts invariants, not a prefix: the shared builder now fetches to a
-        # temp file before running it (a pipe reported only sh's status, hiding a
-        # failed download), so the command no longer begins with curl.
-        cmd = updates._wheel_update_command("insider", "https://download.example")
+        capability = update_capability.derive_capability(install_root="", dist="wheel")
+        assert capability.remediation is not None
+        cmd = capability.remediation["command"]
         assert "--channel insider" in cmd
         assert "curl -fsSL --proto '=https'" in cmd
         assert "/cli.sh" in cmd
-        # The invariant is that the DOWNLOAD's failure fails the command.
-        # A pipe fed from an already-checked variable preserves that; only a
-        # bare `curl … | sh` would report just sh's status.
+        # The invariant is that the DOWNLOAD's failure fails the command. The
+        # shared builder fetches to a temp file before running it (a pipe reported
+        # only sh's status, hiding a failed download), so a pipe fed from an
+        # already-checked variable preserves that; only a bare `curl … | sh`
+        # would report just sh's status.
         assert '_kc_body="$(curl' in cmd, "curl must not feed sh directly"
 
-    def test_update_command_pins_https(self, monkeypatch):
+    def test_remediation_command_pins_https(self, monkeypatch):
         # The string is copied into a shell and runs an installer, and the base is
         # overridable via KIROCREW_CDN_BASE. Without --proto '=https' an http://
         # override yields a command that fetches a script in plaintext and
         # executes it — an on-path attacker could swap the installer. curl
         # refuses the scheme even when the override is plaintext.
         monkeypatch.setenv("KIROCREW_CDN_BASE", "http://evil.example")
-        cmd = updates._wheel_update_command("stable", "http://evil.example")
-        assert "--proto '=https'" in cmd
+        capability = update_capability.derive_capability(install_root="", dist="wheel")
+        assert capability.remediation is not None
+        assert "--proto '=https'" in capability.remediation["command"]
 
     def test_cdn_override_moves_check_and_command_together(self, monkeypatch):
         monkeypatch.setenv("KIROCREW_CDN_BASE", "https://cdn.example/")
@@ -182,14 +197,42 @@ class TestWheelInstallCheck:
 
         info = updates.get_update_info()
         assert seen["url"] == "https://updates.crew.kiro.dev/feed/insider/latest-cli.json"
-        assert info["available"] is True
-        assert info["checked"] is True
-        assert info["error"] == ""
-        assert info["remote_version"] == "0.1.3rc2"
-        assert info["install_kind"] == "wheel"
-        assert info["self_updatable"] is False
+        assert info["update_available"] is True
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+        assert info["latest_version"] == "0.1.3rc2"
+        assert info["managed_by"] == "kirocrew"
+        assert info["can_apply"] is False
         assert info["channel"] == "insider"
-        assert "--channel insider" in str(info["update_command"])
+        assert "--channel insider" in updates.remediation_command(info)
+
+    def test_a_switch_mid_check_cannot_pair_one_lane_with_the_other_s_command(self, monkeypatch):
+        """The capability's command and the reported channel are read separately.
+
+        `derive_capability` composes the installer command from the channel at
+        DERIVATION time; the feed check reads the channel again to build the URL. A
+        switch (the endpoint, or `cli.sh` writing the file directly) landing between
+        the two used to publish the new lane's name beside the OLD lane's command —
+        and the command is the half the user acts on, so copy-pasting it would move
+        the install straight back.
+        """
+        # Only the DERIVATION-time read is redirected: `updates` binds
+        # `release_channel` at import, while `derive_capability` imports it inside the
+        # call, so patching the module attribute reaches one and not the other. That
+        # asymmetry is precisely the production race — two reads, two moments.
+        monkeypatch.setattr("kiro_crew.platform.update_layout.release_channel", lambda: "stable")
+        _stub_feed(monkeypatch, body=_manifest(version="0.1.3rc2"))
+        monkeypatch.setattr(updates, "_local_version", "0.1.2rc3")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        command = updates.remediation_command(info)
+        # The invariant is the PAIR, not any particular lane: whatever channel the
+        # check reports, the command it offers must name that same channel.
+        assert (
+            f"--channel {info['channel']}" in command
+        ), f"reported channel {info['channel']!r} paired with command {command!r}"
+        assert "stable" not in command
 
     def test_reports_up_to_date_only_after_a_real_comparison(self, monkeypatch):
         _stub_feed(monkeypatch, body=_manifest(version="0.1.2rc3"))
@@ -197,9 +240,9 @@ class TestWheelInstallCheck:
         asyncio.run(updates._do_update_check())
 
         info = updates.get_update_info()
-        assert info["available"] is False
-        assert info["checked"] is True  # THIS is what licenses the UI success line
-        assert info["error"] == ""
+        assert info["update_available"] is False
+        assert info["check_status"] == "succeeded"  # THIS is what licenses the UI success line
+        assert info["error_code"] is None
 
     def test_never_surfaces_installable_artifact_metadata(self, monkeypatch):
         _stub_feed(monkeypatch)
@@ -220,15 +263,15 @@ class TestWheelInstallCheck:
         _stub_feed(monkeypatch)
         monkeypatch.setattr(updates, "_local_version", "0.1.0")
         asyncio.run(updates._do_update_check())
-        assert updates.get_update_info()["remote_pub_date"] == "2026-08-05T07:49:33Z"
+        assert updates.get_update_info()["latest_pub_date"] == "2026-08-05T07:49:33Z"
 
     def test_drops_a_malformed_publication_date_without_failing(self, monkeypatch):
         _stub_feed(monkeypatch, body=_manifest(pub_date="<script>x</script>"))
         monkeypatch.setattr(updates, "_local_version", "0.1.0")
         asyncio.run(updates._do_update_check())
         info = updates.get_update_info()
-        assert "remote_pub_date" not in info
-        assert info["checked"] is True  # optional field, not a hard failure
+        assert "latest_pub_date" not in info
+        assert info["check_status"] == "succeeded"  # optional field, not a hard failure
 
 
 class TestWheelInstallFailuresAreHonest:
@@ -236,13 +279,15 @@ class TestWheelInstallFailuresAreHonest:
 
     def _assert_failed(self, code: str) -> None:
         info = updates.get_update_info()
-        assert info["error"] == code
-        assert info["checked"] is False
-        assert info["available"] is False
+        assert info["error_code"] == code
+        assert info["check_status"] == "failed"
+        # No verdict, not a negative one: a failed check must never be
+        # readable as "up to date".
+        assert info["update_available"] is None
         # The install is still identified, so the UI can still tell the user HOW
         # to update even when it could not learn WHETHER to.
-        assert info["install_kind"] == "wheel"
-        assert "--channel insider" in str(info["update_command"])
+        assert info["managed_by"] == "kirocrew"
+        assert "--channel insider" in updates.remediation_command(info)
 
     def test_network_error(self, monkeypatch):
         _stub_feed(monkeypatch, exc=aiohttp.ClientConnectionError("boom"))
@@ -308,29 +353,40 @@ class TestWheelInstallFailuresAreHonest:
         monkeypatch.setattr(updates, "_local_version", "not-a-version")
         asyncio.run(updates._do_update_check())
         info = updates.get_update_info()
-        assert info["error"] == "version_unparseable"
-        assert info["checked"] is False
-        assert info["available"] is False
+        assert info["error_code"] == "version_unparseable"
+        assert info["check_status"] == "failed"
+        # No verdict, not a negative one: a failed check must never be
+        # readable as "up to date".
+        assert info["update_available"] is None
 
     def test_stale_state_never_survives_a_later_failure(self, monkeypatch):
         _stub_feed(monkeypatch, body=_manifest(version="0.1.3rc2"))
         monkeypatch.setattr(updates, "_local_version", "0.1.2rc3")
         asyncio.run(updates._do_update_check())
-        assert updates.get_update_info()["remote_version"] == "0.1.3rc2"
+        assert updates.get_update_info()["latest_version"] == "0.1.3rc2"
 
         _stub_feed(monkeypatch, exc=aiohttp.ClientConnectionError("boom"))
         asyncio.run(updates._do_update_check())
         info = updates.get_update_info()
-        assert info["remote_version"] == ""  # no half-truth beside a fresh error
-        assert info["available"] is False
-        assert info["error"] == "feed_unreachable"
+        assert info["latest_version"] == ""  # no half-truth beside a fresh error
+        # No verdict, not a negative one: a failed check must never be
+        # readable as "up to date".
+        assert info["update_available"] is None
+        assert info["error_code"] == "feed_unreachable"
 
 
 class TestGitCheckoutStillWorks:
     @pytest.fixture
     def _git_install(self, monkeypatch, tmp_path):
-        (tmp_path / ".git").mkdir()
+        _init_repo(tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        # These tests exercise the CHECK against a scripted git; the process
+        # running them does not load kiro_crew from tmp_path, so the provenance
+        # half of the git-lane gate is declared rather than derived.
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_capability.running_from_checkout",
+            lambda root, **kw: True,
+        )
         return tmp_path
 
     @staticmethod
@@ -354,15 +410,14 @@ class TestGitCheckoutStillWorks:
         monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _exec)
         return calls
 
-    def test_detects_a_prerelease_bump_the_old_comparator_missed(
-        self, _git_install, monkeypatch
-    ):
+    def test_detects_a_prerelease_bump_the_old_comparator_missed(self, _git_install, monkeypatch):
         calls = self._git_script(
             monkeypatch,
             [
                 (0, b""),  # git fetch
                 (0, b"aaaa\n"),  # rev-parse HEAD
                 (0, b"bbbb\n"),  # rev-parse @{u}
+                (0, b"0\t1\n"),  # rev-list --count --left-right HEAD...@{u}
                 (0, b'__version__ = "0.1.3rc2"\n'),  # git show
                 (0, b"+### 0.1.3rc2\n+- thing\n"),  # git diff CHANGELOG.md
             ],
@@ -371,24 +426,209 @@ class TestGitCheckoutStillWorks:
         asyncio.run(updates._do_update_check())
 
         info = updates.get_update_info()
-        assert info["install_kind"] == "git"
-        assert info["self_updatable"] is True
-        assert info["available"] is True
-        assert info["checked"] is True
-        assert info["error"] == ""
-        assert info["remote_version"] == "0.1.3rc2"
+        assert info["managed_by"] == "git"
+        assert info["can_apply"] is True
+        assert info["update_available"] is True
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+        assert info["latest_version"] == "0.1.3rc2"
         assert "### 0.1.3rc2" in str(info["changes"])
         assert info["channel"] == ""
-        assert info["update_command"] == ""
+        # A checkout's remediation is the CLI command, not an installer re-run.
+        assert updates.remediation_command(info) == "kirocrew update"
         assert any("fetch" in c for c in calls)
+
+    def test_commits_behind_with_an_unchanged_version_is_an_update(self, _git_install, monkeypatch):
+        """The reported bug: 219 commits behind, both sides still ``0.3.0``.
+
+        ``__version__`` is bumped only at a release, so comparing version
+        strings reported "you're on the latest version" to a checkout days of
+        merges behind ``origin/main`` — for as long as the next bump took.
+        """
+        self._git_script(
+            monkeypatch,
+            [
+                (0, b""),  # git fetch
+                (0, b"aaaa\n"),  # rev-parse HEAD
+                (0, b"bbbb\n"),  # rev-parse @{u}
+                (0, b"0\t219\n"),  # rev-list: 0 ahead, 219 behind
+                (0, b'__version__ = "0.3.0"\n'),  # git show — SAME version
+                (0, b""),  # git diff CHANGELOG.md
+            ],
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["update_available"] is True
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+
+    def test_ahead_after_a_version_bump_pull_is_not_an_update(self, _git_install, monkeypatch):
+        """A checkout that pulled a bump and committed on top must not be reset.
+
+        Its upstream still reads NEWER than the version this process imported,
+        so an ungated version signal marks it available and the unattended
+        ``_auto_apply_update`` resets hard onto the upstream, dropping the local
+        commits. The version signal only ever meant "pull landed, restart
+        pending", which is ``local_sha == remote_sha``.
+        """
+        self._git_script(
+            monkeypatch,
+            [
+                (0, b""),  # git fetch
+                (0, b"dddd\n"),  # rev-parse HEAD — local commits on top
+                (0, b"bbbb\n"),  # rev-parse @{u}
+                (0, b"2\t0\n"),  # rev-list: 2 ahead, 0 behind
+                (0, b'__version__ = "0.4.0"\n'),  # git show — upstream bumped
+            ],
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["update_available"] is False
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+
+    def test_a_pull_awaiting_a_restart_is_still_reported(self, _git_install, monkeypatch):
+        """The version signal's real case survives the gate: shas agree.
+
+        The pull landed, so HEAD == upstream and there is no commit distance;
+        only the imported ``__version__`` is stale. Applying here is a restart,
+        not a reset, so this must still light up.
+        """
+        self._git_script(
+            monkeypatch,
+            [
+                (0, b""),  # git fetch
+                (0, b"eeee\n"),  # rev-parse HEAD
+                (0, b"eeee\n"),  # rev-parse @{u} — SAME sha
+                (0, b"0\t0\n"),  # rev-list: level with upstream
+                (0, b'__version__ = "0.4.0"\n'),  # git show — on-disk is newer
+                (0, b""),  # git diff CHANGELOG.md
+            ],
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["update_available"] is True
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+
+    def test_a_diverged_checkout_is_not_offered_a_destructive_update(
+        self, _git_install, monkeypatch
+    ):
+        """Behind AND ahead: an update here would discard the local commits.
+
+        ``GatewayOrchestrator._auto_apply_update`` applies ``git fetch`` +
+        ``git reset --hard`` unattended under ``auto_update``, so a diverged
+        branch offered an update loses its own commits with no prompt. Only a
+        fast-forwardable checkout is offered one.
+        """
+        self._git_script(
+            monkeypatch,
+            [
+                (0, b""),  # git fetch
+                (0, b"cccc\n"),  # rev-parse HEAD
+                (0, b"bbbb\n"),  # rev-parse @{u}
+                (0, b"3\t219\n"),  # rev-list: 3 ahead, 219 behind — DIVERGED
+                (0, b'__version__ = "0.3.0"\n'),  # git show
+            ],
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["update_available"] is False
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+
+    def test_a_diverged_checkout_reports_its_commit_distance(self, _git_install, monkeypatch):
+        """Diverged is its own wire state, not a quieter "up to date".
+
+        ``update_available: False`` alone is what BOTH a current checkout and a
+        diverged one report, so the counts are the only signal the panel has to
+        say "rebase or merge" instead of "you're on the latest version". The
+        availability assertion rides along on purpose: populating the counts
+        must not loosen the no-auto-apply property the diverged case exists to
+        protect.
+        """
+        self._git_script(
+            monkeypatch,
+            [
+                (0, b""),  # git fetch
+                (0, b"cccc\n"),  # rev-parse HEAD
+                (0, b"bbbb\n"),  # rev-parse @{u}
+                (0, b"3\t219\n"),  # rev-list: 3 ahead, 219 behind — DIVERGED
+                (0, b'__version__ = "0.3.0"\n'),  # git show
+            ],
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["commits_ahead"] == 3
+        assert info["commits_behind"] == 219
+        assert info["update_available"] is False
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+
+    def test_a_checkout_only_ahead_is_up_to_date(self, _git_install, monkeypatch):
+        """Unpushed local commits are not an update to offer.
+
+        ``HEAD != @{u}`` is also true for a checkout that is merely AHEAD, and
+        the unattended apply path resets hard to the remote, so treating that as
+        an update would recommend discarding the user's own commits.
+        """
+        self._git_script(
+            monkeypatch,
+            [
+                (0, b""),  # git fetch
+                (0, b"cccc\n"),  # rev-parse HEAD — ahead of upstream
+                (0, b"aaaa\n"),  # rev-parse @{u}
+                (0, b"2\t0\n"),  # rev-list: 2 ahead, 0 behind
+                (0, b'__version__ = "0.3.0"\n'),  # git show
+            ],
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["update_available"] is False
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+
+    def test_an_unparseable_version_does_not_discard_a_commit_distance_verdict(
+        self, _git_install, monkeypatch
+    ):
+        """``behind > 0`` answers on its own, so a junk version is not fatal."""
+        self._git_script(
+            monkeypatch,
+            [
+                (0, b""),
+                (0, b"aaaa\n"),
+                (0, b"bbbb\n"),
+                (0, b"0\t4\n"),
+                (0, b'__version__ = "not-a-version"\n'),
+                (0, b""),
+            ],
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["update_available"] is True
+        assert info["error_code"] is None
 
     def test_git_fetch_failure_is_reported_not_swallowed(self, _git_install, monkeypatch):
         self._git_script(monkeypatch, [(128, b"")])
         asyncio.run(updates._do_update_check())
         info = updates.get_update_info()
-        assert info["error"] == "git_fetch_failed"
-        assert info["checked"] is False
-        assert info["install_kind"] == "git"
+        assert info["error_code"] == "git_fetch_failed"
+        assert info["check_status"] == "failed"
+        assert info["managed_by"] == "git"
 
     def test_missing_upstream_is_reported_not_up_to_date(self, _git_install, monkeypatch):
         self._git_script(
@@ -397,16 +637,22 @@ class TestGitCheckoutStillWorks:
         )
         asyncio.run(updates._do_update_check())
         info = updates.get_update_info()
-        assert info["error"] == "git_read_failed"
-        assert info["checked"] is False
+        assert info["error_code"] == "git_read_failed"
+        assert info["check_status"] == "failed"
 
     def test_unreadable_remote_version_is_reported(self, _git_install, monkeypatch):
         self._git_script(
             monkeypatch,
-            [(0, b""), (0, b"aaaa\n"), (0, b"bbbb\n"), (0, b"# no version here\n")],
+            [
+                (0, b""),
+                (0, b"aaaa\n"),
+                (0, b"bbbb\n"),
+                (0, b"0\t1\n"),
+                (0, b"# no version here\n"),
+            ],
         )
         asyncio.run(updates._do_update_check())
-        assert updates.get_update_info()["error"] == "git_read_failed"
+        assert updates.get_update_info()["error_code"] == "git_read_failed"
 
     def test_a_git_checkout_never_touches_the_feed(self, _git_install, monkeypatch):
         # The autouse conftest guard would blow up on any real fetch; this asserts
@@ -421,12 +667,13 @@ class TestGitCheckoutStillWorks:
                 (0, b""),
                 (0, b"aaaa\n"),
                 (0, b"aaaa\n"),
+                (0, b"0\t0\n"),
                 (0, b'__version__ = "0.1.2rc3"\n'),
             ],
         )
         monkeypatch.setattr(updates, "_local_version", "0.1.2rc3")
         asyncio.run(updates._do_update_check())
-        assert updates.get_update_info()["checked"] is True
+        assert updates.get_update_info()["check_status"] == "succeeded"
 
 
 class TestExternallyManagedInstalls:
@@ -441,47 +688,51 @@ class TestExternallyManagedInstalls:
     """
 
     @pytest.mark.parametrize(
-        ("dist", "code"),
-        [("dmg", "managed_by_app"), ("appimage", "managed_by_app"), ("docker", "managed_by_image")],
+        ("dist", "managed_by", "reason"),
+        [
+            ("dmg", "electron", "managed_by_app"),
+            ("appimage", "electron", "managed_by_app"),
+            ("docker", "container", "managed_by_image"),
+        ],
     )
-    def test_defers_instead_of_guessing(self, monkeypatch, dist, code):
+    def test_defers_instead_of_guessing(self, monkeypatch, dist, managed_by, reason):
         def _boom(url: str):  # pragma: no cover - must not be called
             raise AssertionError(f"{dist} must not read the CLI release feed")
 
         monkeypatch.setattr(updates, "_fetch_feed_bytes", _boom)
-        monkeypatch.setattr(updates, "distribution", lambda: dist)
+        monkeypatch.setattr(update_capability, "distribution", lambda: dist)
         asyncio.run(updates._do_update_check())
 
         info = updates.get_update_info()
-        assert info["install_kind"] == dist
-        assert info["error"] == code
-        assert info["self_updatable"] is False
-        # Not available: this is what keeps the nav badge quiet. And not checked:
-        # the gateway reached no verdict, so nothing may render "up to date".
-        assert info["available"] is False
-        assert info["checked"] is False
-        # No command either — the app/image owns the upgrade, not a shell one-liner.
-        assert info["update_command"] == ""
+        assert info["managed_by"] == managed_by
+        # A deferral is not a failure: the app has not malfunctioned, and rendering
+        # it as an error is its own lie. The reason gets its own slot.
+        assert info["check_status"] == "deferred"
+        assert info["unavailable_reason"] == reason
+        assert info["error_code"] is None
+        assert info["can_apply"] is False
+        # No verdict at all, which is what keeps the nav badge quiet — and null
+        # rather than False, so nothing may render "up to date" either.
+        assert info["update_available"] is None
 
-    def test_a_git_checkout_wins_over_a_desktop_stamp(self, monkeypatch, tmp_path):
-        # A developer running the desktop build's own source tree is still a git
-        # checkout, and `POST /api/update` works there.
-        (tmp_path / ".git").mkdir()
+    def test_a_desktop_stamp_wins_over_a_git_checkout(self, monkeypatch, tmp_path):
+        # A desktop bundle ships this backend inside itself, so being pointed at a
+        # checkout does not make the checkout its update surface: its own updater
+        # owns the bytes, and reading the CLI feed here would compare against the
+        # wrong release stream.
+        _init_repo(tmp_path)
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
-        monkeypatch.setattr(updates, "distribution", lambda: "dmg")
+        monkeypatch.setattr(update_capability, "distribution", lambda: "dmg")
 
-        class _Proc:
-            returncode = 128
+        def _boom(url: str):  # pragma: no cover - must not be called
+            raise AssertionError("a desktop bundle must not read the CLI release feed")
 
-            async def communicate(self):
-                return (b"", b"")
-
-        async def _exec(*a, **k):
-            return _Proc()
-
-        monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _exec)
+        monkeypatch.setattr(updates, "_fetch_feed_bytes", _boom)
         asyncio.run(updates._do_update_check())
-        assert updates.get_update_info()["install_kind"] == "git"
+
+        info = updates.get_update_info()
+        assert info["managed_by"] == "electron"
+        assert info["check_status"] == "deferred"
 
     @pytest.mark.parametrize("dist", ["wheel", "source"])
     def test_feed_checkable_kinds_are_matched_by_exclusion(self, monkeypatch, dist):
@@ -490,15 +741,17 @@ class TestExternallyManagedInstalls:
         # released before it carries none. An `== "wheel"` allowlist would exclude
         # exactly the already-released installs this check exists to fix.
         _stub_feed(monkeypatch, body=_manifest(version="0.1.3rc2"))
-        monkeypatch.setattr(updates, "distribution", lambda: dist)
+        monkeypatch.setattr(update_capability, "distribution", lambda: dist)
         monkeypatch.setattr(updates, "_local_version", "0.1.2rc3")
         asyncio.run(updates._do_update_check())
 
         info = updates.get_update_info()
-        assert info["install_kind"] == dist  # reported verbatim, not flattened
-        assert info["available"] is True
-        assert info["checked"] is True
-        assert "--channel insider" in str(info["update_command"])
+        # One capability for both stamps: what a consumer acts on is who manages
+        # the install, not which packaging label it happens to carry.
+        assert info["managed_by"] == "kirocrew"
+        assert info["update_available"] is True
+        assert info["check_status"] == "succeeded"
+        assert "--channel insider" in updates.remediation_command(info)
 
 
 class TestCheckIsRateLimitedEvenOnFailure:
@@ -531,7 +784,7 @@ class TestCheckIsRateLimitedEvenOnFailure:
         asyncio.run(_drive())
         assert calls["n"] == 1
         # The winner's verdict still lands — the no-ops must not blank it.
-        assert updates.get_update_info()["available"] is True
+        assert updates.get_update_info()["update_available"] is True
 
     def test_the_flag_is_released_even_when_the_check_raises(self, monkeypatch):
         # A stuck flag would wedge the check for the process's lifetime.
@@ -541,7 +794,29 @@ class TestCheckIsRateLimitedEvenOnFailure:
         monkeypatch.setattr(updates, "_fetch_feed_bytes", _boom)
         asyncio.run(updates._do_update_check())
         assert updates._check_in_flight is False
-        assert updates.get_update_info()["error"] == "unknown"
+        assert updates.get_update_info()["error_code"] == "unknown"
+
+    def test_the_flag_is_released_when_the_DERIVATION_raises(self, monkeypatch):
+        # The derivation runs before any branch is chosen, so a raise there is the
+        # one that can escape the single-flight guard. A leaked flag makes every
+        # later check a silent no-op: the gateway stops noticing updates at all
+        # and nothing surfaces the fact.
+        def _boom() -> object:
+            raise RuntimeError("git exploded")
+
+        monkeypatch.setattr(updates, "derive_capability", _boom)
+        asyncio.run(updates._do_update_check())
+        assert updates._check_in_flight is False
+        assert updates.get_update_info()["error_code"] == "unknown"
+        assert updates.get_update_info()["check_status"] == "failed"
+
+        # And the next check must actually run rather than hit the leaked flag.
+        monkeypatch.setattr(updates, "derive_capability", update_capability.derive_capability)
+        _stub_feed(monkeypatch, body=_manifest(version="0.1.3rc2"))
+        monkeypatch.setattr(updates, "_local_version", "0.1.2rc3")
+        monkeypatch.setattr(updates, "_last_update_check", 0.0)
+        asyncio.run(updates._do_update_check())
+        assert updates.get_update_info()["update_available"] is True
 
 
 class TestAutoApplyGuard:
@@ -560,13 +835,14 @@ class TestAutoApplyGuard:
         orch._auto_apply_wheel_update = AsyncMock()
         return orch
 
-    def _run(self, info: dict[str, object], *, auto_update: bool):
+    def _run(self, info: dict[str, object], *, auto_update: bool, dist: str = "wheel"):
         import kiro_crew.dashboard.handlers as handlers
 
         orch = self._orchestrator()
         cfg = MagicMock()
         cfg.auto_update = auto_update
         from kiro_crew.platform.governance import UpdatePins
+
         original = dict(handlers._update_info)
         try:
             handlers._update_info.clear()
@@ -577,14 +853,18 @@ class TestAutoApplyGuard:
                         "kiro_crew.platform.update_governance.update_required",
                         return_value=False,
                     ):
-                        # No commands in the policy pins, so resolve_provider
-                        # returns None and the code falls through to the legacy
-                        # path under test.
-                        with patch(
-                            "kiro_crew.platform.governance.active_update_pins",
-                            return_value=UpdatePins(),
-                        ):
-                            asyncio.run(orch._check_for_updates())
+                        # The installer may only be driven for the `wheel` stamp,
+                        # so the stamp is part of the case rather than whatever
+                        # this test host happens to be built as.
+                        with patch("kiro_crew.slack.gateway.distribution", return_value=dist):
+                            # No commands in the policy pins, so resolve_provider
+                            # returns None and the code falls through to the legacy
+                            # path under test.
+                            with patch(
+                                "kiro_crew.platform.governance.active_update_pins",
+                                return_value=UpdatePins(),
+                            ):
+                                asyncio.run(orch._check_for_updates())
         finally:
             handlers._update_info.clear()
             handlers._update_info.update(original)
@@ -593,10 +873,14 @@ class TestAutoApplyGuard:
     def test_wheel_install_notifies_instead_of_applying(self):
         orch = self._run(
             {
-                "available": True,
-                "self_updatable": False,
-                "install_kind": "wheel",
-                "update_command": "curl -fsSL … | sh",
+                "update_available": True,
+                "can_apply": False,
+                "managed_by": "kirocrew",
+                "remediation": {
+                    "kind": "command",
+                    "message": "Re-run the installer to upgrade.",
+                    "command": "curl -fsSL … | sh",
+                },
             },
             auto_update=True,
         )
@@ -605,21 +889,158 @@ class TestAutoApplyGuard:
         # The wheel auto-apply IS called (new behavior).
         orch._auto_apply_wheel_update.assert_awaited_once()
 
-    def test_git_checkout_still_auto_applies(self):
+    def test_git_checkout_auto_applies_when_the_version_moved(self):
+        """The git apply needs `version_newer`, not just `available`.
+
+        `available` is true on commit distance alone for a checkout, and this
+        path applies `git reset --hard`. Requiring the version to have moved
+        keeps it firing no more often than while the verdict was version-only
+        (see `TestCheckForUpdates` in `test_slack_gateway.py` for the negative).
+        """
         orch = self._run(
-            {"available": True, "self_updatable": True, "install_kind": "git"},
+            {
+                "update_available": True,
+                "can_apply": True,
+                "managed_by": "git",
+                # The git auto-apply guard requires the version to have moved too,
+                # not just commit distance.
+                "version_newer": True,
+            },
             auto_update=True,
         )
         orch._auto_apply_update.assert_awaited_once()
 
     def test_a_failed_check_does_not_claim_up_to_date(self, capsys):
         orch = self._run(
-            {"available": False, "error": "feed_unreachable", "install_kind": "wheel"},
+            {"update_available": None, "error_code": "feed_unreachable", "managed_by": "kirocrew"},
             auto_update=True,
         )
         orch._auto_apply_update.assert_not_awaited()
         assert "Already on latest version" not in capsys.readouterr().out
 
     def test_a_clean_check_still_reports_up_to_date(self, capsys):
-        self._run({"available": False, "checked": True, "error": ""}, auto_update=True)
+        self._run(
+            {"update_available": False, "check_status": "succeeded", "error_code": None},
+            auto_update=True,
+        )
         assert "Already on latest version" in capsys.readouterr().out
+
+    def test_a_deferred_check_does_not_claim_up_to_date(self, capsys):
+        """A DEFERRAL carries no `error_code`, so keying only on that lies.
+
+        A desktop bundle's own updater owns its bytes: this process never asked the
+        feed anything, so it has no verdict to report. Printing "already on latest"
+        is the same false reassurance a FAILED check must not print — the deferral
+        just arrives through a different field.
+        """
+        self._run(
+            {
+                "update_available": None,
+                "check_status": "deferred",
+                "error_code": None,
+                "managed_by": "dmg",
+            },
+            auto_update=True,
+        )
+        assert "Already on latest version" not in capsys.readouterr().out
+
+    def test_an_unchecked_state_does_not_claim_up_to_date(self, capsys):
+        """Same hole from the other side: no check has run at all yet."""
+        self._run(
+            {"update_available": None, "check_status": "unchecked", "error_code": None},
+            auto_update=True,
+        )
+        assert "Already on latest version" not in capsys.readouterr().out
+
+
+class TestCommandManagedCheck:
+    """A policy-pinned command provider owns the check: no feed, no git, no channel.
+
+    Before this, ``resolve_provider`` was consulted only on the apply path, so a
+    command-managed host's badge was still computed against the feed/git
+    mechanism its policy excluded: the panel could advertise an update the
+    Update button (which honors the provider) would never deliver, and named a
+    release channel the provider never reads.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_cache(self):
+        saved_info = dict(updates._update_info)
+        saved_clock = updates._last_update_check
+        saved_generation = updates._check_generation
+        saved_flight = updates._check_in_flight
+        yield
+        updates._update_info.clear()
+        updates._update_info.update(saved_info)
+        updates._last_update_check = saved_clock
+        updates._check_generation = saved_generation
+        updates._check_in_flight = saved_flight
+
+    def _run(self, provider: CommandProvider, result: UpdateCheckResult) -> dict:
+        # ``derive_capability`` and both built-in checkers are booby-trapped:
+        # the provider branch must bypass the built-in mechanism entirely, and
+        # a silent fall-through here would be the exact badge/apply divergence
+        # this feature removes. ``_shell_exec_args`` is pinned so ``can_apply``
+        # reflects command PRESENCE on every platform — on Windows it refuses
+        # every command (fail-closed), which is its own behavior under test in
+        # test_update_provider.py, not this dispatch contract's.
+        with (
+            patch.object(updates, "resolve_provider", return_value=provider),
+            patch.object(CommandProvider, "check", AsyncMock(return_value=result)),
+            patch.object(
+                update_provider, "_shell_exec_args", return_value=["/bin/sh", "-c", "cmd"]
+            ),
+            patch.object(
+                updates,
+                "derive_capability",
+                side_effect=AssertionError("built-in derivation must not run"),
+            ),
+            patch.object(
+                updates,
+                "_check_release_feed",
+                side_effect=AssertionError("feed check must not run"),
+            ),
+            patch.object(
+                updates,
+                "_check_git_checkout",
+                side_effect=AssertionError("git check must not run"),
+            ),
+        ):
+            asyncio.run(updates._do_update_check())
+        return updates.get_update_info()
+
+    def test_an_available_update_reports_success_with_no_channel(self):
+        provider = CommandProvider(check_command="check-cmd", apply_command="apply-cmd")
+        info = self._run(provider, UpdateCheckResult(available=True, remote_version="2.0.0"))
+        assert info["update_available"] is True
+        assert info["version_newer"] is True
+        assert info["latest_version"] == "2.0.0"
+        assert info["check_status"] == "succeeded"
+        assert info["managed_by"] == "command"
+        assert info["can_apply"] is True
+        # The core invariant: a command-managed install has no release channel,
+        # which is what tells the panel to hide the channel switcher.
+        assert info["channel"] == ""
+        assert updates.status_update_fields()["update_channel"] == ""
+
+    def test_up_to_date_reports_no_update_not_an_error(self):
+        provider = CommandProvider(check_command="check-cmd", apply_command="apply-cmd")
+        info = self._run(provider, UpdateCheckResult(available=False))
+        assert info["update_available"] is False
+        assert info["check_status"] == "succeeded"
+        assert info["error_code"] is None
+        assert info["latest_version"] == ""
+
+    def test_check_only_pins_offer_no_apply_button(self):
+        provider = CommandProvider(check_command="check-cmd")
+        info = self._run(provider, UpdateCheckResult(available=True, remote_version="2.0.0"))
+        assert info["can_apply"] is False
+        assert info["update_available"] is True
+
+    def test_a_failing_provider_reports_a_failed_check_not_a_stale_verdict(self):
+        provider = CommandProvider(check_command="check-cmd", apply_command="apply-cmd")
+        info = self._run(provider, UpdateCheckResult(error="command timed out"))
+        assert info["check_status"] == "failed"
+        assert info["update_available"] is None
+        assert info["error_code"] == "unknown"
+        assert info["latest_version"] == ""

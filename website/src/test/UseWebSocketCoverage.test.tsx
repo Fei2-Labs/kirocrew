@@ -979,6 +979,26 @@ describe('useWebSocket frame router', () => {
     expect(chat().voicePlaying).toBe(false)
   })
 
+  it('uses the WAV MIME type supplied with a local voice chunk', async () => {
+    const blobs: Blob[] = []
+    URL.createObjectURL = vi.fn((blob: Blob) => {
+      blobs.push(blob)
+      return 'blob:voice-wav'
+    })
+    vi.stubGlobal('Audio', MockAudio)
+    const { ws } = mount()
+
+    await act(async () => {
+      ws.simulateMessage({
+        type: 'voice_chunk',
+        data: { slot: ACTIVE, audio: btoa('wav'), audioMime: 'audio/wav' },
+      })
+    })
+
+    expect(blobs).toHaveLength(1)
+    expect(blobs[0].type).toBe('audio/wav')
+  })
+
   it('advances past a chunk whose audio element errors', async () => {
     vi.stubGlobal('Audio', MockAudio)
     const { ws } = mount()

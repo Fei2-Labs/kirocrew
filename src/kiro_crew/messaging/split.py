@@ -1,9 +1,10 @@
 """Fence-safe markdown splitting, shared by every messaging channel.
 
-Six splitters grew independently — Discord and Telegram each carry a
+Six splitters grew independently — Telegram carries a
 ``_split_text``/``_split_markdown`` pair, ``messaging/renderer.py`` chunks blind
 fixed-width, and Slack, Webex and Weixin have their own — so a fix landed in one
-never reached the others. This module is the single engine they converge on.
+never reached the others. This module is the single engine they converge on, and
+Discord is the first channel on it.
 
 Three properties make it safe for the shared path:
 
@@ -61,9 +62,10 @@ source, and byte or UTF-16 length limits.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 
-__all__ = ["split_markdown_safe"]
+__all__ = ["split_markdown_safe", "iter_fence_spans", "open_fence_at_end"]
 
 # An opener is <=3 spaces of indent + a run of >=3 backticks/tildes + an info
 # string. A backtick fence's info string may not contain a backtick (otherwise
@@ -311,6 +313,47 @@ def _advance(fence: _Fence | None, line: str) -> _Fence | None:
     if m:
         return _Fence(char=m.group(1)[0], length=len(m.group(1)), opener=body)
     return None
+
+
+def open_fence_at_end(text: str) -> tuple[str, int, str] | None:
+    """Return ``(character, length, opener)`` for the fence open at text's end."""
+    fence: _Fence | None = None
+    for line, _full, _terminated in _lines(text):
+        fence = _advance(fence, line)
+    return (fence.char, fence.length, fence.opener) if fence else None
+
+
+def iter_fence_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Yield ``(start, end)`` character spans of *text* inside a fenced code block.
+
+    Each span covers the opener line through the end of the closer line, so
+    everything a fence encloses -- and the delimiter lines themselves -- falls
+    inside one. A fence left open runs to the end of *text*: content after a
+    dangling opener renders as code. Spans are yielded in order and never overlap.
+
+    This is the whole-text view of the same machine :func:`split_markdown_safe`
+    runs on: both drive :func:`_advance`, so the open/close rule -- which run
+    length closes which fence character -- exists once. A consumer that needs to
+    know "is this offset inside code?" uses this instead of re-deriving the rule,
+    because a second spelling of it diverges on the next CommonMark fix. Line
+    boundaries come from :func:`_lines` for the same reason.
+    """
+    fence: _Fence | None = None
+    open_at = 0
+    pos = 0
+    # _lines rejoins to `text` exactly, so `pos` tracks true character offsets
+    # and reaches len(text) on the final line -- no clamping needed.
+    for line, _full, _terminated in _lines(text):
+        line_start = pos
+        pos += len(line)
+        after = _advance(fence, line)
+        if fence is None and after is not None:
+            open_at = line_start
+        elif fence is not None and after is None:
+            yield open_at, pos
+        fence = after
+    if fence is not None:
+        yield open_at, len(text)
 
 
 def _safe_cut(fence: _Fence | None, frag: str, room: int) -> int:

@@ -46,6 +46,11 @@ ENFORCED = {
     # no widget (trailer stripped; their text fallback is the
     # approval-ladder work).
     "max_buttons",
+    # Gates whether a renderer extracts local image references out of a sealed
+    # segment and uploads them (discord/renderer.py::_uploads_enabled ->
+    # client.send_message_with_files). A channel declaring False keeps printing
+    # the markdown path, which is the honest degradation -- never a silent drop.
+    "files_outbound",
 }
 
 #: Declared honestly, read by nothing yet. The capability-gated interface
@@ -56,7 +61,6 @@ ASPIRATIONAL = {
     "edit",
     "reactions",
     "files_inbound",
-    "files_outbound",
     "rich_blocks",
     "threads",
 }
@@ -117,14 +121,14 @@ class TestCorrectedDeclarations:
         assert WEBEX_CAPABILITIES.max_message_chars * 4 <= WEBEX_MAX_TEXT
 
     def test_the_file_directions_are_declared_separately(self) -> None:
-        # One boolean was undecidable: discord ingests but cannot upload,
-        # slack does both. A gate reading a single `files` flag got the
-        # wrong answer for one of them.
+        # One boolean was undecidable: the two directions land per channel and in
+        # different changes, so a gate reading a single `files` flag got the wrong
+        # answer for one of them.
         from kiro_crew.discord.transport import DISCORD_CAPABILITIES
         from kiro_crew.slack.transport import SLACK_CAPABILITIES
 
         assert DISCORD_CAPABILITIES.files_inbound is True
-        assert DISCORD_CAPABILITIES.files_outbound is False
+        assert DISCORD_CAPABILITIES.files_outbound is True
         assert SLACK_CAPABILITIES.files_inbound is True
         assert SLACK_CAPABILITIES.files_outbound is True
 
@@ -172,6 +176,7 @@ class TestSessionResumeIsDeclaredOnlyWhereItIsHonoured:
         )
 
     def test_no_other_transport_declares_it(self) -> None:
+        from kiro_crew.imessage.transport import IMESSAGE_CAPABILITIES
         from kiro_crew.slack.transport import SLACK_CAPABILITIES
         from kiro_crew.teams.transport import TEAMS_CAPABILITIES
         from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES
@@ -186,6 +191,7 @@ class TestSessionResumeIsDeclaredOnlyWhereItIsHonoured:
             "webex": WEBEX_CAPABILITIES,
             "wecom": WECOM_CAPABILITIES,
             "weixin": WEIXIN_CAPABILITIES,
+            "imessage": IMESSAGE_CAPABILITIES,
         }
         claiming = [name for name, caps in others.items() if caps.supports_session_resume]
         assert claiming == [], (

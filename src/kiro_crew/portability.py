@@ -270,10 +270,10 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     Three rules, each closing a different way an archive can act on the host:
 
     1. A job that is not an object, or whose ``schedule`` is not one, is DROPPED.
-       ``CronService._load`` subscripts ``j["id"]`` and ``j["schedule"]["kind"]``
-       directly and catches only ``JSONDecodeError``/``KeyError``, so ``null`` or
-       a scalar in ``jobs`` raises ``TypeError`` straight out of the load. An
-       importer must not be able to write a store the loader cannot read.
+       ``CronService._load`` skips such a record with a warning and it is then
+       silently dropped from the store on the next write — dead weight with an
+       invisible deadline. Dropping it at import, with the drop REPORTED to the
+       user, is the honest version of the same outcome.
 
     2. A ``command`` is vetted with ``mcp_cron._vet_shell_command``, so it is
        judged exactly as the same command would be at ``cron_add`` (deny-list,
@@ -303,11 +303,10 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
         crons_path.write_text(json.dumps({"jobs": []}, indent=2))
         return [_UNREADABLE_STORE], []
     # A store whose top level is not an object, or whose `jobs` is not a list, is
-    # REPLACED rather than left alone. Returning early used to leave it in place,
-    # and the file is then copied into the target: `CronService._load` calls
-    # `data.get("jobs")` on it and raises AttributeError for `[]`/`null`/a scalar,
-    # which its `except (JSONDecodeError, KeyError)` does not catch. Not touching
-    # a malformed file only looks conservative — it installs the crash.
+    # REPLACED rather than left alone. `CronService._load` treats such a document
+    # as unsalvageable (empty registry, warning) — replacing it here means the
+    # user is TOLD the store was unreadable at import time, instead of the
+    # gateway silently starting with an empty schedule later.
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
         crons_path.write_text(json.dumps({"jobs": []}, indent=2))
         return [_UNREADABLE_STORE], []
@@ -323,12 +322,13 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
         return str(name) if name else "<unnamed>"
 
     for job in jobs:
-        # Rule 1: a shape the loader cannot read must not survive the import.
-        # `_load` subscripts these four directly, and its `except` catches only
-        # JSONDecodeError/KeyError — so a missing key is not merely a skipped job:
-        # it discards the WHOLE store (`self._jobs = []`), and a non-dict raises
-        # TypeError straight out of the load. Both are worse than dropping the one
-        # job here.
+        # Rule 1: a shape unfit for the store must not survive the import. This
+        # predicate is deliberately STRICTER than the loader's (it also demands
+        # str-typed id/name/message, which `_job_from_record` would accept
+        # untyped): the loader skips a bad record with a warning and the next
+        # write drops it for good, so importing anything questionable only
+        # manufactures dead weight with an invisible deadline. Dropping it here,
+        # reported in the import summary, tells the user it happened.
         if (
             not isinstance(job, dict)
             or not all(isinstance(job.get(f), str) for f in ("id", "name", "message"))

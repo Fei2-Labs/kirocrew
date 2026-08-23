@@ -39,9 +39,40 @@ export function trustBasePattern(baseCommand: string): string {
 /**
  * Shorten a command for a BUTTON LABEL only — never for the pattern itself.
  * Truncating a pattern would change the grant; this is display only.
+ *
+ * Elides the MIDDLE rather than the tail. This label is the only place INSIDE
+ * THE GRANT CONTROL that shows what is about to be trusted (the card renders
+ * toolInput above it when the gateway sent one, but the trust row must stand on
+ * its own), and cutting the tail is what makes two commands collide: they share a
+ * long head (`gh api repos/<owner>/<repo>/contents/…`) and differ at the END, in
+ * the filename. Raising the budget alone only moves that cliff, since a longer
+ * `owner/repo` pushes the filename past any fixed head budget.
+ *
+ * Must stay byte-identical to the dashboard copy in
+ * `website/src/utils/trustPatterns.ts` — a divergent budget OR a divergent
+ * algorithm is this same defect in a new place. Callers pass the untruncated
+ * command as a `title` tooltip so a long command stays fully recoverable.
  */
-export function truncateCommandLabel(cmd: string, max = 30): string {
-  return cmd.length > max ? cmd.slice(0, max) + '…' : cmd
+export function truncateCommandLabel(cmd: string, max = 64): string {
+  if (cmd.length <= max) return cmd
+  const tail = Math.floor((max - 1) / 3)
+  const head = max - 1 - tail
+  // Both cuts snap off surrogate boundaries: `slice` counts UTF-16 code units, so
+  // an unsnapped cut through an astral character leaves a lone surrogate and the
+  // label renders as a replacement character.
+  const headEnd = isHighSurrogate(cmd.charCodeAt(head - 1)) ? head - 1 : head
+  const tailStart = isLowSurrogate(cmd.charCodeAt(cmd.length - tail))
+    ? cmd.length - tail + 1
+    : cmd.length - tail
+  return cmd.slice(0, headEnd) + '…' + cmd.slice(tailStart)
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff
 }
 
 /**

@@ -740,8 +740,8 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     )
     renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
 
-    expect(await screen.findByText('Deny-all fallback in effect')).toBeInTheDocument()
-    expect(screen.getByText(/fail-closed deny-all ceiling/)).toBeInTheDocument()
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText(/policy fallback ceiling/)).toBeInTheDocument()
     expect(screen.getByText(/Affected: host\./)).toBeInTheDocument()
     // The remedy is only useful if it says WHERE the file is.
     expect(screen.getByText(/profiles folder of your Kiro Crew data home/)).toBeInTheDocument()
@@ -757,7 +757,7 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     )
     renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
 
-    expect(await screen.findByText('Deny-all fallback in effect')).toBeInTheDocument()
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
     expect(screen.getByText(/Affected: cron, subagent\./)).toBeInTheDocument()
   })
 
@@ -768,7 +768,7 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
 
     await screen.findByText('Policy v1')
-    expect(screen.queryByText('Deny-all fallback in effect')).not.toBeInTheDocument()
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
   })
 
   it('does not show fallback banner when fallback_profiles is absent', async () => {
@@ -776,7 +776,7 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
     renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
 
     await screen.findByText('Policy v1')
-    expect(screen.queryByText('Deny-all fallback in effect')).not.toBeInTheDocument()
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
   })
 })
 

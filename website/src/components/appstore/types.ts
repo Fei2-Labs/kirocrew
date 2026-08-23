@@ -84,7 +84,16 @@ export type InstalledApp = {
     crons?: { name: string }[]
     tags?: string[]
     jobFamilies?: string[]
-    ui?: { entry?: string; pages?: { route: string; label: string; icon: string }[] }
+    ui?: {
+      entry?: string
+      pages?: { route: string; label: string; icon: string }[]
+      /**
+       * Host surfaces this app replaces while enabled. Serialized by the manifest
+       * but previously undeclared here, so a reader outside `overlaySlots.ts` (which
+       * carries its own record type) could not see it.
+       */
+      overlays?: { id: string; replaces: string }[]
+    }
     permissions?: { api?: string[]; events?: string[]; mcpTools?: string[]; storage?: boolean; cron?: boolean; network?: boolean }
     setup?: { onInstall?: string; onUpdate?: string; onUninstall?: string; onEnable?: string; onDisable?: string }
     minKiroCrewVersion?: string
@@ -159,6 +168,36 @@ export function isVerified(app: Pick<RegistryApp, 'origin' | 'author' | '_regist
   // Legacy fallback (older gateway: no ``verified`` field).
   if (app.origin === 'builtin') return true
   return (app.author || '').toLowerCase() === 'kirocrew'
+}
+
+/** The ``source`` prefix ``install_from_registry`` records on a cloned app. */
+const REGISTRY_SOURCE_PREFIX = 'registry:'
+
+/**
+ * Whether an installed app's bytes came from a registry clone rather than from a
+ * directory on this machine.
+ *
+ * This is the discriminator ``handle_update_app`` itself branches on, and the two
+ * refresh paths are not interchangeable: a registry-sourced app is re-cloned
+ * through ``/api/apps/registry/install``, while an app installed from a path is
+ * re-copied from that path by ``POST /api/apps/{name}/update``. A local-source app
+ * has no registry row at all, so sending it down the registry path fails with
+ * "not found in registry" however it was installed.
+ *
+ * ``origin`` is the fallback for a record written before ``source`` was stored —
+ * the same secondary signal ``manager.py`` accepts for the same question. It is
+ * also the fallback when ``source`` is present but not a string: the detail page
+ * spreads a CATALOG row into its app object when the installed-record fetch
+ * fails, and ``registry.py`` copies index keys verbatim for a row it has not
+ * installed, so an external index can publish ``source: {type: "git"}``. The
+ * declared type says ``string``, but the payload is untrusted and this runs
+ * inside the ``autoAction`` effect — an unguarded ``startsWith`` throws there and
+ * Sync never dispatches at all.
+ */
+export function isRegistrySourced(app: Pick<InstalledApp, 'source' | 'origin'>): boolean {
+  const source = app.source
+  if (typeof source === 'string' && source) return source.startsWith(REGISTRY_SOURCE_PREFIX)
+  return app.origin === 'registry'
 }
 
 /**

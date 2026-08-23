@@ -29,6 +29,7 @@ export const json = (route, body, status = 200) => route.fulfill({
  *   theme?: string,
  *   botName?: string,
  *   preserveStorage?: boolean,
+ *   localStorageEntries?: Record<string, string>,
  *   extra?: (path: string, route: import('playwright').Route) => unknown,
  * }} opts
  */
@@ -38,6 +39,12 @@ export async function stubDashboardApi(page, opts = {}) {
     slots = [],
     theme = 'dark',
     preserveStorage = false,
+    // Extra localStorage seeds applied INSIDE this stub's own init script,
+    // after its clear. Playwright does not define the evaluation order of
+    // separately registered init scripts, so a harness that seeds storage via
+    // its own addInitScript races the clear below — pass the entries here
+    // instead.
+    localStorageEntries = null,
     // The backend's own default (`api_branding`: `cfg.dashboard.bot_name or
     // "Kiro Crew"`). It must stay TWO WORDS: the nav brand row accents the last
     // word only, and the composer placeholder interpolates the whole name — so
@@ -93,11 +100,12 @@ export async function stubDashboardApi(page, opts = {}) {
     return json(route, objectish ? {} : [])
   })
 
-  await page.addInitScript(([themeMode, keepStorage]) => {
+  await page.addInitScript(([themeMode, keepStorage, entries]) => {
     if (!keepStorage) localStorage.clear()
     localStorage.setItem('mc-theme', themeMode)
     localStorage.setItem('mc-onboarded', '1')
-  }, [theme, preserveStorage])
+    for (const [k, v] of Object.entries(entries || {})) localStorage.setItem(k, v)
+  }, [theme, preserveStorage, localStorageEntries])
 }
 
 /** Surface page errors + console errors on stdout so a broken capture is obvious. */

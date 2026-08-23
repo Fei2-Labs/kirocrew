@@ -139,10 +139,24 @@ async def handle_get_meeting(request: web.Request) -> web.Response:
             {"error": "meeting not found", "code": "meeting_not_found"}, status=404
         )
     live = ACTIVE.get(meeting_id)
+    live_payload = None
+    if live is not None:
+        live_payload = live.status()
+        # Whether a dispatch sent NOW would be admitted, from the same holder flag
+        # ``get_for_dispatch`` reads. The status is persisted ``active`` before
+        # ``init_agents`` runs, so status alone overstates readiness for the whole
+        # initialization window (~tens of seconds) while every dispatch 409s. The
+        # frontend polls this endpoint to decide when to open the microphone, and
+        # this field is the only per-poll answer to "would speech land?" — the
+        # start response alone cannot be, because it can be lost in transit while
+        # the server side succeeded. Plain attribute read on the single-threaded
+        # loop, same as the ``ACTIVE.get`` above; the value is a snapshot and may
+        # change by the next poll, which is exactly what a poll is for.
+        live_payload["accepting_dispatches"] = ACTIVE.accepting_dispatches
     return web.json_response(
         {
             "meta": meta,
-            "live": live.status() if live is not None else None,
+            "live": live_payload,
         }
     )
 

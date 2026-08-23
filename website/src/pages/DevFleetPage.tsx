@@ -20,6 +20,7 @@ import {
   Ellipsis, RotateCw, FileText, GitCommit, Rocket, Info, AlertTriangle, ShieldAlert,
 } from 'lucide-react'
 import * as api from './devFleetApi'
+import { ApiError } from '../api/client'
 
 import { i18nT } from '../i18n/t'
 import { compareText } from '../i18n/format'
@@ -830,14 +831,40 @@ export default function DevFleetPage() {
     // A poll for this run is already in flight (it outlived a previous mount of
     // this page, which is intended — the build's auto-restart must not be lost
     // to navigation). Starting a second loop here would race it: both would see
-    // `done` and both would fire the restart POST. Skip and let the existing
-    // loop own the run.
-    if (_activeSyncPolls.has(rid)) return
+    // `done` and both would fire the restart POST. Skip — but start a
+    // lightweight state relay so this mount's UI stays updated.
+    if (_activeSyncPolls.has(rid)) {
+      _syncStateRelay(rid, startedAt)
+      return
+    }
     _activeSyncPolls.add(rid)
     try {
       await _pollSyncRunLoop(rid, startedAt)
     } finally {
       _activeSyncPolls.delete(rid)
+    }
+  }
+
+  // Lightweight relay: polls /run to keep THIS mount's syncRun state in sync
+  // while the primary poll (from a prior mount) handles the auto-restart logic.
+  // Exits when the run finishes, the component unmounts, or the run is dismissed.
+  async function _syncStateRelay(rid: string, startedAt: number) {
+    for (let i = 0; i < 900; i++) {
+      await sleep(2000)
+      if (!pollAliveRef.current) return
+      if (cancelledRunsRef.current.has(rid)) return
+      let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string } | null = null
+      try { run = await api.get('/run?id=' + rid) } catch { continue }
+      if (!run) continue
+      const t0 = run.started ? run.started * 1000 : startedAt
+      const out = run.output || []
+      const last = [...out].reverse().find((l: string) => l?.trim() && !STEP_MARKER_RE.test(l)) || ''
+      if (run.status === 'done' || run.status === 'timeout') {
+        const okRun = run.exit_code === 0
+        setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last })
+        return
+      }
+      setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, last, stepLabel: run.step_label })
     }
   }
 
@@ -1060,12 +1087,33 @@ export default function DevFleetPage() {
     finally { setFlag(name + ':remove', false) }
   }
 
+  // Normalize a failed POST /sync into the shape the caller below already
+  // handles. The single-flight refusal is an HTTP 409 whose body names the run
+  // already in flight, so it arrives as a thrown error and never as a returned
+  // body — which is what left the `!ok && run_id` branch below unreachable.
+  // Every other status is a real failure carrying its message.
+  function syncPostFailure(e: unknown): { ok: false; run_id?: string; error: string } {
+    let rid: unknown
+    if (e instanceof ApiError && e.status === 409) {
+      try { rid = (JSON.parse(e.body) as { run_id?: unknown })?.run_id } catch { /* not JSON */ }
+    }
+    return {
+      ok: false,
+      run_id: typeof rid === 'string' && rid ? rid : undefined,
+      error: (e as Error)?.message || String(e),
+    }
+  }
+
   async function syncMain() {
     setFlag('__syncmain', true)
     try {
-      const r = await api.post<{ ok?: boolean; run_id?: string; error?: string }>('/sync', {})
+      const r = await api.post<{ ok?: boolean; run_id?: string; error?: string }>('/sync', {}).catch(syncPostFailure)
       if (!r?.ok && r?.run_id) {
-        // Sync already running — reattach to the in-flight run instead of erroring
+        // Sync already running — reattach to the in-flight run instead of erroring.
+        // A second press is a user who cannot see the run, so an error toast would
+        // leave them exactly where they started. `startedAt` is provisional: the
+        // poll loop recomputes elapsed from the run's own `started` on its first
+        // tick, and it refuses a second loop for a rid already being polled.
         setSyncRun({ rid: r.run_id, status: 'running', lines: [], startedAt: Date.now() })
         pollSyncRun(r.run_id, Date.now())
         return
@@ -1132,12 +1180,17 @@ export default function DevFleetPage() {
         let st: { running?: boolean; done?: number; items?: Record<string, { status?: string; error?: string | null }> } | null = null
         try { st = await api.get('/prune-status') } catch { continue }
         if (!st) continue
-        // Rebuild the item map in the ORIGINAL selection order; fall back to
-        // the pending seed for any name the backend has not populated yet.
+        // Rebuild the item map in the ORIGINAL selection order over the FULL
+        // regular-plus-forced set: the checklist, denominator, and success
+        // tally must all cover every name the backend tracks, forced worktrees
+        // included. Counting over ``names`` alone drops the forced worktrees
+        // from the denominator and the tally, restoring the ``1/0`` counter and
+        // the false failure toast. Fall back to the pending seed for any name
+        // the backend has not populated yet.
         const raw = st.items || {}
-        const backendTotal = Object.keys(raw).length || names.length
+        const backendTotal = Object.keys(raw).length || allNames.length
         const items: Record<string, { status: string; error?: string | null }> =
-          Object.fromEntries(names.map((n) => [n, {
+          Object.fromEntries(allNames.map((n) => [n, {
             status: raw[n]?.status || 'pending',
             error: raw[n]?.error ?? null,
           }]))
@@ -1146,14 +1199,14 @@ export default function DevFleetPage() {
           // A name the backend never tracked (filtered server-side, e.g. the
           // worktree vanished between preview and execute) must terminate as
           // an explained failure, not sit "Pending" in a finished checklist.
-          for (const n of names) {
+          for (const n of allNames) {
             if (!raw[n]) items[n] = { status: 'failed', error: 'not processed (unknown or no longer a worktree)' }
           }
         }
-        setPruneProgress({ names, items, done: st.done || 0, total: names.length, running })
+        setPruneProgress({ names: allNames, items, done: st.done || 0, total: allNames.length, running })
         if (!running) {
-          const removed = names.filter((n) => items[n]?.status === 'done').length
-          const failed = names.filter((n) => items[n]?.status === 'failed').length
+          const removed = allNames.filter((n) => items[n]?.status === 'done').length
+          const failed = allNames.filter((n) => items[n]?.status === 'failed').length
           notify(removed > 0 ? `Pruned ${removed} worktree(s)` + (failed > 0 ? ` (${failed} failed)` : '') : `Prune: ${failed} failed`, { type: removed > 0 ? 'success' : 'error' })
           invalidateAll()
           setTimeout(() => setPruneProgress(null), 5000)

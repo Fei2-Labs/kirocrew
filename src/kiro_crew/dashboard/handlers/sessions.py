@@ -10,7 +10,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider  # noqa: F811
@@ -1108,6 +1108,10 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     # (never the session JSONL) so summarizing an *active* session never rewrites
     # its log and cannot lose a concurrently-appended message.
     sig = await loop.run_in_executor(None, log.session_mtime, key)
+    # Captured WITH the signature: a rewrite during the model call below
+    # preserves the mtime while advancing this counter, and stamping the new
+    # content identity onto the older summary would bless it as fresh.
+    generation = await loop.run_in_executor(None, log.rotation_generation, key)
     cached = await loop.run_in_executor(None, log.get_cached_summary, key)
     if cached:
         return str(cached)
@@ -1141,7 +1145,9 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
         try:
             await loop.run_in_executor(
                 None,
-                functools.partial(log.set_cached_summary, key, summary, sig),
+                functools.partial(
+                    log.set_cached_summary, key, summary, sig, generation
+                ),
             )
         except Exception:
             logger.debug("Failed to persist summary cache for %s", key, exc_info=True)
@@ -1477,8 +1483,68 @@ async def api_session_keepalive(request: web.Request) -> web.Response:
     reply: dict = {"ok": True}
     wait_id = str(body.get("wait_id") or "").strip()[:64]
     if wait_id:
-        _service_wait_ping(state, session_key, wait_id, body, reply)
+        _service_wait_ping(state, session_key, wait_id, body, reply, provider)
     return web.json_response(reply)
+
+
+def _wait_end_reason(slot, wait_id: str, provider: Any) -> str | None:
+    """Why this sleep should return early, or None to keep sleeping.
+
+    Exactly two reasons, and the narrowness is the design:
+
+    ``"user"``
+        The End-wait button parked an explicit request naming this ``wait_id``.
+
+    ``"steer"``
+        A mid-turn steer reached the backend AFTER this sleep began. kiro-cli
+        can only inject a steer at a model-inference boundary and an in-flight
+        tool call is the absence of one, so without this the user's correction
+        sits in the backend's steer queue until the sleep elapses — up to the
+        tool's 1800s ceiling — while the agent sleeps through it.
+
+    "After this sleep began" is decided by comparing the provider's steer stamp
+    against the reading taken when this sleep was minted, so the handler reads
+    no clock of its own: the only two values ever compared are two readings of
+    the same monotonic source. That is deliberate — a wall-clock stamp on one
+    side and a monotonic one on the other is how a suspend silently reorders
+    the comparison.
+
+    Re-taking the baseline at every mint is also what makes the reason fire
+    once. A steer the backend has accepted but not yet injected stays newer
+    than nothing at all, so without a per-sleep baseline it would end sleep
+    after sleep for the rest of the turn and hand the model a `wait` that
+    returns instantly.
+
+    Not extended to the other long block on this route. ``spawn_sub_agents``
+    can wait 7200s on live sub-agents and pings the same endpoint, but sends no
+    ``wait_id`` and so never reaches this decision — an exclusion worth keeping
+    deliberately: ending a sleep discards nothing, while cutting a sub-agent
+    collection short orphans work that keeps running with nobody left to read
+    its results.
+    """
+    if slot._end_wait_request and slot._end_wait_request == wait_id:
+        return "user"
+    tracked = slot._wait_state or {}
+    if tracked.get("wait_id") != wait_id:
+        # Not the sleep this slot is tracking (contested identity, stale ping).
+        return None
+    steered_at = _provider_steer_stamp(provider)
+    return "steer" if steered_at > slot._wait_steer_baseline else None
+
+
+def _provider_steer_stamp(provider: Any) -> float:
+    """Monotonic time of the session's last steer, 0.0 when never steered or
+    when the provider does not expose one (a non-kiro backend, a test double).
+
+    Read through ``getattr`` rather than an interface method because this route
+    is reached by every backend, and a missing stamp must read as "no steer" —
+    the direction that keeps sleeping — rather than raise on the keepalive that
+    stops the watchdog killing the session mid-sleep.
+    """
+    try:
+        return float(getattr(provider, "last_steer_monotonic", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _service_wait_ping(
@@ -1487,13 +1553,14 @@ def _service_wait_ping(
     wait_id: str,
     body: dict,
     reply: dict,
+    provider: Any = None,
 ) -> None:
     """Track an in-flight `wait` sleep and hand back any early-end request.
 
-    Mutates ``reply`` in place, adding ``end_wait`` when the user asked to end
-    this exact wait. Silent no-op when the calling session has no dashboard tab
-    (a Slack/cron session can call `wait` too — it just has nothing to render a
-    countdown on).
+    Mutates ``reply`` in place, adding ``end_wait`` when the sleep should return
+    early (see :func:`_wait_end_reason`). Silent no-op when the calling session
+    has no dashboard tab (a Slack/cron session can call `wait` too — it just has
+    nothing to render a countdown on).
     """
     # Local import: this module's other chat_utils uses are function-local for
     # the same circular-import reason (handlers/__init__ re-exports this module).
@@ -1519,6 +1586,7 @@ def _service_wait_ping(
             slot._wait_state = None
             slot._end_wait_request = None
             slot._wait_last_ping = 0.0
+            slot._wait_steer_baseline = 0.0
             state.push_slots_update()
         return
     # ── Ambiguous-identity guard ──
@@ -1550,6 +1618,7 @@ def _service_wait_ping(
             slot._wait_state = None
             slot._end_wait_request = None
             slot._wait_last_ping = 0.0
+            slot._wait_steer_baseline = 0.0
             state.push_slots_update()
         return
     prev = slot._wait_state
@@ -1559,6 +1628,7 @@ def _service_wait_ping(
             slot._wait_state = None
             slot._end_wait_request = None
             slot._wait_last_ping = 0.0
+            slot._wait_steer_baseline = 0.0
             logger.info("two concurrent waits share session %s; countdown suppressed", session_key)
             state.push_slots_update()
             return
@@ -1582,21 +1652,53 @@ def _service_wait_ping(
         }
         # A brand-new wait cannot inherit an end request aimed at an older one.
         slot._end_wait_request = None
+        # Baseline for the steer reason: re-read on every mint, so only a steer
+        # that lands after THIS sleep began can end it. No clock read here —
+        # the baseline and the later comparison are two readings of the same
+        # provider stamp.
+        slot._wait_steer_baseline = _provider_steer_stamp(provider)
         slot._wait_last_ping = now
         state.push_slots_update()
     else:
         # Heartbeat only. Held OFF the wire payload so the deadline the browser
         # counts down against stays byte-identical between pushes.
         slot._wait_last_ping = now
-    if slot._end_wait_request and slot._end_wait_request == wait_id:
+    reason = _wait_end_reason(slot, wait_id, provider)
+    if reason is not None:
         # Consume exactly once. Leaving it set would make the NEXT wait in this
         # session return instantly, which is the failure mode a session-scoped
         # boolean flag would have had.
         slot._end_wait_request = None
         slot._wait_state = None
         slot._wait_last_ping = 0.0
+        slot._wait_steer_baseline = 0.0
         reply["end_wait"] = wait_id
+        logger.info("wait ending early for %s (reason=%s)", session_key, reason)
         state.push_slots_update()
+
+
+def _read_managed_tool_policy_sync(agent_path: Path) -> dict[str, Any] | None:
+    """Read one agent's ``managedToolPolicy`` from disk. Blocking.
+
+    Split out so the whole filesystem transaction -- the existence probe, the
+    read and the JSON parse -- crosses to a worker as ONE unit. Offloading only
+    the read would leave the ``stat`` and the parse on the gateway's single event
+    loop, which is the same defect in a smaller form.
+
+    ``None`` means "no policy to report", and is deliberately distinct from an
+    empty dict. The caller answers ``{}`` for both, but only a dict is an agent
+    whose config was read and understood, which is what its SEL ``ok`` record
+    attests -- an unreadable or malformed file is not an agent with no policy.
+    Collapsing the two would start logging success for files this never parsed.
+    """
+    try:
+        if not agent_path.is_file():
+            return None
+        config = json.loads(agent_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    policy = config.get("managedToolPolicy", {})
+    return policy if isinstance(policy, dict) else None
 
 
 async def api_session_tool_policy(request: web.Request) -> web.Response:
@@ -1666,18 +1768,15 @@ async def api_session_tool_policy(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid agent name"}, status=400)
 
-    # Read agent config from disk
+    # Read agent config from disk, OFF the event loop. A managed MCP server
+    # calls this to filter its tool list, so it runs on ordinary request traffic
+    # rather than at startup: the stat, the read and the parse would otherwise
+    # execute on the single loop every gateway request shares.
     agent_path = kiro_agents_dir() / f"{agent_name}.json"
-    if not agent_path.is_file():
-        return web.json_response({})
-
-    try:
-        config = json.loads(agent_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return web.json_response({})
-
-    policy = config.get("managedToolPolicy", {})
-    if not isinstance(policy, dict):
+    policy = await asyncio.to_thread(_read_managed_tool_policy_sync, agent_path)
+    if policy is None:
+        # Missing, unreadable, malformed, or a non-dict policy: answer the same
+        # empty policy as before and, as before, do not log it as a success.
         return web.json_response({})
 
     _sel().log_api_access(

@@ -7,6 +7,7 @@ import logging
 import math
 import struct
 from collections import defaultdict
+from typing import Any
 
 try:
     import pysqlite3 as sqlite3
@@ -34,6 +35,22 @@ _STOPWORDS = frozenset({
 VECTOR_RRF_WEIGHT = 2.0
 
 
+def _stored_item_ids(raw: str | bytes | None) -> Any:
+    """A state row's ``item_ids`` JSON column, decoded as stored.
+
+    An empty column, or one whose value ``json`` reports as malformed, yields
+    ``[]`` so a single bad row costs its own citation locator rather than the
+    whole enrichment pass. The decoded value is handed back unchecked -- callers
+    only iterate it.
+    """
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 class HybridRetriever:
     """FTS5 keyword + graph traversal + optional vector search, fused with RRF."""
 
@@ -42,18 +59,26 @@ class HybridRetriever:
         self.store = store
         self.embedder = embedder
 
-    def search(self, query: str, limit: int = 10) -> list[dict]:
-        """Hybrid search with RRF fusion. Returns [{id, title, summary, content, score, source, match_type}]."""
-        kw = self._keyword_search(query, limit=limit * 2)
+    def search(self, query: str, limit: int = 10, source_id: str | None = None) -> list[dict]:
+        """Hybrid search with RRF fusion. Returns [{id, title, summary, content, score, source, match_type}].
+
+        ``source_id`` scopes the SEED legs only (FTS5 keyword + vector
+        similarity): it stops other sources from dominating the seeds when
+        vocabularies collide across a heterogeneous corpus. The graph leg is
+        deliberately left unfiltered so cross-source entity connections can
+        still contribute traversal context to the fused ranking.
+        """
+        kw = self._keyword_search(query, limit=limit * 2, source_id=source_id)
         gr = self._graph_search(query, limit=limit * 2)
-        vec = self._vector_search(query, limit=limit * 2)
+        vec = self._vector_search(query, limit=limit * 2, source_id=source_id)
 
         # Vector leg is weighted higher so semantic matches dominate when the
         # keyword leg is weak. Weights align positionally
         # with (kw, gr, vec).
         fused = self._rrf_fuse(kw, gr, vec, weights=(1.0, 1.0, VECTOR_RRF_WEIGHT))
 
-        # Batch-fetch all candidate items once
+        # Resolve every fused candidate up front: both the recency tie-break below
+        # and the result rows read the same item, so one lookup per id serves both.
         all_ids = [item_id for item_id, _ in fused]
         items_cache: dict[str, dict] = {}
         for item_id in all_ids:
@@ -168,15 +193,10 @@ class HybridRetriever:
         except sqlite3.OperationalError:
             return
 
-        folder_sids = [
-            sid for sid in sid_list
-            if meta.get(sid) is not None
-            and meta[sid]["source_type"] in ("local_folder", "obsidian_vault")
-        ]
-        artifact_sids = [
-            sid for sid in sid_list
-            if meta.get(sid) is not None and meta[sid]["source_type"] == "artifact"
-        ]
+        folder_sids = [sid for sid in sid_list if sid in meta
+                       and meta[sid]["source_type"] in ("local_folder", "obsidian_vault")]
+        artifact_sids = [sid for sid in sid_list if sid in meta
+                         and meta[sid]["source_type"] == "artifact"]
 
         item_to_file: dict[str, str] = {}
         for sid in folder_sids:
@@ -184,11 +204,7 @@ class HybridRetriever:
                 "SELECT file_path, item_ids FROM folder_file_state WHERE source_id = ?",
                 (sid,),
             ).fetchall():
-                try:
-                    ids = json.loads(row["item_ids"]) if row["item_ids"] else []
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                for item_id in ids:
+                for item_id in _stored_item_ids(row["item_ids"]):
                     item_to_file[item_id] = row["file_path"]
 
         item_to_artifact: dict[str, tuple] = {}
@@ -197,11 +213,7 @@ class HybridRetriever:
                 "SELECT slug, name, item_ids FROM artifact_item_state WHERE source_id = ?",
                 (sid,),
             ).fetchall():
-                try:
-                    ids = json.loads(row["item_ids"]) if row["item_ids"] else []
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                for item_id in ids:
+                for item_id in _stored_item_ids(row["item_ids"]):
                     item_to_artifact[item_id] = (row["slug"], row["name"])
 
         for result in results:
@@ -218,18 +230,36 @@ class HybridRetriever:
             if artifact:
                 result["artifact_slug"], result["artifact_name"] = artifact
 
-    def _keyword_search(self, query: str, limit: int = 20) -> list[tuple[str, int]]:
-        """FTS5 search. Returns [(item_id, rank)] where rank is position (1=best)."""
+    def _keyword_search(
+        self, query: str, limit: int = 20, source_id: str | None = None
+    ) -> list[tuple[str, int]]:
+        """FTS5 search. Returns [(item_id, rank)] where rank is position (1=best).
+
+        ``source_id`` narrows matches to items of one source via a
+        parameterized WHERE clause (never string interpolation).
+        """
         safe_query = self._sanitize_fts5_query(query)
         if not safe_query:
             return []
+        sql = (
+            "SELECT i.id FROM items_fts fts "
+            "JOIN items i ON i.rowid = fts.rowid "
+            "WHERE items_fts MATCH ?"
+        )
+        params: list[object] = [safe_query]
+        if source_id is not None:
+            # An item belongs to a source by ownership (items.source_id) OR by
+            # location (source_locations: the surviving copy of a cross-source
+            # dedup collapse still lives in the other source's files).
+            sql += (
+                " AND (i.source_id = ? OR i.id IN"
+                " (SELECT sl.item_id FROM source_locations sl WHERE sl.source_id = ?))"
+            )
+            params.extend([source_id, source_id])
+        sql += " ORDER BY fts.rank LIMIT ?"
+        params.append(limit)
         try:
-            rows = self.store.db.execute(
-                "SELECT i.id FROM items_fts fts "
-                "JOIN items i ON i.rowid = fts.rowid "
-                "WHERE items_fts MATCH ? ORDER BY fts.rank LIMIT ?",
-                (safe_query, limit),
-            ).fetchall()
+            rows = self.store.db.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
             return []
         return [(row["id"], rank + 1) for rank, row in enumerate(rows)]
@@ -293,17 +323,30 @@ class HybridRetriever:
         sorted_items = sorted(item_counts.items(), key=lambda x: x[1], reverse=True)
         return [(item_id, rank + 1) for rank, (item_id, _) in enumerate(sorted_items)]
 
-    def _vector_search(self, query: str, limit: int = 20) -> list[tuple[str, int]] | None:
-        """Brute-force cosine similarity against stored embeddings. Returns None if no embedder."""
+    def _vector_search(
+        self, query: str, limit: int = 20, source_id: str | None = None
+    ) -> list[tuple[str, int]] | None:
+        """Brute-force cosine similarity against stored embeddings. Returns None if no embedder.
+
+        ``source_id`` narrows candidates to items of one source via a
+        parameterized WHERE clause (never string interpolation).
+        """
         if self.embedder is None:
             return None
 
         query_vec = self.embedder(query)
         if not query_vec:
             return None
-        rows = self.store.db.execute(
-            "SELECT id, embedding FROM items WHERE embedding IS NOT NULL AND status = 'active'"
-        ).fetchall()
+        sql = "SELECT id, embedding FROM items WHERE embedding IS NOT NULL AND status = 'active'"
+        params: tuple[str, ...] = ()
+        if source_id is not None:
+            # Ownership OR location — same membership rule as _keyword_search.
+            sql += (
+                " AND (source_id = ? OR id IN"
+                " (SELECT sl.item_id FROM source_locations sl WHERE sl.source_id = ?))"
+            )
+            params = (source_id, source_id)
+        rows = self.store.db.execute(sql, params).fetchall()
 
         scored = []
         mismatched = 0

@@ -42,7 +42,54 @@ export function baseCommandLabel(baseCommand: string): string {
 /**
  * Shorten a command for a BUTTON LABEL only — never for the pattern itself.
  * Truncating a pattern would change the grant; this is display only.
+ *
+ * Elides the MIDDLE rather than the tail, which is what actually removes the
+ * collision class. Commands that differ usually differ at the END — a filename,
+ * a trailing path segment, a flag value — while sharing a long head
+ * (`gh api repos/<owner>/<repo>/contents/…`). Cutting the tail is therefore
+ * precisely what makes two different commands render identically, and raising the
+ * budget alone would only move that cliff: a longer `owner/repo` pushes the
+ * distinguishing filename past any fixed head budget.
+ *
+ * Keeping the tail also matters on touch, where the `title` tooltip callers
+ * attach never fires, so the label is the whole basis for an exact-string grant.
+ *
+ * Must stay byte-identical to the mochi copy in
+ * `website/src/apps/mochi/src/shared/trustPatterns.ts` — a divergent budget OR a
+ * divergent algorithm is this same defect in a new place.
  */
-export function truncateCommandLabel(cmd: string, max = 30): string {
-  return cmd.length > max ? cmd.slice(0, max) + '…' : cmd
+
+/** Pull a head cut back off a lone high surrogate, so slicing never emits half a
+ *  code point. Only ever shrinks, so the budget contract still holds. */
+function snapHeadOffSurrogate(cmd: string, end: number): number {
+  const code = cmd.charCodeAt(end - 1)
+  return code >= 0xd800 && code <= 0xdbff ? end - 1 : end
+}
+
+/** Push a tail cut forward off a lone low surrogate, for the same reason. */
+function snapTailOffSurrogate(cmd: string, start: number): number {
+  const code = cmd.charCodeAt(start)
+  return code >= 0xdc00 && code <= 0xdfff ? start + 1 : start
+}
+
+export function truncateCommandLabel(cmd: string, max = 64): string {
+  if (cmd.length <= max) return cmd
+  // One char of the budget goes to the ellipsis; the tail gets a third of the
+  // rest, which is enough for a filename plus a short flag without starving the
+  // head of the subcommand and repo. Degrades gracefully at any budget, so there
+  // is deliberately no small-budget special case: no production caller passes
+  // `max` at all, and a second branch in a security-adjacent helper is surface
+  // that has to be reasoned about for no gain.
+  const tail = Math.floor((max - 1) / 3)
+  const head = max - 1 - tail
+  // Both cuts are snapped off surrogate boundaries. `slice` counts UTF-16 code
+  // units, so an unsnapped cut through an astral character (an emoji in a commit
+  // message, a CJK extension-B ideograph in a path) leaves a lone surrogate that
+  // renders as a replacement character -- turning a label the user is meant to
+  // read for a security decision into mojibake.
+  return (
+    cmd.slice(0, snapHeadOffSurrogate(cmd, head))
+    + '…'
+    + cmd.slice(snapTailOffSurrogate(cmd, cmd.length - tail))
+  )
 }

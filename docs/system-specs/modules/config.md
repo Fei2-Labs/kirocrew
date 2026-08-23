@@ -20,7 +20,7 @@ surfaces, out-of-range values are clamped with a warning rather than raising, an
 a malformed section degrades to defaults so a hand-edited file cannot prevent the
 gateway from starting.
 
-## Data Home Location & Migration
+## Data Home Location
 
 KiroCrew's data root nests **under kiro-cli's own `~/.kiro/` base** so all
 Kiro-family apps share a single directory a user can secure. `config_dir()`
@@ -31,114 +31,16 @@ is the single accessor and resolves to:
    `/usr`, `/System`, `/etc`), else
 2. `~/.kiro/crew` (the default).
 
-**One-time migration.** On the first launch after upgrading an existing install,
-`config_dir()` triggers a one-time relocation of the pre-move top-level
-`~/.kirocrew` into `~/.kiro/crew` (implemented in `kiro_crew/home_migration.py`).
-
-**The completion marker is authoritative.** Resolution is gated on
-`~/.kiro/crew/.data-home-ready`: once it exists (written only after a verified
-copy), the migration is done and the new home is authoritative — `config_dir()`
-returns it and **never re-migrates**, even if a `~/.kirocrew` directory is
-present alongside it. Because the migration force-deletes legacy and there is
-no downgrade/rollback path (below), a legacy dir that reappears *after* the
-marker can only be resurrection **debris** (stale files an old or legacy-pinned
-process wrote back); it is never authoritative and is never copied over the new
-home — doing so would revert same-named files (`sel_hmac.key`, logs,
-`workspace/`) to stale versions. The debris is left in place and RETAINED for
-manual cleanup — it stays under the credential-protected `.kirocrew`
-sensitive-path prefix, but is NOT auto-removed (the leftover sweep only clears
-`.kirocrew.archived` / `.kiro/crew.pre-migration`, never `.kirocrew` itself). A
-legacy dir re-created later is likewise never promoted, so the recreate /
-check-to-resolve race is benign. The conflicted state (marker + non-empty
-legacy) is not silent: `config_dir()` logs a one-time WARNING and
-`detect_data_home_conflict()` surfaces it in `kirocrew doctor`'s Data Home
-section with a manual-cleanup hint. Migration therefore runs **only**
-when the marker is absent (a genuine pre-move install whose legacy home is the
-real data root).
-
-It is **copy-then-verify-then-delete**: the legacy tree is copied directly into
-the new home — OVERWRITING any file already present there under the same
-relative path, so the legacy copy always wins over whatever pre-existed at
-`~/.kiro/crew` (a partial prior migration, a dir a sibling Kiro tool created, or
-a `KIROCREW_HOME=~/.kiro/crew` experiment), while a new-home-only entry with no
-legacy counterpart is left untouched — every regular file is then verified
-present at the destination, and only after that verification succeeds is
-`~/.kirocrew` removed outright. **There is no rollback copy and no backup of
-whatever the new home held before the overwrite** — once the move completes,
-only `~/.kiro/crew` remains on disk. If the copy or verification fails,
-`~/.kirocrew` is left fully intact for a retry on the next start. The move is
-idempotent, skipped while a gateway is live on either home (the resolving
-process JOINS whichever home the live gateway holds — legacy or new — so its
-`.local_secret` matches the gateway's for internal IPC, rather than pinning to
-the other home and failing every internal API call with 403; the completion
-marker is NOT written on a liveness skip — it is reserved for a verified copy,
-so a fail-safe `_gateway_is_live` OSError can't brand a partial home as
-migrated — and the one-time copy simply completes on the next clean cold
-start), and never runs when `KIROCREW_HOME` is set (dev/worktree homes are
-not migrated). Before the copy starts it prints a one-line `migrating data
-home …` notice to stderr so a slow first-run copy on a large home is not
-mistaken for a hang.
-
-**Read-only destination files are overwritten.** The copy passes a custom
-`copy_function` (`_copy_overwrite`) instead of `shutil.copytree`'s default
-`copy2`. When the new home is already populated (a partial prior migration, or
-a directory a sibling Kiro tool created — the marker is ABSENT, so this is the
-one-time first migration, NOT a re-migration; under the marker-authoritative
-rule a marker-present home is never re-migrated), a same-path destination file
-that is read-only would make `copy2`'s
-truncate-open fail with `PermissionError`. This is not hypothetical: git writes
-packfiles (`*.pack`/`*.idx`/`*.rev` under `.git/objects/pack`) mode `0o444`, and
-app-source checkouts under the data home carry them, so an unguarded merge
-reliably aborted on the first such file — leaving the user in a permanent
-split-brain (legacy authoritative, new home half-populated, gateway pinned to
-legacy). `_copy_overwrite` clears the destination's read-only state (adds the
-owner-write bit, `st_mode | S_IWUSR`) before delegating to `copy2` (which then
-copies the source's own mode bits over, restoring `0o444`), so legacy still wins
-the overwrite as intended. The chmod is best-effort and only touches a path that
-already exists at the destination — never the read-only source.
-
-**Symlinks are skipped, not preserved.** The copy does not pass
-`symlinks=True` to `shutil.copytree`, so any symlink in the legacy tree —
-intra-home, pointing outside the home, or dangling — is skipped entirely
-(matched by `_make_copy_ignore` alongside sockets/FIFOs/devices) rather than
-followed or reproduced. This is a deliberate simplification: preserving
-symlinks across a merge has real edge cases (a legacy symlink can't overwrite
-a real file already at the destination; an absolute intra-home symlink would
-dangle once legacy is deleted; a dangling symlink would abort the whole
-`copytree` call if dereferenced), and the data home has no user-facing
-symlinks worth carrying forward. The practical effect is limited to internal
-convenience links a user or tool may have created inside the data home.
-
-**Excluded bulk trees.** `_EXCLUDED_TOP_LEVEL_DIRS` (`models`, `cache`) are
-large and regenerable, so they are never copied — carrying them forward would
-make the first-run copy needlessly slow for no benefit. The new home simply
-regenerates them on demand (the sha256-pinned GGUF embedding model re-downloads
-over HTTPS on next start), exactly as a fresh install does. A same-named dir
-NESTED under real data is not excluded (the match is anchored at the legacy
-root).
-
-**No rollback.** Because the legacy home is deleted (not archived) and any
-pre-existing divergent `~/.kiro/crew` is overwritten (not backed up), there is no
-supported downgrade path: a release older than this move knows nothing of
-`~/.kiro/crew`, and after the migration completes there is nothing left under
-`~/.kirocrew` to restore from. A user who needs to preserve the pre-move state
-must back it up themselves (e.g. `cp -a ~/.kirocrew ~/.kirocrew.manual-backup`)
-BEFORE upgrading.
-
-**Leftover-archive cleanup (`_sweep_ungated_archive_leftovers`).** An EARLIER
-release of this migration (already shipped on `main` before this no-retention
-contract) could have left `~/.kirocrew.archived` (a full rollback copy) or
-`~/.kiro/crew.pre-migration/<timestamp>` (a sidelined divergent-home backup) on
-disk. Neither path is on the security keystone anymore (`_CREW_HOME_PREFIXES`
-dropped `.kirocrew.archived`; the `.kiro/crew.pre-migration` entry was removed
-outright — nothing creates them, so gating them was dead weight), which means a
-leftover one from that earlier release is now UNGATED: its frozen credentials
-would otherwise be agent-readable indefinitely with nothing to ever prompt a
-cleanup. `config_dir()` therefore deletes either directory outright (matching
-this migration's no-retention design — not just shredding the credential
-leaves) on every default-path resolution. It never follows a symlink at either
-root, is best-effort (a removal failure is logged and retried on the next
-start, never blocks startup), and is a quiet no-op once both are gone.
+**No migration — net-new users only.** All supported installs start directly in
+`~/.kiro/crew`; there is no `~/.kirocrew` to relocate, so `config_dir()` simply
+resolves and `mkdir`s the home above. The one-time `~/.kirocrew` → `~/.kiro/crew`
+data-home migration that earlier releases carried has been **removed** (see
+`docs/system-specs/post-launch-removals.md`). A leftover top-level `~/.kirocrew`
+from an old install is never read, migrated, or deleted; it is left in place —
+still credential-gated by the `.kirocrew` security-path spelling — and `kirocrew
+doctor` reports it, warning rather than advising deletion when it still holds a
+virtual environment (`venv`/`.venv`/`venvs`), since that may be the running
+interpreter.
 
 **Repository-controlled uninstall contract.** Every uninstall path owned by this
 repository preserves the KiroCrew data home by default. `kirocrew service
@@ -200,9 +102,8 @@ _SOME_DIR = config_dir() / "some"        # WRONG -- frozen at import
 ```
 
 An import-time binding captures whatever home was active when the module was
-first imported, which breaks three things at once: pod isolation (a pod exports
-its own `KIROCREW_HOME`), the one-time legacy-home migration (resolved after
-import), and test isolation — `conftest.py`'s autouse `_isolate_kirocrew_home`
+first imported, which breaks two things at once: pod isolation (a pod exports
+its own `KIROCREW_HOME`) and test isolation — `conftest.py`'s autouse `_isolate_kirocrew_home`
 fixture runs *after* collection has already imported the module under test, so
 it cannot reach a frozen constant. That last hole let a local test run write
 2128 fixture rows into an operator's real usage store.
@@ -227,38 +128,32 @@ fails on every hit. The factory list is derived from `paths.py` itself, so a
 newly added factory is covered without editing the test. Issue #874.
 
 **`config_dir()` maintains; `data_home()` only resolves.** `config_dir()` is
-*resolve + maintain*: besides resolving the home it `mkdir`s it, refreshes the
-`~/.kiro-crew-location` recovery breadcrumb (a stat + a read) and re-runs
-`_sweep_ungated_archive_leftovers()`, which can `shutil.rmtree` a leftover
-archive from an earlier release. That work belongs to process start —
+*resolve + maintain*: besides resolving the home it `mkdir`s it and refreshes the
+recovery breadcrumb (a stat + a read). That work belongs to process start —
 `ensure_data_home()` is the startup hook — and the distinction did not matter
 while callers froze the result in a module constant, because the maintenance
 then ran exactly once, at import.
 
 Resolving per call makes it load-bearing: a request handler would otherwise
-perform a destructive sweep **on the event loop** as a side effect of asking
-where a directory is. So the accessors above call **`data_home()`**:
+refresh the breadcrumb **on the event loop** as a side effect of asking where a
+directory is. So the accessors above call **`data_home()`**:
 
 | branch | behaviour |
 | --- | --- |
-| a **valid** `KIROCREW_HOME` override | delegates to `config_dir()` every call, so an override set *after* import is honoured. That branch performs neither the breadcrumb refresh nor the sweep — only a cheap `mkdir`. |
-| default home already resolved | returns the cached `_resolved_home` directly — no `mkdir`, no breadcrumb, no sweep. |
-| not yet resolved | delegates to `config_dir()`, so the **first** resolution in a process still migrates, creates the home and sweeps once. |
+| a **valid** `KIROCREW_HOME` override | delegates to `config_dir()` every call, so an override set *after* import is honoured. That branch performs no breadcrumb refresh — only a cheap `mkdir`. |
+| default home already resolved | returns the cached `_resolved_home` directly — no `mkdir`, no breadcrumb. |
+| not yet resolved | delegates to `config_dir()`, so the **first** resolution in a process creates the home and refreshes the breadcrumb once. |
 
 The first row tests `_valid_override_home()` — the **same predicate `config_dir()`
 gates on**, not merely "is the env var set". An override naming a system
 directory (`/`, `/usr`, …) is rejected there and resolution falls through to the
 default home, so gating on the raw env var would send every call down the
-maintenance path and put the destructive sweep back on the request path for
-anyone with a bad override. The two predicates must not drift apart; a regression
-test pins both directions.
+maintenance path for anyone with a bad override. The two predicates must not
+drift apart; a regression test pins both directions.
 
-That last row is what keeps the sweep's documented contract intact: it specifies
-"a leftover created between two starts … is still caught on the **next start**".
-The sweep is specified per *start*; running it per *call* was the mechanism, not
-the requirement. `data_home()` keeps no cache of its own — the override branch
-must stay live, and the cached branch reads the same `_resolved_home` that
-`config_dir()` populates, so there is one source of truth for the location.
+`data_home()` keeps no cache of its own — the override branch must stay live, and
+the cached branch reads the same `_resolved_home` that `config_dir()` populates,
+so there is one source of truth for the location.
 
 Existing direct `config_dir()` callers are unchanged and keep the maintenance
 behaviour, including 25 pre-existing calls that already sit inside async
@@ -455,6 +350,66 @@ requested name was honored — False means the default answered) and
 name must store `resolved_alias`, never `kiro_agent`: the stored value is
 re-resolved later with aliases matched FIRST, so a physical agent name that also
 happens to be an alias key would dispatch that alias's target instead.
+
+#### App-slot cold-snapshot self-heal & fail-loud (`dashboard/chat_runner._run_chat`)
+The one-turn cold fallback above is acceptable for an ordinary session (the next
+turn self-heals), but it is **not** acceptable for an **app-owned** slot
+(`slot._app` truthy — an App-Kit slot bound to an app's own kiro agent, e.g.
+`my-app-agent`). An app agent is never in `config.agents` and is resolvable
+*only* through the materialized snapshot, so a cold on-loop read makes
+`resolve_agent_bindings` fall back to the default agent with
+`requested_resolved=False`. The result is silent: the slot still advertises the
+requested name while the generic default agent answers **with none of the app's
+MCP tools and no error**, leaving the app unusable until a gateway restart happens
+to re-warm the snapshot. `_run_chat` therefore guards the resolve, strictly behind
+`slot._app and not bindings.requested_resolved` (zero extra work / I/O on the
+common hot path — no `_app`, or already resolved):
+
+1. **Self-heal (two escalating steps).** First, **rescan** the snapshot **off the
+   loop** with the same pattern `server.py` uses at boot —
+   `await loop.run_in_executor(subprocess_executor(), refresh_materialized_agents)`
+   (`refresh_materialized_agents` never raises, so awaiting it via the executor is
+   safe) — then **re-resolve once**. This recovers an app slot whose spec is on
+   disk but whose snapshot was simply not yet warmed on this loop. If the
+   re-resolve *still* misses, the spec was never materialized even though the
+   source is intact, so **re-register this app's resources from source** —
+   `await loop.run_in_executor(subprocess_executor(), register_app, slot._app)`
+   (`register_app`, `apps/bridges.py`, registers the app's MCP servers BEFORE its
+   agents and publishes the snapshot synchronously; imported via a **local** import
+   inside the function to avoid the top-level `apps`↔`dashboard` cycle, mirroring
+   `server.py`'s local import of `reconcile_enabled_app_resources`. `register_app`
+   is used rather than the narrower `refresh_app_agents` because a never-materialized
+   app also has unregistered MCP servers, and re-materializing only the agent would
+   inline an empty server map — recreating an agent whose own `@<app>:<server>` tool
+   refs dangle, i.e. it dispatches but its tools never mount. `register_app` already
+   honors the execution-admission gate, and the recovery call is additionally gated
+   on `is_app_enabled(slot._app)` held under `app_lifecycle_lock(slot._app)`, so a
+   concurrent disable/uninstall cannot race recovery into reactivating a
+   deregistered agent — a disabled app simply falls through to the fail-loud) —
+   then **re-resolve again** and use the fresh bindings. A recovery-step failure
+   only logs a warning; it costs nothing beyond the fail-loud below.
+2. **Fail-loud.** If the slot is app-owned and *still* unresolved after the
+   from-source re-registration, `_run_chat` does **not** run the default agent. It
+   raises `_AppAgentNotLoaded` (naming `slot.agent`, e.g. *"The app agent
+   'my-app-agent' isn't loaded yet — try again in a moment, or restart the
+   gateway"*) which a dedicated `except` arm beside the terminal turn-error
+   handlers surfaces as a normal `error` card (no `record_failure` — nothing ran).
+   The raise happens *before* `get_or_create`, while no session lock is held, so
+   the standard `finally` teardown runs without ever creating a session or
+   dispatching an agent.
+
+The eager-spawn pre-warm path mirrors the **self-heal** step (rescan →
+re-register-from-source) only (so the speculative session bakes in the app's own
+agent rather than the default, which a first real turn would otherwise have to
+discard); the **fail-loud** lives on the real turn alone, since the eager path is
+best-effort and tears itself down on any miss.
+
+`register_app` (`apps/bridges.py`) backs the from-source recovery with a **visible
+error**: when a manifest declares agents but `_register_agents` materializes none
+(source missing or unreadable) it appends a `"registered 0 of N declared
+agent(s)"` entry to `result.errors` — which `reconcile_enabled_app_resources`
+counts and logs — instead of returning a silent 0-agent success; a partial
+registration (some but not all) logs a warning.
 
 ### Materialized-agent snapshot (`config/loader.py`)
 Rung 2's membership test is a process-global `frozenset` — a pure in-memory lookup
@@ -663,7 +618,7 @@ class AgentConfig:
 class SessionConfig:
     timeout_secs: int = 3600       # 60 min idle timeout (DEFAULT_SESSION_TIMEOUT)
     empty_response_auto_continue: bool = True  # after TWO consecutive empty model responses, auto-send ONE synthetic "continue" nudge on the same live session (transcript-visible notice; bounded to once per user message; the config gate fails OPEN to the default so a config-load hiccup cannot disable self-healing). See session.md "Empty-response recovery ladder".
-    autocompact_pct: float = 90.0  # context usage % at which auto-compaction triggers (5-90)
+    autocompact_pct: float = 70.0  # context usage % at which auto-compaction triggers (DEFAULT_AUTOCOMPACT_PCT). Load-time clamped to [5.0, 90.0] (one constant pair shared with the dashboard write gate)
     pool_size: int = 2             # pre-warmed kiro-cli processes kept ready for instant session start; 0 disables. Load-time clamped to [0, 10]
     watchdog_rss_max_mb: int = 0   # recycle a session when its process tree RSS exceeds this many MiB; 0 disables (default). Busy sessions (turn in flight) are never recycled.
 
@@ -796,7 +751,8 @@ leaf on `security._CREW_SECRET_LEAVES`):
 The absence is deliberate and the precedent is `denied_commands.json`:
 `is_sensitive_write_path("~/.kiro/crew/config.json")` is `True` (the *tool* path is
 protected), but `is_sensitive_bash_command("echo x > ~/.kiro/crew/config.json")` is
-`None` — `_WRITE_PROTECTED_BASH_LEAVES` is `('.data-home-ready',)` only. A config
+`None` — `config.json` is not among `_WRITE_PROTECTED_BASH_LEAVES` (which fences
+only a few specific control files elsewhere under the home). A config
 toggle would therefore be flippable by a prompt-injected agent through any shell
 redirect.
 
@@ -947,7 +903,7 @@ membership: `context.ui_language_tag()` checks the tag against
 to a language the chrome cannot render (#1130). Adding a language is therefore
 the three frontend edits — add `locales/<tag>.json`, register the picker entry
 in `SUPPORTED_LANGUAGES`, and add the static import plus `AUTHORED_CATALOGS`
-entry in `i18n/index.ts` — **plus one mechanical backend entry** in
+entry in `i18n/catalogs.ts` — **plus one mechanical backend entry** in
 `_UI_LANGUAGE_CATALOGS`, which the drift gate in
 `test/test_context_ui_language.py` names explicitly on failure.
 
@@ -970,10 +926,12 @@ load regardless of the language they read.
 
 The documented next step is therefore to keep `en` static and lazily fetch the
 active non-English catalog. That seam is already isolated to
-`website/src/i18n/index.ts` plus a `<Suspense>` boundary in `main.tsx`; no call
-site changes. **Catalog #13 belongs behind that seam**: Korean is #12 and the last
-one this chunk absorbs in front of it. Re-measure when the seam lands — the figure
-above is what says whether it worked.
+`website/src/i18n/catalogs.ts` — the module that owns every catalog import — plus
+a `<Suspense>` boundary in `main.tsx`; no call site changes, and
+`registerCatalogs()` is where a fetching backend hands its catalog over.
+**Catalog #13 belongs behind that seam**: Korean is #12 and the last one this
+chunk absorbs in front of it. Re-measure when the seam lands — the figure above
+is what says whether it worked.
 
 #### The tag reaches the agent, too
 

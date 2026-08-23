@@ -89,13 +89,23 @@ async def _spawn_stub(
     work_dir: Path,
     home: Path,
     poolable: bool = True,
+    session_key: str = "",
 ) -> asyncio.subprocess.Process:
     """Launch a REAL stub process, exactly as the rewriter's overlay would.
 
     ``poolable`` mirrors the flag the rewriter passes: set, the backend may be
     shared with other connections carrying the same PoolKey; unset, this
     connection gets its own.
+
+    ``session_key`` is what the stub puts in its Register frame, and therefore
+    what gatewayd injects as the caller block. Empty means the stub registers
+    without an identity -- a state gatewayd handles by forwarding ``caller=None``.
     """
+    env = {**_clean_env(), "KIROCREW_HOME": str(home)}
+    if session_key:
+        env["KIROCREW_SESSION_KEY"] = session_key
+    else:
+        env.pop("KIROCREW_SESSION_KEY", None)
     return await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -115,7 +125,7 @@ async def _spawn_stub(
         # KIROCREW_HOME redirects the stub's fallback audit log into the test's
         # own tree, so a degradation is observable instead of landing in the
         # developer's real home.
-        env={**_clean_env(), "KIROCREW_HOME": str(home)},
+        env=env,
     )
 
 
@@ -127,6 +137,28 @@ def _clean_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k != "KIROCREW_CHANNEL_ID"}
 
 
+async def _drive_frame(proc: asyncio.subprocess.Process, frame: str, req_id: int) -> dict:
+    """Write one arbitrary JSON-RPC frame through the stub and read its reply."""
+    assert proc.stdin is not None and proc.stdout is not None
+    stdin, stdout = proc.stdin, proc.stdout
+    stdin.write(frame.encode("utf-8"))
+    await stdin.drain()
+
+    async def _read_reply() -> dict:
+        while True:
+            line = await stdout.readline()
+            if not line:
+                raise AssertionError("stub closed stdout before replying")
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") == req_id:
+                return msg
+
+    return await asyncio.wait_for(_read_reply(), timeout=_REPLY_TIMEOUT)
+
+
 async def _drive_initialize(proc: asyncio.subprocess.Process, req_id: int) -> dict:
     """Write one ``initialize`` through the stub and return the parsed reply.
 
@@ -135,28 +167,23 @@ async def _drive_initialize(proc: asyncio.subprocess.Process, req_id: int) -> di
     the reply back also proves the whole chain (stub -> gateway -> backend ->
     stub) carried it, not merely that a process appeared.
     """
-    assert proc.stdin is not None and proc.stdout is not None
-    # Bound to locals so the None-narrowing survives into the closure below;
-    # mypy does not carry an outer narrowing across a nested function.
-    stdin, stdout = proc.stdin, proc.stdout
-    stdin.write(_init_frame(req_id).encode("utf-8"))
-    await stdin.drain()
+    return await _drive_frame(proc, _init_frame(req_id), req_id)
 
-    async def _read_reply() -> dict:
-        while True:
-            line = await stdout.readline()
-            if not line:
-                raise AssertionError(
-                    "stub closed stdout before replying to initialize"
-                )
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # non-JSON diagnostics are not part of the protocol
-            if msg.get("id") == req_id:
-                return msg
 
-    return await asyncio.wait_for(_read_reply(), timeout=_REPLY_TIMEOUT)
+async def _drive_tool_call(proc: asyncio.subprocess.Process, req_id: int) -> dict:
+    """Write one ``tools/call`` through the stub.
+
+    ``initialize`` carries no caller block (gatewayd injects on forwarded
+    requests, and the handshake is cached across stubs), so proving injection
+    needs a per-turn frame.
+    """
+    frame = json.dumps({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "tools/call",
+        "params": {"name": "noop", "arguments": {}},
+    }) + "\n"
+    return await _drive_frame(proc, frame, req_id)
 
 
 async def _reap(procs: list[asyncio.subprocess.Process]) -> None:
@@ -186,6 +213,97 @@ def _launch_count(log: Path) -> int:
     if not log.exists():
         return 0
     return len([ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()])
+
+
+def _observed_callers(log: Path) -> list[str]:
+    """The session key each ``tools/call`` reached the backend carrying."""
+    if not log.exists():
+        return []
+    return log.read_text(encoding="utf-8").splitlines()
+
+
+@pytest.mark.asyncio
+async def test_two_stubs_on_one_backend_are_told_apart(tmp_path: Path, short_sock_dir) -> None:
+    """Each session's calls reach the SHARED backend carrying its own identity.
+
+    The unit tests around ``kirocrew-cron`` prove the server CONSUMES the caller
+    block. They cannot prove gatewayd SENDS one, which is the half that was
+    broken: ``backend.py`` strips any stub-supplied block from every forwarded
+    request and re-injects its own only when the backend advertised
+    ``kirocrew.caller-identity`` -- and that capability is parsed off a REAL
+    ``initialize`` response, a step the in-process stub seam every other gateway
+    test uses does not go through.
+
+    So this drives two real stubs with different session keys onto one pooled
+    backend and reads back what the backend was actually handed. Counting
+    backends (the sibling test) says they shared a process; this says the shared
+    process could still tell them apart.
+    """
+    endpoint_root = short_sock_dir
+    sock = endpoint_root / "gw.sock"
+    work_dir = tmp_path / "ws"
+    work_dir.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    launch_log = tmp_path / "launches.txt"
+    caller_log = tmp_path / "callers.txt"
+
+    def _resolver(_key: object) -> tuple[str, list[str], dict[str, str], str]:
+        return (
+            sys.executable,
+            [str(_FAKE_SERVER), str(launch_log), str(caller_log)],
+            {},
+            str(work_dir),
+        )
+
+    stop = asyncio.Event()
+    daemon = asyncio.create_task(
+        gw.run_gatewayd(
+            socket_path=sock,
+            max_backends=8,
+            idle_timeout_secs=300,
+            stop_event=stop,
+            target_resolver=_resolver,
+            prewarm_count=0,
+        )
+    )
+    procs: list[asyncio.subprocess.Process] = []
+    try:
+        for _ in range(100):
+            if transport.endpoint_exists(sock):
+                break
+            await asyncio.sleep(0.05)
+        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+
+        keys = ["dashboard:alice", "dashboard:bob"]
+        for i, key in enumerate(keys):
+            proc = await _spawn_stub(
+                socket_path=sock, server="fake", agent="probe",
+                work_dir=work_dir, home=home, session_key=key,
+            )
+            procs.append(proc)
+            reply = await _drive_initialize(proc, req_id=i + 1)
+            assert "result" in reply, f"stub {key} got no initialize result: {reply}"
+            reply = await _drive_tool_call(proc, req_id=100 + i)
+            assert "result" in reply, f"stub {key} got no tools/call result: {reply}"
+
+        assert _launch_count(launch_log) == 1, (
+            "the two stubs did not share a backend, so this run says nothing "
+            "about telling co-tenants apart"
+        )
+
+        observed = _observed_callers(caller_log)
+        assert observed == keys, (
+            f"the shared backend saw {observed!r}, expected {keys!r}. An empty "
+            "string means nothing injected a caller block -- the backend cannot "
+            "tell its co-tenants apart and every session-scoped path in it "
+            "silently falls back to unattached behaviour. Two identical values "
+            "would mean worse: one session's identity applied to another's call."
+        )
+    finally:
+        await _reap(procs)
+        stop.set()
+        await asyncio.wait_for(daemon, timeout=30)
 
 
 @pytest.mark.asyncio

@@ -149,6 +149,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "wecom",
         "weixin",
         "teams",
+        "imessage",
         "dashboard",
         "tunnel",
         "hooks",
@@ -162,6 +163,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "computer_use",
         "instances",
         "mcp_gateway",
+        "mcp",
         "taskrunner",
         "orchestrator",
         "watchdog",
@@ -227,6 +229,20 @@ _warned_env_keys: set[str] = set()
 
 DEFAULT_MODEL = "auto"
 DEFAULT_SESSION_TIMEOUT = 3600  # 60 min
+# Auto-compaction threshold, as a percentage of the context window. Named
+# because two code paths need it — the dataclass field default (used only when
+# there is no config file) and the dict-load fallback in ``load()`` (used when
+# a config file omits the key). Restating the number in both is how
+# ``pool_size`` came to have a field default of 0 and a load fallback of 2.
+DEFAULT_AUTOCOMPACT_PCT = 70.0
+# Margin BELOW the configured compaction threshold at which the "context is
+# getting large" warning fires. A margin rather than an absolute percentage
+# because both consumers test compaction FIRST in an if/elif chain
+# (``session.check_context_usage`` and the ``cli_chat`` REPL loop), so an
+# absolute warn level at or above the configured threshold makes the warning arm
+# unreachable and the early signal disappears for whoever did not change the
+# default. Kept here rather than in either consumer so the two cannot drift.
+CONTEXT_WARN_MARGIN_PCT = 20.0
 DEFAULT_MAX_PARALLEL_STEPS = (
     0  # 0 = auto: derive from agent.subagent_auto_max via compute_max_subagents
 )
@@ -391,6 +407,47 @@ def _safe_nonnegative_int(value: object, default: int) -> int:
     """Convert a legacy integer value and reject negative results."""
     result = _safe_int(value, default)
     return result if result >= 0 else default
+
+
+def _clamp_pct(value: int) -> int:
+    """Clamp an integer context-threshold percentage to 1..100.
+
+    The single statement of the range: the floor is 1, not 0, because a 0%
+    threshold means "always over" and would fire the notice/compaction on
+    every turn.
+    """
+    return max(1, min(100, value))
+
+
+def _threshold_pct(raw: object, default: int) -> int:
+    """Coerce a transport context-threshold percentage and clamp it to 1..100.
+
+    The single coercion for every ``soft_threshold_pct`` / ``hard_threshold_pct``
+    read, so a hand-edited config can never load an out-of-range threshold on
+    any channel.
+    """
+    return _clamp_pct(_safe_int(raw, default))
+
+
+def _normalize_threshold_pair(soft: int, hard: int) -> tuple[int, int]:
+    """Normalize a soft/hard context-threshold pair to a valid ordering.
+
+    Clamp both to the shared range and pull the soft threshold down to the
+    hard one when it exceeds it, so a misconfig (e.g. hard=50, soft=95) can't
+    make the soft nudge unreachable — the transports check ``pct >= hard``
+    first.
+    """
+    soft = _clamp_pct(soft)
+    hard = _clamp_pct(hard)
+    if soft > hard:
+        soft = hard
+    return soft, hard
+
+
+#: Outbound services the iMessage bridge accepts. Anything else is a typo that
+#: would be rejected per send rather than at load time. Shared with the settings
+#: API so the form's choices and the loader's clamp cannot drift apart.
+IMESSAGE_SERVICES = frozenset(("imessage", "sms", "auto"))
 
 
 def _safe_bool(value: object, default: bool) -> bool:
@@ -591,6 +648,27 @@ def oauth_endpoints_path() -> Path:
     the operator hand-edits the file out-of-band. Respects ``KIROCREW_HOME``.
     """
     return config_dir() / "oauth_endpoints.json"
+
+
+def aws_consent_path() -> Path:
+    """Return path to aws_service_consent.json — paid-AWS-service consent.
+
+    Same KEYSTONE reasoning as :func:`computer_use_state_path`, and the leaf is
+    on ``security._CREW_SECRET_LEAVES`` for the same reason: a recorded consent
+    to call a PAID AWS service is an authorization, not a preference. Storing it
+    in ``config.json`` would leave it writable by any auto-approved agent shell,
+    so a prompt-injected agent could mint the grant and consent, on the
+    operator's behalf, to spending the operator's money in an account it picked.
+    ``is_sensitive_path`` blocks the tool path and ``is_sensitive_bash_command``
+    blocks the shell forms.
+
+    Holds ``{"<service>": {profile, region, account, arn, granted_at}}``; every
+    read fails soft to NO CONSENT (see ``aws_consent.read_grant``). The writers
+    are the authenticated dashboard ``/api/aws/consent`` handler and the
+    ``kirocrew aws-consent`` CLI, both of which open the path directly rather
+    than through this gate. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "aws_service_consent.json"
 
 
 def read_local_secret(port: int) -> str:
@@ -1106,9 +1184,7 @@ def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str,
     (exact on POSIX, case-folded on Windows) so a differently-cased Windows
     spelling cannot slip past. Mutates *env* in place and returns it.
     """
-    matched = [
-        k for k in env if platform_compat.env_key_allowed(k, _KIRO_API_KEY_ONLY)
-    ]
+    matched = [k for k in env if platform_compat.env_key_allowed(k, _KIRO_API_KEY_ONLY)]
     for k in matched:
         del env[k]
     return env
@@ -1280,6 +1356,20 @@ class AgentConfig:
     default_agent: str = field(
         default="",
         metadata=_meta("Default Agent", "Default agent name for new sessions."),
+    )
+    sweep_agents_backups: bool = field(
+        default=False,
+        metadata=_meta(
+            "Sweep foreign agent backups",
+            "When true, the agents-directory janitor also deletes aged backup "
+            "files (*.bak-<digits> / *.json.bak.<digits>, older than 14 days) "
+            "from the shared kiro agents directory. OFF by default: Kiro Crew "
+            "does not author those backups, so every one it would delete belongs "
+            "to another tool whose retention policy is not ours to decide. The "
+            "orphaned atomic-write TEMP sweep (24h) always runs and reclaims most "
+            "of the growth at near-zero risk; enable this only if you also want "
+            "foreign backups in that directory reaped.",
+        ),
     )
     sandbox: str = field(
         default="auto",
@@ -1748,7 +1838,7 @@ class SessionConfig:
         ),
     )
     autocompact_pct: float = field(
-        default=90.0,
+        default=DEFAULT_AUTOCOMPACT_PCT,
         metadata=_meta(
             "Auto-Compact Threshold",
             "Context usage percentage at which auto-compaction triggers (5-90).",
@@ -1998,6 +2088,22 @@ class MemoryConfig:
     episodic_max_count: int = field(
         default=10_000,
         metadata=_meta("Episodic Max Count", "Maximum total episodic memories stored."),
+    )
+    decay_rates: dict[str, float] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Memory Decay Rates",
+            "Per-tag episodic recency decay rates, per day (retrieval score factor "
+            "exp(-rate * days_old)). Keys are memory tags (case-insensitive); the "
+            "reserved 'default' key replaces the built-in 0.03 for memories matching "
+            "no configured tag. A memory carrying several configured tags uses the "
+            "slowest (smallest) rate, so a broad tag can never age out a "
+            "long-retention one. 0 means never ages out of retrieval ranking; 1 "
+            "drops a memory out of retrieval within about a day. Ranking only: "
+            "episodic_max_count cap eviction (lowest importance, then oldest) "
+            "still applies regardless of decay rate. Values are clamped to 0..10; "
+            "non-numeric values are ignored with a logged warning.",
+        ),
     )
     semantic_keys: list[str] = field(
         default_factory=list,
@@ -3191,10 +3297,11 @@ class SkillsConfig:
         metadata=_meta(
             "Auto-Create Skills",
             "When true, analyze each session after completion and synthesize a reusable "
-            "SKILL.md when a non-trivial multi-step procedure is detected. Candidates are "
-            "staged for review (see approval_required) rather than going live, and live "
-            "under skills/auto/ so they never collide with hand-authored skills. Disabled "
-            "by default; enable in Settings → Skills.",
+            "SKILL.md when the session demonstrates a recurring procedure — one a future "
+            "session, working on a different target, would run again. Candidates are staged "
+            "for review (see approval_required) rather than going live, and live under "
+            "skills/auto/ so they never collide with hand-authored skills. Disabled by "
+            "default; enable in Settings → Skills.",
         ),
     )
     auto_refine_on_deviation: bool = field(
@@ -3373,21 +3480,27 @@ class SessionSummaryConfig:
         ),
     )
     max_intents: int = field(
-        default=8,
+        default=50,
         metadata=_meta(
             "Maximum Intents",
-            "Upper bound on intents kept per session (>=1). Beyond this the oldest "
-            "closed intents are dropped, since the panel collapses them anyway.",
+            "Safety ceiling on intents stored per session (>=1). Trimming runs "
+            "before the summary is saved, so whatever exceeds this is dropped "
+            "from the record rather than hidden -- the panel itself withholds "
+            "nothing, rendering every intent it receives and collapsing all but "
+            "the most recently touched one. The ceiling therefore sits high "
+            "enough that reaching it is unusual rather than routine.",
         ),
     )
     max_constraints: int = field(
-        default=5,
+        default=50,
         metadata=_meta(
             "Maximum Project Notes",
-            "Upper bound on session-level operational notes -- the recurring facts "
-            "about how this project is run (>=0). Kept small on purpose: a long "
-            "list stops being read, and durable cross-session preferences belong "
-            "in lessons rather than here.",
+            "Safety ceiling on session-level operational notes -- the recurring facts "
+            "about how this project is run (>=0). Whatever exceeds this is dropped "
+            "from the record rather than hidden: how many are worth writing at all "
+            "is governed by the generation prompt, and the panel bounds the expanded "
+            "list's height rather than its length. Durable cross-session preferences "
+            "belong in lessons rather than here.",
         ),
     )
     assistant_excerpt_chars: int = field(
@@ -3407,9 +3520,7 @@ class SessionSummaryConfig:
             logger.warning("min_user_turns %d < 1, using 1", self.min_user_turns)
             object.__setattr__(self, "min_user_turns", 1)
         if self.regenerate_after_turns < 1:
-            logger.warning(
-                "regenerate_after_turns %d < 1, using 1", self.regenerate_after_turns
-            )
+            logger.warning("regenerate_after_turns %d < 1, using 1", self.regenerate_after_turns)
             object.__setattr__(self, "regenerate_after_turns", 1)
         if self.max_intents < 1:
             logger.warning("max_intents %d < 1, using 1", self.max_intents)
@@ -3672,6 +3783,20 @@ LOOP_STALL_EXIT_AFTER_MAX = 300
 # dashboard API. Mirrors ``subagent._LEGACY_DEFAULT_MAX`` (kept as a local
 # constant to avoid a config→subagent import cycle).
 MAX_SUBAGENTS_FIXED_FLOOR = 3
+
+# session.autocompact_pct — context-usage percentage at which the backend
+# autocompactor fires. SINGLE SOURCE OF TRUTH for the documented 5-90 range:
+# the dashboard config API (``dashboard/handlers/core.py``) validates writes
+# against these same constants, and the load read clamps a hand-edited
+# config.json value into them, so the two ranges cannot drift as separate
+# literals. The autocompactor is the backstop that keeps a session's context
+# window from overflowing — above the ceiling the trigger
+# (``pct >= autocompact_pct``) never fires before the window overflows, and
+# at/below zero it fires on every turn. Floats are outside the int-only
+# ``_SECURITY_BOUNDED_FIELDS`` sweep, so the clamp lives on the ``_safe_float``
+# read instead.
+AUTOCOMPACT_PCT_MIN = 5.0
+AUTOCOMPACT_PCT_MAX = 90.0
 
 # (section, key, min, max) for each bounded field clamped at load time. The
 # mins match the runtime floors: subagent_auto_max has a floor of 3
@@ -4370,13 +4495,16 @@ class McpGatewayConfig:
         ),
     )
     forward_declared_env: bool = field(
-        default=False,
+        default=True,
         metadata=_meta(
             "Forward Declared Env",
             "Apply a pooled server's declared env (mcpServers.<name>.env) to the "
             "shared backend. Only non-secret keys are forwarded — rotating-secret "
-            "and credential-prefixed keys are never applied to a shared backend. "
-            "Default False — opt-in.",
+            "and credential-prefixed keys are never applied to a shared backend, "
+            "and gatewayd re-hashes the sidecar at spawn and forwards nothing on "
+            "mismatch, so every forwarded key is one all co-tenants of that "
+            "backend declared identically. Turn it OFF to make an env-declaring "
+            "server run unwrapped (no stub, no pooling) instead.",
         ),
     )
     socket_path: str = field(
@@ -4401,6 +4529,21 @@ class McpGatewayConfig:
     idle_timeout_secs: int = field(
         default=300,
         metadata=_meta("Idle Timeout", "Seconds a refcount=0 MCP backend is kept before drain."),
+    )
+    resolve_once_refresh_hours: int = field(
+        default=24,
+        metadata=_meta(
+            "Pre-resolve Refresh",
+            "Hours before an UNPINNED npm-launcher MCP server (an npx spec at "
+            "@latest, a range, or no version) is re-resolved from the registry. "
+            "Pre-resolving lets a launch exec the installed tree directly, so "
+            "session start does no dependency resolution and needs no network; "
+            "this is how often that resolution is refreshed so such a spec still "
+            "tracks upstream. A spec pinned to an exact version ignores this -- "
+            "re-asking about an exact version cannot change the answer. 0 "
+            "re-resolves on every prefetch pass; a server with no resolution yet "
+            "simply launches the way it does today.",
+        ),
     )
     max_backends: int = field(
         default=64,
@@ -4440,6 +4583,27 @@ class McpGatewayConfig:
             "stub set.",
         ),
     )
+    pool_identity_env: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Pool Identity Env Keys",
+            "Env variable NAMES whose value is part of a shared backend's "
+            "identity. Names listed here are folded into the backend's env hash "
+            "even when they look like a rotating secret (AWS_SECRET*, "
+            "AWS_SESSION*, OAUTH*), which is what makes them safe to apply to a "
+            "shared backend: two sessions declaring different values get "
+            "different backends instead of colliding onto one. Use it to let a "
+            "server that authenticates from such a variable be shared at all — "
+            "by default it declares one, so nothing is forwarded and the server "
+            "runs unwrapped. The cost is the reason the exclusion exists: "
+            "rotating a named value re-partitions that server's pool, so the "
+            "next session cold-starts a backend. Exact names, not prefixes. "
+            "Names the daemon's own credential scrub removes (AWS_ACCESS*, "
+            "AWS_SECRET*, AWS_SESSION*, SSH_AUTH_SOCK*, GNUPGHOME*, "
+            "GIT_ASKPASS*) are ignored here — that scrub is a separate, broader "
+            "guard this setting does not lift. Empty by default.",
+        ),
+    )
     prewarm_count: int = field(
         default=0,
         metadata=_meta(
@@ -4472,6 +4636,45 @@ class McpGatewayConfig:
             "written to ~/.kiro/crew/mcp_spill/ and truncated inline to 16 KiB + "
             "a file path marker. Default 256 KiB. Set 0 to disable spilling. "
             "Env override: KIROCREW_MCP_SPILL_THRESHOLD.",
+        ),
+    )
+
+
+# The forwarding default assumed when config omits
+# ``mcp_gateway.forward_declared_env``. Read from the dataclass default so the
+# field and every parse-site fallback cannot drift apart: this default is read
+# in three places (the field, the loader's ``_safe_bool`` fallback, and the
+# dashboard stub-batch reader), and a reader disagreeing with the field makes the
+# batch skip servers the rewrite pools perfectly well.
+FORWARD_DECLARED_ENV_DEFAULT = bool(
+    McpGatewayConfig.__dataclass_fields__["forward_declared_env"].default  # type: ignore[arg-type]
+)
+
+
+@dataclass
+class McpConfig:
+    """MCP server settings that apply whether or not the broker is enabled.
+
+    Distinct from :class:`McpGatewayConfig`, which configures the sharing broker
+    itself: these settings govern how MCP servers are FOUND and launched, so
+    they matter equally with the broker off.
+    """
+
+    extra_path_dirs: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Extra MCP Binary Directories",
+            "Additional directories to search for MCP server binaries, ahead of "
+            "the built-in locations. Add one when a package manager installs its "
+            "MCP launchers somewhere Kiro Crew does not know about: a server "
+            "declared by bare name that resolves nowhere never starts, and the "
+            "session just comes up short of tools. Each entry must be a single "
+            "absolute directory (``~`` is expanded); anything else is ignored "
+            "with a warning. These directories are prepended to the search path "
+            "used by the MCP probe, the agent-config command resolver, and the "
+            "broker's rewriter alike, so a binary found here is found "
+            "everywhere. They do NOT join the search for the agent runtime "
+            "itself, which must not be shadowable by a configured directory.",
         ),
     )
 
@@ -4619,10 +4822,7 @@ class InstancesConfig:
                 _MINT_TIMEOUT_FLOOR,
             )
             object.__setattr__(self, "mint_timeout_secs", None)
-        elif (
-            self.mint_timeout_secs is not None
-            and self.mint_timeout_secs > _MINT_TIMEOUT_CEILING
-        ):
+        elif self.mint_timeout_secs is not None and self.mint_timeout_secs > _MINT_TIMEOUT_CEILING:
             logger.warning(
                 "instances.mint_timeout_secs %s > %s, clamping to %s",
                 self.mint_timeout_secs,
@@ -4854,13 +5054,13 @@ class WeComConfig:
     )
 
     def __post_init__(self) -> None:
-        # Clamp thresholds to [0, 100] and guarantee soft <= hard so a misconfig
-        # (e.g. hard=50, soft=95, or an out-of-range value) can't make the soft
-        # nudge unreachable -- _maybe_notice checks ``pct >= hard`` first.
-        self.soft_threshold_pct = max(0, min(100, self.soft_threshold_pct))
-        self.hard_threshold_pct = max(0, min(100, self.hard_threshold_pct))
-        if self.soft_threshold_pct > self.hard_threshold_pct:
-            self.soft_threshold_pct = self.hard_threshold_pct
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig (e.g. hard=50, soft=95, or an out-of-range value) can't
+        # make the soft nudge unreachable -- _maybe_notice checks ``pct >= hard``
+        # first.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
 
 
 def _coerce_int_ids(raw: object) -> list[int]:
@@ -4953,9 +5153,7 @@ def _parse_telegram_accounts(raw: object) -> dict[str, "TelegramAccountConfig"]:
             allowed_user_ids=_coerce_int_ids(acct_data.get("allowed_user_ids")),
             allow_forum=_safe_bool(acct_data.get("allow_forum"), False),
             allowed_forum_chat_ids=_coerce_int_ids(acct_data.get("allowed_forum_chat_ids")),
-            soft_threshold_pct=max(
-                1, min(100, _coerce_int(acct_data.get("soft_threshold_pct"), 80))
-            ),
+            soft_threshold_pct=_threshold_pct(acct_data.get("soft_threshold_pct"), 80),
         )
     return out
 
@@ -5233,6 +5431,11 @@ class TelegramConfig:
         ),
     )
 
+    def __post_init__(self) -> None:
+        # Telegram carries only the soft nudge threshold; the hard-compaction
+        # backstop is the backend autocompactor (session.autocompact_pct).
+        self.soft_threshold_pct = _clamp_pct(self.soft_threshold_pct)
+
 
 @dataclass
 class WeixinConfig:
@@ -5327,6 +5530,14 @@ class WeixinConfig:
         ),
     )
 
+    def __post_init__(self) -> None:
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig can't make the soft nudge unreachable -- _maybe_notice
+        # checks ``pct >= hard`` first. Mirrors WeComConfig.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
+
 
 @dataclass
 class DiscordConfig:
@@ -5368,6 +5579,22 @@ class DiscordConfig:
             tags=["discord"],
         ),
     )
+    allowed_channel_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Channel IDs",
+            "Discord server channels where approved users may start a new agent thread.",
+            tags=["discord"],
+        ),
+    )
+    auto_thread: bool = field(
+        default=True,
+        metadata=_meta(
+            "Auto-create Threads",
+            "Create one Discord thread per approved message in an allowed channel.",
+            tags=["discord"],
+        ),
+    )
     soft_threshold_pct: int = field(
         default=80,
         metadata=_meta(
@@ -5388,6 +5615,11 @@ class DiscordConfig:
             tags=["discord"],
         ),
     )
+
+    def __post_init__(self) -> None:
+        # Discord carries only the soft nudge threshold; the hard-compaction
+        # backstop is the backend autocompactor (session.autocompact_pct).
+        self.soft_threshold_pct = _clamp_pct(self.soft_threshold_pct)
 
 
 @dataclass
@@ -5452,13 +5684,103 @@ class WebexConfig:
     )
 
     def __post_init__(self) -> None:
-        # Clamp thresholds to [0, 100] and guarantee soft <= hard so a misconfig
-        # can't make the soft nudge unreachable -- _maybe_notice checks
-        # ``pct >= hard`` first. Mirrors WeComConfig.
-        self.soft_threshold_pct = max(0, min(100, self.soft_threshold_pct))
-        self.hard_threshold_pct = max(0, min(100, self.hard_threshold_pct))
-        if self.soft_threshold_pct > self.hard_threshold_pct:
-            self.soft_threshold_pct = self.hard_threshold_pct
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig can't make the soft nudge unreachable -- _maybe_notice
+        # checks ``pct >= hard`` first. Mirrors WeComConfig.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
+
+
+@dataclass
+class IMessageConfig:
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enabled",
+            "Enable the iMessage channel. macOS only, and the gateway must run "
+            "on the Mac that is signed in to Messages. Needs no bot and no "
+            "token — it drives Messages.app through the local imsg bridge, so "
+            "the transport involves no third party. The turn itself still goes "
+            "to the configured model provider, as on any channel.",
+            tags=["imessage"],
+        ),
+    )
+    db_path: str = field(
+        default="",
+        metadata=_meta(
+            "Messages Database Path",
+            "Override the Messages database location. Empty (the default) lets "
+            "the bridge use ~/Library/Messages/chat.db. Reading it needs Full "
+            "Disk Access for the process the gateway runs as.",
+            tags=["imessage"],
+        ),
+    )
+    allowed_handles: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Handles",
+            "Phone numbers or Apple ID emails permitted to message the agent. "
+            "Empty = deny all (fail closed): anyone who knows this Mac's handle "
+            "can send to it. Formatting is ignored, so '+61 400 000 000' and "
+            "'+61400000000' are the same handle.",
+            tags=["imessage"],
+        ),
+    )
+    service: str = field(
+        default="imessage",
+        metadata=_meta(
+            "Send Service",
+            "Which service outbound replies use: 'imessage' (default), 'sms', "
+            "or 'auto' to let the bridge fall back to SMS when iMessage is "
+            "unavailable. Inbound is unaffected — the channel answers on "
+            "whichever service the message arrived over.",
+            tags=["imessage"],
+        ),
+    )
+    soft_threshold_pct: int = field(
+        default=80,
+        metadata=_meta(
+            "Soft Context Threshold %",
+            "When a conversation's context passes this, prompt the user to "
+            "/compact or /new instead of auto-compacting.",
+            tags=["imessage"],
+        ),
+    )
+    hard_threshold_pct: int = field(
+        default=95,
+        metadata=_meta(
+            "Hard Context Threshold %",
+            "Force a compaction when context reaches this, even without a user "
+            "decision, so the window never overflows.",
+            tags=["imessage"],
+        ),
+    )
+    session_folder: str = field(
+        default="",
+        metadata=_meta(
+            "Session Folder",
+            "Optional sidebar folder for sessions that start on this channel. "
+            "Empty (the default) leaves them unfiled; any other value is the "
+            "folder name, created when these settings are saved and marked with "
+            "the channel's brand mark. A configured folder that no longer exists "
+            "leaves conversations unfiled until the next save recreates it.",
+            tags=["imessage"],
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig can't make the soft nudge unreachable -- _maybe_notice
+        # checks ``pct >= hard`` first. Mirrors WebexConfig.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
+        # An unrecognized service would be forwarded to the bridge and rejected
+        # per send, turning a typo into a channel that accepts messages and
+        # never answers. Fall back to the safe default instead.
+        service = (self.service or "").strip().lower()
+        self.service = service if service in IMESSAGE_SERVICES else "imessage"
 
 
 @dataclass
@@ -5547,12 +5869,12 @@ class TeamsConfig:
     )
 
     def __post_init__(self) -> None:
-        # Clamp thresholds to [0, 100] and guarantee soft <= hard so a misconfig
-        # can't make the soft nudge unreachable. Mirrors WebexConfig.
-        self.soft_threshold_pct = max(0, min(100, self.soft_threshold_pct))
-        self.hard_threshold_pct = max(0, min(100, self.hard_threshold_pct))
-        if self.soft_threshold_pct > self.hard_threshold_pct:
-            self.soft_threshold_pct = self.hard_threshold_pct
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig can't make the soft nudge unreachable. Mirrors
+        # WebexConfig.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
 
 
 @dataclass
@@ -5623,6 +5945,13 @@ class KiroCrewConfig:
         default_factory=McpGatewayConfig,
         metadata=_meta("MCP Gateway", "Sidecar MCP broker that shares backends across sessions."),
     )
+    mcp: McpConfig = field(
+        default_factory=McpConfig,
+        metadata=_meta(
+            "MCP",
+            "How MCP servers are found and launched — applies with the broker off too.",
+        ),
+    )
     instances: InstancesConfig = field(
         default_factory=InstancesConfig,
         metadata=_meta(
@@ -5673,6 +6002,14 @@ class KiroCrewConfig:
     teams: TeamsConfig = field(
         default_factory=TeamsConfig,
         metadata=_meta("Teams", "Microsoft Teams integration settings.", tags=["teams"]),
+    )
+    imessage: IMessageConfig = field(
+        default_factory=IMessageConfig,
+        metadata=_meta(
+            "iMessage",
+            "iMessage integration settings (macOS only, local bridge, no bot token).",
+            tags=["imessage"],
+        ),
     )
     dashboard: DashboardConfig = field(
         default_factory=DashboardConfig,
@@ -5791,6 +6128,33 @@ class KiroCrewConfig:
         The overlay is applied at load time but NOT persisted back by
         ``save()`` — only the base config is written to ``config.json``.
         """
+        cfg = cls._load_resolved()
+        # Push the MCP search-path setting to its consumer. It is PUSHED rather
+        # than read there because kiro_crew.env.mcp_search_path is reached from
+        # the event loop by every MCP probe and by the agent-config resolver, so
+        # a config read on that side would stat/read/validate config.json on the
+        # loop. Done here rather than inside _load_resolved so EVERY return path
+        # publishes -- including the defaults path taken when neither config file
+        # could be read, which must CLEAR a previously published snapshot rather
+        # than leave a deleted directory resolving commands. Lazy import: env
+        # must stay off this module's import graph.
+        try:
+            from kiro_crew.env import publish_config_path_dirs
+
+            publish_config_path_dirs(cfg.mcp.extra_path_dirs)
+        except Exception as e:  # pragma: no cover - defensive
+            # A publish failure must never make the config unloadable; the
+            # search path simply keeps its previous (or empty) contribution.
+            logger.warning("Publishing mcp.extra_path_dirs failed: %s", e)
+        return cfg
+
+    @classmethod
+    def _load_resolved(cls) -> KiroCrewConfig:
+        """Resolve the config from disk (or defaults). See :meth:`load`.
+
+        Split out so :meth:`load` owns the post-resolution publication on every
+        return path; this method may return from more than one place.
+        """
         path = config_path()
 
         # Hot-path cache: reuse the validated, merged dict when neither config
@@ -5907,6 +6271,9 @@ class KiroCrewConfig:
         teams_data = data.get("teams", {})
         if not isinstance(teams_data, dict):
             teams_data = {}
+        imessage_data = data.get("imessage", {})
+        if not isinstance(imessage_data, dict):
+            imessage_data = {}
         slack_data = data.get("slack", {})
         if not isinstance(slack_data, dict):
             slack_data = {}
@@ -5937,6 +6304,9 @@ class KiroCrewConfig:
         mcp_gateway_data = data.get("mcp_gateway", {})
         if not isinstance(mcp_gateway_data, dict):
             mcp_gateway_data = {}
+        mcp_data = data.get("mcp", {})
+        if not isinstance(mcp_data, dict):
+            mcp_data = {}
         heartbeat_data = data.get("heartbeat", {})
         if not isinstance(heartbeat_data, dict):
             heartbeat_data = {}
@@ -6054,6 +6424,9 @@ class KiroCrewConfig:
                 mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
                 default_agent=agent_data.get("default_agent", ""),
+                sweep_agents_backups=_safe_bool(
+                    agent_data.get("sweep_agents_backups", False), False
+                ),
                 sandbox=agent_data.get("sandbox", "auto"),
                 sandbox_allow_no_isolation=bool(
                     agent_data.get("sandbox_allow_no_isolation", False)
@@ -6080,10 +6453,10 @@ class KiroCrewConfig:
                     agent_data.get("tool_search_min_tokens", 50000), 50000
                 ),
                 session_sharing=bool(agent_data.get("session_sharing", True)),
-                max_subagents=agent_data.get("max_subagents", 0),
-                max_stop_hook_nudges=_safe_int(
-                    agent_data.get("max_stop_hook_nudges", 100), 100, 0
+                max_subagents=_safe_int(
+                    agent_data.get("max_subagents", 0), 0, 0, SUBAGENT_AUTO_MAX_CEILING
                 ),
+                max_stop_hook_nudges=_safe_int(agent_data.get("max_stop_hook_nudges", 100), 100, 0),
                 subagent_mem_buffer_pct=_safe_int(
                     agent_data.get("subagent_mem_buffer_pct", 20), 20
                 ),
@@ -6109,7 +6482,9 @@ class KiroCrewConfig:
                 subagent_cpu_cost_cores=_safe_float(
                     agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0
                 ),
-                subagent_auto_max=_safe_int(agent_data.get("subagent_auto_max", 32), 32),
+                subagent_auto_max=_safe_int(
+                    agent_data.get("subagent_auto_max", 32), 32, 3, SUBAGENT_AUTO_MAX_CEILING
+                ),
                 subagent_spawn_stagger_secs=_safe_float(
                     agent_data.get("subagent_spawn_stagger_secs", 2.0), 2.0
                 ),
@@ -6117,7 +6492,9 @@ class KiroCrewConfig:
                 resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
                 resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
                 admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
-                subagent_max_turns=agent_data.get("subagent_max_turns", 100),
+                subagent_max_turns=_safe_int(
+                    agent_data.get("subagent_max_turns", 100), 100, 1, SUBAGENT_MAX_TURNS_CEILING
+                ),
                 subagent_timeout_secs=agent_data.get("subagent_timeout_secs", 1800),
                 subagent_stall_idle_secs=_safe_int(
                     agent_data.get("subagent_stall_idle_secs", 120), 120
@@ -6156,8 +6533,13 @@ class KiroCrewConfig:
                 empty_response_auto_continue=bool(
                     session_data.get("empty_response_auto_continue", True)
                 ),
-                autocompact_pct=_safe_float(session_data.get("autocompact_pct", 90.0), 90.0),
-                pool_size=_safe_int(session_data.get("pool_size", 2), 2),
+                autocompact_pct=_safe_float(
+                    session_data.get("autocompact_pct", DEFAULT_AUTOCOMPACT_PCT),
+                    DEFAULT_AUTOCOMPACT_PCT,
+                    lo=AUTOCOMPACT_PCT_MIN,
+                    hi=AUTOCOMPACT_PCT_MAX,
+                ),
+                pool_size=_safe_int(session_data.get("pool_size", 2), 2, 0, POOL_SIZE_MAX),
                 pool_agent=str(session_data.get("pool_agent", "")),
                 pool_ttl_secs=_safe_int(session_data.get("pool_ttl_secs", 1800), 1800),
                 eager_spawn=bool(session_data.get("eager_spawn", True)),
@@ -6240,6 +6622,9 @@ class KiroCrewConfig:
                 episodic_dedup_threshold=memory_data.get("episodic_dedup_threshold", 0.88),
                 episodic_max_results=memory_data.get("episodic_max_results", 8),
                 episodic_max_count=memory_data.get("episodic_max_count", 10_000),
+                decay_rates=(
+                    dr if isinstance(dr := memory_data.get("decay_rates", {}), dict) else {}
+                ),
                 semantic_keys=memory_data.get("semantic_keys", []),
                 history_idle_hours=memory_data.get("history_idle_hours", 3.0),
                 history_max_days=memory_data.get("history_max_days", 365),
@@ -6315,9 +6700,7 @@ class KiroCrewConfig:
                 enabled=bool(telegram_data.get("enabled", False)),
                 bot_token=str(telegram_data.get("bot_token", "")),
                 allowed_user_ids=_coerce_int_ids(telegram_data.get("allowed_user_ids")),
-                soft_threshold_pct=max(
-                    1, min(100, _coerce_int(telegram_data.get("soft_threshold_pct"), 80))
-                ),
+                soft_threshold_pct=_threshold_pct(telegram_data.get("soft_threshold_pct"), 80),
                 allow_forum=bool(telegram_data.get("allow_forum", False)),
                 allowed_forum_chat_ids=_coerce_int_ids(telegram_data.get("allowed_forum_chat_ids")),
                 accounts=_parse_telegram_accounts(telegram_data.get("accounts")),
@@ -6330,12 +6713,8 @@ class KiroCrewConfig:
                 base_url=str(weixin_data.get("base_url", "") or "https://ilinkai.weixin.qq.com"),
                 dm_policy=str(weixin_data.get("dm_policy", "allowlist") or "allowlist"),
                 allowed_user_ids=_coerce_opaque_str_ids(weixin_data.get("allowed_user_ids")),
-                soft_threshold_pct=max(
-                    1, min(100, _coerce_int(weixin_data.get("soft_threshold_pct"), 80))
-                ),
-                hard_threshold_pct=max(
-                    1, min(100, _coerce_int(weixin_data.get("hard_threshold_pct"), 95))
-                ),
+                soft_threshold_pct=_threshold_pct(weixin_data.get("soft_threshold_pct"), 80),
+                hard_threshold_pct=_threshold_pct(weixin_data.get("hard_threshold_pct"), 95),
             ),
             discord=DiscordConfig(
                 session_folder=_coerce_session_folder(discord_data.get("session_folder")),
@@ -6346,9 +6725,9 @@ class KiroCrewConfig:
                 # transport's string comparison).
                 allowed_user_ids=_coerce_str_ids(discord_data.get("allowed_user_ids")),
                 allowed_thread_ids=_coerce_str_ids(discord_data.get("allowed_thread_ids")),
-                soft_threshold_pct=max(
-                    1, min(100, _coerce_int(discord_data.get("soft_threshold_pct"), 80))
-                ),
+                allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
+                auto_thread=bool(discord_data.get("auto_thread", True)),
+                soft_threshold_pct=_threshold_pct(discord_data.get("soft_threshold_pct"), 80),
             ),
             webex=WebexConfig(
                 session_folder=_coerce_session_folder(webex_data.get("session_folder")),
@@ -6359,8 +6738,21 @@ class KiroCrewConfig:
                     if isinstance(webex_data.get("allowed_emails", []), list)
                     else []
                 ),
-                soft_threshold_pct=_coerce_int(webex_data.get("soft_threshold_pct"), 80),
-                hard_threshold_pct=_coerce_int(webex_data.get("hard_threshold_pct"), 95),
+                soft_threshold_pct=_threshold_pct(webex_data.get("soft_threshold_pct"), 80),
+                hard_threshold_pct=_threshold_pct(webex_data.get("hard_threshold_pct"), 95),
+            ),
+            imessage=IMessageConfig(
+                session_folder=_coerce_session_folder(imessage_data.get("session_folder")),
+                enabled=bool(imessage_data.get("enabled", False)),
+                db_path=str(imessage_data.get("db_path", "")),
+                allowed_handles=[
+                    h
+                    for h in _safe_list(imessage_data.get("allowed_handles"))
+                    if isinstance(h, str) and h
+                ],
+                service=str(imessage_data.get("service", "") or "imessage"),
+                soft_threshold_pct=_threshold_pct(imessage_data.get("soft_threshold_pct"), 80),
+                hard_threshold_pct=_threshold_pct(imessage_data.get("hard_threshold_pct"), 95),
             ),
             teams=TeamsConfig(
                 session_folder=_coerce_session_folder(teams_data.get("session_folder")),
@@ -6376,8 +6768,8 @@ class KiroCrewConfig:
                     if isinstance(teams_data.get("allowed_emails", []), list)
                     else []
                 ),
-                soft_threshold_pct=_coerce_int(teams_data.get("soft_threshold_pct"), 80),
-                hard_threshold_pct=_coerce_int(teams_data.get("hard_threshold_pct"), 95),
+                soft_threshold_pct=_threshold_pct(teams_data.get("soft_threshold_pct"), 80),
+                hard_threshold_pct=_threshold_pct(teams_data.get("hard_threshold_pct"), 95),
             ),
             slack=SlackConfig(
                 session_folder=_coerce_session_folder(slack_data.get("session_folder")),
@@ -6438,8 +6830,8 @@ class KiroCrewConfig:
                 ],
                 allow_all_users=bool(wecom_data.get("allow_all_users", False)),
                 ws_url=str(wecom_data.get("ws_url", "wss://openws.work.weixin.qq.com")),
-                soft_threshold_pct=_safe_int(wecom_data.get("soft_threshold_pct", 80), 80),
-                hard_threshold_pct=_safe_int(wecom_data.get("hard_threshold_pct", 95), 95),
+                soft_threshold_pct=_threshold_pct(wecom_data.get("soft_threshold_pct"), 80),
+                hard_threshold_pct=_threshold_pct(wecom_data.get("hard_threshold_pct"), 95),
             ),
             dashboard=DashboardConfig(
                 url=dashboard_data.get("url", ""),
@@ -6545,9 +6937,7 @@ class KiroCrewConfig:
                 # (809M vs 74M, but much better latency).
                 model=stt_data.get("model", "turbo"),
                 mlx_model=stt_data.get("mlx_model", "mlx-community/whisper-large-v3-turbo"),
-                parakeet_model=stt_data.get(
-                    "parakeet_model", "mlx-community/parakeet-tdt-0.6b-v3"
-                ),
+                parakeet_model=stt_data.get("parakeet_model", "mlx-community/parakeet-tdt-0.6b-v3"),
                 device=stt_data.get("device", "cpu"),
                 timeout_secs=stt_data.get("timeout_secs", 300),
                 transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
@@ -6664,23 +7054,47 @@ class KiroCrewConfig:
                 # ``bool("false")`` is True. The write path is where an opt-out is
                 # actually enforced: the endpoint rejects any non-boolean body.
                 apps_enabled=_safe_bool(mcp_gateway_data.get("apps_enabled", True), True),
-                # Default False AND type-checked: ``bool("false")`` is True, so a
-                # hand-edited string would silently ENABLE forwarding. A
-                # malformed value must mean "do not apply declared env to a
-                # shared backend", never the reverse.
+                # ON by default. The forwarded set is a strict subset of the
+                # hashed set and gatewayd re-hashes the sidecar at spawn,
+                # forwarding nothing on mismatch, so a forwarded key is one every
+                # co-tenant of that backend declared identically. With it off, one
+                # ordinary declared key costs the whole server its pooling.
+                #
+                # Both arguments are True on purpose. A malformed value never
+                # reaches this call: ``config.validation`` type-checks first and
+                # ``_apply_field_default`` strips a non-boolean so the dataclass
+                # default applies, which is why the log says "using default". The
+                # fallback here is defence in depth for a bypassed validator, and
+                # giving it a different answer than the schema would only put two
+                # disagreeing defaults in the file.
                 forward_declared_env=_safe_bool(
-                    mcp_gateway_data.get("forward_declared_env", False), False
+                    mcp_gateway_data.get("forward_declared_env", FORWARD_DECLARED_ENV_DEFAULT),
+                    FORWARD_DECLARED_ENV_DEFAULT,
                 ),
                 socket_path=str(mcp_gateway_data.get("socket_path", "")),
                 overlay_dir=str(mcp_gateway_data.get("overlay_dir", "")),
                 idle_timeout_secs=max(
                     10, _safe_int(mcp_gateway_data.get("idle_timeout_secs", 300), 300)
                 ),
+                # 0 is meaningful (re-resolve every pass), so the floor is 0 and
+                # not the usual "at least something" clamp.
+                resolve_once_refresh_hours=max(
+                    0, _safe_int(mcp_gateway_data.get("resolve_once_refresh_hours", 24), 24)
+                ),
                 max_backends=max(1, _safe_int(mcp_gateway_data.get("max_backends", 64), 64)),
                 poolable_servers=[
                     s for s in mcp_gateway_data.get("poolable_servers", []) if isinstance(s, str)
                 ],
                 stub_servers=_resolve_stub_servers(mcp_gateway_data),
+                # Hand-editable list of env NAMES; keep only strings and drop
+                # blanks so a stray null or nested object cannot reach the
+                # hashing layer as a key. Not deduplicated here — every consumer
+                # builds a frozenset from it.
+                pool_identity_env=[
+                    s.strip()
+                    for s in mcp_gateway_data.get("pool_identity_env", [])
+                    if isinstance(s, str) and s.strip()
+                ],
                 prewarm_count=max(0, _safe_int(mcp_gateway_data.get("prewarm_count", 0), 0)),
                 read_buffer_limit_bytes=max(
                     1024,
@@ -6696,6 +7110,18 @@ class KiroCrewConfig:
                         256 * 1024,
                     ),
                 ),
+            ),
+            mcp=McpConfig(
+                # Kept as authored strings — validation (absolute-only, ``~``
+                # expansion, dedup) belongs to the consumer,
+                # kiro_crew.env.augmented_path, so the ONE gate the built-in
+                # directories already pass applies to these too instead of a
+                # second rule drifting here. Non-strings ARE dropped now: the
+                # field is typed list[str] and to_dict() round-trips it verbatim
+                # into the saved config.
+                extra_path_dirs=[
+                    d for d in _safe_list(mcp_data.get("extra_path_dirs", [])) if isinstance(d, str)
+                ],
             ),
             instances=InstancesConfig(
                 enabled=bool(instances_data.get("enabled", False)),
@@ -6755,16 +7181,15 @@ class KiroCrewConfig:
             ),
             session_summary=SessionSummaryConfig(
                 enabled=bool(session_summary_data.get("enabled", False)),
-                min_user_turns=_safe_int(
-                    session_summary_data.get("min_user_turns", 2), 2),
+                min_user_turns=_safe_int(session_summary_data.get("min_user_turns", 2), 2),
                 regenerate_after_turns=_safe_int(
-                    session_summary_data.get("regenerate_after_turns", 1), 1),
-                max_intents=_safe_int(
-                    session_summary_data.get("max_intents", 8), 8),
-                max_constraints=_safe_int(
-                    session_summary_data.get("max_constraints", 5), 5),
+                    session_summary_data.get("regenerate_after_turns", 1), 1
+                ),
+                max_intents=_safe_int(session_summary_data.get("max_intents", 50), 50),
+                max_constraints=_safe_int(session_summary_data.get("max_constraints", 50), 50),
                 assistant_excerpt_chars=_safe_int(
-                    session_summary_data.get("assistant_excerpt_chars", 400), 400),
+                    session_summary_data.get("assistant_excerpt_chars", 400), 400
+                ),
             ),
             slack_channels={
                 ch_id: ChannelConfig.from_dict(ch_data)
@@ -6843,6 +7268,7 @@ class KiroCrewConfig:
             "wecom": asdict(self.wecom),
             "weixin": asdict(self.weixin),
             "teams": asdict(self.teams),
+            "imessage": asdict(self.imessage),
             "dashboard": asdict(self.dashboard),
             "tunnel": asdict(self.tunnel),
             "hooks": self.hooks,
@@ -6856,6 +7282,7 @@ class KiroCrewConfig:
             "computer_use": asdict(self.computer_use),
             "instances": asdict(self.instances),
             "mcp_gateway": asdict(self.mcp_gateway),
+            "mcp": asdict(self.mcp),
             "taskrunner": asdict(self.taskrunner),
             "orchestrator": asdict(self.orchestrator),
             "watchdog": asdict(self.watchdog),
@@ -7040,9 +7467,7 @@ class KiroCrewConfig:
         for k, v in creds.items():
             if not v:
                 continue
-            if scrubbed and (
-                k in _CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)
-            ):
+            if scrubbed and (k in _CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)):
                 continue
             os.environ.setdefault(k, v)
 
@@ -7352,6 +7777,16 @@ def refresh_materialized_agents() -> None:
         _MATERIALIZED_AGENTS = snapshot
         _MATERIALIZED_AGENTS_READY = True
         _MATERIALIZED_REFRESH_APPLIED = my_ticket
+    # An app install/upgrade that rewrote agent JSON just landed in the snapshot;
+    # drop the context builder's per-agent includeCrewContext cache so the next
+    # build re-reads the flag rather than serving a value cached before the write
+    # (otherwise a flipped flag heals only on gateway restart).
+    try:
+        from kiro_crew.context import invalidate_include_crew_context_cache
+
+        invalidate_include_crew_context_cache()
+    except Exception:  # noqa: BLE001 — best-effort; a stale flag is not fatal
+        logger.debug("Failed to invalidate includeCrewContext cache", exc_info=True)
 
 
 def publish_materialized_agents(names: Iterable[str]) -> None:
@@ -7569,9 +8004,7 @@ def resolve_crew_identity(
         # The line exists so a kiro-template name that collides with a crew
         # key (which would silently inherit that crew's watchdog windows) is
         # diagnosable from logs.
-        logger.debug(
-            "crew_agent %r resolved by crew-namespace fallback", agent
-        )
+        logger.debug("crew_agent %r resolved by crew-namespace fallback", agent)
         return agent
     return ""
 

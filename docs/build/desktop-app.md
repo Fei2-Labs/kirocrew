@@ -313,6 +313,10 @@ same way). Key details:
   relative dylib references (genuinely portable, no system Python dependency).
 - **Entry point** is `bin/kirocrew` — a shell script that execs
   `bin/python3.12 -s -m kiro_crew "$@"`.
+- **Stdlib probes verified** — `stdlib_probe_gate` fails the build if any package
+  the launcher's readiness check probes is missing from the pruned tree, so a
+  drifted probe list breaks the build instead of every user's launch (see
+  [How the app finds and launches the backend](#how-the-app-finds-and-launches-the-backend)).
 - **Self-containment verified** — the build script runs
   `PYTHONNOUSERSITE=1 bin/python3.12 -m kiro_crew --version` to catch any
   missing dependency before packaging.
@@ -329,6 +333,79 @@ forward to a remote gateway—is reused. Otherwise the shell locates the backend
 binary via [`find-bin.js`](../../website/electron/find-bin.js), spawns it as
 `kirocrew gateway --no-open`, polls `/api/status`, and loads the dashboard once
 it is healthy.
+
+Before spawning a **bundled** backend the shell checks that the bundle's Python
+stdlib is fully on disk
+([`bundle-integrity.js`](../../website/electron/bundle-integrity.js)). The
+Windows NSIS installer extracts `backend-dist/` incrementally and launches the
+app as it finishes (`runAfterFinish`), so a launch inside that window finds
+`python.exe` present while late-alphabet stdlib packages are not — the
+interpreter then dies on `from urllib.parse import …` reached through
+`pathlib`, which reads as a corrupt install rather than an unfinished one. The
+check probes stdlib packages spread across the alphabet — via each one's
+`__init__.py`, since an extractor creates a directory before filling it and a
+top-level `.py` file lands with the early batch — and, when any are missing,
+reports "still being installed" through the normal gateway-failure dialog, whose
+**Retry** succeeds once extraction completes. It stays silent for the legacy
+flat layout, which carries no interpreter tree to verify.
+
+That pre-spawn check cannot be complete, and does not pretend to be: extraction
+order *within* a package is not the app's to control, so `import zoneinfo` can
+still fail moments after `zoneinfo/__init__.py` appears. A second, sound check
+backstops it. The two are not redundant — the pre-spawn probe is **preventive but
+unsound**, the backstop **sound but after-the-fact**, and each covers what the
+other cannot. Refusing before `spawn()` keeps a doomed interpreter from running
+module-scope work against the live data home (it creates the home and
+`.local_secret`, and writes bytecode caches) and from failing in messier ways than
+a clean `ModuleNotFoundError` while extraction is still writing underneath it;
+the backstop can only ever explain a crash that already happened.
+
+When a spawn dies on a **stdlib** import, the launch log is read and the failure
+reclassified as an unfinished install. Two traceback forms are matched, because a
+half-written package does not report the obvious one:
+
+- `ModuleNotFoundError: No module named 'urllib'` — the package (or, for a dotted
+  name, a submodule of a package that did land) is absent.
+- `ImportError: cannot import name '_tzpath' from partially initialized module
+  'zoneinfo'` — the package's `__init__.py` arrived before its siblings. This is
+  what CPython actually raises in that case, verified against the shipped
+  interpreter, and it is precisely the state the pre-spawn probe cannot see.
+
+Three conditions keep it from excusing anything else. Judgement is by the
+**top-level package name**, which must be in the stdlib set, so a missing
+third-party or first-party module (a genuine packaging defect) is never relabelled.
+Only a **bundled** backend qualifies — a user's own install or a `PATH` `kirocrew`
+failing on a stdlib import is a broken environment, and "wait for the installer"
+would be misleading advice there. And only the **current launch attempt** is read:
+the log is append-only across launches, so the text is sliced from the last spawn
+marker (`SPAWN_MARKER`, owned by `bundle-integrity.js` and logged by `main.js` so
+writer and reader cannot drift). Without that, an older traceback could relabel
+this attempt's unrelated failure — a `SIGKILL`, or a bound port whose real remedy
+is force-stop rather than a bare Retry — and show a reassuring dialog over a live
+fault. When the marker has scrolled out of the tail, attribution is unknowable and
+the check declines.
+
+**Why not an installer-written completion sentinel?** It looks like the obviously
+sounder mechanism — the installer knows exactly when extraction finished, and
+`installer.nsh` could write a marker from `customInstall`. It is rejected because
+`nsis.perMachine` is `false` and updates run the new version's installer **over the
+existing install directory**: after the first update the tree carries a sentinel
+written by the *previous* installer, which cannot be told apart from a valid one
+while a newer build is still extracting. That is precisely the reported failure (an
+update, not a fresh install), so a naive sentinel would assert "complete" during the
+exact race it was added to close. A sound version must be version-scoped, rewritten
+atomically per install, and compared against the running app's own version. It would
+also be Windows-only — the DMG and the Linux packages have no `customInstall` — so
+it is an addition on top of the probe, never a replacement for it.
+
+The build enforces the other direction: **`stdlib_probe_gate`** runs after
+pruning in both backend build paths and **fails the build** if any probed package
+is absent from the tree just built. A probe list that drifts from the shipped
+stdlib (a Python bump turning a package back into a module, a rename, or a new
+prune) would otherwise refuse *every* launch of a healthy app — a permanent
+failure worse than the transient one the gate prevents. Like `resolver_gate` it
+needs `node`, and logs a visible SKIP rather than failing when none is on PATH,
+so a `node`-less build environment still produces a bundle (unvalidated).
 
 The gateway-hosted dashboard then checks both prerequisites needed by the ACP
 provider:
@@ -601,6 +678,100 @@ tccutil reset Microphone com.amazon.kiro.crew
 
 This is also why distributing the signed + notarized DMG matters (above): a
 stable identity is what keeps grants sticky instead of silently orphaning them.
+
+### Local network access needs a USAGE STRING, and no entitlement exists for it
+
+macOS 15 (Sequoia) added local-network privacy for **every** app, sandboxed or
+not. The mic's lesson does not transfer: there is no `device.*` entitlement to
+add here, and adding one of the neighbouring network keys makes things worse.
+This resource is TCC-only, and `NSLocalNetworkUsageDescription` is the entire
+declaration.
+
+> **Symptom:** an agent's shell command connects fine to the default gateway
+> (`192.168.x.1`) and to any public host, but every **other** LAN address — a NAS,
+> an IoT device, another dev box — fails **instantly** with errno 65
+> (`EHOSTUNREACH`, "No route to host") in ~0.000s rather than timing out. `ping`
+> and ARP to the same host succeed, so it reads as a routing fault. There is no
+> Kiro Crew row under System Settings › Privacy & Security › Local Network, and
+> `tccutil reset LocalNetwork com.amazon.kiro.crew` fails because no TCC record
+> exists to reset.
+
+The gateway-works / everything-else-fails split is the signature of the TCC gate,
+not of the network. With no declared intent macOS creates no
+`kTCCServiceLocalNetwork` record, so there is no prompt to answer and no toggle to
+flip — the same dead end as the mic, reached by a different mechanism.
+
+Three neighbouring keys look like the fix and are **not**:
+
+- `com.apple.developer.networking.multicast` covers multicast and broadcast,
+  requires an Apple-granted provisioning profile, and breaks signing when
+  requested unprovisioned. Plain unicast LAN access does not need it.
+- `com.apple.security.network.client` only means anything under **App Sandbox**,
+  which this bundle does not use.
+- `NSAllowsLocalNetworking` (which the bundle already carries) is an **App
+  Transport Security** key that relaxes HTTPS requirements for local hostnames.
+  It has nothing to do with the TCC gate — an easy one to mistake for a fix,
+  since it is already present in a bundle that cannot reach the LAN.
+
+`website/electron/test/packaging.test.js` pins both directions: the usage string
+must be declared with real copy, and neither entitlement may appear in either
+signing lane.
+
+#### Why the CLI gateway is not affected the same way
+
+Apple exempts several launch contexts from local-network privacy: daemons started
+by `launchd`, anything running as root, and **command-line tools run from Terminal
+or over SSH, including every child process they spawn**. So a gateway started with
+`kirocrew gateway` from a terminal reaches the LAN normally, while the same agent
+command run under the desktop app is gated by the app bundle's TCC record. That
+asymmetry is a useful triage question ("how did you start the gateway?") and a
+usable workaround, not evidence that the app is fine.
+
+One caveat worth knowing before concluding the usage string alone fixed it: agent
+shell commands are wrapped by `sandbox_exec_argv` in `src/kiro_crew/sandbox.py`,
+which `exec`s the target through `/usr/bin/sandbox-exec` and replaces the process
+image. The Seatbelt profile itself is `(allow default)` plus filesystem denies and
+carries **no** network rules, so the sandbox does not block sockets — but whether
+TCC's responsible-process attribution still lands on the app bundle across that
+`exec` has to be confirmed on a real macOS 15 host rather than reasoned about.
+
+## Externally-managed installs (repackagers)
+
+A distro or enterprise packager that redistributes the desktop app through its
+own package manager owns the install's update lifecycle: the package manager
+replaces the whole install, so the built-in auto-updater would fight it (each
+overwriting the other's bytes) and its feed check would compare against
+releases the packager never ships.
+
+Such a packager opts out by dropping an `EXTERNALLY-MANAGED` marker file
+(named after the PEP 668 precedent) into the packaged resources directory —
+the same outside-asar surface that carries `package-type` and `backend-dist`
+(`Contents/Resources/` on macOS, `resources/` on Linux and Windows). Its
+presence alone disables the updater: the feed is never contacted, and
+Settings → About hides the release-channel switcher (the lanes it offers are
+ones the packager never reads). The body is optional JSON metadata for the
+About panel:
+
+```json
+{
+  "managedBy": "your package manager's name",
+  "updateCommand": "the command users run to update"
+}
+```
+
+`managedBy` names the owning system in the "updates are managed by …"
+message; `updateCommand` renders as a copyable command. An empty or
+unparsable body still counts as managed — an operator who dropped the file
+gets the safe behavior even when the metadata is wrong. For local testing,
+the `KIROCREW_EXTERNALLY_MANAGED` env var points at a marker file (any other
+non-empty value marks the install managed with no metadata).
+
+The gateway has the matching seam for its own surfaces: an operator's
+`security_policy.json` `updates` block (`check_command` / `apply_command`)
+routes the dashboard's update check, badge, and Update button through the
+declared commands, and the gateway then reports no release channel at all.
+The `check_command` runs on every check — the 12-hourly background poll AND
+the manual Check button — so it must be side-effect-free and idempotent.
 
 ## Remote tunnel mode
 

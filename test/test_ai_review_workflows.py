@@ -1394,6 +1394,23 @@ class TestClaudeReviewQualityDimensions:
         assert "flake8, mypy, isort, eslint" in disco
         assert "Judge" in disco and "behaviour, not form" in disco
 
+    def test_retired_single_user_premise_is_gone(self) -> None:
+        """Regression for #3484: both opus lanes carried a variant of the
+        retired 'single-user tool ... proportional to that shape' premise
+        that a prior fix (#3451) replaced with deployment-neutral framing in
+        the four workflow-inline reviewer prompts, but left these two shared
+        prompt files untouched -- a contradiction between the lanes reading
+        the same repo. The replacement text still quotes "single-user tool"
+        once, as an example of forbidden reasoning -- that is intentional and
+        not the retired premise.
+        """
+        for stage in ("opus-discovery", "opus-validate"):
+            text = _flat(_review_prompt(stage))
+            assert "proportional to that shape" not in text, stage
+            assert "Judge reachability against that shape" not in text, stage
+            assert "DO NOT REASON FROM AN ASSUMED USER COUNT" in text, stage
+            assert "DERIVED rather than speculative" in text, stage
+
 
 class TestGptPrIntentGrounding:
     """The GPT reviewer must be GROUNDED in the PR's stated purpose (title/body),

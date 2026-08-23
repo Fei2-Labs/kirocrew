@@ -466,7 +466,8 @@ Writers: `apps/dependency_ledger.py`, `apps/dependencies.py`;
 ## 12. Store visibility is a manifest flag, not a code removal
 
 Built-in apps ship default-DISABLED. `manager._DEFAULT_ON_BUILTINS` is the single
-source of truth for the exemption (currently only `projects`, the Task Runner),
+source of truth for the exemption (`projects`, the Task Runner, and `command-bar`,
+which replaces the quick-search gesture rather than adding a sidebar entry),
 read by the policy tests over both the hardcoded list and the file-based
 manifests, so a builtin cannot become default-on through one registration path
 while the other path's test still forbids it. A default-enabled builtin is
@@ -661,6 +662,17 @@ catalog's OFFLINE SNAPSHOT, not a peer source: a reachable catalog means the
 store renders the published document's list, display copy, AND installable
 inventory; an unreachable one degrades the listing to the seed.
 
+User-configured external registries (`config.registries`) are a separate,
+always-present source: both `list_registry` and `list_catalog_apps` merge them
+through one shared site, `_append_external_registry_apps`, so the online and
+offline paths enrich, probe (`detectInstalled`), and trust-stamp external rows
+identically and cannot drift. A catalog/seed/builtin row wins a `name`
+collision; the catalog path reserves every catalog name (snapshotted before the
+`git`-installability filter) plus every seed name, so an external row can only
+ADD a name no catalog or seed row claims and can never shadow a name install
+resolves by. External rows keep their `provenance: "external"`/`verified: false`
+stamp.
+
 The catalog is trusted only as far as TLS, so its power is bounded by
 pin-or-refuse rather than by withholding coordinates.
 `official_catalog.inventory()` materialises each `git`-source entry as an
@@ -704,7 +716,8 @@ A name is a filesystem path on install, so `inventory()` and
 
 Writers: `apps/official_catalog.py` (`list_catalog_rows`, `inventory`,
 `fetch_inventory_entries`, `inventory_for_install`), `apps/registry.py`
-(`list_catalog_apps`, `_resolve_registry_row`, `_git_fetch_commit`),
+(`list_catalog_apps`, `_resolve_registry_row`, `_git_fetch_commit`,
+`_append_external_registry_apps`, `_detect_installed_probe`),
 `apps/routes.py` (`handle_registry`).
 
 ## 15. A registry's credential posture follows its index's change control

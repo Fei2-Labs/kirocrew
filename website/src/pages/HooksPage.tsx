@@ -21,7 +21,7 @@ interface Hook {
   id: string; name: string; event: string; matcher: string
   matcher_mode: string; command: string; skills: string[]
   timeout: number; enabled: boolean
-  last_run: number; last_status: string; run_count: number
+  last_run: number; last_status: string; last_error: string; run_count: number
 }
 
 /** Result payload from POST /api/hooks/:id/test. */
@@ -69,6 +69,26 @@ function HookForm({ hook, onSave, onCancel }: {
   const [skills, setSkills] = useState<string[]>(hook?.skills || [])
   const [timeout, setTimeout_] = useState(hook?.timeout || 30)
   const isToolHook = event === 'PreToolUse' || event === 'PostToolUse'
+  // Skills fire only for a standalone skills hook (no command) on
+  // UserPromptSubmit/AgentSpawn — a command makes them inert, and other events
+  // have no consumer for the injected directive.
+  const isSkillsCapable =
+    (event === 'UserPromptSubmit' || event === 'AgentSpawn') && !command.trim()
+  // A legacy/edited hook can arrive with skills that can no longer fire. Show
+  // them read-only with a warning (never silently delete on mount — that would
+  // be data loss the user never asked for). The save sends skills unchanged;
+  // the backend rejects the invalid pairing with an actionable field-level
+  // error, and the warning banner tells the user what to change.
+  const inertSkills = !isSkillsCapable && skills.length > 0
+
+  // Dynamic placeholder text per matcher mode
+  const matcherPlaceholder = isToolHook
+    ? i18nT('pages.hooksPage.matcher_tool_filter_e_g_fs_write_git')
+    : matcherMode === 'regex'
+      ? i18nT('pages.hooksPage.matcher_placeholder_regex')
+      : matcherMode === 'contains'
+        ? i18nT('pages.hooksPage.matcher_placeholder_contains')
+        : i18nT('pages.hooksPage.matcher_optional_e_g_deploy')
 
   return (
     <Card>
@@ -102,7 +122,7 @@ function HookForm({ hook, onSave, onCancel }: {
               breaking, so a sibling that does not fit wraps instead: 231px worst
               case, never below 120px. Same idiom as the tokens row in
               WebhooksPage, which had the identical defect. */}
-          <Input className="basis-full sm:basis-auto" placeholder={isToolHook ? i18nT('pages.hooksPage.matcher_tool_filter_e_g_fs_write_git') : i18nT('pages.hooksPage.matcher_optional_e_g_deploy')} value={matcher} onChange={e => setMatcher(e.target.value)} />
+          <Input className="basis-full sm:basis-auto" placeholder={matcherPlaceholder} value={matcher} onChange={e => setMatcher(e.target.value)} />
           {!isToolHook && (
             <SimpleSelect
               options={MATCHER_MODES}
@@ -117,9 +137,19 @@ function HookForm({ hook, onSave, onCancel }: {
             <span>{i18nT('pages.hooksPage.s')}</span>
           </div>
         </div>
-        <div>
-          <SkillsMultiSelect selected={skills} onChange={setSkills} />
-        </div>
+        {isSkillsCapable && (
+          <div>
+            <SkillsMultiSelect selected={skills} onChange={setSkills} />
+          </div>
+        )}
+        {inertSkills && (
+          <div className="flex items-start gap-2 text-[13px] text-warn bg-warn-subtle border border-warn/30 rounded-lg px-3 py-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>
+              {i18nT('pages.hooksPage.skills_inert_warning', { skills: skills.join(', ') })}
+            </span>
+          </div>
+        )}
         <div className="flex gap-2 items-center">
           <SendBtn onClick={() => onSave({ name, event, matcher, matcher_mode: matcherMode, command, skills, timeout })}>{i18nT('pages.hooksPage.save')}</SendBtn>
           <Btn onClick={onCancel} className="h-9 px-4 text-sm font-semibold rounded-lg">{i18nT('pages.hooksPage.cancel')}</Btn>
@@ -308,8 +338,17 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                       <td className="px-2.5 py-2 border-b border-border text-sm">
                         {!h.last_status ? <span className="text-muted italic">—</span>
                           : h.last_status === 'ok' ? <Badge variant="ok">{i18nT('pages.hooksPage.ok')}</Badge>
-                          : h.last_status === 'error' ? <Badge variant="err">{i18nT('pages.hooksPage.error')}</Badge>
-                          : <Badge variant="warn">{h.last_status}</Badge>}
+                          : h.last_status === 'error' ? (
+                            <span className="inline-flex items-center gap-1">
+                              <Badge variant="err">{i18nT('pages.hooksPage.error')}</Badge>
+                              {h.last_error && <InfoTip text={h.last_error} placement="top" />}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1">
+                              <Badge variant="warn">{h.last_status}</Badge>
+                              {h.last_error && <InfoTip text={h.last_error} placement="top" />}
+                            </span>
+                          )}
                       </td>
                       <td className="px-2.5 py-2 border-b border-border text-sm text-muted">{timeAgo(h.last_run)}</td>
                       {/* Pinned like the header cell, on an OPAQUE `bg-card`.

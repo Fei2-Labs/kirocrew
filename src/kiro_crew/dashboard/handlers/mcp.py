@@ -18,7 +18,11 @@ from aiohttp import web
 from kiro_crew import platform_compat
 from kiro_crew.agent import _atomic_json_write, kiro_agents_dir_path, rebuild_agent_config
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import KiroCrewConfig, _resolve_stub_servers
+from kiro_crew.config.loader import (
+    FORWARD_DECLARED_ENV_DEFAULT,
+    KiroCrewConfig,
+    _resolve_stub_servers,
+)
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.env import emit_env
@@ -48,14 +52,17 @@ logger = logging.getLogger(__name__)
 
 # Allowlist pattern for MCP server names.  Matches the convention used
 # in AIM / kiro-cli (alphanumerics, dashes, underscores, slashes, dots,
-# and ``@`` for scoped names like ``@org/server``) and defends against
-# command-injection into subprocess calls that pass the name as an argv
-# element (e.g. a capability-manager `uninstall <name>` argv).
+# ``@`` for scoped names like ``@org/server``, and ``:`` for app-provided
+# keys like ``<app>:<server>`` as enumerated from ``~/.kiro/agents/*.json``)
+# and defends against command-injection into subprocess calls that pass the
+# name as an argv element (e.g. a capability-manager `uninstall <name>` argv).
+# A colon is not a shell metacharacter and names only ever travel as
+# list-form argv elements, so admitting it does not widen that surface.
 #
 # The leading char must be alphanumeric or ``@`` so a name can't begin
-# with ``.`` or ``/``.  Path-traversal sequences (``..``) are rejected
-# separately at validation time below.
-_VALID_MCP_NAME_RE = re.compile(r"^[@a-zA-Z0-9][@a-zA-Z0-9/_.-]*$")
+# with ``.``, ``/``, or ``:``.  Path-traversal sequences (``..``) are
+# rejected separately at validation time below.
+_VALID_MCP_NAME_RE = re.compile(r"^[@a-zA-Z0-9][@a-zA-Z0-9/_.:-]*$")
 _MAX_MCP_NAME_LEN = 128
 
 
@@ -218,6 +225,11 @@ _mcp_probe_cache: list[dict] = []
 _mcp_probe_ts: float = 0.0
 _MCP_PROBE_CACHE_SECS = 600  # 10 min
 _mcp_probe_in_progress = False
+# Handle on the one probe allowed to be in flight. `_mcp_probe_in_progress` is
+# the flag the request handlers below consult to avoid STACKING a re-probe; this
+# is the joinable object that makes `_bg_mcp_probe` single-flight, which the flag
+# alone cannot do (a caller cannot await a bool).
+_mcp_probe_task: asyncio.Task[None] | None = None
 
 
 def _sync_mcp_to_agent(name: str, enabled: bool, *, remove: bool = False) -> None:
@@ -469,8 +481,43 @@ def _sync_mcp_to_agent_batch_unlocked(names: list[str], enabled: bool) -> None:
 
 
 async def _bg_mcp_probe() -> None:
-    """Background MCP probe — populates cache at startup."""
+    """Populate the MCP probe cache — SINGLE-FLIGHT.
+
+    Two independent boot paths reach this: ``dashboard/server.py`` fires it as a
+    background task once the port is bound, and ``slack/gateway.py`` awaits it
+    before warming sessions (kiro-cli reads mcp.json at spawn time). Without a
+    join, boot spawns and handshakes EVERY enabled MCP server twice — doubling
+    the subprocess churn, doubling occupancy of probe_all()'s concurrency
+    semaphore (so the first URL waits longer), and giving each server two
+    chances to trip a rate limit or an auth prompt.
+
+    ``_mcp_probe_in_progress`` could not close this on its own: it was written
+    but never read here, and a bool cannot be awaited, so the second caller had
+    nothing to wait on. The task handle can be, so both callers get one fan-out
+    and both still return only once the cache is populated.
+
+    The join is SHIELDED so a caller giving up (gateway wraps this in
+    ``wait_for`` with a timeout) abandons its own wait without cancelling the
+    probe mid-handshake — the fan-out completes and the cache is populated for
+    whoever asks next, which is what the boot path's
+    "continuing without full probe" message already implies.
+    """
+    global _mcp_probe_task
+
+    inflight = _mcp_probe_task
+    if inflight is not None and not inflight.done():
+        await asyncio.shield(inflight)
+        return
+
+    task = asyncio.ensure_future(_run_mcp_probe())
+    _mcp_probe_task = task
+    await asyncio.shield(task)
+
+
+async def _run_mcp_probe() -> None:
+    """The probe fan-out itself. Reached only through `_bg_mcp_probe`."""
     global _mcp_probe_ts, _mcp_probe_in_progress
+    _mcp_probe_in_progress = True
     try:
         # circular import: mcp_discovery defers imports of kiro_crew.agent
         # which shares state with this module, so importing it at module top
@@ -2238,6 +2285,60 @@ def _freeze_stub_servers(section: dict, overlay: dict | None = None) -> None:
         section["stub_servers"] = sorted(set(_resolve_stub_servers(effective)))
 
 
+#: Serializes explicit pre-resolve refreshes. Installs are registry-bound and
+#: slow, so two overlapping presses would double the network work and race each
+#: other's atomic commits. Deliberately NOT the gateway apply lock: a refresh
+#: must not block an operator toggling sharing while it runs.
+_MCP_RESOLVE_REFRESH_LOCK = asyncio.Lock()
+
+
+async def api_mcp_resolve_refresh(request: web.Request) -> web.Response:
+    """POST /api/mcp-gateway/resolve-refresh -- re-resolve npm MCP targets now.
+
+    Pre-resolving lets a launch exec an already-installed tree, so session start
+    performs no dependency resolution. An unpinned spec is refreshed on a timer;
+    this is the operator asking for that check immediately, so it forces past the
+    freshness window.
+
+    Returns ``{ok, resolved, ready}`` where ``resolved`` maps each npm package to
+    ``ready`` / ``unresolved`` / ``error``. A server that fails to resolve is not
+    an error for the request: it simply keeps launching the way it does today.
+    """
+    state: DashboardState = request.app["state"]
+    refresh = getattr(state, "_mcp_resolve_refresh", None)
+    if refresh is None:
+        return web.json_response(
+            {
+                "error": "Pre-resolve is not available in this process.",
+                "code": "resolve_refresh_unavailable",
+            },
+            status=503,
+        )
+    if _MCP_RESOLVE_REFRESH_LOCK.locked():
+        # Report the in-flight pass instead of queueing behind it: the caller is
+        # a person who pressed a button, and a silent multi-minute wait reads as
+        # a hang.
+        return web.json_response(
+            {"error": "A pre-resolve pass is already running.", "code": "resolve_in_progress"},
+            status=409,
+        )
+    async with _MCP_RESOLVE_REFRESH_LOCK:
+        try:
+            result = await refresh()
+        except Exception:
+            logger.exception("mcp-gateway: explicit pre-resolve refresh failed")
+            return web.json_response(
+                {"error": "Could not pre-resolve.", "code": "resolve_refresh_failed"},
+                status=500,
+            )
+    if not isinstance(result, dict):
+        return web.json_response(
+            {"error": "Could not pre-resolve.", "code": "resolve_refresh_failed"},
+            status=500,
+        )
+    return web.json_response(result)
+
+
 async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
     """POST /api/mcp-gateway/enable — persist the flag and apply it in-process.
 
@@ -2494,7 +2595,11 @@ def _stub_eligibility(
     """
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
     from kiro_crew.mcp_gateway.evaluate import identity_for
-    from kiro_crew.mcp_gateway.rewriter import UNPOOLABLE_SERVERS, _withheld_env_count
+    from kiro_crew.mcp_gateway.rewriter import (
+        UNPOOLABLE_SERVERS,
+        _withheld_env_count,
+        pool_identity_env_keys,
+    )
     from kiro_crew.mcp_gateway.verdict_cache import load_cache
 
     rows = _collect_server_rows()
@@ -2520,7 +2625,9 @@ def _stub_eligibility(
             skipped.append({"name": name, "reason": "cannot_stub"})
             continue
         if sharing_on and _withheld_env_count(
-            {k: "" for k in row["env_names"]}, forward_declared_env
+            {k: "" for k in row["env_names"]},
+            forward_declared_env,
+            pool_identity_env_keys(),
         ):
             skipped.append({"name": name, "reason": "pooling_blocked_by_env"})
             continue
@@ -2544,6 +2651,7 @@ def _stub_eligibility(
             env_names=tuple(sorted(row["env_names"])),
             observed_hazards=observed.get(name, ()),
             preflight=preflight,
+            identity_keys=pool_identity_env_keys(),
         )
         allowed = verdict.recommend_share if sharing_on else verdict.recommend_stub
         if not allowed:
@@ -2570,11 +2678,18 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
     global switch (``mcp_gateway.enabled``), reported by the status endpoint.
     """
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
-    from kiro_crew.mcp_gateway.rewriter import UNPOOLABLE_SERVERS, _withheld_env_count
+    from kiro_crew.mcp_gateway.rewriter import (
+        UNPOOLABLE_SERVERS,
+        _withheld_env_count,
+        pool_identity_env_keys,
+    )
 
     gw_cfg = KiroCrewConfig.load().mcp_gateway
     stub_set = set(gw_cfg.stub_servers)
     forward_declared_env = bool(gw_cfg.forward_declared_env)
+    # Resolved ONCE for the whole payload, same reason the shareability files are:
+    # two rows in one response must not disagree about the operator's list.
+    identity_keys = pool_identity_env_keys()
 
     rows = await asyncio.to_thread(_collect_server_rows)
 
@@ -2616,7 +2731,9 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
         # row builder's value-free discipline holds.
         pooling_blocked = bool(
             gw_cfg.enabled
-            and _withheld_env_count({k: "" for k in row["env_names"]}, forward_declared_env)
+            and _withheld_env_count(
+                {k: "" for k in row["env_names"]}, forward_declared_env, identity_keys
+            )
         )
         result.append(
             {
@@ -2646,6 +2763,7 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
                     preflight=(
                         preflights.get(name) if len(row["launch_ids"]) <= 1 else None
                     ),
+                    identity_keys=identity_keys,
                 ).to_dict(),
             }
         )
@@ -2693,6 +2811,7 @@ def _assess_server(
     env_names: tuple[str, ...],
     observed_hazards: tuple[str, ...],
     preflight: tuple[bool, bool] | None,
+    identity_keys: Collection[str] = (),
 ) -> ShareVerdict:
     """Build evidence for one row and hand it to the verdict engine.
 
@@ -2724,7 +2843,8 @@ def _assess_server(
             observed_hazards=observed_hazards,
             preflight_ran=preflight[0] if preflight else None,
             preflight_caller_sensitive=preflight[1] if preflight else False,
-        )
+        ),
+        identity_keys,
     )
 
 
@@ -2734,14 +2854,16 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
     Body ``{"name": "slack-mcp", "stub": true}`` for one server, or
     ``{"names": ["a-mcp", "b-mcp"], "stub": true}`` for several.  Adds or
     removes those names from ``mcp_gateway.stub_servers`` in config.json
-    (same config lock + atomic write as the enable toggle), then re-applies the
-    change in-process so new sessions pick up the new stub set without a
-    restart.  When the gateway is disabled, the allowlist is persisted only (it
-    takes effect when the gateway is enabled).
+    (same config lock + atomic write as the enable toggle).  The change is
+    RECORDED, not applied: the running broker is left alone and the response
+    carries ``restart_required``, because the daemon's routing is built with the
+    agent-spec rewrite at startup and a session's MCP toolset is fixed at
+    ``session/new``.  When the gateway is disabled, the allowlist is persisted
+    only (it takes effect when the gateway is enabled).
 
     The batch form exists because the UI's "toggle all" would otherwise issue
-    one request per server: N config rewrites and N pool re-applies for a single
-    user gesture, each one racing the others for the config lock.  One request
+    one request per server: N config rewrites for a single user gesture, each
+    one racing the others for the config lock.  One request
     means one write and one apply, so the allowlist can never land half-flipped.
 
     ``resolve_eligibility: true`` (with ``stub: true``) hands the POLICY to this
@@ -2892,11 +3014,17 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
                     # the overlay wins, because that is what the rewriter will see.
                     # Taking the base value alone would let a base ``true`` plus an
                     # overlay ``false`` report a stub whose backend the rewriter
-                    # then leaves direct.
+                    # then leaves direct. The absent-key fallback comes from the
+                    # config field's own default (FORWARD_DECLARED_ENV_DEFAULT),
+                    # not a literal: this reader and the rewriter must agree, or
+                    # the batch skips servers the rewrite pools perfectly well.
                     forward_declared_env=bool(
                         overlay["forward_declared_env"]
                         if "forward_declared_env" in overlay
-                        else section.get("forward_declared_env", False)
+                        else section.get(
+                            "forward_declared_env",
+                            FORWARD_DECLARED_ENV_DEFAULT,
+                        )
                     ),
                 )
                 resolved["skipped"] = skipped
@@ -2950,7 +3078,7 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
         apply = getattr(state, "_mcp_gateway_apply_stub", None)
         applied: dict[str, Any] = {"applied": False}
         # One apply for the whole batch: the allowlist is already fully written, so a
-        # single re-link picks up every name at once.
+        # single call records every name at once.
         audited = f"names={','.join(names)}" if batch else f"name={name}"
         if resolve_eligibility and stub:
             # Audit what was WRITTEN, not what was asked for -- the two differ by
@@ -2958,9 +3086,8 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
             audited += f" written={','.join(resolved.get('eligible') or [])}"
         # Nothing qualified means nothing was written, so there is no new link for
         # an apply to pick up.
-        if apply is not None and not (
-            resolve_eligibility and stub and not resolved.get("eligible")
-        ):
+        nothing_written = bool(resolve_eligibility and stub and not resolved.get("eligible"))
+        if apply is not None and not nothing_written:
             try:
                 applied = await apply()
             except Exception as exc:
@@ -2972,6 +3099,14 @@ async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
                     resources=f"{audited} stub={stub} error={exc}",
                 )
                 return web.json_response({"error": f"apply failed: {exc}"}, status=500)
+        elif not nothing_written:
+            # No callback means no gateway wired this process -- but the allowlist
+            # was already persisted above, so the change WAS recorded and takes
+            # effect at the next start, which is exactly what the callback would
+            # have reported. Answering it here keeps the client off its
+            # ``applied: false`` fault branch, which would otherwise tell the
+            # operator the gateway could not start a change that is safely saved.
+            applied = {"applied": False, "restart_required": True}
 
     sel().log_api_access(
         caller=request.get("user", "dashboard"),

@@ -95,7 +95,9 @@ DISCORD_BOT_TOKEN=<your bot token>
 }
 ```
 
-Omit `allowed_thread_ids` or leave it empty for DMs only.
+Omit `allowed_thread_ids` or leave it empty for DMs only. An optional
+`soft_threshold_pct` (default `80`, clamped to 1–100) sets the context % at
+which the bot suggests `!compact`.
 
 ### 6. Restart the gateway
 

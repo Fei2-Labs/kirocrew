@@ -13,6 +13,13 @@ from kiro_crew.cron import CronJob, CronSchedule, CronService, format_schedule
 from kiro_crew.mcp_cron import _call_tool
 from kiro_crew.slack.handler import _handle_cron_command
 
+#: The session the MCP ``cron_list`` tests call as, and the owner stamped on every
+#: fixture job. ``cron_list`` scopes to the caller's own rows, so a job left at the
+#: default ``session_key=""`` is not listed and a timezone-FORMAT assertion would
+#: read "No cron jobs." instead. See test/test_mcp_cron_caller_identity.py for the
+#: scope rule; nothing here is about authorization.
+_TZ_OWNER = "dashboard:tz-format-slot"
+
 
 def _make_job(timezone: str = "", **kwargs) -> CronJob:
     defaults = dict(
@@ -22,6 +29,7 @@ def _make_job(timezone: str = "", **kwargs) -> CronJob:
         schedule=CronSchedule(kind="cron", cron_expr="0 9 * * 1"),
         created_ts=time.time() - 3600,
         timezone=timezone,
+        session_key=_TZ_OWNER,
     )
     defaults.update(kwargs)
     return CronJob(**defaults)
@@ -102,6 +110,12 @@ class TestDashboardCronsTimezone:
 
 class TestMcpCronListTimezone:
     """cron_list MCP tool uses job.timezone for schedule display."""
+
+    @pytest.fixture(autouse=True)
+    def _calls_as_the_fixture_owner(self, monkeypatch) -> None:
+        """Call as the session ``_make_job`` stamps as owner; see _TZ_OWNER."""
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", _TZ_OWNER)
+        monkeypatch.delenv("KIROCREW_CLI", raising=False)
 
     def test_cron_list_uses_job_timezone(self, tmp_path) -> None:
         job = _make_job(timezone="UTC")

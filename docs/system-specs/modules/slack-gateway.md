@@ -55,7 +55,9 @@ Starts the Socket Mode listener. Blocks until SIGINT/SIGTERM. When `no_crons=Tru
 1. First Ctrl+C sets `shutdown_event` → graceful shutdown begins (10s deadline)
 2. Second Ctrl+C calls `os._exit(0)` immediately (force exit)
 3. `_shutdown()` **first disarms the loop-stall watchdog** (`dashboard_state._loop_watchdog.stop()` + cancels `_loop_heartbeat`), then saves active chat slots, cancels handler tasks, stops cron/heartbeat, closes sessions. The watchdog MUST be disarmed before `close_all()`/`cancel_all()` because that teardown deliberately kills every kiro-cli child — the same `os.waitpid` reaping burst the watchdog guards against — and a slow teardown would otherwise let the armed `faulthandler.dump_traceback_later(exit=True)` timer `_exit(1)` the process mid-shutdown (a clean quit would look like a crash). The watchdog's own `on_cleanup` hook fires too late (inside `AppRunner.cleanup()`, gathered concurrently with the reaping).
-4. Before `os._exit(0)`, `cleanup_orphaned_sessions()` kills any kiro-cli PIDs tracked in the PID file
+4. The gateway clears its port-keyed run marker in both dashboard and API-only
+   modes, then `cleanup_orphaned_sessions()` kills any kiro-cli PIDs tracked in
+   the PID file before `os._exit(0)`.
 
 ### Event-loop stall watchdog & blocking-work executors
 

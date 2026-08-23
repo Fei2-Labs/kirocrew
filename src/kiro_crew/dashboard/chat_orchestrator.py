@@ -184,6 +184,27 @@ def _completion_excerpts(result_paths: tuple[tuple[int, str], ...]) -> dict[int,
     return excerpts
 
 
+def _orchestration_stopped(slot: "_ChatSlot", tracker: OrchestrationTracker) -> bool:
+    """True when the stage loop must not advance the plan any further.
+
+    Two independent channels revoke a run, and they do not mean the same thing:
+
+    * ``slot._stopping`` — session/ACP teardown. The slot itself is going away,
+      so nothing on it may keep running.
+    * ``tracker.stopped`` — the user revoked approval to keep ORCHESTRATING, via
+      the plan Cancel control (``api_chat_plan_action``) or an orchestrator stop
+      word. The slot stays alive and usable; only the plan ends.
+
+    A plan cancel sets the second and deliberately not the first, so an
+    advancement gate reading one flag observes only half the cancels. Every gate
+    below therefore reads both. The inverse fix — having Cancel set
+    ``slot._stopping`` — would hand a plan cancel the teardown semantics that
+    flag carries for paths outside this loop, which is not what the user asked
+    for by cancelling a plan.
+    """
+    return bool(slot._stopping) or bool(tracker.stopped)
+
+
 async def _stage_loop(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -232,7 +253,7 @@ async def _stage_loop(
     slot._in_stage_execution = True
     try:
         for stage_idx in range(start_idx, total):
-            if slot._stopping:
+            if _orchestration_stopped(slot, tracker):
                 break
 
             stage_num = stage_idx + 1  # 1-based for display
@@ -311,6 +332,12 @@ async def _stage_loop(
                 "Stage %d/%d: context=%d chars, messages=%d",
                 stage_num, total, len(context), len(slot.messages),
             )
+            # NOT flushed here: a stage turn is automatic (`auto-go`), and a held
+            # note is owed to the next USER turn, so feeding it to a stage would
+            # spend it on a turn nobody asked for. The loop-exit flush below is
+            # the delivery point -- it sits in this function's `finally`, where
+            # `slot.task` is this loop's own task, so it fires on the completed,
+            # paused and cancelled paths alike.
             slot.append("user", context, "msg msg-u auto-go")
             try:
                 # `_bounded_turn`, NOT `asyncio.wait_for`. `_run_chat` CATCHES
@@ -387,7 +414,7 @@ async def _stage_loop(
                 )
                 break
 
-            if slot._stopping:
+            if _orchestration_stopped(slot, tracker):
                 break
 
             # Wait for pending subagents spawned during this stage
@@ -479,7 +506,7 @@ async def _stage_loop(
                 while (
                     _pending
                     and _sa_rounds < _sa_max_rounds
-                    and not slot._stopping
+                    and not _orchestration_stopped(slot, tracker)
                 ):
                     _sa_rounds += 1
                     await asyncio.sleep(2)
@@ -555,7 +582,7 @@ async def _stage_loop(
                 )
                 break
 
-            if slot._stopping:
+            if _orchestration_stopped(slot, tracker):
                 break
 
             # Capture result to disk
@@ -662,6 +689,16 @@ async def _stage_loop(
         # task owns slot.task and will drain the queue + emit chat_done itself, so
         # we must not start a second turn or clobber/idle-close over it.
         _next_started = False
+        # Before _start_next_queued_turn, not after: a held note's context half
+        # drains into that successor, so flushing later would let the note shape
+        # a turn its visible line appears below. Skipped while a turn runs, since
+        # that turn drains AFTER its task is assigned and would consume a note
+        # written after it began; it flushes at its own completion instead.
+        # ``slot.running`` cannot express that: inside this finally it names THIS
+        # loop's own task, so defer only to a live task that is someone else's.
+        _note_owner = slot.task
+        if _note_owner is None or _note_owner is asyncio.current_task() or _note_owner.done():
+            slot.flush_deferred_notes()
         if (
             not _cancelled
             and not slot.running

@@ -84,6 +84,48 @@ This allows `kirocrew` to find project-level agent config and skills from any di
 
 ## Commands
 
+### Top-level help
+
+`kirocrew --help` (and a bare `kirocrew`, which prints the banner first) does NOT
+use argparse's own subcommand block. With ~40 commands that block is one flat
+list in registration order, so the three commands a new install needs — `gateway`,
+`service`, `doctor` — land in the middle of it, and the `{chat,doctor,gateway,…}`
+choice blob makes the usage line unreadable.
+
+`cli_help.py` owns the taxonomy instead:
+
+- `COMMAND_GROUPS` is an ordered list of sections, each an ordered list of
+  `(command, one-line summary)`. It is the single source of truth for what the
+  top-level help lists and in what order; `Start here` is first and holds exactly
+  `gateway`, `service`, `doctor`.
+- Its notes answer the two questions the flat list never did: how `gateway`
+  (foreground, dies with the terminal) differs from `service install` (systemd
+  unit / launchd agent, detached, restarts on crash, starts at boot, only one at
+  a time), and that the dashboard on loopback `5476` is the **only** port opened
+  — messaging channels connect outbound.
+- `cli.py` sets `help=argparse.SUPPRESS` on the subparsers action to hide
+  argparse's listing, passes `cli_help.TOP_USAGE` as the top-level `usage=`
+  (the suppressed action would otherwise drop the placeholder), and pins
+  `prog="kirocrew"` on the action so each subcommand's own usage line is
+  `usage: kirocrew <cmd> …` rather than the whole top-level usage string.
+- Every user-facing command is registered with `cli_help.add_command(sub, name)`,
+  which raises `KeyError` for a name that is in no section — a new command cannot
+  be added without appearing in the help. The section summary becomes the
+  subparser's `description`, which is what `kirocrew <cmd> --help` prints, so the
+  sentence is not duplicated. A caller may pass its own longer `description`
+  (`bench` does).
+- Internal `mcp-*` servers call `sub.add_parser(name)` with no `help`, which keeps
+  them out of both listings. They are also kept out of argparse's
+  `invalid choice: 'x' (choose from …)` message: `cli_help.hide_internal_commands`
+  swaps the subparsers action's `choices` for a live Mapping view over the same
+  parser map that ITERATES only user-facing commands, in the help's section order.
+  Membership is unfiltered and `_name_parser_map` is untouched, so `kirocrew
+  mcp-core` still dispatches — the filter changes what argparse prints, never what
+  it accepts. It must be installed after the last `add_parser` and before
+  `parse_args`.
+- `test/test_cli_help.py` pins offered-vs-listed parity by reading that same
+  message, and pins that a hidden command still resolves.
+
 | Command | Description |
 |---------|-------------|
 | `kirocrew chat -m "msg"` | Send a single message, print streaming response |
@@ -122,7 +164,7 @@ This allows `kirocrew` to find project-level agent config and skills from any di
 | `kirocrew snapshot --keep N` | Auto-prune to N most recent snapshots (default 7) |
 | `kirocrew snapshot --list` | List existing snapshots |
 | `kirocrew restore <file>` | Restore from a snapshot (auto-detects replace vs merge) |
-| `kirocrew restore <file> --mode replace\|merge` | Force restore mode |
+| `kirocrew restore <file> --mode replace\|merge` | Force restore mode; merge skips malformed incoming or local cron JSON with a file-specific warning |
 | `kirocrew restore <file> --components X,Y` | Selective component restore |
 | `kirocrew restore <file> --dry-run` | Preview restore without writing |
 | `kirocrew restore --list-components` | Show available component names |
@@ -131,7 +173,8 @@ This allows `kirocrew` to find project-level agent config and skills from any di
 | `kirocrew config set --file <path>` | Replace config from a JSON file |
 | `kirocrew config edit` | Open config in `$EDITOR` |
 | `kirocrew memory list/search/stats/audit` | Inspect vector memory (entries, semantic search, counts, suspicious-content scan) |
-| `kirocrew memory export/import/migrate` | Export memory to JSON, import it back, or migrate legacy markdown memory into the vector store |
+| `kirocrew memory show [preferences\|projects\|history]` | Read the markdown memory layer (all three when no target given); `--format md\|json`, `--since YYYY-MM-DD` for history |
+| `kirocrew memory export/import/migrate` | Export memory to JSON (`--include-markdown` adds the markdown layer), import it back, or migrate legacy markdown memory into the vector store |
 | `kirocrew policy show/validate/explain/profile` | Inspect the effective enterprise security policy, load-check it and all profiles, explain one tool/scope decision for a surface, or print a profile. `show` also summarizes the built-in denied-command catalog as grouped counts (`--ids` lists each category's rule ids), on every install regardless of whether an enterprise policy is active — the one place an agent can learn a class of work is hard-denied before planning around it. |
 | `kirocrew pod up/down/ls/status/token/url/logs/exec/install/provision` | Isolated worktree test gateways (**Linux `systemd --user` only** — every systemd-touching verb refuses with a one-line message on macOS/Windows). See `src/kiro_crew/pod/README.md`. |
 | `kirocrew knowledge dedup [--apply]` | Collapse cross-source duplicate knowledge documents (dry-run unless `--apply`) |
@@ -143,7 +186,7 @@ This allows `kirocrew` to find project-level agent config and skills from any di
 | `kirocrew computer call --calls '[…]'` | Run a JSON array of tool calls in a SINGLE process, so `element_index` values from an earlier `computer_get_state` are still resolvable |
 | `kirocrew mcp-cron` | MCP server for cron tools (spawned by kiro-cli) |
 | `kirocrew mcp-core` | MCP server for spawn, learn, task tools (spawned by kiro-cli) |
-| `kirocrew mcp-computer` | MCP server for computer-use tools (spawned by kiro-cli; `argparse.SUPPRESS`-hidden). A **thin shim** — it forwards to the gateway over loopback and does no accessibility work itself. |
+| `kirocrew mcp-computer` | MCP server for computer-use tools (spawned by kiro-cli; hidden — registered with no `help`, so it is in neither listing). A **thin shim** — it forwards to the gateway over loopback and does no accessibility work itself. |
 | `kirocrew --version` | Print version |
 
 ## Token Command Output Streams
@@ -421,8 +464,8 @@ All write paths emit SEL audit events (`config_get`, `config_set`, `config_set_f
 ### Context Tracking
 
 After each message, checks `provider.context_usage_pct()`:
-- `>= autocompact_pct` (default 90%): compact → shutdown → restart provider, reset counter
-- `>= 75%`: warning printed to stderr
+- `>= autocompact_pct` (default 70%): compact → shutdown → restart provider, reset counter
+- `>= autocompact_pct - CONTEXT_WARN_MARGIN_PCT` (50% on the default): warning printed to stderr. Relative, not absolute: the compact arm is tested first, so an absolute warn level at or above the threshold would be unreachable
 
 CLI compaction is blocking (single-user, acceptable).
 
@@ -823,10 +866,39 @@ underlying `journalctl`/`tail` process.
 
 ## Dashboard Self-Update
 
-On gateway startup and every 12 hours, a background task runs `git fetch`
-and compares the remote `__version__` with the local version. Only triggers
-when the remote version is strictly higher (commits without a version bump
-are ignored).
+On gateway startup and every 12 hours, a background task runs `git fetch` and
+reports an update when EITHER the checkout can be FAST-FORWARDED
+(`git rev-list --count --left-right HEAD...@{u}` shows commits behind and none
+ahead) OR the pull already landed and only a restart is missing (`HEAD` equals
+its upstream while the on-disk `__version__` outranks the one this process
+imported).
+
+Commit distance is the primary signal because `__version__` is bumped only at a
+release: comparing version strings alone reported "you're on the latest version"
+to a checkout hundreds of commits behind `main`, for as long as the next bump
+took.
+
+Both conditions are narrower than "is it behind", because `available` is also
+read by an unattended apply. `GatewayOrchestrator._auto_apply_update` applies
+`git fetch` + `git reset --hard origin/<branch>` with no prompt, so:
+
+- "Behind" alone is true both for a checkout that is purely behind and for a
+  DIVERGED one carrying its own commits, and the second would have those commits
+  reset away. Only a fast-forwardable checkout is offered an update.
+- The version signal is required to come with `HEAD == @{u}`. A checkout that
+  pulled a version bump and then committed on top is ahead, so its upstream
+  still reads newer than the imported version; without that requirement the
+  same reset would drop those commits.
+
+**The unattended apply is triggered by the version, not by commit distance.**
+The check reports `version_newer` beside `available`, and the git branch of the
+`auto_update` path requires both. `available` is what the dashboard shows, and
+on commit distance alone that would mean any upstream commit — resetting a
+source checkout within 12 hours of one, where the version-only verdict only did
+so at a release. Requiring both keeps that path firing no more often than
+before. Commit distance without a version bump lights the dashboard badge, and
+`POST /api/update` (`git pull`, dirty tree refused with 409) is the
+non-destructive way to apply it.
 
 - Topbar shows `📦 v0.1.3` badge — click to check and view changelog
 - If newer version found: badge turns into "📦 Update Available"
@@ -926,7 +998,7 @@ governance model.
 All three are **human-facing**. `apps` has an MCP twin (`computer_list_apps`) per
 the MCP-first rule; `doctor` is a permission diagnostic rather than a capability,
 so the rule does not bind it; and `call` adds no capability at all — it is a
-harness over the ten existing MCP tools, and deliberately has **no** MCP twin,
+harness over the eleven existing MCP tools, and deliberately has **no** MCP twin,
 because a tool that runs other tools would let a model launder one per-call gate
 decision into many. There is deliberately **no** `kirocrew computer state <app>` —
 that would be a second, CLI-shaped spelling of an LLM-facing capability and would

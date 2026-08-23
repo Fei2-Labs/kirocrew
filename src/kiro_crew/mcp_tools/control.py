@@ -375,12 +375,16 @@ def schemas() -> list[dict[str, Any]]:
                 "\n\n"
                 "Use after a skill scaffolds a new working tree (e.g. a new workspace) "
                 "so the agent retargets to the new source instead of the old one. "
+                "Also use when the user asks you to work on a specific repository or "
+                "project folder — calling set_project ensures the session's CWD is "
+                "updated and future tool calls (file reads, bash commands) default to "
+                "the correct location. "
                 'To clear the project, pass path="" with clear=true. '
                 "\n\n"
-                "Restrictions: only works in dashboard sessions with explicit identity "
-                "(injected KIROCREW_SESSION_KEY or per-call caller context). Subagents, "
-                "Slack, and cron contexts are rejected — those resolve via PID-walk and "
-                "would silently mutate the wrong slot. Sensitive paths (~/.aws, ~/.ssh, "
+                "Restrictions: headless callers (cron jobs, subagents, task "
+                "runners) are rejected — a cron turn can run on a user's "
+                "dashboard slot and a subagent shares its parent's slot, so "
+                "they must not retarget it. Sensitive paths (~/.aws, ~/.ssh, "
                 "etc.) are blocked by the underlying endpoint. "
                 "\n\n"
                 "The session is reset on the NEXT turn boundary (not inline) so this "
@@ -511,7 +515,10 @@ def wait(name: str, args: dict[str, Any]) -> str:
     deadline = mcp_core.time.monotonic() + seconds
     # Identity for THIS sleep. The dashboard's "end wait now" button echoes
     # it back through the keepalive response, so a request left over from an
-    # earlier sleep can never terminate the next one in the same session.
+    # earlier sleep can never terminate the next one in the same session. The
+    # same reply also ends the sleep when a mid-turn steer lands after it
+    # began: the backend can only inject a steer at a model-inference
+    # boundary, and this sleep is the absence of one (see _wait_end_reason).
     wait_id = uuid.uuid4().hex
     # Ping session-keepalive every WAIT_PING_SECS so the gateway's
     # is_responsive() doesn't flag this session as stale and SIGTERM the ACP

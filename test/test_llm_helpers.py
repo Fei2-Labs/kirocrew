@@ -10,6 +10,7 @@ from kiro_crew.acp.client import AcpError, AcpPromptBusy
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
+    first_advertised_fallback,
     parse_llm_json,
     parse_llm_json_list,
     record_interaction_event,
@@ -17,6 +18,32 @@ from kiro_crew.llm_helpers import (
     stream_and_collect,
 )
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+
+class TestFirstAdvertisedFallback:
+    """Unit tests for the shared model-fallback helper."""
+
+    def test_skips_rejected_and_auto(self) -> None:
+        result = first_advertised_fallback(["auto", "claude-opus-5", "claude-sonnet-5"], "auto")
+        assert result == "claude-opus-5"
+
+    def test_skips_rejected_concrete(self) -> None:
+        result = first_advertised_fallback(["claude-opus-5", "claude-sonnet-5"], "claude-opus-5")
+        assert result == "claude-sonnet-5"
+
+    def test_returns_none_when_empty(self) -> None:
+        assert first_advertised_fallback([], "auto") is None
+
+    def test_returns_none_when_only_auto_and_rejected(self) -> None:
+        assert first_advertised_fallback(["auto"], "auto") is None
+
+    def test_none_rejected(self) -> None:
+        result = first_advertised_fallback(["claude-opus-5"], None)
+        assert result == "claude-opus-5"
+
+    def test_case_insensitive(self) -> None:
+        result = first_advertised_fallback(["Auto", "Claude-Opus-5"], "auto")
+        assert result == "Claude-Opus-5"
 
 
 class TestParseLlmJson:
@@ -519,6 +546,112 @@ class TestStreamAndCollectTransient:
             await stream_and_collect(provider, "test", retry_transient=False)
 
         assert call_count == 1  # opt-out → no inner retry
+
+
+class TestStreamAndCollectModelFallback:
+    """Model-rejection reactive fallback (e.g. "auto" on GovCloud)."""
+
+    @pytest.mark.asyncio
+    async def test_model_rejected_retries_with_fallback(self) -> None:
+        """When 'auto' is rejected with an advertised list, retry once with
+        the first advertised model after calling set_model."""
+        call_count = 0
+
+        async def _stream(msg):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                exc = AcpError("model 'auto' not available")
+                exc.rejected_model = "auto"
+                exc.advertised = ["claude-opus-5", "claude-sonnet-5"]
+                raise exc
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="success")
+            yield LLMEvent(kind=EVENT_COMPLETE)
+
+        provider = AsyncMock()
+        provider.cancel = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.stream = _stream
+        provider.set_model = AsyncMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await stream_and_collect(provider, "test", model_fallback=True)
+
+        assert result == "success"
+        assert call_count == 2
+        provider.set_model.assert_awaited_once_with("claude-opus-5")
+
+    @pytest.mark.asyncio
+    async def test_model_rejected_default_propagates_no_swap(self) -> None:
+        """Without model_fallback=True, a rejected model propagates and is NOT
+        silently swapped — an interactive user pick must surface the error."""
+        call_count = 0
+
+        async def _stream(msg):
+            nonlocal call_count
+            call_count += 1
+            exc = AcpError("model 'auto' not available")
+            exc.rejected_model = "auto"
+            exc.advertised = ["claude-opus-5", "claude-sonnet-5"]
+            raise exc
+            yield  # pragma: no cover
+
+        provider = AsyncMock()
+        provider.cancel = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.stream = _stream
+        provider.set_model = AsyncMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(AcpError):
+            await stream_and_collect(provider, "test")
+
+        assert call_count == 1  # no retry
+        provider.set_model.assert_not_awaited()  # no silent swap
+
+    @pytest.mark.asyncio
+    async def test_model_rejected_no_advertised_propagates(self) -> None:
+        """When 'auto' is rejected but no advertised list, propagate."""
+
+        async def _stream(msg):
+            exc = AcpError("model 'auto' not available")
+            exc.rejected_model = "auto"
+            exc.advertised = []
+            raise exc
+            yield  # pragma: no cover
+
+        provider = AsyncMock()
+        provider.cancel = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.stream = _stream
+
+        with patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(AcpError):
+            await stream_and_collect(provider, "test", model_fallback=True)
+
+    @pytest.mark.asyncio
+    async def test_model_fallback_only_once(self) -> None:
+        """Fallback retries only once — a second rejection propagates."""
+        call_count = 0
+
+        async def _stream(msg):
+            nonlocal call_count
+            call_count += 1
+            exc = AcpError("model rejected")
+            exc.rejected_model = "auto"
+            exc.advertised = ["claude-opus-5"]
+            raise exc
+            yield  # pragma: no cover
+
+        provider = AsyncMock()
+        provider.cancel = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.stream = _stream
+        provider.set_model = AsyncMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock), pytest.raises(AcpError):
+            await stream_and_collect(provider, "test", model_fallback=True)
+
+        # First call triggers fallback, second call propagates.
+        assert call_count == 2
 
 
 class TestRecordInteractionEvent:

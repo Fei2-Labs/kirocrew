@@ -339,6 +339,43 @@ class TestRestoreMerge:
         count = len(json.loads((dst / "crons.json").read_text(encoding="utf-8"))["jobs"])
         assert count == 2
 
+    def test_merge_malformed_snapshot_crons_skips_without_changing_local_file(
+        self, env, capsys, monkeypatch
+    ):
+        src, _, _, tmp_path = env
+        (src / "crons.json").write_text("{malformed", encoding="utf-8")
+        tarball = _make_snapshot(src, tmp_path / "malformed-snapshot-out")
+        dst = tmp_path / "dst_malformed_snapshot_crons"
+        _setup_fake_kirocrew(dst)
+        before = (dst / "crons.json").read_bytes()
+
+        monkeypatch.setenv("KIROCREW_HOME", str(dst))
+        ret = restore_main([str(tarball), "--mode", "merge", "--components", "crons", "--force"])
+
+        assert ret == 0
+        assert (dst / "crons.json").read_bytes() == before
+        output = capsys.readouterr().out
+        assert "crons.json" in output
+        assert "skipping cron merge" in output
+
+    def test_merge_malformed_local_crons_skips_without_changing_local_file(
+        self, env, capsys, monkeypatch
+    ):
+        _, _, tarball, tmp_path = env
+        dst = tmp_path / "dst_malformed_local_crons"
+        _setup_fake_kirocrew(dst)
+        malformed = b"{malformed"
+        (dst / "crons.json").write_bytes(malformed)
+
+        monkeypatch.setenv("KIROCREW_HOME", str(dst))
+        ret = restore_main([str(tarball), "--mode", "merge", "--components", "crons", "--force"])
+
+        assert ret == 0
+        assert (dst / "crons.json").read_bytes() == malformed
+        output = capsys.readouterr().out
+        assert str(dst / "crons.json") in output
+        assert "skipping cron merge" in output
+
     def test_merge_workspace_no_overwrite(self, env, monkeypatch):
         """TEST 10"""
         _, _, tarball, tmp_path = env

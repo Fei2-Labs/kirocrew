@@ -89,8 +89,10 @@ from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
 
 # ── Connections OAuth relay (handlers/connections.py) ──
 from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
+    api_connections_cancel,
     api_connections_mint,
     api_connections_mint_state,
+    api_connections_status,
     api_mcp_oauth_relay,
 )
 from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
@@ -175,6 +177,7 @@ from kiro_crew.dashboard.handlers.hooks import (  # noqa: E402, F401
     api_webhook_test,
     api_webhook_token_create,
     api_webhook_token_delete,
+    api_webhook_token_update,
     api_webhooks,
     api_webhooks_switch,
 )
@@ -198,6 +201,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_probe,
     api_mcp_probe_cached,
     api_mcp_remove,
+    api_mcp_resolve_refresh,
     api_mcp_server_detail,
     api_mcp_servers,
     api_mcp_sync,
@@ -254,6 +258,8 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_delete_message,
     api_discord_config_get,
     api_discord_config_save,
+    api_imessage_config_get,
+    api_imessage_config_save,
     api_notification_ack,
     api_notification_agent_push,
     api_notification_channel_settings,
@@ -558,6 +564,15 @@ def _list_aim_prompts() -> list[dict[str, Any]]:
     _prompt_cache_ts = now
     return [dict(p) for p in result]
 
+
+# Paid-AWS-service consent — the operator's confirmation surface for Amazon
+# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant
+# alongside the ``kirocrew aws-consent`` CLI.
+from kiro_crew.dashboard.handlers.aws_consent import (  # noqa: E402, F401
+    api_aws_consent_delete,
+    api_aws_consent_get,
+    api_aws_consent_post,
+)
 
 # Computer use — the Settings config pair (browser, cookie-authed) plus the two
 # loopback legs: ``invoke`` (the ``kirocrew-computer`` MCP shim's forward) and

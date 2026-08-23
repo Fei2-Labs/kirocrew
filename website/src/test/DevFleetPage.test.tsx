@@ -225,9 +225,12 @@ describe('DevFleetPage', () => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
-      // POST /sync returns "already running" with the in-flight run_id
+      // POST /sync refuses a second concurrent run with HTTP 409, naming the
+      // in-flight run. Mocking this as a 200 made the test vacuous: the client
+      // throws on any non-2xx, so a 200 exercised a branch the backend can
+      // never produce while the real 409 path surfaced a raw JSON error toast.
       if (u.includes('/sync') && opts?.method?.toUpperCase() === 'POST') {
-        return Promise.resolve(new Response(JSON.stringify({ ok: false, error: 'sync already running', run_id: 'run-inflight-99' }), { status: 200 }))
+        return Promise.resolve(new Response(JSON.stringify({ ok: false, error: 'sync already running', run_id: 'run-inflight-99' }), { status: 409 }))
       }
       if (u.includes('/run?id=run-inflight-99')) {
         runPolls++
@@ -1289,6 +1292,54 @@ describe('DevFleetPage', () => {
     expect(screen.getByTestId('prune-item-wt-b')).toHaveAttribute('data-status', 'failed')
     expect(screen.getByText('pod still active after shutdown')).toBeInTheDocument()
     expect(screen.getByText('Prune complete')).toBeInTheDocument()
+  }, 15000)
+
+  it('force-only prune counts the forced worktree and reports success (issue #4128)', async () => {
+    // Force-overriding a KEPT worktree sends it in force_names, disjoint from
+    // the regular candidate names. The counter and success tally must cover it
+    // — otherwise the denominator drops to 0 (the impossible "1/0") and the
+    // toast turns red ("Prune 0: failed") on a removal that actually succeeded.
+    let runBody: unknown = null
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/prune-candidates')) return Promise.resolve(new Response(JSON.stringify({
+        // No regular candidates — only a kept worktree offered for force-override.
+        ok: true, candidates: [], kept: [{ name: 'wt-kept', code: 'merged_new_commits' }], scanned: 1,
+      }), { status: 200 }))
+      if (u.includes('/prune-run')) {
+        runBody = init?.body ? JSON.parse(String(init.body)) : null
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, total: 1 }), { status: 200 }))
+      }
+      if (u.includes('/prune-status')) {
+        // Backend tracks the forced item: it is in total/items and done bumps.
+        return Promise.resolve(new Response(JSON.stringify({
+          running: false, total: 1, done: 1, current: null,
+          results: [{ name: 'wt-kept', ok: true }],
+          items: { 'wt-kept': { status: 'done', error: null } },
+        }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('Prune merged'))
+    await waitFor(() => expect(screen.getByText('Prune worktrees')).toBeInTheDocument())
+    // Check the force-override box on the kept row, then remove + confirm.
+    fireEvent.click(screen.getByLabelText('Force remove wt-kept'))
+    fireEvent.click(screen.getByText('Remove selected'))
+    fireEvent.click(await screen.findByText('Delete anyway'))
+    // The forced worktree is tracked as its own checklist row and finishes done.
+    await waitFor(() => expect(screen.getByTestId('prune-item-wt-kept')).toHaveAttribute('data-status', 'done'), { timeout: 8000 })
+    // Counter reads 1/1 (not 1/0) and completion is the success state.
+    expect(screen.getByText((_, el) => el?.textContent === 'Finished 1/1')).toBeInTheDocument()
+    expect(screen.getByText('Prune complete')).toBeInTheDocument()
+    // Success toast (green), not the red "Prune: 0 failed".
+    expect(screen.getByText('Pruned 1 worktree(s)')).toBeInTheDocument()
+    expect(screen.queryByText(/Prune: \d+ failed/)).not.toBeInTheDocument()
+    // The forced name went out in force_names, not the regular names list.
+    expect(runBody).toEqual({ names: [], force_names: ['wt-kept'] })
   }, 15000)
 
   it('refetches the fleet with fresh=1 once a prune finishes', async () => {

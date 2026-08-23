@@ -30,7 +30,7 @@ import type { SettingEntry, SettingPrimitiveType } from '../src/components/comma
 
 export type { SettingEntry, SettingPrimitiveType }
 
-/** English catalogs, in load order (manual wins) — mirrors `src/i18n/index.ts`. */
+/** English catalogs, in load order (manual wins) — mirrors `src/i18n/enCatalog.ts`. */
 const EN_CATALOG_PATHS = [
   path.resolve(__dirname, '../src/i18n/locales/en.json'),
   path.resolve(__dirname, '../src/i18n/locales/en.manual.json'),
@@ -119,6 +119,10 @@ const PANEL_TAB_MAP: Record<string, PanelTarget> = {
 const PRIMITIVE_MAP: Record<string, SettingPrimitiveType> = {
   SettingsToggle: 'toggle',
   SettingsSelect: 'select',
+  // A searchable dropdown is still a select to every consumer of this registry:
+  // nothing branches on `SettingEntry.type`, so a distinct value would be surface
+  // with no reader. Give it a distinct one only when something renders it apart.
+  SettingsCombobox: 'select',
   SettingsInput: 'input',
   SettingsStepper: 'stepper',
   SettingsButtonGroup: 'buttonGroup',
@@ -168,7 +172,14 @@ function extractStringProp(source: string, propName: string): string | undefined
     'g',
   )
   const tMatch = tCall.exec(source)
-  if (tMatch) return getEnCatalog()[tMatch[1]]
+  // `{{productName}}` is resolved to its stock default here, mirroring what
+  // i18next's `defaultVariables` renders at runtime. The registry is a SEARCH
+  // corpus: leaving the raw placeholder in would make a user's query for the
+  // product name stop matching these entries. The literal deliberately
+  // duplicates DEFAULT_PRODUCT_NAME in `src/i18n/index.ts`: importing that
+  // module here would drag i18next and every catalog into a build-time
+  // script for one constant.
+  if (tMatch) return getEnCatalog()[tMatch[1]]?.replaceAll('{{productName}}', 'Kiro Crew')
   return undefined
 }
 

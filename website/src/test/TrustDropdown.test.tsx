@@ -4,7 +4,8 @@ vi.mock("@radix-ui/react-dropdown-menu", async () => await import("./__mocks__/@
 
 import { render, screen, fireEvent } from '@testing-library/react'
 import TrustDropdown from '../components/TrustDropdown'
-import { i18next } from '../i18n/index'
+// `/all` for the ja/ko/de/zh-CN catalogs: `../i18n` registers English only.
+import { i18next } from '../i18n/all'
 
 const btnClass = 'px-2 py-1 rounded text-sm'
 
@@ -33,6 +34,40 @@ describe('TrustDropdown', () => {
     expect(texts.some(t => t?.includes('ls /tmp'))).toBe(true)
     expect(texts.some(t => t?.includes('ls') && t?.includes('commands'))).toBe(true)
     expect(screen.getByText('Trust all tools')).toBeInTheDocument()
+  })
+
+  // The exact-command option is the one the user is most likely to misread: it
+  // grants an exact-string match, so a label that renders two different commands
+  // identically asks for consent to something unreadable.
+  it('does not render two long commands with the same label', () => {
+    const shot = (cmd: string) => {
+      const { unmount } = render(
+        <TrustDropdown fullCommand={cmd} baseCommand="gh" isShell className={btnClass} onAction={() => {}} />,
+      )
+      fireEvent.click(screen.getByText('Trust'))
+      const label = screen.getAllByRole('menuitem')[0].textContent ?? ''
+      unmount()
+      return label
+    }
+    const config = shot('gh api repos/owner/some-repository/contents/config.json --jq .sha')
+    const secrets = shot('gh api repos/owner/some-repository/contents/secrets.json --jq .sha')
+    expect(config).not.toBe(secrets)
+  })
+
+  it('carries the untruncated command as a tooltip so nothing is hidden', () => {
+    const cmd = 'gh api repos/owner/some-repository/contents/a/very/long/path/to/a/file.json'
+    render(<TrustDropdown fullCommand={cmd} baseCommand="gh" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    expect(screen.getAllByRole('menuitem')[0].querySelector(`[title="${cmd}"]`)).not.toBeNull()
+  })
+
+  it('grants the untruncated command, never the shortened label', () => {
+    const cmd = 'gh pr view 42 --repo owner/some-repository --json title,body,comments'
+    const onAction = vi.fn()
+    render(<TrustDropdown fullCommand={cmd} baseCommand="gh" isShell className={btnClass} onAction={onAction} />)
+    fireEvent.click(screen.getByText('Trust'))
+    fireEvent.click(screen.getAllByRole('menuitem')[0])
+    expect(onAction).toHaveBeenCalledWith('trust_command', cmd)
   })
 
   // Each locale orders the sentence around the operand differently — Japanese

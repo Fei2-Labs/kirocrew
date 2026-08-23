@@ -11,12 +11,13 @@ package, so we load them by path with importlib. Everything here is stdlib and
 runs on the full CI matrix (3.10 + 3.12); the TOML path is version-guarded
 because tomllib is 3.11+.
 """
-import importlib.util
 import json
 import os
 import re
 import sys
 from pathlib import Path
+
+from skill_script_helpers import load_skill_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr"
@@ -25,12 +26,7 @@ PROFILES_DIR = SKILL_DIR / "profiles"
 
 
 def _load(module_name, filename):
-    path = SCRIPTS_DIR / filename
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_skill_script(module_name, SCRIPTS_DIR / filename)
 
 
 resolve_profile = _load("_pp_resolve_profile", "resolve_profile.py")
@@ -303,9 +299,14 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         "python": "covered by the scripts/ scan and the pytest gate",
         "python3": "covered by the scripts/ scan and the pytest gate",
         "unshare": "namespace wrapper around the pytest gate",
-        # Diagnostic only: the blob-reconcile step in frontend-coverage-merge
-        # always exits 0 and never changes a job verdict, so it is not a gate.
-        "node": "runs the diagnostic frontend-blob-reconcile step, which never gates",
+        # node runs two kinds of step: the diagnostic blob-reconcile step in
+        # frontend-coverage-merge (always exits 0, never a gate) and the
+        # bundle-size gate. The latter IS a gate and is carried in gates[]
+        # (analyze-mode build + scripts/check-bundle-size.mjs); this exemption
+        # covers only the diagnostic step. A future gating node step must be
+        # added to gates[] by hand -- the tool scan cannot see through this
+        # exemption, so keep the reason accurate.
+        "node": "diagnostic blob-reconcile step; the gating bundle-size step is in gates[]",
     }
     tools = set(re.findall(r"(?m)^\s*run: ([a-z][a-z0-9_-]+) ", run_text))
     tool_missing = sorted(
@@ -319,19 +320,51 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
 
 
 def test_floor_typechecks_the_way_ci_does():
-    """`npm run typecheck` is a no-op gate; the floor must use `tsc -b`.
+    """The floor spells out `tsc -b` rather than going through an npm script.
 
-    ci.yml documents this: the root tsconfig is `files: []` plus project
-    references, so `tsc --noEmit` -- what the `typecheck` script runs -- checks
-    ZERO files and always passes. A floor carrying the convenient script would
-    look enforced and catch nothing, which is worse than having no gate.
+    Build mode is what makes the check real: the root tsconfig is `files: []`
+    plus project references, and references are followed only by `-b`, so any
+    single-project invocation there compiles an EMPTY program and passes
+    unconditionally. Naming the command directly means the floor cannot be
+    changed out from under itself by an edit to `package.json` -- the same reason
+    ci.yml's Type check step spells it out too.
     """
     gates = "\n".join(
         json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))["gates"]
     )
     assert "tsc -b" in gates, "the gate floor no longer type-checks with `tsc -b`"
     assert "run typecheck" not in gates, (
-        "the floor uses the `typecheck` npm script, which checks zero files"
+        "the floor reaches type-checking through an npm script, so a package.json "
+        "edit can silently change what this gate runs"
+    )
+
+
+def test_typecheck_script_actually_type_checks():
+    """`npm run typecheck` must run in BUILD mode, or it checks nothing at all.
+
+    `website/tsconfig.json` is a solution-style config -- `{"files": [], "references":
+    [...]}`. TypeScript follows `references` only in build mode, so `tsc --noEmit`
+    there compiles an empty program: measured 0 files listed, exit 0 with a genuine
+    type error present in `src/App.tsx`. `npm run check` chains this script, so the
+    one command that looks like a pre-push gate would pass over the whole tree.
+
+    Nothing else pins the spelling, so without this a revert to `tsc --noEmit`
+    restores a gate that is enforced in appearance only.
+    """
+    scripts = json.loads(
+        (REPO_ROOT / "website" / "package.json").read_text(encoding="utf-8")
+    )["scripts"]
+    typecheck = scripts["typecheck"]
+
+    assert "tsc -b" in typecheck, (
+        f"website `typecheck` script is {typecheck!r}; it must use build mode "
+        "(`tsc -b`) because the root tsconfig has `files: []` and a "
+        "non-build invocation there type-checks zero files"
+    )
+    assert "--noEmit" not in typecheck, (
+        f"website `typecheck` script is {typecheck!r}; `--noEmit` selects "
+        "single-project mode, which compiles an empty program against the "
+        "solution-style root tsconfig"
     )
 
 

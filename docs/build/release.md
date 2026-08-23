@@ -62,8 +62,51 @@ rebuild that hopes for reproducibility. The mechanism:
   identity. pip users selecting a promoted (prerelease-versioned) wheel by
   version must allow prereleases; the stable channel feed remains
   channel-sticky.
+- **Stable DISPLAYS a clean base version even though the bytes keep the RC
+  stamp.** The embedded version cannot change under promotion, so the remedy is
+  at the read layer: `_display_version()` in
+  `src/kiro_crew/dashboard/handlers/updates.py` folds the running version to its
+  bare `X.Y.Z` on the **stable** channel only (insider/nightly keep the full
+  stamp), so About and the Releases page show `0.4.0`, not `0.4.0rc3` /
+  `0.4.0-insider.3`. It is DISPLAY-ONLY — every version *comparison* still reads
+  the raw `__version__`, so it cannot cause an update loop —
+  `test/test_stable_version_display.py` is the regression gate. **This fix must
+  ride in the RC bytes**: promotion never rebuilds, so a display change added
+  after the RC is cut can never reach the promoted stable. Land it before the RC
+  is cut, or stable shows the RC stamp with no in-band remedy.
 - **Hot patches follow the same rule**: at least one recorded RC before the
   bare patch tag.
+
+### Runbook: promoting an RC to stable
+
+The constraint that shapes the whole timeline: **promotion is byte-for-byte, so
+anything a stable user will see must already be in the RC that gets promoted** —
+there is no build step at stable-tag time to add it.
+
+1. **Before the RC is cut — bake the fix in.**
+   - *CHANGELOG*: the release branch already carries `## [X.Y.Z] — <date>` (no
+     `[Unreleased]`, enforced by the changelog gate). Confirm at cut time.
+   - *Version display*: the base-version fold above must be merged to `main`
+     and cherry-picked to `release/X.Y` **before the RC is cut**, or stable will
+     show the RC stamp.
+2. **Cut the RC — verify content, not PR status.** On the target commit confirm:
+   `github-release` has an `if:`; `CHANGELOG.md` line 5 is `## [X.Y.Z]` with zero
+   non-bare-release `##` headings; exactly one `### Contributors`;
+   `__version__ = "X.Y.Z"`; the bytecode/pycache test fix is present; the
+   base-version fold is present (stable About shows `X.Y.Z`); no existing bare
+   `vX.Y.Z` tag. Then tag `vX.Y.Z-insider.N`.
+3. **Soak.** Ship the RC on insider and let real users run it. **Do not push any
+   byte-affecting change to the release branch between soak and promote** — the
+   guarantee is that stable gets exactly the soaked bytes.
+4. **Promote (bare tag).** Confirm the `vX.Y.Z-insider.N` run at the target
+   commit is SUCCESS (`resolve-promotion` finds the candidate by it). Push a bare
+   `vX.Y.Z` tag on that commit. The build lanes skip; `resolve-promotion`
+   re-verifies the recorded bundle and republishes it to stable.
+   `Create GitHub Release` runs (the `if:` fix) and renders GitHub's own
+   contributor block — **do not hand-write a contributors list in the body**
+   (that duplicated the native block on v0.3.0). Verify: stable feed points at
+   the RC's version, About shows the clean `X.Y.Z` via the fold, CHANGELOG shows
+   no draft heading.
 
 ## Workflows in the release path
 
@@ -351,6 +394,47 @@ by trailing number alone. `v0.2.0-rc.1` and `v0.2.0-insider.1` both map to
 `0.2.0rc1`, and the second publish fails as a republish of an immutable key.
 Stick to one convention (`-rc.N`) per base version.
 
+### Version numbering policy
+
+`__version__` in `src/kiro_crew/__init__.py` is the branch's DECLARED identity.
+A tagged build overrides all three manifests from the tag (the table above), so
+the in-code value is what a non-tag build reports and what the promote sequence
+manipulates — the final byte stamp is decided by the tag, not this value.
+
+- **On an insider release branch, `__version__` carries the RC suffix, and the
+  tag matches.** The branch reads as what it is: `__version__ = "X.Y.Z-rc.N"`,
+  tags `vX.Y.Z-insider.N`. Do not leave a release branch declaring a bare
+  `X.Y.Z` while it is still cutting RCs. All three version files
+  (`src/kiro_crew/__init__.py`, `pyproject.toml`,
+  `website/electron/package.json`) use the **same dual-valid spelling**
+  `X.Y.Z-rc.N` — valid SemVer and valid (non-canonical) PEP 440. The canonical
+  PEP 440 form (`0.4.0rc4`) is forbidden in `__init__.py`:
+  `packaging/build-desktop.sh` feeds `__version__` verbatim to
+  electron-builder, which requires SemVer.
+- **Promoting an insider line to stable is a three-step sequence:**
+  1. **Drop the RC in a PR** — change `__version__` from `X.Y.ZrcN` to the bare
+     `X.Y.Z`. This is the release commit; it also sets the base the stable
+     display folds to (`_display_version`, see "Client auto-update").
+  2. **Cut one more RC tag** (`vX.Y.Z-insider.<N+1>`) on that commit and let it
+     soak. This bare-`__version__` commit is the promotion candidate.
+  3. **Tag the bare `vX.Y.Z`** on the same commit to promote — promotion
+     republishes the soaked candidate's exact bytes (see "Stable promotion").
+- **`main` (nightly) is always one MINOR ahead of the active insider line.**
+  While `release/0.4` stabilizes on insider at `0.4.x`, `main`'s `__version__`
+  is already `0.5.0`. The release branch owns the version being shipped; `main`
+  owns the next one. This keeps every nightly strictly newer than any RC of the
+  shipping line, so a nightly user is never offered what looks like a downgrade
+  to an RC.
+
+**Why the display still folds even after step 1.** The build stamps the version
+FROM THE TAG, and the desktop's embedded version MUST equal the feed version or
+the auto-updater's compare gate breaks (see "Client auto-update"). So the
+promotion candidate's *bytes* still carry the RC/insider stamp (`0.4.0rcN` /
+`0.4.0-insider.N`) even though the branch declares a bare `__version__`. The
+bare declaration sets the source-of-truth and the fold's base; `_display_version`
+is what actually shows a stable user `0.4.0`. The two are complementary, not
+alternatives.
+
 ## CLI channel and the signed manifest
 
 The wheel is a first-class channel target, not a byproduct: a Linux or EC2 host
@@ -545,6 +629,30 @@ what makes a channel switch-back work), and `allowPrerelease=true` (every
 nightly and insider stamp is a semver prerelease and would otherwise be
 invisible to its own channel). The library still refuses an equal version before
 the `allowDowngrade` branch, which is what prevents a self-reinstall loop.
+
+**Which channel a build follows is a default plus an opt-in, not a property of
+the bytes.** `channelForVersion()` classifies the version stamp and `nightly`
+stays pinned by it, but for the two production lanes `resolveChannel()` honours
+the persisted Settings → About preference and defaults to **stable** when none is
+set. It cannot read the lane out of the stamp, because stable is PROMOTED: the
+stable and insider downloads of a promoted version are the same notarized file
+carrying the same `-insider.N` stamp, so a stamp-derived channel would send every
+promoted-stable install to the insider feed. The consequences to know:
+
+- **Insider is an explicit opt-in.** Any install with no recorded preference
+  follows stable — including one installed from the insider DMG, and including an
+  insider install that predates this rule. The two downloads are identical files,
+  so nothing in them can record which page one came from, and nothing already on
+  disk distinguishes an insider install from a stable one that has been offered
+  the promoted build. Insider is reached by the switcher, once, per install.
+- **There is no way to seed that preference retroactively.** A migration would
+  have to read the channel from the version stamp, and the first build carrying
+  any such migration is itself promotion-stamped, so it would write `insider` for
+  every stable install — the defect this rule exists to remove, made permanent.
+  A future transition could use a persisted last-run version; this one cannot.
+- **The "you are running prerelease bytes" note still keys on the stamp**
+  (`stampedChannel`), not on the followed channel, because that statement is
+  about the bytes and stays literally true on a promoted stable install.
 
 The specific to Kiro Crew part is install ordering: the app supervises a bundled
 Python gateway child, so before `quitAndInstall` the client stops it gracefully
@@ -773,11 +881,20 @@ The rules that keep the two from drifting:
 - **`main` is the recovery source.** If a release branch's changelog is damaged,
   restore from `main` rather than reconstructing by hand; `main` is never rewound
   by a release cut, so its copy is the one that still has the full history.
-- **Never carry a release branch's `Unreleased` entries into its own section by
-  assumption.** Entries accumulated on `main` after the release branch was cut
-  describe commits that branch does not contain — check with
-  `git merge-base --is-ancestor <sha> origin/release/<x.y.z>` before folding
-  anything in, or the release gets credited with work it does not ship.
+- **Write it from the commit range, under the release's final heading.** There is no
+  `## [Unreleased]` section to accumulate into and no in-progress prerelease heading
+  to rename later — `scripts/check_changelog_history.py` refuses both, at head, with
+  or without a base ref. So the section is composed once, from
+  `git log --oneline <last-tag>..HEAD`, and every commit in that range is accounted
+  for rather than sampled. 0.4.0 is the cautionary case: its per-PR accumulation
+  reached 721 lines while describing about 11% of the 453 commits it covered, and it
+  named none of the eighteen breaking changes it shipped.
+- **Editing the in-flight section after it is written needs the documented human
+  override**, because the immutability rule cannot tell a not-yet-shipped section
+  from a shipped one without a tag lookup, and a shallow CI checkout has no tags.
+  This is the intended trade: a fix cherry-picked into a later RC that deserves a
+  changelog line is rare, and the alternative — an exemption keyed on position in
+  the file — once made the most recently shipped section the only editable one.
 
 ## Deliberately not built
 

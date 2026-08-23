@@ -2,7 +2,6 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ReactNode }
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { Star, Brain, Plug, Pin, Package, Lock, Hourglass, Bot, ChevronDown, LayoutTemplate, X } from 'lucide-react'
 import { createPortal } from 'react-dom'
-import { useAppSelector } from '../store'
 import { api } from '../api/client'
 import type { SubagentInfo } from '../types'
 import Clickable from '../components/Clickable'
@@ -413,27 +412,25 @@ function SubagentsCard({ agents, onClear, onDelete }: { agents: SubagentInfo[]; 
 }
 
 export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
-  const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
-
   const { data: spawnData, refetch: refetchSpawn } = useQuery({
-    queryKey: ['spawn-list', refreshTrigger],
+    queryKey: ['spawn-list'],
     queryFn: () => api.spawnList(),
   })
   const agents: SubagentInfo[] = spawnData?.agents || []
 
   const { data: ctx = [] } = useQuery<CtxSession[]>({
-    queryKey: ['sessions-context', refreshTrigger],
+    queryKey: ['sessions-context'],
     queryFn: () => api.sessionsContext().then(d => d.sessions || []),
     refetchInterval: 15000,
   })
 
   const { data: usage = null } = useQuery({
-    queryKey: ['sessions-usage', refreshTrigger],
+    queryKey: ['sessions-usage'],
     queryFn: () => api.sessionsUsage().then(d => (d.usage && Number.isFinite(d.usage.credits_plan)) ? d.usage : null).catch(() => null),
   })
 
   const { data: installed = [], isPending: installedLoading, refetch: refetchInstalled } = useQuery({
-    queryKey: ['agents-installed', refreshTrigger],
+    queryKey: ['agents-installed'],
     queryFn: async () => {
       const a = await api.agentsInstalled()
       if (!Array.isArray(a)) return []
@@ -447,7 +444,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   })
 
   const { data: mcpTools = {} } = useQuery({
-    queryKey: ['mcp-tools', refreshTrigger],
+    queryKey: ['mcp-tools'],
     queryFn: async () => {
       const probed = await api.mcpProbeCache()
       if (!Array.isArray(probed)) return {}
@@ -467,13 +464,13 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
    *  this one (`crews.filter` on an object throws during render). Storing the
    *  response verbatim and selecting from it also dedupes the fetch. */
   const { data: crewsData, isError: crewsFailed, refetch: refetchCrews } = useQuery<{ agents?: KiroCrewAgent[]; default_agent?: string }>({
-    queryKey: ['kirocrew-agents', refreshTrigger],
+    queryKey: ['kirocrew-agents'],
     queryFn: () => api.kirocrewAgents(),
   })
   const crews = useMemo(() => crewsData?.agents ?? [], [crewsData])
 
   const { data: defaultAgentData, isError: defaultFailed, refetch: refetchDefault } = useQuery({
-    queryKey: ['default-agent', refreshTrigger],
+    queryKey: ['default-agent'],
     queryFn: () => api.defaultAgent().then(d => d.default_agent || ''),
   })
   const defaultAgent = defaultAgentData ?? ''

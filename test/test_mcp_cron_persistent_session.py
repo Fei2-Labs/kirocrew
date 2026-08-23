@@ -25,7 +25,11 @@ def _isolate_cron_store(monkeypatch, tmp_path):
     monkeypatch.setattr("kiro_crew.cron._DEFAULT_DIR", tmp_path)
     monkeypatch.setattr("kiro_crew.mcp_cron.config_dir", lambda: tmp_path)
     monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
-    monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
+    # Pinned rather than deleted: ``mcp_cron`` refuses a write from a caller it
+    # cannot name, and every test here writes. A fixed value keeps the isolation
+    # this fixture is for (no ambient key leaks in) while stating the identity
+    # precondition these tests always assumed.
+    monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:psess-slot")
 
 
 class TestCronAddPersistentSession:

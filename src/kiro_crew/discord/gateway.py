@@ -62,6 +62,10 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
         allowed_threads: set[str] = set(
             getattr(orch, "_discord_allowed_thread_ids", []) or []
         )
+        allowed_channels: set[str] = set(
+            getattr(orch, "_discord_allowed_channel_ids", []) or []
+        )
+        auto_thread = bool(getattr(orch, "_discord_auto_thread", True))
         if not allowed_ids:
             logger.warning(
                 "Discord: allowed_user_ids is empty — the bot is reachable by "
@@ -83,12 +87,15 @@ async def maybe_start_discord(orch: "GatewayOrchestrator") -> "DiscordClient | N
         client = DiscordClient(
             token=bot_token,
             on_interaction=dispatcher.on_interaction,
-            enable_guild_threads=bool(allowed_threads),
+            enable_guild_threads=bool(allowed_threads or allowed_channels),
         )
         transport = DiscordTransport(
             client,
             allowed_user_ids=allowed_ids,
             allowed_thread_ids=allowed_threads,
+            allowed_channel_ids=allowed_channels,
+            auto_thread=auto_thread,
+            on_thread_created=dispatcher.register_allowed_thread,
             dispatch=dispatcher.handle_message,
         )
         # Inbound: Gateway WS -> transport.receive (authorize + normalize)

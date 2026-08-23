@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import importlib
 import json
 import logging
@@ -217,6 +218,67 @@ class TestFileReader:
         reader = FileReader()
         for ext in ('.md', '.txt', '.py', '.html', '.json', '.jsonl', '.ndjson', '.yaml', '.csv'):
             assert ext in reader.SUPPORTED, f"{ext} missing from SUPPORTED"
+
+    def test_powershell_extensions_ingested_as_plain_text(self, tmp_path):
+        # PowerShell scripts (.ps1), modules (.psm1), and module manifests
+        # (.psd1) are plain UTF-8 text: they must be in SUPPORTED (so folder
+        # sources ingest rather than silently skip them) and must flow through
+        # the generic _read_text path, not a _DISPATCH reader.
+        reader = FileReader()
+        samples = {
+            '.ps1': 'Write-Host "hello from a script"',
+            '.psm1': 'function Get-Thing { "hello from a module" }',
+            '.psd1': "@{ ModuleVersion = '1.0'; Description = 'hello manifest' }",
+        }
+        for ext, content in samples.items():
+            assert ext in reader.SUPPORTED, f"{ext} missing from SUPPORTED"
+            assert ext not in reader._DISPATCH, f"{ext} must use the generic text path"
+            f = tmp_path / f"sample{ext}"
+            f.write_text(content, encoding="utf-8")
+            text, meta = reader.read(str(f))
+            assert content in text
+            assert meta['format'] == ext.lstrip('.')
+            assert meta['extension'] == ext
+        # Scripts and modules chunk at function boundaries like their .sh/.rb
+        # peers; the .psd1 manifest is data, so it stays on the generic path.
+        from kiro_crew.knowledge.ingestion import CODE_EXTS
+        assert '.ps1' in CODE_EXTS
+        assert '.psm1' in CODE_EXTS
+        assert '.psd1' not in CODE_EXTS
+
+    def test_utf16_powershell_files_decode_cleanly(self, tmp_path):
+        # Windows PowerShell 5.1 tooling (New-ModuleManifest, the legacy ISE)
+        # writes UTF-16LE with a BOM. Without BOM sniffing those bytes miss
+        # utf-8 and land in the latin-1 fallback, which preserves the BOM and
+        # interleaved NULs -- the store would index mojibake, not the script.
+        reader = FileReader()
+        content = "@{ ModuleVersion = '1.0'; Description = 'utf16 manifest' }"
+        for name, encoding in (
+            ("manifest-le.psd1", "utf-16-le"),
+            ("manifest-be.psd1", "utf-16-be"),
+        ):
+            f = tmp_path / name
+            # Write the BOM explicitly so both endiannesses are exercised.
+            bom = codecs.BOM_UTF16_LE if encoding == "utf-16-le" else codecs.BOM_UTF16_BE
+            f.write_bytes(bom + content.encode(encoding))
+            text, meta = reader.read(str(f))
+            assert content in text, f"{name}: UTF-16 content not decoded"
+            assert '\x00' not in text, f"{name}: NUL bytes leaked into indexed text"
+            assert meta['format'] == 'psd1'
+        # A BOM that lies (truncated/invalid UTF-16 payload) degrades to
+        # latin-1 like the utf-8 branch does -- ingest never hard-fails on it.
+        liar = tmp_path / "truncated.psd1"
+        liar.write_bytes(codecs.BOM_UTF16_LE + b'A')
+        text, meta = reader.read(str(liar))
+        assert meta['format'] == 'psd1', "invalid UTF-16 must degrade, not error"
+        # The HTML reader shares the same decode: BOM'd UTF-16 HTML from
+        # Windows tooling must not fall into the latin-1 mojibake path either.
+        page = tmp_path / "saved.html"
+        page.write_bytes(codecs.BOM_UTF16_LE
+                         + "<html><body>utf16 page body</body></html>".encode("utf-16-le"))
+        text, meta = reader.read(str(page))
+        assert "utf16 page body" in text
+        assert '\x00' not in text
 
 
 def _make_pdf(text: str = "Hello PDF regression") -> bytes:
@@ -460,6 +522,76 @@ class TestHybridRetriever:
         assert top["source_type"] == "artifact"
         assert top["artifact_slug"] == "op-vision"
         assert top["artifact_name"] == "OP Vision Plan"
+
+
+class TestHybridRetrieverSourceFilter:
+    def test_source_id_narrows_keyword_seeds(self, store):
+        # Both items match the query; scoping to one source keeps only its item
+        # (no entities exist, so the unfiltered graph leg contributes nothing).
+        src_a = store.add_source("Docs A", "local_folder", "/tmp/a")
+        src_b = store.add_source("Docs B", "local_folder", "/tmp/b")
+        store.add_item("Auth A", "JWT tokens for service alpha", "doc", source_id=src_a)
+        store.add_item("Auth B", "JWT tokens for service beta", "doc", source_id=src_b)
+        retriever = HybridRetriever(store)
+        results = retriever.search("JWT", source_id=src_a)
+        assert [r["title"] for r in results] == ["Auth A"]
+
+    def test_omitted_source_id_keeps_current_behavior(self, store):
+        # Regression: no source_id == the pre-filter result set.
+        src_a = store.add_source("Docs A", "local_folder", "/tmp/a")
+        src_b = store.add_source("Docs B", "local_folder", "/tmp/b")
+        store.add_item("Auth A", "JWT tokens for service alpha", "doc", source_id=src_a)
+        store.add_item("Auth B", "JWT tokens for service beta", "doc", source_id=src_b)
+        retriever = HybridRetriever(store)
+        results = retriever.search("JWT")
+        assert {r["title"] for r in results} == {"Auth A", "Auth B"}
+
+    def test_graph_leg_still_reaches_other_sources(self, store):
+        # The graph leg is deliberately unfiltered: an entity hit in another
+        # source still surfaces, marked as a graph match, while the keyword
+        # seeds stay scoped to the requested source.
+        src_a = store.add_source("Docs A", "local_folder", "/tmp/a")
+        src_b = store.add_source("Docs B", "local_folder", "/tmp/b")
+        store.add_item("Auth A", "JWT tokens for service alpha", "doc", source_id=src_a)
+        item_b = store.add_item("Gateway Doc", "routing notes", "doc", source_id=src_b)
+        ent = store.add_entity("Gateway", "service")
+        store.add_mention(item_b, ent)
+        retriever = HybridRetriever(store)
+        results = retriever.search("JWT Gateway", source_id=src_a)
+        by_title = {r["title"]: r for r in results}
+        assert "Auth A" in by_title
+        assert "Gateway Doc" in by_title
+        assert by_title["Gateway Doc"]["match_type"] == "graph"
+
+    def test_source_id_narrows_vector_seeds(self, store):
+        # Identical embeddings in two sources; scoping keeps one. The query
+        # shares no tokens with the content, isolating the vector leg.
+        src_a = store.add_source("Docs A", "local_folder", "/tmp/a")
+        src_b = store.add_source("Docs B", "local_folder", "/tmp/b")
+        vec = json.dumps([1.0, 0.0, 0.0, 0.0]).encode()
+        store.add_item("Vec A", "alpha content", "doc", source_id=src_a, embedding=vec)
+        store.add_item("Vec B", "beta content", "doc", source_id=src_b, embedding=vec)
+        retriever = HybridRetriever(store, embedder=lambda q: [1.0, 0.0, 0.0, 0.0])
+        results = retriever.search("unrelatedquerytoken", source_id=src_a)
+        assert [r["title"] for r in results] == ["Vec A"]
+
+    def test_unknown_source_id_returns_graph_only_results(self, store):
+        # A nonexistent id empties the seed legs without raising; the tool
+        # layer is what turns this into a guidance message.
+        store.add_item("Auth", "JWT tokens", "doc")
+        retriever = HybridRetriever(store)
+        assert retriever.search("JWT", source_id="no-such-source") == []
+
+    def test_scoped_search_includes_dedup_survivor_via_source_locations(self, store):
+        # An item owned by source A but located in source B (the surviving copy
+        # of a cross-source dedup collapse) still belongs to B's scope — the
+        # same ownership-OR-location rule the /api/knowledge/graph filter uses.
+        src_a = store.add_source("Owner", "local_folder", "/tmp/owner")
+        src_b = store.add_source("Location", "local_folder", "/tmp/loc")
+        item = store.add_item("Shared Doc", "JWT tokens shared", "doc", source_id=src_a)
+        store.add_source_location(item, src_b)
+        retriever = HybridRetriever(store)
+        assert [r["title"] for r in retriever.search("JWT", source_id=src_b)] == ["Shared Doc"]
 
 
 # ---------------------------------------------------------------------------
@@ -957,7 +1089,7 @@ class TestEntityExtractorExtended:
         result = asyncio.get_event_loop().run_until_complete(ext.extract("text"))
         assert result == {"title": "", "entities": [], "relations": [], "category": "document", "summary": ""}
 
-    def test_parse_response_regex_fallback(self):
+    def test_parse_response_prose_wrapped(self):
         ext = EntityExtractor()
         raw = 'Some preamble text {"entities": [], "relations": [], "category": "runbook", "summary": "ok"} trailing'
         result = ext._parse_response(raw)
@@ -968,11 +1100,35 @@ class TestEntityExtractorExtended:
         result = ext._parse_response("totally invalid garbage")
         assert result == {"title": "", "entities": [], "relations": [], "category": "document", "summary": ""}
 
-    def test_extract_code_block(self):
+    def test_parse_response_stray_brace_in_prose(self):
+        # The old greedy first-'{'-to-last-'}' regex spanned from the
+        # {placeholder} aside to the trailing "{}" echo, so the slice never
+        # parsed and a valid payload was silently lost.
         ext = EntityExtractor()
-        assert ext._extract_code_block("no block here") is None
-        result = ext._extract_code_block('```\n{"a": 1}\n```')
-        assert result == '{"a": 1}'
+        raw = (
+            'Per the {name, type} shape: {"entities": [], "relations": [], '
+            '"category": "runbook", "summary": "ok"} — use {} when empty.'
+        )
+        result = ext._parse_response(raw)
+        assert result["category"] == "runbook"
+        assert result["summary"] == "ok"
+
+    def test_parse_response_non_dict_reply_is_empty(self):
+        # A top-level array reply must yield the empty result, not leak an
+        # AttributeError out of _validate (which nuked a whole extract_batch
+        # under the old direct json.loads path).
+        ext = EntityExtractor()
+        raw = '[{"entities": []}]'
+        result = ext._parse_response(raw)
+        assert result == {"title": "", "entities": [], "relations": [], "category": "document", "summary": ""}
+
+    def test_parse_response_two_different_payloads_refuse_the_guess(self):
+        # The shared extractor's ambiguity contract: two DIFFERENT
+        # payload-shaped dicts mean the caller cannot know which is real.
+        ext = EntityExtractor()
+        raw = '{"summary": "first"} or maybe {"summary": "second"}'
+        result = ext._parse_response(raw)
+        assert result == {"title": "", "entities": [], "relations": [], "category": "document", "summary": ""}
 
     def test_validate_partial_data(self):
         ext = EntityExtractor()

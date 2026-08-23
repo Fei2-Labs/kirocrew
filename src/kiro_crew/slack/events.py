@@ -1276,8 +1276,8 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         # ── Version ──
         version_text = f"📦 Kiro Crew v{__version__}"
         update_info = get_update_info()
-        remote_ver = update_info.get("remote_version")
-        if update_info.get("available") and remote_ver is not None:
+        remote_ver = update_info.get("latest_version")
+        if update_info.get("update_available") and remote_ver:
             version_text += f"  •  🆕 v{remote_ver} available — open Dashboard to update"
         version_text = redact_credentials(redact_exfiltration_urls(version_text)[0])[0]
         blocks.append({"type": "divider"})
@@ -1642,6 +1642,10 @@ async def _dispatch_queued(
                 show_thinking=KiroCrewConfig.load().slack.show_thinking,
                 consolidator=orch.consolidator,
                 user_display_name=kwargs.get("user_display_name"),
+                # Live gateway state for the session-directive consumer (a
+                # monitor directive on a dashboard-owned thread resolves its
+                # slot through orch.dashboard_state).
+                gateway=orch,
             )
             return
         await handle_message(
@@ -2524,6 +2528,10 @@ async def _route_message(
                 # handle_message (parity: don't drop these on the transport path).
                 consolidator=orch.consolidator,
                 user_display_name=_sender_display,
+                # Live gateway state for the session-directive consumer (a
+                # monitor directive on a dashboard-owned thread resolves its
+                # slot through orch.dashboard_state).
+                gateway=orch,
             )
         )
         orch._session_tasks[session_key] = t

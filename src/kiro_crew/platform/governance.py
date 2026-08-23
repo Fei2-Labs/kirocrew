@@ -1332,6 +1332,14 @@ class GovernanceCeiling:
     signature_state: str = "unchecked"
     # Policy-only update pins (outside ``controls`` — see UpdatePins).
     updates: UpdatePins = field(default_factory=UpdatePins)
+    # Optional operator-declared fallback profile (policy top-level ``fallback``).
+    # When a per-surface profile FILE is unusable (unreadable, unparseable, or a
+    # broken ``extends``), the loader substitutes THIS profile instead of the
+    # most-restrictive deny-all. Absent (the default) keeps the deny-all fallback,
+    # so an operator who declares nothing is unchanged (fail-closed). A declared
+    # fallback is still intersected with this ceiling, so it can only ever narrow
+    # it — it trades strict fail-closed for keeping the unlisted planes available.
+    fallback_profile: "Optional[Profile]" = None
 
     def get(self, scope: str) -> Optional[object]:
         return self.controls.get(scope)
@@ -1473,7 +1481,7 @@ def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool)
 # Structural (non-governed) keys consumed by parse_policy/parse_profile, not as
 # governed scopes.
 _STRUCTURAL_KEYS = frozenset(
-    {"version", "boot", "identity", "name", "bind", "extends", "description", "updates"}
+    {"version", "boot", "identity", "name", "bind", "extends", "description", "updates", "fallback"}
 )
 
 
@@ -1605,6 +1613,31 @@ def parse_policy(
     raw_updates = data.get("updates")
     if raw_updates is not None and not isinstance(raw_updates, dict):
         raise PlatformCompositionError("security policy 'updates' must be an object")
+    # Optional operator-declared fallback profile (see GovernanceCeiling.fallback_profile).
+    # Parsed as a narrow-only PROFILE (is_policy=False): it is intersected with this
+    # ceiling like any per-surface profile when a profile FILE is unusable, so it can
+    # only narrow the ceiling, and an unknown scope inside it fails closed at boot
+    # exactly like a real profile would.
+    raw_fallback = data.get("fallback")
+    fallback_profile: "Optional[Profile]" = None
+    if raw_fallback is not None:
+        if not isinstance(raw_fallback, dict):
+            raise PlatformCompositionError("security policy 'fallback' must be an object")
+        # The fallback payload is a controls-only profile body. EVERY structural
+        # key (name/bind/extends/updates/fallback/…) is skipped by _parse_controls,
+        # so a payload like {"extends": "lockdown"} would silently lose its intent
+        # and the fallback would resolve to ceiling-permitted controls instead of the
+        # intended restriction. Reject any structural key so such a fallback fails
+        # closed at boot rather than vanishing.
+        stray = sorted(_STRUCTURAL_KEYS & raw_fallback.keys())
+        if stray:
+            raise PlatformCompositionError(
+                f"security policy 'fallback' may not contain structural key(s) {stray} — "
+                "it is a controls-only profile body"
+            )
+        fallback_profile = Profile(
+            name="_fallback", controls=_parse_controls(raw_fallback, is_policy=False)
+        )
     return GovernanceCeiling(
         version=POLICY_VERSION,
         boot=boot,
@@ -1613,6 +1646,7 @@ def parse_policy(
         identity_signature=signature,
         signature_state=signature_state,
         updates=UpdatePins.from_dict(raw_updates or {}),
+        fallback_profile=fallback_profile,
     )
 
 
@@ -1640,6 +1674,18 @@ def parse_profile(data: Mapping[str, object]) -> Profile:
         raise PlatformCompositionError(
             "profiles may not set 'updates' — update pins are policy-only "
             "(a profile redirecting the update source would be privilege escalation)"
+        )
+    # ``fallback`` is POLICY-ONLY for the same reason ``updates`` is. It is in
+    # _STRUCTURAL_KEYS (so parse_policy's _parse_controls skips it rather than
+    # rejecting it as an unknown scope), which would make a profile's copy silently
+    # inert — a validation hole. A profile IS a per-surface narrowing; there is no
+    # narrower "what an unusable profile falls back to", and a profile declaring its
+    # own fallback would be nonsensical. Reject it loudly here (the loader turns this
+    # into the deny-all fallback via Validation rule 5).
+    if "fallback" in data:
+        raise PlatformCompositionError(
+            "profiles may not set 'fallback' — the unusable-profile fallback is "
+            "policy-only (a profile declaring its own fallback is meaningless)"
         )
     bind: Optional[Bind] = None
     raw_bind = data.get("bind")

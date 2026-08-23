@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.project_scope import canonical_scope, project_scope_satisfied
 
 try:
     from kiro_crew.config.loader import config_dir as _config_dir
@@ -71,6 +72,11 @@ class Lesson:
     rule: str
     category: str  # "tool", "preference", "knowledge"
     negative: str | None = None
+    # Path fragment naming the repository this correction belongs to, or None for
+    # a correction that applies everywhere. Absent is the default so every stored
+    # lesson keeps applying exactly as before, and only a lesson that opts in is
+    # ever withheld. See ``kiro_crew.project_scope``.
+    repo_scope: str | None = None
 
 
 # ── Storage ──
@@ -226,6 +232,10 @@ class LessonStore:
             wanted_negative = (
                 lesson.negative.strip() or None if isinstance(lesson.negative, str) else None
             )
+            # Same normalisation for the scope key: a whitespace-only value is no
+            # scope, and a non-string is refused before ``.strip()`` can raise,
+            # because consolidation hands over a value the model produced.
+            wanted_scope = canonical_scope(lesson.repo_scope)
             # load_all() is called under the lock deliberately: it takes no lock of
             # its own, so this is not a re-entrant acquisition on a non-reentrant
             # Lock. Do NOT call save() from in here for the same reason.
@@ -235,9 +245,34 @@ class LessonStore:
             matched = False
             outcome = "inserted"
             for le in existing:
-                if not matched and le.rule.lower().strip() == wanted:
+                # Scope is part of a lesson's IDENTITY, not a field to overwrite, and
+                # the comparison is STRICT. The same rule with and without a scope is
+                # two lessons, exactly as in the vector store, where the scope is
+                # folded into the key so the two never share a row.
+                #
+                # Matching loosely broke it in both directions: on rule text alone a
+                # submission for repo B replaced repo A's scope and A lost the lesson,
+                # and treating an omitted scope as "no conflict" made a genuine
+                # save-this-globally request bind to a scoped row and report success
+                # without ever creating the global lesson. Addressing a scoped lesson
+                # therefore means naming its scope.
+                if (
+                    not matched
+                    and wanted_scope == le.repo_scope
+                    and (le.rule.lower().strip() == wanted)
+                ):
                     matched = True
-                    if not enrich or wanted_negative is None or le.negative == wanted_negative:
+                    # A field is enriched only when the submission carries a value
+                    # for it AND that value differs. A bare re-submit therefore
+                    # never strips a stored clause or scope -- it reports
+                    # ``unchanged``, matching the vector store for the same case.
+                    next_negative = le.negative
+                    if wanted_negative is not None:
+                        next_negative = wanted_negative
+                    next_scope = le.repo_scope
+                    if wanted_scope is not None:
+                        next_scope = wanted_scope
+                    if not enrich or (next_negative == le.negative and next_scope == le.repo_scope):
                         outcome = "unchanged"
                         updated.append(le)
                     else:
@@ -247,7 +282,7 @@ class LessonStore:
                         # edit followed by a failed write would leave the cache
                         # advertising a clause that was never persisted -- and that
                         # cache feeds context injection.
-                        updated.append(replace(le, negative=wanted_negative))
+                        updated.append(replace(le, negative=next_negative, repo_scope=next_scope))
                     continue
                 updated.append(le)
             if outcome == "unchanged":
@@ -255,7 +290,7 @@ class LessonStore:
             if not matched:
                 # Insert the normalised clause too, so a whitespace-only one is stored
                 # as absent rather than as blanks.
-                updated.append(replace(lesson, negative=wanted_negative))
+                updated.append(replace(lesson, negative=wanted_negative, repo_scope=wanted_scope))
                 if len(updated) > _MAX_LESSONS_TOTAL:
                     updated = updated[-_MAX_LESSONS_TOTAL:]
             self._write_all(updated)
@@ -296,12 +331,22 @@ class LessonStore:
                 continue
             try:
                 data = json.loads(line)
+                raw_scope = data.get("repo_scope")
+                # A PRESENT but unusable scope is not "applies everywhere": the row
+                # meant to be scoped and cannot say where, so it is dropped rather
+                # than admitted globally (fail-open) or passed to the gate, where a
+                # non-string would raise while a prompt is being assembled.
+                if raw_scope is not None and (
+                    not isinstance(raw_scope, str) or not raw_scope.strip()
+                ):
+                    continue
                 lessons.append(
                     Lesson(
                         ts=data.get("ts", ""),
                         rule=data.get("rule", ""),
                         category=data.get("category", "knowledge"),
                         negative=data.get("negative"),
+                        repo_scope=raw_scope,
                     )
                 )
             except (json.JSONDecodeError, KeyError):
@@ -309,9 +354,28 @@ class LessonStore:
         self._cache = (mtime, lessons)
         return lessons
 
-    def get_context(self) -> str:
-        """Format lessons as context for injection into prompts."""
-        lessons = self.load_all()
+    def _applicable(self, lessons: list[Lesson], project_dir: str | Path | None) -> list[Lesson]:
+        """Drop lessons whose ``repo_scope`` does not cover *project_dir*.
+
+        A lesson with no scope applies everywhere, so an existing store is
+        unaffected. A scoped one is withheld unless the session's project is
+        positively inside the named tree -- the gate fails closed, so a surface
+        with no project loses the scoped lessons rather than inheriting another
+        repository's rules.
+        """
+        return [
+            le
+            for le in lessons
+            if not le.repo_scope or project_scope_satisfied(le.repo_scope, project_dir)
+        ]
+
+    def get_context(self, project_dir: str | Path | None = None) -> str:
+        """Format lessons as context for injection into prompts.
+
+        *project_dir* is the session's active project, used only by the
+        ``repo_scope`` gate; omitting it withholds every scoped lesson.
+        """
+        lessons = self._applicable(self.load_all(), project_dir)
         if not lessons:
             return ""
 

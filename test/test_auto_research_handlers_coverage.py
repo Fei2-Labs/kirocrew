@@ -178,21 +178,23 @@ def _workflow_state(**svc_attrs: Any) -> SimpleNamespace:
     return SimpleNamespace(workflow_service=SimpleNamespace(**svc_attrs))
 
 
-async def _drive_watchdog(app: Any, until, timeout: float = 5.0) -> bool:
+async def _drive_watchdog(app: Any, until, timeout: float = 10.0) -> bool:
     """Run one or more real watchdog iterations, stopping as soon as ``until()``.
 
     The loop is a ``while True`` driven by ``asyncio.sleep(POLL_INTERVAL)``;
     callers shorten POLL_INTERVAL, so this polls the observable side effect and
     always cancels the task (no leaked background work).
+
+    Waiting is delegated to ``_await_until`` so both helpers share ONE budget:
+    two call sites here wait on a status commit made from a worker thread AND
+    the SSE emitted from that thread's ``call_soon_threadsafe`` hook, which is
+    two scheduling hops, and the tighter of two budgets is what made those
+    flake on a loaded shard. The timeout is a deadlock backstop; observable
+    state is what ends a successful wait.
     """
     task = asyncio.ensure_future(h._watchdog_loop(app))
     try:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.01)
-            if until():
-                return True
-        return False
+        return await _await_until(until, timeout=timeout)
     finally:
         task.cancel()
         try:

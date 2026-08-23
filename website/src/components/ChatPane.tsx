@@ -11,7 +11,8 @@ import ChatInput from './ChatInput'
 import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
-import AgentDropdownList, { ManageAgentsFooter } from './AgentDropdownList'
+import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from './AgentDropdownList'
+import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import ModelDropdownList from './ModelDropdownList'
 import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
@@ -21,10 +22,10 @@ import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage, setAgentSwitchNotice } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage, setAgentSwitchNotice } from '../store/chatSlice'
 import { confirmedDelivered } from '../utils/sendDelivery'
-import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
-import { triggerRefresh } from '../store/dashboardSlice'
+import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
+import { performSlotSwitch } from '../lib/slotSwitch'
 import { api } from '../api/client'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import { classifyDrop } from '../utils/dropClassify'
@@ -47,6 +48,7 @@ const SEND_ABORT_MS = 10_000
  * Messages stream live from the store; per-slot metadata comes from
  * s.dashboard.slots. Server reads/writes go through React Query + the api client.
  */
+
 export default function ChatPane({
   slotKey,
   focused,
@@ -54,6 +56,7 @@ export default function ChatPane({
   onRemove,
   onSplitRight,
   onSplitDown,
+  onOpenFull,
 }: {
   slotKey: string
   focused?: boolean
@@ -61,6 +64,10 @@ export default function ChatPane({
   onRemove?: () => void
   onSplitRight?: () => void
   onSplitDown?: () => void
+  /** Hands this pane's slot to the full session, leaving split view. Without it
+   *  the earlier-messages row is hidden rather than shown inert. The optional ts
+   *  anchors the destination near the pane's oldest message, not the newest. */
+  onOpenFull?: (slot: string, anchorTs?: string, anchorMid?: string) => void
 }) {
   const dispatch = useAppDispatch()
   const provider = useProvider()
@@ -77,6 +84,7 @@ export default function ChatPane({
   const isAtBottomRef = useRef(true)
 
   const allMessages = useAppSelector((s) => selectSlotMessages(s, slotKey))
+  const activeSlot = useAppSelector((s) => s.chat.activeSlot)
   const streamState = useAppSelector((s) => selectSlotStreamState(s, slotKey))
   const running = streamState !== 'idle'
   // Per-slot context-window usage for the input-bar ring (mirrors ChatPage; the
@@ -84,7 +92,13 @@ export default function ChatPane({
   // like single chat.
   const contextPct = useAppSelector((s) => s.chat.slotContextPct[slotKey] ?? 0)
   const contextTokens = useAppSelector((s) => s.chat.slotContextTokens?.[slotKey])
+  // Prefer the warm's value: this pane's own query is staleTime:Infinity, so its
+  // has_more freezes at mount while a later bounded warm can truncate the cache.
+  const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
   const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
+  // One source for both same-meaning markers in the agent pop-up: the row's check and
+  // the default-agent row's label.
+  const paneAgentName = paneSlot?.agent || 'default'
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
   // streaming OR sub-agents running (dual signal). Drives the queue affordance
   // and skips the optimistic user bubble (the backend returns a "queued"
@@ -119,7 +133,10 @@ export default function ChatPane({
   // Subscribes to the store's global refresh so a default-agent write in ANY pane (or
   // in single chat) lands here too; a per-hook refresh would leave sibling pickers stale.
   const agentsRefreshTrigger = useAppSelector((s) => s.dashboard.refreshTrigger ?? 0)
-  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey)
+  // This pane takes no project prop, so read THIS slot's project from the store:
+  // it scopes which project-local agents exist, so a project change must refetch.
+  const paneProject = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined)
+  const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
   const navigate = useNavigate()
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Same contract as ChatPage: set-only, clearing lives on the Templates page.
@@ -142,14 +159,26 @@ export default function ChatPane({
   // One-time hydrate of this slot's message history via React Query + the api
   // client (caching + cross-pane dedup; staleTime Infinity keeps it one-shot —
   // live updates arrive through the WS store routing, not a refetch).
+  // Bounding a streaming slot would slice its in-flight response: the limit cuts
+  // RAW rows and the chunk run only collapses after, leaving the tail alone.
+  // A background slot's stream state reads idle until an SSE frame arrives, so
+  // the slot record is the signal; latch only once unbounded so a turn that starts
+  // while the bounded fetch is still in flight can still upgrade it.
+  const limitRef = useRef<number | undefined>(PANE_HYDRATE_LIMIT)
+  const limitLatched = useRef(false)
+  if (!limitLatched.current && (running || paneSlot?.running)) {
+    limitRef.current = undefined
+    limitLatched.current = true
+  }
+  const hydrateLimit = limitRef.current
   const { data: slotDetail } = useQuery({
-    queryKey: ['slot-messages', slotKey],
-    queryFn: () => api.chatSlotDetail(slotKey),
+    queryKey: ['slot-messages', slotKey, hydrateLimit],
+    queryFn: () => api.chatSlotDetail(slotKey, hydrateLimit),
     staleTime: Infinity,
   })
   useEffect(() => {
-    if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages }))
-  }, [slotDetail, slotKey, dispatch])
+    if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running }))
+  }, [slotDetail, slotKey, dispatch, hydrateLimit])
 
   // Track whether this pane is scrolled to the bottom. The endRef sentinel sits
   // at the bottom of the scroll container (the overflow-y-auto div); when it's
@@ -187,7 +216,24 @@ export default function ChatPane({
     api.chatSlotAgent(slotKey, name)
       .catch((e) => dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e))))
   }, [dispatch, slotKey])
-  const switchModel = useCallback((name: string) => { api.chatSlotModel(slotKey, name).catch((e) => console.error('[ChatPane] switchModel failed', e)) }, [slotKey])
+  const switchModel = useCallback(async (name: string) => {
+    try {
+      // performSlotSwitch owns the whole protocol: serialized dispatch,
+      // latest-request-wins adjudication, hung-request timeout, and exactly
+      // one store write on the authoritative value (#4523) — the pane must
+      // not depend on the coalesced slots rebroadcast to see its own pick.
+      await performSlotSwitch('model', slotKey, name,
+        async () => {
+          const r = await api.chatSlotModel(slotKey, name)
+          return r?.model ?? name
+        },
+        (value) => dispatch(updateSlot({ key: slotKey, model: value })))
+    } catch (e) {
+      // Same failure surface as switchAgent above: the shared notice toast.
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+      console.error('[ChatPane] switchModel failed', e)
+    }
+  }, [dispatch, slotKey])
 
   // Roving-focus keyboard nav for the pickers (mirrors ChatPage / StyledSelect):
   // ArrowUp/Down across options, Enter/Space select, Escape/Tab close + return
@@ -431,7 +477,7 @@ export default function ChatPane({
     [slotKey, toolDisclosure, setToolDisclosureFor],
   )
 
-  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-none focus:border-accent'
+  const ddInputCls = 'w-full px-2 py-1 text-[13px] font-body bg-bg border border-border rounded text-text outline-none focus-visible:border-accent'
 
   return (
     <SlotProvider slotId={slotKey}>
@@ -496,6 +542,16 @@ export default function ChatPane({
         <div className="chat-container flex-1 overflow-y-auto overflow-x-hidden py-3 min-h-0">
           {messages.length === 0 && !running && (
             <div className="text-center text-muted text-[13px] py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
+          )}
+          {/* Suppressed on the active slot: that pane renders the store's full
+              history, so the bound does not apply and the row would be false. */}
+          {warmHasMore && slotKey !== activeSlot && onOpenFull && (
+            <button
+              onClick={() => onOpenFull(slotKey, messages[0]?.ts, messages[0]?.meta?.mid as string | undefined)}
+              className="block w-full text-center text-accent text-[12px] underline py-2 bg-transparent border-none cursor-pointer hover:text-accent-hover transition-colors"
+            >
+              {i18nT('components.chatPane.earlier_messages_open_session')}
+            </button>
           )}
           <ChatMessageList messages={messages} running={running} renderers={renderers} hideCardOwnedOAuth={connectionsUiOn} />
           <div ref={endRef} />
@@ -579,8 +635,9 @@ export default function ChatPane({
               />
             </div>
             <div role="listbox" aria-label={i18nT('components.chatPane.agent_list')} className="overflow-y-auto max-h-[280px]">
-              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneSlot?.agent || 'default'} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); agentDD.setOpen(false) }} onSetDefault={toggleDefaultAgent} />
+              <AgentDropdownList agents={agentDD.filtered} activeAgent={paneAgentName} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); agentDD.setOpen(false) }} />
             </div>
+            <DefaultAgentRow agentName={paneAgentName} isDefault={paneAgentName === defaultAgent} onSetDefault={() => toggleDefaultAgent(paneAgentName)} />
             <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { agentDD.setOpen(false); navigate('/capabilities?tab=templates') }} />
           </div>,
           document.body,

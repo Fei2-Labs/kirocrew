@@ -448,6 +448,8 @@ function slugify(children: React.ReactNode): string | undefined {
  * schemes) keep in-place navigation; everything else opens in a new tab. */
 function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAnchorElement> & ExtraProps) {
   const override = useContext(LinkOverrideCtx)
+  const probeEnabled = useContext(PathProbeCtx)
+  const actions = useContext(PathActionCtx)
   // The override is resolved FIRST and wins outright — Issue Radar's in-app
   // issue/PR affordance must keep beating a link preview. Feeding `null` into
   // the unfurl gate for a claimed href also means a claimed link is never
@@ -479,6 +481,40 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   // so the no-fetch guarantee holds at the network boundary, not just visually.
   const target = useUnfurlHref(claimed || source ? null : href)
   const meta = useLinkMeta(target ?? undefined, target !== null)
+  let localHref: string | null = null
+  if (href?.startsWith('/')) {
+    try {
+      const decodedHref = decodeURIComponent(href)
+      if (!decodedHref.startsWith('//')) localHref = decodedHref
+    } catch { /* keep it a normal link */ }
+  }
+  const pathResolution = usePathResolution(
+    localHref ?? '',
+    probeEnabled
+      && !claimed
+      && !!localHref
+      && !artifactSlugFromHref(localHref)
+      && !!(actions.onFileOpen || actions.onFolderOpen),
+  )
+  const onPathClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey
+    if (pathResolution.probePending && plainPrimaryClick) {
+      e.preventDefault()
+      return
+    }
+    if (!pathResolution.candidate
+      || (pathResolution.kind !== 'file' && pathResolution.kind !== 'dir')
+      || !plainPrimaryClick) return
+    e.preventDefault()
+    activatePath(
+      pathResolution.path,
+      pathResolution.kind,
+      e.shiftKey,
+      actions,
+      pathResolution.line,
+      pathResolution.endLine,
+    )
+  }
   if (claimed) return <>{claimed}</>
   if (source?.provider === 'jira') {
     const jira = source
@@ -523,6 +559,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
     <a
       {...sp(node)}
       href={href}
+      onClick={pathResolution.candidate ? onPathClick : undefined}
       {...(ext ? {} : { target: '_blank', rel: 'noopener noreferrer' })}
       className="text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent"
     >
@@ -552,6 +589,41 @@ const PathProbeCtx = createContext<boolean>(true)
  */
 type PathActions = { onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void }
 const PathActionCtx = createContext<PathActions>({})
+
+type PathResolution = {
+  candidate: boolean
+  kind: PathKind | undefined
+  path: string
+  splitPath: string
+  line: number | undefined
+  endLine: number | undefined
+  probePending: boolean
+}
+
+/** Resolve both legal readings of a location suffix before exposing an action.
+ *
+ * A literal filename such as `report.md:12` takes precedence over the inferred
+ * `report.md` at line 12, so both Markdown forms use the same probe ordering.
+ */
+function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
+  const { path: splitPath, line, endLine } = splitLineRef(raw)
+  const candidate = probeEnabled && isPathCandidate(splitPath)
+  const literalCandidate = candidate && line != null
+  const splitKind = usePathKind(candidate ? splitPath : null)
+  const literalKind = usePathKind(literalCandidate ? raw : null)
+  const literalWins = literalKind === 'file' || literalKind === 'dir'
+
+  return {
+    candidate,
+    kind: literalWins ? literalKind : splitKind,
+    path: literalWins ? raw : splitPath,
+    splitPath,
+    line: literalWins ? undefined : line,
+    endLine: literalWins ? undefined : endLine,
+    probePending: (candidate && splitKind === undefined)
+      || (literalCandidate && literalKind === undefined),
+  }
+}
 
 /**
  * Act on a confirmed path chip.
@@ -672,42 +744,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   const actions = useContext(PathActionCtx)
   const gatewayPlatform = useGatewayPlatform()
   const raw = codeStr.trim()
-  // Split `file.py:447` BEFORE probing, not just before the click. Candidacy is
-  // decided on the split path too: `src/main.py:447` fails the extension test as
-  // one token (it ends in digits, not `.py`), so testing the raw text would keep
-  // rejecting exactly the citations this is meant to admit.
-  const { path: stripped, line, endLine } = splitLineRef(raw)
-  const strippedCandidate = probeEnabled && isPathCandidate(stripped)
-  // Colons are legal in POSIX filenames, so `report:12` may name a real file or
-  // directory. Both spellings are therefore probed CONCURRENTLY — not the split
-  // one first with the literal as a fallback — because when both exist the
-  // fallback order would silently open the sibling the reader did not name, in an
-  // editor where a subsequent save would write to the wrong file. Two HEADs for a
-  // suffixed chip is the price of that being unambiguous; `usePathKind` caches and
-  // de-duplicates, and an unsuffixed chip still costs one.
-  //
-  // Derived from `strippedCandidate` rather than re-running the pre-filter on the
-  // raw text, because the pre-filter CANNOT see the literal form: `src/report.py:12`
-  // fails the extension test as one token (the suffix hides the `.py`), so testing
-  // it directly left relative citations — the majority form — with only one probe
-  // and no sibling precedence at all. If the split path is worth a probe then so is
-  // the literal spelling of the same path; that pairs them for every suffixed
-  // candidate instead of only rooted ones.
-  const rawCandidate = line != null && strippedCandidate
-  const strippedKind = usePathKind(strippedCandidate ? stripped : null)
-  const rawKind = usePathKind(rawCandidate ? raw : null)
-  // The literal text wins whenever it resolves: the reader clicked THAT name, and
-  // the split is only our interpretation of it. So there is no line to reveal.
-  const rawWins = rawKind === 'file' || rawKind === 'dir'
-  const kind = rawWins ? rawKind : strippedKind
-  const targetLine = rawWins ? undefined : line
-  const targetEndLine = rawWins ? undefined : endLine
-  // Withhold the affordance until EVERY probe in flight has reported. Rendering it
-  // on the split path's verdict alone would leave a window in which a click opened
-  // the split path even though the literal name exists — the same wrong-file
-  // outcome, just narrower.
-  const probePending = (strippedCandidate && strippedKind === undefined)
-    || (rawCandidate && rawKind === undefined)
+  const pathResolution = usePathResolution(raw, probeEnabled)
 
   // `data-path` / `data-path-kind` describe a chip THIS component rendered, so
   // only it may set them. rehypeSanitize allowlists every `data-*` attribute
@@ -718,12 +755,13 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     Object.entries(props).filter(([k]) => !k.toLowerCase().startsWith('data-path')),
   )
 
-  if (probePending || (kind !== 'file' && kind !== 'dir')) {
+  if (pathResolution.probePending
+    || (pathResolution.kind !== 'file' && pathResolution.kind !== 'dir')) {
     return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{children}</CopyableCode>
   }
-  const isDir = kind === 'dir'
+  const isDir = pathResolution.kind === 'dir'
+  const { path, splitPath, kind, line: targetLine, endLine: targetEndLine } = pathResolution
   const revealHint = revealHintFor(isDir, gatewayPlatform)
-  const path = rawWins ? raw : stripped
   // A leading glyph is what makes "this is actionable" legible at rest. Without
   // one, a confirmed chip and an inert one differ only on hover, so a reader
   // cannot tell which paths the backend actually resolved. Files use the same
@@ -771,12 +809,12 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
       title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
     >
       <Glyph size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
-      {targetLine != null && raw.length > stripped.length
+      {targetLine != null && raw.length > splitPath.length
         // Keep the location suffix atomic. A range is the case that actually
         // misleads: broken across lines, `…2026.md:10-` / `16` reads as a citation
         // ending at line 10 until the eye reaches the next line. The path itself
         // stays breakable, since that is what lets a long citation wrap at all.
-        ? <>{stripped}<span className="whitespace-nowrap">{raw.slice(stripped.length)}</span></>
+        ? <>{splitPath}<span className="whitespace-nowrap">{raw.slice(splitPath.length)}</span></>
         : children}
     </code>
   )
@@ -837,7 +875,7 @@ function MdParagraph({ node, children }: React.HTMLAttributes<HTMLParagraphEleme
     )
   }
   if (unfurl && meta) return <LinkCard meta={meta} href={unfurl} />
-  return <p {...sp(node)} className="my-1.5 leading-relaxed">{children}</p>
+  return <p {...sp(node)} className="my-1 leading-6">{children}</p>
 }
 
 /**

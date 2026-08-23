@@ -105,6 +105,19 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "AWS identity-probe failures",
+        "aws_consent.py",
+        "The stderr of a failed `aws sts get-caller-identity`, run to show the "
+        "operator which account a paid AWS service would bill before they confirm "
+        "it. The text reaches TWO surfaces: the Settings > Voice consent card "
+        "(`identityDetail` over `GET /api/aws/consent`) and `kirocrew aws-consent "
+        "show` on stdout. The CLI quotes back what it was resolving, so a failure "
+        "can carry a `credential_process` command line, an SSO start URL, or a "
+        "role ARN, and an endpoint override can carry an inline-credential URL -- "
+        "so the first stderr line goes through the shared credential + "
+        "exfiltration-URL chain at the source, before it is put on an `Identity`.",
+    ),
+    (
         "Browser CLI install failures",
         "browser_cli/install.py",
         "The stderr of a failed `npm install -g @playwright/cli` / browser download, "
@@ -115,6 +128,19 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "`*_TOKEN=` echo -- shapes the shared credential family does NOT match, so "
         "this sink adds its own npm patterns on top of the shared two-pass and "
         "redacts at the source rather than at either boundary.",
+    ),
+    (
+        "Azure DevOps comment bodies",
+        "apps/builtins/issue_radar/backend/azure_client.py",
+        "The text Issue Radar posts as a work-item or pull-request comment on Azure "
+        "DevOps. A comment body is frequently model-authored -- a crew's reply, or an "
+        "AI summary the user accepted -- and publishing it is irreversible: it lands "
+        "somewhere public and permanent on the customer's own organization, so a "
+        "credential or an exfiltration URL cannot be walked back. `_comment_text` "
+        "therefore runs the two-pass chain at the client, immediately before the body "
+        "reaches `az devops invoke`, rather than trusting each caller to have "
+        "redacted; the crew path already redacts and loses nothing, because both "
+        "passes are idempotent.",
     ),
     (
         "Session intent summaries",
@@ -501,9 +527,28 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "channel inherits redaction from this one egress.",
     ),
     (
+        "Outbound raster payloads",
+        "messaging/outbound_files.py",
+        "Exact raster bytes pass both credential and exfiltration-URL scanners " "before upload.",
+    ),
+    (
         "Discord direct send",
         "discord/transport_dispatch.py",
         "The direct-send path that bypasses TurnDriver, redacted independently.",
+    ),
+    (
+        "Discord transformed image text",
+        "discord/renderer.py",
+        "Image-markup removal can join previously separated text into a credential; "
+        "the transformed body is re-scanned before Discord receives it.",
+    ),
+    (
+        "Discord attachment description",
+        "discord/client.py",
+        "The accessible description on an uploaded image, from its markdown alt "
+        "text. Extraction unescapes that text before the wire, reassembling a "
+        "backslash-escaped credential the TurnDriver's stream scan never saw "
+        "contiguously -- it is re-scanned here, on the form that actually leaves.",
     ),
     (
         "Telegram failure reason",
@@ -581,6 +626,21 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "ZWSP insertion is itself a post-scan transformation. Enforced at this sink "
         "rather than per renderer for the same reason the max_buttons cap lives in "
         "shared code: a channel cannot forget what it does not call.",
+    ),
+    (
+        "iMessage delivery",
+        "imessage/renderer.py",
+        "The iMessage DELIVERY boundary. This channel is the one that collapses "
+        "markdown itself -- `to_plaintext` in `delivery_text` -- because the "
+        "surface renders no markup, so the driver's literal-byte scan of the "
+        "provider stream runs BEFORE the transformation that can reassemble a "
+        "credential it could not match (`**AKIA**IOSFODNN7EXAMPLE`, a link "
+        "target broken by emphasis). `delivery_text` therefore re-scans the "
+        "flattened form through redact_for_display (messaging/display_safety.py) "
+        "with the same redactor pair TurnDriver streams through, which is the "
+        "only form that actually ships. Elsewhere in this package "
+        "`redact_handle` appears solely in log lines, which is why the sibling "
+        "modules are listed as non-egress and this one is not.",
     ),
     (
         "Slack render pipeline",
@@ -770,6 +830,21 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "shared tag-creation path. Names are passed through redact_credentials "
         "and redact_exfiltration_urls before resolution or persistence.",
     ),
+    (
+        "Session-pulse survey feedback (Aperture egress)",
+        "dashboard/handlers/feedback.py",
+        "The free-text `feedback` field submitted via POST /api/feedback/submit is "
+        "forwarded to Aperture, a third-party AWS service, so it is a genuine "
+        "external egress boundary — a user typing a credential or exfiltration URL "
+        "while describing their experience would otherwise leave the host "
+        "unredacted. `_customer_responses` runs it through redact_exfiltration_urls "
+        "then redact_credentials before it is included in the outbound payload. "
+        "`email` is run through that SAME pass (redact_exfiltration_urls then "
+        "redact_credentials) because a user could paste a credential into it; its "
+        "`pii: True` marker is a separate Aperture disclosure flag, not a "
+        "substitute for redaction. `rating` (a fixed frontend enum) is not run "
+        "through this pass.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -792,6 +867,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # third party — the redaction is defensive so a credential-bearing
         # installer error cannot leak into the log ring / /api/logs stream.
         "platform/update_provider.py",
+        # Same shape: redacts the unparseable LLM decomposition response before
+        # writing the diagnostic ERROR line to the gateway log. Defensive log
+        # hygiene so a response echoing a credential or exfiltration URL cannot
+        # leak into the log ring / /api/logs stream; not an egress boundary.
+        "task_planner.py",
         # The shared recursive redactor helper itself — a pure scrubber, not an
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
@@ -805,7 +885,30 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # no output of its own -- the registered sinks are the modules that call
         # it (slack/format.py, messaging/renderer.py).
         "messaging/display_safety.py",
+        # Gate-side log hygiene: the session-directive consumer redacts the
+        # applier's confirmation string (which interpolates LLM-derived text —
+        # a stop reason, a rejected path, exception args) before writing it to
+        # the gateway log. The channel surface never renders tool results, so
+        # this line is an operational record, not an output boundary bound for
+        # a human; the applier itself SEL-audits every outcome.
+        "messaging/dispatch.py",
         "autonudge_authz.py",
+        # Gate-side log hygiene for a channel whose user identity IS a phone
+        # number or an Apple Account email. ``redact_handle`` shortens a handle
+        # before it reaches a gateway log line or a SEL ``caller`` field. None of
+        # these modules writes message content to the user through this call.
+        #
+        # ``imessage/renderer.py`` is deliberately NOT in this list even though
+        # it also calls ``redact_handle`` for a delivery-failure log line: it is
+        # a real egress sink and is registered as one above. An earlier version
+        # of this note claimed the renderer's redaction "is the shared
+        # TurnDriver's and is already counted there" -- that was wrong, and it is
+        # the kind of wrong that suppresses a gate. The driver scans the provider
+        # stream as literal bytes; the renderer then flattens the markup, which
+        # can reassemble a credential that scan could not see.
+        "imessage/client.py",
+        "imessage/transport.py",
+        "imessage/transport_dispatch.py",
         "acp/_dispatch.py",
         "acp/client.py",
         # Redacts the tool title in the auto-rejected-permission WARNING (a
@@ -1066,6 +1169,20 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # Bundled dev-skill script: prints CI/review findings to a
         # developer terminal, not an agent-output egress path.
         "builtin_skills/kirocrew-dev/prepare-pr/scripts/pr_findings.py",
+        # Same shape, one step further: a bundled dev-skill AUTHORING script that
+        # an author runs from a shell to narrate a demo film. It scrubs the
+        # author's own script text before handing it to the author's own cloud
+        # speech account -- defensive hygiene on a line that would otherwise be
+        # spoken aloud in a published video. The gateway neither imports nor runs
+        # it, so it is not a path this product carries agent output over, and
+        # counting it would inflate "egress paths covered" with a surface the
+        # product does not have.
+        "apps/builtins/dev_fleet/skills/feature-demo-recording/references/narrate.py",
+        # Same shape, the other authored input: the compositor scrubs `brand.json`
+        # prose before rendering it onto a slide, so a credential in a brand file is
+        # not published in the film. Also not a path this product carries agent
+        # output over -- the gateway neither imports nor runs it.
+        "apps/builtins/dev_fleet/skills/feature-demo-recording/references/compose.py",
         # Ops Mission Control provider-token redactor. ``secrets.py`` DEFINES
         # ``redact_tokens`` (the PagerDuty/Datadog token shapes) rather than
         # crossing a boundary with it — the same self-referential case as
@@ -1076,6 +1193,18 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # ``.../backend/registry.py``, a registered sink above.
         "apps/builtins/ops_mission_control/backend/secrets.py",
         "apps/builtins/ops_mission_control/backend/providers/http.py",
+        # Log-level defensive scrubbing: strips vault secrets and Bearer tokens
+        # from log output before it reaches the log ring. Not an egress boundary
+        # itself — the log ring reader (/api/logs) is the registered sink.
+        "log_redaction.py",
+        # CLI bootstrap: the ``install_log_redaction()`` call in
+        # ``_setup_cli_logging`` matches the drift-guard's redaction regex.
+        # The CLI is not an egress boundary — it's an installer, not a sink.
+        "cli.py",
+        # Defensive scrub: hooks.py redacts stderr before storing in last_error
+        # (an internal model field). The egress boundary is the dashboard API
+        # handler that serializes hooks via to_dict() — already a registered sink.
+        "hooks.py",
     }
 )
 
@@ -1286,6 +1415,7 @@ _AUDIT_SURFACE_DETAIL: dict[str, str] = {
     "weixin": "Weixin messages, approvals, and owner-authorization decisions",
     "webex": "Webex messages, approvals, and owner-authorization decisions",
     "teams": "Microsoft Teams messages, approvals, and owner-authorization decisions",
+    "imessage": "iMessage messages, approvals, and owner-authorization decisions",
     "host": "In-process governance checks not driven by a user-facing surface",
     "unknown": "Events that carry no surface signal (classified rather than misattributed)",
 }

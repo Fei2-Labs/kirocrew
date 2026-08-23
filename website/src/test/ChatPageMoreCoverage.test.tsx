@@ -114,7 +114,7 @@ vi.mock('../components/MarkdownRenderer', () => ({
 }))
 vi.mock('../components/TypewriterText', () => ({ default: () => null }))
 vi.mock('../components/OverlayDrawer', () => ({ default: ({ children }: { children?: ReactNode }) => children }))
-vi.mock('../components/AgentDropdownList', () => ({ default: () => null, ManageAgentsFooter: () => null }))
+vi.mock('../components/AgentDropdownList', () => ({ default: () => null, DefaultAgentRow: () => null, ManageAgentsFooter: () => null }))
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
@@ -547,10 +547,11 @@ describe('ChatPage window-event listeners', () => {
           detail: { code: 'npm test', reqId: 'r2' },
         }))
       })
-      // The handler opens the panel synchronously, then races the PTY against a
-      // ~6 s cap. Either leg answers; the `settled` latch is what guarantees the
-      // code-block button is told once and only once.
-      expect(store.getState().chat.activityOpen).toBe(true)
+      // "Run in terminal" now routes to the app-wide dock panel
+      // (useBottomTerminal), not the chat-scoped activity panel, so
+      // `chat.activityOpen` is intentionally untouched. The handler races the
+      // PTY against a ~6 s cap; either leg answers, and the `settled` latch is
+      // what guarantees the code-block button is told once and only once.
       await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
       await waitFor(() => expect(results.length).toBe(1), { timeout: 5_000 })
     } finally {

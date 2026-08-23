@@ -95,7 +95,7 @@ Every job here is blocking.
 | `backend-test-macos` | macos-14, deliberately SCOPED (gateway, socketsec, platform-compat, pod and MCP-apps suites via a glob). A full macOS run needs its own exclusion burn-down first, and a job that is red on arrival trains people to ignore it |
 | `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those 85 assertions (the `~/.kiro/crew` keystone among them) actually execute |
 | `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces the project line-rate floors, plus a per-file floor with a shrink-only baseline (all floors live in the job's `env:` block) |
-| `frontend-lint` | `tsc -b`, `eslint --max-warnings 1116`, `jscpd`, and `npm run i18n:check` |
+| `frontend-lint` | `tsc -b`, `eslint --max-warnings <measured count>`, `jscpd`, and `npm run i18n:check` |
 | `electron-test` | The Electron shell's own node:test suite (`website/electron`) |
 | `frontend-test` | `vitest run --coverage` |
 | `cfn-lint` | Lints the artifact-deploy templates with a pinned `cfn-lint` |
@@ -135,8 +135,11 @@ Details worth knowing:
   places. Per-file enforcement is skipped for a lane whose suite ran as a
   coverage-free subset, because subset rates are not comparable to a baseline
   recorded on the full suite.
-- **`eslint --max-warnings 1116` is a ratchet baseline.** Burn it down, never raise
-  it.
+- **`eslint --max-warnings <n>` is a ratchet baseline, and `<n>` is the measured
+  count.** Burn it down, never raise it, and never leave it above what
+  `npx eslint src/` reports: the difference is a budget new warnings land inside
+  without anyone seeing them. `test_eslint_warning_ceiling.py` keeps the number in one place so a
+  burn-down cannot leave a stale copy behind.
 - **The i18n gates split into three tiers,** and only two can fail: diff-scoped
   zero-tolerance checks (a user-visible literal on a line this branch wrote, a
   file holding more than it did at the base, new English key shape, changed catalog
@@ -201,8 +204,15 @@ of the AUTOSDE rules; the semantic half is delegated to the line reviewers.
 - **`inclusive-language`** runs a SHA-pinned `woke` over added lines only and fails
   on `(error)` severity. Legacy violations are burned down separately; this stops
   new ones.
-- **`sast`** runs Semgrep in a pinned container, diff-only against the base,
-  `p/python p/typescript p/security-audit p/secrets`, with `--error`. Blocking.
+- **`sast`** runs Semgrep in a pinned container: first `semgrep --test` over the
+  custom rules in `semgrep/` against the annotated fixtures in `semgrep-tests/`
+  (both directions — a `ruleid:` line must match, an `ok:` line must not — so a
+  rule regression goes red here, not on a later unrelated PR; the rules dir is
+  non-hidden because semgrep 1.78's test mode cannot discover tests under a
+  hidden directory), then the scan itself, diff-only against the base,
+  community packs plus `semgrep/`, with `--error`. The fixtures are listed in
+  `.semgrepignore` so the deliberately vulnerable fixture code is never read by
+  the scan. Blocking.
 - **`dep-audit`** calls the reusable `dependency-vulnerability.yml`, which runs
   `scripts/check_npm_audit.py` over every lockfile-backed Node project and fails
   closed on **high or critical production** vulnerabilities. Time-boxed exceptions

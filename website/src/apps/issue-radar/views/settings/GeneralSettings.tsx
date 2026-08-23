@@ -168,7 +168,7 @@ export default function GeneralSettings({ anchor }: { anchor: GeneralAnchor }) {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
                   <span className="text-[14px] font-medium truncate">{r.owner}/{r.repo}</span>
-                  {isReadOnly(r.permissions) && <ReadOnlyTag />}
+                  {isReadOnly(r.permissions) && <ReadOnlyTag repoRef={r} />}
                 </div>
                 <div className="text-[12px] text-muted mt-0.5 inline-flex items-center gap-1">
                   <SettingsIcon size={11} /> {i18nT('apps.issueRadar.views.settings.generalSettings.configure_triage')}

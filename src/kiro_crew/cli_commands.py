@@ -21,10 +21,11 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from kiro_crew import __version__, beacon, platform_compat
+from kiro_crew.agent import reset_agent_model
 from kiro_crew.apps.bridges import (
     deregister_app,
     deregister_app_crons_from_service,
@@ -52,6 +53,7 @@ from kiro_crew.config.loader import (
     config_local_path,
     config_path,
     read_config_for_update,
+    read_local_secret,
     update_config_locked,
 )
 from kiro_crew.cron import CronSchedule, CronService, format_schedule
@@ -61,9 +63,11 @@ from kiro_crew.dashboard.origin import parse_dashboard_url
 from kiro_crew.eval.judge import LLMJudge
 from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
+from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.learn import Lesson, LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.memory import MemoryStore
 from kiro_crew.port_resolution import resolve_client_port_ex
 from kiro_crew.security import (
     BUILTIN_DENIED_RULES,
@@ -169,7 +173,7 @@ def _format_schedule(schedule: object) -> str:
     return format_schedule(schedule)
 
 
-def _internal_secret() -> str:
+def _internal_secret(port: int) -> str:
     """Read the per-session IPC secret written by the gateway.
 
     The gateway writes ``~/.kiro/crew/.local_secret`` (mode 0600) after a
@@ -182,10 +186,7 @@ def _internal_secret() -> str:
     server then rejects the request with 403, which is the correct
     failure mode.
     """
-    try:
-        return (config_dir() / ".local_secret").read_text().strip()
-    except Exception:
-        return ""
+    return read_local_secret(port)
 
 
 def _spawn(args: argparse.Namespace) -> None:
@@ -196,7 +197,7 @@ def _spawn(args: argparse.Namespace) -> None:
     if action == "list":
         req = urllib.request.Request(
             f"{base}/api/spawn",
-            headers={"X-Internal-Secret": _internal_secret()},
+            headers={"X-Internal-Secret": _internal_secret(args.port)},
         )
         try:
             with loopback_urlopen(req, timeout=5) as resp:
@@ -235,7 +236,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         data=data,
         headers={
             "Content-Type": "application/json",
-            "X-Internal-Secret": _internal_secret(),
+            "X-Internal-Secret": _internal_secret(args.port),
         },
     )
     try:
@@ -262,7 +263,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
 
     print(f"Spawned subagent {agent_id}, waiting for result...", file=sys.stderr)
     poll_url = f"{base}/api/spawn/{agent_id}"
-    secret = _internal_secret()
+    secret = _internal_secret(args.port)
     while True:
         _time.sleep(2)
         poll_req = urllib.request.Request(poll_url, headers={"X-Internal-Secret": secret})
@@ -734,13 +735,20 @@ def _handle_app(args: argparse.Namespace) -> None:
         include_backend = getattr(args, "backend", False)
         include_ui = getattr(args, "ui", False)
         include_cron = getattr(args, "cron", False)
-        app_dir = scaffold_app(
-            output,
-            args.name,
-            include_backend=include_backend,
-            include_ui=include_ui,
-            include_cron=include_cron,
-        )
+        try:
+            app_dir = scaffold_app(
+                output,
+                args.name,
+                include_backend=include_backend,
+                include_ui=include_ui,
+                include_cron=include_cron,
+            )
+        except ValueError as exc:
+            # scaffold_app raises when a write path escapes the app directory
+            # (traversal in the name, a symlink in the tree). Match the clean
+            # error contract of the sibling app actions, not a raw traceback.
+            print(f"❌ {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"✅ Scaffolded app: {app_dir}")
         print("   Edit app.json, add agents and skills, then:")
         if include_ui:
@@ -811,8 +819,50 @@ def _handle_agent(args: argparse.Namespace) -> None:
         cfg.save()
         print(f"Deleted agent: {args.name}")
 
+    elif action == "reset-model":
+        _agent_reset_model(args)
+
     else:
-        print("Usage: kirocrew agent {list|create|update|delete}")
+        print("Usage: kirocrew agent {list|create|update|delete|reset-model}")
+
+
+def _agent_reset_model(args: argparse.Namespace) -> None:
+    """Clear an agent spec's pinned model (``kirocrew agent reset-model``).
+
+    The explicit, narrow way back to the shipped default model. It exists
+    because ownership of a spec's ``model`` cannot be inferred: a value an older
+    build's propagation wrote and one the user typed in by hand are
+    byte-identical on disk, so nothing may reclassify a pin behind the user's
+    back. Before this, the only ways out were the dashboard's Agent Templates
+    editor (clear the model) and ``kirocrew setup --clean``, which also
+    regenerates the whole spec and discards every other customization with it.
+    """
+    name = getattr(args, "agent", None) or "kirocrew"
+    try:
+        spec_path, previous = reset_agent_model(name)
+    except FileNotFoundError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
+        # Ambiguous: two specs claim the name and the runtime's choice between
+        # them is undefined, so resetting either could strip the wrong one.
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as exc:
+        print(f"❌ Could not write the agent spec: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if previous:
+        # repr on BOTH the model and the path. Neither is trusted input: an
+        # installed app writes specs into the agents directory and a cloned
+        # repository can ship one, so an OSC/ANSI sequence can arrive in the
+        # `model` value AND in the FILENAME -- the declared-name scan returns
+        # whichever file declares the requested name, so its path is attacker-
+        # shaped even though *name* itself is grammar-validated.
+        print(f"✅ Cleared {name}'s pinned model ({previous!r}) in {str(spec_path)!r}")
+    else:
+        print(f"✅ {name} had no pinned model in {str(spec_path)!r}")
+    print("   It now tracks the shipped default; restart the gateway to apply.")
 
 
 def _cron(args: argparse.Namespace) -> None:
@@ -830,6 +880,97 @@ def _cron(args: argparse.Namespace) -> None:
             status = "✅" if j.enabled else "⏸️"
             sched = _format_schedule(j.schedule)
             print(f"  {status} {j.id}  {j.name}  ({sched})  {j.message[:60]}")
+            # Ownership is printed because it decides which surfaces can manage
+            # the job at all: a job with no owning session is outside every chat
+            # session's scope, so `cron_list` from chat does not list it and the
+            # mutating tools answer a deliberately vague "job not found". That is
+            # the intended boundary, but with the field invisible here the CLI
+            # was the only place the state existed and nothing showed it -- which
+            # is what made a normal, correct state read as a job that had
+            # vanished. `cron adopt` is the way back.
+            owner = j.session_key or ""
+            provenance = j.created_by or ""
+            if owner:
+                detail = f"owner: {owner}"
+            else:
+                detail = "owner: none (manage from CLI or the dashboard Schedule page)"
+            if provenance:
+                detail += f"  created by: {provenance}"
+            print(f"      {detail}")
+
+    elif action == "adopt":
+        job_id = args.job_id
+        if getattr(args, "release", False):
+            session_key = ""
+        else:
+            # One flag, two accepted spellings of the same target. A bare slot
+            # name gets the `dashboard:` namespace the delivery consumers strip
+            # back off (messaging.py / the Slack gateway both
+            # removeprefix("dashboard:")), so adding it here is their exact
+            # inverse and needs no lookup. An already-namespaced key passes
+            # through untouched -- there is no second flag for that case,
+            # because a key with no namespace at all could never equal any
+            # caller's session key and so could only ever produce a row nobody
+            # can own.
+            target = (getattr(args, "session_of", None) or "").strip()
+            if not target:
+                print("Error: --session-of requires a session", file=sys.stderr)
+                sys.exit(1)
+            session_key = target if ":" in target else f"dashboard:{target}"
+        if not svc.adopt_job(job_id, session_key):
+            print(f"Error: job not found: {job_id}", file=sys.stderr)
+            sys.exit(1)
+        sel().log_api_access(
+            caller="cli",
+            operation="cron.adopt",
+            outcome="allowed",
+            source="cli",
+            resources=f"job_id={job_id} session_key={session_key or '(released)'}",
+        )
+        if session_key:
+            # Ownership and delivery do not have the same reach. `_owned_by`
+            # matches any namespace, so a Slack or Telegram session can own and
+            # manage a job -- but only a `dashboard:` key resolves to a slot the
+            # delivery path can inject into (both consumers reach a slot with
+            # removeprefix("dashboard:")). Saying "results are delivered there"
+            # for a `slack:` key would be a promise the code does not keep.
+            if session_key.startswith("dashboard:"):
+                print(
+                    f"Job {job_id} now belongs to {session_key}: that session can manage it "
+                    f"and its results are delivered there."
+                )
+                # A typo'd key is accepted by the store but resolves to no slot,
+                # so the job's output would go nowhere -- the same
+                # invisible-delivery state this command exists to recover from.
+                # Warn rather than refuse: the delivery path resolves a live slot
+                # first and only falls back to rehydrating from history, so a
+                # brand-new tab that has not logged anything yet is a legitimate
+                # target and absence of a log does not prove the key is wrong.
+                slot = session_key.removeprefix("dashboard:")
+                try:
+                    known = ConversationLog().has_log(slot)
+                except Exception:
+                    known = True  # cannot tell -> stay quiet rather than cry wolf
+                if not known:
+                    print(
+                        f"Warning: no recorded session named {slot!r}. If that is a typo, "
+                        f"the job's results will not reach anyone -- re-run with the right "
+                        f"key, or `--release` to undo.",
+                        file=sys.stderr,
+                    )
+            else:
+                print(f"Job {job_id} now belongs to {session_key}: that session can manage it.")
+                print(
+                    f"Note: results are not injected into a chat for a "
+                    f"{session_key.split(':', 1)[0]!r} owner -- only a dashboard session is "
+                    f"resolved as a delivery target. Ownership transferred; delivery did not.",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"Job {job_id} released: no owning session, so manage it from the CLI or "
+                f"the dashboard Schedule page."
+            )
 
     elif action == "add":
         every = getattr(args, "every", None)
@@ -1077,8 +1218,18 @@ def _cron_preview(args: argparse.Namespace) -> None:
                 )
             return result
 
-        def notify(self, message: str) -> None:
-            print(f"[notify suppressed]: {message}")
+        def notify(self, text: str, **kwargs: object) -> dict:
+            # Signature mirrors production ScriptContext.notify: scripts pass routing
+            # kwargs (session="origin" is the documented way for a cron to reach the
+            # chat that created it), so a positional-only stub made preview crash on
+            # the one branch a monitor cron exists for. Redaction mirrors production
+            # too -- this prints to the user's terminal, and kwargs values are
+            # script-supplied. Returns an empty dict: nothing was delivered.
+            safe_text = redact(text)
+            safe_kwargs = json.loads(redact(json.dumps(kwargs))) if kwargs else {}
+            routing = f" (kwargs: {safe_kwargs})" if safe_kwargs else ""
+            print(f"[notify suppressed]: {safe_text}{routing}")
+            return {}
 
         def close(self):
             pass
@@ -1109,6 +1260,60 @@ def _cron_preview(args: argparse.Namespace) -> None:
         )
     if outcome == "error":
         sys.exit(1)
+
+
+_TIME_SELECTOR_RE = re.compile(r"(?i)\A(?P<value>\d+)(?P<unit>[smhdw])\Z")
+_TIME_SELECTOR_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+}
+
+
+def parse_time_selector(raw: str, *, now: datetime | None = None) -> datetime | None:
+    """Resolve a ``--since``/``--until`` selector to an aware UTC datetime.
+
+    Accepts a relative AGE (``30m``, ``2h``, ``7d``, ``1w``) meaning "that long
+    ago", or an absolute ISO 8601 instant (``2026-08-21``,
+    ``2026-08-21T04:00:00Z``). Empty input means "no bound" and returns ``None``.
+
+    A bare ISO date/time with no offset is read as UTC — the audit log is written
+    in UTC, so interpreting it as local time would silently shift the window by
+    the host's offset. ``Z`` is normalized because ``fromisoformat`` only accepts
+    it from Python 3.11 and this package supports 3.10.
+
+    Raises ``ValueError`` with the accepted forms spelled out, so a typo gets a
+    usable message instead of an empty result the caller reads as "no events".
+    An absurd but well-formed age (``999999999999999999w``) overflows
+    ``timedelta``; that surfaces as the same ``ValueError`` rather than an
+    uncaught ``OverflowError`` traceback, so the CLI still exits 2 with guidance.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    match = _TIME_SELECTOR_RE.match(text)
+    if match:
+        seconds = int(match.group("value")) * _TIME_SELECTOR_UNITS[match.group("unit").lower()]
+        try:
+            return (now or datetime.now(tz=timezone.utc)) - timedelta(seconds=seconds)
+        except (OverflowError, OSError):
+            raise ValueError(
+                f"{raw!r} is too far in the past to represent. Use a smaller age "
+                "(30m, 2h, 7d, 1w) or an ISO 8601 instant."
+            ) from None
+    iso = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError:
+        raise ValueError(
+            f"cannot read {raw!r} as a time. Use a relative age (30m, 2h, 7d, 1w) "
+            "or an ISO 8601 instant (2026-08-21, 2026-08-21T04:00:00Z)."
+        ) from None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _security(args: argparse.Namespace) -> None:
@@ -1152,11 +1357,26 @@ def _security(args: argparse.Namespace) -> None:
     elif action == "events":
 
         limit = getattr(args, "limit", 20)
-        events = sel().recent(limit=limit)
+        try:
+            since = parse_time_selector(getattr(args, "since", "") or "")
+            until = parse_time_selector(getattr(args, "until", "") or "")
+        except ValueError as exc:
+            print(f"❌ {exc}")
+            sys.exit(2)
+        if since and until and since >= until:
+            print("❌ --since must be earlier than --until")
+            sys.exit(2)
+        events = sel().recent(limit=limit, since=since, until=until)
+        window = ""
+        if since or until:
+            window = (
+                f" in [{since.isoformat() if since else '-'}, "
+                f"{until.isoformat() if until else 'now'})"
+            )
         if not events:
-            print("No security events recorded.")
+            print(f"No security events recorded{window}.")
             return
-        print(f"📋 Last {len(events)} security event(s):\n")
+        print(f"📋 Last {len(events)} security event(s){window}:\n")
         for e in events:
             ts = e.get("timestamp", "?")[:19]
             etype = e.get("event_type", "?")
@@ -1508,7 +1728,9 @@ def _learn(args: argparse.Namespace) -> None:
                     # the dashboard's JSONL path: a blank/legacy category gets
                     # the store's own "knowledge" default instead of printing [].
                     category = normalize_lesson_category(le.category, strict=False)
-                    print(f"  [{_TERMINAL_CTRL_RE.sub('', category)}] {_TERMINAL_CTRL_RE.sub('', str(le.rule))}{neg}")
+                    print(
+                        f"  [{_TERMINAL_CTRL_RE.sub('', category)}] {_TERMINAL_CTRL_RE.sub('', str(le.rule))}{neg}"
+                    )
 
         elif action == "remove":
             if vs.get_lessons() and vs.delete_lesson(args.query):
@@ -1524,14 +1746,71 @@ def _learn(args: argparse.Namespace) -> None:
         vs.close()
 
 
+def _markdown_memory_store() -> MemoryStore:
+    """MemoryStore anchored where the DEFAULT runtime writer writes.
+
+    The markdown layer this surface exposes is written by the gateway's
+    consolidator, which is constructed over a bare ``MemoryStore()`` (the
+    hard-coded ``workspace`` dir under the data home). The reader must resolve
+    identically or an install whose config maps the default workspace
+    elsewhere would export a tree the consolidator never writes to. In a stock
+    config this is the same directory ``workspace_dir_for()`` returns; when
+    they diverge, the writer wins.
+    """
+    return MemoryStore()
+
+
+def _memory_show(args: argparse.Namespace) -> None:
+    """Read-only view of the markdown memory layer (preferences/projects/history).
+
+    Routes through :class:`MemoryStore`'s own readers so consumers depend on an
+    interface rather than the on-disk layout. A missing or empty file is a
+    normal state and prints as empty rather than erroring. Validation failures
+    go to stderr with a non-zero exit so scheduled (non-TTY) consumers get a
+    real failure signal instead of non-JSON text on stdout.
+    """
+    target = getattr(args, "target", None)
+    since_raw = getattr(args, "since", None)
+    since = None
+    if since_raw:
+        if target not in (None, "history"):
+            print("--since applies only to history", file=sys.stderr)
+            sys.exit(1)
+        try:
+            since = datetime.strptime(since_raw, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"Invalid --since date (expected YYYY-MM-DD): {since_raw}", file=sys.stderr)
+            sys.exit(1)
+    snapshot = _markdown_memory_store().markdown_snapshot(since=since)
+    if getattr(args, "format", "md") == "json":
+        payload = snapshot[target] if target else snapshot
+        print(json.dumps(payload, indent=2))
+        return
+    parts: list[str] = []
+    for key in [target] if target else ["preferences", "projects", "history"]:
+        if key == "history":
+            parts.extend(e["content"].strip() for e in snapshot[key] if e["content"].strip())
+        elif snapshot[key]["content"].strip():
+            parts.append(snapshot[key]["content"].strip())
+    text = "\n\n".join(parts)
+    if text:
+        # The markdown layer is consolidator (LLM) written — strip terminal
+        # control sequences before printing, same policy as `memory list`.
+        print(_TERMINAL_CTRL_RE.sub("", text))
+
+
 def _memory_cmd(args: argparse.Namespace) -> None:
-    """Manage vector memory system."""
+    """Manage the memory system (vector store + markdown layer)."""
+    action = getattr(args, "mem_action", None)
+    # "show" reads only the markdown layer — don't open (or create) the
+    # vector store for it.
+    if action == "show":
+        _memory_show(args)
+        return
     cfg = KiroCrewConfig.load()
     store = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim)
     store.init()
     try:
-        action = getattr(args, "mem_action", None)
-
         if action == "list":
             entries = store.get_all_semantic()
             if not entries:
@@ -1548,7 +1827,9 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                 if str(e["key"]).startswith("lesson."):
                     val = _lesson_display_text(val) or val
                 safe_val = _TERMINAL_CTRL_RE.sub("", str(val))
-                print(f"  {e['key']}: {safe_val}  (confidence={e['confidence']}, source={e['source']})")
+                print(
+                    f"  {e['key']}: {safe_val}  (confidence={e['confidence']}, source={e['source']})"
+                )
 
         elif action == "search":
             results = store.search_episodic(query_text=args.query, limit=10)
@@ -1591,11 +1872,15 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                 print("✅ No suspicious content in memory.")
 
         elif action == "export":
-            data = {
+            data: dict[str, object] = {
                 "semantic": store.get_all_semantic(),
                 "episodic": store.get_episodic_list(limit=10000),
                 "events": store.get_events(limit=1000),
             }
+            if getattr(args, "include_markdown", False):
+                # Opt-in so the default payload shape stays byte-identical
+                # for existing consumers.
+                data["markdown"] = _markdown_memory_store().markdown_snapshot()
             output = json.dumps(data, indent=2, default=str)
             out_file = getattr(args, "output", None)
             if out_file:
@@ -1626,9 +1911,17 @@ def _memory_cmd(args: argparse.Namespace) -> None:
             print(f"  Semantic: {counts['semantic']}")
             print(f"  Episodic: {counts['episodic']}")
             print(f"  Skipped:  {counts['skipped']}")
+            if "markdown" in data:
+                # The markdown collection is export-only: the markdown layer is
+                # consolidator-owned, so import never writes it. Say so rather
+                # than letting a backup/restore silently drop it.
+                print(
+                    "Note: the 'markdown' collection is export-only and was NOT imported "
+                    "(the markdown memory layer has no write path here)."
+                )
 
         else:
-            print("Usage: kirocrew memory {list|search|stats|audit|export|migrate|import}")
+            print("Usage: kirocrew memory {list|search|show|stats|audit|export|migrate|import}")
     finally:
         store.close()
 
@@ -1641,7 +1934,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     action = getattr(args, "artifact_action", None) or "list"
 
-    headers: dict[str, str] = {"X-Internal-Secret": _internal_secret()}
+    headers: dict[str, str] = {"X-Internal-Secret": _internal_secret(port)}
 
     def _request(method: str, path: str, body: dict | None = None) -> dict:
         data = json.dumps(body).encode() if body is not None else None

@@ -9,6 +9,7 @@ import { openActivityPanel, sseSubagentQueued } from '../store/chatSlice'
 import SegmentedControl from '../components/SegmentedControl'
 import { ApiError } from '../api/client'
 import { safeSetItem } from '../utils/safeStorage'
+import { FEATURE_REQUEST_PROMPT_FALLBACK } from '../prompts/featureRequest'
 
 /** A failure `POST /api/chat/slots/{slot}/agent` really can return today. */
 const REAL_FAILURE = 'invalid agent name'
@@ -97,6 +98,9 @@ vi.mock('../api/client', () => ({
       env_var: 'KIROCREW_TELEMETRY_DISABLED',
     }),
     patchConfig: vi.fn().mockResolvedValue({}),
+    createChatSlot: vi.fn().mockResolvedValue({ key: 'feature-slot', title: 'feature-slot', messages: 0, running: false }),
+    chatSlotContext: vi.fn().mockResolvedValue({ ok: true }),
+    sendChat: vi.fn().mockResolvedValue({ ok: true }),
   },
   // Default to "no auth banner showing" so existing App tests render the
   // normal connected/offline pill paths. The dedicated auth-banner
@@ -628,6 +632,45 @@ describe('App routing', () => {
     }
   })
 
+  it('invalidates the registry query on mc:apps-changed so install state refreshes', async () => {
+    // The Explore shelf renders Get vs Installed from the server-computed
+    // `installed` flag on the `['registry']` rows, cached with a multi-minute
+    // staleTime. Install/uninstall surfaces announce themselves via
+    // mc:apps-changed; the handler must drop that cache or a just-installed
+    // registry app keeps showing a "Get" button until the cache expires.
+    const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    queryClient.setQueryData(['registry'], { apps: [] })
+    expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(false)
+    act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+    await waitFor(() => {
+      expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(true)
+    })
+  })
+
+  it('marks the apps cache stale on mc:apps-changed even when the refetch fails', async () => {
+    // Dispatch sites do not invalidate ['apps'] themselves; this listener
+    // owns that cache. refreshAppNav publishes fresh data only on fetch
+    // SUCCESS, so the handler must invalidate the cache up front — otherwise
+    // a retry-exhausted refetch chain would leave stale ['apps'] rows marked
+    // fresh.
+    const { api } = await import('../api/client')
+    const listApps = api.listApps as ReturnType<typeof vi.fn>
+    listApps.mockReset()
+    listApps.mockRejectedValue(new Error('gateway down'))
+    try {
+      const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+      queryClient.setQueryData(['apps'], [])
+      expect(queryClient.getQueryState(['apps'])?.isInvalidated).toBe(false)
+      act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+      await waitFor(() => {
+        expect(queryClient.getQueryState(['apps'])?.isInvalidated).toBe(true)
+      })
+    } finally {
+      listApps.mockReset()
+      listApps.mockResolvedValue([])
+    }
+  })
+
   it('shows a portaled hover label for a collapsed (icon-only) nav item', async () => {
     // Covers useNavTip: in collapsed mode nav rows hide their text label and
     // instead show it via a portal to <body> on hover (so the rail's vertical
@@ -762,22 +805,33 @@ describe('App routing', () => {
   it('renders the search trigger in the header centre track, not as a positioned overlay', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const trigger = screen.getByRole('button', { name: 'Search sessions, files, and commands' })
-    // The trigger is a flow item now: it fills its grid track (`w-full`) and
-    // carries no positioning of its own. The previous implementation centred it
-    // on `50vw` with a JS-measured inline width, which is what forced it to
-    // reserve `max(left, right)` on BOTH sides and drop itself once that
-    // mirrored gutter fell under a floor.
-    expect(trigger).toHaveClass('w-full')
+    // The trigger is a flow item now: it fills its grid track and carries no
+    // positioning of its own. The previous implementation centred it on `50vw`
+    // with a JS-measured inline width, which is what forced it to reserve
+    // `max(left, right)` on BOTH sides and drop itself once that mirrored gutter
+    // fell under a floor.
+    //
+    // It shares the centre CELL with the focus-mode toggle, so it fills that
+    // cell (`flex-1`) rather than the track directly — the cell is what fills
+    // the track. Both halves of the original assertion still hold: nothing here
+    // is positioned, and the header keeps exactly three in-flow children.
+    expect(trigger).toHaveClass('flex-1')
     expect(trigger).not.toHaveClass('absolute')
     expect(trigger.style.left).toBe('')
     expect(trigger.style.width).toBe('')
-    // Header children, in order: left group · trigger · actions group. The
+    // Header children, in order: left group · centre cell · actions group. The
     // three-track grid depends on that being exactly three in-flow children.
-    const header = trigger.parentElement!
+    const centre = trigger.parentElement!
+    const header = centre.parentElement!
     const flow = [...header.children].filter(el => !el.className.includes('absolute'))
     expect(flow[0]).toHaveClass('tb-left')
-    expect(flow[1]).toBe(trigger)
+    expect(flow[1]).toBe(centre)
     expect(flow[2]).toHaveClass('tb-right')
+    // The centre cell holds the trigger and the focus-mode toggle, and nothing
+    // else: a third control there is what website/AUTOSDE.yaml's
+    // max-two-buttons-per-row rule forbids.
+    expect([...centre.children]).toHaveLength(2)
+    expect(centre.children[1]).toBe(screen.getByTestId('focus-mode-toggle'))
   })
 
   it('sizes the top-bar search from the window alone, with equal side tracks', () => {
@@ -964,42 +1018,42 @@ describe('App routing', () => {
     localStorage.removeItem('mc-nav')
   })
 
-  it('lets the brand toggle expand the rail while preview focus mode is active', () => {
+  it('lets the brand toggle expand the rail while preview expand mode is active', () => {
     localStorage.removeItem('mc-nav')
     renderWithProviders(<App />, { route: '/chat' })
     const nav = screen.getByRole('navigation', { name: 'Main navigation' })
 
     // Entering the Web Preview's expand mode collapses the rail.
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: true } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: true } }))
     })
     expect(within(nav).getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument()
 
-    // The logo keeps its standard behavior inside focus mode: it expands.
+    // The logo keeps its standard behavior inside expand mode: it expands.
     fireEvent.click(within(nav).getByRole('button', { name: 'Expand sidebar' }))
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
 
-    // Leaving focus mode must not undo that explicit choice.
+    // Leaving expand mode must not undo that explicit choice.
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: false } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: false } }))
     })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
     localStorage.removeItem('mc-nav')
   })
 
-  it('restores the pre-focus rail state when preview focus mode ends untouched', () => {
+  it('restores the pre-expand rail state when preview expand mode ends untouched', () => {
     localStorage.removeItem('mc-nav') // start expanded
     renderWithProviders(<App />, { route: '/chat' })
     const nav = screen.getByRole('navigation', { name: 'Main navigation' })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
 
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: true } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: true } }))
     })
     expect(within(nav).getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument()
 
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: false } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: false } }))
     })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
     // The auto-collapse is transient: it never writes the persisted preference.
@@ -1035,6 +1089,36 @@ describe('App routing', () => {
     expect(screen.getByRole('button', { name: 'Request a Feature' })).toBeInTheDocument()
     expect(localStorage.getItem('mc-nav')).toBe('0')
     localStorage.removeItem('mc-nav')
+  })
+
+  it('keeps feature-request instructions hidden from the persisted user message', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api.createChatSlot).mockClear()
+    vi.mocked(api.chatSlotContext).mockClear()
+    vi.mocked(api.sendChat).mockClear()
+    renderWithProviders(<App />, { route: '/chat' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Request a Feature' }))
+
+    await waitFor(() => {
+      expect(api.chatSlotContext).toHaveBeenCalledWith(
+        'feature-slot',
+        FEATURE_REQUEST_PROMPT_FALLBACK,
+        // maxAge bounds the hidden seed's lifetime so a failed visible send
+        // cannot leave it queued for a later, unrelated message.
+        { source: 'feature-request', maxAge: 60 },
+      )
+      expect(api.sendChat).toHaveBeenCalledWith(
+        'I’d like to request a feature!',
+        'feature-slot',
+        expect.any(String),
+      )
+    })
+    expect(api.sendChat).not.toHaveBeenCalledWith(
+      FEATURE_REQUEST_PROMPT_FALLBACK,
+      expect.anything(),
+      expect.anything(),
+    )
   })
 
   it('renders connection status', () => {

@@ -94,8 +94,17 @@ def identity_for(server: Any) -> Identity:
     adding a second row.
 
     Env is hashed by the same helper the pool uses, so the rotating-secret
-    exclusions apply identically — a credential rotation must not look like a
-    different server here either.
+    exclusions apply — a credential rotation must not look like a different
+    server here either.
+
+    It deliberately does NOT pass ``identity_keys``, so a variable an operator
+    named in ``mcp_gateway.pool_identity_env`` still does not enter THIS hash.
+    The pool needs the value in its key because the value decides which backend
+    is the right backend; a measurement is a claim about the server's BEHAVIOUR,
+    and rotating a credential does not change that. Folding it in here would
+    discard a good measurement on every rotation, which is the stale-verdict
+    failure this identity exists to prevent, in reverse. So the two hashes agree
+    on the default set and diverge only on named keys, on purpose.
 
     ``binary_version`` fingerprints everything the launch actually runs, not just
     the executable. Most MCP servers are launched THROUGH an interpreter —
@@ -261,22 +270,38 @@ async def _evaluate_pass(
     cache, identities = await asyncio.to_thread(_load_and_identify, servers, runtime_dir)
 
     known: dict[str, CachedPreflight] = {}
-    due: list[Any] = []
-    remaining = budget
+    candidates: list[tuple[bool, Any]] = []
     for server in servers:
         hit = cache.get(server.name, identities[server.name], reported_version(server))
         if hit is not None:
             known[server.name] = hit
-            continue
+            # Stored is not the same as settled. A divergent row is kept so the
+            # page can SHOW it -- the dashboard builds its rows from this cache
+            # and nothing else, so a result that is not stored is not merely
+            # forgotten, it is reported as "never measured" about a server we
+            # just spawned twice -- but it must not suppress a re-measure, being
+            # the one verdict two spawns cannot justify freezing (#4339). So it
+            # stays a candidate and the next pass re-derives it, which is what
+            # lets a press clear a row that was wrong.
+            if not hit.caller_sensitive:
+                continue
         if getattr(server, "disabled", False) or not getattr(server, "command", ""):
             # A disabled server must not be spawned (probing is the act consent
             # gates), and a server with no command has no stdio pipe to stub.
             continue
-        if remaining is not None:
-            if remaining <= 0:
-                continue
-            remaining -= 1
-        due.append(server)
+        candidates.append((server.name in known, server))
+
+    # Never-measured servers are admitted FIRST, and the budget is applied after
+    # that ordering rather than while walking the config. A divergent row is
+    # re-measured every pass and so competes for the same budget for ever; in
+    # config order a large enough divergent set would take every slot and a server
+    # nobody has ever probed would sit behind it indefinitely -- and it would never
+    # even enter this list, because the budget was already spent. Sorting first is
+    # what makes the bound fair instead of positional.
+    candidates.sort(key=lambda pair: pair[0])
+    due: list[Any] = [s for _, s in candidates] if budget is None else [
+        s for _, s in candidates[:budget]
+    ]
 
     # Bounded fan-out, not a sequential walk. This is awaited by a request the
     # operator is waiting on, and each pre-flight is two spawns that can each hit
@@ -339,6 +364,13 @@ async def _evaluate_pass(
             reported_version=reported_version(server),
         )
         if result.ran:
+            # Both outcomes are stored, including a divergence. Storing is what
+            # makes a result VISIBLE (the dashboard reads this cache and only this
+            # cache); what makes a divergence non-durable is that the loop above
+            # refuses to let such a row skip the next measurement. Separating
+            # those two meanings is the whole of the #4339 fix -- the earlier
+            # attempt withheld the row instead, which made the measurement
+            # invisible and had the page call the server unmeasured.
             cache.put(server.name, identities[server.name], verdict)
             measured += 1
         else:

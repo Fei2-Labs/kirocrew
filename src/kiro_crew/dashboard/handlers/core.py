@@ -30,6 +30,8 @@ from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NO
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
 from kiro_crew.config.loader import (
     _VALID_STT_PROVIDERS,
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     MAX_SUBAGENTS_FIXED_FLOOR,
     SUBAGENT_AUTO_MAX_CEILING,
     SUBAGENT_MAX_TURNS_CEILING,
@@ -695,8 +697,6 @@ def _pip_install_channel_available() -> bool:
     it there recreates the press-and-nothing-changes failure this surface
     exists to avoid:
 
-    - a frozen backend: its import set is fixed at build time (the packaging
-      spec excludes the voice extra), so no install can become importable;
     - the desktop app's bundled interpreter (see
       :func:`platform_compat.is_bundled_interpreter`): pip may exist, but a
       pip install writes into the code-signed bundle — breaking launches and
@@ -707,8 +707,6 @@ def _pip_install_channel_available() -> bool:
       pip refuses to install. Checked only outside a venv: inside one, pip
       works and deliberately ignores the marker, so a venv returns True.
     """
-    if getattr(sys, "frozen", False):
-        return False
     if platform_compat.is_bundled_interpreter():
         return False
     if importlib.util.find_spec("pip") is None:
@@ -922,8 +920,10 @@ async def api_stt_install(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "code": "stt_no_local_install",
-                "error": "AWS Transcribe has no local install;"
-                " run the prerequisite command to add the 'voice' extra instead",
+                "error": (
+                    "AWS Transcribe has no local install;"
+                    " run the prerequisite command to add the 'voice' extra instead"
+                ),
             },
             status=400,
         )
@@ -1002,8 +1002,10 @@ async def api_stt_install(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "ok": True,
-                "ffmpeg": shutil.which("ffmpeg") is not None
-                or os.path.isfile(os.path.expanduser("~/ffmpeg/ffmpeg")),
+                "ffmpeg": (
+                    shutil.which("ffmpeg") is not None
+                    or os.path.isfile(os.path.expanduser("~/ffmpeg/ffmpeg"))
+                ),
             }
         )
     except asyncio.TimeoutError:
@@ -1079,9 +1081,7 @@ def _build_stt_install_script(provider: str = "whisper") -> str:
     if provider in ("mlx", "parakeet"):
         pipx_pkg = "parakeet-mlx" if provider == "parakeet" else "mlx-whisper"
         verify_bin = "parakeet-mlx" if provider == "parakeet" else "mlx_whisper"
-        return (
-            prelude
-            + rf"""
+        return prelude + rf"""
 [ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
 
 if ! command -v brew >/dev/null 2>&1; then
@@ -1102,7 +1102,6 @@ pipx install --force {pipx_pkg} 2>&1 || {{ echo "ERROR: pipx install {pipx_pkg} 
 
 echo "Done. {verify_bin}=$(command -v {verify_bin} 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
 """
-        )
     return prelude + r"""
 # Pick up ffmpeg from ~/ffmpeg if installed there
 [ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
@@ -1551,7 +1550,9 @@ def _active_advertised_ids(request: web.Request) -> list[str] | None:
     return None
 
 
-def _validate_role_model(value: str, request: web.Request) -> str | None:
+def _validate_role_model(
+    value: str, request: web.Request, provider: str | None = None
+) -> str | None:
     """Reject a per-role model pin the account cannot use; ``None`` = allow.
 
     ``""`` / ``"auto"`` always allow (they defer to the chat default). Otherwise
@@ -1561,13 +1562,17 @@ def _validate_role_model(value: str, request: web.Request) -> str | None:
     (:func:`model_is_unusable`, #1596) so the picker and the wire cannot disagree.
     No advertised set => accept (entitlement unknowable; don't accuse on no
     evidence), matching that predicate's own conservative default.
+
+    *provider* is forwarded to :func:`_model_rejected_reason` so a caller holding
+    an already-loaded config does not pay a second synchronous config read; the
+    remaining work is in-memory. Omit it and the provider is resolved there.
     """
     if not value or value == "auto":
         return None
     from kiro_crew.acp.client import model_is_unusable
     from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
 
-    reason = _model_rejected_reason(value)
+    reason = _model_rejected_reason(value, provider=provider)
     if reason:
         return reason
     advertised = _active_advertised_ids(request)
@@ -1649,7 +1654,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.completion_keep_chars": {"type": "int", "min": 0, "max": RESULT_FILE_MAX_BYTES},
     "agent.soft_stop_budget_secs": {"type": "float", "min": 0.5, "max": 60.0},
     "session.timeout_secs": {"type": "int", "min": 0, "max": 86400},
-    "session.autocompact_pct": {"type": "float", "min": 5.0, "max": 90.0},
+    # Range shared with the load-time clamp in config/loader.py — one constant
+    # pair, so the write gate and the load path cannot drift (issue #4734).
+    "session.autocompact_pct": {
+        "type": "float",
+        "min": AUTOCOMPACT_PCT_MIN,
+        "max": AUTOCOMPACT_PCT_MAX,
+    },
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
     "session.pool_ttl_secs": {"type": "int", "min": 0, "max": 7200},
@@ -1929,8 +1940,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             _log_sel("denied", f"{path_key}={value}")
             return web.json_response(
                 {
-                    "error": "must be an executable shell (an absolute path or a "
-                    "command on PATH); leave empty to use the system default",
+                    "error": (
+                        "must be an executable shell (an absolute path or a "
+                        "command on PATH); leave empty to use the system default"
+                    ),
                     "code": "shell_not_executable",
                 },
                 status=400,

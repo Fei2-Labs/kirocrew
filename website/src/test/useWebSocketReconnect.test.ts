@@ -6,7 +6,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { api } from '../api/client'
-import chatReducer, { sseSubagentSpawn, sseSubagentPending, sseSubagentDone } from '../store/chatSlice'
+import chatReducer, { PANE_HYDRATE_LIMIT, sseSubagentSpawn, sseSubagentPending, sseSubagentDone } from '../store/chatSlice'
 import type { RootState } from '../store'
 
 // Track markSlotUnread dispatches
@@ -75,6 +75,12 @@ describe('useWebSocket reconnect unread suppression', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    // Unconditional, because the fake-timer installs in this file are restored
+    // INLINE at the end of the tests that need them. An assertion that fails
+    // before its restore line leaves fake timers installed for every LATER test
+    // here, so one real failure reports as a cascade of unrelated ones and the
+    // real cause is buried. Idempotent when timers were never faked.
+    vi.useRealTimers()
   })
 
   function wrapper({ children }: { children: React.ReactNode }) {
@@ -273,6 +279,12 @@ describe('unread fires on chat_done not chat_chunk', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+    // Unconditional, because the fake-timer installs in this file are restored
+    // INLINE at the end of the tests that need them. An assertion that fails
+    // before its restore line leaves fake timers installed for every LATER test
+    // here, so one real failure reports as a cascade of unrelated ones and the
+    // real cause is buried. Idempotent when timers were never faked.
+    vi.useRealTimers()
   })
 
   function wrapper({ children }: { children: React.ReactNode }) {
@@ -386,7 +398,9 @@ describe('chat-stream-perf: chunk coalescing + background cache warm', () => {
     ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockClear()
 
     act(() => { ws.simulateMessage({ type: 'chat_done', data: { slot: 'chat-other' } }) })
-    expect(api.chatSlotDetail).toHaveBeenCalledWith('chat-other')
+    // The background warm is bounded (see PANE_HYDRATE_LIMIT); the active slot
+    // still hydrates unbounded.
+    expect(api.chatSlotDetail).toHaveBeenCalledWith('chat-other', PANE_HYDRATE_LIMIT)
     unmount()
   })
 

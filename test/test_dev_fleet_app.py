@@ -36,6 +36,25 @@ _POSIX_ONLY = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _venv_maps_to_the_synced_checkout():
+    """Answer the sync's foreign-venv guard with "it maps", for tests not about it.
+
+    Both install paths now refuse a venv that serves a DIFFERENT checkout, and
+    answering that question RUNS the target interpreter — which every sync test
+    here points at a path that does not exist. Stubbing both halves keeps an
+    unrelated assertion from turning into an unrunnable-interpreter refusal. The
+    guard's own behaviour is asserted by
+    ``test_sync_refuses_a_venv_that_serves_another_checkout``, which patches it
+    back to a refusal, and the logic behind it lives in ``test/test_dep_sync.py``.
+    """
+    from kiro_crew import dep_sync
+
+    with patch.object(dep_sync, "installed_package_origin", return_value="<stubbed>"), \
+         patch.object(dep_sync, "venv_not_mapped_to", return_value=None):
+        yield
+
+
 # --- worktree porcelain parsing ---
 def test_parse_worktree_porcelain_basic():
     from kiro_crew.apps.builtins.dev_fleet.server import _parse_worktree_porcelain
@@ -890,88 +909,9 @@ async def test_sync_script_emits_step_markers():
 
 
 # --- Windows: a write-locked console script must not be handed to pip ---
-def _make_scripts(tmp_path, *names):
-    """A fake venv Scripts/ dir, returning the interpreter path inside it."""
-    scripts = tmp_path / ".venv" / "Scripts"
-    scripts.mkdir(parents=True)
-    for name in names:
-        (scripts / name).write_bytes(b"MZ")
-    return scripts / "python.exe"
-
-
-def _raise_on(monkeypatch, name, exc):
-    """Make Path.open raise *exc* for the file called *name* only."""
-    real_open = Path.open
-
-    def fake_open(self, *args, **kwargs):
-        if self.name == name:
-            raise exc
-        return real_open(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", fake_open)
-
-
-def test_write_locked_console_scripts_is_a_posix_noop(tmp_path, monkeypatch):
-    """POSIX can unlink an executing binary, so there is nothing to detect."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
-    _raise_on(monkeypatch, "kirocrew.exe", PermissionError(13, "in use"))
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_flags_a_locked_script(tmp_path, monkeypatch):
-    """The real failure: the exe the gateway is executing cannot be replaced."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "kirocrew.exe", PermissionError(13, "in use"))
-
-    locked = mod._write_locked_console_scripts(py)
-    assert len(locked) == 1
-    assert locked[0].endswith("kirocrew.exe")
-
-
-def test_write_locked_console_scripts_passes_a_writable_script(tmp_path, monkeypatch):
-    """A venv the gateway is NOT running from must still get its reinstall."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_ignores_unrelated_executables(tmp_path, monkeypatch):
-    """Only the scripts pip would rewrite matter.
-
-    Some other locked exe sharing the Scripts dir must not suppress the
-    reinstall — that would turn an unrelated process into a silent skip.
-    """
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe", "unrelated.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "unrelated.exe", PermissionError(13, "in use"))
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_lets_pip_judge_other_errors(tmp_path, monkeypatch):
-    """An unreadable-for-other-reasons script is not evidence of a lock.
-
-    Skipping on any OSError would suppress installs that would have worked.
-    """
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "kirocrew.exe", OSError(5, "I/O error"))
-
-    assert mod._write_locked_console_scripts(py) == []
+# The probe itself moved to kiro_crew.dep_sync with the substitute it feeds, and
+# its tests moved with it (test/test_dep_sync.py). What stays here is the sync's
+# use of the result: which install step gets built.
 
 
 def _steps_from_script(script):
@@ -1004,6 +944,9 @@ async def _run_sync(mod, locked):
     ambient makes them pass or fail on whether the HOST running them happens to
     sit in a Kiro Crew checkout. Assertions that quote the repo path must use
     ``_SYNC_REPO`` rather than reading ``mod.MAIN_REPO``.
+
+    The venv-origin guard is answered by the module's autouse fixture; a test
+    about that guard patches it back to a refusal.
     """
     mod._UPSTREAM_REMOTE = "origin"
     mod._SYNC_RID = None
@@ -1011,7 +954,7 @@ async def _run_sync(mod, locked):
          patch.object(mod, "_git", new_callable=AsyncMock, return_value="main"), \
          patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
-         patch.object(mod, "_write_locked_console_scripts", return_value=locked), \
+         patch.object(mod.dep_sync, "locked_console_scripts", return_value=locked), \
          patch("kiro_crew.apps.builtins.dev_fleet.server.sandboxed_spawn_argv",
                side_effect=lambda cmd, mode, env=None: (cmd, env or {}, None)), \
          patch.object(mod, "_start_run", new_callable=AsyncMock, return_value="run-123") as mock_start:
@@ -1019,52 +962,82 @@ async def _run_sync(mod, locked):
             result = await mod._sync_start_locked()
     mod._UPSTREAM_REMOTE = None
     script = mock_start.call_args[0][1][2] if mock_start.call_args else None
+    # Stubbing _start_run also stubs out its `finally` cleanup, so anything the
+    # sync staged for removal (the dependency-only path snapshots dep_sync into a
+    # temp dir) would outlive the test. Remove exactly what it registered, in the
+    # order it registered it — file before directory.
+    if mock_start.call_args:
+        for path in mock_start.call_args.kwargs.get("cleanup_paths") or []:
+            try:
+                os.unlink(path)
+            except OSError:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
     return result, script
 
 
 @pytest.mark.asyncio
-async def test_sync_refuses_entirely_when_a_console_script_is_locked():
-    """Nothing may run — not even fetch/merge.
+async def test_sync_substitutes_a_dependency_only_install_when_a_script_is_locked():
+    """The sync proceeds; only the editable reinstall is swapped out.
 
-    pip cannot replace the locked binary, and merging anyway is not a safe
-    consolation prize: a revision that adds a dependency would land with that
-    dependency absent, the run would report success, and the next restart would
-    fail to import it. Leaving the checkout on a revision whose dependencies are
-    satisfied is the only outcome that cannot brick the gateway.
+    pip cannot replace the locked wrapper, but it does not have to. An editable
+    install serves source straight from ``src``, so the merge alone makes the new
+    revision live; the only thing the reinstall was still buying is a dependency
+    the revision added, and installing a dependency never touches the project's
+    own console script. Refusing the whole sync instead left the single-checkout
+    Windows layout — the ordinary one — with no working Pull+build at all.
     """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
 
     result, script = await _run_sync(mod, [r"C:\repo\.venv\Scripts\kirocrew.exe"])
 
-    assert result["ok"] is False
-    # No run was started at all, so fetch/merge never happened.
-    assert script is None
-    err = result["error"]
-    assert "kirocrew.exe" in err          # names the blocker
-    assert "pip install -e" in err        # and the remedy
-    assert "Stop the gateway" in err
+    assert result["ok"] is True
+    # A run was started, so fetch and merge do happen.
+    assert script is not None
+    # Steps are JSON-embedded in the generated script, so quotes arrive escaped;
+    # comparing against a de-escaped copy keeps these assertions independent of
+    # how many encoding layers the script generator happens to use.
+    flat = script.replace("\\", "")
+    assert "dep_sync.py" in flat
+    assert '"-e"' not in flat
+    # It must NOT be run as `-m kiro_crew...dep_sync`. That would import the
+    # module from the working tree after the merge has landed, pulling the whole
+    # package __init__ chain with it, so a revision that raises the
+    # `requires-python` floor with newer syntax would SyntaxError while being
+    # parsed and the floor refusal written for that revision could never run.
+    assert dep_sync.__name__ not in flat
+    assert '"-m"' not in flat.split('"merge"', 1)[1]
+    # The file it runs is a snapshot taken BEFORE the merge, so it lives outside
+    # the checkout being synced.
+    assert r"C:repo\dep_sync.py" not in flat
+    # ORDER MATTERS, and it is the SAME order the reinstall it replaces uses:
+    # fetch -> merge -> install. Installing first would need the merge to be
+    # proven impossible to fail, which cannot be done completely; a failed install
+    # after a landed merge is exactly what the reinstall path already does.
+    assert flat.index('"merge"') < flat.index("dep_sync.py")
 
 
 @pytest.mark.asyncio
-async def test_refusal_remedy_is_cwd_independent_and_quoted():
-    """The suggested command must not depend on where it is pasted.
+async def test_sync_keeps_the_editable_reinstall_when_nothing_is_locked():
+    """A venv this gateway is NOT served by must still get the real reinstall.
 
-    `-e .` resolves against the terminal's cwd, and this project is normally
-    checked out as several worktrees at once — so the same line copied from a
-    feature worktree would install THAT tree into the primary venv and repoint
-    its editable install away from the primary checkout. Both paths are also
-    quoted, because a Windows home directory routinely contains a space.
+    The substitution is a concession to a lock, not an improvement to prefer: it
+    cannot refresh a console script, so anywhere pip can do the whole job, it
+    should.
     """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
 
-    result, _ = await _run_sync(mod, [r"C:\repo\.venv\Scripts\kirocrew.exe"])
-    err = result["error"]
+    result, script = await _run_sync(mod, [])
 
-    # The install target is named explicitly, never left to the shell's cwd —
-    # including in the prose, so the message never shows the misleading form.
-    assert "pip install -e ." not in err
-    assert f'pip install -e "{_SYNC_REPO}"' in err
-    assert f'git -C "{_SYNC_REPO}"' in err
+    assert result["ok"] is True
+    flat = script.replace("\\", "")
+    assert '"-e"' in flat
+    assert dep_sync.__name__ not in flat
+    assert "dep_sync.py" not in flat
 
 
 @pytest.mark.asyncio
@@ -1099,6 +1072,39 @@ async def test_sync_runs_every_step_when_nothing_is_locked():
     labels = _steps_from_script(script)
     assert "pip install" in labels
     assert "Pull" in labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked", [[], [r"C:\repo\.venv\Scripts\kirocrew.exe"]],
+                         ids=["reinstall-branch", "substitute-branch"])
+async def test_sync_refuses_a_venv_that_serves_another_checkout(locked):
+    """The refusal covers BOTH install paths, and refuses before either runs.
+
+    `<repo>/.venv` is only where the interpreter was found; it can be an install
+    of a different checkout, and `pip install -e .` would then silently repoint
+    that editable install at this repo — so the OTHER checkout's gateway becomes
+    this code on its next restart. The dependency-only path has always refused
+    this; the reinstall path did not, which left the safer path as the only
+    guarded one. Parametrized over both branches because that asymmetry is
+    exactly the bug: a fix that only covers the one it was found on is not one.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
+
+    with patch.object(
+        dep_sync,
+        "venv_not_mapped_to",
+        return_value="the target venv imports this project from /other/checkout",
+    ):
+        result, script = await _run_sync(mod, locked)
+
+    assert result["ok"] is False
+    assert "/other/checkout" in result["error"]
+    # Remedy-first, like every other refusal on this endpoint.
+    assert "own editable install" in result["error"]
+    # Nothing ran: no fetch, no merge, no install. A refusal after the merge
+    # would leave the checkout moved with its dependencies unresolved.
+    assert script is None
 
 
 @pytest.mark.asyncio
@@ -1246,12 +1252,22 @@ async def test_worktree_remove_force_must_be_bool():
 # --- sync single-flight (409 on busy) ---
 @pytest.mark.asyncio
 async def test_sync_returns_409_when_already_running():
+    import asyncio
+
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
-    # Inject a fake running sync
+    # Inject a fake running sync with a live task + process
     mod._SYNC_RID = "fake123"
     async with mod._RUNS_LOCK:
         mod._RUNS["fake123"] = {"status": "running", "exit_code": None, "label": "sync", "output": []}
+
+    # Simulate a genuinely-running process (returncode=None)
+    from unittest.mock import MagicMock
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    never_done = asyncio.get_event_loop().create_future()
+    running_task = asyncio.ensure_future(never_done)
+    mod._ACTIVE_RUNS["fake123"] = (running_task, mock_proc)
 
     try:
         result = await mod._sync()
@@ -1261,6 +1277,9 @@ async def test_sync_returns_409_when_already_running():
         async with mod._RUNS_LOCK:
             del mod._RUNS["fake123"]
         mod._SYNC_RID = None
+        mod._ACTIVE_RUNS.pop("fake123", None)
+        never_done.set_result(None)
+        await running_task
 
 
 # --- redaction ---
@@ -1372,9 +1391,18 @@ def test_build_pending_false_when_dist_missing():
         mod._START_EPOCH = original_start
 
 
-# --- sync_run_id exposed in fleet response ---
+# --- run pointers are NOT baked into the cached snapshot ---
 @pytest.mark.asyncio
-async def test_fleet_includes_sync_run_id():
+async def test_fleet_build_does_not_bake_run_pointers():
+    """`_build_fleet` must leave the run pointers to the request-time overlay.
+
+    The snapshot it returns is cached and served stale-while-revalidate, so a
+    pointer written here is a frozen answer to a live question: a run started
+    after the build would be invisible until the cache turned over, which is the
+    "no progress, press it again" bug. `_with_live_run_pointers` owns both
+    pointers; this pins that there is only one owner, so a future edit cannot
+    quietly reintroduce a second, staler one.
+    """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
     mod._SYNC_RID = "test-rid-abc"
@@ -1391,7 +1419,8 @@ async def test_fleet_includes_sync_run_id():
              patch.object(mod, "_load_cfg", return_value=None), \
              patch.object(mod, "_build_pending", return_value=False):
             data = await mod._build_fleet()
-        assert data["sync_run_id"] == "test-rid-abc"
+        assert "sync_run_id" not in data
+        assert all("provision_run_id" not in w for w in data["worktrees"])
         assert "build_pending" in data
     finally:
         mod._SYNC_RID = None
@@ -1415,53 +1444,25 @@ async def test_fleet_includes_build_pending():
 
 
 # --- provision_run_id exposed in fleet response (reattach after reload) ---
-def _fleet_patches(stack, worktrees):
-    """Patch the fleet-build collaborators shared by the provision-id tests."""
-    stack.enter_context(patch.object(
-        mod, "_discover_worktrees", new_callable=AsyncMock, return_value=worktrees))
-    stack.enter_context(patch.object(mod, "_git_info", new_callable=AsyncMock, return_value={
-        "branch": "b", "head": "abc1234", "dirty": False,
-        "ahead": 0, "behind": 0, "last_updated_at": None,
-    }))
-    stack.enter_context(patch.object(
-        mod, "_pr_status_cached", new_callable=AsyncMock, return_value=None))
-    stack.enter_context(patch.object(
-        mod, "_git_ahead", new_callable=AsyncMock, return_value=0))
-    stack.enter_context(patch.object(
-        mod, "_context_cached", new_callable=AsyncMock,
-        return_value={"issues": [], "tickets": [], "summary": None}))
-    stack.enter_context(patch.object(mod, "_load_cfg", return_value=None))
-    stack.enter_context(patch.object(mod, "_build_pending", return_value=False))
-    stack.enter_context(patch.object(mod, "_POD_IMPORTED", False))
-
-
+# --- provision run-id selection (what a reloaded page can reattach to) ---
+# These pin the SELECTION semantics at their owning unit rather than through a
+# fleet build: the pointer reaches the payload via the request-time overlay
+# (`_with_live_run_pointers`), which
+# `test_fleet_handler_overlays_runs_started_after_snapshot` covers.
 @pytest.mark.asyncio
-async def test_fleet_exposes_provision_run_id_for_running_and_failed_runs():
-    wts = [
-        {"path": "/fake/wt-running", "head": "abc1234", "branch": "f/run", "is_main": False},
-        {"path": "/fake/wt-failed", "head": "abc1234", "branch": "f/fail", "is_main": False},
-    ]
+async def test_provision_reattach_ids_expose_running_and_failed_runs():
     with patch.dict(mod._PROVISION_INFLIGHT, {
         "wt-running": "rid-running", "wt-failed": "rid-failed",
     }, clear=True), patch.dict(mod._RUNS, {
         "rid-running": {"status": "running", "exit_code": None, "output": []},
         "rid-failed": {"status": "done", "exit_code": 1, "output": []},
     }, clear=True):
-        with ExitStack() as stack:
-            _fleet_patches(stack, wts)
-            data = await mod._build_fleet()
-    by_name = {w["name"]: w for w in data["worktrees"]}
-    assert by_name["wt-running"]["provision_run_id"] == "rid-running"
-    assert by_name["wt-failed"]["provision_run_id"] == "rid-failed"
+        rids = await mod._provision_reattach_ids()
+    assert rids == {"wt-running": "rid-running", "wt-failed": "rid-failed"}
 
 
 @pytest.mark.asyncio
-async def test_fleet_omits_provision_run_id_for_successful_and_evicted_runs():
-    wts = [
-        {"path": "/fake/wt-ok", "head": "abc1234", "branch": "f/ok", "is_main": False},
-        {"path": "/fake/wt-gone", "head": "abc1234", "branch": "f/gone", "is_main": False},
-        {"path": "/fake/main", "head": "abc1234", "branch": "main", "is_main": True},
-    ]
+async def test_provision_reattach_ids_omit_successful_and_evicted_runs():
     with patch.dict(mod._PROVISION_INFLIGHT, {
         # Success: nothing to reattach — the fleet row shows the built state.
         "wt-ok": "rid-ok",
@@ -1470,11 +1471,8 @@ async def test_fleet_omits_provision_run_id_for_successful_and_evicted_runs():
     }, clear=True), patch.dict(mod._RUNS, {
         "rid-ok": {"status": "done", "exit_code": 0, "output": []},
     }, clear=True):
-        with ExitStack() as stack:
-            _fleet_patches(stack, wts)
-            data = await mod._build_fleet()
-    for w in data["worktrees"]:
-        assert w["provision_run_id"] is None, w["name"]
+        rids = await mod._provision_reattach_ids()
+    assert rids == {}
 
 
 # --- SEL audit on mutations (Codex R17) ---
@@ -2589,7 +2587,7 @@ async def test_sync_unresolved_git_names_override_not_path(monkeypatch):
          patch.object(mod, "_venv_python",
                       return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: None), \
-         patch.object(mod, "_write_locked_console_scripts", return_value=[]):
+         patch.object(mod.dep_sync, "locked_console_scripts", return_value=[]):
         mod._SYNC_RID = None
         res = await mod._sync()
     assert res["ok"] is False
@@ -5618,6 +5616,39 @@ async def test_hmac_invalid_signature_denial_is_audited(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_startup_skips_background_tasks_when_disabled(monkeypatch):
+    """``dev_fleet_startup`` must not start the refresher/reaper/warm tasks
+    when background tasks are disabled, so tests that boot the real app via
+    ``create_app()`` (e.g. the HMAC tests above) never drag in a live network
+    ``git fetch``. See issue #1832: an unstubbed ``_status_refresher`` leaked
+    into unrelated tests and flaked ``Gateway Tests (macOS)``."""
+    monkeypatch.setattr(mod, "_load_app_secret", lambda: "sekrit")
+    monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: True)
+    app = mod.create_app()
+    async with TestClient(TestServer(app)):
+        assert mod._refresher_task is None
+        assert mod._reaper_task is None
+        assert mod._warm_task is None
+
+
+@pytest.mark.asyncio
+async def test_startup_starts_background_tasks_when_enabled(monkeypatch):
+    """The opposite of the above: with the gate off (production default),
+    startup still creates all three background tasks."""
+    monkeypatch.setattr(mod, "_load_app_secret", lambda: "sekrit")
+    monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: False)
+    monkeypatch.setattr(mod, "_upstream_remote", AsyncMock(return_value="origin"))
+    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
+    monkeypatch.setattr(mod, "_fleet_refresh", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "_auto_prune_reaper", AsyncMock(return_value=None))
+    app = mod.create_app()
+    async with TestClient(TestServer(app)):
+        assert mod._refresher_task is not None
+        assert mod._reaper_task is not None
+        assert mod._warm_task is not None
+
+
+@pytest.mark.asyncio
 async def test_prunable_merged_unverified_when_oid_lookup_fails():
     """OID verification unavailable -> never a prune candidate (preview must
     match the removal path, which would refuse anyway)."""
@@ -6649,6 +6680,85 @@ async def test_prune_run_deduplicates_names(reset_prune_state):
     assert len(st["results"]) == 2
     # completed batch never leaves a finished name in ``current``
     assert st["current"] is None
+
+
+@pytest.mark.asyncio
+async def test_prune_run_processes_force_only_names(reset_prune_state):
+    """A force-override on a kept worktree arrives in ``force_names`` disjoint
+    from ``names``. It must still be processed and counted: absent from the
+    work list, its ``done`` bump would have no denominator or item row,
+    producing the impossible ``1/0`` counter (and a false failure toast). The
+    forced item also skips the prunable-verdict recheck — ``_prunable`` is
+    never consulted for it."""
+    prunable_calls: list[str] = []
+    removed: list[str] = []
+
+    async def fake_find(nm):
+        return {"path": f"/wt/{nm}", "branch": f"feat/{nm}"}, None
+
+    async def fake_prunable(path, branch):
+        prunable_calls.append(path)
+        return {"ok": True, "code": "merged"}
+
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
+        removed.append(nm)
+        return {"ok": True, "removed": True}
+
+    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
+         patch.object(mod, "_prunable", side_effect=fake_prunable), \
+         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
+         patch.object(mod, "_staged_target", return_value=None), \
+         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
+        # No regular candidates; a single kept worktree via force-override.
+        r = await mod._prune_run([], force_names={"wt-kept"})
+        assert r == {"ok": True, "total": 1}
+        await _await_prune_idle()
+
+    st = await mod._prune_status()
+    # The forced worktree is in the denominator, has an item row, and is done.
+    assert st["total"] == 1 and st["done"] == 1
+    assert set(st["items"]) == {"wt-kept"}
+    assert st["items"]["wt-kept"]["status"] == "done"
+    assert removed == ["wt-kept"]
+    # Forced items bypass the prunable verdict recheck entirely.
+    assert prunable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_prune_run_unions_regular_and_forced_names(reset_prune_state):
+    """A mixed batch (regular candidates + a forced kept worktree) processes
+    the order-preserving union: every name is counted and removed exactly
+    once, and only the non-forced names go through the prunable recheck."""
+    prunable_paths: list[str] = []
+    removed: list[str] = []
+
+    async def fake_find(nm):
+        return {"path": f"/wt/{nm}", "branch": f"feat/{nm}"}, None
+
+    async def fake_prunable(path, branch):
+        prunable_paths.append(path)
+        return {"ok": True, "code": "merged"}
+
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
+        removed.append(nm)
+        return {"ok": True, "removed": True}
+
+    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
+         patch.object(mod, "_prunable", side_effect=fake_prunable), \
+         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
+         patch.object(mod, "_staged_target", return_value=None), \
+         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
+        r = await mod._prune_run(["wt-a", "wt-b"], force_names={"wt-forced"})
+        assert r == {"ok": True, "total": 3}
+        await _await_prune_idle()
+
+    st = await mod._prune_status()
+    assert st["total"] == 3 and st["done"] == 3
+    assert set(st["items"]) == {"wt-a", "wt-b", "wt-forced"}
+    assert all(it["status"] == "done" for it in st["items"].values())
+    assert sorted(removed) == ["wt-a", "wt-b", "wt-forced"]
+    # Only the two regular candidates go through the verdict recheck.
+    assert sorted(prunable_paths) == ["/wt/wt-a", "/wt/wt-b"]
 
 
 @pytest.mark.asyncio

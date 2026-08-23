@@ -17,7 +17,13 @@ from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
-from kiro_crew.agent import AGENT_FILENAME, get_shipped_tools, install_agent, kiro_agents_dir_path
+from kiro_crew.agent import (
+    AGENT_FILENAME,
+    clear_model_pin,
+    get_shipped_tools,
+    install_agent,
+    kiro_agents_dir_path,
+)
 from kiro_crew.agent_discovery import (
     clear_list_agents_cache,
     list_agents,
@@ -55,6 +61,7 @@ from kiro_crew.dashboard.handlers._shared import (
     apply_skill_mapping,
 )
 from kiro_crew.dashboard.handlers.discover import _redact_external
+from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
@@ -116,6 +123,42 @@ def _sel():
     return _pkg.sel()
 
 
+async def _require_owner(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate shared by every mutating handler in this module.
+
+    ``~/.kiro/agents`` and ``cfg.agents`` are machine-global: a write there
+    installs tool grants and MCP server commands that later sessions execute,
+    so mutations are owner-only — the same server-side boundary
+    ``mcp_apps.api_mcp_apps_call`` enforces. The caller identity comes from
+    the token-auth middleware (``request["user"]`` / ``request["app"]``),
+    never from a client-set header. Returns the 403 to send, or ``None`` when
+    the caller is the owner.
+    """
+    if is_owner_dashboard_request(request):
+        return None
+    # Off the loop: the FIRST sel() of a process CONSTRUCTS the log — trust-dir
+    # creation, key validation, and on Windows an icacls subprocess — so on a
+    # fresh gateway whose first mutating request is non-owner this would stall
+    # every other request. Same reasoning as connections._audit_started.
+    caller = str(request.get("user") or "unknown")
+    try:
+        await asyncio.to_thread(
+            lambda: _sel().log_api_access(
+                caller=caller,
+                operation=operation,
+                outcome="denied",
+                source="dashboard",
+                resources="non_owner_block",
+            )
+        )
+    except Exception:  # pragma: no cover — audit must never change the outcome
+        logger.debug("SEL audit for non-owner %s failed", operation, exc_info=True)
+    return web.json_response(
+        {"error": "owner authorization required", "code": "owner_only"},
+        status=403,
+    )
+
+
 # ── Agent Config ──
 
 
@@ -157,6 +200,9 @@ async def api_agent_config(request: web.Request) -> web.Response:
     agent_config_path = installed_path if installed_path.is_file() else defaults_path
 
     if request.method == "PUT":
+        denied = await _require_owner(request, "agent_config.write")
+        if denied is not None:
+            return denied
         try:
             body = await request.json()
         except Exception:
@@ -237,6 +283,9 @@ async def api_default_agent(request: web.Request) -> web.Response:
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
     if request.method == "PUT":
+        denied = await _require_owner(request, "default_agent.write")
+        if denied is not None:
+            return denied
         try:
             body = await request.json()
         except Exception:
@@ -390,6 +439,9 @@ async def api_capability_mcp_list(request: web.Request) -> web.Response:
 
 async def api_capability_mcp_install(request: web.Request) -> web.Response:
     """POST /api/capability/mcp/install — install an MCP server via the capability manager."""
+    denied = await _require_owner(request, "capability_mcp_install")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -423,6 +475,9 @@ async def api_capability_mcp_install(request: web.Request) -> web.Response:
 
 async def api_capability_mcp_uninstall(request: web.Request) -> web.Response:
     """POST /api/capability/mcp/uninstall — uninstall an MCP server via the capability manager."""
+    denied = await _require_owner(request, "capability_mcp_uninstall")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -472,6 +527,9 @@ async def api_capability_skills_install(request: web.Request) -> web.Response:
     edition's capability manager (no Amazon-internal version-set field is
     exposed on the public API).
     """
+    denied = await _require_owner(request, "capability_skills_install")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -499,6 +557,9 @@ async def api_capability_skills_install(request: web.Request) -> web.Response:
 
 async def api_capability_skills_uninstall(request: web.Request) -> web.Response:
     """POST /api/capability/skills/uninstall — uninstall a skill package."""
+    denied = await _require_owner(request, "capability_skills_uninstall")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -535,6 +596,11 @@ async def _mutate_agent_package(request: web.Request, *, install: bool) -> web.R
     same seam: an allowlist on the name BEFORE it leaves core, ``_redact_external``
     on the manager's message, and an explicit SEL line naming the package.
     """
+    denied = await _require_owner(
+        request, f"capability_agent_{'install' if install else 'uninstall'}"
+    )
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -620,6 +686,9 @@ async def api_capability_plugins_list(request: web.Request) -> web.Response:
 
 async def api_capability_plugins_sync(request: web.Request) -> web.Response:
     """POST /api/capability/plugins/sync — reconcile plugins with agent packages."""
+    denied = await _require_owner(request, "capability_plugins_sync")
+    if denied is not None:
+        return denied
     mgr = _capability_manager()
     if not mgr.available():
         return web.json_response({"error": _CAPABILITY_UNAVAILABLE}, status=503)
@@ -1203,6 +1272,10 @@ async def api_slash_commands(request: web.Request) -> web.Response:
 async def api_agent_detail(request: web.Request) -> web.Response:
     """GET/DELETE/PATCH /api/agents/detail/{name} — view, delete, or update agent config."""
     name = request.match_info["name"]
+    if request.method != "GET":
+        denied = await _require_owner(request, f"agent_detail.{request.method.lower()}")
+        if denied is not None:
+            return denied
     # Parse body early so JSONDecodeError returns 400, not 404 from the file loop.
     patch_body = None
     if request.method == "PATCH":
@@ -1365,10 +1438,12 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                             # provider id at the config.loader factory boundary.
                             data["model"] = patch_body["model"] or None
                             if data["model"] is None:
-                                data.pop("model", None)
                                 # Cleared/auto: resume tracking the shipped
                                 # default (re-synced by _refresh_dynamic_fields).
-                                agent_state.set_model_managed(agent_name, True)
+                                # Shared with `kirocrew agent reset-model` so the
+                                # two surfaces cannot disagree on what clearing a
+                                # model means.
+                                clear_model_pin(data, agent_name)
                             else:
                                 # Explicit pick: freeze it against default bumps.
                                 agent_state.set_model_managed(agent_name, False)
@@ -1544,6 +1619,9 @@ def _get_config_lock() -> asyncio.Lock:
 
 async def api_kirocrew_agents_sync(request: web.Request) -> web.Response:
     """POST /api/agents/sync — auto-sync AIM-installed agents into config.json."""
+    denied = await _require_owner(request, "agents.sync")
+    if denied is not None:
+        return denied
     async with _get_config_lock():
         return await _do_agents_sync(request)
 
@@ -1699,9 +1777,70 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     )
 
 
+def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
+    """Reason a crew's model pin is unusable, or ``None`` to allow it.
+
+    An agent's ``model`` is read by kiro-cli when the child starts, so a pin the
+    account cannot serve kills every session and subagent using that agent
+    seconds after spawn, before anything can inspect it. Rejecting it here — at
+    the one moment a human is looking at the value — turns that into a single
+    message on the surface that authored it.
+
+    *provider* is passed in rather than resolved here so this whole path adds no
+    config read of its own: every caller already holds a loaded config, and
+    ``KiroCrewConfig.load()`` deep-copies the validated dict even on a cache
+    hit — work that must not land on the event loop while the config lock is
+    held. It is forwarded to the validator for the same reason.
+
+    A known wrong-flavour registry spelling is reported before entitlement: a
+    live advertised set would otherwise replace the actionable ACP-id mapping
+    with a generic "not available" error. All other values delegate to the
+    per-role validator so the crew form, the role pins and the session-init
+    withhold apply one predicate. ``""``/``"auto"`` mean inherit and always
+    pass; an unknown advertised set means entitlement is unknowable, and the
+    validator accepts rather than accusing on no evidence.
+    """
+    # The retained claude_code seam accepts canonical and registered Bedrock
+    # wire ids that the ACP correction and advertised-id comparison below
+    # intentionally map away from. Its entitlement guard lives in its own
+    # provider path, where full configured ids and bare advertised ids can be
+    # canonicalized before comparison.
+    if provider == "claude_code":
+        return None
+
+    # The registry knows each model under several spellings and only one is what
+    # kiro-cli serves; the others reach the child verbatim and kill it at startup.
+    # Check this before live entitlement because a wrong-flavour id is naturally
+    # absent from that set and would otherwise produce a less actionable error.
+    correction = model_registry.acp_id_correction(model)
+    if correction:
+        # Deliberately NOT prescriptive. Upstream naming does not line up across
+        # providers — Bedrock's ``claude-opus-4-8`` is the registry's
+        # ``claude-opus-4.5``, while ``claude-opus-4-8[1m]`` is ``claude-opus-4.8``
+        # — so a user who typed the Bedrock spelling meaning "Opus 4.8" may not
+        # want the id this maps to. Telling them to adopt it would steer a
+        # plausible-intent user into a quieter capability change than the one
+        # they asked for. Report the mapping, show what is actually served, and
+        # let them choose.
+        served = ", ".join(model_registry.available_models("acp")[:8]) or "auto"
+        return (
+            f"{model!r} is not a model kiro-cli serves. The registry maps that "
+            f"spelling to {correction!r} — confirm that is the model you want, or "
+            f"pick one of: {served}, or 'auto'."
+        )
+    # circular import: handlers.core resolves _get_config_lock from this module,
+    # so importing it at module scope would close the cycle.
+    from kiro_crew.dashboard.handlers.core import _validate_role_model
+
+    return _validate_role_model(model, request, provider=provider)
+
+
 async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
     """POST /api/agents — create a new KiroCrew agent."""
 
+    denied = await _require_owner(request, "agent.create")
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:
@@ -1761,19 +1900,25 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             name,
             kiro_agent,
         )
+    # Passed RAW, not str()-coerced: normalize_agent_model is total and maps a
+    # non-string to "" (inherit). Wrapping in str() first would turn
+    # {"model": 123} into the literal "123", which normalizes to a string the
+    # backend then rejects as an unknown model id.
+    model = normalize_agent_model(body.get("model"))
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name in cfg.agents:
             return web.json_response({"error": f"Agent '{name}' already exists"}, status=409)
+        model_reason = _model_pin_rejected(model, request, cfg.agent.provider)
+        if model_reason:
+            return web.json_response(
+                {"error": model_reason, "code": "invalid_model"}, status=400
+            )
         cfg.agents[name] = KiroCrewAgentConfig(
             kiro_agent=kiro_agent,
             workspace=body.get("workspace", "default"),
             memory_store=body.get("memory_store", "default"),
-            # Passed RAW, not str()-coerced: normalize_agent_model is total and
-            # maps a non-string to "" (inherit). Wrapping in str() first would
-            # turn {"model": 123} into the literal "123", which normalizes to a
-            # string the backend then rejects as an unknown model id.
-            model=normalize_agent_model(body.get("model")),
+            model=model,
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
@@ -1792,15 +1937,28 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
 async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
     """PUT /api/agents/{name} — update a KiroCrew agent."""
 
+    denied = await _require_owner(request, "agent.update")
+    if denied is not None:
+        return denied
     name = request.match_info["name"]
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    if "model" in body:
+        pending_model = normalize_agent_model(body["model"])
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name not in cfg.agents:
             return web.json_response({"error": f"Agent '{name}' not found"}, status=404)
+        if "model" in body:
+            # Validated before the write, reusing the config loaded just above so
+            # this costs no extra read.
+            model_reason = _model_pin_rejected(pending_model, request, cfg.agent.provider)
+            if model_reason:
+                return web.json_response(
+                    {"error": model_reason, "code": "invalid_model"}, status=400
+                )
         agent = cfg.agents[name]
         changed: list[str] = []
         if "kiro_agent" in body:
@@ -1841,6 +1999,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
 async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
     """DELETE /api/agents/{name} — delete a KiroCrew agent."""
 
+    denied = await _require_owner(request, "agent.delete")
+    if denied is not None:
+        return denied
     name = request.match_info["name"]
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()

@@ -1,11 +1,12 @@
 import { X, Loader2 } from 'lucide-react'
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { useZoomCtx } from '../../hooks/ZoomProvider'
+import type { FontFamily } from '../../hooks/useZoom'
 import { useTheme } from '../../hooks/useTheme'
 import type { ColorTheme } from '../../hooks/useTheme'
 import { useUIMode } from '../../hooks/useUIMode'
-import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput } from '../../components/settings'
+import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput, SettingsCombobox } from '../../components/settings'
 import SimpleSelect from '../../components/SimpleSelect'
 import { Input } from '../../components/ui'
 import { useThemeEditor, ThemeEditorPanel } from '../../components/themeEditor'
@@ -27,6 +28,9 @@ import {
   setTerminalFontSize,
   DEFAULT_TERMINAL_FONT_SIZE,
 } from '../../hooks/useTerminalFont'
+import { FONT_FAMILY_OPTIONS, OPENDYSLEXIC_MONO_FAMILY_NAME } from '../../utils/fontFamilyOptions'
+import { useFontOptions } from '../../hooks/useFontOptions'
+import { isFontInstalled, monospaceFontStack } from '../../utils/fontDetect'
 
 import { i18nT } from '../../i18n/t'
 import { ThemeDroppedRulesNotice } from './ThemeDroppedRulesNotice'
@@ -73,6 +77,61 @@ export function DisplayPanel() {
   const { uiMode, setUIMode } = useUIMode()
   const editor = useThemeEditor()
   const termFont = useTerminalFont()
+  // Probed families become picker rows previewed in their own family, so the
+  // Powerline sample answers "will my prompt theme render" before the choice is
+  // committed. The default row's value is the empty string the store already uses
+  // for "no explicit family" — see useTerminalFont.
+  const { families: fontFamilies, accessSupported: fontAccessSupported, lastResult: fontDetectResult, enumerate: enumerateFonts } = useFontOptions()
+  // The row's own name, rendered in its own family, IS the preview. No specimen
+  // string beside it: a 5-glyph sample is the part a reader would have to
+  // scrutinise, yet it sits in the sublabel slot the component styles as
+  // recede-into-the-background metadata — and the trigger folds a sublabel into
+  // "<family> (<sample>)" once a font is picked.
+  const fontPreview = (family: string) => ({
+    previewFontFamily: monospaceFontStack(family),
+  })
+  // Only the font names are memoized. The default row's label is a CATALOG
+  // string, and caching one across renders is what makes it stick in the wrong
+  // language: i18next resolves its resources after the first paint, so a label
+  // captured in a memo keeps the English fallback that first render returned and
+  // no dep change ever invalidates it. Resolved inline instead, like the
+  // description beside it.
+  const fontRows = useMemo(
+    () => fontFamilies.map(family => ({ value: family, label: family, ...fontPreview(family) })),
+    [fontFamilies],
+  )
+  // The bundled OpenDyslexicMono row sits between the Default row and the OS-
+  // detected list. Always selectable regardless of what Local Font Access
+  // reports, because the browser has the family loaded from the page's own
+  // @font-face declaration. Users who pick OpenDyslexic for the dashboard can
+  // apply OpenDyslexicMono to the terminal without having to type the family
+  // name. A future bundled mono face becomes a second inlined row.
+  const fontOptions = [
+    { value: '', label: i18nT('pages.settings.displayPanel.terminal_font_default') },
+    {
+      value: OPENDYSLEXIC_MONO_FAMILY_NAME,
+      label: OPENDYSLEXIC_MONO_FAMILY_NAME,
+      ...fontPreview(OPENDYSLEXIC_MONO_FAMILY_NAME),
+    },
+    ...fontRows,
+  ]
+  // A literal key per branch, never an assembled one: a key built from parts is
+  // invisible to the catalog reference scanner, so a missing translation would
+  // ship as a raw identifier instead of failing the gate.
+  //
+  // `added` reports too, even though the list grows: the user most likely to run
+  // this action is the one whose filter matched nothing, and a filter that also
+  // hides every newly added family leaves the popup pixel-identical after a
+  // permission grant — which reads as the grant having failed.
+  const fontDetectStatus = fontDetectResult === 'checking'
+    ? i18nT('pages.settings.displayPanel.terminal_font_detect_checking')
+    : fontDetectResult === 'added'
+      ? i18nT('pages.settings.displayPanel.terminal_font_detect_added')
+      : fontDetectResult === 'denied'
+        ? i18nT('pages.settings.displayPanel.terminal_font_detect_denied')
+        : fontDetectResult === 'none'
+          ? i18nT('pages.settings.displayPanel.terminal_font_detect_none')
+          : undefined
 
   const dispatch = useAppDispatch()
   const { paletteColors: colors, colorMode, paletteName, intensity, boost } = useSessionPalette()
@@ -255,27 +314,50 @@ export function DisplayPanel() {
             </div>
           )}
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.font_family')} description={i18nT('pages.settings.displayPanel.ui_font_family_for_the_dashboard_code_font_follo')} value={family}
-            options={[{ value: 'sans', label: 'Sans' }, { value: 'mono', label: 'Mono' }, { value: 'system', label: 'System' }]}
-            onChange={v => setFontFamily(v as 'sans' | 'mono' | 'system')} />
+            options={FONT_FAMILY_OPTIONS.map(o => ({ value: o.value, label: o.labelKey ? i18nT(o.labelKey) : o.label! }))}
+            onChange={v => setFontFamily(v as FontFamily)} />
         </SettingsCard>
       </SettingsSection>
 
       <SettingsSection title={i18nT('pages.settings.displayPanel.terminal')}>
         <SettingsCard index={2}>
-          {/* Free-text family: the browser cannot enumerate OS-installed fonts, so
-              the user names the font (a monospace / Nerd Font they have installed).
+          {/* Detected families, not free text alone: the fonts that matter are the
+              ones installed on the machine RENDERING the terminal, which is the
+              browser's machine — xterm rasterizes client-side while the pty lives on
+              the gateway host, so a host-side enumeration would list the wrong
+              computer whenever the dashboard is reached over a tunnel. Hence probing
+              in the browser (see useFontOptions), with the typed value still
+              committable because the probe can only confirm names it is handed.
               resolveTerminalFontFamily quotes multi-word names and appends a
               monospace fallback, and the change is pushed live onto open terminals
-              by CliPanel's font subscription. No placeholder or unit suffix: a raw
-              font stack / "px" is Latin the en-XA i18n-render gate flags as
-              untranslated, and neither is translatable copy that could be a catalog
-              value — the descriptions carry the guidance and the unit instead. */}
-          <SettingsInput
+              by CliPanel's font subscription. */}
+          <SettingsCombobox
             label={i18nT('pages.settings.displayPanel.terminal_font_family')}
             description={i18nT('pages.settings.displayPanel.terminal_font_family_desc')}
             value={termFont.fontFamily}
+            options={fontOptions}
             onChange={setTerminalFontFamily}
-            aria-label={i18nT('pages.settings.displayPanel.terminal_font_family')}
+            triggerFallback={termFont.fontFamily || i18nT('pages.settings.displayPanel.terminal_font_default')}
+            searchPlaceholder={i18nT('pages.settings.displayPanel.terminal_font_search')}
+            customValueOption={typed => (isFontInstalled(typed)
+              ? {
+                label: i18nT('pages.settings.displayPanel.terminal_font_use_typed', { value: typed }),
+                ...fontPreview(typed),
+              }
+              // No preview for a name that did not resolve. Styling the sample
+              // with an uninstalled family renders it in the fallback, which is
+              // indistinguishable from a confirmed font — the row would quietly
+              // confirm a typo, which is the failure this picker exists to end.
+              // Still committable: the family may be installed later, or on
+              // another machine this preference is not synced to.
+              : {
+                label: i18nT('pages.settings.displayPanel.terminal_font_use_typed', { value: typed }),
+                sublabel: i18nT('pages.settings.displayPanel.terminal_font_not_detected'),
+              })}
+            action={fontAccessSupported
+              ? { label: i18nT('pages.settings.displayPanel.terminal_font_detect'), onSelect: enumerateFonts }
+              : undefined}
+            actionStatus={fontDetectStatus}
           />
           <SettingsStepper
             label={i18nT('pages.settings.displayPanel.terminal_font_size')}

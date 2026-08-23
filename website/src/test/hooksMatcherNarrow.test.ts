@@ -12,7 +12,7 @@ describe('HooksPage matcher field at narrow pane widths', () => {
     // The shared Input is `flex-1 min-w-0` (flex-basis: 0%), so its hypothetical
     // main size is zero and flex line-breaking keeps every non-shrinking sibling
     // on line 1 -- the field absorbs the whole shortfall (45px at a 360px pane).
-    const m = s.match(/<Input className="([^"]*)" placeholder=\{isToolHook/)
+    const m = s.match(/<Input className="([^"]*)" placeholder=\{matcherPlaceholder/)
     expect(m, 'the matcher Input must carry a basis override').not.toBeNull()
     expect(m![1], 'expected a full line while narrow').toContain('basis-full')
     expect(m![1], 'expected intrinsic sizing above the breakpoint').toContain('sm:basis-auto')

@@ -501,6 +501,34 @@ class TestTTLExpiration:
 
         mgr._schedule_replenish.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_claim_ttl_discard_logs_info_dead_keeps_warning(self, caplog):
+        """#4052: the claim path follows the same severity rule as the health
+        sweep — a TTL recycle of a healthy provider is INFO, one that also died
+        before aging out keeps WARNING. Both are still discarded."""
+        import logging
+
+        mgr, _ = _make_manager(pool_agent="kirocrew", pool_ttl_secs=60)
+        stale = _make_provider()
+        stale.is_process_alive = MagicMock(return_value=True)
+        stale_dead = _make_provider()
+        stale_dead.is_process_alive = MagicMock(return_value=False)
+        mgr._warm_pool.put_nowait((stale, time.monotonic() - 120))
+        mgr._warm_pool.put_nowait((stale_dead, time.monotonic() - 120))
+
+        with patch("kiro_crew.session._sync_kill_provider"):
+            with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
+                result = await mgr._drain_and_claim("kirocrew")
+
+        assert result is None
+        ttl_records = [
+            r for r in caplog.records if str(r.msg).startswith("Warm pool: %.0fs old provider")
+        ]
+        # FIFO claim order: healthy-stale first (INFO), dead-stale second (WARNING).
+        assert [r.levelname for r in ttl_records] == ["INFO", "WARNING"]
+        stale.shutdown.assert_awaited_once()
+        stale_dead.shutdown.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # Model-matches-pool-default bypass (effective_model normalization)
@@ -1332,7 +1360,22 @@ class TestDiscardReaping:
         wedged.shutdown = _never_returns
         self._expired_entry(mgr, wedged)
 
-        with patch("kiro_crew.session._sync_kill_provider") as mock_kill:
+        # Give the hard-kill offload a PRIVATE executor. Production dispatches it
+        # to `subprocess_executor()`, a process-wide 8-worker singleton shared by
+        # every test in this xdist worker, and a started run_in_executor future
+        # cannot be cancelled — so a sibling test holding those threads (a wedged
+        # PTY close, a real `taskkill` on Windows) makes this offload queue behind
+        # them. That queue wait is unbounded and is NOT covered by
+        # `_POOL_DISCARD_TIMEOUT`, so it could consume the 5s budget below and
+        # fail with a TimeoutError naming the wedged shutdown — the one thing this
+        # test had already bounded, to 0.05s. A dedicated executor keeps the
+        # assertion about escalation ordering instead of about the shared pool's
+        # spare capacity.
+        with ThreadPoolExecutor(max_workers=1) as private_executor, patch(
+            "kiro_crew.session._sync_kill_provider"
+        ) as mock_kill, patch(
+            "kiro_crew.session.subprocess_executor", return_value=private_executor
+        ):
             pooled = await asyncio.wait_for(mgr._drain_and_claim("kirocrew"), timeout=5)
 
         assert pooled is None
@@ -1351,6 +1394,45 @@ class TestDiscardReaping:
 
         survivor.shutdown.assert_awaited_once()
         mock_kill.assert_called_once_with(survivor)
+        assert mgr._warm_pool.qsize() == 0
+
+    @pytest.mark.asyncio
+    async def test_sweep_ttl_discard_logs_info_dead_provider_stays_warning(self, caplog):
+        """#4052: a scheduled TTL recycle of a healthy provider is the pool
+        working as designed, so its discard line is INFO. Both anomalies keep
+        WARNING: a provider that died before aging out (TTL line, dead process)
+        and the dead-provider branch below. All three are still reaped."""
+        import logging
+
+        mgr, _ = _make_manager(pool_agent="kirocrew", pool_ttl_secs=60)
+        stale = _make_provider()
+        stale.is_process_alive = MagicMock(return_value=True)
+        stale_dead = _make_provider()
+        stale_dead.is_process_alive = MagicMock(return_value=False)
+        dead = _make_provider()
+        dead.is_process_alive = MagicMock(return_value=False)
+        dead.exit_code = 9
+        mgr._warm_pool.put_nowait((stale, time.monotonic() - 120))
+        mgr._warm_pool.put_nowait((stale_dead, time.monotonic() - 120))
+        mgr._warm_pool.put_nowait((dead, time.monotonic()))
+
+        with patch("kiro_crew.session._sync_kill_provider"):
+            with caplog.at_level(logging.INFO, logger="kiro_crew.session"):
+                await mgr._sweep_warm_pool_once()
+
+        ttl_records = [
+            r for r in caplog.records if str(r.msg).startswith("Pool health: %.0fs old provider")
+        ]
+        dead_records = [
+            r for r in caplog.records if str(r.msg).startswith("Pool health: dead provider")
+        ]
+        # FIFO drain order: healthy-stale first (INFO), dead-stale second (WARNING).
+        assert [r.levelname for r in ttl_records] == ["INFO", "WARNING"]
+        assert [r.levelname for r in dead_records] == ["WARNING"]
+        # Severity-only: all three entries were still discarded and shut down.
+        stale.shutdown.assert_awaited_once()
+        stale_dead.shutdown.assert_awaited_once()
+        dead.shutdown.assert_awaited_once()
         assert mgr._warm_pool.qsize() == 0
 
     @pytest.mark.asyncio

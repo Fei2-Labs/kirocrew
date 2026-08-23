@@ -704,6 +704,15 @@ jobs:
             description="Eligible automated validation passed for this revision"
           fi
 
+          # Diagnostic-only: the lane arrays are only ever readable from
+          # $GITHUB_STEP_SUMMARY, which `gh run view --log` cannot query --
+          # so a run that publishes a wrong pending/failed verdict (e.g. a
+          # lane invisible under GITHUB_TOKEN but visible under a user token)
+          # can only be diagnosed by opening the summary UI by hand (#3550).
+          # Plain `echo` here lands in the job's own log instead, so
+          # `gh run view --log | grep 'pr-readiness: lane state'` finds it.
+          echo "pr-readiness: lane state -- passed=[${passed[*]:-}] pending=[${pending[*]:-}] failed=[${failed[*]:-}] skipped=[${skipped[*]:-}]"
+
           {
             echo "state=$state"
             echo "label=$label"

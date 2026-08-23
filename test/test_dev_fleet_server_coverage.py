@@ -974,8 +974,45 @@ async def test_fleet_handler_fresh_bypasses_cache(monkeypatch):
     monkeypatch.setattr(mod, "_fleet_refresh", refresh)
     monkeypatch.setattr(mod, "_fleet_cached", AsyncMock(return_value={"worktrees": []}))
     resp = await mod.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet?fresh=1"))
-    assert json.loads(resp.text)["worktrees"] == [{"name": "a"}]
+    # The row also carries the request-time `provision_run_id` overlay, which is
+    # authoritative: a provision that finished after the snapshot was built has
+    # no reattachable run, so the pointer must read None rather than the id the
+    # snapshot froze.
+    assert json.loads(resp.text)["worktrees"] == [{"name": "a", "provision_run_id": None}]
     refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fleet_handler_overlays_runs_started_after_snapshot(monkeypatch):
+    """A run started AFTER the cached snapshot was built is still reported.
+
+    The fleet cache is stale-while-revalidate, so a run pointer baked into the
+    snapshot left a freshly-mounted page with nothing to reattach its progress
+    stepper to for a full cache cycle plus a rebuild -- no progress, and a button
+    still inviting a second press. Both pointers share that cause: the sync's,
+    and each row's provision run.
+    """
+    cached = {
+        "worktrees": [
+            {"name": "main", "provision_run_id": None},
+            {"name": "feature-x", "provision_run_id": None},
+        ],
+        "sync_run_id": None,
+    }
+    monkeypatch.setattr(mod, "_fleet_cached", AsyncMock(return_value=cached))
+    monkeypatch.setattr(mod, "_SYNC_RID", "rid-after-snapshot")
+    monkeypatch.setattr(
+        mod, "_provision_reattach_ids", AsyncMock(return_value={"feature-x": "prov-rid-7"})
+    )
+    resp = await mod.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet"))
+    body = json.loads(resp.text)
+    assert body["sync_run_id"] == "rid-after-snapshot"
+    rows = {w["name"]: w["provision_run_id"] for w in body["worktrees"]}
+    assert rows == {"main": None, "feature-x": "prov-rid-7"}
+    # The snapshot and its rows are the cache's own objects, shared with every
+    # other in-flight request, so the overlay must copy rather than write through.
+    assert cached["sync_run_id"] is None
+    assert [w["provision_run_id"] for w in cached["worktrees"]] == [None, None]
 
 
 @pytest.mark.asyncio
@@ -1809,3 +1846,52 @@ async def test_worktree_detail_survives_pod_probe_failure(monkeypatch, tmp_path)
     assert detail["pod_running"] is False
     assert detail["disk_mb"] is None
     assert detail["commits"] == []
+
+
+def test_main_boots_platform_before_serving(monkeypatch):
+    """main() must install the platform context BEFORE create_app/run_app.
+
+    The app backend launches this module as its own subprocess, which inherits
+    no installed platform context. If it served without booting, the first read
+    of current_context() (e.g. the sandbox floor resolved while wrapping the
+    app's own git worktree scan) would raise on a non-standalone edition and the
+    error would surface verbatim in the UI. The ORDER is the invariant: boot
+    resolves the profile and installs the context, so create_app never runs
+    against a cold context.
+    """
+    calls: list[str] = []
+
+    def _fake_boot(_cfg):
+        calls.append("boot")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(mod, "boot_platform", _fake_boot)
+    monkeypatch.setattr(mod.KiroCrewConfig, "load", classmethod(lambda cls: SimpleNamespace()))
+    monkeypatch.setattr(mod, "create_app", lambda: calls.append("create_app") or MagicMock())
+    monkeypatch.setattr(mod.web, "run_app", lambda *a, **k: calls.append("run_app"))
+
+    assert mod.main() == 0
+    assert calls == ["boot", "create_app", "run_app"]
+
+
+def test_main_fails_closed_when_platform_cannot_compose(monkeypatch):
+    """A composition failure must ABORT main(), never serve a cold backend.
+
+    Mirrors the CLI entry point's fail-closed posture: a non-standalone profile
+    whose companion cannot compose must not fall through to serving the backend
+    with no security overlay.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+
+    def _boom(_cfg):
+        raise PlatformCompositionError("companion missing")
+
+    served: list[str] = []
+    monkeypatch.setattr(mod, "boot_platform", _boom)
+    monkeypatch.setattr(mod.KiroCrewConfig, "load", classmethod(lambda cls: SimpleNamespace()))
+    monkeypatch.setattr(mod, "create_app", lambda: served.append("create_app") or MagicMock())
+    monkeypatch.setattr(mod.web, "run_app", lambda *a, **k: served.append("run_app"))
+
+    with pytest.raises(PlatformCompositionError):
+        mod.main()
+    assert served == []

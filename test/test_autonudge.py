@@ -603,14 +603,26 @@ async def test_rearm_backoff_escalates_on_consecutive_failures(svc, monkeypatch)
     import kiro_crew.autonudge as _an
 
     sleep_calls: list[float] = []
+    real_sleep = asyncio.sleep
 
     async def _sleep(secs):
         sleep_calls.append(secs)
         if len(sleep_calls) >= 5:
             raise asyncio.CancelledError  # halt the chain; _timer returns cleanly
-        return None
+        # Yield, because the real asyncio.sleep always does. A double that
+        # returns without yielding lets every timer generation run back-to-back
+        # inside a single event-loop slice, which is not how the production
+        # chain is scheduled; the yield keeps the mock a faithful stand-in.
+        await real_sleep(0)
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    # Freeze the clock for the arm. add() anchors next_due_ts = now + idle_secs,
+    # then AWAITS an fsync of the state file before _arm_from_deadline re-reads
+    # time.time() to derive `remaining`. Unfrozen, the first delay is short by
+    # however long that write took (1.8s on a loaded shard), so the assertion
+    # below was really asserting that the runner never stalls between two
+    # statements. Frozen, `remaining` is exactly idle_secs.
+    monkeypatch.setattr(_an.time, "time", lambda: 1_000_000.0)
 
     async def on_fire_skip(loop):
         return False
@@ -630,7 +642,10 @@ async def test_rearm_backoff_escalates_on_consecutive_failures(svc, monkeypatch)
             break
         task = nxt
     # First sleep = (deadline-anchored) full idle; then exponential backoff per failure.
-    assert sleep_calls == [pytest.approx(10000, abs=1), 15, 30, 60, 120]
+    # Exact, not approx: the frozen clock makes the first delay deterministic,
+    # so a tolerance here would only hide a regression that reintroduces the
+    # wall-clock dependency.
+    assert sleep_calls == [10000, 15, 30, 60, 120]
     assert svc._loops[loop.id].active is True
     assert svc._rearm_fail_count[loop.id] == 4
     svc._cancel_timer(loop.id)

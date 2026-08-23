@@ -2,17 +2,28 @@ const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Me
 const Store = require("electron-store");
 const fs = require("fs");
 const os = require("os");
-const { spawn, execFile } = require("child_process");
+const { spawn, execFile, execFileSync } = require("child_process");
 const path = require("path");
 const http = require("http");
 
 const { findKirocrewBin } = require("./find-bin");
+const { resolveGatewayPath } = require("./mac-env");
+const {
+  findMissingBundleParts,
+  describeIncompleteBundle,
+  shouldReclassifyAsInstalling,
+  currentAttemptLog,
+  SPAWN_MARKER,
+} = require("./bundle-integrity");
 const { findConfiguredDashboardPort } = require("./data-home");
 const { createTokenRetryHandler } = require("./token-retry");
+const { createRendererRecovery } = require("./renderer-recovery");
 const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
 const { exitImmersiveModes } = require("./blocking-prompt");
+const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
 const { shouldRetryLocalTokenMint, tokenMintRetryDelayMs, TOKEN_MINT_MAX_RETRIES } = require("./token-acquire");
 const { createDisplayMediaHandler } = require("./display-media");
+const { applyFocusModeChrome } = require("./focus-chrome");
 const {
   createPermissionRequestHandler,
   createPermissionCheckHandler,
@@ -64,6 +75,7 @@ const { capturePySpyDump } = require("./pyspy-dump");
 const { createMetricsRecorder } = require("./perf-metrics");
 const { identityFamily, decideGatewayAction, classifyGatewayReadiness, FAMILY_META, HEALTH_IDENTITY_PATH, READY_PATH } = require("./instance-guard");
 const { initMochi, shutdownMochi } = require("./mochi/index");
+const { borrowSessionToken } = require("./mochi-session-token");
 const { initCrewCompanion, shutdownCrewCompanion } = require("./crew-companion/index");
 const { clampZoomFactor, stepZoomFactor } = require("./zoom");
 const { createBrowserViewManager, isUntrustedContents } = require("./browser-view");
@@ -115,7 +127,17 @@ const {
 
 const { migrateRemoteHostConfig, getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
 
+const { seedRenamedStore } = require("./store-rename");
+
 const { isLocalGatewayEnabled, setLocalGatewayEnabled, classifyStartFailure } = require("./local-gateway");
+
+// Carry settings across the npm `name` rename, by writing the new store's file
+// BEFORE electron-store opens it. Order is load-bearing: construction writes the
+// defaults, after which the file always exists and the seed can never run. It only
+// ever writes a file that does not exist, so it cannot overwrite anything.
+seedRenamedStore(app.getPath("userData"), {
+  log: (m) => console.log(`store migration: ${m}`),
+});
 
 const store = new Store({
   defaults: {
@@ -127,11 +149,12 @@ const store = new Store({
     globalHotkey: null,                    // system-wide summon accelerator: null = platform default, "" = disabled, string = custom (see global-hotkey.js)
     lastNudgedVersion: "",                 // last update version announced via native notification (nudge once per version)
     themeAccent: "",                       // user's resolved theme accent hex; injected into the boot splash
-    updateChannel: "",                     // "" = follow build stamp; "insider"|"stable" = user opt-in (Settings > About)
+    updateChannel: "",                     // "" = follow the stable default; "insider"|"stable" = user opt-in (Settings > About)
     runLocalGateway: true,                 // false = act as a pure client; never start a gateway on this machine
     linuxFrameless: null,                  // Linux window chrome: true = frameless, false = native frame, null = follow the desktop environment (see linux-frame.js)
   },
 });
+
 
 // Read ONCE at launch, because the setting takes effect on the next launch.
 // startGateway() is also the recovery path for a gateway that died mid-session,
@@ -142,13 +165,10 @@ const store = new Store({
 // that IS the user asking for a gateway right now.
 let runLocalGateway = isLocalGatewayEnabled(store);
 
-// The PRE-SPAWN read home (see home-dir.js for the full contract): whichever
-// directory's config.json governs this launch under the backend's migration
-// rules -- legacy ~/.kirocrew when it exists (the backend force-copies it
-// over ~/.kiro/crew, marker or not), canonical otherwise. Parity with
-// config/paths.py is gated by test/fixtures/home-resolution-cases.json.
-// Boot-time WRITES (mkdir, pycache prefix) use canonicalHome() instead --
-// writing into the legacy dir re-arms the migration every launch (#483).
+// The data home whose config.json governs this launch (see home-dir.js): a
+// valid KIROCREW_HOME override, else the default ~/.kiro/crew -- mirroring the
+// backend resolver in config/paths.py. Boot-time WRITES (mkdir, pycache prefix)
+// use canonicalHome() so an override is honored without a stray write.
 const { resolveHome, canonicalHome } = require("./home-dir");
 const { fetchLocalToken: fetchTokenFromHome } = require("./local-token");
 const KIROCREW_HOME = resolveHome();
@@ -166,8 +186,7 @@ function resolvePort() {
   // No env override — derive the gateway port from config.json. The fork's
   // DashboardConfig has no `dashboard.port` key; the port lives in
   // `dashboard.url` (see backend cli_server.resolve_client_port /
-  // dashboard/origin.parse_dashboard_url). A real legacy home is checked first
-  // because the backend migration makes legacy data authoritative on conflict.
+  // dashboard/origin.parse_dashboard_url). Read it from the resolved data home.
   const configuredPort = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
   if (configuredPort) return configuredPort;
   console.debug("No usable dashboard.url port in the data home, falling back to 5476");
@@ -207,6 +226,10 @@ const LINUX_FRAME_DECISION = IS_LINUX
   : null;
 const LINUX_FRAMELESS = !!(LINUX_FRAME_DECISION && LINUX_FRAME_DECISION.frameless);
 const DEFAULT_THEME_ACCENT = "#8E48FF";
+// Loading-screen status for a refused spawn on a bundle that is still being
+// written. Deliberately not "Gateway failed": nothing failed, so the line must
+// not contradict the dialog that follows.
+const INSTALLING_STATUS = "Finishing installation…";
 const THEME_ACCENT_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
 function currentThemeAccent() {
@@ -258,6 +281,9 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on("second-instance", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
+      // Relaunching the app is a request for the window back; it must win over
+      // a hide still deferred to the fullscreen exit (see hide-to-tray.js).
+      cancelPendingTrayHide(mainWindow);
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.show();
       mainWindow.focus();
@@ -783,12 +809,10 @@ function resolveProjectDir() {
 }
 
 function spawnGateway(resolve) {
-        // Pre-create the backend's POST-migration data root so the pycache
-        // prefix below has a live target. Deliberately NOT resolveHome():
-        // that answers "which config content governs this launch" and can be
-        // the legacy dir -- pre-creating or writing into ~/.kirocrew re-arms
-        // the backend's legacy migration on every launch (issue #483 class).
-        // The gateway creates/owns its home and .local_secret regardless.
+        // Pre-create the backend's data root so the pycache prefix below has a
+        // live target. Honor a KIROCREW_HOME override, else the default home
+        // (canonicalHome()). The gateway creates/owns its home and
+        // .local_secret regardless.
         const kirocrewDir = process.env.KIROCREW_HOME || canonicalHome();
         try {
           fs.mkdirSync(kirocrewDir, { recursive: true, mode: 0o700 });
@@ -801,6 +825,36 @@ function spawnGateway(resolve) {
         let execState = "executable";
         try { fs.accessSync(bin, fs.constants.X_OK); } catch (e) { execState = `NOT-EXECUTABLE(${e.code})`; }
         glog(`no gateway on :${PORT} — spawning bundled backend: bin=${bin} bundled=${bundled} ${execState}`);
+
+        // Refuse to exec a bundled interpreter whose stdlib is only partly on
+        // disk. The installer extracts backend-dist/ incrementally and starts the
+        // app as it finishes (runAfterFinish), so a launch inside that window
+        // finds python.exe present but late-alphabet stdlib packages missing --
+        // the interpreter then dies on `from urllib.parse import ...` from inside
+        // pathlib, which reads as a corrupt install rather than an unfinished one.
+        //
+        // This is PREVENTIVE and unsound; the launch-log backstop in the failure
+        // handler is sound but after-the-fact. They cover different halves, so
+        // neither replaces the other: refusing before spawn() keeps a doomed
+        // interpreter from running module-scope work against the user's live data
+        // home (it creates the home and .local_secret, and writes bytecode caches)
+        // and from failing in messier ways than ModuleNotFoundError while
+        // extraction is still writing underneath it -- the backstop only ever
+        // explains a crash that already happened.
+        if (bundled) {
+          const backendRoot = path.resolve(path.dirname(bin), "..");
+          const missingParts = findMissingBundleParts(fs, path, backendRoot);
+          if (missingParts.length) {
+            const errMsg = describeIncompleteBundle(missingParts);
+            glog(`spawn REFUSED: incomplete bundle at ${backendRoot} — missing: ${missingParts.join(", ")}`);
+            gatewayStartFailure = { error: errMsg, incompleteBundle: true, bundled: true };
+            // Neutral status: nothing failed, the install has not finished.
+            sendStatus(INSTALLING_STATUS);
+            resolve(false);
+            return;
+          }
+        }
+
         sendStatus("Starting gateway…");
 
         // Linux AppImage only: this process is about to exec the backend with no
@@ -837,13 +891,34 @@ function spawnGateway(resolve) {
         // served on.
         const { KIROCREW_PORT: _ignored, ...cleanEnv } = process.env;
 
+        // macOS: a GUI-launched .app inherits launchd's minimal environment, so
+        // cleanEnv.PATH is typically /usr/bin:/bin:/usr/sbin:/sbin. Recover the
+        // user's configured PATH from the launchd user domain and APPEND the
+        // directories it adds, so agent shell tools and MCP servers can resolve
+        // user-installed CLIs instead of reporting "command not found" for a
+        // binary that works in Terminal (issue #2367). No-op off darwin, when
+        // the domain is unset, or when it adds nothing — in which case
+        // gatewayPath is null and the inherited environment is left untouched.
+        //
+        // This only fixes the environment of a Gateway spawned FROM HERE.
+        // Already-running Gateway/ACP/MCP children keep the environment they
+        // were started with, so changing the domain still needs a Gateway
+        // restart to take effect.
+        const gatewayPath = resolveGatewayPath({
+          execFileSync,
+          basePath: cleanEnv.PATH || "",
+        });
+        if (gatewayPath) {
+          glog(`PATH recovered from launchd domain: +${gatewayPath.added.length} dir(s) appended`);
+        }
+
         // Tee the child's stdout+stderr straight to the launch log via a file
         // descriptor — no JS pipe to drain, no backpressure on a long-running
         // child. This is what surfaces a Python traceback / dylib load error /
         // "killed: 9" on a recipient's machine.
         let childOut = "ignore";
         try { childOut = fs.openSync(gatewayLogPath(), "a"); } catch (e) { glog(`WARN could not open child log fd: ${e.message}`); }
-        glog("---- spawning gateway; child stdout+stderr follows ----");
+        glog(SPAWN_MARKER);
         gatewayStartFailure = null; // re-arm for this spawn attempt
 
         // Bind handlers to THIS child via a captured reference, not the
@@ -868,14 +943,24 @@ function spawnGateway(resolve) {
             spawnBin = pyExe;
             spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
           } else {
-            // Bundled layout is present but python.exe is missing/corrupted.
-            // Surface this as a clear error instead of letting spawn() hang or
-            // emit a cryptic ENOENT for the .cmd shim.
-            const errMsg = `Bundled Python interpreter not found at ${pyExe}. `
-              + `The installation may be corrupted — reinstall the app.`;
-            glog(`spawn ERROR: ${errMsg}`);
-            gatewayStartFailure = { error: errMsg };
-            sendStatus(`Gateway failed: ${errMsg}`);
+            // The .cmd shim is here but python.exe is not. That is the same
+            // extraction race as the incomplete-stdlib case above, caught one
+            // wave earlier — bin/ lands before the interpreter — so it gets the
+            // same "still installing, retry" framing.
+            //
+            // A mid-extraction tree and a permanently truncated one are
+            // indistinguishable at this instant, so this deliberately reads the
+            // ambiguity as transient. Mid-extraction is the common state (every
+            // install and update passes through it) and the costs are asymmetric:
+            // guessing "installing" wrongly costs a retry, after which the copy's
+            // "if this persists, reinstall" gives the right instruction anyway,
+            // while guessing "corrupted" wrongly sends the user to reinstall a
+            // bundle that needed a few more seconds — the harm this whole path
+            // exists to prevent, and not undoable once done.
+            const errMsg = describeIncompleteBundle([]);
+            glog(`spawn REFUSED: bundled interpreter absent at ${pyExe} — install likely still extracting`);
+            gatewayStartFailure = { error: errMsg, incompleteBundle: true, bundled: true };
+            sendStatus(INSTALLING_STATUS);
             resolve(false);
             return;
           }
@@ -889,6 +974,10 @@ function spawnGateway(resolve) {
           windowsHide: true,
           env: {
             ...cleanEnv,
+            // Overrides the inherited PATH only when the launchd domain
+            // actually contributed a directory (see resolveGatewayPath above);
+            // otherwise this spreads nothing and cleanEnv.PATH stands.
+            ...(gatewayPath ? { PATH: gatewayPath.path } : {}),
             // Windows source layout puts agents/ + skills/ at the repo root
             // (two levels up from electron/), so resolve by markers there.
             // macOS/Linux keep the original one-level-up path unchanged.
@@ -918,13 +1007,19 @@ function spawnGateway(resolve) {
           // ENOENT = bin not found on disk; EACCES = present but not executable.
           glog(`spawn ERROR code=${err.code || "?"} msg=${err.message}`);
           if (gatewayProcess !== child) return; // stale child we already replaced
-          gatewayStartFailure = { error: err.message };
+          gatewayStartFailure = { error: err.message, bundled };
           sendStatus(`Gateway failed: ${err.message}`);
           resolve(false);
         });
         child.on("exit", (code, signal) => {
           glog(`gateway child exited code=${code} signal=${signal}`);
-          if (signal === "SIGKILL") {
+          // macOS only. The hint is the right first thing to say there, but on
+          // Windows this signalCode is produced by OUR OWN teardown -- Node maps
+          // both .kill("SIGTERM") and .kill("SIGKILL") onto TerminateProcess --
+          // so an ungated hint prints a mac remedy on every wedge recovery and
+          // every fallback stop, in the very log the unrecoverable-gateway dialog
+          // tells the user to read.
+          if (signal === "SIGKILL" && IS_MAC) {
             glog("HINT: SIGKILL on a freshly-spawned bundled binary almost always means macOS Gatekeeper blocked an unsigned/quarantined nested executable. On the recipient's Mac run: xattr -cr <path to KiroCrew.app>");
           }
           // Only the CURRENT child may mutate the shared state. A stale child's
@@ -937,32 +1032,28 @@ function spawnGateway(resolve) {
           // user-initiated Retry clears it so a re-probe can genuinely succeed.
           // Guard: preserve the root cause from the 'error' handler if it fired
           // first (Node fires both 'error' then 'exit' on spawn failure).
-          if (!gatewayStartFailure) gatewayStartFailure = { code, signal };
+          if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
           gatewayProcess = null;
         });
         resolve(true);
 }
 
 /**
- * Gracefully stop the embedded gateway and await its exit (POST /api/shutdown
- * -> SIGTERM -> SIGKILL). Core logic lives in gateway-stop.js for testability;
- * this thin wrapper binds the module-level child process + config.
+ * Gracefully stop the embedded gateway and await its exit: POST /api/shutdown,
+ * then on POSIX SIGTERM -> SIGKILL, and on Windows a tree kill (no real signals
+ * there, so the escalation is scope rather than force — see gateway-stop.js).
+ * Core logic lives in gateway-stop.js for testability; this thin wrapper binds
+ * the module-level child process + config.
  *
  * Uses call-time home resolution (secretCandidates) rather than the boot-time
- * KIROCREW_HOME pin, because on the migration launch the boot-time dir may
- * have been deleted by the backend — the secret lives in whichever candidate
- * still exists at shutdown time.
+ * KIROCREW_HOME pin, so a KIROCREW_HOME change between boot and shutdown is
+ * honored when locating the secret.
  */
 async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
   const proc = gatewayProcess;
   if (!proc || proc.exitCode !== null) { gatewayProcess = null; return; }
   console.log("Stopping gateway gracefully...");
-  // Resolve the secret location at call time: try each candidate in order
-  // (canonical first, legacy second) so graceful stop works even when the
-  // boot-time home was moved/deleted during migration.
-  // Resolve the secret location at call time: a migration may have moved or
-  // deleted the boot-time home, and a partial migration can leave BOTH a
-  // canonical and a legacy `.local_secret`. Collect every readable candidate
+  // Resolve the secret location at call time. Collect every readable candidate
   // value and let gateway-stop POST each one — the gateway answers 200 only to
   // the secret it actually loaded, so a stale copy can't force a hard SIGTERM.
   const candidates = secretCandidates();
@@ -979,8 +1070,81 @@ async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
     kirocrewHome,
     secrets,
     timeoutMs,
+    // Windows fallback scope: when /api/shutdown does not take, a single-pid kill
+    // frees the port but leaves the gateway's detached kiro-cli / MCP / app-server
+    // children alive and reparented, holding the data home's locks. Windows has no
+    // process group to signal, so the tree kill is the only way to take them with
+    // the parent. Gated on the same identity check the port sweep uses, so a
+    // recycled pid is refused rather than killed.
+    //
+    // TIMEOUTS ARE PINNED, not defaulted. windowsTaskkill's defaults are sized for
+    // the interactive port sweep (8s PowerShell + 5s WMIC + 10s taskkill = 23s),
+    // which exceeds stopGatewayGracefully's own deadline of timeoutMs + 3000. The
+    // tree kill is awaited rather than pre-empted -- cutting it short would kill
+    // the parent alone and orphan the tree -- so it is the BUDGET that has to fit:
+    // 3+2+5 = 10s, comfortably inside 18s, and still generous for probes that
+    // normally answer in well under a second.
+    killTreeFn: killGatewayTreeOnWindowsBounded,
   });
   gatewayProcess = null;
+}
+
+/**
+ * Tree-kill the gateway pid on Windows for the SHUTDOWN path only, with the
+ * timeouts that path's deadline can afford.
+ *
+ * windowsTaskkill's DEFAULTS (8s PowerShell + 5s WMIC + 10s taskkill = 23s) suit
+ * a caller with no deadline, but exceed stopGatewayGracefully's own
+ * timeoutMs + 3000. The kill is awaited rather than pre-empted — cutting it short
+ * would kill the parent alone and orphan the very descendants it exists to reap —
+ * so the BUDGET is what has to fit: 3+2+5 = 10s, inside 18s, and still generous
+ * for probes that normally answer in well under a second.
+ *
+ * Do NOT reuse this anywhere without such a deadline: shorter probe timeouts only
+ * make an early fallback to the parent-only kill MORE likely, which is the outcome
+ * the tree kill exists to prevent. Unbounded callers use
+ * killGatewayProcessTree().
+ */
+function killGatewayTreeOnWindowsBounded(pid) {
+  return windowsTaskkill(pid, {
+    isTrustedCommand: isTrustedWindowsGatewayCommand,
+    getCommandFn: (probePid) => windowsProcessCommand(probePid, {
+      powershellTimeoutMs: 3000,
+      wmicTimeoutMs: 2000,
+    }),
+    timeoutMs: 5000,
+  });
+}
+
+/**
+ * Kill a gateway child and, on Windows, everything it spawned.
+ *
+ * POSIX needs no tree walk here: the signal reaches the gateway, which reaps its
+ * own children on the way out. Windows has neither — no signal semantics (Node
+ * maps every name onto TerminateProcess) and no process group — so the detached
+ * kiro-cli / MCP / app-server descendants survive a single-pid kill, reparented
+ * and still holding the data home's locks.
+ *
+ * Falls back to the single-pid kill whenever the tree kill refuses (identity
+ * probe unavailable, or a recycled pid): losing the descendants is a leak, while
+ * losing the parent too would leave a live gateway behind a caller that believes
+ * it is gone.
+ */
+async function killGatewayProcessTree(proc, signal) {
+  if (!proc || proc.exitCode !== null) return;
+  const killPid = () => {
+    try { proc.kill(signal); } catch (e) { glog(`${signal} failed: ${e && e.message}`); }
+  };
+  if (!IS_WIN || !proc.pid) { killPid(); return; }
+  try {
+    // windowsTaskkill's OWN defaults: this path has no deadline to fit, so the
+    // identity probe gets its full budget rather than the shutdown path's
+    // shortened one.
+    await windowsTaskkill(proc.pid, { isTrustedCommand: isTrustedWindowsGatewayCommand });
+  } catch (e) {
+    glog(`tree kill refused (${e && e.message}) — falling back to a single-pid kill`);
+    killPid();
+  }
 }
 
 /** Best-effort synchronous-ish stop for the before-quit path (can't await). */
@@ -1019,8 +1183,8 @@ function fetchRemoteToken(port) {
 }
 
 async function fetchLocalToken(backendUrl = BACKEND_URL) {
-  // Re-resolve the authoritative home at call time: migration may move or pin
-  // the live secret after Electron starts. Send exactly that one secret to the
+  // Re-resolve the authoritative home at call time so a KIROCREW_HOME change
+  // after Electron starts is honored. Send exactly that one secret to the
   // gateway's literal IPv4 bind address; never probe alternate homes/addresses.
   return fetchTokenFromHome({
     backendUrl,
@@ -1031,6 +1195,25 @@ async function fetchLocalToken(backendUrl = BACKEND_URL) {
   });
 }
 
+/**
+ * Resolve a gateway credential for Mochi's poller, trying the same paths (in
+ * the same order) the main window itself would: the local secret first
+ * (same machine, unchanged), then an explicitly configured SSH remote host
+ * for this port (unchanged), then — new — the session the main window has
+ * ALREADY established. That third path only runs when the first two come
+ * back empty, so an ordinary same-machine or SSH-remote install never
+ * reaches it at all. See mochi-session-token.js for why it exists and why it
+ * cannot weaken auth: it only ever hands back a credential a genuine prior
+ * authentication already produced.
+ */
+async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
+  const localValue = await fetchLocalToken(backendUrl);
+  if (localValue) return { value: localValue, viaCookie: false };
+  const { token: remoteValue } = await fetchRemoteToken(new URL(backendUrl).port);
+  if (remoteValue) return { value: remoteValue, viaCookie: false };
+  const borrowed = await borrowSessionToken({ electronSession: session.defaultSession, backendUrl });
+  return borrowed ? { value: borrowed, viaCookie: true } : { value: "" };
+}
 
 function checkBackend(healthUrl = HEALTH_URL) {
   return new Promise((resolve, reject) => {
@@ -1648,6 +1831,25 @@ function setupWindowContents(win, backendUrl) {
         [role="button"], [tabindex], iframe {
           -webkit-app-region: no-drag;
         }
+        /* Focus mode (see website/src/hooks/useFocusMode.ts) hides the dashboard
+           header, so this bar would be a 42px drag region sitting on top of the
+           content focus mode just reclaimed -- the session title, the sidebar
+           toggles, the transcript. pointer-events:none does NOT save that: a
+           drag region is resolved by the compositor before hit-testing, so the
+           band stops answering hover and swallows the press.
+           An app-region:no-drag child DOES subtract (this bar is prepended to
+           body, so it comes FIRST in tree order and every later no-drag element
+           wins), which is what keeps buttons clickable -- but there is nothing to
+           hang that on for the transcript itself.
+           So the region collapses with the header, and comes back with it: the
+           renderer sets mc-focus-chrome while the header is on screen, which is
+           when the bar is the drag surface the user expects. */
+        body.mc-focus-mode #electron-drag-bar {
+          height: 0;
+        }
+        body.mc-focus-mode.mc-focus-chrome #electron-drag-bar {
+          height: 42px;
+        }
       `);
       view.webContents.executeJavaScript(`
         if (!document.getElementById('electron-drag-bar')) {
@@ -1934,10 +2136,11 @@ function createWindow() {
     // out of the resting chrome while Alt still reveals it.
     opts.autoHideMenuBar = true;
   }
-  // Window + taskbar icon (Windows only): running unpackaged (`electron .`)
-  // otherwise shows the default Electron icon. macOS takes its icon from the
-  // .app bundle and Linux from the .desktop/AppImage, so leave those untouched.
-  if (IS_WIN) {
+  // Window + taskbar icon: the explicit BrowserWindow icon is required on
+  // Linux too. Some GNOME/AppImage launches do not associate the generated
+  // desktop entry with the live window and otherwise fall back to Electron's
+  // generic X icon. macOS takes its icon from the .app bundle.
+  if (IS_WIN || IS_LINUX) {
     const iconFile = identityFamily(app.getVersion()) === "nightly"
       && fs.existsSync(path.join(__dirname, "icon-nightly.png"))
       ? "icon-nightly.png" : "icon.png";
@@ -1992,10 +2195,79 @@ function createWindow() {
     onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
   });
 
+  // Renderer-crash self-healing. Without this a dead renderer leaves the window
+  // mapped but permanently BLACK — the SPA and its top tab strip both lived in
+  // that process, so the user is left with no UI and no way back short of
+  // quitting. Re-load through the same fresh-token path `did-navigate` uses, so
+  // recovery also survives a gateway secret that rotated while we were down.
+  // Bounded (see renderer-recovery.js): repeated deaths inside the window stop
+  // the loop instead of spinning on a broken build.
+  const rendererRecovery = createRendererRecovery({
+    isQuitting: () => isQuitting,
+    log: glog,
+    // Snapshot every Electron process at the moment of death. A macOS crash
+    // report names the thread that aborted but NOT what the process had grown
+    // to, so without this a post-mortem cannot tell "renderer hit a memory
+    // ceiling" from "renderer was pegged on CPU" — the two hypotheses this
+    // window's black-screen crashes leave open. Totals plus the worst offender
+    // keep it to one log line.
+    describeProcesses: () => {
+      const metrics = app.getAppMetrics() || [];
+      let totalCpu = 0;
+      let totalMb = 0;
+      let worst = null;
+      for (const m of metrics) {
+        const cpu = (m.cpu && m.cpu.percentCPUUsage) || 0;
+        const mb = ((m.memory && m.memory.workingSetSize) || 0) / 1024;
+        totalCpu += cpu;
+        totalMb += mb;
+        if (!worst || mb > worst.mb) worst = { type: m.type, pid: m.pid, mb, cpu };
+      }
+      const parts = [
+        `procs=${metrics.length}`,
+        `totalCpu=${totalCpu.toFixed(1)}%`,
+        `totalWorkingSet=${Math.round(totalMb)}MB`,
+      ];
+      if (worst) {
+        parts.push(
+          `largest=${worst.type}:${worst.pid}@${Math.round(worst.mb)}MB/${worst.cpu.toFixed(1)}%`
+        );
+      }
+      return parts.join(" ");
+    },
+    reload: () => {
+      if (mainWindow.isDestroyed()) return;
+      (async () => {
+        let token = await fetchLocalToken(BACKEND_URL);
+        if (!token) ({ token } = await fetchRemoteToken(PORT));
+        if (mainWindow.isDestroyed()) return;
+        mainWindow.webContents.loadURL(
+          token ? `${BACKEND_URL}?token=${token}` : BACKEND_URL
+        );
+      })().catch((err) => glog(`renderer recovery reload failed: ${err && err.message}`));
+    },
+    onGiveUp: ({ reason }) => {
+      // Deliberately log-only. Reloading again is the thing we must NOT do here
+      // (that is the loop this budget exists to stop), and the window is already
+      // showing the failure — it is blank. The log line is what tells a human
+      // WHY it stayed blank, which a silent give-up would not.
+      glog(`renderer recovery exhausted (reason=${reason}); leaving the window as-is`);
+    },
+  });
+  mainWindow.webContents.on("render-process-gone", (_e, details) => {
+    rendererRecovery.handleGone(details || {});
+  });
+
   mainWindow.on("close", (e) => {
     if (!isQuitting) {
       e.preventDefault();
-      mainWindow.hide();
+      // Not a quit — hide to the tray. On macOS this MUST leave a native
+      // fullscreen Space first, or the Space is orphaned as a black surface and
+      // the window later re-shows at a degenerate frame (see hide-to-tray.js).
+      // The hide is deferred to `leave-full-screen` in that case; the existing
+      // geometry listener fires on the same event, so the persisted state
+      // truthfully records the window as windowed at its normal bounds.
+      hideToTray(mainWindow);
       return;
     }
     // Real quit — capture the final geometry synchronously before teardown so
@@ -2008,6 +2280,13 @@ function createWindow() {
 }
 
 function createTray() {
+  // A tray gesture asking for the window back must first disarm any hide that
+  // hideToTray() deferred to the fullscreen exit, or the show is undone moments
+  // later when the exit completes (see hide-to-tray.js CANCELLATION).
+  const showFromTray = () => {
+    cancelPendingTrayHide(mainWindow);
+    mainWindow?.show();
+  };
   // Nightly ships its own icon (night-sky variant) so the menu-bar presence
   // matches the Dock identity; app.name was set channel-aware at boot.
   const nightly = identityFamily(app.getVersion()) === "nightly";
@@ -2045,7 +2324,7 @@ function createTray() {
   // tabs were removed with the single-surface shell redesign).
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: `Show ${app.name}`, click: () => mainWindow?.show() },
+      { label: `Show ${app.name}`, click: showFromTray },
       { type: "separator" },
       { label: "New Connection Window…", click: () => openNewConnectionWindow() },
       { type: "separator" },
@@ -2054,7 +2333,7 @@ function createTray() {
       { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
     ])
   );
-  tray.on("click", () => mainWindow?.show());
+  tray.on("click", showFromTray);
 }
 
 // ── Remote host settings ──
@@ -2436,7 +2715,13 @@ async function recoverWedgedGateway(win) {
       log: (m) => glog(`liveness: ${m}`),
     }).catch((e) => glog(`liveness: py-spy capture threw: ${e && e.message}`));
   }
-  try { if (gatewayProcess) gatewayProcess.kill("SIGKILL"); } catch (e) { glog(`SIGKILL failed: ${e && e.message}`); }
+  // TREE-scoped on Windows. This path deliberately skips /api/shutdown (it runs on
+  // the frozen loop), so it is the one trigger where nothing else reaps the
+  // gateway's detached kiro-cli / MCP children -- and the port sweep below cannot
+  // cover for it, because a single-pid kill FREES the port, after which the sweep
+  // finds no owner and its own /T taskkill is never reached. Awaited so the tree is
+  // gone before the respawn, and it falls back to the pid kill on any refusal.
+  await killGatewayProcessTree(gatewayProcess, "SIGKILL");
   gatewayProcess = null;
   let freed = true;
   let foreignHolder = false;
@@ -2745,9 +3030,36 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     // Nothing was spawned in the client-only case, so it is classified before
     // the port-conflict probe — see classifyStartFailure for why the log tail
     // cannot be trusted to mean "a holder exists right now".
-    const failureKind = classifyStartFailure({
+    // The pre-spawn check cannot be complete: extraction order within a package
+    // is not ours to control, so a spawn can still die on a stdlib import that
+    // was a moment away from existing. The interpreter's own traceback settles
+    // what no filesystem probe could, so a missing-stdlib crash is reclassified
+    // here as an unfinished install rather than reported as a defect.
+    //
+    // Requires the tail to be free of a bound-port report. The launch log is
+    // append-only across launches, so a stdlib traceback left by an EARLIER run
+    // would otherwise relabel today's "address already in use" exit as
+    // "installing" and hide the force-stop path — the port holder is still
+    // there, so Retry alone would loop. When both signals appear, the port
+    // conflict is the actionable one. This guard applies only to the log-sniffed
+    // path; a pre-spawn refusal sets `incompleteBundle` explicitly and keeps
+    // outranking a stale port line, since nothing was spawned in that case.
+    const failureRecord = shouldReclassifyAsInstalling({
       failedToStart,
       failure: err.failure,
+      logTail,
+      // Scoped to THIS attempt, like the crash match itself: a bound-port line
+      // left by an earlier launch must not suppress a genuine current stdlib
+      // crash. The port-conflict branch below keeps using the whole tail, since
+      // its own guard is about not offering force-stop for a port nothing holds.
+      portInUseInLog: isPortInUse(currentAttemptLog(logTail)),
+      bundled: !!(err.failure && err.failure.bundled),
+    })
+      ? { ...err.failure, incompleteBundle: true }
+      : err.failure;
+    const failureKind = classifyStartFailure({
+      failedToStart,
+      failure: failureRecord,
       isOwnPort: backendUrl === BACKEND_URL,
       portInUseInLog: isPortInUse(logTail),
     });
@@ -2755,7 +3067,15 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     const portConflict = failureKind === "port-conflict";
 
     let title, message;
-    if (localGatewayOff) {
+    if (failureKind === "installing") {
+      // The bundled backend is still being written to disk, so the honest
+      // framing is "not ready yet" and Retry is the whole remedy. Use the
+      // unfinished-install copy rather than err.message: on the reclassified
+      // path err.message is the interpreter's own exit report, which is what
+      // this branch exists to stop showing as the headline.
+      title = "Kiro Crew — installation still finishing";
+      message = err.failure?.incompleteBundle ? err.message : describeIncompleteBundle([]);
+    } else if (localGatewayOff) {
       // Nothing failed here — the app was told not to start a gateway and the
       // port is silent. "Failed to start" would send the user hunting a crash.
       title = `Kiro Crew — no gateway on port ${PORT}`;
@@ -2835,6 +3155,9 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
 
 async function openNewConnectionWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  // Reachable from the tray menu during the deferred fullscreen-exit hide; the
+  // pending hide would otherwise take the parent away from under the modal.
+  cancelPendingTrayHide(mainWindow);
   mainWindow.show();
 
   const css = await getModalCSS();
@@ -3134,6 +3457,9 @@ app.whenReady().then(async () => {
   const openSettingsPage = (tab) => {
     const win = focusedDashboardWindow();
     if (!win) return;
+    // The window may be mid deferred-hide (still visible, still focusable);
+    // opening settings on it is a request to keep it, not lose it 2s later.
+    cancelPendingTrayHide(win);
     if (win.isMinimized()) win.restore();
     win.show();
     win.focus();
@@ -3253,6 +3579,33 @@ app.whenReady().then(async () => {
     if (typeof hex === "string" && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(hex)) {
       store.set("themeAccent", hex);
     }
+  });
+
+  // Focus mode: the renderer reports whether the dashboard header is currently
+  // on screen, and the native macOS traffic lights follow it.
+  //
+  // Driven from here because AppKit paints them at a WINDOW coordinate, not in
+  // the DOM — nothing the renderer hides moves them, so with the header gone they
+  // were left floating over the sessions sidebar and the chat title row, clipping
+  // both. Hiding them is what lets focus mode reclaim the whole top row on macOS
+  // instead of reserving 42px for controls the user did not ask to keep.
+  //
+  // Resolved from the SENDER's own window, never a broadcast: a connection window
+  // running the same SPA must not hide the main window's buttons. Skipped in
+  // fullscreen, where macOS owns the buttons itself (they live in the auto-hiding
+  // menu-bar overlay) and there is no title bar to hide them from.
+  // `positionTrafficLights` is re-asserted on the way back because a visibility
+  // round-trip can drop the custom inset.
+  ipcMain.on("focus-mode-chrome", (event, visible) => {
+    if (!IS_MAC) return;
+    const win = windowForWebContents(event.sender);
+    if (!win) return;
+    // applyFocusModeChrome (focus-chrome.js) also re-declares the renderer's
+    // draggable regions after the native change: setWindowButtonVisibility
+    // mutates the titlebar styleMask and DROPS the declared regions, which is
+    // why every renderer-side drag surface for the peeked header went dead on
+    // macOS while the CSS was provably correct.
+    applyFocusModeChrome(win, visible, { positionTrafficLights });
   });
 
   // Caption controls for the frameless Linux window (see the injected
@@ -3593,6 +3946,7 @@ app.whenReady().then(async () => {
         });
         n.on("click", () => {
           if (mainWindow && !mainWindow.isDestroyed()) {
+            cancelPendingTrayHide(mainWindow);
             if (mainWindow.isMinimized()) mainWindow.restore();
             mainWindow.show();
             mainWindow.focus();
@@ -3671,7 +4025,12 @@ app.whenReady().then(async () => {
   // be answering before we ask it whether Mochi is on, and the pet page is
   // loaded from the gateway origin. Best-effort -- a failure here must never
   // block the dashboard, so everything is inside a catch that only logs.
-  initMochi({ backendUrl: BACKEND_URL, fetchLocalToken, glog, getMainWindow: () => mainWindow });
+  initMochi({
+    backendUrl: BACKEND_URL,
+    fetchGatewayAuth: fetchMochiGatewayAuth,
+    glog,
+    getMainWindow: () => mainWindow,
+  });
   // Same shape and the same best-effort contract: the companion's windows follow
   // the app's enabled state, and a failure here must never block the dashboard.
   try {
@@ -3681,6 +4040,12 @@ app.whenReady().then(async () => {
   }
 
   app.on("activate", () => {
+    // An activate landing while hideToTray() is still waiting out the
+    // fullscreen-exit animation must win over the pending hide: the window is
+    // still visible at this point, so the isVisible() guard below would skip
+    // the show and the deferred hide would then take the window away — the
+    // user clicked the Dock icon and watched the window vanish.
+    cancelPendingTrayHide(mainWindow);
     if (!mainWindow?.isVisible()) mainWindow?.show();
   });
 });

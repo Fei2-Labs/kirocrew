@@ -15,8 +15,20 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 from kiro_crew.cron import CronService
 from kiro_crew.mcp_cron import _call_tool_inner
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 def _jobs(tmp_path):

@@ -208,6 +208,55 @@
   unicode-range: U+0980-09FF;
 }
 
+/* ─── OpenDyslexic (SIL-OFL) ── accessibility built-in ───
+   Registered as its own font-family so the a11y font never leaks into
+   var(--mono) consumers: proportional variants live under 'OpenDyslexic',
+   the monospace face under 'OpenDyslexicMono'. useZoom's MONO_OVERRIDE map
+   points --mono at OpenDyslexicMono when the user selects opendyslexic.
+
+   Italic and BoldItalic are bundled so <em>, blockquotes, and markdown
+   ***bold-italic*** render as drawn glyphs — synthesized italic on OpenDyslexic
+   destroys the weighted-bottom/asymmetric-shape properties dyslexic readers
+   pick this font for. Family-name isolation means italic never resolves inside
+   <code> blocks: var(--mono) reads 'OpenDyslexicMono' which has no italic face
+   declared, so italic inside code stays synthesized (same as JetBrains Mono).
+*/
+@font-face {
+  font-family: 'OpenDyslexic';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexic-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'OpenDyslexic';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexic-Bold.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'OpenDyslexic';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexic-Italic.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'OpenDyslexic';
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexic-BoldItalic.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'OpenDyslexicMono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/opendyslexic/OpenDyslexicMono-Regular.woff2') format('woff2');
+}
+
 /* ── Design tokens ── */
 /* Shared across all themes */
 :root {
@@ -1227,18 +1276,22 @@ html:lang(ko) {
      Scoped with :has() so the onboarding and welcome views, which legitimately
      grow past the viewport, keep their document scroll. */
   body:has([data-testid="dashboard-shell"]){overflow:hidden}
-  /* Global focus ring for keyboard navigation */
-  /* TESTING: disabled to check scroll bug */
-  /* :focus-visible{outline:2px solid var(--accent);outline-offset:2px} */
+  /* Global focus ring for keyboard navigation. Keyed on `:focus-visible` rather
+     than `:focus` so a pointer click never paints it — the ring is drawn only
+     for the keyboard and AT interactions that have no other cue to where focus
+     sits. `outline` is used (not border/box-shadow) because it is painted
+     outside the box and so cannot shift layout. */
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   @media(prefers-reduced-motion:reduce){*:not([data-virtuoso-scroller] *),*::before,*::after{animation-duration:0.01ms !important;animation-iteration-count:1 !important}}
-  /* The rule above zeroes animation-DURATION but not animation-DELAY, and
-     `animate-rise` uses fill-mode `backwards` — so a stagger-delayed card
-     (Overview stat tiles, Settings cards) would sit fully invisible for its
-     whole delay when the user asked for no motion. Zero the delay for the
-     rise entrance specifically; `!important` is required to beat the inline
-     `animationDelay` the stagger ladder sets. Deliberately scoped to that
-     entrance rather than zeroing every animation delay globally. */
-  @media(prefers-reduced-motion:reduce){.animate-rise{animation-delay:0s !important}}
+  /* The rule above zeroes animation-DURATION but not animation-DELAY, and both
+     `animate-rise` and `animate-chip-hop` use fill-mode `backwards` — so a
+     stagger-delayed element (Overview stat tiles, Settings cards, follow-up
+     option chips) would sit fully invisible for its whole delay when the user
+     asked for no motion. Zero the delay for those entrances specifically;
+     `!important` is required to beat the inline `animationDelay` the stagger
+     ladder sets. Deliberately scoped to them rather than zeroing every
+     animation delay globally. */
+  @media(prefers-reduced-motion:reduce){.animate-rise,.animate-chip-hop{animation-delay:0s !important}}
   ::selection{background:var(--accent-subtle);color:var(--text-strong)}
   .bg-accent::selection{background:rgba(255,255,255,.25);color:white}
   ::-webkit-scrollbar{width:6px;height:6px}
@@ -1802,6 +1855,63 @@ file-tree-container{
    chips are clickable, hoverable, and drag-reorderable. Ignored in browsers. */
 .side-panel-strip,.side-panel-strip *{-webkit-app-region:no-drag}
 
+/* Focus-mode edge triggers. 10px is deliberately tight: a wider strip opened the
+   chrome on pointer travel that was merely passing near the edge, and overshooting
+   a 10px target is cheap because the edge-slam path (App.tsx mouseout handler)
+   opens the overlay anyway when the pointer exits the window through that edge.
+
+   The size is CONSTANT. An earlier version shrank the strip to 8px on reveal so it
+   would stop covering the top of the revealed header's controls, and that produced
+   a hover feedback loop: the strip resized out from under a stationary pointer,
+   which fired mouseleave, which started the close grace, which closed the chrome,
+   which grew the strip back under the pointer, which re-opened it — flickering
+   indefinitely without the user moving the mouse. Anything that changes the hit
+   target under a resting pointer can oscillate like that, so the strip is instead
+   COVERED by the chrome it summons (z-61 against the chrome's z-62): while the
+   chrome is up, hover and clicks land on the header or rail, which keeps them open
+   through their own surface handlers, and nothing resizes. */
+.focus-peek-top{height:10px}
+.focus-peek-rail{width:10px}
+
+/* no-drag only while the chrome is HIDDEN. While it is shown the drag surface is
+   the header (Windows/Linux, below) or the .host-drag-strip gap strips (macOS,
+   App.tsx), and a no-drag strip laid over the band's top 10px could only subtract
+   from it. Hidden, the injected drag bar is collapsed to 0 anyway, so this is a
+   backstop rather than load-bearing. */
+body.mc-focus-mode:not(.mc-focus-chrome) .focus-peek-top{-webkit-app-region:no-drag}
+body.mc-focus-mode:not(.mc-focus-rail) .focus-peek-rail{-webkit-app-region:no-drag}
+
+/* The revealed header is a window-drag surface in its empty regions on Windows
+   and frameless Linux, where the class-driven region resolves reliably. macOS is
+   deliberately EXCLUDED (:not below): every drag mechanism attached to the shell
+   — this class-toggled rule on the transformed header, a full-width mount strip,
+   in-shell gap strips — failed to register with the native window on the desktop
+   app, so macOS drag is carried entirely by .host-drag-strip elements rendered
+   OUTSIDE the shell (see the pane-stack strips in App.tsx), and a transformed
+   drag-marked header must not exist in the document to interfere. */
+body.mc-focus-mode.mc-focus-chrome .win-electron header.topbar-glass,
+body.mc-focus-mode.mc-focus-chrome .linux-electron header.topbar-glass{-webkit-app-region:drag}
+
+/* Focus mode: the peeked chrome FLOATS over content instead of sitting above a
+   flat background, which is a different rendering problem from the docked case.
+   .topbar-glass is `color-mix(in srgb, var(--chrome) 74%, transparent)` — 26%
+   see-through. Docked there is nothing behind it but --bg, so that reads as a
+   tint; as an overlay the transcript shows straight through the blur and the
+   header's own text becomes hard to read. Opaque while floating.
+   The reduced-transparency / high-contrast fallbacks further down force an opaque
+   background with !important, so they still win — which is the same answer. */
+body.mc-focus-mode header.topbar-glass{background:var(--chrome)}
+
+/* The drop shadows are gated on the surface actually being ON SCREEN. Both the
+   header and the rail stay MOUNTED and slide out of view, so an always-on shadow
+   keeps painting its tail into the content: this shadow reaches 28px past the
+   box, and a header translated up by its own 42px leaves that tail sitting over
+   the top of the transcript as a permanent smudge. */
+body.mc-focus-mode.mc-focus-chrome header.topbar-glass{
+  box-shadow:0 10px 28px -10px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.10)}
+body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
+  box-shadow:0 10px 28px -10px rgba(0,0,0,.5)}
+
 /* Draggable title-bar strips laid over a remote-instance pane. The pane is a
    cross-origin iframe, so the host's injected #electron-drag-bar can't reach
    into it and the blanket marks the whole iframe no-drag — the pane's header
@@ -1842,7 +1952,14 @@ file-tree-container{
 
 /* ── Consistent focus ring ── */
 .focus-ring{transition:border-color 0.2s,box-shadow 0.2s}
-.focus-ring:focus{outline:none;border-color:var(--ring);
+/* Keyed on `:focus-visible` for the same reason as the global ring: a pointer
+   click on one of these (cards, list rows, template tiles) leaves no ring.
+   Text inputs are the exception the UA makes for us — they match
+   `:focus-visible` even on a click, since keyboard input is expected next — so
+   the treatment below still appears where it is a typing affordance.
+   `outline:none` opts out of the global ring in favour of this border + glow,
+   and the extra class raises specificity so the two never stack. */
+.focus-ring:focus-visible{outline:none;border-color:var(--ring);
   box-shadow:0 0 0 3px var(--accent-subtle),0 0 20px color-mix(in srgb,var(--accent) 8%,transparent)}
 
 /* ── Syntax highlighting (highlight.js) ── */
@@ -2248,17 +2365,42 @@ file-tree-container{
    from body). Do not promote any of this to an unscoped rule. */
 html[data-font-family="mono"] .rail-community-links{ letter-spacing:-0.05em; word-spacing:-2.5px; gap:3px }
 
-/* Trailing fade on the pinned-crew chip row. The row is a single nowrap line
-   with overflow:hidden so the trailing dropdown stays against the last chip
-   (see InstanceTabBar.CrewChipRow), which means the chip at the boundary is cut
-   rather than dropped. The fade marks that edge so a cut chip reads as "there is
-   more, in the dropdown next to me" instead of as a rendering fault.
+/* OpenDyslexicMono (data-font-family="opendyslexic" in CLI mode) is measured
+   ~22% wider than JetBrains Mono at 12px (advance 8.784 vs 7.20 for capital 'S'
+   from fontTools on the shipped .woff2). The rail budget above therefore has
+   less slack under opendyslexic than under mono, and the "Report issue" button
+   may truncate to an ellipsis on very narrow rails.
+   No opendyslexic-specific tightening rule is applied: -0.05em / -2.5px are
+   metrically tuned for JetBrains Mono's advance and would misfire on
+   OpenDyslexicMono, and negative tracking on a legibility font actively fights
+   the readability properties a user picking OpenDyslexic came for. The
+   button's `text-ellipsis` on `Report issue` handles overflow gracefully;
+   a dedicated rule can be added later if visual QA shows truncation matters. */
 
-   Written here rather than as a Tailwind arbitrary value because the WebKit
-   prefix is still required and Tailwind emits only the unprefixed property. */
-.crew-chip-row-fade {
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent 100%);
-  mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent 100%);
+/* Cut-edge rule on the pinned-crew chip row. The row is a single nowrap line with
+   overflow:hidden so the trailing dropdown stays against the last chip (see
+   InstanceTabBar.CrewChipRow), which means the chip at the boundary is cut rather
+   than dropped, and that cut needs saying.
+
+   It is said with a 1px rule AT the boundary, not with an alpha fade ACROSS the
+   last pixels. A chip's unread badge is its trailing element, so any cut reaches
+   the badge first: a fade there does not soften an edge, it dissolves the count —
+   an 18px ramp is wider than the 16px badge, so at the rungs where the crew name
+   has already collapsed the whole glyph goes. Nothing about the count is lost to
+   the cut either way: it is already rolled into the dropdown trigger's aggregate
+   badge, whose roll-up counts exactly the crews whose chips measured as cut.
+
+   `::after` so the rule takes no layout: the row is sized from the space the
+   trigger leaves, and an in-flow 1px would feed its own clip measurement. */
+.crew-chip-row[data-cut='true']::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  right: 0;
+  width: 1px;
+  background: var(--border);
+  pointer-events: none;
 }
 
 /* Reserve a transcript image's EXACT display box before its bytes decode.

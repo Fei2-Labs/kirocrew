@@ -25,7 +25,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, Fragment, type CSSProperties } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Home, Loader2, ChevronDown, Pin, Check } from 'lucide-react'
+import { Home, Loader2, ChevronDown, Pin } from 'lucide-react'
 import { api, ApiError, type InstanceView } from '../api/client'
 import { useAppSelector } from '../store'
 import { type WarmConn } from '../store/instancesSlice'
@@ -39,7 +39,6 @@ import {
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuSeparator,
-  DropdownMenuLabel,
   DropdownMenuItem,
 } from './ui/dropdown-menu'
 
@@ -297,6 +296,7 @@ function SwitcherRow({
   onSelect,
   pinned,
   noRoom,
+  onTogglePin,
 }: {
   entry: SwitcherEntry
   onSelect: () => void
@@ -304,67 +304,103 @@ function SwitcherRow({
   pinned: boolean
   /** Pinned, but the header cut its chip off — see `useClippedChipIds`. */
   noRoom: boolean
+  onTogglePin: () => void
 }) {
   const isLocal = entry.id === null
-  // The pin state rides on the row's own hover/accessible name rather than on the
-  // glyph, because a `title` on a non-interactive span inside a menu item is not
-  // reliably surfaced. `noRoom` has to be sayable: a pinned crew with no visible
-  // chip otherwise looks like the pin silently failed.
-  const pinNote = !pinned
-    ? ''
-    : noRoom
-      ? i18nT('components.instanceTabBar.pinned_no_room')
-      : i18nT('components.instanceTabBar.pinned')
+  const id = entry.id ?? LOCAL_VALUE
+  // `noRoom` has to be sayable: a pinned crew with no visible chip otherwise
+  // looks like the pin silently failed, and the glyph does not encode it.
+  const pinTitle = pinned
+    ? i18nT('components.instanceTabBar.unpin_crew', { name: entry.name })
+    : i18nT('components.instanceTabBar.pin_crew', { name: entry.name })
+  const pinLabel =
+    pinned && noRoom
+      ? `${pinTitle} — ${i18nT('components.instanceTabBar.pinned_no_room')}`
+      : pinTitle
   return (
-    <DropdownMenuRadioItem
-      value={entry.id ?? LOCAL_VALUE}
-      className="gap-2 text-[13px]"
-      onSelect={onSelect}
-      title={pinNote ? `${entry.title} — ${pinNote}` : entry.title}
-    >
-      {isLocal ? (
-        <Home className="lucide-inline shrink-0" />
-      ) : entry.connecting ? (
-        <Loader2 className="lucide-inline shrink-0 animate-spin" />
-      ) : (
-        <span
-          className={`w-1.5 h-1.5 rounded-full shrink-0 ${stateDotCls(entry.state)}`}
-          aria-hidden
-        />
-      )}
-      <span className="flex flex-col min-w-0 flex-1">
-        <span className="truncate">{entry.name}</span>
-        {/* A crew whose ssh alias IS its name would otherwise render the same
-            word twice, which reads as a bug rather than as extra detail. */}
-        {entry.detail && entry.detail !== entry.name ? (
-          <span className="truncate text-[12px] text-muted">{entry.detail}</span>
-        ) : null}
-      </span>
-      {entry.unread > 0 ? (
-        <UnreadBadge
-          count={entry.unread}
-          label={i18nT('components.instanceTabBar.n_unread', { n: entry.unread })}
-        />
-      ) : null}
-      {/* Visible, not sr-only. The dot is the only other carrier of state, and
-          colour alone cannot distinguish a connected crew from a failed one for
-          a colourblind user — who would otherwise have to hover every row to
-          find the one that errored. One label serves both audiences, so the
-          word a screen reader announces is the word on screen. */}
-      {entry.state ? (
-        <span className={`shrink-0 text-[11px] ${stateTextCls(entry.state)}`}>
-          {stateLabel(entry.state)}
+    // The destination and its pin are SIBLING menu items sharing one visual row,
+    // never a control nested inside the row: a menuitemradio may not contain
+    // another interactive element (invalid ARIA, and the menu's arrow-key focus
+    // cannot reach it). Two stops per row is the cost, and it keeps each pin
+    // beside the crew it pins instead of in a second list of the same crews.
+    <div className="flex items-center">
+      <DropdownMenuRadioItem
+        value={id}
+        className="gap-2 text-[13px] flex-1 min-w-0 pr-2"
+        onSelect={onSelect}
+        title={entry.title}
+      >
+        {isLocal ? (
+          <Home className="lucide-inline shrink-0" />
+        ) : entry.connecting ? (
+          <Loader2 className="lucide-inline shrink-0 animate-spin" />
+        ) : (
+          <span
+            className={`w-1.5 h-1.5 rounded-full shrink-0 ${stateDotCls(entry.state)}`}
+            aria-hidden
+          />
+        )}
+        <span className="flex flex-col min-w-0 flex-1">
+          <span className="truncate">{entry.name}</span>
+          {/* A crew whose ssh alias IS its name would otherwise render the same
+              word twice, which reads as a bug rather than as extra detail. */}
+          {entry.detail && entry.detail !== entry.name ? (
+            <span className="truncate text-[12px] text-muted">{entry.detail}</span>
+          ) : null}
         </span>
-      ) : null}
-      {/* Filled = pinned and on screen; dimmed = pinned but cut off. The word is in
-          the row's title, so this is decoration for sighted scanning only. */}
-      {pinned ? (
+        {entry.unread > 0 ? (
+          <UnreadBadge
+            count={entry.unread}
+            label={i18nT('components.instanceTabBar.n_unread', { n: entry.unread })}
+          />
+        ) : null}
+        {/* Visible, not sr-only. The dot is the only other carrier of state, and
+            colour alone cannot distinguish a connected crew from a failed one for
+            a colourblind user — who would otherwise have to hover every row to
+            find the one that errored. One label serves both audiences, so the
+            word a screen reader announces is the word on screen. */}
+        {entry.state ? (
+          <span className={`shrink-0 text-[11px] ${stateTextCls(entry.state)}`}>
+            {stateLabel(entry.state)}
+          </span>
+        ) : null}
+      </DropdownMenuRadioItem>
+      <DropdownMenuItem
+        className="shrink-0 px-1.5 justify-center"
+        role="menuitemcheckbox"
+        aria-checked={pinned}
+        data-testid={`crew-pin-${id}`}
+        title={pinLabel}
+        aria-label={pinLabel}
+        // Toggle from `onSelect`, the one activation handler Radix fires exactly
+        // once for BOTH pointer and keyboard (Enter/Space) — the menuitemcheckbox
+        // is unreachable by keyboard otherwise. Hanging the toggle on the raw DOM
+        // `onClick` also dropped pointer clicks: the whole entries list re-renders
+        // on every pin change (the glyph flips), so the item pressed could be
+        // replaced between pointerdown and click and never receive the event.
+        // preventDefault keeps the menu open so a second crew can be pinned
+        // without reopening it, and stops the click from switching crews.
+        onSelect={(e: Event) => {
+          e.preventDefault()
+          onTogglePin()
+        }}
+      >
+        {/* Two states, and FILL is the whole distinction: filled accent = pinned,
+            unfilled muted outline = not pinned. The resting glyph carries no
+            opacity, because it is the only affordance the feature has and
+            `--muted` composited below full strength drops under the 3:1 contrast
+            floor a UI control has to clear. A pinned crew whose header chip got
+            clipped stays filled for the same reason inverted: fading accent to
+            mark it would read as the unpinned outline and invite an accidental
+            unpin, and `--accent` differs per theme so no single opacity is
+            measurably safe. That state is said in the item's accessible name
+            instead. */}
         <Pin
-          className={`lucide-inline shrink-0 text-accent ${noRoom ? 'opacity-40' : 'fill-current'}`}
+          className={`lucide-inline shrink-0 ${pinned ? 'text-accent fill-current' : 'text-muted'}`}
           aria-hidden
         />
-      ) : null}
-    </DropdownMenuRadioItem>
+      </DropdownMenuItem>
+    </div>
   )
 }
 
@@ -448,64 +484,11 @@ function SwitcherMenu({
                 onSelect={() => onSelect(entry.id)}
                 pinned={pinned.has(entry.id ?? LOCAL_VALUE)}
                 noRoom={clippedPinned.has(entry.id ?? LOCAL_VALUE)}
+                onTogglePin={() => onTogglePin(entry.id ?? LOCAL_VALUE)}
               />
             </Fragment>
           ))}
         </DropdownMenuRadioGroup>
-        <DropdownMenuSeparator />
-        {/* Pinning is a flat section of this menu rather than a submenu, and not a
-            button on each row above: a menuitemradio may not contain another
-            interactive control (nested interactive elements are invalid ARIA), and
-            a submenu buries a set-once choice behind a hover. Listing the crews
-            twice is the cost — once to switch to, once to pin — and it reads
-            cleanly because the two lists answer different questions. Checkbox
-            semantics are hand-built on DropdownMenuItem, the same pattern the
-            session sidebar's folder filter uses, because the menu has no checkbox
-            primitive. */}
-        <DropdownMenuLabel className="text-[11px] uppercase tracking-[.04em] text-muted">
-          {i18nT('components.instanceTabBar.pin_crews')}
-        </DropdownMenuLabel>
-        {entries.map(entry => {
-          const id = entry.id ?? LOCAL_VALUE
-          const isPinned = pinned.has(id)
-          return (
-            <DropdownMenuItem
-              key={`pin-${id}`}
-              className="gap-2 text-[13px]"
-              role="menuitemcheckbox"
-              aria-checked={isPinned}
-              data-testid={`crew-pin-${id}`}
-              title={
-                isPinned
-                  ? i18nT('components.instanceTabBar.unpin_crew', { name: entry.name })
-                  : i18nT('components.instanceTabBar.pin_crew', { name: entry.name })
-              }
-              // Two handlers, deliberately: `onClick` is the plain DOM event and is
-              // what actually toggles, while `onSelect` exists only to
-              // preventDefault so the menu stays open for a second pin.
-              onClick={() => onTogglePin(id)}
-              onSelect={(e: Event) => e.preventDefault()}
-            >
-              <span
-                aria-hidden
-                className="w-3.5 h-3.5 shrink-0 rounded-[3px] border flex items-center justify-center"
-                style={
-                  isPinned
-                    ? { borderColor: 'var(--accent)', background: 'var(--accent)' }
-                    : { borderColor: 'var(--border)', background: 'transparent' }
-                }
-              >
-                {isPinned ? <Check className="lucide-inline text-accent-fg" strokeWidth={3} /> : null}
-              </span>
-              <span className="flex-1 truncate">{entry.name}</span>
-              {isPinned && clippedPinned.has(id) ? (
-                <span className="shrink-0 text-[11px] text-muted">
-                  {i18nT('components.instanceTabBar.no_room')}
-                </span>
-              ) : null}
-            </DropdownMenuItem>
-          )
-        })}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -525,14 +508,42 @@ function SwitcherChip({
   active,
   onSelect,
   className = '',
+  shrinkable = false,
 }: {
   entry: SwitcherEntry
   active: boolean
   onSelect: () => void
   /** Extra classes for the caller's own layout hooks (see `tb-crew-active-chip`). */
   className?: string
+  /**
+   * Let the chip give up NAME width when its row is short of room, instead of
+   * holding its full width and letting the row cut whichever chip lands on the
+   * boundary. Only the pinned row passes this: the crew ON SCREEN keeps its full
+   * name, because it is the one label that says where you are.
+   *
+   * The shortage lands on the name because that is the only part of a chip with
+   * slack — the state dot, the unread badge and the padding are all `shrink-0`,
+   * and the name carries `truncate`, so it ellipsises rather than wrapping.
+   *
+   * The floor is on the CHIP, not on the name, and that placement is forced: a
+   * flex item's `min-width:auto` resolves to its content-based minimum, which for
+   * nowrap text is the FULL name — so leaving it `auto` means the chip never
+   * shrinks, while `min-w-0` lets the row squeeze it past its own content and the
+   * name paints outside its border. An explicit floor is the only third option.
+   *
+   * The floor's non-name half is read off this chip's own classes: `px-2` (16) +
+   * `border` (2) + the `w-1.5` dot (6) + one `gap-1.5` (6) = 30px, plus, when an
+   * unread badge is present, a second gap (6) + `ml-0.5` (2) + the badge's
+   * `min-w-[16px]` (16) = 54px. Keep them in sync with the classes below;
+   * `capture-crew-chip-shrink.mjs` asserts the declared floor against the measured
+   * one, so a drift cannot pass silently. A chip carrying a state WORD is never
+   * shrinkable (see `CrewChipRow`), because that word's width is not fixed and
+   * would break the arithmetic.
+   */
+  shrinkable?: boolean
 }) {
   const isLocal = entry.id === null
+  const hasBadge = entry.unread > 0
   return (
     <button
       type="button"
@@ -543,7 +554,11 @@ function SwitcherChip({
       className={
         className +
         ' ' +
-        'flex items-center gap-1.5 h-6 px-2 rounded-md text-[12px] whitespace-nowrap transition-colors shrink-0 border focus-ring ' +
+        'flex items-center gap-1.5 h-6 px-2 rounded-md text-[12px] whitespace-nowrap transition-colors border focus-ring ' +
+        // Both spellings are literal so Tailwind's content scan sees them.
+        (shrinkable
+          ? (hasBadge ? 'min-w-[calc(5ch+54px)] ' : 'min-w-[calc(5ch+30px)] ')
+          : 'shrink-0 ') +
         (active
           ? 'bg-accent-subtle text-accent font-bold border-transparent'
           : 'border-border text-text hover:bg-bg-hover')
@@ -563,7 +578,13 @@ function SwitcherChip({
           `.tb-left` a container rung hides the name so the chip goes icon-only
           rather than pushing the trailing dropdown out of the clip box on a phone.
           The name stays in `aria-label`/`title`, so the chip keeps its accessible
-          name either way. */}
+          name either way.
+
+          On a shrinkable chip the row squeezes the CHIP down to its declared floor
+          and this span absorbs the difference: `truncate`'s `overflow:hidden` gives
+          a flex item an automatic minimum size of zero, so the name is the part
+          that gives way, ellipsised rather than clipped. The 5ch floor lives on the
+          chip, not here, so there is one source of truth for it. */}
       <span className="tb-drop-crew-name truncate max-w-[140px]">{entry.name}</span>
       {entry.unread > 0 ? (
         <UnreadBadge
@@ -664,13 +685,31 @@ function useClippedChipIds(
  * The pinned crews, as always-visible chips between the active crew and the
  * dropdown.
  *
- * One nowrap line, clipped. Wrapping into a hidden second row would keep every
- * chip whole, but it leaves the row holding its full ALLOCATED width with the
- * wrapped chips' space empty — which pushes the trailing dropdown away from the
- * last visible chip by a gap that changes with the viewport. Filling the row
- * instead keeps the dropdown against the chips, at the cost of the boundary chip
- * being cut rather than dropped. The fade marks that edge, so a cut chip reads as
- * "there is more" and the dropdown immediately after it is where the rest is.
+ * One nowrap line that ADAPTS TO ITS OWN TRACK rather than spending the shortage
+ * on one chip. The chips are `shrinkable`, so a row short of room takes the
+ * shortage out of every chip's name (each carries `truncate`) instead of holding
+ * them at full width and letting whichever chip lands on the boundary be sliced
+ * through its unread badge. Nothing outside this group moves: the topbar's grid
+ * hands the identity group a width derived from the WINDOW (both side tracks are
+ * `minmax(0,1fr)` and the group's `container-type:inline-size` keeps its content
+ * out of that calculation), so widening the group would have to be paid for by
+ * the centred search — which stays put.
+ *
+ * Wrapping into a hidden second row is the other way to keep chips whole, and it
+ * is rejected: the row would hold its full ALLOCATED width with the wrapped
+ * chips' space empty, pushing the trailing dropdown away from the last visible
+ * chip by a gap that changes with the viewport.
+ *
+ * A chip's floor is its icon-only form — the state dot, unread badge and padding
+ * are all `shrink-0` — so a cut is still reachable once even those do not fit.
+ * That cut is marked on the EDGE, never over the chips: an alpha fade across the
+ * last pixels reads as a rendering fault rather than as an affordance, because
+ * the unread badge is a chip's trailing element and is therefore the first thing
+ * any cut reaches — a fade there dissolves the one glyph the chip exists to show.
+ * `data-cut` drives a 1px rule at the boundary (index.css), and the count itself
+ * survives twice over: the cut crew's unread is already rolled into the dropdown
+ * trigger's aggregate badge, and its dropdown pin announces the cut in its own
+ * accessible name (`pinned_no_room`).
  *
  * The row needs no width cap of its own: it sits in the topbar's left grid track
  * (`minmax(0,1fr)`) inside `.tb-left`, which carries `min-width:0` and
@@ -698,10 +737,14 @@ function CrewChipRow({
     <div
       ref={rowRef}
       data-testid="crew-chip-row"
+      // Reflects the measurement, so the boundary rule paints only when a chip is
+      // really cut. Safe to feed back: the rule is an absolutely-positioned
+      // pseudo-element, so it takes no layout and cannot change what got clipped.
+      data-cut={clipped.size > 0 ? 'true' : 'false'}
       // `relative` is load-bearing, not cosmetic: it makes this element the chips'
       // offsetParent so useClippedChipIds can compare their offsetLeft against
       // this row's own clientWidth.
-      className="relative flex flex-nowrap items-center gap-1 min-w-0 overflow-hidden crew-chip-row-fade"
+      className="crew-chip-row relative flex flex-nowrap items-center gap-1 min-w-0 overflow-hidden"
     >
       {chips.map(entry => (
         <SwitcherChip
@@ -709,6 +752,11 @@ function CrewChipRow({
           entry={entry}
           active={(entry.id ?? null) === activeId}
           onSelect={() => onSelect(entry.id)}
+          // A chip showing a state WORD ("error", "connecting") is not shrinkable:
+          // that word is text of unknown width, so the chip's declared floor —
+          // which is arithmetic over fixed parts — would not hold for it, and it is
+          // the chip a user most needs to read whole anyway.
+          shrinkable={!entry.state || entry.state === 'connected'}
         />
       ))}
     </div>

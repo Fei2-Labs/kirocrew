@@ -24,6 +24,9 @@ import {
 } from '../src/shared/trustPatterns'
 import { permissionApprovalFromFrame } from '../panel/panelBridge'
 import { approvalBubbleText, approvalPurpose } from '../src/renderer/hooks/useApprovalBubble'
+// The dashboard copy, imported ONLY so the parity test can compare the two
+// implementations directly rather than restating one of them as literals.
+import { truncateCommandLabel as dashboardTruncateCommandLabel } from '../../../utils/trustPatterns'
 
 /** A permission-role chat frame, as the gateway broadcasts it. */
 function frame(meta: Record<string, unknown>): Record<string, unknown> {
@@ -46,9 +49,56 @@ describe('trust pattern transform (shared with the dashboard)', () => {
   })
 
   it('truncates only the LABEL, never the pattern', () => {
-    const long = 'a'.repeat(60)
-    expect(truncateCommandLabel(long)).toHaveLength(31) // 30 + ellipsis
+    const long = 'a'.repeat(80)
+    expect(truncateCommandLabel(long)).toHaveLength(64)
     expect(trustBasePattern(long)).toBe(long + ' *')
+  })
+
+  it('is byte-identical to the dashboard implementation', () => {
+    // Stronger than mirroring a constant by hand: this compares the two copies
+    // directly, so a divergent BUDGET or a divergent ALGORITHM both fail here.
+    // The previous version pinned literals, which meant the dashboard moving to
+    // middle-ellipsis left this copy silently head-truncating -- the same
+    // collision on one surface only (see #4436).
+    const cases = [
+      'a'.repeat(64),
+      'a'.repeat(65),
+      'gh api repos/owner/some-repository/contents/config.json --jq .sha',
+      'gh api repos/rapid7-security-platform-team/ai-vault-service/contents/config.json --jq .sha',
+      'gh api repos/rapid7-security-platform-team/ai-vault-service/contents/secrets.json --jq .sha',
+      // These two STRADDLE the cut points at the default budget, so the parity
+      // comparison actually exercises the surrogate snapping. At max=64 the cuts
+      // are head=42 and tailStart=length-21; an emoji merely sitting in the
+      // elided middle (as the first version of this case did) never snaps, and
+      // the test would have stayed green while the two copies' snap arithmetic
+      // diverged -- the exact behaviour this PR added.
+      `${'a'.repeat(41)}😀${'b'.repeat(40)}`,
+      `${'a'.repeat(61)}😀${'b'.repeat(20)}`,
+      `gh api ${'a'.repeat(40)}😀${'b'.repeat(40)}`,
+      'short',
+      '',
+    ]
+    for (const cmd of cases) {
+      expect(truncateCommandLabel(cmd)).toBe(dashboardTruncateCommandLabel(cmd))
+    }
+    for (const max of [2, 4, 8, 24, 30, 64, 200]) {
+      const cmd = 'gh api repos/owner/some-repository/contents/secrets.json --jq .sha'
+      expect(truncateCommandLabel(cmd, max)).toBe(dashboardTruncateCommandLabel(cmd, max))
+    }
+  })
+
+  it('does not render two commands from the original report with the same label', () => {
+    // The label is the only thing the user reads before granting an exact-string
+    // match. These two differ only in the filename, past the old 30-char budget,
+    // and rendered identically before the fix. Asserting inequality (not just the
+    // new number) catches a build that reintroduces the collision at any length
+    // shorter than where these diverge.
+    const config = 'gh api repos/owner/some-repository/contents/config.json --jq .sha'
+    const secrets = 'gh api repos/owner/some-repository/contents/secrets.json --jq .sha'
+    expect(truncateCommandLabel(config)).not.toBe(truncateCommandLabel(secrets))
+    // ...and pin that the OLD budget is what made them collide, so this test
+    // fails if the budget is narrowed back.
+    expect(truncateCommandLabel(config, 30)).toBe(truncateCommandLabel(secrets, 30))
   })
 
   it('offers the family grant only when it differs from the exact command', () => {

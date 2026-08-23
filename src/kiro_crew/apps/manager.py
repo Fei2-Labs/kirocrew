@@ -277,6 +277,19 @@ def _validate_source_path(source: Path) -> list[str]:
         errors.append(f"invalid {APP_MANIFEST_FILENAME}: {exc}")
         return errors
     errors.extend(manifest.validate(app_root=source))
+    # `ui.overlays` replaces a host surface by naming an overlay component compiled
+    # into the dashboard bundle. An installed app has no way to supply one -- there is
+    # no per-overlay `entryPoint` the way `ui.pages` has -- so accepting the manifest
+    # here would install an app whose declaration can only fail later as a browser
+    # console warning, the one channel an app author never reads. Refuse at install,
+    # which is the channel they do read. Builtins are validated by discovery.py and
+    # are unaffected.
+    if manifest.ui.overlays:
+        errors.append(
+            "ui.overlays is not available to installed apps: an overlay must name a "
+            "component compiled into the dashboard bundle, so a declaration here can "
+            "never render"
+        )
     if manifest.minKiroCrewVersion:
         ver_err = _check_min_version(manifest.minKiroCrewVersion)
         if ver_err:
@@ -1610,7 +1623,16 @@ def register_external_app(
 # both the hardcoded list and the file-based manifests read it from here, so a
 # builtin cannot become default-on in one registration path while the other
 # path's test still forbids it.
-_DEFAULT_ON_BUILTINS: frozenset[str] = frozenset({"projects"})  # Task Runner
+_DEFAULT_ON_BUILTINS: frozenset[str] = frozenset(
+    {
+        "projects",  # Task Runner
+        # Command Bar replaces the quick-search (Cmd+K) surface rather than adding
+        # a sidebar entry, so shipping it off leaves the gesture on the legacy
+        # palette and the launcher unseen. Disabling the app is what restores the
+        # old surface, which is the opt-out this exemption trades for.
+        "command-bar",
+    }
+)
 
 # EMPTY, and that is a finished migration rather than an oversight. Every builtin now
 # ships as a file-based manifest under ``builtins/<dir>/app.json`` and is picked up by

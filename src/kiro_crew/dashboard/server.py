@@ -100,8 +100,10 @@ from kiro_crew.dashboard.handlers.artifacts import (
     api_remote_artifacts_clone,
     api_remote_artifacts_fork,
 )
+from kiro_crew.dashboard.handlers.feedback import setup_feedback_routes
 from kiro_crew.dashboard.handlers.knowledge import setup_knowledge_routes
 from kiro_crew.dashboard.handlers.link_meta import setup_link_meta_routes
+from kiro_crew.dashboard.handlers.secrets import setup_secrets_routes
 from kiro_crew.dashboard.handlers.source_providers import (
     register_status_delta_sink,
     unregister_status_delta_sink,
@@ -2631,6 +2633,8 @@ async def start_dashboard(
     # Knowledge Library
     setup_knowledge_routes(app)
     setup_weixin_routes(app)
+    setup_feedback_routes(app)
+    setup_secrets_routes(app)
 
     # Link previews (chat unfurl). Route is always registered; the handler gates
     # itself on cfg.dashboard.link_previews, so toggling the feature needs no

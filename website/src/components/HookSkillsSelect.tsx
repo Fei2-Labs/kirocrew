@@ -49,8 +49,8 @@ export default function SkillsMultiSelect({ selected, onChange }: Props) {
   const { open, setOpen, filter, setFilter, dropdownRef, inputRef, filtered } =
     useFilteredDropdown(candidates)
 
-  const add = (key: string) => { setOpen(false); onChange([...selected, key]) }
-  const remove = (key: string) => { setOpen(false); onChange(selected.filter(k => k !== key)) }
+  const add = (key: string) => { onChange([...selected, key]) }
+  const remove = (key: string) => { onChange(selected.filter(k => k !== key)) }
 
   return (
     <div>

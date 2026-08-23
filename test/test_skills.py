@@ -346,6 +346,10 @@ class TestRepoScope:
     def _repo(self, tmp_path: Path, name: str = "checkout") -> Path:
         repo = tmp_path / name
         (repo / "src" / "kiro_crew").mkdir(parents=True)
+        # A real checkout carries a .git entry, and the gate reads it as the
+        # boundary the ancestor walk stops at, so the fixture needs one to model a
+        # repository rather than a bare directory tree.
+        (repo / ".git").mkdir()
         return repo
 
     def test_scoped_skill_suppressed_without_a_project(self, tmp_path: Path) -> None:

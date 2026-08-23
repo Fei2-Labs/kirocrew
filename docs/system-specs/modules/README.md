@@ -83,6 +83,7 @@ agent loads only the one it needs.
 | Spec | Subsystem |
 |---|---|
 | [papyrus.md](papyrus.md) | The Papyrus writing app. |
+| [command-bar.md](command-bar.md) | The opt-in launcher that replaces quick-search: the overlay seam, the request-free root, ranking and scopes. |
 | [pptx-maker.md](pptx-maker.md) | Deck generation. |
 | [meetings.md](meetings.md) | Meeting capture and summarization. |
 | [issue-radar.md](issue-radar.md) | Issue triage and grouping. |

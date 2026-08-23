@@ -46,10 +46,11 @@ from kiro_crew.discord.session_resume import (
 )
 from kiro_crew.discord.transport import DISCORD_CAPABILITIES
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.history import is_incognito_transcript
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
-from kiro_crew.messaging.dispatch import delivery_is_muted
+from kiro_crew.messaging.dispatch import build_directive_consumer, delivery_is_muted
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -83,6 +84,41 @@ from kiro_crew.messaging.queue_receipt import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _persisted_mode_is_restricted(session_key: str) -> bool:
+    """Whether ``dashboard:<slot>``'s PERSISTED transcript says it is restricted.
+
+    Blocking (it reads the transcript's metadata line), so callers run it off the
+    event loop. Uses ``_probe_persisted_session``, NOT
+    ``_persisted_session_memory_mode``: the namespace is stripped off the key
+    before it gets here, so one stem can match several transcripts (a legacy bare
+    ``<name>.jsonl`` and an archived ``dashboard_<name>.jsonl``), and the
+    memory-mode helper answers from the FIRST candidate -- letting a persistent
+    file answer for an incognito session. The probe refuses to guess and reports
+    unknown, which denies, as does a header no normal session wrote. Existence is
+    ignored: unknown denies either way.
+
+    Imported inside the function because ``discord`` has no module-level dependency on
+    ``dashboard`` and adding one would cycle through the gateway; import failure denies.
+    """
+    slot_name = session_key.split(":", 1)[-1]
+    try:
+        # circular import: the dashboard gateway imports the Discord transport.
+        from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
+
+        _exists, mode = _probe_persisted_session(slot_name)
+    except Exception:
+        logger.warning(
+            "discord: could not resolve the persisted memory mode for %s; denying uploads",
+            session_key,
+            exc_info=True,
+        )
+        return True
+    if mode is None:
+        return True
+    return is_incognito_transcript(mode)
+
 
 # Canonical kiro-cli agent fallback so Discord sessions load kirocrew-core
 # (spawn_run etc.) — mirrors the Slack/Telegram paths.
@@ -175,6 +211,10 @@ class DiscordDispatcher:
         )
         # Kept as a direct alias for diagnostics/tests; the controller owns it.
         self._session_pickers = self._session_resume.pickers
+
+    def register_allowed_thread(self, thread_id: str) -> None:
+        """Authorize interactions in a thread created by the inbound transport."""
+        self._allowed_threads.add(thread_id)
 
     # ── Turn dispatch (transport's dispatch callback) ──────────────────────
 
@@ -346,7 +386,11 @@ class DiscordDispatcher:
             else None
         )
         renderer = DiscordRenderer(
-            self.client, channel_id, DISCORD_CAPABILITIES, session_key=session_key
+            self.client,
+            channel_id,
+            DISCORD_CAPABILITIES,
+            session_key=session_key,
+            uploads_allowed=not await self._uploads_restricted(session_key),
         )
         # Discord runs its OWN copy of the turn loop instead of going through
         # ``messaging.dispatch.drive_turn``, so the disconnect gate there does not
@@ -400,6 +444,7 @@ class DiscordDispatcher:
                 session_key, agent=agent, channel_id=chan_id
             )
             _acquired = True
+            renderer.authorize_upload_root(provider.cwd)
             if msg.attachments:
                 attachment_result = await process_discord_attachments(
                     self.client, msg.attachments
@@ -496,6 +541,13 @@ class DiscordDispatcher:
                     and title == "spawn_run"
                 ),
                 tool_gate=_tool_gate,
+                # Session-directive consumer: monitor_start / autonudge_stop /
+                # ... return a marker the driver decodes; apply it against THIS
+                # turn's session key (dashboard-only directives stay refused
+                # for channel sessions).
+                directive_consumer=build_directive_consumer(
+                    session_key=session_key, sessions=self.sessions, dispatcher=self
+                ),
             )
             accumulated = await driver.run(full_message)
 
@@ -1169,6 +1221,53 @@ class DiscordDispatcher:
             )
             return None
 
+    async def _uploads_restricted(self, session_key: str) -> bool:
+        """True when this session must not ship local file bytes to Discord.
+
+        Restricted means an incognito or temporary dashboard session this
+        conversation has resumed. Those slots are denied every artifact write, on
+        the reasoning that a session the user expected to leave no trace must not
+        persist its output; uploading a local file into a Discord channel is the
+        same disclosure with a different destination, and an approved guild thread
+        is readable by every member who can view it.
+
+        Three inputs, in the order their evidence is strongest:
+
+        * A key that is not ``dashboard:`` is a Discord-native conversation. It
+          never had a dashboard slot and has no restricted mode, so it is
+          allowed -- blanket fail-closed here would disable uploads for every
+          normal Discord session.
+        * A LIVE slot answers directly, off the same ``slot.is_restricted``
+          signal as the artifact gate, so the two cannot drift.
+        * No live slot, but a ``dashboard:`` binding still resolved. This is a
+          real state, not a defensive branch: closing the tab pops the slot from
+          ``state._slots`` AND discards its key from ``state._restricted_keys``,
+          while the mirror binding lives in the persisted session map, which only
+          an explicit unlink clears. So the next Discord message into that
+          conversation resolves an incognito session whose in-memory restriction
+          is gone. The transcript keeps its ``memory_mode`` marker, so resolve
+          the PERSISTED mode instead -- and deny when it cannot be read.
+
+        The denial is SEL-audited so the ceiling is observable, mirroring how
+        this transport audits its authorization denials.
+        """
+        if not session_key.startswith("dashboard:"):
+            return False
+        slot = self._live_dashboard_slot(session_key)
+        if slot is not None:
+            restricted = bool(getattr(slot, "is_restricted", True))
+        else:
+            restricted = await asyncio.to_thread(_persisted_mode_is_restricted, session_key)
+        if restricted:
+            sel().log_api_access(
+                caller=session_key,
+                operation="discord_dispatch.upload_files",
+                outcome="denied",
+                source="discord",
+                error="restricted_session",
+            )
+        return restricted
+
     def _mirror_turn_to_live_slot(self, session_key: str, user_text: str, reply_text: str) -> bool:
         """Land a resumed turn in the live dashboard window. Loop-side only.
 
@@ -1246,7 +1345,11 @@ class DiscordDispatcher:
     async def _maybe_notice(
         self, channel_id: str, scope_id: str, session_key: str, provider: Any
     ) -> None:
-        """Soft-threshold context warning as a SEPARATE message (not persisted)."""
+        """Soft-threshold context warning as a SEPARATE message (not persisted).
+
+        The hard-compaction backstop is the backend autocompactor
+        (``session.autocompact_pct``).
+        """
         pct = self.sessions.check_context_usage(session_key, provider)
         soft_pct = self.cfg.discord.soft_threshold_pct
         if pct >= soft_pct and not self._conv.is_awaiting(scope_id):

@@ -1036,14 +1036,31 @@ def _send(
         return _transport_failure(str(e), mark_transport_error)
 
 
-def _post(path: str, body: dict | None = None, *, timeout: float = 30) -> dict:
+def _post(
+    path: str,
+    body: dict | None = None,
+    *,
+    timeout: float = 30,
+    session_key: str | None = None,
+) -> dict:
+    """POST a gateway endpoint.
+
+    ``session_key``: as in :func:`_patch`, and it matters for the same reason.
+    The default resolution is :func:`_resolve_session_key`, which includes the
+    ``/proc`` ancestor walk, so a caller that already gated itself on
+    :func:`_resolve_session_key_strict` and then let this helper re-resolve
+    would CHECK one identity and WRITE under another — the walk can land on an
+    ancestor slot, which for an app-owned session means the write arrives
+    looking like the unconfined person. Such a caller must pass the key it
+    verified. It is still validated by ``_session_key_header_error``.
+    """
     data = json.dumps(body or {}).encode()
     headers = {
         "Content-Type": "application/json",
         "X-Internal-Secret": _internal_secret(),
         **_caller_header(),
     }
-    sk = _resolve_session_key()
+    sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
         return {"error": _sk_err}
@@ -1911,10 +1928,11 @@ def run_mcp_core_server() -> None:
         _call_tool,
         # Pooled-operation opt-in: kirocrew-core consumes the per-call
         # ``kirocrew.caller`` identity (see _resolve_session_key*), so it is
-        # safe to share one backend across sessions. kirocrew-cron does NOT
-        # advertise — it imports this module's resolver, so it would consume the
-        # caller block if one were injected, but nothing injects one for a
-        # backend that never advertised, and its channel identity still comes
-        # from process env. So gatewayd keeps it per-session.
+        # safe to share one backend across sessions. kirocrew-cron advertises
+        # too, for the same reason. The two managed servers that do not --
+        # kirocrew-computer and kirocrew-dashboard -- are pooled all the same
+        # (nothing declines to pool an unadvertised backend; see
+        # ``rewriter.UNPOOLABLE_SERVERS``), so what they lack is the injected
+        # block, not co-tenancy.
         advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
     )

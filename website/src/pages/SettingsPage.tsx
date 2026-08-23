@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Bell, Code, Fingerprint, Globe, History, Import, Info, Keyboard, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Server, ShieldCheck, Sparkles, SquareMousePointer, Webhook } from 'lucide-react'
+import { Bell, Code, Fingerprint, Globe, History, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Server, ShieldCheck, Sparkles, SquareMousePointer, Webhook } from 'lucide-react'
 import { useAppSelector } from '../store'
 import SidePanelLayout from '../components/SidePanelLayout'
 import { useSettingHighlight } from '../hooks/useSettingHighlight'
@@ -23,6 +23,7 @@ import { ImportPanel } from './settings/ImportPanel'
 import { ComputerUsePanel } from './settings/ComputerUsePanel'
 import { WebhooksPanel } from './settings/WebhooksPanel'
 import { PrivacyPanel } from './settings/PrivacyPanel'
+import { SecretsPanel } from './settings/SecretsPanel'
 
 import { i18nT } from '../i18n/t'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
@@ -62,6 +63,7 @@ function buildTabs() {
     { key: 'instances', label: i18nT('settings.tabs.instances.label'), icon: <Server size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.instances.description') },
     { key: 'privacy', label: i18nT('privacyDisclosure.settingsLabel'), icon: <Fingerprint className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('privacyDisclosure.settingsDescription') },
     { key: 'security', label: i18nT('settings.tabs.security.label'), icon: <ShieldCheck size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.security.description') },
+    { key: 'secrets', label: i18nT('settings.tabs.secrets.label'), icon: <KeyRound size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.secrets.description') },
     { key: 'developer', label: i18nT('settings.tabs.developer.label'), icon: <Code size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.developer.description') },
     // The trailing divider fences off the entries that are not settings at all.
     // About was its only occupant; the release archive is the same kind of thing
@@ -106,9 +108,18 @@ export default function SettingsPage() {
   // An embedded instance pane can't manage remote instances (single-level by
   // design) — hide the Instances tab so a pane can't connect onward.
   const embedded = isEmbeddedPane()
-  // Update nudge: dot on the About entry while a desktop update is available
-  // (mirrored from Electron update-state by useUpdateSubscription).
-  const updateAvailable = useAppSelector(s => s.dashboard.desktopUpdateAvailable)
+  // Update nudge: dot on the About entry while an update is available. Two
+  // independent sources, because they cover different installs: the Electron
+  // updater's mirrored flag (desktop only) and the gateway's own verdict (every
+  // other shape). Keying on the desktop flag alone left the dot permanently dark
+  // on a wheel install, which is the majority of installs.
+  //
+  // `=== true` is required, not cosmetic: the gateway sends null for a check that
+  // never ran or failed, and a truthiness test would keep that dark while a
+  // `!== false` test would light it on no evidence.
+  const gatewayUpdateAvailable = useAppSelector(s => s.dashboard.status?.update_available)
+  const desktopUpdateAvailable = useAppSelector(s => s.dashboard.desktopUpdateAvailable)
+  const updateAvailable = gatewayUpdateAvailable === true || desktopUpdateAvailable
   // Inbound webhooks is preview-gated. The rail and the palette apply that gate
   // through `getAdvertisedSurfaces()`, but this tab is the surface's only
   // advertised home (it is `hiddenFromNav`), so the gate has to be applied here
@@ -145,6 +156,7 @@ export default function SettingsPage() {
         {tab === 'instances' && !embedded && <RemoteCrewPanel />}
         {tab === 'privacy' && <PrivacyPanel />}
         {tab === 'security' && <SecurityPanel />}
+        {tab === 'secrets' && <SecretsPanel />}
         {tab === 'developer' && <DeveloperPanel />}
         {tab === 'releases' && <ReleasesPanel />}
         {tab === 'about' && <AboutPanel />}

@@ -33,6 +33,13 @@ from typing import Any
 from kiro_crew.computer_use import types as _cu_types
 from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 
+# Reasoning-effort vocabulary: ``effort.py`` is the single source of truth for
+# the valid levels; EFFORT_VALUES additionally admits ``""`` ("unset — defer to
+# the role pin / provider default"). Import-safe: ``effort`` pulls in only
+# ``model_registry`` (stdlib-only), so no cycle back into validation.
+from kiro_crew.effort import EFFORT_VALUES
+from kiro_crew.project_scope import SCOPE_FRAGMENT_RE
+
 # ── Constants ──
 
 # Max lengths for string inputs
@@ -970,6 +977,10 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # Optional model override for the subagent (e.g. "deepseek-3.2").
         # When set, the subagent runs on this model instead of the gateway default.
         FieldSpec("model", str, max_len=MAX_SHORT_STRING, pattern=_MODEL_NAME_RE),
+        # Optional per-call reasoning-effort override for the subagent(s).
+        # Batch-wide, like ``model``. ``""`` (in EFFORT_VALUES) means "unset —
+        # defer to the role_efforts['subagent'] pin, else the provider default".
+        FieldSpec("reasoning_effort", str, allowed=EFFORT_VALUES),
         # keep=True makes the run a continuable conversation: its session
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
@@ -1033,9 +1044,18 @@ LEARN_ADD_SCHEMA = ToolSchema(
         FieldSpec("rule", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("category", str, allowed=ALLOWED_LESSON_CATEGORIES, default="knowledge"),
         FieldSpec("negative", str, max_len=MAX_SHORT_STRING),
-        # scope/workspace: the learn_add MCP tool (mcp_core.py) and the
-        # /api/lessons handler support workspace-scoped lessons. The "workspace
-        # required when scope='workspace'" rule is enforced in the handler.
+        # Path fragment naming the repository a correction belongs to; absent means
+        # it applies everywhere. The pattern is the gate's own (imported, not
+        # restated), so a value the gate could never satisfy -- a dot segment,
+        # traversal, an empty segment, a drive-qualified path -- is refused HERE
+        # rather than stored as a lesson that reports success and applies nowhere.
+        # Whether the named path exists is still the gate's business, at injection.
+        FieldSpec("repo_scope", str, max_len=MAX_SHORT_STRING, pattern=SCOPE_FRAGMENT_RE),
+        # scope/workspace: the /api/lessons handler stores and lists
+        # workspace-scoped lessons, but that tier does NOT reach a prompt -- the
+        # context builder gates injected lessons on repo_scope instead. The
+        # "workspace required when scope='workspace'" rule is enforced in the
+        # handler.
         FieldSpec("scope", str, allowed=ALLOWED_LESSON_SCOPES, default="global"),
         FieldSpec("workspace", str, max_len=MAX_SHORT_STRING, pattern=WORKSPACE_NAME_RE),
     ],
@@ -2215,6 +2235,49 @@ def _validate_hook_has_action(args: dict) -> None:
     """A hook must have either a command or skills — an empty hook is invalid."""
     if not args.get("command") and not args.get("skills"):
         raise ValidationError("command", "either command or skills must be provided")
+    # Skills injection only fires for a *standalone* skills hook (no command) on
+    # UserPromptSubmit/AgentSpawn — see ScriptHookStore.fire(), which emits the
+    # "Load skills:" directive only when `hook.skills and not hook.command` and
+    # the event is one of those two. Reject any other pairing at save time so a
+    # hook can never save cleanly and then silently never fire:
+    #   - skills + a command: the command runs but the skills are inert.
+    #   - skills on PreToolUse/PostToolUse/Stop: the directive has no consumer.
+    if args.get("skills"):
+        if args.get("command"):
+            raise ValidationError(
+                "skills",
+                "skills cannot be combined with a command — the skills would "
+                "never fire; use a skills-only hook or drop the skills",
+            )
+        event = args.get("event", "")
+        if event in ("PreToolUse", "PostToolUse", "Stop"):
+            raise ValidationError(
+                "skills",
+                f"skills hooks cannot fire on {event} events — "
+                "choose UserPromptSubmit or AgentSpawn",
+            )
+
+
+def _validate_hook_create(args: dict) -> None:
+    """Validate a hook at creation time: action + regex syntax."""
+    _validate_hook_has_action(args)
+    _validate_hook_regex(args)
+
+
+def _validate_hook_update(args: dict) -> None:
+    """Validate a hook at update time: regex syntax (action already checked by store)."""
+    _validate_hook_regex(args)
+
+
+def _validate_hook_regex(args: dict) -> None:
+    """Reject an invalid regex pattern at save time with a field-level error."""
+    matcher = args.get("matcher", "")
+    mode = args.get("matcher_mode", "glob")
+    if mode == "regex" and matcher:
+        try:
+            re.compile(matcher)
+        except re.error as exc:
+            raise ValidationError("matcher", f"invalid regex: {exc}") from None
 
 
 HOOK_CREATE_SCHEMA = ToolSchema(
@@ -2229,7 +2292,7 @@ HOOK_CREATE_SCHEMA = ToolSchema(
         FieldSpec("timeout", int, min_val=1, max_val=300, default=30),
         FieldSpec("enabled", bool, default=True),
     ],
-    custom_validator=_validate_hook_has_action,
+    custom_validator=_validate_hook_create,
 )
 
 HOOK_UPDATE_SCHEMA = ToolSchema(
@@ -2244,25 +2307,45 @@ HOOK_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("timeout", int, min_val=1, max_val=300),
         FieldSpec("enabled", bool),
     ],
+    custom_validator=_validate_hook_update,
 )
 
 # ── Tool Schemas (File I/O) ──
 
+#: Syntactic shape gate for a filesystem path arriving over the dashboard's
+#: file endpoints. It admits POSIX (``/x``, ``~/x``) *and* native Windows
+#: (``C:\x``, ``C:/x``, UNC ``\\host\share\x``) absolute paths. A prefix is
+#: still required, so a bare relative path is refused exactly as before --
+#: the endpoints that support relative input rewrite it to an absolute path
+#: via ``_resolve_project_relative`` under ``resolve=1``, ahead of this gate.
+#:
+#: One pattern rather than a ``sys.platform`` branch: a drive letter and a UNC
+#: root have no meaning on POSIX, so accepting those shapes there admits no
+#: path that was previously unreachable, and a single pattern cannot drift
+#: between platforms the way two would. This is a *syntax* gate only -- the
+#: security boundary is downstream, where ``hooks.validate_file_path``
+#: canonicalizes through ``realpath`` (resolving ``..`` and following symlinks)
+#: and refuses the resolved target via ``is_sensitive_path``.
+#:
+#: The prefix alternation is matched separately from the body so that ``:``
+#: stays confined to a drive prefix: an NTFS alternate data stream
+#: (``C:\x\file.txt:hidden``, which reads a different byte stream than the path
+#: the caller appears to name) has a ``:`` in the body and is still refused.
+#: A drive-relative path (``C:x``) is likewise refused -- it resolves against a
+#: per-drive working directory the caller cannot see.
+_FS_PATH_PATTERN = re.compile(r"^(?:[~/]|[A-Za-z]:[\\/]|\\\\)[-\w.@~/\\ ]+$")
+
 FILE_READ_SCHEMA = ToolSchema(
     tool_name="file_read",
     fields=[
-        FieldSpec(
-            "path", str, required=True, max_len=4096, pattern=re.compile(r"^[~/][-\w.@~/ ]+$")
-        ),
+        FieldSpec("path", str, required=True, max_len=4096, pattern=_FS_PATH_PATTERN),
     ],
 )
 
 FILE_WRITE_SCHEMA = ToolSchema(
     tool_name="file_write",
     fields=[
-        FieldSpec(
-            "path", str, required=True, max_len=4096, pattern=re.compile(r"^[~/][-\w.@~/ ]+$")
-        ),
+        FieldSpec("path", str, required=True, max_len=4096, pattern=_FS_PATH_PATTERN),
         FieldSpec("content", str, required=True, max_len=512000),
     ],
 )
@@ -2369,7 +2452,16 @@ LOCAL_KNOWLEDGE_SEARCH_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("query", str, required=True, max_len=500),
         FieldSpec("limit", int, required=False, min_val=1, max_val=5, default=3),
+        # Opaque source id (uuid4 today). No pattern: an unknown id must reach
+        # the handler for a graceful "use knowledge_list_sources" reply, not a
+        # ValidationError; every downstream use is a parameterized SQL bind.
+        FieldSpec("source_id", str, required=False, max_len=64),
     ],
+)
+
+KNOWLEDGE_LIST_SOURCES_SCHEMA = ToolSchema(
+    tool_name="knowledge_list_sources",
+    fields=[],
 )
 
 KNOWLEDGE_DEDUP_SCHEMA = ToolSchema(
@@ -2449,6 +2541,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "local_knowledge_search": LOCAL_KNOWLEDGE_SEARCH_SCHEMA,
     "knowledge_dedup": KNOWLEDGE_DEDUP_SCHEMA,
     "knowledge_add_document": KNOWLEDGE_ADD_DOCUMENT_SCHEMA,
+    "knowledge_list_sources": KNOWLEDGE_LIST_SOURCES_SCHEMA,
     "search_chat_history": SEARCH_CHAT_HISTORY_SCHEMA,
     "get_chat_session": GET_CHAT_SESSION_SCHEMA,
     "list_sessions": LIST_SESSIONS_SCHEMA,
@@ -2588,6 +2681,16 @@ _CU_OPTIONAL_ELEMENT_FIELD = FieldSpec(
 )
 _CU_CLICK_METHODS = frozenset(_cu_types.CLICK_METHODS)
 _CU_MOUSE_BUTTONS = frozenset(_cu_types.MOUSE_BUTTONS)
+_CU_DRAG_PATHS = frozenset(_cu_types.DRAG_PATHS)
+# ``computer_launch_app``'s target is a NAME, and this field is where that is
+# enforced on the wire. Deliberately the same bounded single-line string shape as
+# ``app`` — there is no path field and no argument field, because a launch that
+# accepted either would be "run an arbitrary program with attacker-chosen input"
+# rather than "open an application". The drivers narrow it much further (a resolved
+# executable must sit under a protected install root); this is only the outer bound.
+_CU_LAUNCH_APP_FIELD = FieldSpec(
+    "app", str, required=True, max_len=_cu_types.MAX_LAUNCH_QUERY_LEN
+)
 
 
 def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
@@ -2628,6 +2731,16 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
     _cu_types.TOOL_LIST_APPS: ToolSchema(tool_name=_cu_types.TOOL_LIST_APPS, fields=[]),
+    _cu_types.TOOL_LAUNCH_APP: ToolSchema(
+        tool_name=_cu_types.TOOL_LAUNCH_APP,
+        # ONE field, and the absence of the others is the point. No ``path``, no
+        # ``args``, no ``url``: the target is a name resolved against the OS's own
+        # catalog of installed applications, and each of those fields would turn this
+        # into a way to run an arbitrary program with attacker-chosen input — which,
+        # because computer use is deliberately not governance-gated, would also skip
+        # the ``BUILTIN_DENIED_RULES`` floor every ``bash`` call passes.
+        fields=[_CU_LAUNCH_APP_FIELD],
+    ),
     _cu_types.TOOL_GET_STATE: ToolSchema(
         tool_name=_cu_types.TOOL_GET_STATE,
         fields=[
@@ -2680,6 +2793,17 @@ MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
             # for a drag — enumerating a smaller set here would put the same rule
             # in two places and let them drift.
             FieldSpec("click_method", str, max_len=16, allowed=_CU_CLICK_METHODS),
+            # The PATH shape. ``steps`` has no default here: absent means the
+            # dispatcher's ``DEFAULT_DRAG_STEPS`` (the two-point form), and putting a
+            # default in the schema as well would make one of the two authoritative
+            # by accident.
+            FieldSpec(
+                "steps",
+                int,
+                min_val=_cu_types.MIN_DRAG_STEPS,
+                max_val=_cu_types.MAX_DRAG_STEPS,
+            ),
+            FieldSpec("path", str, max_len=16, allowed=_CU_DRAG_PATHS),
         ],
     ),
     _cu_types.TOOL_TYPE_TEXT: ToolSchema(

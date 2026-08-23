@@ -81,6 +81,98 @@ function resolveLinuxInstall({ env = process.env, resourcesPath = process.resour
   return { kind, format, appImagePath };
 }
 
+// The externally-managed marker, named after the PEP 668 precedent: a distro or
+// enterprise packager that owns this install's update lifecycle drops this file
+// into the packaged resources (beside `package-type` and `backend-dist`, the
+// established outside-asar packager surface). Its PRESENCE is the whole signal;
+// the JSON body only adds display metadata.
+const EXTERNALLY_MANAGED_MARKER = "EXTERNALLY-MANAGED";
+// Read cap for the marker and display caps for its fields. The marker is an
+// operator/packager-owned local file, but this code runs synchronously during
+// main-process startup: an unbounded read of a huge file (or a symlink into a
+// FIFO/device) must not be able to stall or exhaust the app. An over-cap or
+// non-regular entry still counts as MANAGED — presence is the signal — just
+// with no metadata to show.
+const EXTERNALLY_MANAGED_MAX_BYTES = 8192;
+const MANAGED_BY_MAX_CHARS = 128;
+const UPDATE_COMMAND_MAX_CHARS = 512;
+
+/**
+ * Is this install's update lifecycle owned by an external package manager?
+ *
+ * Lookup order: the `KIROCREW_EXTERNALLY_MANAGED` env var (a path to a marker
+ * file, or any other non-empty value to mark the install managed with no
+ * metadata — the test-harness seam, mirroring `KIROCREW_UPDATE_FEED`), then
+ * `<resourcesPath>/EXTERNALLY-MANAGED`. I/O-bearing and fully injectable, like
+ * resolveLinuxInstall above.
+ *
+ * The marker body is optional JSON `{managedBy, updateCommand}`: `managedBy`
+ * names the owning system for the About panel, `updateCommand` is the command
+ * the panel offers to copy. Every degenerate marker — empty, unparsable,
+ * over-cap, a directory, a symlink, a dangling symlink — still means MANAGED:
+ * an operator who dropped SOMETHING at that name gets the safe behavior
+ * (updater off) even when the metadata is wrong, never a silent fallback to
+ * self-updating. Entries are `lstat`ed and only regular files are read, so a
+ * symlink can never route this startup-path read into a FIFO or device.
+ *
+ * @param {object} [o]
+ * @param {object} [o.env=process.env]
+ * @param {string} [o.resourcesPath=process.resourcesPath]
+ * @returns {{managedBy:string, updateCommand:string}|null} null when not managed
+ */
+function readExternallyManaged({ env = process.env, resourcesPath = process.resourcesPath } = {}) {
+  let raw = null;
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    // Present-but-unreadable (non-regular, over-cap, read error) = managed, no
+    // metadata. Absent = null. Never follows a symlink into the read.
+    const readMarkerAt = (p) => {
+      let st;
+      try {
+        st = fs.lstatSync(p);
+      } catch {
+        return null; // absent
+      }
+      if (!st.isFile() || st.size > EXTERNALLY_MANAGED_MAX_BYTES) return "";
+      try {
+        return fs.readFileSync(p, "utf8");
+      } catch {
+        return "";
+      }
+    };
+    const override = (env && env.KIROCREW_EXTERNALLY_MANAGED) || "";
+    if (override) {
+      // A value that names a marker file reads it; any other non-empty value
+      // (including a dangling path) marks the install managed with no metadata.
+      raw = readMarkerAt(override);
+      if (raw === null) raw = "";
+    } else {
+      raw = readMarkerAt(path.join(resourcesPath || "", EXTERNALLY_MANAGED_MARKER));
+      if (raw === null) return null;
+    }
+  } catch {
+    // fs itself unavailable (non-node runtime): nothing to read, not managed.
+    return null;
+  }
+  let managedBy = "";
+  let updateCommand = "";
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed.managedBy === "string") {
+        managedBy = parsed.managedBy.trim().slice(0, MANAGED_BY_MAX_CHARS);
+      }
+      if (typeof parsed.updateCommand === "string") {
+        updateCommand = parsed.updateCommand.trim().slice(0, UPDATE_COMMAND_MAX_CHARS);
+      }
+    }
+  } catch {
+    // Presence alone is the signal; a bare marker means managed, no metadata.
+  }
+  return { managedBy, updateCommand };
+}
+
 // Can the AppImage replace itself, i.e. is the directory HOLDING the image
 // writable? AppImageUpdater stages the new image beside the old one and `mv`s it
 // over the original, so the containing directory — not the mounted, read-only
@@ -215,20 +307,33 @@ function channelForVersion(version) {
  *   migrate the dev app onto a production channel.
  * - unstamped (dev, stamped === null) builds have no update lane; the
  *   preference cannot conjure one.
- * - production stamps (insider/stable) follow the preference when set,
- *   else their own stamp. Switching BACK can be a downgrade mid-cycle
- *   (insider 0.2.0-insider.1 -> stable 0.1.0), which is why allowDowngrade
- *   is enabled in configureUpdater.
+ * - production builds (insider/stable stamps) follow the preference when set,
+ *   and default to STABLE when it is not. Switching BACK can be a downgrade
+ *   mid-cycle (insider 0.2.0-insider.1 -> stable 0.1.0), which is why
+ *   allowDowngrade is enabled in configureUpdater.
+ *
+ * Why the unset default is stable rather than the stamp: a stable release is
+ * PROMOTED, meaning the exact notarized candidate bytes are re-pointed at the
+ * stable channel without a rebuild, so the stable download and the insider
+ * download of a promoted version are the SAME FILE and carry the same
+ * prerelease stamp (`0.3.0-insider.13`). The channel therefore cannot be a
+ * property of the bytes, and reading it out of the version string sends every
+ * promoted-stable install to the insider feed. It is a default plus an opt-in,
+ * which is what this function's own contract above already describes.
+ *
+ * `channelForVersion` deliberately keeps classifying the BYTES (it is what the
+ * About panel's "you are running prerelease bytes" note is keyed on); only the
+ * followed feed is decoupled from it here.
  *
  * @param {"nightly"|"insider"|"stable"|null} stamped - channelForVersion(version)
- * @param {"insider"|"stable"|""|null|undefined} preference - user opt-in, falsy = follow stamp
+ * @param {"insider"|"stable"|""|null|undefined} preference - user opt-in, falsy = default
  * @returns {"nightly"|"insider"|"stable"|null}
  */
 function resolveChannel(stamped, preference) {
   if (stamped === "nightly") return "nightly";
   if (stamped === null) return null;
   if (preference === "insider" || preference === "stable") return preference;
-  return stamped;
+  return "stable";
 }
 
 /**
@@ -504,6 +609,10 @@ function initAutoUpdate(deps) {
     // test without a real AppImage mount or a real /opt install.
     linuxInstall = null,
     probeAppImageWritable = isAppImageContainerWritable,
+    // Externally-managed verdict, injected for the same reason as linuxInstall:
+    // assertable in tests without a real marker file. undefined = read the
+    // marker from disk; null = not managed; object = managed.
+    externallyManaged = undefined,
     // Electron's NATIVE autoUpdater, used only to observe
     // `before-quit-for-update` -- the signal that the platform installer has
     // actually taken over (see forceExitFailsafe). electron-updater drives it
@@ -526,6 +635,13 @@ function initAutoUpdate(deps) {
   const linux = osPlatform === "linux"
     ? (linuxInstall || resolveLinuxInstall({ resourcesPath }))
     : { kind: "", format: "", appImagePath: "" };
+
+  // Externally-managed verdict. Resolved once and BEFORE getInfo() is defined,
+  // for the same temporal-dead-zone reason as `linux` above: the early-return
+  // stub below hands getInfo out, and getInfo reports the marker's metadata.
+  const managed = externallyManaged !== undefined
+    ? externallyManaged
+    : readExternallyManaged({ resourcesPath });
 
   // When the in-app UI is wired (onUpdateState provided), it owns the prompt;
   // the native dialog stays as the fallback for headless / no-renderer cases.
@@ -570,10 +686,14 @@ function initAutoUpdate(deps) {
       version: app.getVersion(),
       channel: currentChannel(),
       // Switcher inputs: the build's own lane, whether this build may switch
-      // (nightly is pinned; dev has no lane), and the stored preference.
+      // (nightly is pinned; dev has no lane; an externally-managed install has
+      // no lane the marker's owner reads), and the stored preference.
       stampedChannel: stamped,
-      channelSwitchable: stamped === "insider" || stamped === "stable",
+      channelSwitchable: !managed && (stamped === "insider" || stamped === "stable"),
       channelPreference: getChannelPreference() || "",
+      // Externally-managed metadata, both empty on a self-updating install.
+      managedBy: managed ? managed.managedBy || "" : "",
+      updateCommand: managed ? managed.updateCommand || "" : "",
       platform,
       packaged: !!app.isPackaged,
       // Escape hatch for a failed install (see manualDownloadUrl).
@@ -583,6 +703,17 @@ function initAutoUpdate(deps) {
     };
   }
 
+  // An operator or distro packager that dropped the EXTERNALLY-MANAGED marker
+  // owns this install's update lifecycle: the external package manager replaces
+  // the whole install, so a self-update would fight it (each overwriting the
+  // other's bytes) and a feed check would compare against releases the owner
+  // never ships. FIRST gate on purpose: the marker is an intentional operator
+  // override, so it wins over every runtime detection below — the updater is
+  // never armed and the feed is never contacted.
+  if (managed) {
+    log.info(`[update] externally managed${managed.managedBy ? ` by ${managed.managedBy}` : ""} — auto-update disabled`);
+    return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "externally-managed" };
+  }
   // Updating requires an installed, signed bundle (macOS code signature
   // validation is mandatory for Squirrel.Mac; Linux AppImage needs the
   // AppImage runtime), so dev builds have no update lane.
@@ -732,6 +863,17 @@ function initAutoUpdate(deps) {
    */
   async function safeCheck() {
     if (checking) return;
+    if (installing || quitHandled) {
+      // Install activity: the gateway is stopped on purpose and the process
+      // is handing off to the platform installer. The poll timer already
+      // skips this window (see pollTimer below); the renderer-driven path
+      // must refuse for the same reasons — a check outcome here either races
+      // the handoff or, because `installing` outranks `checking` in the error
+      // handler's phase derivation, a feed failure would fire the host's
+      // gateway recovery in the middle of the bundle swap.
+      log.info("[update] check requested during install activity — skipping");
+      return;
+    }
     if (downloading) {
       // A download is in flight. Re-entering the check would restart the
       // updater's flow underneath the running download; report progress
@@ -889,6 +1031,51 @@ function initAutoUpdate(deps) {
     } catch (err) {
       log.error("[update] gateway stop errored (continuing to install)", err);
     }
+    // An install-phase failure can land while the gateway stops: the error
+    // handler classifies it (installing outranks checking there), resets
+    // `installing`, and runs the host recovery. This dispatch is already
+    // dead — proceeding would install on a failure the user was just told
+    // about, and aborting would run the recovery a second time.
+    if (!installing) {
+      log.info("[update] install failed while the gateway stopped — dispatch abandoned");
+      return;
+    }
+    // Re-check the stage AFTER the await: a feed response already in flight
+    // when the user clicked install can report a retraction or a newer build
+    // while the gateway stops, and the update-available / update-not-available
+    // handlers then discard the stage. Installing those bytes anyway would
+    // ship a build the feed has withdrawn or superseded. A check STILL in
+    // flight is the same hazard one step earlier: its response can invalidate
+    // the stage the moment after this dispatch commits, and an error event it
+    // produces during the bundle swap would be misattributed to the install
+    // (see the phase derivation in the error handler). Aborting on `checking`
+    // makes the dispatch itself the serialization point between checks and
+    // installs: no check outcome — result or failure — can land past
+    // quitAndInstall.
+    if (!updateReady || checking) {
+      log.info(
+        !updateReady
+          ? "[update] stage invalidated while the gateway stopped — aborting install and restoring"
+          : "[update] check still in flight after the gateway stopped — aborting install and restoring",
+      );
+      installing = false;
+      try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
+      // Use the install-error renderer contract, NOT a bare found/not-available:
+      // the user just clicked Restart & Update and is watching an install
+      // surface -- a silent state swap reads as an unexplained cancel. The
+      // error/install shape has an existing renderer contract (the About
+      // card, and the in-place overlay failure state) that says the install
+      // did not proceed and offers the way forward.
+      emit("error", {
+        phase: "install",
+        code: !updateReady ? "stage-invalidated" : "check-in-flight",
+        message: !updateReady
+          ? "the staged update was withdrawn or superseded before the install could run"
+          : "a feed check was still in flight when the install was ready to run",
+        ...(foundVersion ? { version: foundVersion } : {}),
+      });
+      return;
+    }
     app.removeListener("before-quit", deferredInstallOnQuit);
     log.info("[update] gateway down — quitAndInstall");
     quitAndInstall();
@@ -912,6 +1099,27 @@ function initAutoUpdate(deps) {
       // where main.js has already set isQuitting -- the watchdog is covered.
       log.info("[update] deferred install on quit");
       try { await stopGateway(); } catch (err) { log.error("[update] stop on quit errored", err); }
+      // Same stage re-check as the manual path: a feed response in flight at
+      // quit time can invalidate the stage while the gateway stops. The user
+      // asked to QUIT, so skip the install and let the quit proceed. What
+      // makes the re-entry safe is the LISTENER state, not `quitHandled`: a
+      // retraction handler resets `quitHandled = false` and removes this
+      // listener, and it was registered with app.once so it has already been
+      // consumed -- either way no live before-quit hook re-prevents the quit,
+      // so app.quit() exits normally without installing the withdrawn build.
+      if (!updateReady) {
+        log.info("[update] stage invalidated during quit — quitting without installing");
+        // The user was told the update would finish on quit; explain why it
+        // did not, or the still-old version at next launch reads as a failure.
+        try {
+          new Notification({
+            title: "Update canceled",
+            body: "The staged update was withdrawn or superseded, so it was not installed. You\u2019ll be offered the latest version next launch.",
+          }).show();
+        } catch { /* notifications optional */ }
+        app.quit();
+        return;
+      }
       quitAndInstall();
       forceExitFailsafe("deferred install on quit");
     })();
@@ -952,8 +1160,21 @@ function initAutoUpdate(deps) {
 
   autoUpdater.on("error", (err) => {
     // The library funnels every failure through one event, so derive the phase
-    // from what we were doing. Read the flags BEFORE clearing `downloading`, or
-    // a mid-download failure would be reported as a check failure.
+    // from the operation actually in flight. Read the flags BEFORE clearing
+    // `downloading`, or a mid-download failure would be reported as a check
+    // failure. `installing` must outrank `checking`: once an install is
+    // dispatched the gateway is stopped ON PURPOSE, and a genuine installer
+    // failure (observed live in the OTA lane: a Squirrel signature rejection)
+    // that arrives while a check happens to be in flight would otherwise be
+    // labelled "check" — onInstallFailed never fires, nothing restores the
+    // stopped gateway, and the app survives with a dead dashboard. The
+    // converse misattribution is the recoverable one: a straddling check's
+    // feed error killing the install runs the same onInstallFailed recovery
+    // the post-stopGateway abort would run anyway — and that abort refuses to
+    // reach quitAndInstall while `checking` is true, so no check outcome can
+    // fire recovery in the middle of an actual bundle swap. The
+    // `downloading`-before-`installing` precedence is long-standing behavior,
+    // preserved as-is.
     const phase = downloading ? "download" : installing ? "install" : "check";
     downloading = false;
     if (phase === "install") {
@@ -1050,7 +1271,25 @@ function initAutoUpdate(deps) {
 
   configureFeed();
   const launchTimer = setTimeout(safeCheck, LAUNCH_CHECK_DELAY_MS);
-  const pollTimer = setInterval(() => { if (!updateReady) safeCheck(); }, CHECK_INTERVAL_MS);
+  // The poll must keep consulting the feed even while an update is STAGED
+  // (see the note in safeCheck). Gating it on !updateReady would pin a
+  // long-running session to its stale stage whenever a newer version ships
+  // mid-session -- the supersede path in the update-available handler is only
+  // reachable if some check actually runs. safeCheck() already owns the
+  // staged case: re-surface when the stage is still latest, discard and
+  // re-find when it is superseded.
+  //
+  // INSTALL ACTIVITY is the one state the poll must still skip, and there are
+  // exactly two install entry points to cover: `installing` (the manual
+  // Restart & Update dispatch) and `quitHandled` (the deferred install on a
+  // natural quit, which never sets `installing`). In either window the
+  // gateway is being stopped on purpose and the process is about to hand off
+  // to the platform installer -- a check there is useless at best, and at
+  // worst its outcome (an error event, or a retraction clearing the stage
+  // under a dispatch that already passed its guard) races the handoff.
+  // Staged-but-idle and installing are different states; only the latter is
+  // unsafe to probe.
+  const pollTimer = setInterval(() => { if (!installing && !quitHandled) safeCheck(); }, CHECK_INTERVAL_MS);
   // Timers must never hold the process open (Electron quit, tests).
   if (typeof launchTimer.unref === "function") launchTimer.unref();
   if (typeof pollTimer.unref === "function") pollTimer.unref();
@@ -1077,6 +1316,7 @@ module.exports = {
   classifyError,
   manualDownloadUrl,
   resolveLinuxInstall,
+  readExternallyManaged,
   DEFAULT_FEED_BASE,
   DOWNLOAD_BASE,
   SUPPORTED_PLATFORMS,

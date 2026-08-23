@@ -253,6 +253,16 @@ BENIGN_COMMANDS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
+
+
 @pytest.mark.parametrize("cmd", MALICIOUS_COMMANDS)
 def test_vet_shell_command_blocks_malicious(cmd):
     err = _vet_shell_command(cmd)

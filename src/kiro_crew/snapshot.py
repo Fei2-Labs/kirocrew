@@ -492,8 +492,16 @@ def _merge_memory(src_db: Path, dst_db: Path) -> None:
 
 
 def _merge_crons(src_path: Path, dst_path: Path) -> None:
-    src = json.loads(src_path.read_text())
-    dst = json.loads(dst_path.read_text())
+    try:
+        src = json.loads(src_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"  ⚠️  Could not read {src_path}: {exc} — skipping cron merge")
+        return
+    try:
+        dst = json.loads(dst_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"  ⚠️  Could not read {dst_path}: {exc} — skipping cron merge")
+        return
     existing = {j.get("name") for j in dst.get("jobs", [])}
     imported = 0
     for job in src.get("jobs", []):

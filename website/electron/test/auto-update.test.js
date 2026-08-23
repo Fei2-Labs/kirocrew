@@ -7,6 +7,7 @@ const {
   resolveChannel,
   buildFeedBase,
   configureUpdater,
+  readExternallyManaged,
   DEFAULT_FEED_BASE,
   SUPPORTED_PLATFORMS,
 } = require("../auto-update");
@@ -58,11 +59,42 @@ test("resolveChannel: production stamps follow the preference when set", () => {
   assert.strictEqual(resolveChannel("insider", "stable"), "stable");
 });
 
-test("resolveChannel: no/invalid preference falls back to the stamp", () => {
+test("resolveChannel: no/invalid preference defaults to STABLE, not to the stamp", () => {
+  // A stable release is PROMOTED, not rebuilt: the stable and insider downloads
+  // of a promoted version are the same file carrying the same prerelease stamp,
+  // so the stamp cannot say which feed to follow. Insider is an explicit opt-in.
   assert.strictEqual(resolveChannel("stable", ""), "stable");
-  assert.strictEqual(resolveChannel("insider", undefined), "insider");
+  assert.strictEqual(resolveChannel("insider", undefined), "stable");
   assert.strictEqual(resolveChannel("stable", "nightly"), "stable"); // nightly is not a valid opt-in
-  assert.strictEqual(resolveChannel("insider", "bogus"), "insider");
+  assert.strictEqual(resolveChannel("insider", "bogus"), "stable");
+});
+
+test("a promoted -insider.N build with no preference follows the STABLE feed", async () => {
+  // The regression this exists for: promoting 0.3.0 publishes the insider
+  // candidate's exact bytes to stable, so every stable install would otherwise
+  // read its own version stamp and migrate itself onto the insider feed.
+  const { deps, calls } = makeDeps({ appVersion: "0.3.0-insider.13" });
+  deps.getChannelPreference = () => "";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  assert.ok(calls.setFeedURL.length >= 1);
+  assert.ok(
+    calls.setFeedURL.every((o) => o.url === "https://cdn.example.dev/feed/stable/"),
+    `expected stable feed urls, got: ${calls.setFeedURL.map((o) => o.url)}`,
+  );
+  assert.strictEqual(u.getInfo().channel, "stable");
+});
+
+test("an explicit insider preference still selects insider on promoted bytes", async () => {
+  const { deps, calls } = makeDeps({ appVersion: "0.3.0-insider.13" });
+  deps.getChannelPreference = () => "insider";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  assert.ok(
+    calls.setFeedURL.every((o) => o.url === "https://cdn.example.dev/feed/insider/"),
+    `expected insider feed urls, got: ${calls.setFeedURL.map((o) => o.url)}`,
+  );
+  assert.strictEqual(u.getInfo().channel, "insider");
 });
 
 // ---------------------------------------------------------------------------
@@ -215,6 +247,9 @@ function makeDeps(opts = {}) {
     // tests below drive these to the refused states.
     resourcesPath = "/Applications/Kiro Crew.app/Contents/Resources",
     bundleWritable = true,
+    // Externally-managed verdict. null (the default) = not managed, decided
+    // here so no test's outcome depends on the host filesystem.
+    externallyManaged = null,
   } = opts;
   const calls = { setFeedURL: [], checkForUpdates: 0, downloadUpdate: 0, quitAndInstall: [] };
   const handlers = {};
@@ -249,6 +284,7 @@ function makeDeps(opts = {}) {
     // Stubbed so the writable-vs-read-only axis is decided by the test, not by
     // whatever the host filesystem happens to allow.
     probeBundleWritable: () => bundleWritable,
+    externallyManaged,
     feedBase: "https://cdn.example.dev/feed",
     onUpdateState: (s) => states.push(s),
     log: { info: () => {}, warn: () => {}, error: () => {} },
@@ -468,6 +504,156 @@ test("dev (unpackaged) build returns disabled:'dev'", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Externally-managed marker (PEP 668 precedent). An operator/distro packager
+// that owns the install's update lifecycle disables the updater outright: the
+// feed is never contacted, the channel switcher loses its lane, and the About
+// panel gets the marker's metadata to display instead.
+// ---------------------------------------------------------------------------
+
+test("externally-managed install returns disabled:'externally-managed' and never arms the updater", () => {
+  const { deps, calls } = makeDeps({
+    externallyManaged: { managedBy: "internal-registry", updateCommand: "pkgtool update kirocrew" },
+  });
+  const u = initAutoUpdate(deps);
+  assert.strictEqual(u.disabled, "externally-managed");
+  assert.strictEqual(calls.setFeedURL.length, 0, "the feed must never be contacted");
+  assert.strictEqual(calls.checkForUpdates, 0);
+  assert.strictEqual(deps.autoUpdater.autoDownload, undefined, "policy flags must not be applied");
+  // The whole disabled surface must stay callable (ipcMain invokes every key).
+  assert.strictEqual(typeof u.check, "function");
+  assert.strictEqual(typeof u.download, "function");
+  assert.strictEqual(typeof u.install, "function");
+  assert.strictEqual(typeof u.getInfo, "function");
+});
+
+test("externally-managed getInfo carries the marker metadata and kills the switcher", () => {
+  const { deps } = makeDeps({
+    appVersion: "1.0.0", // bare semver stamps as 'stable' -> switchable on a normal install
+    externallyManaged: { managedBy: "internal-registry", updateCommand: "pkgtool update kirocrew" },
+  });
+  const info = initAutoUpdate(deps).getInfo();
+  assert.strictEqual(info.managedBy, "internal-registry");
+  assert.strictEqual(info.updateCommand, "pkgtool update kirocrew");
+  assert.strictEqual(info.channelSwitchable, false,
+    "a managed install has no lane the marker's owner reads");
+});
+
+test("a self-updating install reports empty managed metadata", () => {
+  const { deps } = makeDeps({ appVersion: "1.0.0" });
+  const info = initAutoUpdate(deps).getInfo();
+  assert.strictEqual(info.managedBy, "");
+  assert.strictEqual(info.updateCommand, "");
+  assert.strictEqual(info.channelSwitchable, true);
+});
+
+test("externally-managed wins over the dev gate (intentional operator override)", () => {
+  const { deps } = makeDeps({
+    isPackaged: false,
+    externallyManaged: { managedBy: "", updateCommand: "" },
+  });
+  assert.strictEqual(initAutoUpdate(deps).disabled, "externally-managed");
+});
+
+test("readExternallyManaged: absent marker -> null", (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kc-ext-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  assert.strictEqual(readExternallyManaged({ env: {}, resourcesPath: dir }), null);
+});
+
+test("readExternallyManaged: JSON marker carries metadata", (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kc-ext-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(dir, "EXTERNALLY-MANAGED"),
+    JSON.stringify({ managedBy: "internal-registry", updateCommand: "pkgtool update kirocrew" }),
+  );
+  assert.deepStrictEqual(readExternallyManaged({ env: {}, resourcesPath: dir }), {
+    managedBy: "internal-registry",
+    updateCommand: "pkgtool update kirocrew",
+  });
+});
+
+test("readExternallyManaged: bare/unparsable marker still means managed", (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kc-ext-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "EXTERNALLY-MANAGED"), "not json {");
+  assert.deepStrictEqual(readExternallyManaged({ env: {}, resourcesPath: dir }), {
+    managedBy: "",
+    updateCommand: "",
+  });
+});
+
+test("readExternallyManaged: degenerate markers (oversized, symlink, directory) mean managed, no metadata", (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  // Oversized: presence still wins, the body is never read into memory.
+  const big = fs.mkdtempSync(path.join(os.tmpdir(), "kc-ext-"));
+  t.after(() => fs.rmSync(big, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(big, "EXTERNALLY-MANAGED"), "x".repeat(9000));
+  assert.deepStrictEqual(readExternallyManaged({ env: {}, resourcesPath: big }), {
+    managedBy: "",
+    updateCommand: "",
+  });
+  // Symlink (even dangling): lstat'ed, never followed — a link into a FIFO or
+  // device must not be able to stall this startup-path read.
+  const sym = fs.mkdtempSync(path.join(os.tmpdir(), "kc-ext-"));
+  t.after(() => fs.rmSync(sym, { recursive: true, force: true }));
+  fs.symlinkSync(path.join(sym, "nowhere"), path.join(sym, "EXTERNALLY-MANAGED"));
+  assert.deepStrictEqual(readExternallyManaged({ env: {}, resourcesPath: sym }), {
+    managedBy: "",
+    updateCommand: "",
+  });
+  // Directory named like the marker: present = managed, nothing to parse.
+  const dirCase = fs.mkdtempSync(path.join(os.tmpdir(), "kc-ext-"));
+  t.after(() => fs.rmSync(dirCase, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dirCase, "EXTERNALLY-MANAGED"));
+  assert.deepStrictEqual(readExternallyManaged({ env: {}, resourcesPath: dirCase }), {
+    managedBy: "",
+    updateCommand: "",
+  });
+});
+
+test("readExternallyManaged: metadata fields are length-capped", (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kc-ext-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(dir, "EXTERNALLY-MANAGED"),
+    JSON.stringify({ managedBy: "m".repeat(500), updateCommand: "c".repeat(2000) }),
+  );
+  const got = readExternallyManaged({ env: {}, resourcesPath: dir });
+  assert.strictEqual(got.managedBy.length, 128);
+  assert.strictEqual(got.updateCommand.length, 512);
+});
+
+test("readExternallyManaged: env override points at a marker file", (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kc-ext-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "custom-marker.json");
+  fs.writeFileSync(marker, JSON.stringify({ managedBy: "harness", updateCommand: "" }));
+  const got = readExternallyManaged({
+    env: { KIROCREW_EXTERNALLY_MANAGED: marker },
+    resourcesPath: "/nonexistent",
+  });
+  assert.deepStrictEqual(got, { managedBy: "harness", updateCommand: "" });
+});
+
+// ---------------------------------------------------------------------------
 // Bundle-location guard. The macOS install is an in-place .app replacement
 // (MacUpdater -> Squirrel.Mac -> ShipIt), so a translocated copy or a read-only
 // disk image can never apply an update. electron-updater has no such check of
@@ -674,6 +860,64 @@ test("a NEWER version discovered while one is staged supersedes the stale stage"
   // Consent now downloads the NEWER build.
   await u.download();
   assert.strictEqual(calls.downloadUpdate, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Background poll with a staged update. The supersede handling above is only
+// reachable if a check actually RUNS while the stage is armed -- and the only
+// check most users ever get is the background poll. A poll gated on
+// !updateReady makes that path unreachable: the app sits on its stale stage
+// for the rest of the session, the user installs a superseded build, and is
+// re-prompted immediately after relaunch. These tests drive the REAL interval
+// with node:test mock timers, so a regression on the timer wiring itself (not
+// just on safeCheck's internals) fails here.
+// ---------------------------------------------------------------------------
+
+test("the background poll invokes checkForUpdates even while an update is staged", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const { deps, calls, emit } = makeDeps({ appVersion: "1.0.0" });
+  initAutoUpdate(deps);
+  // Drain the 30s launch check first so the poll's contribution is isolated,
+  // and flush its microtasks so safeCheck's `checking` flag is released.
+  t.mock.timers.tick(30 * 1000);
+  await new Promise((r) => setImmediate(r));
+  // Stage an update: this is the state the old `if (!updateReady)` guard
+  // silenced the poll in.
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "old" });
+  const before = calls.checkForUpdates;
+  t.mock.timers.tick(4 * 60 * 60 * 1000); // one full poll interval
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    calls.checkForUpdates,
+    before + 1,
+    "the poll must consult the feed with a stage armed -- skipping pins the user to the stale stage",
+  );
+});
+
+test("poll-path supersede end-to-end: poll fires -> NEWER version found -> stage discarded ('found', not 'downloaded')", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const { deps, calls, emit, states, stateNames } = makeDeps({ appVersion: "1.0.0" });
+  const u = initAutoUpdate(deps);
+  t.mock.timers.tick(30 * 1000); // drain the launch check
+  await new Promise((r) => setImmediate(r));
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "old" });
+  assert.strictEqual(u.isReady(), true, "precondition: an update is staged");
+  states.length = 0;
+  const before = calls.checkForUpdates;
+  t.mock.timers.tick(4 * 60 * 60 * 1000); // the poll fires with the stage armed
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(calls.checkForUpdates, before + 1, "poll must reach the feed");
+  // The feed answers with a NEWER version than the stage.
+  emit("update-available", { version: "1.2.0", releaseNotes: "new" });
+  assert.strictEqual(u.isReady(), false, "the stale stage must be discarded");
+  const found = states.find((s) => s.state === "found");
+  assert.ok(found, "the newer version must be surfaced as a fresh find");
+  assert.strictEqual(found.version, "1.2.0");
+  assert.ok(
+    !stateNames().includes("downloaded"),
+    "the superseded stage must not be re-surfaced as installable",
+  );
+  assert.strictEqual(calls.downloadUpdate, 0, "discovery via the poll must never download");
 });
 
 test("re-check and re-click while a download is in flight report progress instead of restarting", async () => {
@@ -950,4 +1194,219 @@ test("BLOCKING-fix contract: package.json declares a publish entry so app-update
   assert.ok(Array.isArray(publish) && publish.length > 0, "build.publish must be a non-empty array");
   assert.strictEqual(publish[0].provider, "generic");
   assert.match(publish[0].url, /^https:\/\//, "baked publish url must be https");
+});
+
+test("the poll skips while an install is in flight (dispatched, gateway stopping)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const { deps, calls, emit } = makeDeps({ appVersion: "1.0.0" });
+  // Hold the gateway stop open so the poll interval can fire inside the
+  // dispatch window (installing === true, quitAndInstall not yet reached).
+  let releaseGateway;
+  deps.stopGateway = () => new Promise((resolve) => { releaseGateway = resolve; });
+  const u = initAutoUpdate(deps);
+  t.mock.timers.tick(30 * 1000); // drain the launch check
+  await new Promise((r) => setImmediate(r));
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "n" });
+  const installPromise = u.install(); // dispatch: blocks awaiting stopGateway
+  await new Promise((r) => setImmediate(r));
+  const before = calls.checkForUpdates;
+  t.mock.timers.tick(4 * 60 * 60 * 1000); // poll interval elapses mid-install
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    calls.checkForUpdates,
+    before,
+    "a poll during an install dispatch must not consult the feed -- a check "
+      + "failure in that window is classified as an install failure and would "
+      + "trigger the host's gateway recovery during the bundle swap",
+  );
+  releaseGateway();
+  await installPromise;
+});
+
+test("an installer failure that arrives while a check is in flight fires onInstallFailed and classifies as an install failure", async () => {
+  // GPT round-7 finding: `checking` outranking `installing` in the phase
+  // derivation labelled a genuine installer failure (observed live in the OTA
+  // lane: a Squirrel signature rejection) as "check" whenever a check happened
+  // to be in flight -- onInstallFailed never fired, and nothing restored the
+  // gateway the dispatch had deliberately stopped.
+  const { deps, calls, emit, states } = makeDeps({ appVersion: "1.0.0" });
+  let installFailedCalls = 0;
+  deps.onInstallFailed = () => { installFailedCalls += 1; };
+  // Hold the check open so it is still in flight when the install dispatches,
+  // and hold the gateway stop open so the failure lands mid-dispatch.
+  let rejectCheck;
+  deps.autoUpdater.checkForUpdates = () => new Promise((_, reject) => { rejectCheck = reject; });
+  let releaseGateway;
+  deps.stopGateway = () => new Promise((resolve) => { releaseGateway = resolve; });
+  const u = initAutoUpdate(deps);
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "n" });
+  const checkPromise = u.check(); // checking = true, unresolved
+  const installPromise = u.install(); // installing = true, awaiting stopGateway
+  await new Promise((r) => setImmediate(r));
+  // The installer path fails, delivered as the library's error EVENT
+  // (electron-updater funnels every failure through one channel -- the phase
+  // derivation is the only classifier).
+  emit("error", new Error("Code signature at URL ... did not pass validation"));
+  const errState = states.filter((s) => s.state === "error").pop();
+  assert.ok(errState, "an error state must be emitted");
+  assert.strictEqual(
+    errState.phase,
+    "install",
+    "a failure while an install is dispatched must be reported as an install failure -- the gateway was stopped on purpose and only onInstallFailed restores it",
+  );
+  assert.strictEqual(installFailedCalls, 1, "host recovery must fire to restore the deliberately-stopped gateway");
+  releaseGateway();
+  await installPromise;
+  assert.strictEqual(installFailedCalls, 1, "the dead dispatch must not run the recovery a second time");
+  assert.strictEqual(calls.quitAndInstall.length, 0, "a dispatch whose install already failed must never reach quitAndInstall");
+  rejectCheck(new Error("feed unreachable"));
+  await checkPromise;
+});
+
+test("a check still in flight when the gateway has stopped aborts the install through the recovery path", async () => {
+  // Companion to the precedence above: this abort is what guarantees no
+  // install proceeds into quitAndInstall with a check outstanding, so a check
+  // outcome -- a stage-invalidating response or a feed error -- can never land
+  // in the middle of an actual bundle swap.
+  const { deps, calls, emit, states } = makeDeps({ appVersion: "1.0.0" });
+  let installFailedCalls = 0;
+  deps.onInstallFailed = () => { installFailedCalls += 1; };
+  let resolveCheck;
+  deps.autoUpdater.checkForUpdates = () => new Promise((resolve) => { resolveCheck = resolve; });
+  const u = initAutoUpdate(deps);
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "n" });
+  const checkPromise = u.check(); // checking = true, unresolved
+  await u.install(); // gateway stops immediately; the check is still in flight
+  assert.strictEqual(calls.quitAndInstall.length, 0, "an install must not commit while a check is in flight");
+  assert.strictEqual(installFailedCalls, 1, "the abort must run the host recovery to bring the gateway back");
+  const last = states[states.length - 1];
+  assert.strictEqual(last.state, "error", "the renderer must learn the install did not proceed");
+  assert.strictEqual(last.phase, "install", "the abort must use the install-error renderer contract");
+  assert.strictEqual(last.code, "check-in-flight");
+  // The dispatch is over and the stage survives: a retry once the check
+  // settles must proceed.
+  resolveCheck();
+  await checkPromise;
+  await u.install();
+  assert.strictEqual(calls.quitAndInstall.length, 1, "a retry after the check settles must reach quitAndInstall");
+});
+
+test("a renderer-driven check during an install dispatch is refused, mirroring the poll gate", async () => {
+  const { deps, calls, emit } = makeDeps({ appVersion: "1.0.0" });
+  let releaseGateway;
+  deps.stopGateway = () => new Promise((resolve) => { releaseGateway = resolve; });
+  const u = initAutoUpdate(deps);
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "n" });
+  const installPromise = u.install();
+  await new Promise((r) => setImmediate(r));
+  const before = calls.checkForUpdates;
+  await u.check();
+  assert.strictEqual(
+    calls.checkForUpdates,
+    before,
+    "a check during install activity must not consult the feed -- its failure would be classified as an install failure and fire gateway recovery mid-swap",
+  );
+  releaseGateway();
+  await installPromise;
+});
+
+test("the poll also skips during a deferred install-on-quit (quitHandled, installing never set)", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const { deps, calls, emit, appOnce } = makeDeps({ appVersion: "1.0.0" });
+  // Hold the quit-path gateway stop open so the deferred install window stays
+  // live while the poll interval elapses.
+  deps.stopGateway = () => new Promise(() => {});
+  initAutoUpdate(deps);
+  t.mock.timers.tick(30 * 1000); // drain the launch check
+  await new Promise((r) => setImmediate(r));
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "n" });
+  // Fire the deferred install exactly as app quit would: the before-quit
+  // listener registered on update-downloaded.
+  const quitHook = appOnce.find((h) => h.ev === "before-quit");
+  assert.ok(quitHook, "update-downloaded must register the deferred quit install");
+  quitHook.fn({ preventDefault: () => {} });
+  await new Promise((r) => setImmediate(r));
+  const before = calls.checkForUpdates;
+  t.mock.timers.tick(4 * 60 * 60 * 1000);
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(
+    calls.checkForUpdates,
+    before,
+    "a poll during a deferred install-on-quit must not consult the feed -- a "
+      + "retraction there clears the stage under a dispatch that already "
+      + "passed its guard",
+  );
+});
+
+test("a stage invalidated while the gateway stops aborts the manual install and restores the gateway", async () => {
+  const { deps, calls, emit, states } = makeDeps({ appVersion: "1.0.0" });
+  let installFailedCalls = 0;
+  deps.onInstallFailed = () => { installFailedCalls += 1; };
+  let releaseGateway;
+  deps.stopGateway = () => new Promise((resolve) => { releaseGateway = resolve; });
+  const u = initAutoUpdate(deps);
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "n" });
+  const installPromise = u.install(); // passes its updateReady guard, blocks on stopGateway
+  await new Promise((r) => setImmediate(r));
+  // A feed response that was in flight at click time now reports a
+  // retraction: the handler discards the stage mid-dispatch.
+  emit("update-not-available");
+  releaseGateway();
+  await installPromise;
+  assert.strictEqual(calls.quitAndInstall.length, 0, "an invalidated stage must never reach quitAndInstall");
+  assert.strictEqual(installFailedCalls, 1, "the abort must run the host recovery to bring the gateway back");
+  const last = states[states.length - 1];
+  assert.strictEqual(last.state, "error", "the renderer must learn the install did not proceed");
+  assert.strictEqual(last.phase, "install", "the abort must use the install-error renderer contract, not a silent state swap");
+});
+
+test("a stage invalidated during a deferred quit-install quits without installing", async () => {
+  const { deps, calls, emit, appOnce } = makeDeps({ appVersion: "1.0.0" });
+  let quitCalls = 0;
+  deps.app.quit = () => { quitCalls += 1; };
+  let releaseGateway;
+  deps.stopGateway = () => new Promise((resolve) => { releaseGateway = resolve; });
+  initAutoUpdate(deps);
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "n" });
+  const quitHook = appOnce.find((h) => h.ev === "before-quit");
+  assert.ok(quitHook, "update-downloaded must register the deferred quit install");
+  quitHook.fn({ preventDefault: () => {} });
+  await new Promise((r) => setImmediate(r));
+  emit("update-not-available"); // retraction lands while the gateway stops
+  releaseGateway();
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(calls.quitAndInstall.length, 0, "the withdrawn build must not install on quit");
+  assert.strictEqual(quitCalls, 1, "the quit the user asked for must still proceed");
+});
+
+
+test("a genuine install failure after a straddling check settles still fires recovery", async () => {
+  const { deps, calls, emit } = makeDeps({ appVersion: "1.0.0" });
+  let installFailedCalls = 0;
+  deps.onInstallFailed = () => { installFailedCalls += 1; };
+  let rejectCheck;
+  deps.autoUpdater.checkForUpdates = () => new Promise((_, reject) => { rejectCheck = reject; });
+  deps.stopGateway = async () => {};
+  const u = initAutoUpdate(deps);
+  emit("update-downloaded", { version: "1.1.0", releaseNotes: "n" });
+  const checkPromise = u.check(); // straddles the dispatch
+  const installPromise = u.install();
+  await new Promise((r) => setImmediate(r));
+  // The gateway stopped with the check still in flight: the dispatch aborts
+  // through the recovery path rather than committing under an unsettled check.
+  await installPromise;
+  assert.strictEqual(calls.quitAndInstall.length, 0, "the dispatch must not commit under an unsettled check");
+  assert.strictEqual(installFailedCalls, 1, "the abort must restore the gateway");
+  // With no install in flight, the straddling check's own failure is a plain
+  // check failure -- it must NOT fire recovery again.
+  rejectCheck(new Error("feed unreachable"));
+  await checkPromise;
+  emit("error", new Error("feed unreachable"));
+  assert.strictEqual(installFailedCalls, 1, "a check failure outside an install must not fire recovery");
+  // A retry now commits, and a LATER genuine installer failure in that
+  // dispatch classifies as `install` and fires recovery -- the flag was armed.
+  await u.install();
+  assert.strictEqual(calls.quitAndInstall.length, 1, "the retry must commit once the check has settled");
+  emit("error", new Error("Squirrel could not validate the update"));
+  assert.strictEqual(installFailedCalls, 2, "recovery must remain armed for a real install failure after the check settles");
 });

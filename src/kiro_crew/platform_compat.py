@@ -323,17 +323,16 @@ else:
 # EACCES), so an unbounded spin would turn a permission error into a hang.
 #
 # Two ceilings, because on-loop and off-loop have opposite needs:
-#  - OFF the loop (cron, home migration, app backends — threads/subprocesses):
-#    the wait must cover a legitimately long holder. home_migration holds the
-#    lock across a full copy+verify+delete of the data home, which can exceed
-#    many seconds, and a waiter there must NOT give up and race it. So use a
-#    generous ceiling that no real hold approaches, matching POSIX's "wait for
-#    the lock" as closely as a bounded spin can.
+#  - OFF the loop (cron, app backends — threads/subprocesses): the wait must
+#    cover a legitimately long holder that can hold the lock across a
+#    multi-second operation, and a waiter there must NOT give up and race it. So
+#    use a generous ceiling that no real hold approaches, matching POSIX's "wait
+#    for the lock" as closely as a bounded spin can.
 #  - ON the loop (e.g. bridges._mcp_lock during app enable): a spin-sleep would
 #    freeze chat/heartbeat, so that path never sleeps at all (single-shot).
 _WIN_LOCK_POLL_SECS = 0.01
-# Generous off-loop ceiling: longer than any legitimate hold (a large data-home
-# migration), short enough that a truly stuck/permission-denied fd still fails.
+# Generous off-loop ceiling: longer than any legitimate hold, short enough that
+# a truly stuck/permission-denied fd still fails.
 _WIN_LOCK_TIMEOUT_SECS = 300.0
 
 
@@ -348,8 +347,8 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _WIN_LOCK_TIMEOUT_SECS) -
     loop is detected the acquire is single-shot — take it if free, else return
     False at once — and the caller fails closed rather than stalling the loop.
     Off the loop (the common case) it polls up to ``timeout`` as a real
-    blocking wait, so a legitimately long holder (a data-home migration) is
-    waited out rather than raced.
+    blocking wait, so a legitimately long holder is waited out rather than
+    raced.
     """
 
     def _try_once() -> bool:
@@ -1047,6 +1046,17 @@ def _windows_system_dirs() -> tuple[str, ...]:
     unexpected case where the API call fails. PowerShell ships in a versioned
     directory beside the system binaries, not inside it, so it is appended per
     root rather than assumed to sit alongside ``taskkill``.
+
+    **The early ``return`` below is what makes "fallback" mean fallback**, and it is
+    load-bearing rather than tidy. Appending the environment-derived path alongside a
+    successful API read reintroduces the input this function exists to avoid: it carries
+    a different casefold from what ``GetSystemDirectoryW`` reports, so the dedupe does
+    not collapse the two, and any caller treating the result as "directories the user
+    cannot write" then trusts a path the user names. Measured: with ``SystemRoot``
+    pointed at a temp directory, ``<temp>\\System32`` appears in this tuple while the API
+    answers normally, and ``computer_use.launch_windows`` accepts a binary planted there
+    as system-installed. ``HKCU\\Environment`` is writable without elevation, so a
+    restarted process inherits such a value.
     """
 
     dirs: list[str] = []
@@ -1059,11 +1069,15 @@ def _windows_system_dirs() -> tuple[str, ...]:
             dirs.append(buf.value)
     except Exception:
         pass
+    if dirs:
+        # The API answered. Adding an environment-derived sibling here would buy
+        # nothing (the real directory is already in hand) and would cost the
+        # guarantee every caller of this function relies on.
+        return tuple(dirs) + tuple(os.path.join(d, "WindowsPowerShell", "v1.0") for d in dirs)
     root = os.environ.get("SystemRoot") or r"C:\Windows"
-    # Case-insensitive dedupe: GetSystemDirectoryW reports the on-disk casing
-    # ("C:\Windows\system32"), which names the same directory as the
-    # conventionally-cased fallback and must not be probed twice.
-    seen = {d.casefold() for d in dirs}
+    # Case-insensitive dedupe: the conventionally-cased fallback can name the same
+    # directory as the environment-derived one and must not be probed twice.
+    seen: set[str] = set()
     for fallback in (os.path.join(root, "System32"), r"C:\Windows\System32"):
         if fallback.casefold() not in seen:
             seen.add(fallback.casefold())
@@ -2051,6 +2065,36 @@ def pid_liveness(pid: int) -> str:
     return PID_ALIVE if pid_exists(pid) else PID_DEAD
 
 
+def pgroup_exists(pgid: int) -> bool:
+    """Return True iff any member of process GROUP ``pgid`` is alive (best-effort).
+
+    The tree-faithful liveness probe for a child spawned with
+    ``start_new_session=True``: the launcher's pid doubles as the group id and
+    ordinary descendants keep it after the launcher exits, so the group
+    outlives the launcher exactly as long as any member does. A descendant
+    that ``setsid()``s out of the group evades this probe precisely as it
+    evades ``kill_process_tree`` -- callers that must catch those use the
+    escaped-children reapers, not this.
+
+    POSIX: ``os.killpg(pgid, 0)`` -- conservative on EPERM (unsignalable
+    reads as alive). Windows: process groups in this sense do not exist and
+    ``kill_process_tree`` already walks the whole child tree via
+    ``taskkill /T``, so the group id (== the launcher pid) is probed as a
+    plain pid via :func:`pid_exists`.
+    """
+    if not IS_POSIX:
+        return pid_exists(pgid)
+    if pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists but we can't signal it
+    return True
+
+
 def pid_exists(pid: int) -> bool:
     """Return True iff ``pid`` currently exists (best-effort).
 
@@ -2100,6 +2144,78 @@ def pid_exists(pid: int) -> bool:
         return getattr(ctypes, "get_last_error", lambda: 0)() == 5  # ERROR_ACCESS_DENIED → exists
     except Exception:
         return False
+
+
+#: Seconds before the ``ps`` start-time probe is abandoned. Only the BSD leg
+#: spawns anything; Linux reads /proc and Windows calls the kernel directly.
+_START_TIME_PS_TIMEOUT = 2
+
+
+def process_start_time(pid: int) -> str | None:
+    """Stable identity for WHEN *pid* started, or ``None`` when unreadable.
+
+    An opaque token whose only contract is that it compares equal across gateway
+    generations on the same host while the PID still names the same process
+    object, and unequal once that PID has been recycled onto another. Units
+    differ per platform and are deliberately not normalised -- nothing ever
+    compares one host's value against another's, and no caller parses it.
+
+    Callers use it as a PID-reuse guard before signalling, so an unreadable
+    value must fail SAFE: ``None`` means "identity unconfirmed", which every
+    caller treats as "do not kill".
+
+    * **Linux** -- ``/proc/<pid>/stat`` field 22 (start time in clock ticks
+      since boot): monotonic, locale-independent, and far finer than 1s, so
+      same-second reuse cannot alias.
+    * **Windows** -- the process creation ``FILETIME`` (100-ns units), read
+      through a QUERY-ONLY handle. Terminate rights are deliberately NOT
+      requested: this value is what decides whether a kill may happen at all, so
+      demanding the right to kill in order to read it would refuse the guard for
+      exactly the processes a caller must be most careful about.
+    * **macOS / other POSIX** -- ``ps -o lstart=`` (1s resolution, locale/TZ
+      formatted). Coarser, so a format or resolution drift can only make the
+      guard decline to act, never act on the wrong process.
+    """
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            # The comm field can contain spaces and parens; split after the
+            # LAST ')' so a process named "(evil) 1 2 3" cannot shift the index.
+            return stat.rsplit(")", 1)[1].split()[19]
+        except (OSError, ValueError, IndexError):
+            return None
+    if IS_WINDOWS:
+        # Opened and closed through the shared seams so this READ and the
+        # identity-pinned TERMINATE below cannot drift in how they acquire or
+        # release the handle -- the difference between the two is the handle's
+        # LIFETIME, and that is easier to reason about with one acquisition site.
+        handle = _open_process_query_handle(pid)
+        if handle is None:
+            return None
+        try:
+            identity = _windows_process_handle_identity(handle)
+        finally:
+            _close_process_handle(handle)
+        # (pid, creation_time, exit_time) -- only the creation half is an
+        # identity; exit_time moves as the process dies.
+        return str(identity[1]) if identity is not None else None
+    ps_bin = trusted_system_bin("ps")
+    if ps_bin is None:
+        return None
+    try:
+        out = subprocess.check_output(
+            [ps_bin, "-o", "lstart=", "-p", str(pid)],
+            stderr=subprocess.DEVNULL,
+            timeout=_START_TIME_PS_TIMEOUT,
+        )
+        # STRICT decode. A lossy one would turn unreadable bytes into a
+        # non-empty string, so the caller would accept garbage as a confirmed
+        # identity -- and two different processes whose output both decoded to
+        # replacement characters would compare equal. Undecodable output means
+        # the probe cannot be trusted, which is the None case.
+        return out.decode().strip() or None
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return None
 
 
 def process_thread_count(pid: int) -> int | None:
@@ -2358,6 +2474,92 @@ def kill_process_tree(pid: int, sig: int = SIGTERM) -> bool:
     return True
 
 
+def _open_process_query_handle(pid: int) -> int | None:
+    """Open a QUERY-ONLY Windows handle to *pid*, or ``None``.
+
+    Terminate rights are deliberately NOT requested: the callers use this handle
+    to decide whether a kill may happen at all, so demanding the right to kill in
+    order to read the identity would refuse the guard for exactly the processes a
+    caller must be most careful about.
+
+    Returns ``None`` on every non-Windows platform, and on any failure -- an
+    unopenable process is one whose identity cannot be confirmed, which every
+    caller must treat as "do not kill".
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    except Exception:
+        return None
+    return int(handle) if handle else None
+
+
+def _close_process_handle(handle: int) -> None:
+    """Release a handle from :func:`_open_process_query_handle`. Never raises."""
+    if not IS_WINDOWS or type(handle) is not int or handle <= 0:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+    except Exception:
+        logger.debug("CloseHandle failed for process handle %d", handle, exc_info=True)
+
+
+def kill_process_tree_pinned(
+    pid: int, expected_start_time: str, sig: int = SIGTERM
+) -> bool:
+    """Kill *pid*'s tree only while its verified identity is PINNED OPEN.
+
+    :func:`kill_process_tree` addresses the target by PID, and on Windows it
+    does so from a separate ``taskkill`` process. A caller that merely read the
+    start time first has released every handle by then, so between the check and
+    the terminate the process can exit and Windows can recycle the PID onto an
+    unrelated process -- which ``taskkill /T /F /PID`` would then tear down with
+    its whole tree. The check is only as good as the window after it.
+
+    Windows keeps a process ID reserved for as long as ANY handle to the process
+    object remains open, so holding the query handle that verified the identity
+    across the terminate is what makes the PID still mean the same process when
+    ``taskkill`` resolves it. That is the guarantee this function adds, and the
+    only reason it exists.
+
+    Returns ``False`` -- WITHOUT invoking any kill -- when the handle cannot be
+    opened or the identity does not match *expected_start_time*. Callers must
+    treat that as "identity unconfirmed, do not reap", the same fail-safe the
+    start-time comparison already gives them. On a match it delegates to
+    :func:`kill_process_tree` and propagates its exceptions unchanged, so
+    ``except (ProcessLookupError, OSError)`` handlers keep firing as before.
+
+    POSIX is deliberately untouched: it delegates straight through, because
+    ``os.killpg`` is issued in-process by the same interpreter that did the
+    check and there is no handle to hold. The residual probe-to-signal window
+    there is the pre-existing one the callers already mitigate by re-confirming
+    identity before the destructive escalation.
+    """
+    if not IS_WINDOWS:
+        return kill_process_tree(pid, sig)
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return False
+    try:
+        identity = _windows_process_handle_identity(handle)
+        # (pid, creation_time, exit_time) -- the creation half is the identity.
+        if identity is None or str(identity[1]) != expected_start_time:
+            return False
+        # The handle stays open for the whole call: taskkill resolves the PID
+        # while this process object is still referenced, so the PID cannot have
+        # been recycled onto a different process in between.
+        return kill_process_tree(pid, sig)
+    finally:
+        _close_process_handle(handle)
+
+
 async def kill_pid_async(pid: int, sig: int = SIGTERM) -> bool:
     """Async variant of :func:`kill_pid` — offloads Windows ``taskkill`` off the loop.
 
@@ -2594,6 +2796,22 @@ def unlink_link_or_junction(path: str | os.PathLike) -> None:
 # the file. See:
 # https://learn.microsoft.com/en-us/windows/win32/secauthz/well-known-sids
 _OWNER_RIGHTS_SID = "*S-1-3-4"
+
+
+# icacls inheritance flags for a DIRECTORY grant: (OI) object-inherit
+# propagates the ACE to files created inside, (CI) container-inherit propagates
+# it to subdirectories. Neither sets (IO), so the ACE also applies to the
+# directory itself and traversal is preserved.
+#
+# Without these flags a grant applies to the named object ALONE. That is
+# correct and complete for a file, and silently wrong for a directory: a file
+# created inside an "owner-only" directory would carry no explicit ACE at all
+# and fall back to whatever the creating process's token grants by default
+# (typically owner + SYSTEM + Administrators) — a default rather than the
+# guarantee the caller asked for. The flags are meaningless on a file, which is
+# why this is a directory-only rights prefix and not something
+# :func:`restrict_to_owner` can pass unconditionally.
+_ICACLS_DIR_INHERIT = "(OI)(CI)"
 
 
 # Success-only memo for _current_user_sid. NOT functools.lru_cache: lru_cache
@@ -2876,6 +3094,76 @@ def current_user_sid() -> str | None:
     return sid
 
 
+def is_token_elevated() -> bool | None:
+    """Whether this process runs with an ELEVATED token, or ``None`` if unknown.
+
+    Lives here rather than beside its one caller because this module already
+    owns "read this process's own access token" for the codebase (see
+    :func:`_process_token_sid_unguarded`), and a second copy of the
+    ``OpenProcessToken`` / ``GetTokenInformation`` prototype pair is plumbing
+    that drifts.
+
+    The tri-state return is deliberate and the two non-``True`` answers are not
+    interchangeable: ``False`` means the token was read and is not elevated,
+    while ``None`` means it could not be read at all. A caller that treats
+    elevation as disqualifying must refuse on ``None`` too, because "unknown"
+    is not "fine". Returns ``False`` on POSIX, where the concept does not exist
+    and the equivalent question is ``geteuid() == 0``.
+    """
+    if not IS_WINDOWS:
+        return False
+    TOKEN_QUERY = 0x0008
+    TOKEN_ELEVATION = 20
+    try:
+        # Per-line ignore is this module's own convention for the Windows-only
+        # ctypes surface (typeshed guards it, and CI type-checks on Linux).
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    except OSError:  # pragma: no cover - a Windows without advapi32
+        return None
+
+    # Same reason as _process_token_sid_unguarded: declare every prototype and
+    # pass ctypes instances, never bare Python ints.
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+        kernel32.GetCurrentProcess(), wintypes.DWORD(TOKEN_QUERY), ctypes.byref(token)
+    ):
+        return None
+    try:
+        elevation = wintypes.DWORD()
+        returned = wintypes.DWORD()
+        ok = advapi32.GetTokenInformation(
+            token,
+            ctypes.c_int(TOKEN_ELEVATION),
+            ctypes.byref(elevation),
+            wintypes.DWORD(ctypes.sizeof(elevation)),
+            ctypes.byref(returned),
+        )
+        if not ok:
+            return None
+        return bool(elevation.value)
+    finally:
+        kernel32.CloseHandle(token)
+
+
 def make_owner_only_dir(path: str | os.PathLike) -> None:
     """Create *path* (with parents) and make it readable only by this user.
 
@@ -2888,9 +3176,16 @@ def make_owner_only_dir(path: str | os.PathLike) -> None:
 
     ``0o700`` and not :func:`restrict_to_owner` on POSIX: that helper applies
     ``0o600``, correct for a secret-bearing file and wrong for a directory,
-    which needs the execute bit to be traversable at all. Windows has no such
-    split (``icacls ... :F`` grants traverse with everything else), and there the
-    DACL is the only carrier of access, so the fail-loud helper is right.
+    which needs the execute bit to be traversable at all. On Windows the split
+    is the inverse of inert: ``restrict_to_owner``'s grants are not inheritable
+    (correct for a file, where the flags mean nothing), so routing a directory
+    through it left every file created inside on the creating token's default
+    DACL. Both platforms therefore go through
+    :func:`restrict_dir_to_owner`, the directory-shaped twin.
+
+    Only newly created children are covered. A file that already exists inside
+    the directory keeps its own DACL — see :func:`restrict_dir_to_owner` for
+    why a tightened parent does not fix one.
 
     Best-effort on the tightening step: the directory is still created, and the
     caller decides whether an un-tightened directory is fatal.
@@ -2898,10 +3193,7 @@ def make_owner_only_dir(path: str | os.PathLike) -> None:
     p = Path(path)
     p.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        if IS_WINDOWS:
-            restrict_to_owner(p)
-        else:
-            p.chmod(0o700)
+        restrict_dir_to_owner(p)
     except OSError:
         logger.warning("could not restrict directory %s to owner-only", p, exc_info=True)
 
@@ -2960,6 +3252,80 @@ def restrict_to_owner(path: str | os.PathLike) -> None:
     if IS_POSIX:
         os.chmod(path, 0o600)
         return
+    # Misuse guard: this helper is FILE-shaped. Its grants carry no (OI)(CI),
+    # so handing it a directory tightens the directory itself and leaves every
+    # file created inside on the creating token's default DACL -- the exact
+    # defect restrict_dir_to_owner exists to close. Warn rather than raise:
+    # the ACE still applies to the named object, so the lockdown is partial
+    # rather than absent, and turning a partial protection into a runtime
+    # OSError would be the worse outcome. The argv tests cannot see this from
+    # the call site, so the check lives here.
+    try:
+        if Path(path).is_dir():
+            # The path is deliberately NOT logged. In this codebase a path can
+            # itself be the secret -- mcp_gateway/apps.py notes that its spool
+            # FILENAMES are live capability tokens -- so naming it here would be
+            # clear-text logging of sensitive information (CodeQL flagged exactly
+            # that). logging already records module/function/lineno, which is
+            # what locates the offending caller.
+            logger.warning(
+                "restrict_to_owner was called on a directory; its grants are not "
+                "inheritable, so files created inside will not be owner-only. "
+                "Use restrict_dir_to_owner for a directory."
+            )
+    except OSError:
+        pass
+    _icacls_owner_only(path, inherit=False)
+
+
+def restrict_dir_to_owner(path: str | os.PathLike) -> None:
+    """Fail-loud owner-only lockdown of a DIRECTORY, inherited by its children.
+
+    The directory twin of :func:`restrict_to_owner`, and separate from it
+    because the two shapes genuinely differ on both platforms:
+
+    POSIX: ``0o700`` rather than ``0o600`` — a directory needs the execute bit
+    to be traversable at all, so the file helper's mode would make the
+    directory useless.
+
+    Windows: the grants carry ``(OI)(CI)`` so they propagate to files and
+    subdirectories created inside. ``restrict_to_owner``'s grants deliberately
+    do not, because those flags are meaningless on a file; applying the
+    file-shaped helper to a directory is what left every file created inside an
+    "owner-only" directory on the creating token's default DACL.
+
+    Note the limit: inheritance governs what gets CREATED from here on. A file
+    that already exists inside the directory keeps its own DACL, and Windows
+    grants *Bypass Traverse Checking* to Everyone by default, so a permissive
+    pre-existing file stays reachable through a tightened parent. Repairing an
+    existing install needs a per-file pass over the known names; this helper is
+    the guarantee for new files, not a retrofit.
+
+    Fail-loud like :func:`restrict_to_owner`: any failure raises ``OSError`` so
+    callers reach their warn-and-continue handlers.
+    """
+    if IS_POSIX:
+        # Semgrep's insecure-file-permissions rule reads 0o700 as "widely
+        # permissive" and recommends 0o644, which is backwards for a DIRECTORY
+        # holding secrets: 0o644 drops owner-execute (making the directory
+        # untraversable) and ADDS world-read -- the exact exposure this helper
+        # exists to close. 0o700 is the restrictive mode here, so the finding is
+        # suppressed on the line below. Same reasoning as cloud/launch_job.py.
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
+        os.chmod(path, 0o700)
+        return
+    _icacls_owner_only(path, inherit=True)
+
+
+def _icacls_owner_only(path: str | os.PathLike, *, inherit: bool) -> None:
+    """Apply an owner-only DACL to *path* via icacls. Windows-only.
+
+    Shared by :func:`restrict_to_owner` (``inherit=False``, file shape) and
+    :func:`restrict_dir_to_owner` (``inherit=True``, directory shape). The only
+    difference between the two argv forms is the rights prefix, so they are one
+    function: an owner-only DACL that two call paths could drift apart on is
+    the defect this consolidation exists to prevent.
+    """
     icacls = shutil.which("icacls") or r"C:\Windows\System32\icacls.exe"
     # Resolve the invoking user's SID BEFORE building the argv. If whoami is
     # unavailable (missing from PATH under a stripped-down profile, subprocess
@@ -2974,19 +3340,21 @@ def restrict_to_owner(path: str | os.PathLike) -> None:
     user_sid = _current_user_sid()
     if user_sid is None:
         raise OSError(
-            "restrict_to_owner: cannot resolve current user SID via whoami; "
+            f"{'restrict_dir_to_owner' if inherit else 'restrict_to_owner'}: "
+            "cannot resolve current user SID via whoami; "
             "refusing to apply Owner-Rights-only DACL (would lock non-owner "
             f"users out of {path!s} — see _current_user_sid docstring)."
         )
+    rights = f"{_ICACLS_DIR_INHERIT}F" if inherit else "F"
     argv: list[str] = [
         icacls,
         os.fspath(path),
         "/inheritance:r",
         "/grant:r",
-        f"{_OWNER_RIGHTS_SID}:F",
+        f"{_OWNER_RIGHTS_SID}:{rights}",
     ]
     if user_sid != _OWNER_RIGHTS_SID:
-        argv += ["/grant:r", f"{user_sid}:F"]
+        argv += ["/grant:r", f"{user_sid}:{rights}"]
     try:
         r = subprocess.run(
             argv,
@@ -3117,21 +3485,135 @@ def find_python_interpreter(reject: Optional[Callable[[str], bool]] = None) -> s
 # Resource limits
 # ---------------------------------------------------------------------------
 
+#: ``task_info`` flavor selector for ``mach_task_basic_info``
+#: (``<mach/task_info.h>``). Chosen over the legacy ``TASK_BASIC_INFO`` because
+#: its sizes are 64-bit, so a footprint above 4 GiB is not truncated.
+_MACH_TASK_BASIC_INFO = 20
 
-def proc_rss_bytes() -> int:
-    """Return this process's resident set size in bytes, or 0 on failure.
 
-    POSIX: ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` (KiB on Linux, bytes
-    on macOS). Windows: ``GetProcessMemoryInfo().WorkingSetSize``.
+class _MachTimeValue(ctypes.Structure):
+    """``time_value_t`` (``<mach/time_value.h>``).
+
+    Never read; present only so the fields after it in
+    :class:`_MachTaskBasicInfo` land at the offsets the kernel writes them to.
     """
-    if IS_POSIX:
-        try:
 
-            ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            # Linux reports KiB; macOS reports bytes.
-            return ru_maxrss if sys.platform == "darwin" else ru_maxrss * 1024
-        except (ImportError, OSError, ValueError):
-            return 0
+    _fields_ = [("seconds", ctypes.c_int32), ("microseconds", ctypes.c_int32)]
+
+
+class _MachTaskBasicInfo(ctypes.Structure):
+    """``mach_task_basic_info`` (``<mach/task_info.h>``), in kernel order.
+
+    ``resident_size`` is the task's CURRENT resident footprint in bytes and
+    falls when pages are released; ``resident_size_max`` is the high-water mark
+    that never falls. Reading the wrong one of the two is exactly the bug this
+    layout exists to avoid, so both are named rather than indexed.
+
+    Module scope is load-bearing: ``ctypes.POINTER(T)`` memoises T in a
+    module-level dict inside ctypes that is never evicted, so declaring this
+    inside the probe would pin a fresh pair of type objects on every call — and
+    this probe is polled by the dashboard's system-metrics endpoint.
+    """
+
+    _fields_ = [
+        ("virtual_size", ctypes.c_uint64),
+        ("resident_size", ctypes.c_uint64),
+        ("resident_size_max", ctypes.c_uint64),
+        ("user_time", _MachTimeValue),
+        ("system_time", _MachTimeValue),
+        ("policy", ctypes.c_int),
+        ("suspend_count", ctypes.c_int),
+    ]
+
+
+#: ``task_info`` takes and returns a count in ``natural_t``-sized elements
+#: (``MACH_TASK_BASIC_INFO_COUNT``). Derived from the layout so it cannot go
+#: stale if a field is added above.
+_MACH_TASK_BASIC_INFO_COUNT = ctypes.sizeof(_MachTaskBasicInfo) // ctypes.sizeof(ctypes.c_int)
+
+
+def _scale_ru_maxrss(ru_maxrss: int) -> int:
+    """``ru_maxrss`` -> bytes. macOS reports bytes; Linux and other POSIX KiB.
+
+    The unit differs by platform with nothing in the value to tell them apart,
+    so every reader of ``ru_maxrss`` goes through here.
+    """
+    return ru_maxrss if sys.platform == "darwin" else ru_maxrss * 1024
+
+
+def _ru_maxrss_bytes() -> int | None:
+    """Peak (high-water) RSS in bytes from ``getrusage``, or None on failure.
+
+    POSIX only. This is a **peak**, not a live reading: ``ru_maxrss`` never
+    decreases for the life of the process.
+    """
+    try:
+        return _scale_ru_maxrss(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError, ValueError, AttributeError):
+        return None
+
+
+def _linux_current_rss_bytes() -> int | None:
+    """Current RSS in bytes from ``/proc/self/statm``, or None if unreadable.
+
+    Field 1 of ``statm`` is the resident page count — the same quantity
+    ``/proc/self/status``'s ``VmRSS`` and ``ps -o rss=`` report, so the
+    dashboard's figure reconciles with what an operator measures by hand.
+    """
+    try:
+        fields = Path("/proc/self/statm").read_text().split()
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _macos_current_rss_bytes() -> int | None:
+    """Current RSS in bytes via Mach ``task_info``, or None on any failure.
+
+    ``proc_rss_bytes_for_pid`` has no ctypes-only route for an ARBITRARY pid
+    (it needs a task port it cannot obtain), but ``mach_task_self()`` hands out
+    a port for THIS task unconditionally, so the self-only reading below is
+    always available — no subprocess, which matters because the macOS app
+    sandbox can deny spawning ``ps``.
+
+    Returns ``resident_size`` (what ``ps -o rss=`` reports), not
+    ``phys_footprint``: every other platform branch here reports RSS, and the
+    payload field it feeds is named for RSS. Activity Monitor's "Memory" column
+    is the phys_footprint variant and will read somewhat differently; that is a
+    separate accounting question from the peak-vs-current bug.
+    """
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+    except OSError:
+        return None  # not macOS / libSystem unavailable
+    try:
+        libc.mach_task_self.restype = ctypes.c_uint
+        libc.task_info.restype = ctypes.c_int
+        libc.task_info.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.POINTER(_MachTaskBasicInfo),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        info = _MachTaskBasicInfo()
+        count = ctypes.c_uint(_MACH_TASK_BASIC_INFO_COUNT)
+        # mach_task_self() returns a port name owned by the task itself, not a
+        # fresh send right, so unlike mach_host_self() it must NOT be deallocated.
+        kern_return = libc.task_info(
+            libc.mach_task_self(),
+            _MACH_TASK_BASIC_INFO,
+            ctypes.byref(info),
+            ctypes.byref(count),
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+    if kern_return != 0:  # non-zero kern_return_t -> failure
+        return None
+    return int(info.resident_size)
+
+
+def _windows_memory_counters() -> "_ProcessMemoryCounters | None":
+    """psapi ``PROCESS_MEMORY_COUNTERS`` for this process, or None on failure."""
     try:
 
         psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
@@ -3153,10 +3635,52 @@ def proc_rss_bytes() -> int:
         if psapi.GetProcessMemoryInfo(
             kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
         ):
-            return int(counters.WorkingSetSize)
-        return 0
+            return counters
+        return None
     except Exception:
-        return 0
+        return None
+
+
+def proc_rss_bytes() -> int:
+    """Return this process's CURRENT resident set size in bytes, or 0 on failure.
+
+    "Current" is the contract, not an implementation detail: this feeds an
+    operator-facing live memory figure, so it must FALL when the gateway
+    releases memory and must reconcile with ``ps -o rss=``.
+
+    - Linux: ``/proc/self/statm`` resident pages.
+    - macOS: Mach ``task_info(MACH_TASK_BASIC_INFO).resident_size``.
+    - Windows: ``GetProcessMemoryInfo().WorkingSetSize``.
+    - Last resort on POSIX only: ``getrusage(RUSAGE_SELF).ru_maxrss``, which is
+      a **peak** that never decreases. It is here so an unreadable ``/proc`` or
+      an unavailable ``libSystem`` still yields an order-of-magnitude number
+      rather than 0, and it over-reports by construction — see
+      :func:`proc_peak_rss_bytes` for the peak as a deliberate reading.
+    """
+    if IS_POSIX:
+        current = (
+            _macos_current_rss_bytes() if sys.platform == "darwin" else _linux_current_rss_bytes()
+        )
+        if current is not None:
+            return current
+        return _ru_maxrss_bytes() or 0
+    counters = _windows_memory_counters()
+    return 0 if counters is None else int(counters.WorkingSetSize)
+
+
+def proc_peak_rss_bytes() -> int:
+    """Return this process's PEAK resident set size in bytes, or 0 on failure.
+
+    The high-water mark since the process started: it never decreases, which is
+    what makes it useful for diagnosing a transient spike that a live reading
+    has already forgotten — and useless as the live reading itself. POSIX reads
+    ``getrusage(RUSAGE_SELF).ru_maxrss``; Windows reads
+    ``GetProcessMemoryInfo().PeakWorkingSetSize``.
+    """
+    if IS_POSIX:
+        return _ru_maxrss_bytes() or 0
+    counters = _windows_memory_counters()
+    return 0 if counters is None else int(counters.PeakWorkingSetSize)
 
 
 def proc_rss_bytes_for_pid(pid: int) -> int | None:
@@ -3383,6 +3907,241 @@ def system_cpu_percent() -> "float | None":
         return min(100.0, max(0.0, round(busy / dtotal * 100.0, 1)))
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Available physical memory, on every platform
+#
+# "How much RAM can a new process take without pushing this machine into swap"
+# has a different answer, and a different interface, on each OS: Linux publishes
+# the number outright, macOS publishes page counters and leaves the composition
+# to the caller, Windows has a Win32 call. A caller that reads only one of them
+# does not get a conservative answer on the others -- it gets NO answer, which
+# is why this lives here rather than at each call site.
+# ---------------------------------------------------------------------------
+
+_MIB_BYTES = 1024 * 1024
+
+#: ``natural_t`` is 32-bit on macOS, including on Apple silicon.
+_NATURAL_T = ctypes.c_uint
+
+#: ``host_statistics64`` flavor selector for ``vm_statistics64_data_t``.
+_HOST_VM_INFO64 = 4
+
+
+class _VMStatistics64(ctypes.Structure):
+    """``vm_statistics64_data_t`` (``<mach/vm_statistics.h>``), in kernel order.
+
+    Declared in full even though few fields are read, so the element count handed
+    to ``host_statistics64`` is exact and the trailing fields land at the offsets
+    the kernel writes them to.
+
+    Module scope is load-bearing: ``ctypes.POINTER(T)`` memoises T in a
+    module-level dict inside ctypes that is never evicted, so declaring this
+    inside the probe would pin a fresh pair of type objects on every call.
+    """
+
+    _fields_ = [
+        ("free_count", _NATURAL_T),
+        ("active_count", _NATURAL_T),
+        ("inactive_count", _NATURAL_T),
+        ("wire_count", _NATURAL_T),
+        ("zero_fill_count", ctypes.c_uint64),
+        ("reactivations", ctypes.c_uint64),
+        ("pageins", ctypes.c_uint64),
+        ("pageouts", ctypes.c_uint64),
+        ("faults", ctypes.c_uint64),
+        ("cow_faults", ctypes.c_uint64),
+        ("lookups", ctypes.c_uint64),
+        ("hits", ctypes.c_uint64),
+        ("purges", ctypes.c_uint64),
+        ("purgeable_count", _NATURAL_T),
+        ("speculative_count", _NATURAL_T),
+        ("decompressions", ctypes.c_uint64),
+        ("compressions", ctypes.c_uint64),
+        ("swapins", ctypes.c_uint64),
+        ("swapouts", ctypes.c_uint64),
+        ("compressor_page_count", _NATURAL_T),
+        ("throttled_count", _NATURAL_T),
+        ("external_page_count", _NATURAL_T),
+        ("internal_page_count", _NATURAL_T),
+        ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
+    ]
+
+
+#: How many ``natural_t``-sized elements the kernel must report having filled
+#: before ``external_page_count`` holds anything. ``host_statistics64`` writes
+#: the count back, and an older kernel that predates the field leaves it zero --
+#: indistinguishable from "no file-backed pages" unless the count is checked.
+#: Derived from the layout so it cannot go stale if a field is added above.
+_EXTERNAL_PAGE_COUNT_ELEMENTS = (
+    _VMStatistics64.external_page_count.offset + _VMStatistics64.external_page_count.size
+) // ctypes.sizeof(ctypes.c_int)
+
+
+def macos_vm_statistics() -> "tuple[_VMStatistics64, int] | None":
+    """Mach ``host_statistics64(HOST_VM_INFO64)``, or ``None`` on any failure.
+
+    Returns the filled struct and the element count the kernel wrote back, which
+    a caller needs to know whether the trailing (later-revision) fields are
+    meaningful. macOS-only; returns ``None`` everywhere else.
+
+    Reads in-process through ``ctypes``/``libSystem`` -- **no subprocess**. That
+    is not merely faster: the macOS app sandbox can deny spawning ``vm_stat`` or
+    ``sysctl``, and this probe runs on the gateway event loop.
+    """
+    try:
+        libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+    except OSError:
+        return None  # not macOS / libSystem unavailable
+
+    try:
+        libc.mach_host_self.restype = ctypes.c_uint
+        libc.mach_task_self.restype = ctypes.c_uint
+        libc.mach_port_deallocate.argtypes = [ctypes.c_uint, ctypes.c_uint]
+        libc.host_statistics64.restype = ctypes.c_int
+        libc.host_statistics64.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.POINTER(_VMStatistics64),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        host_port = libc.mach_host_self()
+        try:
+            stats = _VMStatistics64()
+            count = ctypes.c_uint(ctypes.sizeof(_VMStatistics64) // ctypes.sizeof(ctypes.c_int))
+            kern_return = libc.host_statistics64(
+                host_port,
+                _HOST_VM_INFO64,
+                ctypes.byref(stats),
+                ctypes.byref(count),
+            )
+        finally:
+            # Release the send right from mach_host_self so the port reference is
+            # not leaked per probe. Guarded so a missing symbol still returns
+            # None cleanly below rather than raising out of a memory reading.
+            try:
+                libc.mach_port_deallocate(libc.mach_task_self(), host_port)
+            except (AttributeError, OSError, ValueError):
+                pass
+    except (AttributeError, OSError, ValueError):
+        return None
+    if kern_return != 0:  # non-zero kern_return_t -> failure
+        return None
+    return stats, int(count.value)
+
+
+def _macos_available_mib() -> int:
+    """RAM in MiB a new process can take on macOS without swapping, or 0.
+
+    macOS publishes no ``MemAvailable``; it publishes page counters, and which
+    ones count as available is a decision. Each term here is one:
+
+    * ``free_count`` ALREADY INCLUDES ``speculative_count`` -- Darwin's own
+      ``vm_stat`` prints ``free_count - speculative_count`` as its "Pages free"
+      line. Adding speculative on top double-counts it, which inflates the
+      reading on exactly the loaded machine where it must not.
+    * ``purgeable_count`` is volatile memory the kernel may drop outright, with
+      no I/O, so it is genuinely available.
+    * ``inactive_count`` is NOT all reclaimable: it mixes clean file-backed pages
+      with DIRTY ANONYMOUS pages that cannot be handed over without compressing
+      or swapping them. ``HOST_VM_INFO64`` publishes no inactive-AND-file
+      counter, so the intersection is not computable -- but
+      ``min(inactive, external_page_count)`` is an upper bound on the file-backed
+      share, and it is strictly tighter than ``inactive``. That tightening is
+      what stops a browser's gigabytes of inactive anonymous memory reading as
+      free.
+
+    Compressed pages are occupied, so the compressor counts are excluded.
+
+    ``0`` means UNKNOWN, and callers skip an unknown reading rather than treating
+    it as zero memory. A read that SUCCEEDED but computed nothing therefore
+    returns 0 too: a host with no free, purgeable or file-backed pages at all is
+    not a reading anyone should act on.
+    """
+    probe = macos_vm_statistics()
+    if probe is None:
+        return 0
+    stats, filled = probe
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return 0
+    if page_size <= 0:
+        return 0
+    inactive = int(stats.inactive_count)
+    if filled >= _EXTERNAL_PAGE_COUNT_ELEMENTS:
+        inactive = min(inactive, int(stats.external_page_count))
+    pages = int(stats.free_count) + int(stats.purgeable_count) + inactive
+    if pages <= 0:
+        return 0
+    # max(1, ...) only after the >0 check above, so a real but sub-MiB reading
+    # stays distinguishable from "unknown".
+    return max(1, pages * page_size // _MIB_BYTES)
+
+
+def _linux_available_mib() -> int:
+    """``MemAvailable`` in MiB, or 0 when ``/proc/meminfo`` cannot be read.
+
+    The kernel's own estimate of what a new allocation can use without swapping.
+    It counts reclaimable page cache, which ``MemFree`` and ``SC_AVPHYS_PAGES``
+    both omit -- on a host that has read any files those understate badly (they
+    match ``MemFree`` exactly, measured 43,574 MiB against ``MemAvailable``'s
+    74,768 MiB on the same idle host).
+    """
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                # "MemAvailable:   107374182 kB" -- the unit is always kB.
+                return int(line.split()[1]) * 1024 // _MIB_BYTES
+    except (OSError, IndexError, ValueError):
+        return 0
+    return 0
+
+
+def host_total_mib() -> int:
+    """Total physical RAM in MiB, or 0 when it cannot be determined.
+
+    POSIX ``sysconf`` first, then the Win32 reading -- the same order
+    ``sandbox._default_max_memory_mb`` uses, and for the same reason: ``os.sysconf``
+    does not EXIST on Windows, so a probe written against it alone does not return a
+    conservative number there, it returns nothing. Paired with
+    :func:`host_available_mib` so both halves of a memory budget answer on every
+    platform; a budget with only one of them silently stops bounding anything.
+    """
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return pages * page_size // _MIB_BYTES
+    except (AttributeError, OSError, ValueError):
+        pass
+    mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
+    return (mem[0] // _MIB_BYTES) if mem else 0
+
+
+def host_available_mib() -> int:
+    """RAM in MiB actually free for a new process right now, or 0 when unknown.
+
+    **MiB, not GiB, and the unit is load-bearing.** In GiB every reading under
+    1 GiB truncates to ``0``, which is also this function's "could not
+    determine" answer -- so on the starved host the reading exists to protect,
+    860 MiB free would read as "unknown" and the bound built on it would vanish.
+
+    ``0`` is returned only when the platform genuinely cannot be read, so a
+    caller can distinguish "no headroom" from "no reading" and fail open on the
+    latter.
+    """
+    if IS_LINUX:
+        return _linux_available_mib()
+    if IS_MACOS:
+        return _macos_available_mib()
+    if IS_WINDOWS:
+        mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
+        return (mem[1] // _MIB_BYTES) if mem else 0
+    return 0
 
 
 # ---------------------------------------------------------------------------

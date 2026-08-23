@@ -448,8 +448,24 @@ The Slack posture check itself stays policy-only (a profile cannot carry
 `posture`, Rule 6).
 
 Profiles hot-reload via an mtime fingerprint (`ProfileStore`); a schema-invalid
-profile falls back to deny-all (Validation rule 5), **not** the ceiling.
-`extends` is monotonic narrowing (`compose_profiles`).
+profile falls back to deny-all (Validation rule 5), **not** the ceiling — unless
+the policy declares a top-level `fallback` profile (see *Configurable fallback*
+below), which is substituted instead. `extends` is monotonic narrowing
+(`compose_profiles`).
+
+**Configurable fallback (policy-only).** By default the substitute for an unusable
+profile is the most-restrictive deny-all. A policy MAY declare a top-level
+`fallback` object — parsed as a narrow-only profile (same scope validation; an
+unknown scope in it fails closed at boot) — which the loader substitutes at all
+three unusable-file sites instead of deny-all. Intersected with the ceiling like
+any profile, it can only narrow it: it lets an operator keep the basic operational
+planes available (subagent/cron/heartbeat/taskrunner) while still denying the
+sensitive ones (for example `channels`/`apps`) when a profile file cannot be
+loaded. Absent the key the fallback stays deny-all (the default is unchanged). A
+profile may NOT declare `fallback` (policy-only, rejected at parse). The chosen
+fallback is resolved against the composed ceiling, and the profile-store freshness
+key folds in whether a fallback is declared, so a store first-touched before the
+ceiling composed reloads once it does rather than baking deny-all permanently.
 
 **Present-but-unrecoverable profile — governed fleet fails closed, standalone is
 lenient.** The reload reads each file's bytes SEPARATELY from parsing and handles
@@ -921,7 +937,8 @@ switched off. Two fields keep that honest:
   is unchanged. This answers the question a host-scoped row provokes: *is cron
   really off, or is that just the host's ceiling?*
 - **`fallback_profiles`** — file stems of every profile currently replaced by the
-  deny-all built-in (from `governance_profiles.fallback_profile_names()`), sorted.
+  fallback built-in — deny-all by default, or the policy's declared `fallback`
+  profile (from `governance_profiles.fallback_profile_names()`), sorted.
   **Names only**, same exposure contract as `other_bound_surfaces`: a stem is not
   rule content, so the POSTURE-only boundary is unchanged. `_reload` substitutes
   that built-in at three sites — a present-but-unreadable file, a file whose JSON
@@ -1239,8 +1256,13 @@ scope growth without server-recorded grants is not covered by this decision.
 
 The anonymous daily heartbeat and official-app install receipt (`beacon.py` and
 `apps/install_receipt.py`; full spec in [metrics.md](metrics.md) → "Anonymous
-outbound telemetry") are the repo's **only default-on egress family**. Both use
-fixed anonymous payloads and the same effective-enable ladder. They are governed
+outbound telemetry"), together with the in-app session-pulse survey
+(`dashboard/handlers/feedback.py`), are the repo's **only default-on egress
+family**. All three gate on the same `beacon.telemetry_permitted` effective-enable
+ladder. The heartbeat and install receipt send fixed anonymous payloads; the
+survey egresses the user's own submitted answers plus an anonymous per-install
+id (`beacon.install_id`), and only once that same ladder — including the
+first-run privacy disclosure — permits it. They are governed
 by the `capabilities.telemetry` `SCOPE_CATALOG` capability row
 (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
 change, mirroring the theme rows above).

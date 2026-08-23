@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import stat
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
@@ -568,6 +570,8 @@ async def test_reused_checkout_pull_never_repoints_origin(monkeypatch, tmp_path)
 
     monkeypatch.setattr(registry, "_clone_origin_url", _fake_origin)
 
+    monkeypatch.setattr(registry, "_read_clone_branch", lambda clone_dir: "main")
+
     spawned: list[list[str]] = []
 
     class _Proc:
@@ -630,6 +634,8 @@ async def test_failed_pull_aborts_instead_of_installing_stale_code(monkeypatch, 
         return "https://example.com/demo.git"
 
     monkeypatch.setattr(registry, "_clone_origin_url", _fake_origin)
+
+    monkeypatch.setattr(registry, "_read_clone_branch", lambda clone_dir: "main")
 
     class _Proc:
         pid = 4242
@@ -921,12 +927,15 @@ async def test_postscript_admission_rejection_rolls_back_preexisting_checkout(
 
 
 @pytest.mark.asyncio
-async def test_moveaside_reclone_treated_as_fresh_on_rejection(monkeypatch, tmp_path):
+async def test_moveaside_reclone_retained_not_restored_on_rejection(monkeypatch, tmp_path):
     """When the origin-mismatch gate moves an old checkout aside and
     fresh-clones, a rejection must delete the fresh re-clone (never preserve it
-    or reset it toward the moved-aside repository's commit) and RESTORE the
-    moved-aside previous checkout — otherwise the slot is left empty and the
-    user's old workspace is stranded as a sweeper-doomed .stale-* sibling."""
+    or reset it toward the moved-aside repository's commit) and must NOT
+    restore the moved-aside previous checkout: an origin-mismatch move-aside is
+    a DIFFERENT repository, so handing it back to the slot would give a later
+    retry the very tree this gate already refused. It stays RETAINED as a
+    `.stale-*` sibling (recoverable by hand, swept on a retention timer), which
+    is why only a same-origin/branch-drift move-aside is ever restored."""
     src = tmp_path / "app-sources" / "demoapp"
     (src / ".git").mkdir(parents=True)  # OLD checkout pre-exists (origin A)
     (src / "old-work.txt").write_text("precious", encoding="utf-8")
@@ -935,7 +944,9 @@ async def test_moveaside_reclone_treated_as_fresh_on_rejection(monkeypatch, tmp_
     monkeypatch.setattr(registry, "_resolved_clone_commit", lambda root: "a" * 40)
 
     async def _fake_clone(git_url, branch, dest, log_lines, **kwargs):
-        # Simulate the origin-mismatch move-aside + fresh re-clone.
+        # Simulate the origin-mismatch move-aside + fresh re-clone. Only
+        # `pending_cleanup` is populated, never `restorable_stale` — an
+        # origin-mismatch move is never restorable.
         moved = dest.with_name("demoapp.stale-deadbeef")
         dest.rename(moved)
         cleanup = kwargs.get("pending_cleanup")
@@ -972,11 +983,13 @@ async def test_moveaside_reclone_treated_as_fresh_on_rejection(monkeypatch, tmp_
     assert result["ok"] is False
     # No rollback is attempted toward the moved-aside repo's commit ...
     assert not any(cmd[:3] == ["git", "reset", "--keep"] for cmd in spawned)
-    # ... the rejected re-clone is gone, and the PREVIOUS checkout is back.
-    assert src.exists()
-    assert (src / "old-work.txt").read_text(encoding="utf-8") == "precious"
-    assert not (src / "app.json").exists()  # the rejected clone's manifest is gone
-    assert not src.with_name("demoapp.stale-deadbeef").exists()  # moved back, not stranded
+    # ... the rejected re-clone is gone from the active slot ...
+    assert not src.exists()
+    # ... and the ORIGIN-mismatched previous checkout is retained, not
+    # restored into the slot the gate just refused it for.
+    stale = src.with_name("demoapp.stale-deadbeef")
+    assert stale.exists()
+    assert (stale / "old-work.txt").read_text(encoding="utf-8") == "precious"
 
 
 @pytest.mark.asyncio
@@ -1383,6 +1396,144 @@ class TestApplyTrustFields:
         assert "featured" not in rows["ext-app"]
         # The internal snapshot key never leaks into the API payload.
         assert all("_index_author" not in r for r in rows.values())
+
+
+# ---------------------------------------------------------------------------
+# External registries must surface on the ONLINE catalog path.
+#
+# Regression: handle_registry prefers list_catalog_apps when the published
+# catalog is reachable and only falls back to list_registry (the sole path that
+# merged external registries) when the catalog is empty. So a configured
+# external app was silently dropped from the store the moment the catalog came
+# online. list_catalog_apps now appends external-registry rows itself.
+# ---------------------------------------------------------------------------
+class TestCatalogAppsIncludesExternalRegistries:
+    @pytest.mark.asyncio
+    async def test_external_registry_app_appears_when_catalog_is_online(self, monkeypatch):
+        """With a NON-EMPTY catalog (so the catalog path is taken), a configured
+        external app still shows up — tagged external, not-installed — and a
+        same-named catalog row wins the dedup."""
+        # Catalog is reachable and non-empty: this forces the list_catalog_apps
+        # path rather than the offline list_registry fallback.
+        catalog_rows = [
+            {"name": "catalog-app", "displayName": "Catalog App"},
+            # Collision: the catalog also lists a name an external registry uses.
+            {"name": "shared-app", "displayName": "Official Shared App"},
+        ]
+        monkeypatch.setattr(
+            registry.official_catalog, "list_catalog_rows", lambda: catalog_rows
+        )
+        # Seed only matters for the git-row installable filter; keep it empty.
+        monkeypatch.setattr(registry, "_load_registry_file", lambda: [])
+        monkeypatch.setattr(registry, "list_installed_apps", lambda: [])
+
+        external_rows = [
+            {"name": "labs-app", "repo": "x", "_registry": "labs"},
+            # Same name as a catalog row — the catalog row must win.
+            {"name": "shared-app", "repo": "y", "_registry": "labs"},
+        ]
+
+        async def _fake_external():
+            return external_rows
+
+        async def _fake_resolve(entry):
+            # Manifests already present in the index fixture; return as-is.
+            return entry
+
+        monkeypatch.setattr(registry, "_load_external_registries", _fake_external)
+        monkeypatch.setattr(registry, "_resolve_manifest", _fake_resolve)
+
+        rows = {r["name"]: r for r in await registry.list_catalog_apps()}
+
+        # The external-only app is present, tagged external, and not installed.
+        assert "labs-app" in rows
+        assert rows["labs-app"]["_registry"] == "labs"
+        assert rows["labs-app"]["provenance"] == "external"
+        assert rows["labs-app"]["verified"] is False
+        assert rows["labs-app"]["installed"] is False
+        # The collision resolves to the catalog row (official), not the external one.
+        assert rows["shared-app"]["displayName"] == "Official Shared App"
+        assert rows["shared-app"]["provenance"] != "external"
+        # The plain catalog app is untouched.
+        assert "catalog-app" in rows
+        # The internal snapshot key never leaks into the API payload.
+        assert all("_index_author" not in r for r in rows.values())
+
+    @pytest.mark.asyncio
+    async def test_detect_installed_only_external_app_reads_installed_on_catalog_path(
+        self, monkeypatch
+    ):
+        """Install-status PARITY with the offline path: an external app known ONLY
+        via its detectInstalled probe (absent from installed_map) must read
+        installed=True on the ONLINE catalog path too, because that path now runs
+        the same probe and passes the resulting `detected` into enrichment."""
+        monkeypatch.setattr(
+            registry.official_catalog,
+            "list_catalog_rows",
+            lambda: [{"name": "catalog-app", "displayName": "Catalog App"}],
+        )
+        monkeypatch.setattr(registry, "_load_registry_file", lambda: [])
+        monkeypatch.setattr(registry, "list_installed_apps", lambda: [])
+
+        async def _fake_external():
+            return [
+                {
+                    "name": "detect-app",
+                    "repo": "z",
+                    "_registry": "labs",
+                    "detectInstalled": "true",
+                }
+            ]
+
+        async def _fake_resolve(entry):
+            return entry
+
+        # Stand in for the real subprocess probe: report installed the same way
+        # _detect_installed_probe would for a returncode-0 command.
+        async def _fake_probe(entries, installed_map):
+            return {e["name"] for e in entries if e.get("detectInstalled")}
+
+        monkeypatch.setattr(registry, "_load_external_registries", _fake_external)
+        monkeypatch.setattr(registry, "_resolve_manifest", _fake_resolve)
+        monkeypatch.setattr(registry, "_detect_installed_probe", _fake_probe)
+
+        rows = {r["name"]: r for r in await registry.list_catalog_apps()}
+        assert rows["detect-app"]["installed"] is True
+
+    @pytest.mark.asyncio
+    async def test_external_row_cannot_shadow_filtered_catalog_git_name(self, monkeypatch):
+        """GPT BLOCK regression: a catalog `git` row dropped by the installability
+        filter must still RESERVE its name, so an external row with the same name
+        is deduped away and can never become the row install-by-name resolves."""
+        catalog_rows = [
+            {"name": "keep-app", "displayName": "Keep App"},
+            # git source, and NOT in the seed installable set below -> filtered out.
+            {"name": "filtered-git", "source": {"type": "git"}},
+        ]
+        monkeypatch.setattr(
+            registry.official_catalog, "list_catalog_rows", lambda: catalog_rows
+        )
+        monkeypatch.setattr(registry, "_load_registry_file", lambda: [])
+        monkeypatch.setattr(registry, "list_installed_apps", lambda: [])
+
+        async def _fake_external():
+            # External registry tries to claim the filtered-out catalog name.
+            return [{"name": "filtered-git", "repo": "evil", "_registry": "labs"}]
+
+        async def _fake_resolve(entry):
+            return entry
+
+        monkeypatch.setattr(registry, "_load_external_registries", _fake_external)
+        monkeypatch.setattr(registry, "_resolve_manifest", _fake_resolve)
+
+        rows = {r["name"]: r for r in await registry.list_catalog_apps()}
+        # The catalog git row was filtered out AND the external row was reserved
+        # away, so the name is absent entirely -- crucially it never appears as an
+        # EXTERNAL row pointing at the "evil" repo.
+        assert rows.get("filtered-git", {}).get("provenance") != "external"
+        assert "filtered-git" not in rows
+
+
 # ---------------------------------------------------------------------------
 # Git-install build step: the interpreter, and where the build runs.
 #
@@ -1496,7 +1647,11 @@ async def test_a_monorepo_subdirectory_is_built_not_the_clone_root(tmp_path, mon
     monkeypatch.setattr(registry, "sel", lambda: MagicMock())
 
     await registry._clone_build_app_locked(
-        "https://example.invalid/r.git", "my-tool", [], subdirectory="apps/my-tool"
+        "https://example.invalid/r.git",
+        "my-tool",
+        [],
+        subdirectory="apps/my-tool",
+        pending_cleanup=[],
     )
 
     assert captured, "the build must be attempted"
@@ -1529,7 +1684,11 @@ async def test_a_traversing_subdirectory_does_not_choose_the_build_dir(tmp_path,
     monkeypatch.setattr(registry, "sel", lambda: MagicMock())
 
     result = await registry._clone_build_app_locked(
-        "https://example.invalid/r.git", "evil", [], subdirectory="../../etc"
+        "https://example.invalid/r.git",
+        "evil",
+        [],
+        subdirectory="../../etc",
+        pending_cleanup=[],
     )
 
     assert result["ok"] is False
@@ -1733,3 +1892,139 @@ class TestCatalogFailureNeverBreaksTheStore:
             await self._rows(monkeypatch)
         assert any("catalog" in r.message for r in caplog.records)
         assert any(r.exc_info for r in caplog.records), "expected a traceback"
+
+
+# ---------------------------------------------------------------------------
+# A failed FRESH clone must actually remove the partial checkout on Windows.
+#
+# git writes `.git/objects/pack/*.{pack,idx,rev}` read-only. On Windows that is
+# FILE_ATTRIBUTE_READONLY, so `shutil.rmtree(..., ignore_errors=True)` cannot
+# unlink them and silently reports success over a tree that is still on disk.
+# The update path already copes with a surviving tree -- its `finally` moves the
+# leftover aside so the restore rename cannot collide -- but the fresh-install
+# path had no such guard, so the leftover became permanent: the next install
+# sees `dest/.git` with a matching origin, takes the fast-forward branch, and
+# `git pull` in a never-finished clone fails on every retry.
+#
+# POSIX cannot express this: the read-only bit there does not govern unlink (the
+# parent directory's write permission does), so `rmtree` succeeds either way and
+# the test would be green before the fix. Hence a platform gate rather than a
+# simulated failure -- the real file attribute is the entire mechanism.
+# ---------------------------------------------------------------------------
+
+
+def _partial_clone(dest):
+    """What a `git clone` killed partway through leaves behind at *dest*."""
+    pack = dest / ".git" / "objects" / "pack"
+    pack.mkdir(parents=True, exist_ok=True)
+    (dest / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = https://example.com/demo.git\n', encoding="utf-8"
+    )
+    blob = pack / "pack-0123456789abcdef0123456789abcdef01234567.pack"
+    blob.write_bytes(b"PACK")
+    os.chmod(blob, stat.S_IREAD)
+    return blob
+
+
+def _fresh_clone_harness(monkeypatch, dest, *, mode):
+    """Patch registry so a fresh clone into *dest* fails in *mode*."""
+    monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(registry, "_kill_process_group", AsyncMock())
+    monkeypatch.setattr(registry, "_CLONE_TIMEOUT", 0.05)
+
+    class _Proc:
+        returncode = 1 if mode == "exit" else 0
+        pid = 4242
+
+        async def communicate(self):
+            if mode == "timeout":
+                await asyncio.sleep(30)
+            if mode == "cancel":
+                raise asyncio.CancelledError()
+            return b"fatal: early EOF", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        # git created the destination and wrote pack files before it died.
+        _partial_clone(dest)
+        return _Proc()
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    platform_compat.IS_POSIX,
+    reason="the read-only attribute only blocks unlink on Windows",
+)
+@pytest.mark.parametrize("mode", ["exit", "timeout", "cancel"])
+async def test_failed_fresh_clone_removes_read_only_partial_checkout(
+    monkeypatch, tmp_path, mode
+):
+    """Every fresh-clone failure exit must leave no destination behind."""
+    dest = tmp_path / "app-sources" / "demoapp"
+    _fresh_clone_harness(monkeypatch, dest, mode=mode)
+
+    if mode == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await registry._git_clone_or_pull(
+                "https://example.com/demo.git", "main", dest, []
+            )
+    else:
+        err = await registry._git_clone_or_pull(
+            "https://example.com/demo.git", "main", dest, []
+        )
+        assert err is not None and err["ok"] is False
+
+    assert not dest.exists(), (
+        "the partial checkout survived: the next install would find its .git, "
+        "take the fast-forward branch and fail on every retry"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    platform_compat.IS_POSIX,
+    reason="the read-only attribute only blocks unlink on Windows",
+)
+async def test_failed_pinned_fetch_removes_read_only_partial_checkout(
+    monkeypatch, tmp_path
+):
+    """The pinned path materialises its own destination with `git init`; a failed
+    fetch must discard it as completely as the clone path does."""
+    dest = tmp_path / "app-sources" / "pinnedapp"
+    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (cmd, None))
+    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: cmd)
+    monkeypatch.setattr(registry, "_kill_process_group", AsyncMock())
+
+    class _Proc:
+        pid = 4242
+
+        def __init__(self, rc):
+            self.returncode = rc
+
+        async def communicate(self):
+            return b"fatal: could not read from remote repository", b""
+
+    async def _fake_spawn(*argv, **kwargs):
+        if "init" in argv:
+            _partial_clone(dest)  # git init made it; the fetch left pack files
+            return _Proc(0)
+        if "fetch" in argv:
+            return _Proc(1)
+        return _Proc(0)
+
+    monkeypatch.setattr(registry, "create_subprocess_limited", _fake_spawn)
+
+    err = await registry._git_fetch_commit(
+        "https://example.com/demo.git",
+        "a" * 40,
+        dest,
+        [],
+        clone_env={},
+        sandbox_mode="strict",
+    )
+
+    assert err is not None and err["ok"] is False
+    assert not dest.exists(), "the pinned path left an undeletable checkout behind"

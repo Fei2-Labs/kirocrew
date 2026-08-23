@@ -79,16 +79,22 @@ def test_session_bound_is_the_inverse_of_advertising(name: str, monkeypatch) -> 
     assert managed_server_is_session_bound(name) is (not advertised)
 
 
-def test_core_is_shareable_and_cron_is_not() -> None:
-    """The two concrete answers the dashboard renders, spelled out.
+def test_the_concrete_verdicts_are_spelled_out() -> None:
+    """The concrete answers the dashboard renders, spelled out.
 
     Kept alongside the derived checks above because those pass just as happily if
-    every managed server flipped at once. This is the regression: ``kirocrew-core``
-    was marked unsuitable for sharing purely for being ours, while it is the one
-    managed server that consumes the injected caller block.
+    every managed server flipped at once. ``kirocrew-core`` and ``kirocrew-cron``
+    both consume the injected caller block, so neither is session-bound.
+    ``kirocrew-computer`` and ``kirocrew-dashboard`` do not advertise yet -- they
+    are pooled all the same (nothing declines to pool an unadvertised backend), so
+    what this verdict records is our own unfinished adoption, not a property of
+    those servers. It flips when they adopt it, and the reason code can be deleted
+    once nothing produces it.
     """
     assert managed_server_is_session_bound("kirocrew-core") is False
-    assert managed_server_is_session_bound("kirocrew-cron") is True
+    assert managed_server_is_session_bound("kirocrew-cron") is False
+    assert managed_server_is_session_bound("kirocrew-computer") is True
+    assert managed_server_is_session_bound("kirocrew-dashboard") is True
 
 
 def test_a_third_party_server_is_not_claimed_either_way() -> None:

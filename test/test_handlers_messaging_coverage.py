@@ -112,6 +112,7 @@ def _info(**kw: Any) -> Any:
         "max_turns": 0,
         "cwd": "",
         "model": "",
+        "reasoning_effort": "",
         "approval_mode": "",
         "silent": False,
         "_raw_task": "",

@@ -17,6 +17,7 @@ from kiro_crew.discord.resume_expectation import (
 from kiro_crew.history import is_incognito_transcript, needles_match_text, parse_search_query
 from kiro_crew.messaging.driver import sanitize_channel_replay_text
 from kiro_crew.messaging.link import UNBIND_REASON_USER_UNLINK, ChannelLink
+from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session_map import ConversationOwnershipConflict
@@ -36,6 +37,12 @@ _PICKER_TTL_SECS = 300
 _PICKER_REGISTRY_MAX = 100
 _REPLAY_MESSAGES = 5
 _REPLAY_TEXT_LIMIT = 1900
+#: Appended when a replayed message carried more than the preview shows, so the
+#: user can tell a shortened transcript entry from a complete one.
+_REPLAY_TRUNCATED = "\n… (truncated)"
+#: Budget held back per replayed message for the two-character role-icon prefix
+#: and the marker above, so a preview plus its scaffolding still fits the limit.
+_REPLAY_RESERVE = len(_REPLAY_TRUNCATED) + 2
 #: Matches the picker's own label budget, so the title a detach notice names is
 #: the same string the user picked.
 _TITLE_LIMIT = 76
@@ -64,10 +71,12 @@ _SETTLE_ADOPT = "adopt"  # link moved; adopt the new session
 _MAX_ROUTE_ATTEMPTS = 3
 #: Refusal when the attachment cannot be made durable or read back: the turn would
 #: otherwise use a link whose later loss nothing can detect.
-_STORAGE_REFUSAL = ("🔗 Can't read or save which conversation this channel is linked to, so your "
-                    "message was NOT processed. This needs an operator to repair the gateway's "
-                    "expectation store; `!sessions` still lists sessions, but a reattachment "
-                    "cannot be saved until it is.")
+_STORAGE_REFUSAL = (
+    "🔗 Can't read or save which conversation this channel is linked to, so your "
+    "message was NOT processed. This needs an operator to repair the gateway's "
+    "expectation store; `!sessions` still lists sessions, but a reattachment "
+    "cannot be saved until it is."
+)
 
 
 class ResumeReleaseError(RuntimeError):
@@ -100,14 +109,65 @@ class _SessionPicker:
     choices: tuple[_SessionChoice, ...]
 
 
-def _safe_discord_text(text: str, max_chars: int) -> str:
-    """Redact full text, suppress Discord mentions, then truncate."""
+def _redact_discord_text(text: str) -> str:
+    """Redact credentials and exfiltration URLs, then defuse Discord mentions.
+
+    Mention defusing lengthens the text, so it runs before any budgeting: a
+    caller measuring the pre-defused string would under-count the payload.
+    """
     clean, _ = redact_exfiltration_urls(text or "")
     clean, _ = redact_credentials(clean)
-    clean = clean.replace("@", "@\u200b")
+    return clean.replace("@", "@\u200b")
+
+
+def _safe_discord_text(text: str, max_chars: int) -> str:
+    """Redact full text, suppress Discord mentions, then truncate.
+
+    For a short label (a session title, an error string). A Markdown BODY goes
+    through :func:`_replay_preview` instead, which shortens without cutting a
+    fenced code block in half.
+    """
+    clean = _redact_discord_text(text)
     if len(clean) <= max_chars:
         return clean
     return clean[: max_chars - 1] + "…"
+
+
+async def _replay_preview(text: str, limit: int, *, reserve: int) -> str:
+    """A fence-safe preview of *text*, marked when it left content behind.
+
+    The replay is a bounded context preview, so a long transcript message is
+    still shortened — but a blind character slice can land inside a fenced code
+    block, and Discord then renders everything after it as literal backticks
+    instead of code. Taking the shared splitter's FIRST chunk shortens at a
+    boundary the fence grammar accepts: every chunk but the last is sealed, so
+    that chunk closes any block the cut opened and stands on its own.
+
+    The splitter is prefix-stable, so only a bounded prefix is needed to derive
+    its first sealed chunk. The bounded split still runs off the asyncio thread:
+    pathological delimiter input is finite but CPU-intensive, and transcript
+    replay must not pause unrelated Discord traffic while deriving a preview.
+
+    ``reserve`` is the caller's own scaffolding — the role icon, and the marker
+    below — held out of the splitter's budget so the assembled message still fits
+    ``limit``. A pathological opener can need more fence scaffolding than that
+    budget can hold. In that case the marker is safer than a blind API truncation
+    that would expose an unterminated fence.
+    """
+    redacted = _redact_discord_text(text)
+    probe = redacted[: max(1, limit) * 2]
+    probe_left_content = len(probe) < len(redacted)
+    chunks = await asyncio.to_thread(split_markdown_safe, probe, limit, reserve=reserve)
+    if not chunks:
+        return ""
+
+    first = chunks[0]
+    prefix_reserve = max(0, reserve - len(_REPLAY_TRUNCATED))
+    if len(chunks) == 1 and not probe_left_content:
+        return first if len(first) <= limit - prefix_reserve else _REPLAY_TRUNCATED
+    if len(first) > limit - reserve:
+        return _REPLAY_TRUNCATED
+    return first + _REPLAY_TRUNCATED
 
 
 def _history_dashboard_key(raw_key: object) -> str | None:
@@ -142,11 +202,16 @@ def _picker_components(nonce: str, choices: tuple[_SessionChoice, ...]) -> list[
     return rows
 
 
-def _storage_refused(channel_id: str, why: str,
-                     observed: "InboundResolution | None" = None) -> "RoutingDecision":
+def _storage_refused(
+    channel_id: str, why: str, observed: "InboundResolution | None" = None
+) -> "RoutingDecision":
     """Log and refuse: routing on an unreadable store attaches the turn to a binding whose later loss nothing can detect."""
-    logger.warning("discord resume: %s at channel %s; refusing rather than routing "
-                   "undetectably", why, channel_id, exc_info=True)
+    logger.warning(
+        "discord resume: %s at channel %s; refusing rather than routing " "undetectably",
+        why,
+        channel_id,
+        exc_info=True,
+    )
     return RoutingDecision(refusal=_STORAGE_REFUSAL, settle=_SETTLE_NOTHING, observed=observed)
 
 
@@ -226,25 +291,40 @@ class DiscordSessionResume:
                 # binding revives on restart, splitting the conversation history.
                 try:
                     expected = await self._expectations.get(channel_id)
-                    owner = seen.key or next(iter(self.sessions.find_mirror_sessions(
-                        self.link_for(channel_id), inbound_only=True)), None)
+                    owner = seen.key or next(
+                        iter(
+                            self.sessions.find_mirror_sessions(
+                                self.link_for(channel_id), inbound_only=True
+                            )
+                        ),
+                        None,
+                    )
                     if owner and (expected is None or expected.retired):
-                        await self._expectations.record(channel_id, owner, await self._title_of(owner))
+                        await self._expectations.record(
+                            channel_id, owner, await self._title_of(owner)
+                        )
                 except ExpectationStoreError as exc:
                     raise ResumeReleaseError("release evidence write failed") from exc
                 # Free every co-located occupant so unlink cannot leave an ambiguous owner.
                 cleared = self.sessions.clear_mirror_links_at(
-                    self.link_for(channel_id), reason=UNBIND_REASON_USER_UNLINK)
+                    self.link_for(channel_id), reason=UNBIND_REASON_USER_UNLINK
+                )
             # A retry must land a failed in-memory removal before record retirement.
             try:
                 await self.sessions.aflush()
             except Exception as exc:
-                logger.warning("discord resume: binding release was not durable for channel %s",
-                               channel_id, exc_info=True)
+                logger.warning(
+                    "discord resume: binding release was not durable for channel %s",
+                    channel_id,
+                    exc_info=True,
+                )
                 raise ResumeReleaseError("session-map flush failed") from exc
             if releasing:
-                logger.info("discord: released resumed session %s (cleared bindings: %s)",
-                            seen.key or "(ambiguous)", ", ".join(cleared) or "none")
+                logger.info(
+                    "discord: released resumed session %s (cleared bindings: %s)",
+                    seen.key or "(ambiguous)",
+                    ", ".join(cleared) or "none",
+                )
                 self._push_slots()
             try:
                 # Retire on the version CAS alone: an owner racing the flush is a NEW
@@ -257,7 +337,10 @@ class DiscordSessionResume:
             except ExpectationStoreError:
                 logger.warning(
                     "discord resume: could not retire the released record at channel %s; "
-                    "one stale detach notice may follow", channel_id, exc_info=True)
+                    "one stale detach notice may follow",
+                    channel_id,
+                    exc_info=True,
+                )
         return seen.key or (cleared[0] if cleared else None)
 
     async def route(self, channel_id: str) -> RoutingDecision:
@@ -273,11 +356,15 @@ class DiscordSessionResume:
                 return _storage_refused(channel_id, "cannot read the store")
             resolution = self.resolve_inbound(channel_id)
             if resolution.ambiguous:
-                return RoutingDecision(refusal=(
+                return RoutingDecision(
+                    refusal=(
                         "🔗 Ambiguous link: this conversation is claimed by more than "
                         "one session, so it cannot be resumed and your message was NOT "
-                        "processed. Run `!unlink` to release them, then `!sessions` to " "reattach."
-                    ), settle=_SETTLE_NOTHING, observed=resolution,
+                        "processed. Run `!unlink` to release them, then `!sessions` to "
+                        "reattach."
+                    ),
+                    settle=_SETTLE_NOTHING,
+                    observed=resolution,
                 )
             if resolution.key is None:
                 if expected is None or expected.retired:
@@ -293,7 +380,7 @@ class DiscordSessionResume:
                     described=expected,
                     observed=resolution,
                 )
-            if (expected is not None and not expected.retired and expected.key == resolution.key):
+            if expected is not None and not expected.retired and expected.key == resolution.key:
                 return RoutingDecision(resumed_key=resolution.key)
 
             title = await self._title_of(resolution.key)
@@ -350,8 +437,8 @@ class DiscordSessionResume:
                 await self.sessions.aflush()
             except Exception:
                 logger.warning(
-                    "discord resume: detach durability failed at %s",
-                    channel_id, exc_info=True)
+                    "discord resume: detach durability failed at %s", channel_id, exc_info=True
+                )
                 return
         try:
             if decision.settle == _SETTLE_CLEAR:
@@ -367,7 +454,9 @@ class DiscordSessionResume:
             # Unsettled, so the same refusal is owed again.
             logger.warning(
                 "discord resume: could not settle the notice at channel %s; the "
-                "next message will be refused again", channel_id, exc_info=True,
+                "next message will be refused again",
+                channel_id,
+                exc_info=True,
             )
 
     def _display(self, expected: ResumeExpectation) -> str:
@@ -434,9 +523,9 @@ class DiscordSessionResume:
                 fallback_needles, fallback_phrase, fallback_floor = parse_search_query(
                     normalized_query
                 )
-                fallback_multi = [
-                    n.text for n in fallback_needles if n.required
-                ] != [fallback_phrase]
+                fallback_multi = [n.text for n in fallback_needles if n.required] != [
+                    fallback_phrase
+                ]
                 if not rows and fallback_multi:
                     # search_sessions matches multi-word queries needle-wise (all
                     # required needles must appear, in the title or the content),
@@ -538,7 +627,9 @@ class DiscordSessionResume:
             )
         else:
             if total_choices > _PICKER_LIMIT:
-                summary = f"Showing {_PICKER_LIMIT} of {total_choices} most recent dashboard sessions."
+                summary = (
+                    f"Showing {_PICKER_LIMIT} of {total_choices} most recent dashboard sessions."
+                )
             else:
                 summary = (
                     f"Showing {total_choices} most recent dashboard session"
@@ -667,7 +758,8 @@ class DiscordSessionResume:
             except ExpectationStoreError:
                 logger.warning(
                     "discord resume: the pick of %s did not take effect",
-                    choice.key, exc_info=True,
+                    choice.key,
+                    exc_info=True,
                 )
                 await client.edit_message(
                     interaction.channel_id,
@@ -800,11 +892,17 @@ class DiscordSessionResume:
             raw_content = str(message.get("content") or "")
             if role == "assistant":
                 raw_content = sanitize_channel_replay_text(raw_content)
-            content = _safe_discord_text(raw_content, _REPLAY_TEXT_LIMIT)
+            content = await _replay_preview(
+                raw_content, _REPLAY_TEXT_LIMIT, reserve=_REPLAY_RESERVE
+            )
             if role not in {"user", "assistant"} or not content:
                 continue
             icon = "🧑" if role == "user" else "🤖"
             try:
-                await client.send_message(channel_id, f"{icon} {content}")
+                # The icon gets its OWN line: on the body's first line it would
+                # sit in front of a fence opener, which must start the line, so a
+                # replayed code block would render as literal backticks however
+                # carefully the body was split.
+                await client.send_message(channel_id, f"{icon}\n{content}")
             except Exception:
                 logger.debug("discord resume: context replay failed", exc_info=True)
