@@ -942,6 +942,37 @@ async def api_models(request: web.Request) -> web.Response:
     blocked = await reject_if_kiro_unverified(request)
     if blocked is not None:
         return blocked
+
+    # ── Non-kiro backends: read models from the live ACP session ─────
+    # kiro-cli exposes a `--list-models` subcommand, but other backends
+    # (copilot, claude, kas) do not.  For those, the authoritative model
+    # list is the one the backend returned at session/new and captured in
+    # the provider's available_models().  Fall through to the kiro-cli
+    # spawn only when the backend IS kiro.
+    from kiro_crew.acp.types import ACP_BACKEND_KIRO  # noqa: F811
+
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig.load()
+        _backend = getattr(cfg.agent, "acp_backend", ACP_BACKEND_KIRO) or ACP_BACKEND_KIRO
+    except Exception:
+        _backend = ACP_BACKEND_KIRO
+
+    # Positive identity (harness-parity H5): only kiro-cli owns the
+    # `--list-models` spawn path below; every other backend reads the set its
+    # live session advertised at session/new.
+    if _backend == ACP_BACKEND_KIRO:
+        pass  # fall through to the kiro-cli spawn path below
+    else:
+        provider_models = _advertised_cc_models(request)
+        if provider_models:
+            return web.json_response(provider_models)
+        # No live session yet -- return 503 so the client retries.
+        return web.json_response(
+            {"error": "non-kiro backend has no live session yet"}, status=503
+        )
+
     kiro_bin: str | None = None
     try:
         from kiro_crew.acp.client import (  # noqa: F811

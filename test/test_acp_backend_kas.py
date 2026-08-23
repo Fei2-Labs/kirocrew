@@ -27,6 +27,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KNOWN,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
@@ -48,7 +49,19 @@ def _build_provider(backend: str) -> AcpProvider:
 
 
 class TestBackendPredicates:
-    """The three predicates are mutually exclusive and total over the known set."""
+    """The ``is_*_backend`` predicates name individual harnesses, and
+    ``is_acp_runtime_backend`` names AcpRuntime membership — a SEPARATE set.
+
+    The provider sites that used to read ``not is_claude_backend`` now read
+    ``is_acp_runtime_backend`` (harness-parity H5/H6). In the original
+    three-backend world (``{kiro, claude, kas}``) the two were accidentally
+    equivalent: kiro+kas were the AcpRuntime members and claude was not, so
+    "runtime" and "not claude" meant the same thing. That equivalence is NOT an
+    invariant — it is the coincidence H6 exists to break. A backend that is
+    neither claude NOR on the AcpRuntime (copilot, opencode: one process per
+    session, like claude) makes the two diverge, and that divergence is what
+    keeps the opt-in capability sets from silently capturing the new harness.
+    """
 
     def test_empty_backend_is_kiro(self):
         provider = _build_provider(ACP_BACKEND_KIRO)
@@ -72,22 +85,33 @@ class TestBackendPredicates:
         assert provider.is_acp_runtime_backend is False
 
     @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
-    def test_exactly_one_predicate_holds_for_every_known_backend(self, backend):
+    def test_exactly_one_named_predicate_holds_for_every_known_backend(self, backend):
+        # The per-harness identity predicates (kiro / claude / kas) partition the
+        # kiro-family identifiers. Backends added since (copilot, opencode) have
+        # NO predicate of their own yet — they are identified by the ``backend``
+        # string / membership sets, not by an ``is_<name>_backend`` property — so
+        # they correctly hold ZERO of these three, not one.
         provider = _build_provider(backend)
-        held = [
-            provider.is_kiro_backend,
-            provider.is_claude_backend,
-            provider.is_kas_backend,
-        ]
-        assert sum(held) == 1
+        held = sum(
+            [
+                provider.is_kiro_backend,
+                provider.is_claude_backend,
+                provider.is_kas_backend,
+            ]
+        )
+        assert held <= 1, f"{backend}: at most one named predicate may hold"
 
     @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
-    def test_acp_runtime_backend_is_the_positive_form_of_not_claude(self, backend):
-        # The four provider sites that used to read ``not is_claude_backend``
-        # now read ``is_acp_runtime_backend``; the two must stay equivalent for
-        # every known backend so the conversion is behavior-preserving.
+    def test_acp_runtime_membership_matches_the_capability_set(self, backend):
+        # H6: ``is_acp_runtime_backend`` reads ``ACP_BACKENDS_ACP_RUNTIME``, not
+        # ``not is_claude_backend``. The two diverge for a backend that is
+        # neither claude NOR on the shared runtime — and that divergence is the
+        # point: it keeps a one-process-per-session harness from inheriting the
+        # kiro-family spawn/overlay path. Asserting ``is (not is_claude_backend)``
+        # would re-couple the set to a negation and re-open the silent capture H6
+        # closed. Pin membership against the source of truth instead.
         provider = _build_provider(backend)
-        assert provider.is_acp_runtime_backend is (not provider.is_claude_backend)
+        assert provider.is_acp_runtime_backend is (backend in ACP_BACKENDS_ACP_RUNTIME)
 
 
 class TestUnknownBackendRejected:

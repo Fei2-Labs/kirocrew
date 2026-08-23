@@ -53,7 +53,9 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_COPILOT,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_MODEL_NAMESPACE,
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
     EVENT_AGENT_SWITCHED,
@@ -160,6 +162,18 @@ KIRO_CLI_SUBCMD = "acp"
 # github-copilot-sdk install dir the GitHub Copilot CLI installer/updater uses).
 COPILOT_BIN = "copilot"
 COPILOT_ACP_ARG = "--acp"
+
+# OpenCode's own ACP server mode, verified against a live process:
+# `opencode acp` answers `initialize` with protocolVersion 1 and a normal ACP
+# agentCapabilities payload (agentInfo.name == "OpenCode", loadSession=true).
+# This is the BYOK seam: OpenCode serves any OpenAI-compatible endpoint the
+# user configures in ~/.config/opencode/opencode.json, advertising each as a
+# `provider/model` id in session/new's standard `models` shape and honouring
+# `session/set_model`. A single self-contained binary (Homebrew, npm, or the
+# install script), so resolution is just "find the `opencode` executable"
+# (env override, then augmented PATH).
+OPENCODE_BIN = "opencode"
+OPENCODE_ACP_SUBCMD = "acp"
 
 CLAUDE_ACP_BIN = "claude-agent-acp"
 # On-disk name of the Claude backend CLI.  The claude-agent-acp adapter
@@ -349,6 +363,35 @@ def _resolve_copilot_bin() -> str | None:
         )
         if candidates:
             return str(candidates[0])
+
+    return None
+
+
+def _resolve_opencode_bin() -> str | None:
+    """Find the OpenCode executable for the ``opencode`` ACP backend.
+
+    Resolution order:
+      1. ``OPENCODE_ACP_BIN`` env var (explicit override).
+      2. Augmented PATH (covers Homebrew, `npm i -g opencode-ai`, the
+         install-script layout `~/.opencode/bin`, mise/asdf/nvm shims).
+    """
+    override = os.environ.get("OPENCODE_ACP_BIN")
+    if override and Path(override).is_file():
+        return override
+
+    search_path = augmented_path(os.environ.get("PATH", ""))
+    on_path = shutil.which(OPENCODE_BIN, path=search_path)
+    if on_path:
+        return on_path
+
+    # The opencode install script's default target, present even when the
+    # user's shell profile (which adds it to PATH) never ran — e.g. a
+    # non-login launchd/systemd gateway.
+    install_dir_bin = Path.home() / ".opencode" / "bin" / (
+        "opencode.exe" if platform_compat.IS_WINDOWS else "opencode"
+    )
+    if install_dir_bin.is_file():
+        return str(install_dir_bin)
 
     return None
 
@@ -2285,16 +2328,45 @@ class AcpClient:
         return self.backend == ACP_BACKEND_COPILOT
 
     @property
+    def _is_opencode(self) -> bool:
+        """True when this client drives OpenCode's ``opencode acp`` server.
+
+        OpenCode runs one process per session like claude-agent-acp (no shared
+        AcpRuntime demux), and answers ``initialize`` with the same numeric
+        ACP protocol version — so it shares the generic-external-agent
+        branches (protocol version, session/new & session/load meta shape)
+        rather than kiro-cli's ``--agent``/session-file-specific ones. It is
+        its own backend, not folded into ``_is_claude`` or ``_is_copilot``,
+        because their backend-only behaviors must stay theirs (harness-parity
+        H5: identity is positive, capability is membership).
+        """
+        return self.backend == ACP_BACKEND_OPENCODE
+
+    @property
     def _is_kiro(self) -> bool:
         """True when this client drives kiro-cli (the AcpClient default).
 
-        AcpClient serves kiro-cli plus two external-agent seams (the dormant
-        claude one and the copilot one) — so this is the positive spelling of
-        the sites that used to read ``not self._is_claude`` (harness-parity
-        H5). KAS runs on AcpRuntime, not AcpClient, so it never reaches this
-        property.
+        AcpClient serves kiro-cli plus three external-agent seams (the dormant
+        claude one, the copilot one, and the opencode one) — so this is the
+        positive spelling of the sites that used to read ``not
+        self._is_claude`` (harness-parity H5). KAS runs on AcpRuntime, not
+        AcpClient, so it never reaches this property.
         """
         return self.backend == ACP_BACKEND_KIRO
+
+    @property
+    def _model_namespace_preflight(self) -> bool:
+        """True when ``model_is_unusable`` is meaningful for this backend.
+
+        Membership in ``ACP_BACKENDS_MODEL_NAMESPACE`` (harness-parity H12):
+        the backend's advertised ``availableModels[].modelId`` ids are exactly
+        the ids its own ``session/set_model`` accepts, so an id absent from
+        the list is genuinely unusable and withholding it beats a wire error.
+        The claude seam is excluded — it advertises bare ids while the
+        configured model is the prefixed provider id, so a membership test
+        across those namespaces would call every legitimate model unusable.
+        """
+        return self.backend in ACP_BACKENDS_MODEL_NAMESPACE
 
     def _pooled_mcp_servers(self) -> list[dict[str, Any]]:
         """Broker-stub ``mcpServers`` entries for this session's ``session/new``.
@@ -2410,7 +2482,7 @@ class AcpClient:
         # instead of calling into here — otherwise the same stale setting that is
         # quietly withheld on a cold start would raise and kill a warm claim,
         # making the outcome depend on whether a pooled process happened to exist.
-        if self._is_kiro and self._model_is_unusable(model_id):
+        if self._model_namespace_preflight and self._model_is_unusable(model_id):
             _rejected_log, _ = redact_exfiltration_urls(str(model_id))
             _rejected_log, _ = redact_credentials(_rejected_log)
             raise AcpModelUnavailable(_rejected_log, self._advertised_model_ids())
@@ -2525,7 +2597,7 @@ class AcpClient:
         if not self._model or self._model == DEFAULT_MODEL:
             logger.info("ACP model: %s (from agent config)", self._model or "auto")
             return
-        if self._is_kiro and self._model_is_unusable(self._model):
+        if self._model_namespace_preflight and self._model_is_unusable(self._model):
             _withheld_log, _ = redact_exfiltration_urls(str(self._model))
             _withheld_log, _ = redact_credentials(_withheld_log)
             logger.warning(
@@ -2693,9 +2765,10 @@ class AcpClient:
     async def _spawn(self) -> None:
         """Start the ACP backend subprocess with stdio pipes.
 
-        KiroCrew's public core drives kiro-cli by default and GitHub Copilot
-        CLI when ``agent.acp_backend`` selects it (see ``ACP_BACKEND_COPILOT``
-        — a real, always-available seam, unlike the dormant claude one below).
+        Kiro Crew's public core drives kiro-cli by default, and GitHub Copilot
+        CLI or OpenCode when ``agent.acp_backend`` selects one (see
+        ``ACP_BACKEND_COPILOT`` / ``ACP_BACKEND_OPENCODE`` — real,
+        always-available seams, unlike the dormant claude one below).
         The claude-agent-acp branch is the dormant protocol seam (see
         ``ACP_BACKEND_CLAUDE``): the public provider factory never selects it,
         so it is unreachable here, but an internal companion that re-registers
@@ -2746,6 +2819,16 @@ class AcpClient:
                     f"is on PATH, or set COPILOT_ACP_BIN to its executable path."
                 )
             argv = [copilot_bin, COPILOT_ACP_ARG]
+        elif self._is_opencode:
+            opencode_bin = await asyncio.to_thread(_resolve_opencode_bin)
+            if not opencode_bin:
+                raise AcpError(
+                    f"{OPENCODE_BIN} not found. Install OpenCode "
+                    f"(https://opencode.ai — `brew install opencode` or "
+                    f"`npm i -g opencode-ai`) and make sure it is on PATH, "
+                    f"or set OPENCODE_ACP_BIN to its executable path."
+                )
+            argv = [opencode_bin, OPENCODE_ACP_SUBCMD]
         else:
             try:
                 kiro_bin = await _resolve_kiro_bin_for_spawn()
@@ -2762,7 +2845,6 @@ class AcpClient:
             except Exception:
                 logger.warning("pre-spawn agent materialization failed", exc_info=True)
             argv = [kiro_bin, KIRO_CLI_SUBCMD, "--agent", self._agent]
-
 
         # OS-level sandbox: wrap the command to hide sensitive paths.
         # strip_python_env keeps the host PYTHONPATH/PYTHONHOME out of kiro-cli's
@@ -2889,6 +2971,8 @@ class AcpClient:
             if self._is_claude
             else f"{COPILOT_BIN} {COPILOT_ACP_ARG}"
             if self._is_copilot
+            else f"{OPENCODE_BIN} {OPENCODE_ACP_SUBCMD}"
+            if self._is_opencode
             else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
         )
         # Windows resource ceiling, applied while the child is still SUSPENDED,
@@ -2976,7 +3060,13 @@ class AcpClient:
             redacted, _ = redact_exfiltration_urls(text)
             redacted, _ = redact_credentials(redacted)
             _bin_label = (
-                "claude-acp" if self._is_claude else COPILOT_BIN if self._is_copilot else KIRO_CLI_BIN
+                "claude-acp"
+                if self._is_claude
+                else COPILOT_BIN
+                if self._is_copilot
+                else OPENCODE_BIN
+                if self._is_opencode
+                else KIRO_CLI_BIN
             )
             logger.warning("%s stderr: %s", _bin_label, redacted)
         if suppressed:
@@ -3298,7 +3388,9 @@ class AcpClient:
         """Handshake: initialize → session/load or session/new → set_mode → set_model."""
         # 1. Initialize
         protocol_version: int | str = (
-            PROTOCOL_VERSION_CLAUDE if (self._is_claude or self._is_copilot) else PROTOCOL_VERSION
+            PROTOCOL_VERSION_CLAUDE
+            if (self._is_claude or self._is_copilot or self._is_opencode)
+            else PROTOCOL_VERSION
         )
         init_id = await self._send_request(
             METHOD_INITIALIZE,
@@ -3328,11 +3420,12 @@ class AcpClient:
             # ~38% on turn 1. kiro-cli stores transcripts at ~/.kiro/sessions/
             # cli/<sid>.json; a missing transcript falls back to session/new
             # (a genuinely fresh start).
-            if self._is_claude or self._is_copilot:
-                # Neither seam takes a kiro-cli-style transcript file path:
-                # claude's SDK resolves its own transcript, and Copilot's
-                # `session/load` (it advertised loadSession=true) is keyed by
-                # sessionId alone. The public core simply attempts the load.
+            if self._is_claude or self._is_copilot or self._is_opencode:
+                # None of these seams takes a kiro-cli-style transcript file
+                # path: claude's SDK resolves its own transcript, and Copilot's
+                # and OpenCode's `session/load` (both advertise
+                # loadSession=true) are keyed by sessionId alone. The public
+                # core simply attempts the load.
                 session_file = ""
                 file_ok = True
             else:
@@ -3360,8 +3453,8 @@ class AcpClient:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}
                     elif self._is_kiro:
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
-                    # copilot: no `_meta` — plain ACP session/load, nothing
-                    # backend-specific to attach.
+                    # copilot / opencode: no `_meta` — plain ACP session/load,
+                    # nothing backend-specific to attach.
                     load_id = await self._send_request(METHOD_SESSION_LOAD, load_params)
                     load_resp = await self._wait_for_response(load_id, timeout=_INIT_TIMEOUT)
                     if "modes" in load_resp:

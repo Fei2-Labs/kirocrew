@@ -123,6 +123,18 @@ ACP_BACKEND_KAS = "kas"
 # ACP_BACKENDS_SESSION_SHARING / ACP_BACKENDS_INTERNAL_SANDBOX below — those stay
 # opt-in memberships earned with evidence, not inherited from "not claude".
 ACP_BACKEND_COPILOT = "copilot"
+# OpenCode, driven via its own `opencode acp` subcommand (verified against a
+# live `opencode acp` process, v1.14.18: it answers `initialize` with
+# protocolVersion 1 and loadSession=true, and its session/new returns the
+# standard `models` shape `{currentModelId, availableModels:[{modelId,name}]}`
+# plus a `configOptions` model select; `session/set_model` is implemented).
+# OpenCode is the BYOK seam: any OpenAI-compatible endpoint configured in
+# ~/.config/opencode/opencode.json surfaces here as `provider/model` ids.
+# Like copilot it runs one process per session, so it is deliberately NOT in
+# ACP_BACKENDS_ACP_RUNTIME / ACP_BACKENDS_SESSION_SHARING /
+# ACP_BACKENDS_INTERNAL_SANDBOX — those stay opt-in memberships earned with
+# evidence, not inherited from "not claude".
+ACP_BACKEND_OPENCODE = "opencode"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -135,16 +147,20 @@ ACP_BACKENDS_KNOWN = frozenset(
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_KAS,
         ACP_BACKEND_COPILOT,
+        ACP_BACKEND_OPENCODE,
     }
 )
 # What an operator may actually persist in ``agent.acp_backend``, which is a
 # narrower question than what the code understands: ``ACP_BACKEND_CLAUDE`` is a
 # dormant seam reached by its own provider, not something to select here. Config
 # resolution degrades an unselectable value to the default, so a typo costs a log
-# line rather than a gateway that will not start. ``ACP_BACKEND_COPILOT`` IS
-# selectable here — unlike claude, it is not a dormant/companion-only seam: the
-# public core resolves and spawns `copilot --acp` directly (see acp.client._spawn).
-ACP_BACKENDS_SELECTABLE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_COPILOT})
+# line rather than a gateway that will not start. ``ACP_BACKEND_COPILOT`` and
+# ``ACP_BACKEND_OPENCODE`` ARE selectable here — unlike claude, they are not
+# dormant/companion-only seams: the public core resolves and spawns
+# `copilot --acp` / `opencode acp` directly (see acp.client._spawn).
+ACP_BACKENDS_SELECTABLE = frozenset(
+    {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_COPILOT, ACP_BACKEND_OPENCODE}
+)
 
 # ── Capability membership (harness-parity H6, H7) ──
 # Every capability a backend may claim is an OPT-IN set here, never a negation at
@@ -190,6 +206,24 @@ ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
 # yet is excluded from sharing until keep-aware teardown lands).
 ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
+# Backends whose advertised ``availableModels[].modelId`` ids share a namespace
+# with the ids their own ``session/set_model`` accepts — so an id absent from
+# the advertised list is genuinely unusable and the entitlement pre-flight
+# (``model_is_unusable``) is meaningful. kiro-cli, KAS, copilot, and opencode
+# all satisfy this; the claude seam does NOT (it advertises BARE ids like
+# ``claude-opus-4-8[1m]`` while the configured model is the prefixed provider id
+# ``global.anthropic.claude-opus-4-8[1m]``, so a membership test across those
+# two namespaces would call every legitimate model unusable — harness-parity
+# H12). Opt-in like every other capability set: a new harness starts out.
+ACP_BACKENDS_MODEL_NAMESPACE = frozenset(
+    {
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_COPILOT,
+        ACP_BACKEND_OPENCODE,
+    }
+)
+
 # ── Provider labels ──
 # The backend identity key persisted in the session map. It indexes three
 # things, so every producer must agree on it: resume compatibility
@@ -202,6 +236,7 @@ PROVIDER_LABEL_DEFAULT = "acp"
 PROVIDER_LABEL_CLAUDE = "claude_code"
 PROVIDER_LABEL_KAS = "kas"
 PROVIDER_LABEL_COPILOT = "copilot"
+PROVIDER_LABEL_OPENCODE = "opencode"
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
 # level of clientCapabilities; every other capability it honours lives under

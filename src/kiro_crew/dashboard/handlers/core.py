@@ -1595,8 +1595,10 @@ _MOVED_CONFIG_FIELDS: dict[str, str] = {
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
     # Which ACP agent binary actually drives sessions: "" (kiro-cli, the
-    # default), "copilot" (GitHub Copilot CLI's own `--acp` server mode), or
-    # "kas" (kiro-agent). Editable here because switching it is a config-only
+    # default), "copilot" (GitHub Copilot CLI's own `--acp` server mode),
+    # "opencode" (OpenCode's `acp` server mode — the BYOK seam for
+    # OpenAI-compatible endpoints), or "kas" (kiro-agent). Editable here
+    # because switching it is a config-only
     # change with no destructive side effect — the next spawned session simply
     # launches a different binary (see acp.client._spawn / acp.types
     # ACP_BACKENDS_SELECTABLE, the single source of truth for this set).
