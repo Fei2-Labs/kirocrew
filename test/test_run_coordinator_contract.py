@@ -459,7 +459,95 @@ async def test_exact_execution_command_claim_and_finish_are_idempotent(
 
 
 @pytest.mark.asyncio
-async def test_execution_rejection_retains_fence_for_terminal_outbox_commit(
+async def test_execution_finish_can_fill_result_after_starting_wins_race(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    await coordinator.submit(_request())
+    claim = await coordinator.claim_command(
+        "command-1",
+        OwnerLease("admission", clock.value + 10),
+    )
+    assert claim is not None
+    assert claim.fence is not None
+    assert claim.run is not None
+
+    started = await coordinator.mark_starting(
+        claim.command,
+        claim.fence,
+        claim.run.version,
+    )
+    filled = await coordinator.finish_command(
+        claim.command_fence,
+        CommandStatus.APPLIED,
+        result_json='{"id":"run-1","queued":false}',
+    )
+    queried = await coordinator.get_command_by_key("key-1")
+
+    assert started.decision is CoordinatorDecision.APPLIED
+    assert filled.decision is CoordinatorDecision.APPLIED
+    assert filled.value is not None
+    assert filled.value.result_json == '{"id":"run-1","queued":false}'
+    assert queried is not None
+    assert queried.command == filled.value
+
+
+@pytest.mark.asyncio
+async def test_execution_finish_cannot_fill_result_after_recovery_supersedes_lease(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    await coordinator.submit(_request())
+    claim = await coordinator.claim_command(
+        "command-1",
+        OwnerLease("admission", clock.value + 10),
+    )
+    assert claim is not None
+    assert claim.fence is not None
+    assert claim.run is not None
+    started = await coordinator.mark_starting(
+        claim.command,
+        claim.fence,
+        claim.run.version,
+    )
+    assert started.value is not None
+    clock.value += 11
+    recovery = await coordinator.claim_recovery(
+        OwnerLease("recovery", clock.value + 10),
+        1,
+    )
+    assert len(recovery) == 1
+    completed = await coordinator.complete(
+        RunCompletion(
+            run_id="run-1",
+            outcome=RunOutcome.INTERRUPTED,
+            result_path="",
+            error="interrupted by recovery",
+            event_type="subagent_completion",
+            destination="dashboard:parent",
+            payload_json='{"error":"interrupted by recovery"}',
+            terminal_at=clock.value,
+        ),
+        recovery[0].fence,
+        recovery[0].run.version,
+    )
+    assert completed.decision is CoordinatorDecision.APPLIED
+
+    stale_fill = await coordinator.finish_command(
+        claim.command_fence,
+        CommandStatus.APPLIED,
+        result_json='{"id":"run-1","queued":false}',
+    )
+
+    assert stale_fill.decision is CoordinatorDecision.REJECTED
+    assert stale_fill.reason is CoordinatorReason.STALE_FENCE
+    queried = await coordinator.get_command_by_key("key-1")
+    assert queried is not None
+    assert queried.command.result_json == ""
+
+
+@pytest.mark.asyncio
+async def test_command_rejection_does_not_bypass_terminal_outbox_transition(
     coordinator: RunCoordinator,
     clock: FakeClock,
 ) -> None:
@@ -482,6 +570,7 @@ async def test_execution_rejection_retains_fence_for_terminal_outbox_commit(
     assert run.observed_state is ObservedState.ACCEPTED
     assert run.outcome is None
     assert run.error == ""
+    assert await coordinator.claim_outbox(OwnerLease("delivery", clock.value + 10), 1) == []
     assert await coordinator.claim_commands(OwnerLease("executor", clock.value + 10), limit=1) == []
 
 
@@ -817,6 +906,41 @@ async def test_completion_is_first_writer_wins_and_creates_one_event(
     assert replay.value == completed.value
     assert conflict.decision is CoordinatorDecision.REJECTED
     assert conflict.reason is CoordinatorReason.OUTCOME_CONFLICT
+
+
+@pytest.mark.asyncio
+async def test_synchronous_completion_commits_an_already_delivered_event(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    claim, running = await _claimed_running(coordinator, clock)
+    completed = await coordinator.complete(
+        RunCompletion(
+            run_id="run-1",
+            outcome=RunOutcome.FAILED,
+            result_path="",
+            error="rejected synchronously",
+            event_type="subagent_completion",
+            destination="dashboard:parent",
+            payload_json='{"error":"rejected synchronously"}',
+            terminal_at=clock.value,
+            delivery_state=DeliveryState.DELIVERED,
+        ),
+        claim.fence,
+        expected_version=running.version,
+    )
+
+    assert completed.decision is CoordinatorDecision.APPLIED
+    assert completed.value is not None
+    assert completed.value.status is DeliveryState.DELIVERED
+    assert completed.value.delivered_at == clock.value
+    assert (
+        await coordinator.claim_outbox(
+            OwnerLease("delivery", clock.value + 10),
+            1,
+        )
+        == []
+    )
 
 
 @pytest.mark.asyncio
@@ -1184,3 +1308,49 @@ async def test_legacy_import_retains_result_evidence_without_terminalizing_exist
     assert imported.value.run.error == ""
     assert imported.value.run.result_path == "/tmp/shadow-run/result.txt"
     assert imported.value.event is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_legacy_import_cannot_override_claimed_authoritative_run(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    submitted = await coordinator.submit(_request(run_id="live-authoritative"))
+    assert submitted.value is not None
+    claim = await coordinator.claim_command(
+        submitted.value.command.command_id,
+        OwnerLease("executor", clock.value + 90.0),
+    )
+    assert claim is not None and claim.run is not None
+
+    imported = await coordinator.import_legacy(
+        LegacyRunImport(
+            run_id="live-authoritative",
+            parent_session="dashboard:parent",
+            agent="kirocrew",
+            task="old work",
+            conversation_key="",
+            observed_state=ObservedState.TERMINAL,
+            outcome=RunOutcome.INTERRUPTED,
+            result_path="/tmp/result.txt",
+            error="stale tombstone",
+            created_at=10.0,
+            updated_at=20.0,
+            terminal_at=20.0,
+            source_version="legacy-state-v1",
+            event_type="subagent_completion",
+            destination="dashboard:parent",
+            payload_json='{"id":"live-authoritative"}',
+            delivery_state=DeliveryState.PENDING,
+        )
+    )
+
+    run = await coordinator.get_run("live-authoritative")
+    assert imported.decision is CoordinatorDecision.APPLIED
+    assert run is not None
+    assert run.observed_state is ObservedState.ACCEPTED
+    assert run.outcome is None
+    assert run.error == ""
+    assert run.owner_id == claim.run.owner_id
+    assert run.lease_epoch == claim.run.lease_epoch
+    assert run.version == claim.run.version

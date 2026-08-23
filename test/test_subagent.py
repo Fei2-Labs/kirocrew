@@ -381,6 +381,61 @@ class TestSpawnWithApprovalCallback:
         assert info.result == ""
         on_done_callback.assert_awaited_once_with(info)
 
+    def test_pre_task_policy_failure_rolls_back_registration_and_capacity(self) -> None:
+        def policy_failure() -> bool:
+            raise RuntimeError("policy unavailable")
+
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+            is_yolo=policy_failure,
+        )
+
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            with pytest.raises(RuntimeError, match="policy unavailable"):
+                manager.spawn("fails before task ownership", _preassigned_id="pre-task-failure")
+
+            assert manager.get("pre-task-failure") is None
+            assert "pre-task-failure" not in manager._tasks
+            assert manager.running_count == 0
+
+            manager._is_yolo = lambda: False
+            next_info = manager.spawn("capacity remains usable")
+
+        assert next_info is not None
+        assert next_info.queued is False
+        assert manager.running_count == 0
+
+    @pytest.mark.asyncio
+    async def test_keyed_pre_task_policy_failure_is_durably_rejected(self) -> None:
+        def policy_failure() -> bool:
+            raise RuntimeError("policy unavailable")
+
+        coordinator = MemoryRunCoordinator()
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+            is_yolo=policy_failure,
+            coordinator=coordinator,
+        )
+        identity = CommandIdentity(
+            run_id="keyed-pre-task-failure",
+            command_id="command-keyed-pre-task-failure",
+            idempotency_key="key-keyed-pre-task-failure",
+        )
+
+        result = await manager.command_authority.spawn(identity, "fails before task ownership")
+
+        assert result.done is True
+        assert result.error == "policy unavailable"
+        assert manager.get(identity.run_id) is None
+        assert manager.running_count == 0
+        receipt = await coordinator.get_command_by_key(identity.idempotency_key)
+        assert receipt is not None
+        assert receipt.command.status is CommandStatus.APPLIED
+
     @pytest.mark.asyncio
     async def test_keyed_approval_rejection_finishes_durable_command(self) -> None:
         coordinator = MemoryRunCoordinator()

@@ -2917,12 +2917,15 @@ class SubagentManager:
                     settle_digest=True,
                     teardown_done=None,
                 )
+            else:
+                self._outbox_live_run_batches.pop(event.run_id, None)
             self._outbox_contexts[event.event_id] = context
         info = context.info
         info._delivery_event_id = event.event_id
         # A deferred destination already accepted this stable event into its
-        # own queue or digest. Background retries keep its durable identity
-        # pending for acknowledgement without repeating routing or accounting.
+        # own queue or digest. Exact claims remain available to the eventual
+        # consumer for acknowledgement, but a background drain must not replay
+        # lifecycle callbacks or count the same wave member twice.
         if info._digest_held or info._delivery_queued:
             return False
         info._delivery_failed = False
@@ -4162,6 +4165,9 @@ class SubagentManager:
             except RuntimeError:
                 pass  # no running loop (sync/test context)
 
+        # These callbacks can fail before any task owns the registered record.
+        # Roll that provisional registration back so it cannot retain a slot or
+        # make the command authority mistake a phantom record for accepted work.
         try:
             parent_trusted = (
                 parent_session_key
@@ -4319,11 +4325,26 @@ class SubagentManager:
                 pass  # no running loop (sync/test context)
         return info
 
-    async def announce_durable_rejection(self, info: SubagentInfo) -> None:
-        """Announce a keyed batch rejection after command settlement succeeds."""
+    def prepare_coordinator_rejection(
+        self,
+        run_id: str,
+        *,
+        batch_id: str = "",
+        batch_total: int = 0,
+    ) -> None:
+        """Prepare live delivery before a rejection event becomes claimable."""
 
-        if info.batch_id and self._on_done:
-            await self._safe_announce(info)
+        for task_key in (f"reject-{run_id}", run_id):
+            report_task = self._tasks.pop(task_key, None)
+            if report_task is not None:
+                report_task.cancel()
+        if batch_id:
+            self._outbox_live_run_batches[run_id] = (batch_id, batch_total)
+
+    async def deliver_coordinator_event(self, event_id: str) -> None:
+        """Route one already-durable completion through the fenced outbox."""
+
+        await self._outbox_delivery.drain_once(event_id=event_id)
 
     def _should_stagger_queue(self, now: float) -> tuple[bool, bool]:
         """Decide whether a spawn arriving at *now* must be queued.
@@ -5137,6 +5158,10 @@ class SubagentManager:
             and params.get("_coordinator_fence") is not None
         )
         if coordinator_rejection and drained is not None:
+            # The synchronous caller that received the original queued record
+            # no longer exists.  Bind the drained rejection back to its durable
+            # fence and report it through the coordinator instead of leaving an
+            # authority heartbeat renewing work that can never start.
             report_task = self._tasks.pop(f"reject-{drained.id}", None)
             if report_task is not None:
                 report_task.cancel()
