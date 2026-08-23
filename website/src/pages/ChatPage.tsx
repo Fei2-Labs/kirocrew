@@ -3770,6 +3770,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // is still creating + slack-linking its session; otherwise we'd switch to
     // a different slot and orphan the linked one (breaking Slack mirroring).
     if (tokenConsumingRef.current) return
+    // Don't auto-select while a createSlot thunk is in flight: a stale
+    // localStorage value (or first-slot fallback) could switchSlot onto an
+    // OLDER session before the thunk's activation runs. Hold off until it
+    // resolves.
+    if (creatingSlot) return
     if (searchParams.get('slot') || searchParams.get('sid') || initialSidRef.current) return
     if (filteredSlots.length > 0) {
       const saved = localStorage.getItem(slotStorageKey)
@@ -3780,7 +3785,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       autoCreatedRef.current = true
       dispatch(createSlot({ agent: defaultAgent || undefined, mode }))
     }
-  }, [activeSlot, filteredSlots, searchParams, dispatch, slotStorageKey, connected, slotsLoaded, defaultAgent, mode])
+  }, [activeSlot, filteredSlots, searchParams, dispatch, slotStorageKey, connected, slotsLoaded, defaultAgent, mode, creatingSlot])
 
   // Slot switch: the virtualizer (keyed on sessionId = activeSlot) force-pins
   // to the true bottom itself in a layout effect. Here we just re-arm the
