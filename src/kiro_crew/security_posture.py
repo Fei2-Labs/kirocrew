@@ -1057,6 +1057,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # goes out to a human.
         "context.py",
         "agent.py",
+        # Same inbound shape: the pipeline bridge ingests an EXTERNAL automation's
+        # event log -- arbitrary text written by whatever owns that log -- and
+        # scrubs each line before storing it as a crew ledger entry. The egress
+        # boundary for that text is the crew route that later serves the ledger,
+        # not this module; redacting here is ingestion hygiene so a credential in
+        # a foreign log never reaches the store in the first place. Counting it as
+        # an egress path would inflate "output paths covered" with an inbound one.
+        "apps/builtins/issue_radar/backend/pipeline_bridge.py",
         # Gate-side log hygiene: the update provider redacts an update command's
         # stderr before writing it to the gateway log. It is a boot-time
         # operational log line, not an output boundary bound for a human or a
