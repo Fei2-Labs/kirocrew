@@ -852,6 +852,114 @@ async def stop_target(
     return {"ok": True, "target": slot.key, **result}
 
 
+#: Cap on one delivered message. Matches MAX_LONG_STRING in ``validation.py``
+#: (task specs, inline content) — a seed prompt is that shape, and the schema
+#: layer enforces the same number, so the two reject in the same place.
+MAX_SEND_MESSAGE_CHARS = 50_000
+
+#: Provenance prefix on every delivered message. The target's transcript renders
+#: the message as a user row, and without this line it is indistinguishable from
+#: something the person typed — the same reason auto-nudge tags its injected
+#: turns ``[auto-nudge cycle N]``. The model in the target session sees it too,
+#: so it can weigh the instruction as coming from a peer session, not its user.
+_SEND_PROVENANCE = "[sent by session {caller} via session_send]\n\n"
+
+
+async def send_to_target(
+    state: "DashboardState",
+    *,
+    caller_session_key: str,
+    target: str,
+    message: str,
+) -> dict[str, Any]:
+    """Deliver *message* to *target* as its next agent turn.
+
+    The delivery path is the same queue-vs-run decision the dashboard composer
+    uses (``enqueue_or_run_prompt``): an idle target starts a turn immediately,
+    a busy one queues the message for its next turn. Both outcomes are reported
+    distinctly — ``started`` says which happened — because "it ran" and "it will
+    run later" must not look the same to a caller coordinating several sessions.
+
+    The turn itself is charged against the app-owned background-turn cap via
+    ``run_background_turn``, exactly as Issue Radar's crew dispatch is: a caller
+    that fans a message out to N targets at once must not put more simultaneous
+    turns on the runtime than the cap allows.
+    """
+    # Same prewarm ordering as `stop_target`, for the same reasons: the SEL
+    # write inside `authorize_target`'s deny path must be a cache hit, and the
+    # config warm must be the LAST suspension before the synchronous gate.
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:  # noqa: BLE001 - a prewarm failure must not fail the send
+        logger.warning("session-control SEL prewarm failed", exc_info=True)
+    await prewarm_enabled_check()
+
+    body = message.strip()
+    if not body:
+        raise SessionControlError("message is empty", code="message_empty", status=400)
+    if len(body) > MAX_SEND_MESSAGE_CHARS:
+        raise SessionControlError(
+            f"message exceeds {MAX_SEND_MESSAGE_CHARS} characters",
+            code="message_too_long",
+            status=400,
+        )
+
+    slot = authorize_target(
+        state,
+        caller_session_key=caller_session_key,
+        target=target,
+        operation="send",
+    )
+
+    # Deferred for the same import cycle `stop_target` documents.
+    from kiro_crew.dashboard.chat_runner import _run_chat
+
+    caller_key = caller_slot_key(state, caller_session_key)
+    # Sanitized on the same grounds as the steer path (``chat_delivery`` sanitizes
+    # before ``slot.append``): this body comes from ANOTHER session and is persisted
+    # into — and broadcast from — the target's transcript, so raw content must never
+    # reach that surface. The length gate above deliberately measures the RAW body:
+    # redaction can only shrink the text, so validating the raw form is the honest
+    # limit and keeps the error keyed to what the caller actually sent.
+    prompt = _SEND_PROVENANCE.format(caller=caller_key or "unknown") + sanitize_outbound(body)
+
+    async def _capped_run(st: "DashboardState", sl: Any, p: str) -> None:
+        # Queued at the cap rather than rejected; the only failure it reports is
+        # a turn that never got a permit at all. Surfaced in the target's own
+        # transcript because by then this request has long since returned.
+        try:
+            await st.run_background_turn(sl, _run_chat(st, sl, p))
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning(
+                "session_send: turn on %s never got a background-turn permit",
+                getattr(sl, "key", "?"),
+            )
+            try:
+                sl.append(
+                    "error",
+                    "A message sent by another session could not start a turn "
+                    "(background-turn capacity). It stays queued in the transcript above.",
+                    "msg msg-err",
+                )
+            except Exception:  # pragma: no cover - the card is never load-bearing
+                logger.debug("session_send: could not render the no-permit card", exc_info=True)
+
+    started = bool(slot.enqueue_or_run_prompt(prompt, _capped_run, state))
+    try:
+        state.push_slots_update()
+    except Exception:  # pragma: no cover - sidebar refresh is best-effort
+        logger.debug("session_send: push_slots_update failed", exc_info=True)
+
+    _audit(
+        caller_session_key=caller_session_key,
+        operation="send",
+        slot_key=slot.key,
+        outcome="allowed",
+        detail={"started": started, "chars": len(body)},
+    )
+    return {"ok": True, "target": slot.key, "started": started}
+
+
 def read_messages(
     state: "DashboardState",
     *,
