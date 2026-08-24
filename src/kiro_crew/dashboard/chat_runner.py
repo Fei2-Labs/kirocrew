@@ -2016,7 +2016,7 @@ def _auto_approve_reason(slot: Any, yolo_active: bool) -> str:
     return "trust"
 
 
-def _persistable_session_policy(slot: Any, yolo_active: bool) -> str:
+def _persistable_session_policy(slot: Any, auto_approve_active: bool) -> str:
     """The session-level approval policy to STORE for this slot: ``"auto"`` or ``""``.
 
     Deliberately NOT :func:`_slot_is_trusted`, and that difference is the whole
@@ -2029,7 +2029,8 @@ def _persistable_session_policy(slot: Any, yolo_active: bool) -> str:
 
     * ``slot._trust`` — a human clicked "trust this session". It does not expire,
       and the click is its own audit record, so caching it changes nothing.
-    * yolo — process-wide, and revoking it deactivates the override for everyone.
+    * configured auto approval / yolo — process-wide, and revoking either setting
+      deactivates the override for everyone.
 
     A ``SafetyOverride`` SCOPED grant (``slot._trust_scope``) must NOT reach here.
     Its entire value is being re-checked on every approval, so a cached ``"auto"``
@@ -2042,7 +2043,7 @@ def _persistable_session_policy(slot: Any, yolo_active: bool) -> str:
     consult this value. They go through :func:`_slot_is_trusted` per event, which
     re-checks the scope each time.
     """
-    if yolo_active or getattr(slot, "_trust", False):
+    if auto_approve_active or getattr(slot, "_trust", False):
         return "auto"
     return ""
 
@@ -5119,6 +5120,7 @@ async def _run_chat(
         # guards (`is_claude_backend`, the advertised list) rather than trusting a
         # provider name that could not be read.
         provider_name = ""
+        configured_auto_approve = False
         # Canonical crew identity for watchdog overrides — same seeding rule
         # as the eager-spawn path (the two must agree): slot value until the
         # resolver supplies its alias, which covers the default crew on an
@@ -5131,6 +5133,7 @@ async def _run_chat(
         try:
             cfg = KiroCrewConfig.load()
             provider_name = cfg.agent.provider
+            configured_auto_approve = cfg.agent.approval_mode == "auto"
             # Warm the project agent index OFF the loop, then resolve inline. Only
             # the warm is offloaded: resolve_agent_bindings can raise StopIteration
             # on a malformed config, and StopIteration cannot be delivered through a
@@ -5349,12 +5352,16 @@ async def _run_chat(
                 },
             )
 
-        # Propagate trust/YOLO to session so subagents inherit auto-approve.
+        # Propagate durable trust/config-auto/YOLO policy to the session so
+        # subagents inherit the same auto-approve behavior.
         # A scoped grant is excluded on purpose — see _persistable_session_policy.
         # Assigned unconditionally (not only when granting) so a turn that starts
         # after a grant went away clears any policy an earlier turn stored.
         state.sessions.set_approval_policy(
-            session_key, _persistable_session_policy(slot, state.is_yolo_active())
+            session_key,
+            _persistable_session_policy(
+                slot, state.is_yolo_active() or configured_auto_approve
+            ),
         )
 
         # Drain MCP OAuth requests captured during session init. kiro-cli
@@ -6922,6 +6929,7 @@ async def _run_chat(
                 # Detect bash tools by tool_input content (title is human-readable)
                 cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                 yolo_active = state.is_yolo_active()
+                auto_approve_active = configured_auto_approve or yolo_active
                 # Evaluated ONCE for both branches below. Two separate calls could
                 # straddle a scoped grant's expiry and disagree with each other, and
                 # a scope check is not a pure read — it retires a lapsed grant and
@@ -6971,13 +6979,14 @@ async def _run_chat(
                             metadata={"reason": "trust_reads"},
                         )
                         continue
-                # Trust mode (per-slot) or YOLO mode (global) — auto-approve.
+                # Trust mode (per-slot), configured auto approval, or YOLO mode
+                # (global) — auto-approve.
                 # Low-fidelity child events (backend subagents whose command
                 # bytes never reached the caches) are excluded from every
                 # auto-approve path and fall through to the interactive card;
                 # children WITH cached bytes take these branches exactly like
                 # the main agent (mode parity).
-                if (slot_trusted or yolo_active) and not _child_low_fidelity:
+                if (slot_trusted or auto_approve_active) and not _child_low_fidelity:
                     try:
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
@@ -7045,7 +7054,11 @@ async def _run_chat(
                         request_id=event.request_id,
                         # Provenance, so an auditor can separate a human's session
                         # trust from an unattended worker's expiring scoped grant.
-                        metadata={"reason": _auto_approve_reason(slot, yolo_active)},
+                        metadata={
+                            "reason": _auto_approve_reason(slot, yolo_active)
+                            if not auto_approve_active or yolo_active
+                            else "approval_mode_auto",
+                        },
                     )
                     continue
                 # Auto-reject remaining tools after one rejection in a batch

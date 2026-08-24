@@ -1737,6 +1737,19 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     name = body.get("name")
     agent = body.get("agent", "")
     model = body.get("model", "")
+    project_supplied = "project" in body
+    requested_project = body.get("project", "")
+    if requested_project is None:
+        requested_project = ""
+    if not isinstance(requested_project, str):
+        return web.json_response({"error": "project must be a string"}, status=400)
+    requested_project = requested_project.strip()
+    if requested_project:
+        requested_project = os.path.realpath(os.path.expanduser(requested_project))
+        if not os.path.isdir(requested_project):
+            return web.json_response({"error": "Not a directory"}, status=400)
+        if is_sensitive_path(requested_project):
+            return web.json_response({"error": "Access denied"}, status=403)
     # Folder membership at BIRTH. Assigning it afterwards (client PATCH) is
     # visibly too late: get_or_create_slot broadcasts the new slot before this
     # handler returns, so the dashboard renders it at the top level for a frame
@@ -1886,8 +1899,17 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         artifact_slug = body.get("artifact") if isinstance(body, dict) else None
         if isinstance(artifact_slug, str) and ARTIFACT_SLUG_RE.match(artifact_slug):
             slot._artifact = artifact_slug
+        # Prefer the project selected by the caller. This must happen before the
+        # first slot broadcast and eager spawn so ACP backends receive the same
+        # project as the dashboard session instead of the default workspace.
+        if requested_project:
+            slot.project = requested_project
+        # An explicit null/empty project clears scope. An omitted project keeps
+        # the default workspace directory for first-party file-search behavior.
+        if project_supplied and not requested_project:
+            slot.project = ""
         # Default project to workspace directory so file search works out of the box
-        if not slot.project:
+        if not slot.project and not project_supplied:
             cfg_proj = cfg.dashboard.default_project if cfg else ""
             if isinstance(cfg_proj, str) and cfg_proj:
                 resolved = os.path.realpath(os.path.expanduser(cfg_proj))

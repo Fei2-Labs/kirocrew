@@ -149,6 +149,35 @@ class TestCreateInFolder:
             )
 
     @pytest.mark.asyncio
+    async def test_create_with_project_announces_that_project_first(self, tmp_path):
+        """Project scope reaches eager ACP startup before the first slots frame."""
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        project = tmp_path / "project"
+        project.mkdir()
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots", json={"name": "s1", "project": str(project)}
+            )
+            assert resp.status == 200
+            assert (await resp.json())["project"] == str(project)
+
+        assert len(seen) == 1
+        entry = next(s for s in seen[0] if s["key"] == "s1")
+        assert entry["project"] == str(project)
+
+    @pytest.mark.asyncio
+    async def test_create_with_null_project_keeps_the_slot_unscoped(self, tmp_path):
+        """An explicit clear differs from omitting project and taking the default."""
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots", json={"name": "s1", "project": None})
+            assert resp.status == 200
+            assert (await resp.json())["project"] == ""
+        assert state._slots["s1"].project == ""
+
+    @pytest.mark.asyncio
     async def test_create_without_folder_still_emits_one_broadcast(self, tmp_path):
         """Guard the ordinary path: coalescing must not drop the announcement."""
         state = _make_state(tmp_path)

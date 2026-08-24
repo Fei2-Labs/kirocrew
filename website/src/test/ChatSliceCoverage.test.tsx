@@ -1179,6 +1179,17 @@ describe('chatSlice thunks', () => {
     expect(chat(store).activeSlot).toBe('elsewhere')
   })
 
+  it('inherits the active slot project when the caller omits one', async () => {
+    apiMock.createChatSlot.mockResolvedValue({ key: 'inherited-project-slot' })
+    const store = makeStore()
+    store.dispatch(sseSlots([slotRow('origin', { project: '/tmp/project' })]))
+    store.dispatch(setActiveSlot('origin'))
+
+    await store.dispatch(createSlot({ agent: 'opencode' }))
+
+    expect(apiMock.createChatSlot.mock.calls[0][9]).toBe('/tmp/project')
+  })
+
   it('carries a caller-supplied title on the create request', async () => {
     // The server pins a title given at create time, locking the background
     // auto-titler out, and the create broadcast already carries it. A later

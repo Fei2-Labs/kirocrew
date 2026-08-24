@@ -809,10 +809,10 @@ describe('request bodies with conditionally-omitted keys', () => {
   it('createChatSlot sends only the fields it was given', async () => {
     await api.createChatSlot()
     expect(call().body).toEqual({})
-    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', false, 'slug', 'f1')
+    await api.createChatSlot('n', 'a', 'm', 'mode', 'mem', 't', false, 'slug', 'f1', null)
     expect(call(1).body).toEqual({
       name: 'n', agent: 'a', model: 'm', mode: 'mode', memory_mode: 'mem',
-      title: 't', clean_mode: false, artifact: 'slug', folder_id: 'f1',
+      title: 't', clean_mode: false, artifact: 'slug', folder_id: 'f1', project: null,
     })
   })
 

@@ -1602,7 +1602,12 @@ export const createSlot = createAsyncThunk<
     const title = typeof opts === 'string' ? undefined : opts?.title
     const explicitColor = typeof opts === 'string' ? undefined : opts?.color_index
     const explicitHex = typeof opts === 'string' ? undefined : opts?.color_hex
-    const project = typeof opts === 'string' ? undefined : opts?.project
+    const root = getState() as RootState
+    const project = typeof opts === 'string'
+      ? undefined
+      : opts?.project !== undefined
+        ? opts.project
+        : root.dashboard.slots.find(slot => slot.key === root.chat.activeSlot)?.project
     // `activate: false` creates the session WITHOUT stealing focus, so a caller
     // that must finish setting the slot up (e.g. scoping it to a worktree) can
     // do so before the user is able to type into it. Defaults to true — every
@@ -1614,7 +1619,7 @@ export const createSlot = createAsyncThunk<
     // pending (e.g. New Chat spun on "Creating" under memory pressure and they
     // moved to another tab), the new slot must NOT hijack the view.
     const originActiveSlot = (getState() as RootState).chat.activeSlot
-    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, clean_mode, undefined, folderId || undefined)
+    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, clean_mode, undefined, folderId || undefined, project)
     const dashState = (getState() as RootState).dashboard
     // An explicit color (e.g. carried from a slot being recreated on a
     // mode switch) wins; otherwise fall back to the default-color policy.
