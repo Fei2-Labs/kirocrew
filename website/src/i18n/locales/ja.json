@@ -4415,6 +4415,8 @@
     "crewWakeSection": {
       "active": "実行中",
       "could_not_load_this_crew_s_schedules_so_what_wak": "このクルーのスケジュールを読み込めなかったため、何が起動するかは不明です。",
+      "cancel_new_schedule": "新しいスケジュールをキャンセル",
+      "new_schedule": "新しいスケジュール",
       "no_schedules_run_this_crew_automatically": "このクルーを自動で実行するスケジュールはありません。",
       "open_schedule": "スケジュールを開く",
       "pause_named": "{{name}} を一時停止",
@@ -5397,6 +5399,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "このジョブの短いラベル",
+      "agent_pinned_hint": "この Crew のエディターから作成され、ジョブはこの Crew として実行されます。",
       "add": "追加",
       "agent": "エージェント",
       "approval": "承認",
@@ -8970,6 +8973,7 @@
       "danger_zone": "危険ゾーン",
       "default_2": "デフォルト",
       "delete_crew": "クルーを削除",
+      "finish_the_new_schedule_first": "先に新しいスケジュールを完了またはキャンセルしてください",
       "delete_crew_named_confirm": "クルー{{name}}を削除しますか？新しいチャットではそれを使用しなくなります。ファイル、メモリ、過去の会話は保持されますが、再度設定する必要があります。",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "クルーを削除すると、新しいセッションから削除されます。ワークスペース、メモリストア、過去のトランスクリプトは保持されます。",
       "directory": "ディレクトリ",

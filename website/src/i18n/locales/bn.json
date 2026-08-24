@@ -4480,6 +4480,8 @@
     "crewWakeSection": {
       "active": "সক্রিয়",
       "could_not_load_this_crew_s_schedules_so_what_wak": "এই Crew-এর সময়সূচি লোড করা যায়নি, তাই কী এটি জাগায় তা অজানা।",
+      "cancel_new_schedule": "নতুন শিডিউল বাতিল করুন",
+      "new_schedule": "নতুন শিডিউল",
       "no_schedules_run_this_crew_automatically": "কোনো সময়সূচি এই Crew স্বয়ংক্রিয়ভাবে চালায় না।",
       "open_schedule": "সময়সূচি খুলুন",
       "pause_named": "{{name}} বিরতি দিন",
@@ -5480,6 +5482,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "এই জবের জন্য একটি সংক্ষিপ্ত লেবেল",
+      "agent_pinned_hint": "এই crew-এর সম্পাদক থেকে তৈরি, তাই কাজটি এই crew হিসেবে চলে।",
       "add": "জব যোগ করো",
       "agent": "এজেন্ট",
       "approval": "অনুমোদন",
@@ -9083,6 +9086,7 @@
       "danger_zone": "বিপজ্জনক অংশ",
       "default_2": "ডিফল্ট",
       "delete_crew": "Crew মুছে ফেলুন",
+      "finish_the_new_schedule_first": "প্রথমে নতুন শিডিউল সম্পূর্ণ বা বাতিল করুন",
       "delete_crew_named_confirm": "Crew {{name}} মুছে ফেলবেন? নতুন চ্যাট আর এটি ব্যবহার করবে না। এর ফাইল, মেমরি ও আগের কথাবার্তা রাখা হবে, তবে আবার নতুন করে সেট করতে হবে।",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "Crew মুছে ফেললে সেটি কেবল নতুন সেশন থেকে আলাদা হয়ে যায়। এর ওয়ার্কস্পেস, মেমরি স্টোর ও আগের চ্যাটের রেকর্ড রাখা হয়।",
       "directory": "ডিরেক্টরি",

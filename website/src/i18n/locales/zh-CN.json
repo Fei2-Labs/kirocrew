@@ -4415,6 +4415,8 @@
     "crewWakeSection": {
       "active": "运行中",
       "could_not_load_this_crew_s_schedules_so_what_wak": "无法加载这个 Crew 的定时任务，因此不知道什么会唤醒它。",
+      "cancel_new_schedule": "取消新建定时任务",
+      "new_schedule": "新建定时任务",
       "no_schedules_run_this_crew_automatically": "没有定时任务会自动运行这个 Crew。",
       "open_schedule": "打开定时任务",
       "pause_named": "暂停 {{name}}",
@@ -5397,6 +5399,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "此任务的简短标签",
+      "agent_pinned_hint": "在该 Crew 的编辑器里创建，任务即以该 Crew 身份运行。",
       "add": "添加",
       "agent": "代理",
       "approval": "审批",
@@ -8970,6 +8973,7 @@
       "danger_zone": "危险操作区",
       "default_2": "默认",
       "delete_crew": "删除 Crew",
+      "finish_the_new_schedule_first": "请先完成或取消新建的定时任务",
       "delete_crew_named_confirm": "删除 Crew {{name}}？新对话不会再用它。它的文件、记忆和历史对话都会保留，但你需要重新设置一次。",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "删除 Crew 只会解除它与新会话的绑定。它的工作区、记忆存储和历史记录都会保留。",
       "directory": "目录路径",

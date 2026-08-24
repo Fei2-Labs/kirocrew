@@ -4610,6 +4610,8 @@
     "crewWakeSection": {
       "active": "активно",
       "could_not_load_this_crew_s_schedules_so_what_wak": "Не удалось загрузить расписания этой crew, поэтому неизвестно, что её запускает.",
+      "cancel_new_schedule": "Отменить новое расписание",
+      "new_schedule": "Новое расписание",
       "no_schedules_run_this_crew_automatically": "Ни одно расписание не запускает эту crew автоматически.",
       "open_schedule": "Открыть расписание",
       "pause_named": "Приостановить {{name}}",
@@ -5646,6 +5648,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "Короткое название для этого задания",
+      "agent_pinned_hint": "Создано из редактора этой crew — задание выполняется от её имени.",
       "add": "Добавить",
       "agent": "Агент",
       "approval": "Подтверждение",
@@ -9309,6 +9312,7 @@
       "danger_zone": "Опасная зона",
       "default_2": "по умолчанию",
       "delete_crew": "Удалить crew",
+      "finish_the_new_schedule_first": "Сначала завершите или отмените новое расписание",
       "delete_crew_named_confirm": "Удалить crew {{name}}? Новые чаты больше не будут её использовать. Её файлы, память и прошлые разговоры сохранятся, но настраивать её придётся заново.",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "Удаление crew лишь отвязывает её от новых сессий. Её рабочая область, хранилище памяти и прежние расшифровки сохраняются.",
       "directory": "Каталог",

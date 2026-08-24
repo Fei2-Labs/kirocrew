@@ -4480,6 +4480,8 @@
     "crewWakeSection": {
       "active": "aktiv",
       "could_not_load_this_crew_s_schedules_so_what_wak": "Die Zeitpläne dieser Crew konnten nicht geladen werden, daher ist unbekannt, was sie weckt.",
+      "cancel_new_schedule": "Neuen Zeitplan verwerfen",
+      "new_schedule": "Neuer Zeitplan",
       "no_schedules_run_this_crew_automatically": "Kein Zeitplan führt diese Crew automatisch aus.",
       "open_schedule": "Zeitplan öffnen",
       "pause_named": "{{name}} pausieren",
@@ -5480,6 +5482,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "Eine kurze Bezeichnung für diesen Job",
+      "agent_pinned_hint": "Im Editor dieser Crew erstellt – der Job läuft als diese Crew.",
       "add": "Hinzufügen",
       "agent": "Agent",
       "approval": "Genehmigung",
@@ -9083,6 +9086,7 @@
       "danger_zone": "Gefahrenzone",
       "default_2": "Standard",
       "delete_crew": "Crew löschen",
+      "finish_the_new_schedule_first": "Zuerst den neuen Zeitplan abschließen oder verwerfen",
       "delete_crew_named_confirm": "Crew {{name}} löschen? Neue Chats verwenden sie dann nicht mehr. Ihre Dateien, ihre Erinnerung und frühere Gespräche bleiben erhalten, aber du müsstest sie neu einrichten.",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "Das Löschen einer Crew hebt nur ihre Bindung an neue Sitzungen auf. Ihr Workspace, ihr Erinnerungsspeicher und frühere Transkripte bleiben erhalten.",
       "directory": "Verzeichnis",

@@ -4545,6 +4545,8 @@
     "crewWakeSection": {
       "active": "actif",
       "could_not_load_this_crew_s_schedules_so_what_wak": "Impossible de charger les planifications de ce crew : ce qui le réveille est donc inconnu.",
+      "cancel_new_schedule": "Annuler la nouvelle planification",
+      "new_schedule": "Nouvelle planification",
       "no_schedules_run_this_crew_automatically": "Aucune planification n’exécute ce crew automatiquement.",
       "open_schedule": "Ouvrir la planification",
       "pause_named": "Mettre {{name}} en pause",
@@ -5563,6 +5565,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "Un libellé court pour cette tâche",
+      "agent_pinned_hint": "Créé depuis l’éditeur de cette crew ; la tâche s’exécute en tant que cette crew.",
       "add": "Ajouter",
       "agent": "Agent",
       "approval": "Approbation",
@@ -9196,6 +9199,7 @@
       "danger_zone": "Zone de danger",
       "default_2": "par défaut",
       "delete_crew": "Supprimer le crew",
+      "finish_the_new_schedule_first": "Terminez ou annulez d’abord la nouvelle planification",
       "delete_crew_named_confirm": "Supprimer le crew {{name}} ? Les nouveaux chats ne l’utiliseront plus. Ses fichiers, sa mémoire et les conversations passées sont conservés, mais tu devrais le reconfigurer.",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "Supprimer un crew le dissocie seulement des nouvelles sessions. Son espace de travail, son magasin de mémoire et les transcriptions passées sont conservés.",
       "directory": "Répertoire",

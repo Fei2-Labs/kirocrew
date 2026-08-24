@@ -85,6 +85,7 @@
     "components.commandPalette.providers.allAggregator.all": "Section heading in Search Everywhere for the aggregated result list that mixes every provider (pages, sessions, skills, prompts…). Means \"all categories\", not \"everything selected\".",
     "components.commandPalette.tab": "The literal Tab key cap, shown inside a key badge. Do not translate or transliterate: it names a physical key the user presses.",
     "components.crewWakeSection.active": "Status word on a schedule row in the crew editor: the job is enabled and will fire. An adjective describing the schedule, not a verb and not \"activate\". Width-constrained: keep it short.",
+    "components.crewWakeSection.new_schedule": "Button in the crew editor's schedules pane that expands an inline form to create a new schedule for this crew. \"New\" is the create action, not a freshness adjective. Width-constrained: keep it short.",
     "components.crewWakeSection.paused": "Status word on a schedule row in the crew editor: the job exists but is suspended and will not fire until resumed. An adjective, not the verb \"pause\". Width-constrained: keep it short.",
     "components.crewWakeSection.running": "Status word on a schedule row in the crew editor: a run of this job is in flight right now. An adjective describing the schedule's current state, not a command. Width-constrained: keep it short.",
     "components.discoverySearchBar.no": "Answer/state value meaning negative. Not the beginning of a phrase such as \"No results\".",

@@ -4545,6 +4545,8 @@
     "crewWakeSection": {
       "active": "ativo",
       "could_not_load_this_crew_s_schedules_so_what_wak": "Não foi possível carregar os agendamentos deste crew, então não se sabe o que o aciona.",
+      "cancel_new_schedule": "Cancelar novo agendamento",
+      "new_schedule": "Novo agendamento",
       "no_schedules_run_this_crew_automatically": "Nenhum agendamento executa este crew automaticamente.",
       "open_schedule": "Abrir Agendamentos",
       "pause_named": "Pausar {{name}}",
@@ -5563,6 +5565,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "Um rótulo curto para este job",
+      "agent_pinned_hint": "Criado no editor desta crew; o job é executado como esta crew.",
       "add": "Adicionar",
       "agent": "Agente",
       "approval": "Aprovação",
@@ -9196,6 +9199,7 @@
       "danger_zone": "Zona de perigo",
       "default_2": "padrão",
       "delete_crew": "Excluir o crew",
+      "finish_the_new_schedule_first": "Conclua ou cancele o novo agendamento primeiro",
       "delete_crew_named_confirm": "Excluir o crew {{name}}? Os novos chats não vão mais usá-lo. Os arquivos, a memória e as conversas anteriores são mantidos, mas você teria que configurá-lo de novo.",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "Excluir um crew apenas o desvincula das novas sessões. O espaço de trabalho, o armazenamento de memória e as transcrições anteriores são mantidos.",
       "directory": "Diretório",
