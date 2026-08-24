@@ -227,6 +227,7 @@ class TestSessionResumeIsDeclaredOnlyWhereItIsHonoured:
         )
 
     def test_no_other_transport_declares_it(self) -> None:
+        from kiro_crew.feishu.transport import FEISHU_CAPABILITIES
         from kiro_crew.imessage.transport import IMESSAGE_CAPABILITIES
         from kiro_crew.slack.transport import SLACK_CAPABILITIES
         from kiro_crew.teams.transport import TEAMS_CAPABILITIES
@@ -234,6 +235,7 @@ class TestSessionResumeIsDeclaredOnlyWhereItIsHonoured:
         from kiro_crew.webex.transport import WEBEX_CAPABILITIES
         from kiro_crew.wecom.transport import WECOM_CAPABILITIES
         from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
+        from kiro_crew.whatsapp.transport import WHATSAPP_CAPABILITIES
 
         others = {
             "slack": SLACK_CAPABILITIES,
@@ -243,6 +245,8 @@ class TestSessionResumeIsDeclaredOnlyWhereItIsHonoured:
             "wecom": WECOM_CAPABILITIES,
             "weixin": WEIXIN_CAPABILITIES,
             "imessage": IMESSAGE_CAPABILITIES,
+            "whatsapp": WHATSAPP_CAPABILITIES,
+            "feishu": FEISHU_CAPABILITIES,
         }
         claiming = [name for name, caps in others.items() if caps.supports_session_resume]
         assert claiming == [], (

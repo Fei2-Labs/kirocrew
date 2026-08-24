@@ -98,6 +98,9 @@ def _pin_module_state(monkeypatch):
     monkeypatch.setattr(mod, "_BUILD_PATH_CACHE", "/usr/bin")
     monkeypatch.setattr(mod, "_warm_build_path", AsyncMock())
     monkeypatch.setattr(mod, "_pod_env", lambda: {})
+    # Shutdown admission state: each test starts with a clean (non-shutdown) process.
+    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
 
 
 # --------------------------------------------------------------------------

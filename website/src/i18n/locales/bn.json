@@ -1925,6 +1925,17 @@
           "connect_repo": "রিপো সংযুক্ত করুন",
           "general": "সাধারণ",
           "repository_settings": "রিপোজিটরি সেটিংস"
+        },
+        "depsSection": {
+          "title": "নির্ভরতা",
+          "blocked_by": "যার কারণে অবরুদ্ধ",
+          "blocking": "অবরুদ্ধ করছে",
+          "state_open": "open",
+          "state_closed": "closed",
+          "state_merged": "merged",
+          "source_native": "native",
+          "source_inferred": "inferred",
+          "open_here": "{{sigil}}{{number}} এখানে খুলুন"
         }
       },
       "connectPanel": {
@@ -2191,7 +2202,8 @@
         },
         "registry": {
           "overview": "ওভারভিউ",
-          "tagging": "ট্যাগিং"
+          "tagging": "ট্যাগিং",
+          "graph": "গ্রাফ"
         },
         "settings": {
           "generalSettings": {
@@ -2351,6 +2363,45 @@
           "untagged_issues": "ট্যাগ-না-করা ইস্যু",
           "what_you_see_below_is_the_previous_result_not_th": "নিচে যা দেখছেন তা আগের ফলাফল, বর্তমান অবস্থা নয়।",
           "write_every_staged_label_to": "সব স্টেজ করা লেবেল {{provider}}-এ লিখুন"
+        },
+        "graphView": {
+          "header": "নির্ভরতা",
+          "views_label": "নির্ভরতা ভিউ",
+          "tab_frontier": "ফ্রন্টিয়ার",
+          "tab_focus": "ফোকাস ট্রি",
+          "jump_label": "আইটেমে যান",
+          "jump_placeholder": "আইটেম # এ যান…",
+          "loading": "নির্ভরতা লোড হচ্ছে…",
+          "refresh": "নির্ভরতা ডেটা রিফ্রেশ করুন",
+          "ready_count": "{{n}}টি নতুন আনলক",
+          "frontier_heading": "ফ্রন্টিয়ার",
+          "frontier_sub": "{{ready}}টি নতুন আনলক · {{waiting}}টি এখনও অপেক্ষমাণ",
+          "no_frontier": "নথিভুক্ত নির্ভরতাসহ কোনো খোলা আইটেম নেই।",
+          "waiting_heading": "অপেক্ষমাণ ({{n}})",
+          "more_waiting": "… +{{n}}টি আরও",
+          "why_all_satisfied": "সব ব্লকার পূরণ হয়েছে: {{refs}}",
+          "why_waiting": "অপেক্ষায় {{refs}}",
+          "why_satisfied": "ইতিমধ্যে পূরণ: {{refs}}",
+          "open_tree": "ট্রি খুলুন →",
+          "frontier_caption": "নতুন আনলক আইটেমের নথিভুক্ত সব ব্লকার বন্ধ বা মার্জ হয়েছে। কারণ দেখতে আইটেম খুলুন, বা তার ট্রি খুলুন।",
+          "focus_caption": "নির্বাচিত আইটেমের সম্পূর্ণ সক্রিয় নির্ভরতা ট্রি। যেকোনো নোডে ক্লিকে রুট বদলান, Enter-এ খুলুন। ড্যাশ = অনুমিত, কাটা = পূরণ।",
+          "focus_empty": "নির্ভরতা ট্রি আঁকতে একটি আইটেম নির্বাচন করুন।",
+          "tree_stat": "{{kind}}-{{number}} এর ট্রি: {{nodes}}টি নোড · {{edges}}টি সক্রিয় প্রান্ত",
+          "ghost_satisfied": "পূরণ",
+          "ci_fail": "CI ব্যর্থ",
+          "led_wait": "WAIT",
+          "led_ready": "RDY",
+          "led_run": "RUN",
+          "led_done": "DONE",
+          "led_open": "OPEN",
+          "aria_tree": "{{kind}}-{{number}} এর নির্ভরতা ট্রি: {{nodes}}টি নোড, {{edges}}টি সক্রিয় প্রান্ত",
+          "aria_node": "{{kind}}-{{number}}, {{state}}: {{title}}",
+          "empty_board": "খালি বোর্ড",
+          "empty_title": "এখনও কোনো নির্ভরতা নেই",
+          "empty_blurb": "এই রিপোজিটরিতে আঁকার মতো কোনো নির্ভরতা প্রান্ত নেই। gh issue edit --add-blocked-by দিয়ে নেটিভ নির্ভরতা দিন, নয়তো পরের সিঙ্কে Issue Radar ক্রস-রেফারেন্স থেকে অনুমান করবে।",
+          "empty_unavailable_title": "নির্ভরতার ডেটা অনুপলব্ধ",
+          "empty_unavailable_blurb": "গ্রাফ লোড করা যায়নি। এই রিপোজিটরির জন্য deps রুট হয়তো এখনও চালু হয়নি। চালু হলে আবার চেষ্টা করুন।",
+          "retry": "আবার চেষ্টা করুন"
         }
       },
       "welcomeCarousel": {
@@ -3825,7 +3876,9 @@
         "co_author": "সহ-লেখক",
         "co_author_conflict": "সহ-লেখক এই ফাইলটি পরিবর্তন করেছেন",
         "co_author_conflict_discard": "আমার সম্পাদনা বাতিল করে আবার লোড করুন",
+        "co_author_conflict_discard_button": "সম্পাদনা বাতিল করুন",
         "co_author_conflict_discard_confirm": "“{{file}}”-এ আপনার অসংরক্ষিত সম্পাদনা বাতিল করে সহ-লেখকের সংস্করণ লোড করবেন? এটি আর ফেরানো যাবে না।",
+        "co_author_conflict_discard_title": "অসংরক্ষিত সম্পাদনা বাতিল করবেন?",
         "commit_and_push": "কমিট ও পুশ করুন",
         "commit_message_prompt": "এই কমিটের বর্ণনা দিন। এতে গবেষণাপত্রের সব পরিবর্তন যুক্ত হবে।",
         "compile": "কম্পাইল করুন",
@@ -4148,6 +4201,10 @@
           "advance_to_design": "অনুমোদন → ডিজাইন",
           "advance_to_tasks": "অনুমোদন → কাজ",
           "an_agent_will_work_through_the_task_list": "একজন এজেন্ট কাজের তালিকা ধরে এগোবে",
+          "approved": "অনুমোদিত",
+          "approved_by_user": "{{user}} অনুমোদন করেছে",
+          "archive_this_spec": "এই spec সংরক্ষণাগারে রাখো",
+          "changed_since_approval": "অনুমোদনের পরে বদলেছে",
           "clear": "খালি করুন",
           "close_esc": "বন্ধ করুন (Esc)",
           "close_review_view": "পর্যালোচনা ভিউ বন্ধ করুন",
@@ -4155,24 +4212,30 @@
           "drafting_design": "ডিজাইন লেখা হচ্ছে…",
           "drafting_tasks": "কাজ লেখা হচ্ছে…",
           "drag_or_use_to_resize": "আকার বদলাতে টানুন বা ← → ব্যবহার করুন",
+          "duplicate_this_spec": "এই spec-এর নকল বানাও",
           "expand_document_for_review": "পর্যালোচনার জন্য নথি বড় করো",
           "expand_for_review_esc_to_close": "পর্যালোচনার জন্য বড় করো (Esc দিয়ে বন্ধ)",
+          "name_for_the_copy": "নকলের নাম",
           "pause": "থামাও",
           "pausing": "থামানো হচ্ছে…",
           "pending_comment_one": "{{count}}টি অপেক্ষমাণ মন্তব্য",
           "pending_comment_other": "{{count}}টি অপেক্ষমাণ মন্তব্য",
           "remove_comment_on": "{{document}}-এর মন্তব্য সরাও",
+          "rename_this_spec_label_the_folder_name_stays": "এই spec-এর লেবেল বদলাও। এর ফোল্ডার আর ব্রাঞ্চের নাম একই থাকবে।",
           "resize_document_panel": "নথি প্যানেলের আকার বদলান",
+          "restore_this_spec": "এই spec ফিরিয়ে আনো",
           "review_document": "{{document}} পর্যালোচনা করো",
           "send_all_to_agent": "সব এজেন্টকে পাঠান",
           "sending": "পাঠানো হচ্ছে…",
+          "spec_label": "Spec-এর লেবেল",
           "start_building": "বানানো শুরু করো",
           "starting": "শুরু হচ্ছে…",
           "tab_design": "ডিজাইন",
           "tab_requirements": "চাহিদা",
           "tab_tasks": "কাজ",
-          "tells_the_agent_this_phase_is_approved_and_to_mo": "এজেন্টকে জানায় যে এই ধাপটি অনুমোদিত এবং সে এগিয়ে যেতে পারে — চ্যাটে লেখার মতোই",
+          "tells_the_agent_this_phase_is_approved_and_to_mo": "এই সংস্করণে তোমার অনুমোদন লিখে রাখে, তারপর এজেন্টকে এগিয়ে যেতে বলে",
           "the_agent_is_writing_the_next_document": "অনুমোদিত — এজেন্ট পরবর্তী নথি লিখছে",
+          "this_document_changed_after_it_was_approved": "এই নথিটি অনুমোদনের পরে বদলে গেছে",
           "working": "কাজ চলছে…"
         },
         "specRail": {
@@ -4205,6 +4268,17 @@
           "tool_calls": "টুল কল",
           "turns": "পর্ব",
           "worktree": "Worktree"
+        },
+        "taskList": {
+          "done": "সম্পন্ন",
+          "done_of_total": "{{total}}টির মধ্যে {{done}}টি কাজ সম্পন্ন",
+          "no_tasks_yet": "এখনও কোনো কাজ নেই। ডিজাইন অনুমোদন করার পরে সাজানো কাজের তালিকা এখানে আসবে আর তুমি একটি একটি করে কাজ চালাতে পারবে।",
+          "pause_the_build_first": "একটি কাজ চালানোর আগে বানানো থামাও",
+          "run": "চালাও",
+          "run_only_this_task_and_stop": "শুধু এই কাজটি চালাও, তারপর থামো",
+          "run_task": "কাজ চালাও: {{task}}",
+          "starting": "শুরু হচ্ছে…",
+          "task_progress": "কাজের অগ্রগতি"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "আপনি কী বানাতে চান তা লিখুন, কয়েকটি প্রশ্নের উত্তর দিন, এবং একটি পর্যালোচিত পরিকল্পনা পান — চাহিদা, ডিজাইন ও কাজ — যা একজন এজেন্ট সম্পন্ন করতে পারে।",
@@ -4533,8 +4607,11 @@
       "this_app_provides_agents_and_skills_but_no_visua": "এই অ্যাপটি এজেন্ট ও স্কিল দেয়, কিন্তু কোনও ভিজ্যুয়াল ইন্টারফেস নেই।\n            চ্যাট থেকে এর এজেন্টগুলি ব্যবহার করুন।"
     },
     "approvalCard": {
+      "approval_no_longer_pending": "এই অনুমোদনটির মেয়াদ শেষ হয়ে গেছে বা ইতিমধ্যে সিদ্ধান্ত নেওয়া হয়েছে — এজেন্ট আর এটির জন্য অপেক্ষা করছে না।",
       "approve": "অনুমোদন করুন",
       "approved": "অনুমোদিত",
+      "decision_failed": "এই সিদ্ধান্তটি হয়তো রেকর্ড করা হয়নি — অনুরোধটি ব্যর্থ হয়েছে।",
+      "decision_not_recorded_error": "এই সিদ্ধান্তটি রেকর্ড করা হয়নি: {{error}}",
       "reject": "প্রত্যাখ্যান করুন",
       "rejected": "প্রত্যাখ্যাত",
       "running": "চলছে:",
@@ -4690,8 +4767,10 @@
     },
     "artifactBody": {
       "artifact": "আর্টিফ্যাক্ট: {{slug}}",
+      "could_not_render": "এই আর্টিফ্যাক্টটি রেন্ডার করা যায়নি",
       "image_could_not_be_loaded": "ছবিটি লোড করা যায়নি",
-      "rendering": "রেন্ডার হচ্ছে…"
+      "rendering": "রেন্ডার হচ্ছে…",
+      "retry": "আবার চেষ্টা করুন"
     },
     "artifactChatPanel": {
       "agent_chat": "এজেন্ট চ্যাট",
@@ -5580,6 +5659,7 @@
       "collapse_unchanged": "অপরিবর্তিত অংশ সংকুচিত করুন",
       "copy_content": "কনটেন্ট কপি করুন",
       "copy_path": "পাথ কপি করুন",
+      "discard_changes_button": "পরিবর্তন বাতিল করুন",
       "discard_unsaved_changes": "অসংরক্ষিত পরিবর্তন বাতিল করবেন?",
       "download": "ডাউনলোড",
       "download_failed": "ডাউনলোড ব্যর্থ হয়েছে",
@@ -6294,7 +6374,9 @@
       "search_everywhere": "সর্বত্র সার্চ",
       "show_or_focus_the_kiro_crew_window": "{{productName}} উইন্ডো দেখান বা ফোকাস করুন",
       "use_ctrl_not_option_for_chat_1_9": "চ্যাট 1–9 এর জন্য ⌃ Ctrl ব্যবহার করুন (⌥ Option নয়)",
-      "use_ctrl_not_option_for_chat_1_to_9": "চ্যাট 1 থেকে 9 এর জন্য Ctrl ব্যবহার করুন (Option নয়)"
+      "use_ctrl_not_option_for_chat_1_to_9": "চ্যাট 1 থেকে 9 এর জন্য Ctrl ব্যবহার করুন (Option নয়)",
+      "panel_toggles": "প্যানেল টগল",
+      "unset": "সেট করা নেই"
     },
     "sidePanelLayout": {
       "update_available": "আপডেট উপলব্ধ"
@@ -6361,11 +6443,32 @@
       "triggers": "ট্রিগার",
       "what_this_skill_does_and_when_the_agent_should_u": "এই স্কিলটি কী করে এবং এজেন্ট কখন এটি ব্যবহার করবে"
     },
+    "projectSkillsTrust": {
+      "body": "${{skill}} এসেছে এই প্রকল্পের নিজের .kiro/skills ফোল্ডার থেকে।",
+      "confirm": "এই ফোল্ডার বিশ্বাস করো",
+      "consequence": "এই ফোল্ডার বিশ্বাস করলে এর স্কিল ফাইলগুলো এই চ্যাটের কনটেক্সটে ঢুকতে পারে, যেখান থেকে সেগুলো এজেন্টকে কমান্ড চালানোর নির্দেশ দিতে পারে। যে প্রকল্পকে তুমি চেনো, শুধু সেটিকেই বিশ্বাস করো।",
+      "decline": "এখন নয়",
+      "decline_consequence": "প্রত্যাখ্যান করলে কিছুই লোড হয় না, আর তোমার মেসেজ যেমন লিখেছিলে তেমনই থাকে।",
+      "grant_failed": "এই ফোল্ডারের জন্য বিশ্বাস নথিভুক্ত করা গেল না।",
+      "title": "এই প্রকল্পের স্কিল বিশ্বাস করবে?",
+      "withdraw_hint": "পরে স্কিল সেটিংস পেজ থেকে এটি তুলে নিতে পারবে।",
+      "working": "বিশ্বাস করা হচ্ছে…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "এই ফোল্ডারটি আর নেই।",
+      "hint": "এই প্রজেক্ট ফোল্ডারগুলো নিজেদের স্কিল চ্যাটে লোড করতে পারে। কোনো ফোল্ডারের আস্থা তুলে নিলে তার স্কিল আর লোড হবে না।",
+      "revoke": "আস্থা তুলে নাও",
+      "revoke_failed": "এই ফোল্ডারের আস্থা তুলে নেওয়া যায়নি।",
+      "revoking": "তুলে নেওয়া হচ্ছে…",
+      "title": "বিশ্বস্ত প্রজেক্ট ফোল্ডার"
+    },
     "skillPickerMenu": {
       "loading_skills": "স্কিল লোড হচ্ছে…",
       "no_matching_skills": "মিলে যাওয়া কোনো স্কিল নেই",
       "no_matching_skills_ctrl_enter_sends": "মিলে যাওয়া কোনো স্কিল নেই — Ctrl+Enter বার্তা পাঠাবে",
-      "no_matching_skills_enter_sends": "মিলে যাওয়া কোনো স্কিল নেই — Enter বার্তা পাঠাবে"
+      "no_matching_skills_enter_sends": "মিলে যাওয়া কোনো স্কিল নেই — Enter বার্তা পাঠাবে",
+      "trust_needed_badge": "বিশ্বাস দরকার",
+      "trust_needed_hint": "এই প্রকল্প থেকে। যাচাই করে ফোল্ডার বিশ্বাস করতে এটি বেছে নাও।"
     },
     "slashCommandMenu": {
       "desc_agent": "সক্রিয় এজেন্ট বদলাও বা পরিচালনা করো",
@@ -6387,6 +6490,7 @@
       "desc_model": "চলতি মডেল দেখাও বা বদলাও",
       "desc_onboarding": "সেটআপ ইমপোর্ট আর স্বাগত ট্যুর আবার চালাও",
       "desc_paste": "ক্লিপবোর্ড থেকে একটি ছবি পেস্ট করো",
+      "desc_plain": "এখন কী অবস্থা — বা একটা বিষয় দাও",
       "desc_prompts": "সেভ করা প্রম্পট ও এজেন্ট SOP দেখাও বা চালাও",
       "desc_quit": "চ্যাট সেশন বন্ধ করো",
       "desc_reply": "সহকারীর শেষ মেসেজে উত্তর দাও",
@@ -6520,6 +6624,7 @@
       "trust": "বিশ্বাস করুন",
       "trust_all_base": "সব <mono>{{base}}</mono> কমান্ড বিশ্বাস করুন",
       "trust_all_tools": "সব টুল বিশ্বাস করুন",
+      "trust_all_tools_channel": "এই চ্যানেলের সব টুল বিশ্বাস করুন — রিস্টার্টের পরেও বজায় থাকে",
       "trust_this_command": "«<mono>{{cmd}}</mono>» বিশ্বাস করুন"
     },
     "tunnelStatus": {
@@ -6703,12 +6808,14 @@
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "স্টার দেওয়া যাবে না: উইজেটের কোনো slug বা মেসেজ কনটেক্সট নেই",
+      "could_not_render": "এই উইজেটটি রেন্ডার করা যায়নি",
       "download_as_html": "HTML হিসেবে ডাউনলোড করুন",
       "expand": "প্রসারিত করো",
       "minimize": "গুটিয়ে নাও",
       "open_in_new_tab": "নতুন ট্যাবে খুলুন",
       "remove_artifact_from_library": "লাইব্রেরি থেকে {{name}} আর্টিফ্যাক্ট সরাও",
       "rendering": "রেন্ডার হচ্ছে…",
+      "retry": "আবার চেষ্টা করুন",
       "save_failed": "সেভ ব্যর্থ হয়েছে",
       "star_as_artifact": "আর্টিফ্যাক্ট হিসেবে স্টার দাও",
       "starred_as_click_to_remove": "\"{{name}}\" নামে স্টার দেওয়া — সরাতে ক্লিক করো"
@@ -6824,6 +6931,9 @@
       "confirm_button": "নিশ্চিত করুন এবং সক্রিয় করুন",
       "withdraw": "নিশ্চিতকরণ প্রত্যাহার করুন"
     },
+    "confirmDialog": {
+      "cancel": "বাতিল"
+    },
     "crewWebhookSection": {
       "could_not_load_webhooks": "Webhooks লোড করা যায়নি, তাই এখন জানা নেই কী এই crew-কে জাগায়।",
       "inbound_webhooks_are_switched_off": "ইনবাউন্ড webhooks বন্ধ — বাঁধা টোকেনসহ কোনো কল ঢুকতে পারবে না।",
@@ -6888,7 +6998,10 @@
       "switch_to_remote_crew": "রিমোট ক্রু {{n}}-এ যাওয়া",
       "walk_back_mru_history": "MRU ইতিহাসে পিছিয়ে যাওয়া",
       "stop_speaking": "কথা বলা বন্ধ করুন",
-      "toggle_focus_mode": "ফোকাস মোড টগল করুন"
+      "toggle_focus_mode": "ফোকাস মোড টগল করুন",
+      "toggle_left_sidebar": "বাঁ সাইডবার দেখান/লুকান",
+      "toggle_session_panel": "সেশন প্যানেল দেখান/লুকান",
+      "toggle_side_panel": "সাইড প্যানেল দেখান/লুকান"
     },
     "usePanelTabs": {
       "artifacts": "আর্টিফ্যাক্ট",
@@ -7412,7 +7525,13 @@
       "public_by_link_warning": "প্রকাশিত URL লিঙ্কের মাধ্যমে সর্বজনীন: লিঙ্ক থাকা যে কেউ কন্টেন্ট দেখতে পারবে — এটি কোনো প্রমাণীকরণ ছাড়াই পাবলিক ইন্টারনেটে পরিবেশিত হয়।",
       "random_domain_note": "কন্টেন্ট একটি এলোমেলো *.cloudfront.net ডোমেইনে পরিবেশিত হয় — এমন কিছু প্রকাশ করবেন না যা আপনি খোলা ইন্টারনেটে রাখতে চাইবেন না।",
       "cloud_deployment_disabled": "Cloud deployment is disabled",
-      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake."
+      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake.",
+      "recall_title": "সাইট প্রত্যাহার করবেন?",
+      "recall_button": "সাইট প্রত্যাহার করুন",
+      "destroy_title": "সাইট ডেস্ট্রয় করবেন?",
+      "destroy_button": "সাইট ডেস্ট্রয় করুন",
+      "remove_profile_title": "প্রোফাইল সরাবেন?",
+      "remove_profile_button": "প্রোফাইল সরান"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· রিমোট কপিতে একটি নতুন সংস্করণ পাওয়া যাচ্ছে",
@@ -7444,6 +7563,7 @@
       "copy_failed": "কপি ব্যর্থ",
       "could_not_overwrite": "ওভাররাইট করা যায়নি।",
       "created": "তৈরি হয়েছে",
+      "discard_changes_button": "পরিবর্তন বাতিল করুন",
       "discard_unsaved_changes": "অসংরক্ষিত পরিবর্তনগুলি বাতিল করবেন?",
       "document_type": "নথির ধরন",
       "download": "ডাউনলোড করুন",
@@ -7778,9 +7898,6 @@
         "stopped": "থামানো হয়েছে",
         "subagent": "সাবএজেন্ট {{label}}",
         "subagents": "সাবএজেন্ট",
-        "trusted": "বিশ্বস্ত",
-        "trusted_base": "বিশ্বস্ত বেস",
-        "trusted_command": "বিশ্বস্ত কমান্ড",
         "waiting_for_output": "আউটপুটের অপেক্ষায়…",
         "waiting_to_start_queued_behind_the_concurrency_l": "শুরুর অপেক্ষায় — কনকারেন্সি সীমার পেছনে সারিতে আছে",
         "workflows": "ওয়ার্কফ্লো",
@@ -7943,6 +8060,9 @@
         "recovered_continuing": "চালিয়ে যাওয়ার অনুরোধ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে",
         "resuming_the_interrupted_turn": "বিঘ্নিত টার্ন আবার শুরু হচ্ছে",
         "safety_policy_continuing": "নিরাপত্তা নীতি কলটি ব্লক করেছে · চালিয়ে যাওয়ার অনুরোধ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে",
+        "safety_policy_told_in_turn": "নিরাপত্তা নীতি কলটি আটকে দিয়েছে · এই টার্নেই এজেন্টকে কারণ জানানো হয়েছে",
+        "invalid_name_told_in_turn": "টুলের নাম যাচাইয়ে ব্যর্থ · এই টার্নেই এজেন্টকে কারণ জানানো হয়েছে",
+        "hook_fault_told_in_turn": "কলের আগে একটি হুক ব্যর্থ হয়েছে · এই টার্নেই এজেন্টকে কারণ জানানো হয়েছে",
         "session_busy_continuing": "সেশন ব্যস্ত · চালিয়ে যাওয়ার অনুরোধ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে",
         "subagents_finished": "সাব-এজেন্ট সম্পন্ন",
         "system_notice": "সিস্টেম বিজ্ঞপ্তি",
@@ -8087,7 +8207,8 @@
         "expand_model_reasoning": "মডেলের রিজনিং প্রসারিত করো",
         "hide_reasoning": "রিজনিং লুকাও",
         "show_reasoning": "রিজনিং দেখাও",
-        "thinking": "ভাবছে"
+        "thinking": "ভাবছে",
+        "thought_process": "চিন্তার প্রক্রিয়া"
       },
       "toolCallLine": {
         "aria_hide_diff": "diff লুকান",
@@ -9395,11 +9516,14 @@
       "stub_failed": "পরিবর্তনটি প্রয়োগ করা গেল না। এটি সংরক্ষিত হয়ে থাকতে পারে কিন্তু কার্যকর নয় — নিচের স্যুইচগুলো এখন সংরক্ষিত অবস্থা দেখাচ্ছে।",
       "stub_not_live": "সংরক্ষিত হয়েছে, তবে এখনও কার্যকর নয় — গেটওয়ে চালু করা যায়নি। স্যুইচটি সংরক্ষিত অবস্থা দেখায়, চালু অবস্থা নয়।",
       "stub_restart_required": "সংরক্ষণ করা হয়েছে। এটি কার্যকর করতে গেটওয়ে পুনরায় চালু করুন। ইতিমধ্যে চলমান সেশনগুলি যে সার্ভারগুলি দিয়ে শুরু হয়েছিল সেগুলিই ব্যবহার করতে থাকবে।",
-      "stubbed_of_total": "{{total}}টির মধ্যে {{stubbed}}টিতে স্টাব",
+      "stubbed_of_total": "{{total}}টির মধ্যে {{stubbed}}টি স্টাবের জন্য নির্বাচিত",
       "unsupported_platform": "ব্যাকএন্ড ভাগ করতে Unix ডোমেইন সকেট লাগে, তাই এই প্ল্যাটফর্মে এটি নেই।",
       "view_assessment": "শেয়ারিং মূল্যায়ন",
       "view_servers": "সার্ভার",
-      "views_aria": "MCP ব্যবস্থাপনা ভিউ"
+      "views_aria": "MCP ব্যবস্থাপনা ভিউ",
+      "state_direct_env": "সরাসরি (env)",
+      "state_direct_env_reason": "স্টাব তৈরি হয়নি, তবে আপনার নির্বাচন সংরক্ষিত আছে।",
+      "state_direct_env_legend": "সরাসরি (env) — সার্ভারটি এমন একটি এনভায়রনমেন্ট কি ঘোষণা করে যা শেয়ার্ড ব্যাকএন্ড পাঠাবে না, তাই {{productName}} তার জন্য কোনো স্টাব তৈরি করে না: সেশন নিজেই এটি চালু করে, শেয়ার্ড ব্যাকএন্ড নেই এবং সার্ভারের নিজস্ব UI নেই।"
     },
     "migrationPage": {
       "app_migration": "অ্যাপ মাইগ্রেশন",
@@ -10359,8 +10483,21 @@
       "detail_last_used": "সর্বশেষ ব্যবহার",
       "detail_size": "আকার",
       "detail_turns": "টার্ন",
+      "emptied": "{{size}} মুক্ত করা হয়েছে।",
+      "empty_failed": "{{freed}} মুক্ত করার পর থেমে গেছে।",
+      "empty_kept": "{{freed}} মুক্ত হয়েছে, তবে সবকিছু মুছে ফেলা যায়নি।",
+      "empty_not_started": "ট্র্যাশ খালি করা শুরু করা যায়নি। আবার চেষ্টা করুন।",
+      "emptying": "রিসাইকেল বিন খালি করা হচ্ছে",
+      "emptying_leave_ok": "আপনি এই পৃষ্ঠা ছেড়ে গেলেও এটি চলতে থাকবে।",
+      "emptying_progress": "{{total}}-এর মধ্যে {{freed}} মুক্ত",
       "heading": "সেশন স্টোরেজ",
       "in_use": "ব্যবহারে",
+      "kept_incomplete": "একটি ব্যাচ ডিস্ক থেকে সরানো যায়নি, তাই সেটি এখনও তালিকায় আছে।",
+      "kept_next_step": "এই ব্যাচ থেকে যা ফেরানো যায় তা পুনরুদ্ধার করুন; কোন ফাইল মুছতে বাধা দিয়েছে তা গেটওয়ে লগে লেখা আছে।",
+      "kept_outside_root": "একটি ব্যাচ আর রিসাইকেল বিনের মধ্যে নেই, তাই সেটি রেখে দেওয়া হয়েছে।",
+      "kept_unknown": "একটি ব্যাচ এমন কারণে রাখা হয়েছে যা এই সংস্করণ চিনতে পারে না।",
+      "kept_unlisted_files": "একটি ব্যাচে এমন ফাইল আছে যা তার ম্যানিফেস্টে নেই; সেটি মুছলে কোনো সেশনের একমাত্র কপি নষ্ট হতে পারে।",
+      "kept_unreadable": "একটি ব্যাচ পুরোটা পড়া যায়নি, তাই সেটি রেখে দেওয়া হয়েছে।",
       "move_to_trash_bulk": "ট্র্যাশে সরান",
       "move_to_trash_single": "ট্র্যাশে সরান",
       "next_page": "পরবর্তী",
@@ -10392,7 +10529,9 @@
       "trash_empty": "খালি",
       "trash_note": "খালি না করা পর্যন্ত ডিস্ক স্থান দখল করে থাকবে। এখান থেকে কিছুই স্বয়ংক্রিয়ভাবে মুছে যায় না।",
       "trash_summary": "{{sessions}}টি সেশন · {{size}}",
-      "unknown_session": "তালিকাভুক্ত নয় এমন একটি সেশন"
+      "unknown_session": "তালিকাভুক্ত নয় এমন একটি সেশন",
+      "busy_emptying": "ট্র্যাশ খালি করা হচ্ছে। শেষ হওয়া পর্যন্ত কিছু কাজ থামানো থাকবে।",
+      "empty_failed_next_step": "«স্থায়ীভাবে মুছুন» আবার চেষ্টা করুন। বিবরণ গেটওয়ে লগে আছে।"
     },
     "sessionsTab": {
       "agent": "এজেন্ট",
@@ -10574,7 +10713,8 @@
         "file_sessions_in_folder": "সেশন একটি ফোল্ডারে রাখুন",
         "file_sessions_in_folder_desc": "{{channel}}-এর নতুন সেশন সাইডবারের একটি ফোল্ডারে যায়, ফোল্ডার ছাড়া থাকে না।",
         "session_folder_name": "ফোল্ডারের নাম",
-        "session_folder_name_desc": "এই সেটিংস সেভ করলে এটি তৈরি হয়, যদি আগে থেকে না থাকে।"
+        "session_folder_name_desc": "এই সেটিংস সেভ করলে এটি তৈরি হয়, যদি আগে থেকে না থাকে।",
+        "shared_channels": "শেয়ার করা চ্যানেল"
       },
       "browserPanel": {
         "use_builtin_label": "বিল্ট-ইন ব্রাউজার ব্যবহার করুন",
@@ -10862,12 +11002,23 @@
         "start_a_gateway_on_this_machine_turn_it_off_to_u": "এই মেশিনে একটি গেটওয়ে চালু করে। বন্ধ করলে Kiro Crew শুধু ক্লায়েন্ট হিসেবে কাজ করবে এবং এখানে গেটওয়ে চালানোর বদলে আপনার কনফিগার করা গেটওয়েতে সংযুক্ত হবে। পরের বার অ্যাপ খুললে প্রযোজ্য হবে।"
       },
       "discordPanel": {
+        "allowed_server_channel_ids": "অনুমোদিত সার্ভার চ্যানেল ID",
         "allowed_server_thread_ids": "অনুমোদিত সার্ভার থ্রেড ID",
-        "allowlist_description": "DM-এ বা অনুমোদিত থ্রেডে এজেন্ট চালানোর অনুমতি আছে যেসব Discord ইউজার ID-র। খালি = সবাইকে না (ফেল ক্লোজড)।",
-        "description": "গেটওয়ে WebSocket-এর মাধ্যমে Discord DM বা স্পষ্টভাবে অনুমোদিত সার্ভার থ্রেড থেকে তোমার এজেন্টের সঙ্গে কথা বলো। সাধারণ সার্ভার চ্যানেল সবসময়ই উপেক্ষা করা হয়।",
+        "allowlist_description": "DM-এ, অনুমোদিত থ্রেডে বা অনুমোদিত চ্যানেলে এজেন্ট চালানোর অনুমতি আছে যেসব Discord ইউজার ID-র। খালি = সবাইকে না (ফেল ক্লোজড)।",
+        "auto_thread_description": "অনুমোদিত চ্যানেলে পাঠানো মেসেজ একটি নতুন পাবলিক থ্রেড খোলে, আর পালা শেয়ার করা চ্যানেলের বদলে সেখানেই চলে।",
+        "auto_thread_label": "নতুন থ্রেডে উত্তর দাও",
+        "auto_thread_off_hint": "অটো-থ্রেড বন্ধ, তাই উপরের চ্যানেলগুলোর মেসেজ উপেক্ষা করা হয়। {{productName}} কখনোই শেয়ার করা চ্যানেলে সরাসরি উত্তর দেয় না।",
+        "channel_allowlist_description": "ঐচ্ছিক। অনুমোদিত ব্যবহারকারীরা এই শেয়ার করা সার্ভার চ্যানেল থেকেও এজেন্ট চালাতে পারবে। খালি = কোনো শেয়ার করা চ্যানেল নেই।",
+        "channel_help": "Developer Mode চালু থাকলে চ্যানেলে ডান-ক্লিক করো → <mono>Copy Channel ID</mono>। চ্যানেলের নিজের ID ব্যবহার করো, তার ভিতরের কোনো থ্রেডের ID নয়।",
+        "channel_warning": "শেয়ার করা চ্যানেল থ্রেডের চেয়েও বড় একটি প্রকাশের সীমানা: যে কেউ চ্যানেলটি দেখতে পায়, আর যে কেউ পালা যে পাবলিক থ্রেডে চলছে সেটি খুলতে পারে, সে এজেন্ট যা লেখে আর তার টুল যা ছাপে সবই পড়তে পারবে। চ্যানেলের সব সদস্য এটি দেখতে পারলেই সেটি যোগ করো।",
+        "description": "গেটওয়ে WebSocket-এর মাধ্যমে Discord DM, অনুমোদিত সার্ভার থ্রেড বা অনুমোদিত সার্ভার চ্যানেল থেকে তোমার এজেন্টের সঙ্গে কথা বলো। বাকি সব সার্ভার চ্যানেল উপেক্ষা করা হয়।",
         "empty_allowlist_hint": "কোনো অনুমোদিত ইউজার ID নেই: বট প্রতিটি মেসেজ ফিরিয়ে দেয় (ফেল ক্লোজড)। নিচে তোমার Discord ইউজার ID যোগ করো।",
-        "guide_body": "Discord Developer Portal-এ একটি অ্যাপ তৈরি করো, তারপর <mono>Bot</mono> পেজ থেকে টোকেন কপি করো। শুধু DM-এর জন্য হলে প্রিভিলেজড ইন্টেন্ট বন্ধ রাখো। সার্ভার থ্রেডের জন্য <mono>Message Content Intent</mono> চালু করো, আর <mono>bot</mono> স্কোপের পাশাপাশি View Channel, Read Message History ও Send Messages in Threads দিয়ে ইনস্টল করো। Discord Developer Mode চালু করো, তারপর নিজের নামের উপর ডান-ক্লিক করে তোমার সাংখ্যিক ইউজার ID কপি করো।",
+        "guide_body": "Discord Developer Portal-এ একটি অ্যাপ তৈরি করো, তারপর <mono>Bot</mono> পেজ থেকে টোকেন কপি করো। শুধু DM-এর জন্য হলে প্রিভিলেজড ইন্টেন্ট বন্ধ রাখো। সার্ভার থ্রেডের জন্য <mono>Message Content Intent</mono> চালু করো, আর <mono>bot</mono> ও <mono>applications.commands</mono> স্কোপের পাশাপাশি View Channel, Read Message History ও Send Messages in Threads দিয়ে ইনস্টল করো। Discord Developer Mode চালু করো, তারপর নিজের নামের উপর ডান-ক্লিক করে তোমার সাংখ্যিক ইউজার ID কপি করো।",
         "open_developer_portal": "Developer Portal খোলো",
+        "reactions_description": "এজেন্ট যে ফেজে আছে, সেটি ইমোজি রিঅ্যাকশন দিয়ে তোমার মেসেজে চিহ্নিত করা হয় (কিউতে → ভাবছে → কোডিং → সম্পন্ন)। বন্ধ থাকলে তোমার মেসেজে কোনো চিহ্ন বসে না।",
+        "reactions_label": "ফেজ রিঅ্যাকশন",
+        "thinking_description": "মডেলের রিজনিংয়ের একটি প্রিভিউ উত্তরের উপরে আলাদা সাবটেক্সট নোট হিসেবে পোস্ট করা হয়। বন্ধ থাকলে চ্যানেলে শুধু উত্তরটাই থাকে।",
+        "thinking_label": "থিঙ্কিং দেখান",
         "thread_allowlist_description": "ঐচ্ছিক। অনুমোদিত ব্যবহারকারীরা কেবল ঠিক এই Discord থ্রেডগুলোতেই এজেন্ট চালাতে পারবে। খালি = শুধু DM।",
         "thread_help": "Developer Mode চালু থাকলে থ্রেডে ডান-ক্লিক করো → <mono>Copy Channel ID</mono>। থ্রেডের নিজের ID ব্যবহার করো, তার প্যারেন্ট চ্যানেলের ID নয়।",
         "thread_warning": "থ্রেড মোড Discord-এর গ্লোবাল Message Content ইন্টেন্ট চালু করে দেয়। বট যে সব সার্ভার চ্যানেল দেখতে পায়, Discord সেগুলোর কনটেন্টই পাঠায়; Kiro Crew অনুমোদিত থ্রেডের বাইরের সবকিছু ফেলে দেয়। অনুমোদিত থ্রেড দেখতে পারে এমন সবাই এজেন্টের উত্তর আর টুলের আউটপুট পড়তে পারবে।",
@@ -11372,7 +11523,9 @@
         "record_prompt": "কী চাপুন…",
         "search": "অনুসন্ধান",
         "turn_keyboard_shortcuts_on_or_off_globally": "কীবোর্ড শর্টকাট গ্লোবালি চালু বা বন্ধ করো — {{mod}} + K (এই রেফারেন্স) সবসময় কাজ করে",
-        "use_ctrl_not_option_for_chat_1_9": "চ্যাট 1–9-এর জন্য ⌃ Ctrl ব্যবহার করুন (⌥ Option নয়)"
+        "use_ctrl_not_option_for_chat_1_9": "চ্যাট 1–9-এর জন্য ⌃ Ctrl ব্যবহার করুন (⌥ Option নয়)",
+        "clear_shortcut": "সাফ করুন",
+        "panel_toggles": "প্যানেল টগল"
       },
       "skillsPanel": {
         "analyze_each_completed_session_and_draft_a_reusa": "প্রতিটি সম্পন্ন সেশন বিশ্লেষণ করে, সেশনটি কোনো পুনরাবৃত্ত প্রক্রিয়া দেখালে — অর্থাৎ এমন প্রক্রিয়া যা ভবিষ্যতের কোনো সেশন ভিন্ন লক্ষ্যে আবার চালাবে — পুনর্ব্যবহারযোগ্য SKILL.md-এর খসড়া তৈরি করে। ডিফল্টভাবে বন্ধ। খসড়াগুলো পর্যালোচনার জন্য স্কিল ট্যাবের অপেক্ষমাণ কিউতে রাখা হয় — আপনার অনুমোদন ছাড়া কিছুই সক্রিয় হয় না (নিচে দেখুন)।",
@@ -11455,7 +11608,7 @@
         "installs_mlx_whisper_via_pipx_ffmpeg_apple_silic": "pipx দিয়ে mlx-whisper ও ffmpeg ইনস্টল করে। শুধু Apple Silicon (arm64)।",
         "installs_openai_whisper_ffmpeg_uses_system_pytho": "openai-whisper ও ffmpeg ইনস্টল করে। সিস্টেমের python3 (≥ 3.10) ব্যবহার করে।",
         "language": "ভাষা",
-        "larger_models_are_more_accurate_but_slower_to_ru": "বড় মডেল বেশি নির্ভুল কিন্তু চলতে ধীর",
+        "larger_models_are_more_accurate_but_slower_to_ru": "বড় মডেল বেশি নির্ভুল কিন্তু চলতে ধীর। মডেলটি প্রথম ব্যবহারে ডাউনলোড হয়, তাই মডেল পরিবর্তনের পর প্রথম ডিক্টেশন ডাউনলোড শেষ না হওয়া পর্যন্ত আটকে আছে বলে মনে হতে পারে বা সময় শেষ হয়ে যেতে পারে।",
         "microphone": "মাইক্রোফোন",
         "microphone_2": "মাইক্রোফোন {{n}}",
         "mlx_model": "MLX মডেল",
@@ -11492,7 +11645,7 @@
         "us_east_1": "us-east-1",
         "whisper_and_mlx_run_locally_transcribe_calls_aws": "Whisper, MLX এবং Apple Speech স্থানীয়ভাবে চলে; Transcribe AWS-কে কল করে",
         "whisper_installed_but_ffmpeg_is_missing_voice_tr": "Whisper ইনস্টল হয়েছে কিন্তু ffmpeg নেই — ভয়েস ট্রান্সক্রিপশনের জন্য ffmpeg দরকার।",
-        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Apple MLX (Metal GPU)-এ চলা Whisper মডেল। প্রথম ব্যবহারে ডাউনলোড হয়।",
+        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Apple MLX (Metal GPU)-এ চলা Whisper মডেল। প্রথম ব্যবহারে ডাউনলোড হয়, তাই প্রথম ডিক্টেশন ডাউনলোড শেষ না হওয়া পর্যন্ত আটকে আছে বলে মনে হতে পারে বা সময় শেষ হয়ে যেতে পারে।",
         "ptt_altgr_note": "অধিকাংশ Windows ও Linux কীবোর্ডে ডান Alt কী আসলে AltGr, যা উচ্চারণ-চিহ্নযুক্ত অক্ষর টাইপ করতে সাহায্য করে — তাই এখানে একক Option ডিফল্ট হতে পারে না।",
         "ptt_heading": "একটি কী দিয়ে ডিক্টেশন শুরু করুন",
         "ptt_heading_desc": "মাইক্রোফোন বাটনে ক্লিক করার বদলে একটি কী চেপে কথা বলা শুরু করুন। ডান Option ⌥ শুরু থেকেই কাজ করে — এখানে সব কিছু যেমন আছে তেমনই রাখা যায়।",
@@ -11741,6 +11894,70 @@
         "wechat_login_qr_code": "WeChat লগইন QR কোড",
         "who_can_message_the_bot": "কারা বটকে মেসেজ করতে পারবে",
         "wxid": "wxid_…"
+      },
+      "whatsAppPanel": {
+        "status_unavailable": "স্ট্যাটাস অনুপলব্ধ",
+        "setup_guide": "সেটআপ গাইড",
+        "whatsapp": "WhatsApp",
+        "connected": "সংযুক্ত",
+        "not_signed_in": "পেয়ার করা নেই",
+        "pair_with_whatsapp": "WhatsApp দিয়ে পেয়ার করুন",
+        "scan_the_code_from_linked_devices": "আপনার ফোনে WhatsApp দিয়ে কোডটি স্ক্যান করুন: সেটিংস, লিঙ্ক করা ডিভাইস, একটি ডিভাইস লিঙ্ক করুন।",
+        "signed_in_restart_the_gateway_to_start_receiving": "পেয়ার হয়েছে। বার্তা পাওয়া শুরু করতে gateway পুনরায় চালু করুন।",
+        "talk_to_your_agent_from_your_own_whatsapp": "লিঙ্ক করা ডিভাইস হিসেবে পেয়ার করা আপনার নিজের WhatsApp অ্যাকাউন্ট থেকে আপনার এজেন্টের সঙ্গে কথা বলুন। এজেন্ট যে বার্তা পাঠায় তা আপনার নম্বর থেকে আসে।",
+        "waiting_for_a_code": "একটি কোডের অপেক্ষা করা হচ্ছে...",
+        "waiting_for_scan": "স্ক্যানের অপেক্ষা করা হচ্ছে...",
+        "scanned_confirm_on_your_phone": "স্ক্যান হয়েছে। আপনার ফোনে নিশ্চিত করুন।",
+        "the_code_expired_try_again": "কোডের মেয়াদ শেষ হয়ে গেছে। আবার চেষ্টা করুন।",
+        "could_not_start_pairing": "পেয়ারিং শুরু করা যায়নি।",
+        "could_not_start_the_login_flow": "পেয়ারিং প্রক্রিয়া শুরু করা যায়নি।",
+        "whatsapp_pairing_qr_code": "WhatsApp পেয়ারিং QR কোড",
+        "enable_the_whatsapp_channel": "WhatsApp চ্যানেল সক্ষম করুন",
+        "who_can_message_the_bot": "কে এজেন্টকে মেসেজ পাঠাতে পারবে",
+        "only_me_the_default": "শুধু আমি (আমার নিজের বার্তা)",
+        "me_plus_allowed_numbers": "আমি, সঙ্গে অনুমোদিত নম্বর",
+        "nobody_ignore_all_messages": "কেউ নয় (সব বার্তা উপেক্ষা করুন)",
+        "anyone_who_messages_you": "যে কেউ বটকে মেসেজ করলেই",
+        "allowed_wa_ids": "অনুমোদিত নম্বর",
+        "allowed_numbers_empty_adds_nobody": "ফোন নম্বর (দেশের কোডসহ সংখ্যা, প্লাস চিহ্ন ছাড়া) যারা এজেন্টের সঙ্গে চ্যাটও করতে পারবে। খালি রাখলে আপনি ছাড়া আর কাউকে যোগ করা হয় না।",
+        "phone_number_placeholder": "447700900000",
+        "created_for_you_when_you_turn_this_on_if_it_does": "আপনি এটি চালু করলে, যদি এটি এখনও না থাকে তবে আপনার জন্য তৈরি করা হয়।",
+        "group_participation_is_opt_in_per_group": "গ্রুপে অংশগ্রহণ প্রতিটি গ্রুপে আলাদাভাবে ঐচ্ছিক: মেনশন মোড শুধু ট্যাগ করা হলে উত্তর দেয়; নিয়ম মোড কুলডাউনসহ না বলা সত্ত্বেও সাহায্য করতে পারে। এটি অনানুষ্ঠানিক WhatsApp Web প্রোটোকল ব্যবহার করে; ব্যবহার ব্যক্তিগত পরিসরে সীমিত রাখুন।",
+        "waiting_to_be_paired": "পেয়ারিংয়ের অপেক্ষায়",
+        "the_link_was_revoked": "লিঙ্ক বাতিল করা হয়েছে",
+        "blocked_by_whatsapp": "WhatsApp ব্লক করেছে",
+        "paired_but_not_connected": "পেয়ার করা আছে, কিন্তু সংযুক্ত নয়",
+        "whatsapp_did_not_connect": "WhatsApp সংযুক্ত হয়নি: {{error}}",
+        "the_channel_is_enabled_but_not_running": "চ্যানেল চালু আছে কিন্তু চলছে না। gateway পুনরায় চালু করুন।",
+        "show_pairing_code": "পেয়ারিং কোড দেখান",
+        "already_paired_unlink_then_restart": "ইতিমধ্যেই পেয়ার করা আছে। অন্য কোনো ডিভাইস পেয়ার করতে নিচে এই ডিভাইসের লিঙ্ক সরিয়ে নিন, তারপর gateway পুনরায় চালু করুন।",
+        "the_link_was_revoked_restart_to_pair_again": "লিঙ্ক বাতিল করা হয়েছে। আবার একটি ডিভাইস পেয়ার করতে gateway পুনরায় চালু করুন।",
+        "blocked_number_cannot_pair": "WhatsApp এই নম্বরটি ব্লক করেছে, তাই পেয়ারিং শুরু করা যাবে না।",
+        "pairing_starts_when_the_channel_starts": "পেয়ারিং কোড শুধু চ্যানেল পেয়ারিং করার সময়েই থাকে, আর পেয়ারিং শুরু হয় চ্যানেল চালু হওয়ার সময়। নিচে চ্যানেল চালু করুন, তারপর gateway পুনরায় চালু করুন।",
+        "the_channel_is_not_running_enable_and_restart": "WhatsApp চ্যানেল চলছে না। নিচে এটি চালু করুন, তারপর gateway পুনরায় চালু করুন।",
+        "unlink_this_device": "এই ডিভাইসের লিঙ্ক সরান",
+        "revokes_the_linked_device_on_your_account": "আপনার WhatsApp অ্যাকাউন্টে এই লিঙ্ক করা ডিভাইসটি বাতিল করে এবং স্থানীয় সেশন মুছে দেয়। আবার কোনো ডিভাইস পেয়ার না করা পর্যন্ত এজেন্ট পড়া ও পাঠানো বন্ধ রাখে।",
+        "confirm_unlink": "লিঙ্ক সরানো নিশ্চিত করুন",
+        "unlinked_restart_to_pair_again": "লিঙ্ক সরানো হয়েছে। আবার একটি ডিভাইস পেয়ার করতে gateway পুনরায় চালু করুন।",
+        "unlinked_but_the_session_file_was_kept": "WhatsApp থেকে লিঙ্ক সরানো হয়েছে, কিন্তু স্থানীয় সেশন ফাইলটি মুছে ফেলা যায়নি। আবার পেয়ার করার আগে ডেটা ডিরেক্টরি থেকে এটি মুছে ফেলুন।",
+        "whatsapp_refused_the_unlink_still_linked": "WhatsApp লিঙ্ক সরানো প্রত্যাখ্যান করেছে, তাই ডিভাইসটি এখনও লিঙ্ক করা আছে এবং স্থানীয় সেশনও রাখা হয়েছে। আবার চেষ্টা করুন, বা ফোনের লিঙ্ক করা ডিভাইস তালিকা থেকে এটি বাতিল করুন।",
+        "channel_not_running_so_nothing_was_unlinked": "চ্যানেল চলছে না, তাই কিছুই সরানো হয়নি। লিঙ্ক করা ডিভাইস লিঙ্ক করাই থাকে: ফোনের লিঙ্ক করা ডিভাইস তালিকা থেকে এটি বাতিল করুন।",
+        "could_not_unlink_the_device": "ডিভাইসের লিঙ্ক সরানো যায়নি।",
+        "groups": "গ্রুপ",
+        "the_agent_ignores_every_group_not_listed": "এখানে তালিকায় নেই এমন প্রতিটি গ্রুপ এজেন্ট উপেক্ষা করে।",
+        "add_a_group": "গ্রুপ যোগ করুন",
+        "your_groups_load_once_the_channel_is_connected": "চ্যানেল সংযুক্ত হলে আপনার গ্রুপগুলো এখানে দেখা যাবে।",
+        "every_group_you_joined_is_already_listed": "আপনি যেসব গ্রুপে আছেন, সবগুলোই ইতিমধ্যে তালিকায় আছে।",
+        "how_the_agent_joins_in": "এজেন্ট কীভাবে যোগ দেয়",
+        "mode_only_when_mentioned": "শুধু মেনশন বা উদ্ধৃত হলে",
+        "mode_also_when_the_rules_apply": "নিয়ম প্রযোজ্য হলেও",
+        "mode_off_keeping_the_entry": "বন্ধ, এন্ট্রি রেখে দেওয়া হবে",
+        "when_the_agent_may_speak": "এজেন্ট কখন বলতে পারবে",
+        "the_agent_stays_silent_unless_these_apply": "মুক্ত লেখা। এই নিয়মগুলো স্পষ্টভাবে প্রযোজ্য না হলে এজেন্ট চুপ থাকে।",
+        "rules_example_placeholder": "3D প্রিন্টিং সম্পর্কে প্রশ্নের উত্তর দেওয়া",
+        "seconds_between_unprompted_replies": "না চাইতেই দেওয়া উত্তরের মধ্যে সেকেন্ড",
+        "remove_name_from_the_group_list": "গ্রুপ তালিকা থেকে {{name}} সরান",
+        "unofficial_protocol_ban_risk": "অনানুষ্ঠানিক প্রোটোকল: WhatsApp সংযুক্ত নম্বরটি নিষিদ্ধ করতে পারে। যে নম্বর হারানো আপনার পক্ষে সম্ভব নয়, সেটি সংযুক্ত করবেন না।"
       },
       "remoteCrewPanel": {
         "your_crews": "Your crews",
@@ -12190,7 +12407,7 @@
         "label": "ব্রাউজার"
       },
       "channels": {
-        "description": "এজেন্ট যেসব চ্যাট প্ল্যাটফর্মে বার্তা পাঠাতে ও গ্রহণ করতে পারে — Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, WeChat",
+        "description": "এজেন্ট যেসব চ্যাট প্ল্যাটফর্মে বার্তা পাঠাতে ও গ্রহণ করতে পারে",
         "label": "চ্যানেল"
       },
       "chat": {

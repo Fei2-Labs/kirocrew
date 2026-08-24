@@ -13,7 +13,7 @@ test collected from any testpath, because what they protect is the
 developer's machine rather than the correctness of one suite. Everything that is
 merely suite-specific isolation stays in ``test/conftest.py``.
 
-The floor has five parts, and each one exists because the "remember to isolate
+The floor has six parts, and each one exists because the "remember to isolate
 this" contract failed at least once:
 
 * **Services.** ``$XDG_CONFIG_HOME`` is redirected and the stdlib spawn funnels
@@ -25,6 +25,10 @@ this" contract failed at least once:
   under ``src/kiro_crew/apps/builtins/*/tests/`` -- which see this conftest and no
   other -- write the operator's live ``~/.kiro/crew`` the moment they touch
   ``config_dir()``.
+* **Credential environment.** Recognised fixed credentials and validated
+  ``JIRA_TOKEN_<HEX>`` keys are restored after every test, so a fabricated
+  ``.env`` cannot silently override the next test's credentials in the same
+  worker.
 * **The agent-spec home.** ``kiro_agents_dir()`` is a LAZY resolver, so neither of
   the two above reaches it, and a test that reaches the spec write path rewrites
   the machine-wide ``<kiro home>/agents/kirocrew.json`` -- the file that decides
@@ -360,6 +364,51 @@ def _isolate_launchd_paths(_xdg_config_root, monkeypatch):
             continue
         for attr, value in attrs.items():
             monkeypatch.setattr(already, attr, value, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_credential_env_residue():
+    """Restore the credential env vars a test may have had INJECTED into it.
+
+    ``KiroCrewConfig.load_credentials()`` deliberately propagates every credential
+    it reads into ``os.environ`` with ``setdefault``, so a spawned child (sandboxed
+    agent, MCP server, cron subprocess) inherits it through ``Popen``'s default
+    ``env=os.environ.copy()``. Any test that points ``env_path()`` at a fabricated
+    ``.env`` therefore leaves those fake credentials in the WORKER's environment,
+    for every test that follows it.
+
+    The usual guard does not catch this, which is what makes it worth a floor:
+    ``monkeypatch.delenv(KEY, raising=False)`` on a key that is ABSENT records
+    nothing to undo, so a value written during the test is restored to nothing.
+
+    And the residue is not inert -- ``load_credentials`` lets ``os.environ`` WIN
+    over the file it just read, so the next test pointing at a different ``.env``
+    is answered with the previous test's token. Observed between
+    ``test_handlers_messaging_coverage.py`` and ``test_review_fixes.py``: a Slack
+    token from one file's temp ``.env`` silently satisfied the other's assertion,
+    and only when both landed in the same worker.
+
+    Bounded to the recognised fixed keys and the validated ``JIRA_TOKEN_<HEX>``
+    shape. Two linear environment scans per test also catch a dynamic key that
+    did not exist at setup, without masking an unrelated environment change.
+    """
+    from kiro_crew.config.loader import _CREDENTIAL_KEYS, _JIRA_TOKEN_RE
+
+    fixed = frozenset(_CREDENTIAL_KEYS)
+
+    def _is_credential(key: str) -> bool:
+        return key in fixed or _JIRA_TOKEN_RE.match(key) is not None
+
+    before = {key: value for key, value in os.environ.items() if _is_credential(key)}
+    try:
+        yield
+    finally:
+        current = {key for key in os.environ if _is_credential(key)}
+        for key in current | before.keys():
+            if key not in before:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = before[key]
 
 
 @pytest.fixture(autouse=True)

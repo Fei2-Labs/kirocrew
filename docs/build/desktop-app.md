@@ -42,19 +42,12 @@ The electron-builder configuration lives in
   restricts them, so the accent is one tone. Nothing is painted behind the icon
   captions either — Finder draws them in dark text even under Dark Mode, so they
   read on the accent directly.
-- Windows target: assisted NSIS. Its borderless, theme-aware 1280×860
-  composition fits proportionally inside the Windows work area and puts native
-  localized controls over light/dark frosted-glass artwork, with
-  current/all-user scope, destination, shortcut and startup choices on one page.
-  Current user remains the no-UAC default; all users elevates into Program Files.
-  A fresh custom destination is normalized to an app-owned product-name leaf,
-  because the generated uninstaller recursively removes its install directory.
-  The options and completion pages reuse all eight opening characters with a
-  staggered entrance and calm bob. The native extraction page replays the same
-  entrance before its progress bar advances; twelve theme-paired 24-bit
-  whole-scene bitmap frames provide the motion without embedding a browser or
-  WebView. When Windows animation effects are disabled, every page settles on a
-  still frame instead.
+- Windows target: assisted NSIS. A 164×314 welcome/finish sidebar and a 150×57
+  page header reuse the Kiro Crew logo while preserving native NSIS controls,
+  localization, the per-user default, and the no-UAC default path. The installer
+  deliberately has no custom page animation or timer work on the NSIS UI thread;
+  Windows CI installs the real artifact, records its duration, and enforces a
+  5-minute ceiling.
 - linux targets: `AppImage`, `deb`, `rpm` (category `Development`). One backend
   tree is packaged three times, with `scripts/stamp-distribution.sh` re-run
   between electron-builder invocations so each artifact's beacon `dist` names
@@ -77,27 +70,6 @@ running **natively** on both Apple Silicon and Intel Macs. It needs only
 **one Apple-Silicon machine** — no Intel host, no second build. (It requires
 an Apple-Silicon host with Rosetta 2; the script fails fast with instructions
 otherwise, and `UNIVERSAL=0` is the opt-out.)
-
-### Bundled kiro-cli — the app carries its own agent runtime
-
-By default (`BUNDLE_KIRO_CLI=1`), the build stages a pinned, sha256-verified
-kiro-cli into the app's resources at `backend-dist/kiro-cli/`: the version is
-resolved from the official release manifest and the archive is verified
-fail-closed before staging, mirroring the Docker image's kiro-cli install. On
-macOS the binaries are extracted from the universal `Kiro CLI.dmg` (one copy
-serves both arches); Linux uses the matching per-arch zip. A
-`BUNDLED-VERSION` file beside the payload records provenance.
-
-At runtime the Electron shell exports the directory as
-`KIROCREW_BUNDLED_KIRO_DIR` when it spawns the gateway; the backend resolver
-ranks it **above** any system install (the app was built against that exact
-version) but **below** the `KIROCREW_KIRO_BIN` operator override. `kiro-cli
-login` is still the user's own step — bundling covers the binary, never the
-credential.
-
-`BUNDLE_KIRO_CLI=0 make desktop` opts a build out (the payload is large);
-the app then detects a system kiro-cli exactly as before. Windows builds
-never bundle (upstream ships only an MSI there).
 
 ### macOS opt-out and Linux — host-arch-only builds
 
@@ -319,10 +291,7 @@ Step by step:
    and run `node packaging/installer-assets/build-assets.mjs` to regenerate the
    TIFF and BMPs. That script is the only place that knows the output shapes
    the two installers require — a multi-representation TIFF for Retina, and
-   24-bit BMPs, which NSIS cannot read at the 32-bit depth `sips` emits. Windows
-   uses two full light/dark surfaces plus twelve theme-paired, whole-scene
-   1280×860 animation frames. Rendering each state as one surface keeps native
-   scaling coherent and avoids seams between independently stretched crops.
+   24-bit BMPs, which NSIS cannot read at the 32-bit depth `sips` emits.
 
 ### Build flags
 

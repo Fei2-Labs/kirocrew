@@ -14,6 +14,10 @@ import pytest
 from kiro_crew.llm_helpers import LLMEvent
 from kiro_crew.slack.handler import _PendingApproval
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 
 def _make_gateway():
     from kiro_crew.slack.gateway import GatewayOrchestrator

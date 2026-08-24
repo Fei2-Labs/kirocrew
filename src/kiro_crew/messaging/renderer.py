@@ -14,9 +14,10 @@ degrades to a numbered text list the user can answer by typing. The cap is
 ENFORCED (see ``test/test_capability_ledger.py``) and pinned per channel by
 the cross-channel contract test in ``test/test_options_cap_contract.py`` —
 a widget-capable renderer that skips the helper fails that test.
-Channels declaring ``max_buttons=0`` render no widget and today strip the
-trailer entirely; the numbered-text fallback for them lands with the
-approval-ladder work.
+Channels declaring ``max_buttons=0`` render no widget and route the whole
+trailer through :func:`render_options_as_text`, which reaches the same helper
+with zero widget slots: every choice becomes a numbered line the user answers by
+typing, rather than being deleted along with the trailer.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from kiro_crew.constants import OPTIONS_RE_TRAILER
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
@@ -52,9 +54,13 @@ class OutputEvent:
     kind: str
     text: str = ""  # text_chunk / thinking
     tool_call_id: str = ""  # tool_call
-    title: str = ""  # tool_call (tool name / "Running: X")
+    # ``title``/``tool_purpose`` describe a tool on BOTH kinds that carry one:
+    # tool_call announces it, prompt_choice asks permission for it. Carrying them
+    # on the prompt is what lets a renderer name the tool the request is actually
+    # about instead of the last one it happened to see.
+    title: str = ""  # tool_call / prompt_choice (tool name / "Running: X")
     tool_kind: str = ""  # tool_call (e.g. "read"/"execute" — drives phase emoji)
-    tool_purpose: str = ""  # tool_call (human-readable purpose -> task title)
+    tool_purpose: str = ""  # tool_call / prompt_choice (human-readable purpose)
     options: list[dict[str, Any]] = field(default_factory=list)  # prompt_choice
     request_id: str | int = ""  # prompt_choice correlation
     context_usage_pct: float = 0.0  # compaction
@@ -94,10 +100,11 @@ def cap_choices(
 ) -> tuple[list[str], list[str]]:
     """Split a parsed ``[OPTIONS:]`` list at ``capabilities.max_buttons``.
 
-    Returns ``(kept, overflow)``. ``max_buttons <= 0`` keeps nothing (the
-    zero-widget channels own their trailer handling). Pure — callers that
-    must transform choices before display (Slack redacts at the sink) split
-    here and format overflow themselves via :func:`format_overflow`.
+    Returns ``(kept, overflow)``. ``max_buttons <= 0`` keeps nothing and
+    overflows everything, which is what makes a zero-widget channel the
+    all-overflow case rather than a special case. Pure — callers that must
+    transform choices before display (Slack redacts at the sink) split here and
+    format overflow themselves via :func:`format_overflow`.
     """
     n = capabilities.max_buttons
     if n <= 0:
@@ -197,29 +204,59 @@ def apply_options_cap(
     widget, so the cap lives in shared code and the per-channel contract
     test can pin it.
 
-    Returns ``(body, kept_choices)``:
+    Returns ``(body, kept_choices)``: the first ``max_buttons`` choices are kept
+    for the widget and the remainder is appended to ``body`` as a numbered text
+    list, numbering continued after the widget slots, rather than dropped — so
+    the user still learns those choices exist. A list that fits is a
+    byte-identical pass-through.
 
-    * ``len(choices) <= max_buttons`` — byte-identical pass-through.
-    * overflow — the first ``max_buttons`` choices are kept for the widget;
-      the remainder is appended to ``body`` as a numbered text list
-      (numbering continues after the widget slots) rather than dropped, so
-      the user still learns those choices exist.
-    * ``max_buttons <= 0`` — returns ``(body, [])``; zero-widget channels
-      own their trailer handling (today: strip).
+    ``max_buttons <= 0`` needs no branch of its own: :func:`cap_choices` keeps
+    nothing and overflows everything, so a button-less channel is the
+    all-overflow case and every choice becomes a numbered line through the same
+    sanitising sink. Dropping the list there would delete the answers to a
+    question the agent just asked and leave the user no way to see what was
+    offered.
     """
-    if capabilities.max_buttons <= 0:
-        return body, []
     kept, overflow = cap_choices(choices, capabilities)
     if not overflow:
         return body, kept
     lines = format_overflow(overflow, start=len(kept))
-    if not body:
-        sep = ""
-    elif body.endswith("\n"):
-        sep = "\n"
-    else:
-        sep = "\n\n"
+    sep = "" if not body else ("\n" if body.endswith("\n") else "\n\n")
     return f"{body}{sep}{lines}", kept
+
+
+def render_options_as_text(text: str, capabilities: TransportCapabilities) -> str:
+    """Rewrite a trailing ``[OPTIONS:]`` trailer in *text* as numbered text.
+
+    The whole trailer handling for a channel that renders no widget, so every
+    channel that renders none shares one implementation instead of a copy each.
+    Returns the body only; the widget half of :func:`apply_options_cap` has
+    nothing to keep at ``max_buttons == 0``.
+
+    Only a COMPLETE marker at the very end is recognised, via the shared
+    ``OPTIONS_RE_TRAILER``. Everything else is returned untouched, and both halves
+    of that matter:
+
+    * A quoted ``[OPTIONS:`` mid-answer cannot swallow the body between it and
+      some later ``]`` — the end-of-buffer anchor is what prevents that.
+    * An UNFINISHED ``[OPTIONS`` tail is left alone rather than stripped. It reads
+      like a marker still arriving, but this helper cannot tell a live frame from
+      a sealed answer, and its callers here do not stream at all — they buffer a
+      whole turn and send once — so for them such a tail is simply the assistant's
+      prose and cutting it is permanent data loss. A reply ending
+      ``see the [OPTIONS section`` keeps its last four words. The one zero-widget
+      channel that DOES stream (WeCom) trades the other way and hides the tail,
+      in its own ``wecom.renderer._render_options_as_text``: there the cost is a
+      transient cosmetic flash whose next frame replaces the bubble anyway.
+
+    Stripping a genuine steering frame is ``TurnDriver``'s job and happens before
+    a renderer sees the text.
+    """
+    match = OPTIONS_RE_TRAILER.search(text)
+    if not match:
+        return text
+    choices = [c.strip() for c in match.group(1).split("|") if c.strip()]
+    return apply_options_cap(text[: match.start()].rstrip(), choices, capabilities)[0]
 
 
 class Renderer(ABC):
@@ -354,8 +391,26 @@ class Renderer(ABC):
         """
 
     @abstractmethod
-    async def on_prompt_choice(self, options: list[dict[str, Any]], request_id: str | int) -> None:
-        """Render an interactive approval/choice prompt (first-class)."""
+    async def on_prompt_choice(
+        self,
+        options: list[dict[str, Any]],
+        request_id: str | int,
+        tool_title: str = "",
+        tool_purpose: str = "",
+    ) -> None:
+        """Render an interactive approval/choice prompt (first-class).
+
+        ``tool_title`` is the tool THIS request asks about, taken from the
+        permission event itself, and ``tool_purpose`` is the purpose the matching
+        ``tool_call`` declared. Name the tool from these, not from a remembered
+        earlier ``on_tool_call``: a permission is not always immediately preceded
+        by its own titled tool call, so a remembered name is the PREVIOUS tool's,
+        and the operator would be consenting to something other than what they
+        read. Both are defaulted, so a renderer that has no name to show stays
+        valid; a renderer that keeps its own fallback should prefer these when
+        they are non-empty and must not pair a supplied title with a remembered
+        purpose from a different tool.
+        """
 
     @abstractmethod
     async def on_compaction(self, context_usage_pct: float) -> None:
@@ -385,7 +440,9 @@ class Renderer(ABC):
                 event.tool_call_id, event.title, event.tool_kind, event.tool_purpose
             )
         elif event.kind == PROMPT_CHOICE:
-            await self.on_prompt_choice(event.options, event.request_id)
+            await self.on_prompt_choice(
+                event.options, event.request_id, event.title, event.tool_purpose
+            )
         elif event.kind == COMPACTION:
             await self.on_compaction(event.context_usage_pct)
         elif event.kind == DONE:
@@ -454,7 +511,13 @@ class SilentRenderer(Renderer):
     ) -> None:
         return None
 
-    async def on_prompt_choice(self, options: list[dict[str, Any]], request_id: str | int) -> None:
+    async def on_prompt_choice(
+        self,
+        options: list[dict[str, Any]],
+        request_id: str | int,
+        tool_title: str = "",
+        tool_purpose: str = "",
+    ) -> None:
         return None
 
     async def on_compaction(self, context_usage_pct: float) -> None:

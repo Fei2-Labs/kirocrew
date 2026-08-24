@@ -1916,6 +1916,17 @@
           "connect_repo": "リポジトリを接続",
           "general": "一般",
           "repository_settings": "リポジトリ設定"
+        },
+        "depsSection": {
+          "title": "依存関係",
+          "blocked_by": "ブロック元",
+          "blocking": "ブロック先",
+          "state_open": "open",
+          "state_closed": "closed",
+          "state_merged": "merged",
+          "source_native": "native",
+          "source_inferred": "inferred",
+          "open_here": "{{sigil}}{{number}} をここで開く"
         }
       },
       "connectPanel": {
@@ -2180,7 +2191,8 @@
         },
         "registry": {
           "overview": "概要",
-          "tagging": "タグ付け"
+          "tagging": "タグ付け",
+          "graph": "グラフ"
         },
         "settings": {
           "generalSettings": {
@@ -2340,6 +2352,45 @@
           "untagged_issues": "タグなし Issue",
           "what_you_see_below_is_the_previous_result_not_th": "以下に表示されている内容は、現在の状態ではなく、以前の結果です。",
           "write_every_staged_label_to": "ステージ済みのラベルをすべて {{provider}} に書き込む"
+        },
+        "graphView": {
+          "header": "依存関係",
+          "views_label": "依存関係ビュー",
+          "tab_frontier": "フロンティア",
+          "tab_focus": "フォーカスツリー",
+          "jump_label": "項目へジャンプ",
+          "jump_placeholder": "項目 # へジャンプ…",
+          "loading": "依存関係を読み込み中…",
+          "refresh": "依存データを更新",
+          "ready_count": "新たに {{n}} 件解放",
+          "frontier_heading": "フロンティア",
+          "frontier_sub": "新たに {{ready}} 件解放 · 待機中 {{waiting}} 件",
+          "no_frontier": "依存関係が記録されたオープン項目はありません。",
+          "waiting_heading": "待機中（{{n}}）",
+          "more_waiting": "… ほか {{n}} 件",
+          "why_all_satisfied": "すべてのブロッカーが解消: {{refs}}",
+          "why_waiting": "待機中: {{refs}}",
+          "why_satisfied": "解消済み: {{refs}}",
+          "open_tree": "ツリーを開く →",
+          "frontier_caption": "新たに解放された項目は、記録上のブロッカーがすべてクローズまたはマージ済みです。項目を開くと理由を展開、またはそのツリーを開きます。",
+          "focus_caption": "選択した項目のライブ依存ツリー全体。ノードをクリックで再ルート、Enter で開きます。破線=推定、取り消し線=解消済み。",
+          "focus_empty": "項目を選択すると依存ツリーを描画します。",
+          "tree_stat": "{{kind}}-{{number}} のツリー: {{nodes}} ノード · {{edges}} ライブエッジ",
+          "ghost_satisfied": "解消済み",
+          "ci_fail": "CI 失敗",
+          "led_wait": "WAIT",
+          "led_ready": "RDY",
+          "led_run": "RUN",
+          "led_done": "DONE",
+          "led_open": "OPEN",
+          "aria_tree": "{{kind}}-{{number}} の依存ツリー: {{nodes}} ノード、{{edges}} ライブエッジ",
+          "aria_node": "{{kind}}-{{number}}、{{state}}: {{title}}",
+          "empty_board": "未実装ボード",
+          "empty_title": "依存関係はまだありません",
+          "empty_blurb": "このリポジトリには描画できる依存エッジがありません。gh issue edit --add-blocked-by でネイティブ依存を設定するか、次回同期時に Issue Radar が相互参照から推定します。",
+          "empty_unavailable_title": "依存データを取得できません",
+          "empty_unavailable_blurb": "依存グラフを読み込めませんでした。このリポジトリで deps ルートが未有効の可能性があります。利用可能になったら再試行してください。",
+          "retry": "再試行"
         }
       },
       "welcomeCarousel": {
@@ -3799,7 +3850,9 @@
         "co_author": "共著者",
         "co_author_conflict": "共著者がこのファイルを変更しました",
         "co_author_conflict_discard": "編集を破棄して再度読み込む",
+        "co_author_conflict_discard_button": "編集を破棄",
         "co_author_conflict_discard_confirm": "「{{file}}」への保存されていない編集を破棄して、共著者のバージョンを読み込みますか？これは取り消せません。",
+        "co_author_conflict_discard_title": "保存されていない編集を破棄しますか？",
         "commit_and_push": "コミット＆プッシュ",
         "commit_message_prompt": "このコミットについて説明してください。ペーパー内のすべての変更をステージングします。",
         "compile": "コンパイル",
@@ -4117,6 +4170,10 @@
           "advance_to_design": "承認 → デザイン",
           "advance_to_tasks": "承認 → タスク",
           "an_agent_will_work_through_the_task_list": "エージェントがタスクリストを処理します",
+          "approved": "承認済み",
+          "approved_by_user": "{{user}} が承認",
+          "archive_this_spec": "このスペックをアーカイブ",
+          "changed_since_approval": "承認後に変更あり",
           "clear": "クリア",
           "close_esc": "閉じる（Esc）",
           "close_review_view": "レビュービューを閉じる",
@@ -4124,23 +4181,29 @@
           "drafting_design": "設計を作成中…",
           "drafting_tasks": "タスクを作成中…",
           "drag_or_use_to_resize": "ドラッグまたは ← → を使用してサイズ変更",
+          "duplicate_this_spec": "このスペックを複製",
           "expand_document_for_review": "ドキュメントを展開してレビュー",
           "expand_for_review_esc_to_close": "レビュー用に展開（Esc で閉じる）",
+          "name_for_the_copy": "コピーの名前",
           "pause": "一時停止",
           "pausing": "一時停止中…",
           "pending_comment_other": "{{count}} 件の保留中のコメント",
           "remove_comment_on": "{{document}} のコメントを削除",
+          "rename_this_spec_label_the_folder_name_stays": "このスペックのラベルを変更します。フォルダー名とブランチ名はそのままです。",
           "resize_document_panel": "ドキュメントパネルのサイズ変更",
+          "restore_this_spec": "このスペックを復元",
           "review_document": "{{document}} をレビュー",
           "send_all_to_agent": "すべてをエージェントに送信",
           "sending": "送信中…",
+          "spec_label": "スペックのラベル",
           "start_building": "ビルド開始",
           "starting": "開始中…",
           "tab_design": "デザイン",
           "tab_requirements": "要件",
           "tab_tasks": "タスク",
-          "tells_the_agent_this_phase_is_approved_and_to_mo": "エージェントにこのフェーズが承認されたことを伝え、次に進むように指示します — チャットで入力するのと同じです",
+          "tells_the_agent_this_phase_is_approved_and_to_mo": "この版への承認を記録し、エージェントに次へ進むよう伝えます",
           "the_agent_is_writing_the_next_document": "承認済み — エージェントが次のドキュメントを作成しています",
+          "this_document_changed_after_it_was_approved": "このドキュメントは承認後に変更されました",
           "working": "処理中…"
         },
         "specRail": {
@@ -4173,6 +4236,17 @@
           "tool_calls": "ツール呼び出し",
           "turns": "ターン",
           "worktree": "ワークツリー"
+        },
+        "taskList": {
+          "done": "完了",
+          "done_of_total": "{{total}} 件中 {{done}} 件完了",
+          "no_tasks_yet": "タスクはまだありません。設計を承認すると、順序付けられたタスクリストがここに表示され、1 件ずつ実行できます。",
+          "pause_the_build_first": "1 件だけ実行する前にビルドを一時停止してください",
+          "run": "実行",
+          "run_only_this_task_and_stop": "このタスクだけを実行して停止します",
+          "run_task": "タスクを実行：{{task}}",
+          "starting": "開始中…",
+          "task_progress": "タスクの進捗"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "作成したいことを説明し、いくつかの質問に答えて、確認済みのプラン — 要件、デザイン、タスク — を取得すれば、エージェントがそれを実行できます。",
@@ -4452,8 +4526,11 @@
       "this_app_provides_agents_and_skills_but_no_visua": "このアプリはエージェントとスキルを提供しますが、ビジュアルインターフェースはありません。\n            チャットからそのエージェントを使用します。"
     },
     "approvalCard": {
+      "approval_no_longer_pending": "この承認は期限切れか、すでに決定済みです — エージェントはもう待機していません。",
       "approve": "承認",
       "approved": "承認済み",
+      "decision_failed": "この決定は記録されていない可能性があります — リクエストが失敗しました。",
+      "decision_not_recorded_error": "この決定は記録されませんでした: {{error}}",
       "reject": "却下",
       "rejected": "却下済み",
       "running": "実行中:",
@@ -4603,8 +4680,10 @@
     },
     "artifactBody": {
       "artifact": "アーティファクト：{{slug}}",
+      "could_not_render": "このアーティファクトを表示できませんでした",
       "image_could_not_be_loaded": "画像を読み込めませんでした",
-      "rendering": "レンダリング中…"
+      "rendering": "レンダリング中…",
+      "retry": "再試行"
     },
     "kiroAccountModal": {
       "account_details_unavailable": "アカウント詳細を取得できません",
@@ -5497,6 +5576,7 @@
       "collapse_unchanged": "変更なしを折りたたむ",
       "copy_content": "コンテンツをコピー",
       "copy_path": "パスをコピー",
+      "discard_changes_button": "変更を破棄",
       "discard_unsaved_changes": "保存されていない変更を破棄しますか？",
       "download": "ダウンロード",
       "download_failed": "ダウンロードに失敗しました",
@@ -6205,7 +6285,9 @@
       "search_everywhere": "すべてを検索",
       "show_or_focus_the_kiro_crew_window": "{{productName}} ウィンドウを表示・フォーカス",
       "use_ctrl_not_option_for_chat_1_9": "チャット 1–9 には ⌃ Ctrl を使用してください (⌥ Option ではなく)",
-      "use_ctrl_not_option_for_chat_1_to_9": "チャット 1 から 9 には Ctrl を使用してください (Option ではなく)"
+      "use_ctrl_not_option_for_chat_1_to_9": "チャット 1 から 9 には Ctrl を使用してください (Option ではなく)",
+      "panel_toggles": "パネルの表示切り替え",
+      "unset": "未設定"
     },
     "sidePanelLayout": {
       "update_available": "アップデート利用可能"
@@ -6271,11 +6353,32 @@
       "triggers": "トリガー",
       "what_this_skill_does_and_when_the_agent_should_u": "このスキルが何をするか、およびエージェントがいつそれを使用すべきかの説明"
     },
+    "projectSkillsTrust": {
+      "body": "${{skill}} はこのプロジェクト自身の .kiro/skills フォルダーにあります。",
+      "confirm": "このフォルダーを信頼",
+      "consequence": "このフォルダーを信頼すると、その中のスキルファイルがこのチャットのコンテキストに読み込まれ、エージェントにコマンドの実行を指示できるようになります。信頼していいのは、心当たりのあるプロジェクトだけです。",
+      "decline": "今はしない",
+      "decline_consequence": "拒否した場合、何も読み込まれず、メッセージは入力したままになります。",
+      "grant_failed": "このフォルダーの信頼を記録できませんでした。",
+      "title": "このプロジェクトのスキルを信頼しますか？",
+      "withdraw_hint": "これは後でスキル設定ページから取り消せます。",
+      "working": "信頼中…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "このフォルダーはもう存在しません。",
+      "hint": "これらのプロジェクトフォルダーは、独自のスキルをチャットに読み込めます。フォルダーの信頼を取り消すと、そのスキルは読み込まれなくなります。",
+      "revoke": "取り消す",
+      "revoke_failed": "このフォルダーの信頼を取り消せませんでした。",
+      "revoking": "取り消し中…",
+      "title": "信頼済みのプロジェクトフォルダー"
+    },
     "skillPickerMenu": {
       "loading_skills": "スキルを読み込み中…",
       "no_matching_skills": "一致するスキルがありません",
       "no_matching_skills_ctrl_enter_sends": "一致するスキルがありません — Ctrl+Enter でメッセージを送信します",
-      "no_matching_skills_enter_sends": "一致するスキルがありません — Enter でメッセージを送信します"
+      "no_matching_skills_enter_sends": "一致するスキルがありません — Enter でメッセージを送信します",
+      "trust_needed_badge": "信頼が必要",
+      "trust_needed_hint": "このプロジェクトのスキルです。選択すると内容を確認してフォルダーを信頼できます。"
     },
     "slashCommandMenu": {
       "desc_agent": "アクティブなエージェントを切り替えるか管理する",
@@ -6297,6 +6400,7 @@
       "desc_model": "現在のモデルを表示または切り替える",
       "desc_onboarding": "セットアップのインポートとウェルカムツアーを再実行する",
       "desc_paste": "クリップボードから画像を貼り付ける",
+      "desc_plain": "今の状況、または指定した話題を説明",
       "desc_prompts": "保存されたプロンプトとエージェントSOPをリストまたは呼び出す",
       "desc_quit": "チャットセッションを終了する",
       "desc_reply": "最後のアシスタントメッセージに返信する",
@@ -6430,6 +6534,7 @@
       "trust": "信頼",
       "trust_all_base": "<mono>{{base}}</mono> コマンドをすべて信頼",
       "trust_all_tools": "すべてのツールを信頼",
+      "trust_all_tools_channel": "このチャネルのすべてのツールを信頼 — 再起動後も維持",
       "trust_this_command": "「<mono>{{cmd}}</mono>」を信頼"
     },
     "tunnelStatus": {
@@ -6613,12 +6718,14 @@
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "スター付けできません：ウィジェットにslugまたはメッセージコンテキストがありません",
+      "could_not_render": "このウィジェットを表示できませんでした",
       "download_as_html": "HTMLとしてダウンロード",
       "expand": "展開",
       "minimize": "最小化",
       "open_in_new_tab": "新しいタブで開く",
       "remove_artifact_from_library": "アーティファクト {{name}} をライブラリから削除",
       "rendering": "描画中…",
+      "retry": "再試行",
       "save_failed": "保存に失敗しました",
       "star_as_artifact": "アーティファクトとしてスター付け",
       "starred_as_click_to_remove": "「{{name}}」としてスター登録済み — クリックで解除"
@@ -6734,6 +6841,9 @@
       "confirm_button": "確認して有効化",
       "withdraw": "確認を取り消す"
     },
+    "confirmDialog": {
+      "cancel": "キャンセル"
+    },
     "crewWebhookSection": {
       "could_not_load_webhooks": "Webhook を読み込めなかったため、何がこのクルーを起こすのか今は不明です。",
       "inbound_webhooks_are_switched_off": "受信 Webhook はオフになっており、紐づけ済みのトークンを含め何も呼び出せません。",
@@ -6797,7 +6907,10 @@
       "switch_to_remote_crew": "リモートクルー {{n}} に切り替え",
       "walk_back_mru_history": "MRU履歴を戻る",
       "stop_speaking": "読み上げを停止",
-      "toggle_focus_mode": "フォーカスモードを切り替え"
+      "toggle_focus_mode": "フォーカスモードを切り替え",
+      "toggle_left_sidebar": "左サイドバーの表示を切り替え",
+      "toggle_session_panel": "セッションパネルの表示を切り替え",
+      "toggle_side_panel": "サイドパネルの表示を切り替え"
     },
     "usePanelTabs": {
       "artifacts": "アーティファクト",
@@ -7312,7 +7425,13 @@
       "public_by_link_warning": "公開された URL はリンクを知っていれば誰でもアクセスできます。リンクを知っている人は誰でもコンテンツを閲覧でき、認証なしで公開インターネット上に配信されます。",
       "random_domain_note": "コンテンツはランダムな *.cloudfront.net ドメインで配信されます。オープンなインターネットに置きたくないものは公開しないでください。",
       "cloud_deployment_disabled": "Cloud deployment is disabled",
-      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake."
+      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake.",
+      "recall_title": "サイトを撤回しますか？",
+      "recall_button": "サイトを撤回",
+      "destroy_title": "サイトを完全に削除しますか？",
+      "destroy_button": "サイトを完全に削除",
+      "remove_profile_title": "プロファイルを削除しますか？",
+      "remove_profile_button": "プロファイルを削除"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· リモートコピーでより新しいバージョンが利用可能です",
@@ -7344,6 +7463,7 @@
       "copy_failed": "コピーに失敗しました",
       "could_not_overwrite": "上書きできませんでした。",
       "created": "作成",
+      "discard_changes_button": "変更を破棄",
       "discard_unsaved_changes": "保存されていない変更を破棄しますか？",
       "document_type": "ドキュメントタイプ",
       "download": "ダウンロード",
@@ -7675,9 +7795,6 @@
         "stopped": "停止",
         "subagent": "サブエージェント {{label}}",
         "subagents": "サブエージェント",
-        "trusted": "信頼済み",
-        "trusted_base": "信頼済みベース",
-        "trusted_command": "信頼済みコマンド",
         "waiting_for_output": "出力待機中…",
         "waiting_to_start_queued_behind_the_concurrency_l": "開始を待機中 — 同時実行制限の後ろのキューに入っています",
         "workflows": "ワークフロー",
@@ -7839,6 +7956,9 @@
         "recovered_continuing": "継続を自動送信しました",
         "resuming_the_interrupted_turn": "中断したターンを再開中",
         "safety_policy_continuing": "安全ポリシーにより呼び出しがブロックされました・継続を自動送信しました",
+        "safety_policy_told_in_turn": "安全ポリシーが呼び出しをブロックしました · このターン内でエージェントに理由を伝えました",
+        "invalid_name_told_in_turn": "ツール名の検証に失敗 · このターン内でエージェントに理由を伝えました",
+        "hook_fault_told_in_turn": "呼び出し前にフックがエラー · このターン内でエージェントに理由を伝えました",
         "session_busy_continuing": "セッションが使用中です・継続を自動送信しました",
         "subagents_finished": "サブエージェントが完了しました",
         "system_notice": "システム通知",
@@ -7982,7 +8102,8 @@
         "expand_model_reasoning": "モデルの推論を展開",
         "hide_reasoning": "推論を非表示",
         "show_reasoning": "推論を表示",
-        "thinking": "考え中"
+        "thinking": "考え中",
+        "thought_process": "思考プロセス"
       },
       "toolCallLine": {
         "aria_hide_diff": "diff を非表示",
@@ -9278,11 +9399,14 @@
       "stub_failed": "変更を適用できませんでした。保存済みでまだ有効になっていない可能性があります。下のスイッチは保存された状態を示しています。",
       "stub_not_live": "保存しましたが、まだ有効ではありません。ゲートウェイを起動できませんでした。スイッチは保存内容を示しており、稼働状態ではありません。",
       "stub_restart_required": "保存しました。反映するにはゲートウェイを再起動してください。実行中のセッションは開始時のサーバーを使い続けます。",
-      "stubbed_of_total": "{{total}} 台中 {{stubbed}} 台にスタブ",
+      "stubbed_of_total": "{{total}} 台中 {{stubbed}} 台をスタブ対象に選択",
       "unsupported_platform": "バックエンド共有には Unix ドメインソケットが必要なため、このプラットフォームでは利用できません。",
       "view_assessment": "共有の評価",
       "view_servers": "サーバー",
-      "views_aria": "MCP 管理ビュー"
+      "views_aria": "MCP 管理ビュー",
+      "state_direct_env": "直接 (env)",
+      "state_direct_env_reason": "スタブなし。選択は保存されたままです。",
+      "state_direct_env_legend": "直接 (env) — 共有バックエンドが渡さない環境変数キーをサーバーが宣言しているため、{{productName}} はスタブを作成しません。セッションが自分で起動し、共有バックエンドもサーバー独自の UI もありません。"
     },
     "migrationPage": {
       "app_migration": "アプリ移行",
@@ -10233,8 +10357,21 @@
       "detail_last_used": "最終使用",
       "detail_size": "サイズ",
       "detail_turns": "ターン数",
+      "emptied": "{{size}} を解放しました。",
+      "empty_failed": "{{freed}} を解放した後に停止しました。",
+      "empty_kept": "{{freed}} を解放しましたが、すべてを削除できませんでした。",
+      "empty_not_started": "ゴミ箱を空にする処理を開始できませんでした。もう一度お試しください。",
+      "emptying": "ごみ箱を空にしています",
+      "emptying_leave_ok": "このページを離れても続行されます。",
+      "emptying_progress": "{{total}} 中 {{freed}} を解放",
       "heading": "セッションストレージ",
       "in_use": "使用中",
+      "kept_incomplete": "ディスクから削除できなかったバッチがあるため、まだ一覧に残っています。",
+      "kept_next_step": "このバッチから戻せるものを復元してください。削除を妨げたファイルはゲートウェイのログに記録されています。",
+      "kept_outside_root": "ごみ箱の外を指すバッチがあったため、そのまま残しました。",
+      "kept_unknown": "このバージョンが認識できない理由でバッチが保持されました。",
+      "kept_unlisted_files": "マニフェストに記載のないファイルを含むバッチがあるため、削除するとセッションの唯一のコピーを失う可能性があります。",
+      "kept_unreadable": "完全に読み取れないバッチがあったため、そのまま残しました。",
       "move_to_trash_bulk": "ゴミ箱に移動",
       "move_to_trash_single": "ゴミ箱に移動",
       "next_page": "次へ",
@@ -10265,7 +10402,9 @@
       "trash_empty": "空",
       "trash_note": "空にするまでディスク容量を消費し続けます。自動的に削除されることはありません。",
       "trash_summary": "{{sessions}}セッション · {{size}}",
-      "unknown_session": "一覧にないセッション"
+      "unknown_session": "一覧にないセッション",
+      "busy_emptying": "ゴミ箱を空にしています。完了するまで一部の操作は停止します。",
+      "empty_failed_next_step": "「完全に削除」をもう一度お試しください。詳細はゲートウェイのログにあります。"
     },
     "sessionsTab": {
       "agent": "エージェント",
@@ -10445,7 +10584,8 @@
         "file_sessions_in_folder": "セッションをフォルダーに整理する",
         "file_sessions_in_folder_desc": "新しい{{channel}}のセッションを未整理のままにせず、サイドバーのフォルダーに入れます。",
         "session_folder_name": "フォルダー名",
-        "session_folder_name_desc": "この設定を保存したときに、まだ存在しなければ作成されます。"
+        "session_folder_name_desc": "この設定を保存したときに、まだ存在しなければ作成されます。",
+        "shared_channels": "共有チャネル"
       },
       "browserPanel": {
         "use_builtin_label": "内蔵ブラウザーを使用する",
@@ -10733,12 +10873,23 @@
         "start_a_gateway_on_this_machine_turn_it_off_to_u": "このマシンでゲートウェイを起動します。オフにすると Kiro Crew をクライアントとしてのみ使用し、ここで起動する代わりに設定済みのゲートウェイに接続します。次回アプリを開いたときに反映されます。"
       },
       "discordPanel": {
+        "allowed_server_channel_ids": "許可されたサーバーチャネル ID",
         "allowed_server_thread_ids": "許可されたサーバースレッド ID",
-        "allowlist_description": "DM またはそれぞれのスレッドでエージェントを実行できる Discord ユーザー ID。空の場合 = すべて拒否（クローズドフェイル）。",
-        "description": "Gateway WebSocket 経由で Discord DM またはそれぞれのサーバースレッドからエージェントと会話してください。通常のサーバーチャネルは常に無視されます。",
+        "allowlist_description": "DM、承認されたスレッド、または許可されたチャネルでエージェントを実行できる Discord ユーザー ID。空の場合 = すべて拒否（クローズドフェイル）。",
+        "auto_thread_description": "許可されたチャネルにメッセージを送ると新しい公開スレッドが開き、共有チャネルではなくそこでターンが実行されます。",
+        "auto_thread_label": "新しいスレッドで応答する",
+        "auto_thread_off_hint": "自動スレッドがオフのため、上のチャネルのメッセージは無視されます。{{productName}} が共有チャネル内で直接応答することはありません。",
+        "channel_allowlist_description": "オプション。許可されたユーザーは、これらの共有サーバーチャネルからエージェントを実行することもできます。空の場合 = 共有チャネルなし。",
+        "channel_help": "デベロッパーモードをオンにして、チャネルを右クリック → <mono>Copy Channel ID</mono>。チャネル内のスレッドの ID ではなく、チャネル自身の ID を使用してください。",
+        "channel_warning": "共有チャネルはスレッドよりも広い開示境界です。そのチャネルを見られる人、そしてターンが実行される公開スレッドを開ける人は誰でも、エージェントが書いた内容とツールが出力した内容を読めます。チャネルを追加するのは、そのメンバー全員に見せてよい場合だけにしてください。",
+        "description": "Gateway WebSocket 経由で、Discord DM、承認されたサーバースレッド、または許可されたサーバーチャネルからエージェントと会話してください。それ以外のサーバーチャネルはすべて無視されます。",
         "empty_allowlist_hint": "許可されたユーザー ID がありません。ボットはすべてのメッセージを拒否します（クローズドフェイル）。下に Discord ユーザー ID を追加してください。",
-        "guide_body": "Discord Developer Portal でアプリを作成し、<mono>Bot</mono> ページからトークンをコピーしてください。DM のみの場合は、特権インテントをオフのままにしてください。サーバースレッドの場合は、<mono>Message Content Intent</mono> を有効にして <mono>bot</mono> スコープと Channel の表示、メッセージ履歴の読み取り、スレッドでのメッセージ送信権限で インストールしてください。Discord デベロッパーモードを有効にしてから、名前を右クリックして数値ユーザー ID をコピーしてください。",
+        "guide_body": "Discord Developer Portal でアプリを作成し、<mono>Bot</mono> ページからトークンをコピーしてください。DM のみの場合は、特権インテントをオフのままにしてください。サーバースレッドの場合は、<mono>Message Content Intent</mono> を有効にして <mono>bot</mono> と <mono>applications.commands</mono> スコープ、Channel の表示、メッセージ履歴の読み取り、スレッドでのメッセージ送信権限で インストールしてください。Discord デベロッパーモードを有効にしてから、名前を右クリックして数値ユーザー ID をコピーしてください。",
         "open_developer_portal": "Developer Portal を開く",
+        "reactions_description": "エージェントが今どのフェーズにいるかを、あなたのメッセージへの絵文字リアクションで示します（キュー中→考え中→コーディング中→完了）。オフにするとメッセージには何も付きません。",
+        "reactions_label": "フェーズリアクション",
+        "thinking_description": "モデルの推論のプレビューを、回答の上に独立した小さな注記として投稿します。オフにするとチャネルには回答だけが残ります。",
+        "thinking_label": "思考を表示",
         "thread_allowlist_description": "オプション。許可されたユーザーは、これらの特定の Discord スレッドでのみエージェントを実行できます。空の場合 = DM のみ。",
         "thread_help": "デベロッパーモードをオンにして、スレッドを右クリック → <mono>チャネル ID をコピー</mono>。親チャネル ID ではなく、スレッドの ID を使用してください。",
         "thread_warning": "スレッドモードは Discord のグローバル Message Content インテントを有効にします。Discord はボットが表示できるあらゆるサーバーチャネルからコンテンツを配信します。Kiro Crew は許可されたスレッド外のトラフィックを破棄します。許可されたスレッドを表示できるユーザーは誰でも、エージェント応答とツール出力を読むことができます。",
@@ -11243,7 +11394,9 @@
         "record_prompt": "キーを押してください…",
         "search": "検索",
         "turn_keyboard_shortcuts_on_or_off_globally": "キーボードショートカットを全体で有効または無効にします — {{mod}} + K（このリファレンス）は常に有効です",
-        "use_ctrl_not_option_for_chat_1_9": "チャット 1～9 に ⌃ Ctrl（⌥ Option ではなく）を使用します"
+        "use_ctrl_not_option_for_chat_1_9": "チャット 1～9 に ⌃ Ctrl（⌥ Option ではなく）を使用します",
+        "clear_shortcut": "クリア",
+        "panel_toggles": "パネルの表示切り替え"
       },
       "skillsPanel": {
         "analyze_each_completed_session_and_draft_a_reusa": "完了したセッションを分析し、繰り返し使われる手順 — 将来のセッションが別の対象に対して再び実行するような手順 — が示されたときに再利用可能な SKILL.md を作成します。デフォルトではオフです。ドラフトはスキルタブの保留キューにステージされます。レビュー用です。何もライブにはなりません（以下を参照してください）。",
@@ -11326,7 +11479,7 @@
         "installs_mlx_whisper_via_pipx_ffmpeg_apple_silic": "mlx-whisper を pipx + ffmpeg でインストールします。Apple Silicon（arm64）のみ。",
         "installs_openai_whisper_ffmpeg_uses_system_pytho": "openai-whisper + ffmpeg をインストールします。システムの python3（3.10 以上）を使用します。",
         "language": "言語",
-        "larger_models_are_more_accurate_but_slower_to_ru": "より大きなモデルはより正確ですが、実行速度が遅くなります",
+        "larger_models_are_more_accurate_but_slower_to_ru": "より大きなモデルはより正確ですが、実行速度が遅くなります。モデルは初回使用時にダウンロードされるため、モデルを切り替えた後の最初の音声入力は、ダウンロードが完了するまで停止しているように見えたり、タイムアウトしたりすることがあります。",
         "microphone": "マイク",
         "microphone_2": "マイク {{n}}",
         "mlx_model": "MLXモデル",
@@ -11363,7 +11516,7 @@
         "us_east_1": "us-east-1",
         "whisper_and_mlx_run_locally_transcribe_calls_aws": "Whisper、MLX、Apple Speechはローカルで実行;Transcribeは AWS を呼び出す",
         "whisper_installed_but_ffmpeg_is_missing_voice_tr": "Whisper はインストール済みですが、ffmpeg がありません — 音声文字起こしには ffmpeg が必要です。",
-        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Whisperモデルがapple MLX (Metal GPU)で実行中。初回使用時にダウンロード。",
+        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Whisperモデルがapple MLX (Metal GPU)で実行中。初回使用時にダウンロードされるため、最初の音声入力はダウンロードが完了するまで停止しているように見えたり、タイムアウトしたりすることがあります。",
         "ptt_altgr_note": "多くの Windows および Linux のキーボードでは右 Alt キーが AltGr で、アクセント付き文字の入力に使われます。そのため Option 単独をここでの既定にはできません。",
         "ptt_heading": "キーで音声入力を開始",
         "ptt_heading_desc": "マイクボタンをクリックする代わりに、キーを押して話し始められます。右 Option ⌥ はそのまま使えるので、ここの設定は変更しなくてもかまいません。",
@@ -11612,6 +11765,70 @@
         "wechat_login_qr_code": "WeChat ログイン QR コード",
         "who_can_message_the_bot": "ボットにメッセージを送信できる人",
         "wxid": "wxid_…"
+      },
+      "whatsAppPanel": {
+        "status_unavailable": "ステータスを取得できません",
+        "setup_guide": "セットアップガイド",
+        "whatsapp": "WhatsApp",
+        "connected": "接続済み",
+        "not_signed_in": "未ペア設定",
+        "pair_with_whatsapp": "WhatsApp でペア設定",
+        "scan_the_code_from_linked_devices": "スマートフォンの WhatsApp でコードをスキャンしてください: 設定、リンクされたデバイス、デバイスをリンク。",
+        "signed_in_restart_the_gateway_to_start_receiving": "ペア設定しました。メッセージの受信を開始するにはゲートウェイを再起動してください。",
+        "talk_to_your_agent_from_your_own_whatsapp": "リンクされたデバイスとしてペア設定した、自分の WhatsApp アカウントからエージェントと会話できます。エージェントが送るメッセージはあなたの番号から送信されます。",
+        "waiting_for_a_code": "コードを待機中…",
+        "waiting_for_scan": "スキャンを待機中…",
+        "scanned_confirm_on_your_phone": "スキャンしました。スマートフォンで確認してください。",
+        "the_code_expired_try_again": "コードの有効期限が切れました。もう一度お試しください。",
+        "could_not_start_pairing": "ペア設定を開始できませんでした。",
+        "could_not_start_the_login_flow": "ペア設定フローを開始できませんでした。",
+        "whatsapp_pairing_qr_code": "WhatsApp ペア設定用 QR コード",
+        "enable_the_whatsapp_channel": "WhatsApp チャネルを有効にする",
+        "who_can_message_the_bot": "エージェントにメッセージを送れる相手",
+        "only_me_the_default": "自分のみ（自分のメッセージ）",
+        "me_plus_allowed_numbers": "自分と許可した番号",
+        "nobody_ignore_all_messages": "誰も不可（すべてのメッセージを無視）",
+        "anyone_who_messages_you": "ボットにメッセージを送信した誰でも",
+        "allowed_wa_ids": "許可する番号",
+        "allowed_numbers_empty_adds_nobody": "エージェントとチャットできる電話番号（国番号付きの数字、プラス記号なし）。空欄の場合、あなた以外は誰も追加されません。",
+        "phone_number_placeholder": "447700900000",
+        "created_for_you_when_you_turn_this_on_if_it_does": "これをオンにしたときに、まだ存在しなければ自動的に作成されます。",
+        "group_participation_is_opt_in_per_group": "グループへの参加はグループごとに有効にします。メンションモードはタグ付けされたときのみ返信し、ルールモードはクールダウンを挟んで自発的に手助けすることもあります。非公式の WhatsApp Web プロトコルを使用します。個人利用の範囲で使ってください。",
+        "waiting_to_be_paired": "ペア設定を待機中",
+        "the_link_was_revoked": "リンクが解除されました",
+        "blocked_by_whatsapp": "WhatsApp にブロックされました",
+        "paired_but_not_connected": "ペア設定済みですが未接続",
+        "whatsapp_did_not_connect": "WhatsApp が接続できませんでした: {{error}}",
+        "the_channel_is_enabled_but_not_running": "チャネルは有効ですが実行されていません。ゲートウェイを再起動してください。",
+        "show_pairing_code": "ペア設定コードを表示",
+        "already_paired_unlink_then_restart": "すでにペア設定済みです。別のデバイスをペア設定するには、下でこのデバイスのリンクを解除し、ゲートウェイを再起動してください。",
+        "the_link_was_revoked_restart_to_pair_again": "リンクが解除されました。もう一度デバイスをペア設定するには、ゲートウェイを再起動してください。",
+        "blocked_number_cannot_pair": "WhatsApp がこの番号をブロックしているため、ペア設定を開始できません。",
+        "pairing_starts_when_the_channel_starts": "ペア設定コードはチャネルがペア設定中のときだけ存在し、ペア設定はチャネルの起動時に始まります。下でチャネルを有効にしてから、ゲートウェイを再起動してください。",
+        "the_channel_is_not_running_enable_and_restart": "WhatsApp チャネルは実行されていません。下で有効にしてから、ゲートウェイを再起動してください。",
+        "unlink_this_device": "このデバイスのリンクを解除",
+        "revokes_the_linked_device_on_your_account": "あなたの WhatsApp アカウントでこのリンクされたデバイスを取り消し、ローカルセッションを削除します。デバイスを再度ペア設定するまで、エージェントはメッセージの読み取りと送信を停止します。",
+        "confirm_unlink": "リンク解除を確認",
+        "unlinked_restart_to_pair_again": "リンクを解除しました。もう一度デバイスをペア設定するには、ゲートウェイを再起動してください。",
+        "unlinked_but_the_session_file_was_kept": "WhatsApp とのリンクは解除しましたが、ローカルのセッションファイルを削除できませんでした。再度ペア設定する前に、データディレクトリから削除してください。",
+        "whatsapp_refused_the_unlink_still_linked": "WhatsApp がリンク解除を拒否したため、デバイスはまだリンクされたままで、ローカルセッションも保持されています。もう一度試すか、スマートフォンの「リンクされたデバイス」から取り消してください。",
+        "channel_not_running_so_nothing_was_unlinked": "チャネルが実行されていないため、何もリンク解除されていません。リンクされたデバイスはリンクされたままです。スマートフォンの「リンクされたデバイス」から取り消してください。",
+        "could_not_unlink_the_device": "デバイスのリンクを解除できませんでした。",
+        "groups": "グループ",
+        "the_agent_ignores_every_group_not_listed": "ここに一覧されていないグループは、エージェントがすべて無視します。",
+        "add_a_group": "グループを追加",
+        "your_groups_load_once_the_channel_is_connected": "チャネルが接続されると、ここにグループが表示されます。",
+        "every_group_you_joined_is_already_listed": "参加しているすべてのグループがすでに一覧にあります。",
+        "how_the_agent_joins_in": "エージェントの参加方法",
+        "mode_only_when_mentioned": "メンションまたは引用されたときのみ",
+        "mode_also_when_the_rules_apply": "ルールが当てはまるときも参加",
+        "mode_off_keeping_the_entry": "オフ（エントリは保持）",
+        "when_the_agent_may_speak": "エージェントが発言してよい条件",
+        "the_agent_stays_silent_unless_these_apply": "自由記述です。これらのルールが明確に当てはまらない限り、エージェントは沈黙します。",
+        "rules_example_placeholder": "3D プリントに関する質問に答える",
+        "seconds_between_unprompted_replies": "自発的な返信の間隔（秒）",
+        "remove_name_from_the_group_list": "グループ一覧から {{name}} を削除",
+        "unofficial_protocol_ban_risk": "非公式プロトコルです。WhatsApp が連携した番号を利用停止にする可能性があります。失っても困らない番号を使ってください。"
       },
       "remoteCrewPanel": {
         "your_crews": "Your crews",
@@ -12052,7 +12269,7 @@
         "label": "ブラウザー"
       },
       "channels": {
-        "description": "エージェントが送受信できるチャットプラットフォーム — Slack、Discord、Telegram、Webex、WeCom、Microsoft Teams、WeChat",
+        "description": "エージェントが送受信できるチャットプラットフォーム",
         "label": "チャネル"
       },
       "chat": {

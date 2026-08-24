@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import fnmatch
 import hashlib
 import json
 import logging
@@ -32,11 +33,12 @@ from kiro_crew.constants import (
     SUBAGENT_COMPLETION_PREFIX,
 )
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
-from kiro_crew.dashboard.session_pulse_counter import increment_user_session_count
+from kiro_crew.dashboard.session_pulse_counter import increment_user_session_count_off_loop
 from kiro_crew.dashboard.side_state import SideState
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
     UNBIND_REASON_DASHBOARD_UNLINK,
@@ -96,6 +98,8 @@ _CHANNEL_LABELS = {
     "wecom": "WeCom",
     "weixin": "WeChat",
     "imessage": "iMessage",
+    "whatsapp": "WhatsApp",
+    "feishu": "Feishu",
 }
 
 
@@ -585,6 +589,896 @@ def _is_help_probe(segment: str) -> bool:
     return True
 
 
+# ── Side effects reached through an allowlisted read-only verb ──
+#
+# The allowlist above names a verb and is matched as a prefix, so it vouches
+# for every flag, subcommand and operand that verb accepts. Some of those
+# write a file, change a ref or launch another program — and none of it goes
+# through a shell redirect, so `_UNSAFE_SHELL_RE` never sees it.
+#
+# The tables are keyed by verb because the same spelling is harmless
+# elsewhere: `ls -o` is a long listing format and `grep -o` prints only the
+# match, while `sort -o FILE` truncates and writes FILE.
+
+# Flags that make the program write a file named on its own command line.
+_WRITE_FLAGS: dict[str, tuple[str, ...]] = {
+    # `-T` does not name the output, it names a DIRECTORY sort writes its
+    # temporaries into — a write to a path the caller chose, one step removed,
+    # exactly like `tree -R` below. Reported by #5038.
+    "sort": ("-o", "--output", "-T", "--temporary-directory"),
+    # `-R` writes without being handed a filename: tree re-runs itself in every
+    # directory it descends into, adding `-o 00Tree.html` each time, so the file
+    # is named by tree rather than by the command line. Same outcome as `-o`, one
+    # step removed, which is why looking only for a filename-bearing flag missed
+    # it.
+    "tree": ("-o", "--output", "-R"),
+    "file": ("-C", "--compile"),
+    "uniq": ("-o",),
+    "git diff": ("--output",),
+    "git show": ("--output",),
+    "git log": ("--output",),
+    # A pager, and not on the prefix allowlist — but the PIPE-TARGET check runs
+    # this table too, and `cat f | less -O FILE` writes FILE from a segment whose
+    # leading verb is a read.
+    "less": ("-o", "-O", "--log-file", "--LOG-FILE"),
+}
+
+# Flags that hand control to a program the repository names, not the caller:
+# an external diff driver comes from the repo's config or .gitattributes.
+_EXEC_FLAGS: dict[str, tuple[str, ...]] = {
+    # `--textconv` is the same hand-off as `--ext-diff` through a different config
+    # key, and it was missing here while `git cat-file` below already listed it —
+    # the table gap, not the design, is what let `git diff --textconv` through.
+    #
+    # Scope, stated plainly: this stops the COMMAND LINE from selecting the
+    # program. It does not stop a textconv driver the user configured from being
+    # applied by default, because that name comes from git config, which is not
+    # part of a repository and is not something a checkout can add. Requiring
+    # `--no-textconv` would be the only way to cover that, and it would take plain
+    # `git diff` off the read-only path — the most common read there is.
+    "git diff": ("--ext-diff", "--textconv"),
+    "git show": ("--ext-diff", "--textconv"),
+    "git log": ("--ext-diff", "--textconv"),
+    # `--filters` runs the repository's clean/smudge filter — a command from
+    # `.gitattributes`, i.e. chosen by the checkout rather than by the caller.
+    # `--textconv` is the same hand-off through a different config key.
+    "git cat-file": ("--filters", "--textconv"),
+    # `sort` compresses its temporary files by running this program.
+    "sort": ("--compress-program",),
+    # A pager that runs a filter over its input, reachable as a pipe target.
+    # `-k` is the sharper one and it is INDIRECT: it loads a lesskey file, and a
+    # lesskey file can set environment variables — including `LESSOPEN`, which less
+    # treats as an input PREPROCESSOR and runs. So a checkout-supplied lesskey is
+    # arbitrary command execution, two steps removed from anything on the command
+    # line. Verified against `less --help` on less 608: `-k [file]` /
+    # `--lesskey-file=[file]`, plus `--lesskey-src` on newer builds.
+    #
+    # Case is load-bearing here, as it is for `file -C`: lowercase `-k` loads the
+    # keyfile, while uppercase `-K` is `--quit-on-intr` and an ordinary read.
+    "less": ("--filter", "-k", "--lesskey-file", "--lesskey-src"),
+}
+
+# `git branch` and `git tag` each carry a read mode and a write mode under one
+# subcommand, so the prefix match admits the destructive spellings. Some of
+# these also open `$EDITOR`, which runs a program of the environment's
+# choosing: `git branch --edit-description` always does, and `git tag <name>`
+# does whenever `tag.gpgSign` or `tag.forceSignAnnotated` is set.
+_GIT_REF_WRITE_FLAGS: dict[str, tuple[str, ...]] = {
+    "branch": (
+        "-d",
+        "-D",
+        "--delete",
+        "-m",
+        "-M",
+        "--move",
+        "-c",
+        "-C",
+        "--copy",
+        "-f",
+        "--force",
+        "-u",
+        "--set-upstream",
+        "--set-upstream-to",
+        "--unset-upstream",
+        "--edit-description",
+    ),
+    "tag": (
+        "-d",
+        "--delete",
+        "-a",
+        "--annotate",
+        "-s",
+        "--sign",
+        "-m",
+        "--message",
+        "-F",
+        "--file",
+        "-f",
+        "--force",
+        "--cleanup",
+        # `-u <keyid>` is `--local-user`: it makes the tag ANNOTATED and signed,
+        # so it creates a ref exactly as `-a` does. `-u` was in the `branch` list
+        # (set-upstream) and missing here, and the omission was reachable —
+        # `git tag -ulin@kiro.co release` created a signed tag.
+        "-u",
+        "--local-user",
+    ),
+}
+
+# Why a bare operand needs TWO tables rather than one.
+#
+# `git branch <name>` creates a ref, so a bare operand is the signal. Deciding
+# when an operand is NOT that name was collapsed into a single "this flag eats
+# the next token" set, and that conflated two different things git keeps apart:
+#
+#   * whether the flag CONSUMES the following word, which git's own option
+#     parser decides by whether the argument is required or optional. A required
+#     argument is taken from the next word; an OPTIONAL one must be attached with
+#     `=`, and a separate word is left as an operand. `--color` is optional, so
+#     `git branch --color newbranch` still creates `newbranch` — while the guard
+#     read `newbranch` as the colour and passed the segment.
+#   * whether the command is in LIST mode, where an operand is a pattern to match
+#     rather than a ref to create. `git branch --list newbranch` lists, it does
+#     not create, so treating that operand as a creation would be a false denial.
+#
+# Splitting them keeps both answers right: `--color` is in neither set, and
+# `--list` is in the list-mode set only.
+
+# Flags whose argument is REQUIRED, so git takes it from the following word.
+_GIT_REF_VALUE_FLAGS: frozenset[str] = frozenset(("--points-at", "--format", "--sort"))
+
+
+def _consumes_next_word(token: str) -> bool:
+    """Whether *token* is a required-argument flag that takes the FOLLOWING word.
+
+    Abbreviations count, because git's parser resolves them: `git branch --form`
+    reaches `--format` and eats the next word, so reading `--form` as an ordinary
+    option left `-l` in `git branch --form -l newbranch` looking like a list flag
+    and licensed the bare operand that created the branch.
+
+    This is the fourth site on this guard to need the abbreviation axis — after
+    `_matched_flag`, `_system_set_flag` and `_glob_reaches` — which is why it is a
+    named helper rather than a fourth inline prefix test.
+
+    An ATTACHED value (`--format=x`) takes nothing from the next word, so it is
+    not one of these. Over-matching an ambiguous abbreviation is safe: git rejects
+    it rather than running it.
+    """
+    if "=" in token or not token.startswith("--") or len(token) <= 2:
+        return False
+    return any(flag == token or flag.startswith(token) for flag in _GIT_REF_VALUE_FLAGS)
+
+
+# Flags that put `git branch` / `git tag` in list mode, where a bare operand is a
+# pattern. `--points-at` appears in both: it consumes its value AND selects.
+_GIT_REF_LIST_FLAGS: frozenset[str] = frozenset(
+    (
+        "-l",
+        "--list",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+    )
+)
+
+
+def _glob_shifts_arguments(token: str) -> bool:
+    """Whether a glob in *token* can change how many arguments the program gets.
+
+    A separate question from `_glob_hides_word`, which asks what a pattern can
+    expand INTO. This one is about the COUNT, and it cuts both ways:
+
+    * several matches become several WORDS — with `in1` and `in2` present,
+      `uniq in*` runs `uniq in1 in2`, whose second operand is an OUTPUT file;
+    * no match under `nullglob` makes the word VANISH — `git branch --format
+      nomatch* --list newbranch` loses the format's value, so `--format` eats
+      `--list` instead and `newbranch` stops being a pattern.
+
+    Neither outcome needs the pattern to resemble anything this module decides on,
+    so it is only asked where the argument COUNT or POSITION carries the verdict:
+    a `uniq` operand, and a required git option's value. An operand whose meaning
+    does not depend on its position — `ls *.py`, `git branch --list 'feat/*'` —
+    is not affected, which is what keeps ordinary globbing on the read path.
+    """
+    return bool(_GLOB_META_RE.search(token) or _EXTGLOB_RE.search(token))
+
+
+# The SHORT list-mode flags, per subcommand, because they do not agree. `-l` is
+# a listing for both, but `git tag -n[<num>]` prints annotation lines — a listing
+# form `git branch` has no counterpart for, and reading it as anything else
+# denied a common inspection (`git tag -n 'v1.*'`) its auto-approval. Kept as
+# LETTERS, not flags, because they arrive bundled: `git tag -n2` and `git tag -ln`
+# both select, and only a per-letter test sees that. A letter here must never be
+# a write flag for the same subcommand — `-n` is not in `_GIT_REF_WRITE_FLAGS`
+# ("tag"), which is what makes reading it as a listing safe.
+_GIT_REF_LIST_SHORTS: dict[str, str] = {"branch": "l", "tag": "ln"}
+
+# Flags that CANCEL list mode, per subcommand. git's parse-options auto-generates
+# a `--no-<opt>` negation for a boolean, so `--list` has one and it undoes the
+# listing — `git branch --list --no-list newbranch` CREATES the branch. Verified
+# against git rather than inferred, which matters because the neighbouring
+# `--no-` spellings do NOT behave this way:
+#
+#     git branch --list --no-list nl1                -> branch nl1 CREATED
+#     git branch --list --no-lis nl2                 -> branch nl2 CREATED
+#     git branch -l --no-list nl3                    -> branch nl3 CREATED
+#     git branch --contains HEAD --no-contains nc1   -> no ref (git errors)
+#     git branch --merged --no-merged nm1            -> no ref (git errors)
+#     git tag -l --no-list t1                        -> no ref (unknown option)
+#
+# So `--no-contains` and `--no-merged` are real list FILTERS rather than
+# negations, and treating them as cancelling would deny two ordinary reads;
+# `git tag` has no `--no-list` at all. The table says only what was measured.
+_GIT_REF_LIST_CANCEL_FLAGS: dict[str, tuple[str, ...]] = {"branch": ("--no-list",)}
+
+
+def _cancels_list_mode(token: str, subcommand: str) -> bool:
+    """Whether *token* turns list mode off for *subcommand*.
+
+    Abbreviations count, as everywhere else on this guard: `--no-lis` reaches
+    `--no-list`. Cancelling can only move a bare operand from "pattern" to
+    "creates a ref", i.e. toward the prompt, so over-matching here is safe.
+    """
+    head = token.split("=", 1)[0]
+    if not head.startswith("--") or len(head) <= 2:
+        return False
+    cancels = _GIT_REF_LIST_CANCEL_FLAGS.get(subcommand, ())
+    return any(flag.startswith(head) for flag in cancels)
+
+
+# `git remote` subcommands that rewrite remote configuration. `set-url` is the
+# sharpest: it repoints the remote, so later fetches and pushes go elsewhere.
+_GIT_REMOTE_WRITE_SUBCOMMANDS: frozenset[str] = frozenset(
+    ("add", "remove", "rm", "rename", "set-url", "set-head", "set-branches", "prune", "update")
+)
+
+# Allowlist entries that name a VERSION PROBE, matched as a prefix like every
+# other entry — so a trailing operand was vouched for too. That is not academic:
+# `javac` does not act on `-version` and exit, it prints the version and then
+# compiles whatever else it was handed, so
+#
+#     javac -version -processorpath evil.jar -processor Evil Payload.java
+#
+# auto-approved and ran an annotation processor — ordinary compiled Java on a
+# path the caller supplies, i.e. arbitrary code execution. Reported by #5038,
+# and the highest-severity shape in this family.
+#
+# All five probes are listed, not only `javac`. Whether an interpreter ignores a
+# trailing operand is a property of the installed release rather than of the
+# flag, and JDK single-file source mode (`java Foo.java`) already moved that
+# answer once. A version probe has no legitimate operand, so requiring the exact
+# spelling costs nothing and does not depend on being right about each tool.
+_EXACT_ONLY_BASH_PREFIXES: frozenset[str] = frozenset(
+    (
+        "python --version",
+        "python3 --version",
+        "node --version",
+        "java -version",
+        "javac -version",
+    )
+)
+
+# Flags that change SYSTEM state rather than writing a file: `hostname` renames
+# the host, `date` sets the clock. Both entries are on the read-only allowlist
+# for their bare listing form, and both carry a setter under the same verb.
+#
+# Kept out of `_WRITE_FLAGS` because they must NOT go through `_matched_flag`'s
+# short-option CLUSTER scan, and `date` is the worked example of why: `-s` sets
+# the clock, while `date -Iseconds` is an ordinary read whose attached VALUE
+# contains an `s`. A cluster scan reads that `s` as `-s` and denies the read.
+# `_system_set_flag` prefix-matches the token instead, which `-Iseconds` (a
+# token starting `-I`) cannot satisfy. Reported by #5038, whose comment names
+# the same trap.
+_SYSTEM_SET_FLAGS: dict[str, tuple[str, ...]] = {
+    # `-b`/`--boot` and `-F`/`--file` set the name with no operand at all.
+    # Case is load-bearing: `-F` sets from a file, `-f` prints the FQDN.
+    "hostname": ("-b", "--boot", "-F", "--file"),
+    "date": ("-s", "--set"),
+}
+
+# Verbs whose bare OPERAND changes system state, with no flag involved:
+# `hostname evil-host` renames the host and `date 08221200` sets the clock.
+# `date`'s one legitimate operand is a `+FORMAT` string, which is why the two
+# need different predicates rather than one shared "no operands" rule.
+#
+# The flags here take their value from the FOLLOWING word, so that word is not
+# an operand — without them `date -d yesterday` and `date -r FILE`, both reads,
+# would be denied.
+_SYSTEM_OPERAND_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "hostname": frozenset(),
+    "date": frozenset(("-d", "--date", "-r", "--reference", "-f", "--file")),
+}
+
+# The SHORT setters as LETTERS, and the letters that consume the rest of their
+# token, because a cluster has to be walked rather than prefix-tested. `-s` sets
+# the clock, and it can arrive anywhere in a cluster: GNU resolves
+# `date -us2026-08-23` to `-u` plus `-s 2026-08-23`, which a test anchored at the
+# token's first character never saw.
+#
+# The value-taking letters are what keeps the walk from reading a VALUE as a flag —
+# the `date -Iseconds` case: `I` takes an optional attached value, so the `s` in
+# `seconds` belongs to that value and the walk stops before it. This is the same
+# distinction, stated per letter, that the note above states per token.
+_SYSTEM_SHORT_SETTERS: dict[str, str] = {"hostname": "bF", "date": "s"}
+_SYSTEM_SHORT_VALUE_TAKING: dict[str, str] = {"hostname": "F", "date": "dfrsI"}
+
+
+def _system_set_flag(verb: str, args: list[str]) -> str:
+    """Return the setter flag *args* supplies for *verb*, or "".
+
+    Prefix-matches the token, so the attached spelling (`--set=…`, `-s2020`) is
+    caught while an unrelated flag whose attached value merely CONTAINS the
+    letter is not. See the note on `_SYSTEM_SET_FLAGS` for why the cluster scan
+    in :func:`_matched_flag` is the wrong tool here.
+
+    A long option is ALSO matched by any unambiguous abbreviation of it, because
+    GNU's own parser resolves one: `date --se=2026-08-23` reaches `--set` and the
+    clock moves, while a plain prefix test on the flag saw nothing. Avoiding the
+    cluster scan is what this function is for — abbreviation is a separate axis,
+    and `_matched_flag` already accepts it for every other table.
+
+    A SHORT setter is found by walking the cluster, because it can sit anywhere in
+    one: GNU resolves `date -us2026-08-23` to `-u` plus `-s 2026-08-23`. The walk
+    stops at the first letter that consumes the rest of the token, which is what
+    keeps `date -Iseconds` a read — the `s` there is part of `I`'s value, not a
+    flag. Avoiding `_matched_flag`'s *undifferentiated* cluster scan is still the
+    point; this one knows which letters take a value.
+    """
+    for tok in args:
+        head = tok.split("=", 1)[0]
+        if len(tok) > 1 and tok[0] == "-" and tok[1] != "-":
+            setters = _SYSTEM_SHORT_SETTERS.get(verb, "")
+            consumes = _SYSTEM_SHORT_VALUE_TAKING.get(verb, "")
+            for ch in tok[1:]:
+                if ch in setters:
+                    return "-" + ch
+                if ch in consumes:
+                    break
+        for flag in _SYSTEM_SET_FLAGS.get(verb, ()):
+            if len(flag) == 2 and flag[0] == "-" and flag[1] != "-":
+                # Short setters are handled by the cluster walk above; matching
+                # them again by prefix here would re-introduce the `-Iseconds`
+                # false positive this function exists to avoid.
+                continue
+            if tok.startswith(flag):
+                return flag
+            # `--` plus at least one character, and a prefix of this flag. Over-
+            # matching can only add a prompt: an abbreviation that is ambiguous
+            # against the tool's OTHER long options is rejected by the tool itself,
+            # so refusing it here costs a command that was never going to run.
+            if (
+                flag.startswith("--")
+                and head.startswith("--")
+                and len(head) > 2
+                and flag.startswith(head)
+            ):
+                return flag
+    return ""
+
+
+def _operands(args: list[str]) -> list[str]:
+    """Operand tokens in *args*, honouring the `--` terminator.
+
+    Before the terminator a leading-dash word is an option; after it EVERY word
+    is an operand however it is spelled. That second half is what
+    `uniq -- input -pwned` turned on: counting only the non-dash words saw one
+    operand and passed a segment that writes `-pwned`.
+    """
+    if "--" in args:
+        cut = args.index("--")
+        return [tok for tok in args[:cut] if not tok.startswith("-")] + args[cut + 1 :]
+    return [tok for tok in args if not tok.startswith("-")]
+
+
+#: Shell expansions whose RESULT is the argument, while ``shlex`` hands this
+#: module the unexpanded text. Every check here is keyed on the token, so where
+#: the two disagree the guard inspects one string and the program receives
+#: another:
+#:
+#:     git diff $'--output=/tmp/pwned'       shlex: `$--output=…`     bash: `--output=…`
+#:     git diff $"--output=/tmp/pwned"       shlex: `$--output=…`     bash: `--output=…`
+#:     git diff ${HOME:+--output=/tmp/pwned} shlex: literal           bash: `--output=…`
+#:     git remote se${x}t-url …              shlex: `se${x}t-url`     bash: `set-url`
+#:     git diff --{out,out}put=/tmp/pwned    shlex: `--{out,out}put=` bash: `--output=…`
+#:
+#: Matched as ONE class rather than one spelling at a time. Closing ``$'`` alone
+#: left ``$"`` (locale translation) and ``${…}`` (parameter expansion) open on the
+#: identical path, and the remaining forms are bounded only by bash's grammar.
+#: Un-expanding them here would mean reimplementing that grammar, so a segment
+#: carrying one is refused instead: a read-only command has no need of any of
+#: them, and a rejected segment falls through to the human approval prompt.
+#:
+#: Brace expansion belongs to the same class even though it carries no ``$``: it
+#: is performed FIRST, before any other expansion, and it can assemble a flag out
+#: of fragments that match nothing here. Only the forms bash actually expands are
+#: matched — a comma list or a ``..`` range — so a lone ``{`` (a JSON argument, a
+#: Go template) is left alone.
+#:
+#: ``$(…)`` and backticks are already refused upstream by ``_UNSAFE_SHELL_RE``;
+#: this covers what that pattern does not reach.
+#:
+#: Positional and special parameters (``$1``, ``$@``, ``$*``, ``$?``, ``$$``,
+#: ``$!``, ``$#``, ``$-``) belong to the same class and are matched by their own
+#: alternative. Their NAME is not an identifier, so the ``$[A-Za-z_]`` branch
+#: above never saw them, and in a `bash -c` string with no positional arguments
+#: ``$@`` and ``$*`` expand to NOTHING — which is what makes them the sharpest
+#: spelling here rather than a curiosity:
+#:
+#:     git remote $@set-url origin …   shlex: `$@set-url`      bash: `set-url`
+#:     git diff $1--output=/tmp/pwned  shlex: `$1--output=…`   bash: `--output=…`
+#:
+#: Matched on the raw segment, so a QUOTED occurrence is refused too even though
+#: bash would not expand it (``grep '*.{js,ts}' f``). That is the same trade the
+#: ``$`` forms already make, and it errs toward the prompt.
+#:
+#: Applied only to a GUARDED verb (see ``_side_effect_reason``). A verb this
+#: module has no table for cannot have a decision subverted by a hidden word,
+#: so ``cat $HOME/.bashrc`` and ``head -20 $LOG`` — the ordinary reads — stay on
+#: the auto-approve path.
+_SHELL_EXPANSION_RE = re.compile(
+    r"\$['\"{]"
+    r"|\$[A-Za-z_][A-Za-z0-9_]*"
+    r"|\$[0-9@*#?$!\-]"
+    r"|\{[^{}\s]*,[^{}\s]*\}"
+    r"|\{[^{}\s]*\.\.[^{}\s]*\}"
+)
+#: Pathname-expansion metacharacters. NOT part of the class above, because a glob
+#: is usually the argument itself in a read-only command (`ls *.py`) — it is
+#: refused only in the positions where the spelling is what gets classified. See
+#: the note in `_side_effect_reason`.
+#:
+#: A leading `~` is deliberately NOT here: tilde expansion yields a path starting
+#: with `/`, so it cannot synthesize a flag or a subcommand.
+_GLOB_META_RE = re.compile(r"[*?\[]")
+
+#: Bash EXTGLOB operators, which synthesize a token the same way an ordinary glob
+#: does — `git diff @(--output=pwned)` matches a file of that name and git writes
+#: it. Reported by #5038, which measured it.
+#:
+#: These get their own regex and their own verdict because `fnmatch` — the test
+#: that makes the plain-glob case precise — does not implement extglob: it reads
+#: `@(` as two literal characters, so `fnmatch("--output", "@(--output")` is False
+#: and the pattern that reaches the flag looks inert. Nothing can be proven about
+#: an extglob token here, so a guarded verb refuses it outright. That is the same
+#: trade the `$`-led forms make, and it costs nothing: unlike a plain glob, an
+#: extglob has no ordinary use in a read-only command.
+#:
+#: Extglob is off by default in a non-interactive `bash -c`, so reaching this needs
+#: `shopt -s extglob` (or a `BASHOPTS` carrying it) AND a matching file — narrower
+#: than the plain-glob case, closed here because it is the same cause.
+_EXTGLOB_RE = re.compile(r"[?*+@!]\(")
+
+#: Every word this module decides on: the flags of all four tables, the
+#: ``git remote`` write subcommands, and the option terminator. A glob is
+#: dangerous exactly when the filesystem can hand the program one of THESE in
+#: place of the pattern, so the test is ``fnmatch`` against this set rather than
+#: "the token contains a metacharacter" — which would have taken `ls *.py` and
+#: `git diff *.py` off the read-only path for no gain.
+_GLOB_SENSITIVE_WORDS: frozenset[str] = (
+    frozenset(
+        flag
+        for table in (_WRITE_FLAGS, _EXEC_FLAGS, _GIT_REF_WRITE_FLAGS)
+        for flags in table.values()
+        for flag in flags
+    )
+    | _GIT_REMOTE_WRITE_SUBCOMMANDS
+    # A glob that expands to `--` shifts every following word into operand
+    # position, which is how the terminator changes what the walk below decides.
+    | frozenset(("--",))
+)
+
+#: Verbs whose OWN tables carry a short flag, so a glob can expand into a bundled
+#: cluster for them (``?uo`` -> ``-uo``, which supplies ``-o``). A cluster is not
+#: a word in the set above, so it takes the extra test in `_glob_hides_word` —
+#: and only here, which is what keeps `git diff *.py` (long flags only) passing.
+#: Derived from the tables so the two cannot drift apart.
+_SHORT_FLAG_VERBS: frozenset[str] = frozenset(
+    key
+    for table in (_WRITE_FLAGS, _EXEC_FLAGS)
+    for key, flags in table.items()
+    if any(len(flag) == 2 and flag[0] == "-" for flag in flags)
+)
+
+
+def _glob_hides_word(token: str, has_short_flags: bool) -> bool:
+    """Whether *token*'s glob can expand into a word this module decides on.
+
+    Two shapes, because a pattern reaches a flag two different ways:
+
+    * it matches a decided word outright — ``s?t-url`` matches ``set-url``,
+      ``--outp?t`` matches ``--output``, ``?o`` matches ``-o``, and a bare ``*``
+      matches every one of them. ``fnmatchcase`` answers this exactly, so a
+      pattern that CANNOT reach one (``*.py``) is left alone;
+    * its metacharacter is the FIRST character, so the filesystem chooses the
+      leading character too and the expansion can be a short-option CLUSTER
+      (``?uo`` -> ``-uo``, which :func:`_matched_flag` reads as supplying ``-o``).
+      A cluster is not a word in the set above, so it needs its own test — but
+      only where the verb HAS a short flag to be bundled into, which keeps
+      ``git diff *.py`` (long flags only) passing.
+
+    An EXTGLOB token short-circuits to True: ``fnmatch`` cannot model extglob, so
+    neither shape below can rule on one. See `_EXTGLOB_RE`.
+    """
+    if _EXTGLOB_RE.search(token):
+        return True
+    if not _GLOB_META_RE.search(token):
+        return False
+    head = token.split("=", 1)[0]
+    # A token that already LOOKS like an option is refused on the metacharacter
+    # alone, without asking what it can match. `fnmatch` answers "can this reach a
+    # decided word", and a short-option CLUSTER is not one of those words, so
+    # `sort -u? victim` slipped: no candidate is three characters long, the
+    # metacharacter is not first so the cluster test below does not fire, and bash
+    # resolves `-u?` against a file named `-uo` — which `_matched_flag` would have
+    # rejected had it ever seen it. Nothing legitimate is lost, because the head is
+    # the flag NAME: a glob in a flag's VALUE is split off above, which is what
+    # keeps `git log --grep=[abc]` a read.
+    if token.startswith("-") and _GLOB_META_RE.search(head):
+        return True
+    # Every word this module decides on, PLUS every abbreviation of a long one,
+    # because `_matched_flag` resolves an abbreviation and so does the parser it
+    # guards. Testing only the full spellings left `git diff ??out=victim`
+    # auto-approved: `fnmatch("--output", "??out")` is False on the length alone,
+    # `git diff`'s table is long-only so the cluster arm below does not fire, and
+    # bash resolves `??out` against a file named `--out` that git then reads as
+    # `--output`. The full spelling `??output` was already refused, which is what
+    # made the gap look closed.
+    if any(_glob_reaches(head, word) for word in _GLOB_SENSITIVE_WORDS):
+        return True
+    return has_short_flags and _GLOB_META_RE.match(token) is not None
+
+
+def _glob_reaches(head: str, word: str) -> bool:
+    """Whether glob *head* can expand to *word* or to an abbreviation of it.
+
+    A long option is abbreviable to any unambiguous prefix, and an ambiguous one
+    is rejected by the tool rather than run — so every prefix of `--` plus one
+    character is tested, and over-matching can only add a prompt.
+
+    Compared CASE-INSENSITIVELY, because `nocaseglob` decouples the pattern's case
+    from the filename's: with it set, `git diff ??OUT=victim` expands to
+    `--out=victim` and git writes the file, while a case-sensitive test saw a
+    pattern matching nothing. Measured — `bash -O nocaseglob -c 'echo git diff
+    ??OUT=victim'` prints `git diff --out=victim`, and plain `bash -c` does not.
+
+    The case sensitivity this module DOES rely on is elsewhere and unaffected:
+    `_matched_flag` still distinguishes `file -C` (compiles a magic file) from
+    `file -c` (prints one), because that reads a literal token rather than asking
+    what a pattern could become.
+    """
+    folded = head.lower()
+    lowered = word.lower()
+    if fnmatch.fnmatchcase(lowered, folded):
+        return True
+    if not word.startswith("--") or len(word) <= 3:
+        return False
+    return any(fnmatch.fnmatchcase(lowered[:cut], folded) for cut in range(3, len(word)))
+
+
+def _matched_flag(tokens: list[str], flags: tuple[str, ...]) -> str:
+    """Return the first token in *tokens* that supplies one of *flags*.
+
+    Matches the flag on its own (``-o``), joined to its value (``--output=x``)
+    and bundled into a short-option cluster (``-uo`` supplies ``-o``), so the
+    check cannot be stepped around by respelling the same flag.
+    """
+    shorts = {f[1] for f in flags if len(f) == 2 and f[0] == "-"}
+    longs = [f for f in flags if f.startswith("--") and len(f) > 2]
+    for tok in tokens:
+        if tok in flags:
+            return tok
+        for flag in flags:
+            if tok.startswith(flag + "="):
+                return flag
+        # A GNU long option may be ABBREVIATED to any unambiguous prefix, so
+        # `--out=FILE` and `--outp=FILE` reach the same `--output` that exact
+        # matching missed. Accept any prefix of a known flag that is at least
+        # `--` plus one character: the parser this guards resolves it, so the
+        # guard has to as well. Over-matching here can only add a prompt.
+        head = tok.split("=", 1)[0]
+        if head.startswith("--") and len(head) > 2:
+            for flag in longs:
+                if flag.startswith(head):
+                    return flag
+        if shorts and len(tok) > 1 and tok[0] == "-" and tok[1] != "-":
+            for ch in tok[1:]:
+                if ch in shorts:
+                    return "-" + ch
+    return ""
+
+
+def _side_effect_reason(segment: str) -> str:
+    """Reason *segment* has a side effect, despite naming a read-only verb.
+
+    Returns "" when the segment is genuinely read-only. Called after the verb
+    has cleared the allowlist, because the allowlist only decides *which
+    program* runs — not what the rest of the command line asks it to do.
+    """
+    try:
+        # Discard-only redirects are scrubbed first, mirroring the unsafe-shell
+        # check upstream, because the exact-match rule below would otherwise read
+        # one as a trailing operand. `java -version 2>&1` is the canonical probe —
+        # java prints its version to stderr — so counting `2>&1` as an operand
+        # would deny the single most common read on this path.
+        tokens = shlex.split(_DEVNULL_REDIR_RE.sub(" ", segment))
+    except ValueError:
+        # Cannot recover argv, so cannot vouch for the operands.
+        return "quoting cannot be resolved"
+    if not tokens:
+        return ""
+    # A version probe acts on an operand, so its entry matches EXACTLY: the
+    # allowlist named `javac -version`, the prefix match vouched for everything
+    # after it, and javac compiled it. See `_EXACT_ONLY_BASH_PREFIXES`.
+    spelled = " ".join(tokens).lower()
+    for probe in _EXACT_ONLY_BASH_PREFIXES:
+        if spelled.startswith(probe + " "):
+            return f"'{probe}' takes no operand, and acts on one when given it"
+    # The verb is matched case-insensitively, like the allowlist does, so an
+    # unusual spelling cannot step past the table. Flags keep their case,
+    # because for these programs the case carries the meaning.
+    verb = tokens[0].rsplit("/", 1)[-1].lower()
+    args = tokens[1:]
+
+    # Whether an unexpanded word can subvert THIS segment's classification.
+    #
+    # Every check below is keyed on a table, so a verb with no table has no
+    # decision to subvert: whatever `cat $HOME/.bashrc` expands to, this
+    # function was always going to return "". Refusing an expansion there buys
+    # nothing and costs the most ordinary read on the auto-approve path, so the
+    # refusal is scoped to the verbs whose arguments this module reads.
+    #
+    # `git` is guarded whatever the subcommand, because the subcommand itself is
+    # a decided word: `git $x` reaches bash as `git branch -D release`.
+    #
+    # `hostname` and `date` are guarded through `_SYSTEM_OPERAND_VALUE_FLAGS`
+    # rather than a flag table, because their rule is an OPERAND rule: an
+    # unexpanded word IS the decision there, so `hostname $EVIL` renames the host
+    # under a spelling this module read as harmless.
+    guarded = (
+        verb in ("git", "uniq")
+        or verb in _WRITE_FLAGS
+        or verb in _EXEC_FLAGS
+        or verb in _SYSTEM_OPERAND_VALUE_FLAGS
+    )
+
+    # ANSI-C quoting is stripped by `shlex` but honoured by bash, so the token
+    # this check inspects is not the token the shell runs: `git diff $'-o'` reaches
+    # `shlex` as `$-o` — matching no flag — while bash passes `-o`. The same trick
+    # hides a subcommand (`git remote $'set-url'`), and a positional or special
+    # parameter does it with no quoting at all — `git remote $@set-url …`, where
+    # `$@` expands to nothing in a `bash -c` string. It is a spelling with no
+    # legitimate use in a read-only command, so the segment is refused outright
+    # rather than un-quoted here, which would mean reimplementing bash's rules.
+    if guarded and _SHELL_EXPANSION_RE.search(segment):
+        return "a shell expansion hides the real argument"
+
+    # Pathname expansion cannot be refused wholesale: a glob usually IS the
+    # argument — `ls *.py`, `grep -rn TODO src/*` — so the question is whether
+    # THIS pattern can reach a word this module decides on. `_glob_hides_word`
+    # answers it with `fnmatch`, which is what keeps the ordinary forms passing:
+    #
+    #     git remote s?t-url origin https://evil   (a file named `set-url` nearby)
+    #     git diff --outp?t=/tmp/pwned
+    #     cat f | sort ?o victim                   (a file named `-o` nearby)
+    #
+    # The last one is why a leading-dash test is not enough. `?o` does not start
+    # with `-`, so a test keyed on the spelling skipped it, bash resolved it to
+    # `-o`, and `sort` truncated `victim` under an auto-approval.
+    if guarded:
+        has_short_flags = verb in _SHORT_FLAG_VERBS or (
+            verb == "git" and bool(args) and args[0].lower() in _GIT_REF_WRITE_FLAGS
+        )
+        for token in args:
+            if _glob_hides_word(token, has_short_flags):
+                return "a glob could expand into a flag or subcommand"
+
+    # The allowlist names `git <subcommand>`, so that is the unit to key on.
+    key = verb
+    if verb == "git" and args:
+        subcommand = args[0].lower()
+        key = f"git {subcommand}"
+        args = args[1:]
+
+        if subcommand in _GIT_REF_WRITE_FLAGS:
+            hit = _matched_flag(args, _GIT_REF_WRITE_FLAGS[subcommand])
+            if hit:
+                return f"'git {subcommand} {hit}' changes a ref"
+            # A bare operand names a ref to create, unless the command is in list
+            # mode (where it is a pattern) or the operand is a required flag value.
+            #
+            # List mode is decided over the whole argument list, because the
+            # selecting flag can come after the operand it makes into a pattern:
+            # `git branch newbranch --list` is still a list. It must stop at `--`,
+            # though: after the terminator a word spelled like a flag is an
+            # operand, so `git tag -- --list` CREATES the ref `--list` while
+            # reading that `--list` as list mode passed it off as a read.
+            options = args[: args.index("--")] if "--" in args else args
+            list_shorts = _GIT_REF_LIST_SHORTS.get(subcommand, "")
+            # A required flag's VALUE is not an option, however it is spelled. git
+            # takes it from the following word, so `git branch --format -l newbranch`
+            # hands `-l` to `--format` and never sees a list flag — while scanning
+            # every token read that `-l` as one, and the bare operand it then
+            # licensed created the branch. The walk below already tracks this for
+            # operands; list mode has to track it too, over the same tokens.
+            selectors: list[str] = []
+            consumed = ""
+            for tok in options:
+                if _consumes_next_word(consumed):
+                    # A glob HERE decides by COUNT, not by what it becomes: under
+                    # `nullglob` an unmatched pattern vanishes, so the flag eats the
+                    # NEXT word instead and every later position shifts by one.
+                    # `git branch --format nomatch* --list newbranch` loses the
+                    # format's value, `--format` takes `--list`, and `newbranch`
+                    # stops being a pattern. See `_glob_shifts_arguments`.
+                    if _glob_shifts_arguments(tok):
+                        return "a glob in a required option's value shifts the arguments"
+                    consumed = ""
+                    continue
+                if tok.startswith("-"):
+                    # An ATTACHED value takes nothing from the next word.
+                    consumed = "" if "=" in tok else tok
+                    selectors.append(tok)
+                    continue
+                consumed = ""
+            list_mode = any(
+                tok.split("=", 1)[0] in _GIT_REF_LIST_FLAGS
+                or (
+                    len(tok) > 1
+                    and tok[0] == "-"
+                    and tok[1] != "-"
+                    # EVERY character of the cluster must be a list letter or a
+                    # digit, not merely one of them. `any` read an attached VALUE
+                    # as part of the cluster, which is the same trap the note on
+                    # `_SYSTEM_SET_FLAGS` records for `date -Iseconds`: the `l` in
+                    # `git tag -ulin@kiro.co` selected list mode and the bare
+                    # operand it then licensed created a signed tag. A digit is
+                    # allowed because `-n` carries an optional count (`-n5`).
+                    #
+                    # A MIXED cluster (`-lv`) is no longer a listing here and falls
+                    # through to the prompt. That is the intended trade: the letter
+                    # this cannot distinguish from a value is exactly the letter a
+                    # write flag arrives on, and the ordinary spellings — a separate
+                    # `-l`, `--list`, or `-n5` — are unaffected.
+                    and all(ch in list_shorts or ch.isdigit() for ch in tok[1:])
+                )
+                for tok in selectors
+            )
+            # A `--no-list` anywhere in the span undoes it, and the operand it was
+            # protecting becomes a ref to create. Applied AFTER the scan and
+            # unconditionally, rather than as git's last-wins: cancelling can only
+            # move an operand toward the prompt, so being coarse here is the safe
+            # direction. See `_GIT_REF_LIST_CANCEL_FLAGS` for what was measured.
+            if list_mode and any(_cancels_list_mode(tok, subcommand) for tok in selectors):
+                list_mode = False
+            previous = ""
+            operand_only = False
+            for tok in args:
+                # `--` ends the options. Everything after it is an operand, however
+                # it is spelled: `git tag -- -z` creates the tag `-z`, while a
+                # leading-dash test read it as one more option and passed. A SECOND
+                # `--` is itself an operand, so the terminator is consumed once.
+                if tok == "--" and not operand_only:
+                    operand_only = True
+                    previous = ""
+                    continue
+                if not operand_only and tok.startswith("-"):
+                    # An ATTACHED value (`--sort=x`) takes nothing from the next
+                    # word, so it must not mark the following operand as consumed.
+                    previous = "" if "=" in tok else tok
+                    continue
+                if _consumes_next_word(previous):
+                    previous = ""
+                    continue
+                if list_mode:
+                    continue
+                return f"'git {subcommand} {tok}' creates a ref"
+
+        if subcommand == "remote":
+            # `git remote -v set-url …` puts an option BEFORE the subcommand, and
+            # git accepts it there. Keying on `args[0]` therefore saw `-v` and let
+            # the mutation through, so the leading options are skipped and the
+            # first non-option word is the subcommand — the same token git uses.
+            for tok in args:
+                if tok.startswith("-"):
+                    continue
+                if tok in _GIT_REMOTE_WRITE_SUBCOMMANDS:
+                    return f"'git remote {tok}' rewrites remote configuration"
+                # A glob HERE, even one that reaches no decided word, because this
+                # loop stops at the first non-option token and `nullglob` can make
+                # a token VANISH: with it exported, `git remote nomatch* set-url
+                # origin …` loses `nomatch*` entirely and git receives `set-url` —
+                # while this loop broke on the pattern and never looked further.
+                #
+                # `_glob_hides_word` above cannot cover it: that test asks whether
+                # the pattern can EXPAND INTO a decided word, and `nomatch*` cannot
+                # — the mutation comes from the token disappearing, not from what it
+                # becomes. Removing this check on the grounds that the general test
+                # subsumed it is what opened the hole.
+                if _GLOB_META_RE.search(tok) or _EXTGLOB_RE.search(tok):
+                    return "a glob in the subcommand hides the real argument"
+                # Likewise an expansion: `guarded` refuses those for `git` before
+                # this point, so reaching here with one is impossible — but the
+                # subcommand position is load-bearing enough to state rather than
+                # infer.
+                if _SHELL_EXPANSION_RE.search(tok):
+                    return "a shell expansion hides the real argument"
+                break
+
+    hit = _matched_flag(args, _WRITE_FLAGS.get(key, ()))
+    if hit:
+        return f"'{key} {hit}' writes a file"
+    hit = _matched_flag(args, _EXEC_FLAGS.get(key, ()))
+    if hit:
+        return f"'{key} {hit}' runs a program named by the repository"
+
+    # `uniq INPUT OUTPUT` writes its second operand. `--` ends the options here
+    # too, so a word after it is an operand however it is spelled:
+    # `uniq -- input -pwned` writes `-pwned`, while a leading-dash test counted
+    # one operand and passed the segment as a read.
+    if verb == "uniq":
+        operands = _operands(args)
+        # Counting the tokens is only sound if each one stays ONE word. A glob
+        # here decides by count: with `in1` and `in2` present, `uniq in*` runs
+        # `uniq in1 in2`, and the second operand is the OUTPUT file — so a single
+        # pattern passed a segment that truncates a file. `uniq`'s operands are
+        # positional, which is what makes this different from `ls *.py`.
+        if any(_glob_shifts_arguments(tok) for tok in operands):
+            return "a glob in a 'uniq' operand can expand into a second operand, which it writes"
+        if len(operands) > 1:
+            return "'uniq INPUT OUTPUT' writes its second operand"
+
+    # `hostname` and `date` each carry a SYSTEM-state setter under a verb whose
+    # bare form is a listing, so the prefix match vouched for the setter too.
+    hit = _system_set_flag(verb, args)
+    if hit:
+        changes = "renames the host" if verb == "hostname" else "sets the system clock"
+        return f"'{verb} {hit}' {changes}"
+
+    # Both also change state through a BARE OPERAND, with no flag at all —
+    # `hostname evil-host` and `date 08221200` (which fails only on privilege,
+    # not on parsing). Their legitimate operands differ, so the predicate does
+    # too: every `hostname` read form is flag-only, while `date`'s one operand
+    # is a `+FORMAT` string.
+    if verb in _SYSTEM_OPERAND_VALUE_FLAGS:
+        value_flags = _SYSTEM_OPERAND_VALUE_FLAGS[verb]
+        previous = ""
+        operand_only = False
+        for tok in args:
+            # `--` ends the options here for the same reason it does for a ref:
+            # after it, `hostname -- -evil` names the host `-evil`, and a
+            # leading-dash test read that as one more option and passed it.
+            if tok == "--" and not operand_only:
+                operand_only = True
+                previous = ""
+                continue
+            if not operand_only and tok.startswith("-"):
+                # Whether a flag takes the FOLLOWING word depends on its form,
+                # and long and short disagree. A long option consumes the next
+                # word unless the value is attached with `=`, so
+                # `date --date yesterday` is a read. A short option consumes it
+                # only when the token is the bare flag: `-Iseconds` carries its
+                # own value, so reading it as `-I` + a separate operand would
+                # deny that read.
+                if tok.startswith("--"):
+                    previous = "" if "=" in tok else tok
+                else:
+                    previous = tok if len(tok) == 2 else ""
+                continue
+            if previous in value_flags:
+                previous = ""
+                continue
+            previous = ""
+            if verb == "date":
+                if tok.startswith("+"):
+                    continue
+                return "'date <operand>' sets the system clock unless it is a +FORMAT string"
+            return f"'{verb} <operand>' sets the hostname; every read form is flag-only"
+
+    return ""
+
+
 def _classify_bash(cmd: str) -> str:
     """Single source of truth for read-only bash classification.
 
@@ -608,17 +1502,55 @@ def _classify_bash(cmd: str) -> str:
         pipe_parts = [p.strip() for p in part.split("|") if p.strip()]
         if not pipe_parts:
             return "unsafe shell pattern"
-        first = pipe_parts[0].strip().lower()
+        # The verb is compared case-insensitively, but the side-effect check
+        # below needs the original spelling: flags are case-sensitive, and the
+        # two cases can mean opposite things (`file -C` compiles a magic file,
+        # `file -c` only prints one).
+        head = pipe_parts[0].strip()
+        first = head.lower()
         if not (
             _is_help_probe(first)
             or any(first == p or first.startswith(p + " ") for p in _READ_ONLY_BASH_PREFIXES)
         ):
             base = first.split()[0] if first.split() else first
             return f"command '{base}' is not on the read-only allowlist"
+        # Clearing the allowlist only settles which program runs. The rest of
+        # the command line can still write a file, change a ref or start
+        # another program.
+        side_effect = _side_effect_reason(head)
+        if side_effect:
+            return f"not read-only: {side_effect}"
         for target in pipe_parts[1:]:
-            if not _READ_ONLY_PIPE_RE.match(target):
+            matched = _READ_ONLY_PIPE_RE.match(target)
+            if not matched:
                 tgt = target.split()[0] if target.split() else target
                 return f"pipe target '{tgt}' is not a read-only filter"
+            # The name the allowlist matched must be the program bash actually
+            # runs. `_READ_ONLY_PIPE_RE` ends its filter name at a `\b`, and `$`
+            # satisfies that, so `sort$IFS-o victim` matched the entry `sort` while
+            # bash split `$IFS` into whitespace and ran `sort -o victim`. Nothing
+            # downstream recovered: `_side_effect_reason` reads the verb as
+            # `sort$ifs-o`, finds no table for it, and returns "".
+            #
+            # The leading segment of a pipeline was never exposed to this, because
+            # its allowlist test pins the boundary to a literal space
+            # (`first == p or first.startswith(p + " ")`). This makes the pipe
+            # allowlist say the same thing: the first argv word, exactly.
+            try:
+                target_tokens = shlex.split(target)
+            except ValueError:
+                return "pipe target quoting cannot be resolved"
+            if not target_tokens or target_tokens[0] != matched.group(1):
+                tgt = target_tokens[0] if target_tokens else target
+                return (
+                    f"pipe target '{tgt}' is not the read-only filter "
+                    f"'{matched.group(1)}' it matched"
+                )
+            # The pipe allowlist matches only the leading verb, so a filter's
+            # own output flag (`sort -o FILE`) needs the same check.
+            side_effect = _side_effect_reason(target)
+            if side_effect:
+                return f"pipe target is not read-only: {side_effect}"
     return ""
 
 
@@ -1107,10 +2039,30 @@ HOOK_CONTINUATION_RECOVERY_PREFIX = "[Hook continuation — automatic]"
 # The VALUE does not say "recovery": nothing failed or recovered, a safety cap
 # fired.
 HOOK_HALTED_RECOVERY_PREFIX = "[Stop-hook nudge cap reached]"
+# Prefix on the DISPLAY-ONLY row appended when a tool deny's reason was steered
+# into the running turn (see chat_runner._steer_policy_notice). Nothing is
+# queued and no turn is dispatched — the agent already has the reason — so this
+# row exists purely so the person sees the same blocked-tool card they used to
+# get from the recovery continuation, instead of only a generic "Steered" chip
+# that reads as though they had steered the turn themselves.
+#
+# Named into the *_RECOVERY_PREFIX family because test_recovery_card_prefixes.py
+# keys its cross-language drift guard on that suffix — a marker outside the
+# family is invisible to it and the row would render as a full-width bubble of
+# machine prose. The VALUE deliberately does not say "recovery": nothing was
+# recovered and no continuation was sent, which is the whole point. Same
+# reasoning as HOOK_HALTED_RECOVERY_PREFIX, whose row is also display-only.
+REFUSAL_INBAND_RECOVERY_PREFIX = "[Tool blocked — reason sent to the agent]"
 
 
 def should_queue_refusal_recovery(
-    refusal_reasons: list, stopping: bool, needs_reset: bool, stop_reason: str
+    refusal_reasons: list,
+    stopping: bool,
+    needs_reset: bool,
+    stop_reason: str,
+    *,
+    notices_sent: int = 0,
+    notices_pending: int = 0,
 ) -> bool:
     """Decide whether to auto-queue a refusal-recovery prompt after a turn.
 
@@ -1119,7 +2071,24 @@ def should_queue_refusal_recovery(
     - A stop is still in progress
     - A session reset is already re-queuing
     - The turn was cancelled by the user (not a policy block)
+    - Every refusal was already explained IN-BAND and the backend confirmed it
+
+    ``notices_sent`` is how many :func:`build_refusal_steer_notice` bodies were
+    steered into the turn, and ``notices_pending`` how many of those the
+    ``steering_consumed`` echo did NOT account for. The extra turn is skipped only
+    when every refusal got a notice AND none is still pending — an unconfirmed
+    steer is treated as undelivered, so the fallback continuation still runs. The
+    check is deliberately coarse (counts, not a per-refusal pairing): its two
+    failure directions are not symmetric. Skipping wrongly leaves the model with
+    kiro-cli's "User denied tool execution" and no correction, while queueing
+    wrongly costs one turn the model would otherwise have been told twice — which
+    is exactly what this path already cost before in-band delivery existed.
+
+    Both are keyword-only with defaults so a caller on a harness without mid-turn
+    steer keeps the original three-condition behaviour unchanged.
     """
+    if refusal_reasons and notices_sent >= len(refusal_reasons) and notices_pending == 0:
+        return False
     return bool(
         refusal_reasons
         and not stopping
@@ -1170,10 +2139,17 @@ def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
 
     When a tool call is refused for a recoverable, system-side reason — a
     host-gate policy deny, the read-only bash safety gate, or a PreToolUse policy
-    hook block — kiro-cli ends the turn early with an attribution-free
-    "tool uses were interrupted" marker. The refusal reason is otherwise surfaced
-    only to the dashboard pill and the SEL audit log, never to the model, so the
-    agent stalls and waits for the user.
+    hook block — the reason reaches the dashboard pill and the SEL audit log but
+    never the model: kiro-cli's own tool result for a rejected permission is the
+    fixed string "User denied tool execution", which is indistinguishable from a
+    human having clicked No. So the agent apologises for a cancellation that
+    never happened and yields.
+
+    This continuation is the FALLBACK path. The primary path is
+    :func:`build_refusal_steer_notice`, which delivers the same reason in-band on
+    a harness that supports mid-turn steer, costing no extra turn. This one runs
+    when that was impossible (harness without steer) or when the steer was never
+    folded in (no ``steering_consumed`` echo covered it).
 
     ``refusals`` is a list of ``(tool_title, reason)`` tuples recorded during the
     turn (already redacted by the caller). The returned text hands those reasons
@@ -1206,6 +2182,91 @@ def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
         "task where you left off.",
     ]
     return "\n".join(lines)
+
+
+#: Why a tool call was denied, for the in-band notice's cause-specific wording.
+#: The notice's INVARIANT half — that this was not a user action, the generic
+#: string it is correcting, and the instruction to decide inside this turn — is
+#: identical for every cause; only the clause naming the cause and the guidance
+#: about what to do next differ. Kept as data rather than three near-copies of
+#: the notice so the invariant half cannot drift between them, which is the half
+#: doing the actual work of overwriting the model's wrong conclusion.
+DENY_CAUSE_POLICY = "policy"
+DENY_CAUSE_INVALID_NAME = "invalid_name"
+DENY_CAUSE_HOOK_ERROR = "hook_error"
+
+#: cause → (clause completing "The tool call you just made …", what to do next).
+_DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
+    DENY_CAUSE_POLICY: (
+        "was blocked by a Kiro Crew safety policy",
+        "use an allowed alternative (for a shell command, a read-only variant), use "
+        "a different tool, or — if the block is correct and you genuinely cannot "
+        "proceed — say so and stop with the reason.",
+    ),
+    DENY_CAUSE_INVALID_NAME: (
+        "was refused because its tool name failed validation",
+        "reissue the call with a name that passes validation. The action itself was "
+        "never judged, so do not abandon it or look for a different approach on this "
+        "evidence — and do not repeat the same malformed name.",
+    ),
+    DENY_CAUSE_HOOK_ERROR: (
+        "could not be authorized because a PreToolUse hook raised while deciding it",
+        "treat this as a host fault, not a verdict on the action: nothing judged the "
+        "call itself. Retrying the identical call is reasonable once; if it faults "
+        "again, say what happened rather than working around it silently.",
+    ),
+}
+
+
+def build_refusal_steer_notice(title: str, reason: str, *, cause: str = DENY_CAUSE_POLICY) -> str:
+    """Body of the in-band deny notice steered into the RUNNING turn.
+
+    Sent BEFORE the permission rejection goes back on the wire, which is what
+    makes it race-free: while the ``session/request_permission`` is still
+    unanswered the turn is provably in flight, so the steer is queued rather than
+    dropped, and kiro-cli folds it in at the next model-inference boundary — the
+    one immediately after the rejected tool resolves. The model therefore learns
+    why inside the SAME turn and no recovery continuation is needed.
+
+    The notice must correct an attribution the model has already been handed:
+    a rejected permission is reported to the model as a generic tool failure with
+    no channel for the host to say more (ACP's permission response carries only
+    ``outcome``/``optionId``). Naming kiro-cli's exact wording — measured against
+    kiro-cli 2.19.1 — is what lets the model overwrite the wrong conclusion rather
+    than hold both, and attributing the quote to that backend keeps the sentence
+    true on another steer-capable harness whose wording has not been measured.
+    ``title``/``reason`` must already be redacted by the caller.
+
+    *cause* selects the wording. The distinction is not cosmetic: a policy block
+    is a verdict the model must route around, an invalid tool name is the model's
+    own malformed output and is the one case it can simply fix, and a hook fault
+    judged nothing at all. Telling the model "safety policy" for the latter two
+    would send it looking for an allowed alternative to an action nobody refused.
+    An unknown cause degrades to the policy wording rather than raising: a wrong
+    noun is recoverable, and losing the notice would hand the model back
+    kiro-cli's "user denied" with nothing to correct it.
+
+    Returns "" when there is nothing to say, so a caller can treat the empty
+    string as "no notice was sent" and fall back to the recovery continuation.
+    """
+    if not (title or "").strip() and not (reason or "").strip():
+        return ""
+    clause, guidance = _DENY_CAUSE_TEXT.get(cause, _DENY_CAUSE_TEXT[DENY_CAUSE_POLICY])
+    what = f"{title}: {reason}" if reason else title
+    # "host notice", not "policy notice": the tag has to be true for all three
+    # causes, and only one of them IS a policy. Naming the ACTOR is also what the
+    # notice exists to do — the model has just been told the user denied this, and
+    # every sentence after this one is spent correcting that.
+    return (
+        f"[Kiro Crew host notice] The tool call you just made {clause}. "
+        "This was NOT a user action — the user did not "
+        "cancel, reject, or interrupt anything. The tool result you were handed for "
+        "it is generic and wrong about who denied it — on kiro-cli it reads "
+        '"User denied tool execution".\n\n'
+        f"Blocked: {what}\n\n"
+        "Do not apologise for a cancellation and do not ask the user whether to "
+        f"retry. Decide and continue in this same turn: {guidance}"
+    )
 
 
 def build_stale_recovery_prompt() -> str:
@@ -1544,6 +2605,7 @@ class _ChatSlot:
         "_native_subagent_tracker",
         "_native_subagent_output",
         "_pending_steers",
+        "_steer_delivery_ids",
         "_wait_state",
         "_end_wait_request",
         "_wait_last_ping",
@@ -2008,6 +3070,13 @@ class _ChatSlot:
         # STOP, error). Without this, a steer swallowed by a dying turn
         # vanished with no trace (see the requeue site).
         self._pending_steers: list[str] = []
+        # Opaque id per in-flight steer, keyed by its text (the one-per-text
+        # rule in chat_delivery makes that key unique). The requeue moves the id
+        # onto the queue entry and the drain unions entry meta onto the row it
+        # writes, which is how a caller can tell a delivery the drain already
+        # persisted from one the running turn consumed — a distinction the bare
+        # text cannot make.
+        self._steer_delivery_ids: dict[str, str] = {}
         # In-flight `wait` tool sleep, as reported by the tool's own keepalive
         # ping: {"wait_id": str, "seconds": int, "deadline_ts": float}. The
         # deadline is on the dashboard's clock (see api_session_keepalive) so
@@ -2704,7 +3773,14 @@ class _ChatSlot:
         """
         self._last_enqueue_ts = datetime.now(timezone.utc).isoformat()
 
-    def queue_insert(self, index: int, content: str, kind: str = "", payload: str = "") -> str:
+    def queue_insert(
+        self,
+        index: int,
+        content: str,
+        kind: str = "",
+        payload: str = "",
+        meta: dict | None = None,
+    ) -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
         See :meth:`queue_append` for the ``kind`` structural origin tag. ``payload``
@@ -2713,7 +3789,10 @@ class _ChatSlot:
         message shares the recovery kind but is not machine speech.
         """
         qid = uuid.uuid4().hex[:12]
-        self._queue.insert(index, {"id": qid, "content": content, "kind": kind, "payload": payload})
+        entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind, "payload": payload}
+        if meta:
+            entry["meta"] = dict(meta)
+        self._queue.insert(index, entry)
         self._note_enqueue()
         return qid
 
@@ -3471,6 +4550,14 @@ class DashboardState:
         # Short reason from the most recent Weixin start failure, empty when
         # connected or never attempted. Read by the settings badge.
         self.weixin_connect_error: str = ""
+        # True only while the WhatsApp (QR-linked personal account) client's
+        # event loop is running (set in maybe_start_whatsapp). Read by the
+        # WhatsApp settings status badge — a paired session DB on disk is NOT
+        # enough to report "connected".
+        self.whatsapp_connected: bool = False
+        # Short reason from the most recent WhatsApp start failure, empty when
+        # connected or never attempted. Read by the settings badge.
+        self.whatsapp_connect_error: str = ""
         # Live channel transports (Telegram/WeCom/...) for channel-neutral
         # cross-surface mirror delivery — registered at boot by each channel's
         # gateway via ``register_channel_transport``. Slack keeps its dedicated
@@ -3571,13 +4658,16 @@ class DashboardState:
         self._chat_pins: list[dict[str, Any]] = []  # pinned chat messages
         # Serializes pin mutation + persistence so concurrent requests cannot
         # interleave snapshots and replace chat_pins.json out of order.
-        self._chat_pins_lock = asyncio.Lock()
+        # LoopBoundLock, not asyncio.Lock (#4800): DashboardState outlives any
+        # single event loop (in-process gateway restart, test loops).
+        self._chat_pins_lock = LoopBoundLock()
         # Serializes read-modify-write of the folder store; see
         # mutate_folders(). Constructed here rather than lazily so two
         # concurrent first-callers cannot each make their own lock and
-        # serialize against nothing. asyncio.Lock binds no loop at
-        # construction (3.10+), so building it off-loop is safe.
-        self._folders_lock = asyncio.Lock()
+        # serialize against nothing. LoopBoundLock binds no loop at
+        # construction, so building it off-loop is safe — and it stays valid
+        # across the loop changes this long-lived state survives (#4800).
+        self._folders_lock = LoopBoundLock()
         # Tag vocabulary: list of {id, name, color, order}. User-managed.
         self._tags: list[dict[str, Any]] = []
         # True once load_tags() parsed tags.json successfully (or seeded a
@@ -5388,7 +6478,14 @@ class DashboardState:
             # only the request layer ever supplies origin=USER. Best-effort:
             # the helper swallows its own I/O errors and never raises into
             # slot creation.
-            increment_user_session_count()
+            #
+            # Off the loop, because this method is synchronous and every
+            # request-layer birth runs it on the gateway loop -- the counter's
+            # read + mkdir + tempfile write + replace would stall it on slow
+            # storage. The offload is the counter's, not this allocation's: this
+            # block must not become a suspension point, or callers could observe
+            # a half-configured slot.
+            increment_user_session_count_off_loop()
         if memory_mode and memory_mode != "persistent":
             self._restricted_keys.add(f"dashboard:{name}")
         if ephemeral:

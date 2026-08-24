@@ -1925,6 +1925,17 @@
           "connect_repo": "रिपो कनेक्ट करें",
           "general": "सामान्य",
           "repository_settings": "रिपॉज़िटरी सेटिंग"
+        },
+        "depsSection": {
+          "title": "निर्भरताएँ",
+          "blocked_by": "इसके कारण अवरुद्ध",
+          "blocking": "अवरुद्ध कर रहा है",
+          "state_open": "open",
+          "state_closed": "closed",
+          "state_merged": "merged",
+          "source_native": "native",
+          "source_inferred": "inferred",
+          "open_here": "{{sigil}}{{number}} यहाँ खोलें"
         }
       },
       "connectPanel": {
@@ -2037,7 +2048,8 @@
         },
         "registry": {
           "overview": "अवलोकन",
-          "tagging": "टैगिंग"
+          "tagging": "टैगिंग",
+          "graph": "ग्राफ़"
         },
         "settings": {
           "generalSettings": {
@@ -2351,6 +2363,45 @@
           "sub_paused": "रुका हुआ — नए इशू नहीं ले रहा",
           "rail_sort": "क्रमबद्ध करें",
           "rail_filters": "फ़िल्टर"
+        },
+        "graphView": {
+          "header": "निर्भरताएँ",
+          "views_label": "निर्भरता दृश्य",
+          "tab_frontier": "फ्रंटियर",
+          "tab_focus": "फ़ोकस ट्री",
+          "jump_label": "आइटम पर जाएँ",
+          "jump_placeholder": "आइटम # पर जाएँ…",
+          "loading": "निर्भरताएँ लोड हो रही हैं…",
+          "refresh": "निर्भरता डेटा रीफ़्रेश करें",
+          "ready_count": "{{n}} नए अनलॉक",
+          "frontier_heading": "फ्रंटियर",
+          "frontier_sub": "{{ready}} नए अनलॉक · {{waiting}} अभी प्रतीक्षारत",
+          "no_frontier": "दर्ज निर्भरताओं वाला कोई खुला आइटम नहीं।",
+          "waiting_heading": "प्रतीक्षारत ({{n}})",
+          "more_waiting": "… +{{n}} और",
+          "why_all_satisfied": "सभी ब्लॉकर पूरे: {{refs}}",
+          "why_waiting": "प्रतीक्षा में {{refs}}",
+          "why_satisfied": "पहले से पूरे: {{refs}}",
+          "open_tree": "ट्री खोलें →",
+          "frontier_caption": "नए अनलॉक आइटम के सभी दर्ज ब्लॉकर बंद या मर्ज हो चुके हैं। कारण देखने के लिए आइटम खोलें, या उसका ट्री खोलें।",
+          "focus_caption": "चयनित आइटम का पूरा सक्रिय निर्भरता ट्री। किसी नोड पर क्लिक से उसे रूट बनाएँ, Enter से खोलें। डैश = अनुमानित, कटा = पूरा।",
+          "focus_empty": "निर्भरता ट्री बनाने के लिए एक आइटम चुनें।",
+          "tree_stat": "{{kind}}-{{number}} का ट्री: {{nodes}} नोड · {{edges}} सक्रिय किनारे",
+          "ghost_satisfied": "पूरा",
+          "ci_fail": "CI विफल",
+          "led_wait": "WAIT",
+          "led_ready": "RDY",
+          "led_run": "RUN",
+          "led_done": "DONE",
+          "led_open": "OPEN",
+          "aria_tree": "{{kind}}-{{number}} का निर्भरता ट्री: {{nodes}} नोड, {{edges}} सक्रिय किनारे",
+          "aria_node": "{{kind}}-{{number}}, {{state}}: {{title}}",
+          "empty_board": "खाली बोर्ड",
+          "empty_title": "अभी कोई निर्भरता नहीं",
+          "empty_blurb": "इस रिपॉज़िटरी में खींचने के लिए कोई निर्भरता किनारा नहीं है। gh issue edit --add-blocked-by से नेटिव निर्भरता सेट करें, या अगली सिंक पर Issue Radar क्रॉस-रेफ़रेंस से अनुमान लगाएगा।",
+          "empty_unavailable_title": "निर्भरता डेटा उपलब्ध नहीं",
+          "empty_unavailable_blurb": "ग्राफ़ लोड नहीं हो सका। संभव है इस रिपॉज़िटरी के लिए deps रूट अभी सक्षम न हो। उपलब्ध होने पर पुनः प्रयास करें।",
+          "retry": "पुनः प्रयास"
         }
       },
       "welcomeCarousel": {
@@ -3825,7 +3876,9 @@
         "co_author": "सह-लेखक",
         "co_author_conflict": "सह-लेखक ने यह फ़ाइल बदली",
         "co_author_conflict_discard": "मेरे बदलाव छोड़ें और फिर लोड करें",
+        "co_author_conflict_discard_button": "बदलाव छोड़ें",
         "co_author_conflict_discard_confirm": "“{{file}}” में अपने सहेजे न गए बदलाव छोड़कर सह-लेखक का संस्करण लोड करें? इसे पूर्ववत नहीं किया जा सकता।",
+        "co_author_conflict_discard_title": "सहेजे न गए बदलाव छोड़ें?",
         "commit_and_push": "कमिट करें और पुश करें",
         "commit_message_prompt": "इस कमिट का वर्णन करें। इसमें पेपर के सभी बदलाव शामिल होंगे।",
         "compile": "कंपाइल करें",
@@ -4148,6 +4201,10 @@
           "advance_to_design": "स्वीकृत करो → डिज़ाइन",
           "advance_to_tasks": "स्वीकृत करो → कार्य",
           "an_agent_will_work_through_the_task_list": "एक एजेंट कार्य सूची पूरी करेगा",
+          "approved": "स्वीकृत",
+          "approved_by_user": "{{user}} ने स्वीकृत किया",
+          "archive_this_spec": "इस spec को संग्रहित करो",
+          "changed_since_approval": "स्वीकृति के बाद बदला",
           "clear": "खाली करें",
           "close_esc": "बंद करें (Esc)",
           "close_review_view": "समीक्षा दृश्य बंद करें",
@@ -4155,24 +4212,30 @@
           "drafting_design": "डिज़ाइन लिखा जा रहा है…",
           "drafting_tasks": "कार्य लिखे जा रहे हैं…",
           "drag_or_use_to_resize": "आकार बदलने के लिए खींचें या ← → का उपयोग करें",
+          "duplicate_this_spec": "इस spec की नकल बनाओ",
           "expand_document_for_review": "समीक्षा के लिए दस्तावेज़ बड़ा करो",
           "expand_for_review_esc_to_close": "समीक्षा के लिए बड़ा करो (Esc से बंद)",
+          "name_for_the_copy": "नकल का नाम",
           "pause": "रोको",
           "pausing": "रोका जा रहा है…",
           "pending_comment_one": "{{count}} लंबित टिप्पणी",
           "pending_comment_other": "{{count}} लंबित टिप्पणियाँ",
           "remove_comment_on": "{{document}} पर की गई टिप्पणी हटाओ",
+          "rename_this_spec_label_the_folder_name_stays": "इस spec का लेबल बदलो। इसके फ़ोल्डर और ब्रांच का नाम वही रहेगा।",
           "resize_document_panel": "दस्तावेज़ पैनल का आकार बदलें",
+          "restore_this_spec": "इस spec को बहाल करो",
           "review_document": "{{document}} की समीक्षा करो",
           "send_all_to_agent": "सब कुछ एजेंट को भेजें",
           "sending": "भेजा जा रहा है…",
+          "spec_label": "Spec का लेबल",
           "start_building": "बनाना शुरू करो",
           "starting": "शुरू हो रहा है…",
           "tab_design": "डिज़ाइन",
           "tab_requirements": "आवश्यकताएं",
           "tab_tasks": "कार्य",
-          "tells_the_agent_this_phase_is_approved_and_to_mo": "एजेंट को बताता है कि यह चरण स्वीकृत है और वह आगे बढ़ सकता है — चैट में लिखने के समान",
+          "tells_the_agent_this_phase_is_approved_and_to_mo": "इस संस्करण के लिए तुम्हारी स्वीकृति दर्ज करता है, फिर एजेंट से आगे बढ़ने को कहता है",
           "the_agent_is_writing_the_next_document": "स्वीकृत — एजेंट अगला दस्तावेज़ लिख रहा है",
+          "this_document_changed_after_it_was_approved": "यह दस्तावेज़ स्वीकृत होने के बाद बदल गया",
           "working": "काम चल रहा है…"
         },
         "specRail": {
@@ -4205,6 +4268,17 @@
           "tool_calls": "टूल कॉल",
           "turns": "चक्र",
           "worktree": "Worktree"
+        },
+        "taskList": {
+          "done": "पूरा",
+          "done_of_total": "{{total}} में से {{done}} कार्य पूरे",
+          "no_tasks_yet": "अभी कोई कार्य नहीं है। डिज़ाइन स्वीकृत करने के बाद क्रमबद्ध कार्य सूची यहाँ आ जाएगी और तुम एक-एक कार्य चला सकोगे।",
+          "pause_the_build_first": "एक कार्य चलाने से पहले निर्माण रोको",
+          "run": "चलाओ",
+          "run_only_this_task_and_stop": "सिर्फ़ यह कार्य चलाओ, फिर रुक जाओ",
+          "run_task": "कार्य चलाओ: {{task}}",
+          "starting": "शुरू हो रहा है…",
+          "task_progress": "कार्य की प्रगति"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "बताओ कि तुम क्या बनाना चाहते हो, कुछ प्रश्नों के उत्तर दो, और एक समीक्षित योजना पाओ — आवश्यकताएं, डिज़ाइन और कार्य — जिसे कोई एजेंट पूरा कर सके।",
@@ -4533,8 +4607,11 @@
       "this_app_provides_agents_and_skills_but_no_visua": "यह ऐप एजेंट और स्किल देता है, लेकिन कोई विज़ुअल इंटरफ़ेस नहीं।\n            इसके एजेंट चैट से उपयोग करें।"
     },
     "approvalCard": {
+      "approval_no_longer_pending": "यह स्वीकृति समाप्त हो गई है या पहले ही तय हो चुकी है — एजेंट अब इसकी प्रतीक्षा नहीं कर रहा है।",
       "approve": "स्वीकृत करें",
       "approved": "स्वीकृत",
+      "decision_failed": "यह निर्णय शायद दर्ज नहीं हुआ — अनुरोध विफल रहा।",
+      "decision_not_recorded_error": "यह निर्णय दर्ज नहीं हुआ: {{error}}",
       "reject": "अस्वीकार करें",
       "rejected": "अस्वीकृत",
       "running": "चल रहा है:",
@@ -4690,8 +4767,10 @@
     },
     "artifactBody": {
       "artifact": "आर्टिफ़ैक्ट: {{slug}}",
+      "could_not_render": "यह आर्टिफ़ैक्ट रेंडर नहीं हो सका",
       "image_could_not_be_loaded": "छवि लोड नहीं हो सकी",
-      "rendering": "रेंडर हो रहा है…"
+      "rendering": "रेंडर हो रहा है…",
+      "retry": "पुन: प्रयास करें"
     },
     "artifactChatPanel": {
       "agent_chat": "एजेंट चैट",
@@ -5580,6 +5659,7 @@
       "collapse_unchanged": "अपरिवर्तित को समेटें",
       "copy_content": "सामग्री कॉपी करें",
       "copy_path": "पाथ कॉपी करें",
+      "discard_changes_button": "बदलाव छोड़ें",
       "discard_unsaved_changes": "बिना सहेजे बदलाव छोड़ दें?",
       "download": "डाउनलोड",
       "download_failed": "डाउनलोड विफल",
@@ -6294,7 +6374,9 @@
       "search_everywhere": "हर जगह खोजें",
       "show_or_focus_the_kiro_crew_window": "{{productName}} विंडो दिखाएँ या फ़ोकस करें",
       "use_ctrl_not_option_for_chat_1_9": "चैट 1–9 के लिए ⌃ Ctrl (⌥ Option नहीं) का उपयोग करें",
-      "use_ctrl_not_option_for_chat_1_to_9": "चैट 1 से 9 के लिए Ctrl (Option नहीं) का उपयोग करें"
+      "use_ctrl_not_option_for_chat_1_to_9": "चैट 1 से 9 के लिए Ctrl (Option नहीं) का उपयोग करें",
+      "panel_toggles": "पैनल टॉगल",
+      "unset": "सेट नहीं है"
     },
     "sidePanelLayout": {
       "update_available": "अपडेट उपलब्ध है"
@@ -6361,11 +6443,32 @@
       "triggers": "ट्रिगर",
       "what_this_skill_does_and_when_the_agent_should_u": "यह स्किल क्या करती है और एजेंट को इसका उपयोग कब करना चाहिए"
     },
+    "projectSkillsTrust": {
+      "body": "${{skill}} इस प्रोजेक्ट के अपने .kiro/skills फ़ोल्डर से आती है।",
+      "confirm": "इस फ़ोल्डर पर भरोसा करो",
+      "consequence": "इस फ़ोल्डर पर भरोसा करने से इसकी स्किल फ़ाइलें इस चैट के कॉन्टेक्स्ट में आ जाती हैं, जहाँ वे एजेंट को कमांड चलाने का निर्देश दे सकती हैं। सिर्फ़ उस प्रोजेक्ट पर भरोसा करो जिसे तुम पहचानते हो।",
+      "decline": "अभी नहीं",
+      "decline_consequence": "मना करने पर कुछ भी लोड नहीं होता और तुम्हारा संदेश वैसा ही रहता है जैसा तुमने लिखा था।",
+      "grant_failed": "इस फ़ोल्डर के लिए भरोसा दर्ज नहीं हो सका।",
+      "title": "इस प्रोजेक्ट की स्किल पर भरोसा करना है?",
+      "withdraw_hint": "इसे बाद में स्किल सेटिंग्स पेज से वापस ले सकते हो।",
+      "working": "भरोसा दर्ज हो रहा है…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "यह फ़ोल्डर अब मौजूद नहीं है।",
+      "hint": "ये प्रोजेक्ट फ़ोल्डर अपनी स्किल चैट में लोड कर सकते हैं। किसी फ़ोल्डर का भरोसा हटा दो, तो उसकी स्किल लोड नहीं होंगी।",
+      "revoke": "भरोसा हटाओ",
+      "revoke_failed": "इस फ़ोल्डर का भरोसा हटाया नहीं जा सका।",
+      "revoking": "हटा रहे हैं…",
+      "title": "भरोसेमंद प्रोजेक्ट फ़ोल्डर"
+    },
     "skillPickerMenu": {
       "loading_skills": "स्किल लोड हो रही हैं…",
       "no_matching_skills": "कोई मेल खाती स्किल नहीं",
       "no_matching_skills_ctrl_enter_sends": "कोई मेल खाती स्किल नहीं — Ctrl+Enter संदेश भेज देगा",
-      "no_matching_skills_enter_sends": "कोई मेल खाती स्किल नहीं — Enter संदेश भेज देगा"
+      "no_matching_skills_enter_sends": "कोई मेल खाती स्किल नहीं — Enter संदेश भेज देगा",
+      "trust_needed_badge": "भरोसा चाहिए",
+      "trust_needed_hint": "इस प्रोजेक्ट से। इसे चुनो ताकि जाँच कर फ़ोल्डर पर भरोसा कर सको।"
     },
     "slashCommandMenu": {
       "desc_agent": "सक्रिय एजेंट बदलें या प्रबंधित करें",
@@ -6387,6 +6490,7 @@
       "desc_model": "मौजूदा मॉडल दिखाएँ या बदलें",
       "desc_onboarding": "सेटअप इंपोर्ट और स्वागत टूर दोबारा चलाएँ",
       "desc_paste": "क्लिपबोर्ड से कोई इमेज पेस्ट करें",
+      "desc_plain": "अब स्थिति क्या है — या कोई विषय दें",
       "desc_prompts": "सहेजे गए प्रॉम्प्ट और एजेंट SOP सूचीबद्ध करें या चलाएँ",
       "desc_quit": "चैट सत्र छोड़ें",
       "desc_reply": "असिस्टेंट के आख़िरी मैसेज का जवाब दें",
@@ -6520,6 +6624,7 @@
       "trust": "भरोसा करें",
       "trust_all_base": "सभी <mono>{{base}}</mono> कमांड पर भरोसा करें",
       "trust_all_tools": "सभी टूल पर भरोसा करें",
+      "trust_all_tools_channel": "इस चैनल के सभी टूल पर भरोसा करें — रीस्टार्ट के बाद भी बना रहता है",
       "trust_this_command": "«<mono>{{cmd}}</mono>» पर भरोसा करें"
     },
     "tunnelStatus": {
@@ -6703,12 +6808,14 @@
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "स्टार नहीं किया जा सकता: विजेट में कोई slug या संदेश संदर्भ नहीं है",
+      "could_not_render": "यह विजेट रेंडर नहीं हो सका",
       "download_as_html": "HTML के रूप में डाउनलोड करें",
       "expand": "फैलाएँ",
       "minimize": "समेटें",
       "open_in_new_tab": "नए टैब में खोलें",
       "remove_artifact_from_library": "आर्टिफ़ैक्ट {{name}} को लाइब्रेरी से हटाएँ",
       "rendering": "रेंडर हो रहा है…",
+      "retry": "पुन: प्रयास करें",
       "save_failed": "सहेजना विफल",
       "star_as_artifact": "आर्टिफ़ैक्ट के रूप में स्टार करें",
       "starred_as_click_to_remove": "\"{{name}}\" के रूप में स्टार किया गया — हटाने के लिए क्लिक करें"
@@ -6824,6 +6931,9 @@
       "confirm_button": "पुष्टि करें और चालू करें",
       "withdraw": "पुष्टि वापस लें"
     },
+    "confirmDialog": {
+      "cancel": "रद्द करें"
+    },
     "crewWebhookSection": {
       "could_not_load_webhooks": "Webhooks लोड नहीं हो सके, इसलिए अभी पता नहीं कि इस crew को क्या जगाता है।",
       "inbound_webhooks_are_switched_off": "इनबाउंड webhooks बंद हैं — बंधे टोकन समेत कोई कॉल नहीं आ सकती।",
@@ -6888,7 +6998,10 @@
       "switch_to_remote_crew": "रिमोट क्रू {{n}} पर जाएँ",
       "walk_back_mru_history": "MRU इतिहास में पीछे जाएँ",
       "stop_speaking": "बोलना बंद करें",
-      "toggle_focus_mode": "फ़ोकस मोड टॉगल करें"
+      "toggle_focus_mode": "फ़ोकस मोड टॉगल करें",
+      "toggle_left_sidebar": "बायाँ साइडबार दिखाएँ/छिपाएँ",
+      "toggle_session_panel": "सत्र पैनल दिखाएँ/छिपाएँ",
+      "toggle_side_panel": "साइड पैनल दिखाएँ/छिपाएँ"
     },
     "usePanelTabs": {
       "artifacts": "आर्टिफ़ैक्ट",
@@ -7412,7 +7525,13 @@
       "public_by_link_warning": "प्रकाशित URL लिंक-द्वारा-सार्वजनिक हैं: लिंक वाला कोई भी व्यक्ति सामग्री देख सकता है — यह सार्वजनिक इंटरनेट पर बिना किसी प्रमाणीकरण के परोसी जाती है।",
       "random_domain_note": "सामग्री एक रैंडम *.cloudfront.net डोमेन पर परोसी जाती है — ऐसा कुछ भी प्रकाशित न करें जिसे आप खुले इंटरनेट पर नहीं रखना चाहेंगे।",
       "cloud_deployment_disabled": "Cloud deployment is disabled",
-      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake."
+      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake.",
+      "recall_title": "साइट वापस लें?",
+      "recall_button": "साइट वापस लें",
+      "destroy_title": "साइट नष्ट करें?",
+      "destroy_button": "साइट नष्ट करें",
+      "remove_profile_title": "प्रोफ़ाइल हटाएँ?",
+      "remove_profile_button": "प्रोफ़ाइल हटाएँ"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· रिमोट कॉपी में एक नया संस्करण उपलब्ध है",
@@ -7444,6 +7563,7 @@
       "copy_failed": "कॉपी विफल",
       "could_not_overwrite": "ओवरराइट नहीं हो सका।",
       "created": "बनाया गया",
+      "discard_changes_button": "बदलाव छोड़ें",
       "discard_unsaved_changes": "बिना सहेजे गए बदलाव छोड़ दें?",
       "document_type": "दस्तावेज़ प्रकार",
       "download": "डाउनलोड",
@@ -7778,9 +7898,6 @@
         "stopped": "रुका हुआ",
         "subagent": "सबएजेंट {{label}}",
         "subagents": "सब-एजेंट",
-        "trusted": "विश्वसनीय",
-        "trusted_base": "विश्वसनीय आधार",
-        "trusted_command": "विश्वसनीय कमांड",
         "waiting_for_output": "आउटपुट की प्रतीक्षा…",
         "waiting_to_start_queued_behind_the_concurrency_l": "शुरू होने की प्रतीक्षा — समांतरता सीमा के कारण कतार में",
         "workflows": "वर्कफ़्लो",
@@ -7943,6 +8060,9 @@
         "recovered_continuing": "जारी रखने का अनुरोध अपने-आप भेज दिया गया",
         "resuming_the_interrupted_turn": "बाधित टर्न फिर से शुरू हो रहा है",
         "safety_policy_continuing": "सुरक्षा नीति ने कॉल को रोक दिया · जारी रखने का अनुरोध अपने-आप भेज दिया गया",
+        "safety_policy_told_in_turn": "सुरक्षा नीति ने कॉल रोक दी · इसी टर्न में एजेंट को कारण बता दिया गया",
+        "invalid_name_told_in_turn": "टूल नाम सत्यापन में विफल · इसी टर्न में एजेंट को कारण बता दिया गया",
+        "hook_fault_told_in_turn": "कॉल से पहले एक हुक विफल हुआ · इसी टर्न में एजेंट को कारण बता दिया गया",
         "session_busy_continuing": "सेशन व्यस्त है · जारी रखने का अनुरोध अपने-आप भेज दिया गया",
         "subagents_finished": "सब-एजेंट पूरे हुए",
         "system_notice": "सिस्टम सूचना",
@@ -8087,7 +8207,8 @@
         "expand_model_reasoning": "मॉडल की रीज़निंग विस्तृत करें",
         "hide_reasoning": "रीज़निंग छिपाएँ",
         "show_reasoning": "रीज़निंग दिखाएँ",
-        "thinking": "सोच रहा है"
+        "thinking": "सोच रहा है",
+        "thought_process": "विचार प्रक्रिया"
       },
       "toolCallLine": {
         "aria_hide_diff": "diff छिपाएँ",
@@ -9395,11 +9516,14 @@
       "stub_failed": "बदलाव लागू नहीं हो सका। यह सहेजा जा चुका हो सकता है पर लागू नहीं — नीचे के स्विच अब सहेजी गई स्थिति दिखाते हैं।",
       "stub_not_live": "सहेज लिया गया, लेकिन यह अभी लागू नहीं है — गेटवे शुरू नहीं हो सका। स्विच सहेजा गया मान दिखाता है, चल रही स्थिति नहीं।",
       "stub_restart_required": "सहेजा गया। यह प्रभावी होने के लिए गेटवे को पुनः आरंभ करें। पहले से चल रहे सत्र उन्हीं सर्वरों का उपयोग करते रहेंगे जिनके साथ वे शुरू हुए थे।",
-      "stubbed_of_total": "{{total}} में से {{stubbed}} पर स्टब",
+      "stubbed_of_total": "{{total}} में से {{stubbed}} स्टब के लिए चयनित",
       "unsupported_platform": "बैकएंड साझा करने के लिए Unix डोमेन सॉकेट चाहिए, इसलिए यह इस प्लैटफ़ॉर्म पर उपलब्ध नहीं है।",
       "view_assessment": "साझाकरण आकलन",
       "view_servers": "सर्वर",
-      "views_aria": "MCP प्रबंधन दृश्य"
+      "views_aria": "MCP प्रबंधन दृश्य",
+      "state_direct_env": "सीधा (env)",
+      "state_direct_env_reason": "स्टब नहीं बना, लेकिन चयन सहेजा रहता है।",
+      "state_direct_env_legend": "सीधा (env) — सर्वर ऐसी वातावरण कुंजी घोषित करता है जो साझा बैकेंड नहीं भेजेगा, इसलिए {{productName}} इसका स्टब बनाता ही नहीं है: सत्र स्वयं इसे प्रारंभ करता है, न साझा बैकेंड और न सर्वर का अपना UI।"
     },
     "migrationPage": {
       "app_migration": "ऐप माइग्रेशन",
@@ -10359,8 +10483,21 @@
       "detail_last_used": "अंतिम उपयोग",
       "detail_size": "आकार",
       "detail_turns": "चरण",
+      "emptied": "{{size}} खाली की गई।",
+      "empty_failed": "{{freed}} खाली करने के बाद रुक गया।",
+      "empty_kept": "{{freed}} खाली हुई, लेकिन सब कुछ नहीं हटाया जा सका।",
+      "empty_not_started": "ट्रैश खाली करना शुरू नहीं हो सका। फिर आज़माएँ।",
+      "emptying": "रद्दी खाली की जा रही है",
+      "emptying_leave_ok": "यह पेज छोड़ने पर भी यह जारी रहेगा।",
+      "emptying_progress": "{{total}} में से {{freed}} खाली हुई",
       "heading": "सत्र भंडारण",
       "in_use": "उपयोग में",
+      "kept_incomplete": "कोई बैच डिस्क से हटाया नहीं जा सका, इसलिए वह अब भी सूची में है।",
+      "kept_next_step": "इस बैच से जो बहाल हो सके उसे बहाल कर लें; जिस फाइल ने हटाना रोका उसका नाम गेटवे लॉग में है।",
+      "kept_outside_root": "कोई बैच अब रद्दी के भीतर नहीं है, इसलिए उसे छोड़ दिया गया।",
+      "kept_unknown": "कोई बैच ऐसे कारण से रखा गया जिसे यह संस्करण नहीं पहचानता।",
+      "kept_unlisted_files": "कोई बैच ऐसी फाइल रखता है जो उसके मेनिफेस्ट में नहीं है; उसे हटाने से किसी सत्र की एकमात्र प्रति नष्ट हो सकती है।",
+      "kept_unreadable": "कोई बैच पूरी तरह पढ़ा नहीं जा सका, इसलिए उसे छोड़ दिया गया।",
       "move_to_trash_bulk": "ट्रैश में ले जाएं",
       "move_to_trash_single": "ट्रैश में ले जाएं",
       "next_page": "आगे",
@@ -10392,7 +10529,9 @@
       "trash_empty": "खाली",
       "trash_note": "खाली करने तक डिस्क स्थान घेरता रहेगा। यहां कुछ भी स्वतः नहीं हटता।",
       "trash_summary": "{{sessions}} सत्र · {{size}}",
-      "unknown_session": "एक असूचीबद्ध सेशन"
+      "unknown_session": "एक असूचीबद्ध सेशन",
+      "busy_emptying": "ट्रैश खाली किया जा रहा है। पूरा होने तक कुछ क्रियाएँ रुकी रहेंगी।",
+      "empty_failed_next_step": "«हमेशा के लिए हटाएँ» फिर आज़माएँ। विवरण गेटवे लॉग में हैं।"
     },
     "sessionsTab": {
       "agent": "एजेंट",
@@ -10574,7 +10713,8 @@
         "file_sessions_in_folder": "सेशन एक फ़ोल्डर में रखें",
         "file_sessions_in_folder_desc": "{{channel}} की नई सेशन साइडबार के एक फ़ोल्डर में जाती है, बिना फ़ोल्डर नहीं रहती।",
         "session_folder_name": "फ़ोल्डर का नाम",
-        "session_folder_name_desc": "इन सेटिंग्स को सेव करने पर यह बन जाता है, अगर पहले से मौजूद न हो।"
+        "session_folder_name_desc": "इन सेटिंग्स को सेव करने पर यह बन जाता है, अगर पहले से मौजूद न हो।",
+        "shared_channels": "साझा चैनल"
       },
       "browserPanel": {
         "use_builtin_label": "बिल्ट-इन ब्राउज़र का उपयोग करें",
@@ -10862,12 +11002,23 @@
         "start_a_gateway_on_this_machine_turn_it_off_to_u": "इस मशीन पर गेटवे शुरू करता है। इसे बंद करने पर Kiro Crew केवल क्लाइंट के रूप में काम करेगा और यहाँ गेटवे चलाने के बजाय कॉन्फ़िगर किए गए गेटवे से जुड़ेगा। अगली बार ऐप खोलने पर लागू होगा।"
       },
       "discordPanel": {
+        "allowed_server_channel_ids": "अनुमत सर्वर चैनल ID",
         "allowed_server_thread_ids": "अनुमत सर्वर थ्रेड ID",
-        "allowlist_description": "DM या मंज़ूर थ्रेड में एजेंट चलाने की अनुमति प्राप्त Discord यूज़र ID। ख़ाली = सभी को अस्वीकार (डिफ़ॉल्ट रूप से अस्वीकार)।",
-        "description": "Gateway WebSocket के ज़रिए Discord DM या साफ़ तौर पर मंज़ूर सर्वर थ्रेड से अपने एजेंट से बात करें। सामान्य सर्वर चैनल हमेशा नज़रअंदाज़ किए जाते हैं।",
+        "allowlist_description": "DM, मंज़ूर थ्रेड या अनुमत चैनल में एजेंट चलाने की अनुमति प्राप्त Discord यूज़र ID। ख़ाली = सभी को अस्वीकार (डिफ़ॉल्ट रूप से अस्वीकार)।",
+        "auto_thread_description": "अनुमत चैनल में भेजा गया मैसेज एक नया सार्वजनिक थ्रेड खोलता है, और बातचीत साझा चैनल के बजाय वहीं चलती है।",
+        "auto_thread_label": "नए थ्रेड में जवाब दें",
+        "auto_thread_off_hint": "ऑटो-थ्रेड बंद है, इसलिए ऊपर दिए चैनलों के मैसेज नज़रअंदाज़ किए जाते हैं। {{productName}} साझा चैनल में ख़ुद कभी जवाब नहीं देता।",
+        "channel_allowlist_description": "वैकल्पिक। मंज़ूर यूज़र इन साझा सर्वर चैनलों से भी एजेंट चला सकते हैं। ख़ाली = कोई साझा चैनल नहीं।",
+        "channel_help": "Developer Mode चालू होने पर चैनल पर राइट-क्लिक करें → <mono>Copy Channel ID</mono>। चैनल की ख़ुद की ID इस्तेमाल करें, उसके अंदर किसी थ्रेड की ID नहीं।",
+        "channel_warning": "साझा चैनल थ्रेड से भी चौड़ी ख़ुलासा सीमा है: जो कोई उस चैनल को देख सकता है, और जो कोई बातचीत वाले सार्वजनिक थ्रेड को खोल सकता है, वह पढ़ सकता है कि एजेंट क्या लिखता है और उसके टूल क्या छापते हैं। कोई चैनल तभी जोड़ें जब उसके सभी सदस्य यह देख सकते हों।",
+        "description": "Gateway WebSocket के ज़रिए Discord DM, मंज़ूर सर्वर थ्रेड या अनुमत सर्वर चैनल से अपने एजेंट से बात करें। बाक़ी हर सर्वर चैनल नज़रअंदाज़ किया जाता है।",
         "empty_allowlist_hint": "कोई अनुमत यूज़र ID नहीं: बॉट हर मैसेज ठुकरा देता है (डिफ़ॉल्ट रूप से अस्वीकार)। नीचे अपनी Discord यूज़र ID जोड़ें।",
-        "guide_body": "Discord Developer Portal में एक ऐप बनाएँ, फिर <mono>Bot</mono> पेज से टोकन कॉपी करें। सिर्फ़ DM के लिए privileged intents बंद ही रहने दें। सर्वर थ्रेड के लिए <mono>Message Content Intent</mono> चालू करें, और <mono>bot</mono> स्कोप के साथ View Channel, Read Message History और Send Messages in Threads चुनकर इंस्टॉल करें। Discord Developer Mode चालू करें, फिर अपने नाम पर राइट-क्लिक करके अपनी अंकों वाली यूज़र ID कॉपी करें।",
+        "guide_body": "Discord Developer Portal में एक ऐप बनाएँ, फिर <mono>Bot</mono> पेज से टोकन कॉपी करें। सिर्फ़ DM के लिए privileged intents बंद ही रहने दें। सर्वर थ्रेड के लिए <mono>Message Content Intent</mono> चालू करें, और <mono>bot</mono> और <mono>applications.commands</mono> स्कोप के साथ View Channel, Read Message History और Send Messages in Threads चुनकर इंस्टॉल करें। Discord Developer Mode चालू करें, फिर अपने नाम पर राइट-क्लिक करके अपनी अंकों वाली यूज़र ID कॉपी करें।",
         "open_developer_portal": "Developer Portal खोलें",
+        "reactions_description": "एजेंट जिस फ़ेज़ में है, उसे तुम्हारे मैसेज पर इमोजी से चिह्नित करता है (क़तार में → सोच रहा है → कोडिंग → पूर्ण)। बंद रहने पर तुम्हारे मैसेज पर कोई चिह्न नहीं लगता।",
+        "reactions_label": "फ़ेज़ प्रतिक्रियाएँ",
+        "thinking_description": "मॉडल के तर्क (reasoning) की झलक जवाब के ऊपर एक अलग सबटेक्स्ट नोट के रूप में पोस्ट करता है। बंद रहने पर चैनल में सिर्फ़ जवाब रहता है।",
+        "thinking_label": "थिंकिंग दिखाएँ",
         "thread_allowlist_description": "वैकल्पिक। मंज़ूर यूज़र एजेंट को सिर्फ़ इन्हीं Discord थ्रेड में चला सकते हैं। ख़ाली = केवल DM।",
         "thread_help": "Developer Mode चालू होने पर थ्रेड पर राइट-क्लिक करें → <mono>Copy Channel ID</mono>। थ्रेड की ID इस्तेमाल करें, उसके पैरेंट चैनल की ID नहीं।",
         "thread_warning": "थ्रेड मोड Discord का ग्लोबल Message Content intent चालू कर देता है। Discord उन सभी सर्वर चैनलों का कंटेंट भेजता है जो बॉट को दिखते हैं; Kiro Crew मंज़ूर थ्रेड के बाहर का ट्रैफ़िक फेंक देता है। जो कोई मंज़ूर थ्रेड देख सकता है, वह एजेंट के जवाब और टूल आउटपुट पढ़ सकता है।",
@@ -11372,7 +11523,9 @@
         "record_prompt": "कुंजियाँ दबाएँ…",
         "search": "खोजें",
         "turn_keyboard_shortcuts_on_or_off_globally": "कीबोर्ड शॉर्टकट को पूरे सिस्टम में चालू या बंद करो — {{mod}} + K (यह संदर्भ) हमेशा काम करता है",
-        "use_ctrl_not_option_for_chat_1_9": "चैट 1–9 के लिए ⌃ Ctrl (⌥ Option नहीं) का उपयोग करें"
+        "use_ctrl_not_option_for_chat_1_9": "चैट 1–9 के लिए ⌃ Ctrl (⌥ Option नहीं) का उपयोग करें",
+        "clear_shortcut": "साफ़ करें",
+        "panel_toggles": "पैनल टॉगल"
       },
       "skillsPanel": {
         "analyze_each_completed_session_and_draft_a_reusa": "प्रत्येक पूर्ण हुए सेशन का विश्लेषण करें और जब वह सेशन कोई दोहराई जाने वाली प्रक्रिया दिखाए — ऐसी प्रक्रिया जिसे भविष्य का कोई सेशन किसी अलग लक्ष्य पर फिर से चलाएगा — तो पुनः प्रयोग योग्य SKILL.md का ड्राफ़्ट बनाएँ। डिफ़ॉल्ट रूप से बंद। ड्राफ़्ट समीक्षा के लिए स्किल टैब की लंबित कतार में रखे जाते हैं — आपकी स्वीकृति के बिना कुछ भी लाइव नहीं होता (नीचे देखें)।",
@@ -11455,7 +11608,7 @@
         "installs_mlx_whisper_via_pipx_ffmpeg_apple_silic": "pipx के ज़रिए mlx-whisper + ffmpeg इंस्टॉल करता है। सिर्फ़ Apple Silicon (arm64) पर।",
         "installs_openai_whisper_ffmpeg_uses_system_pytho": "openai-whisper + ffmpeg इंस्टॉल करता है। सिस्टम python3 (≥ 3.10) इस्तेमाल करता है।",
         "language": "भाषा",
-        "larger_models_are_more_accurate_but_slower_to_ru": "बड़े मॉडल अधिक सटीक होते हैं, लेकिन चलने में धीमे होते हैं",
+        "larger_models_are_more_accurate_but_slower_to_ru": "बड़े मॉडल अधिक सटीक होते हैं, लेकिन चलने में धीमे होते हैं। मॉडल पहली बार उपयोग करने पर डाउनलोड होता है, इसलिए मॉडल बदलने के बाद पहला श्रुतलेख डाउनलोड पूरा होने तक अटका हुआ लग सकता है या समय समाप्त हो सकता है।",
         "microphone": "माइक्रोफ़ोन",
         "microphone_2": "माइक्रोफ़ोन {{n}}",
         "mlx_model": "MLX मॉडल",
@@ -11492,7 +11645,7 @@
         "us_east_1": "us-east-1",
         "whisper_and_mlx_run_locally_transcribe_calls_aws": "Whisper, MLX और Apple Speech स्थानीय रूप से चलते हैं; Transcribe AWS को कॉल करता है",
         "whisper_installed_but_ffmpeg_is_missing_voice_tr": "Whisper इंस्टॉल है लेकिन ffmpeg नहीं मिला — वॉइस ट्रांसक्रिप्शन के लिए ffmpeg ज़रूरी है।",
-        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Apple MLX (Metal GPU) पर चलने वाला Whisper मॉडल। पहली बार उपयोग पर डाउनलोड होता है।",
+        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Apple MLX (Metal GPU) पर चलने वाला Whisper मॉडल। पहली बार उपयोग पर डाउनलोड होता है, इसलिए पहला श्रुतलेख डाउनलोड पूरा होने तक अटका हुआ लग सकता है या समय समाप्त हो सकता है।",
         "ptt_altgr_note": "अधिकांश Windows और Linux कीबोर्ड में दायाँ Alt वास्तव में AltGr है, जो उच्चारण-चिह्न वाले अक्षर टाइप करने में मदद करता है — इसलिए यहाँ अकेला Option डिफ़ॉल्ट नहीं हो सकता।",
         "ptt_heading": "एक कुंजी से बोलकर लिखना शुरू करें",
         "ptt_heading_desc": "माइक्रोफ़ोन बटन दबाने के बजाय एक कुंजी दबाकर बोलना शुरू करें। दायाँ Option ⌥ शुरू से काम करता है — यहाँ सब कुछ वैसा ही छोड़ा जा सकता है।",
@@ -11741,6 +11894,70 @@
         "wechat_login_qr_code": "WeChat लॉगिन QR कोड",
         "who_can_message_the_bot": "बॉट को कौन संदेश भेज सकता है",
         "wxid": "wxid_…"
+      },
+      "whatsAppPanel": {
+        "status_unavailable": "स्थिति उपलब्ध नहीं",
+        "setup_guide": "सेटअप गाइड",
+        "whatsapp": "WhatsApp",
+        "connected": "कनेक्ट हो गया",
+        "not_signed_in": "पेयर नहीं है",
+        "pair_with_whatsapp": "WhatsApp से पेयर करें",
+        "scan_the_code_from_linked_devices": "अपने फ़ोन पर WhatsApp से कोड स्कैन करें: सेटिंग्स, लिंक किए गए डिवाइस, डिवाइस लिंक करें।",
+        "signed_in_restart_the_gateway_to_start_receiving": "पेयर हो गया। संदेश प्राप्त करना शुरू करने के लिए gateway को पुनः प्रारंभ करें।",
+        "talk_to_your_agent_from_your_own_whatsapp": "लिंक किए गए डिवाइस के रूप में पेयर किए गए अपने खुद के WhatsApp अकाउंट से अपने एजेंट से बात करें। एजेंट जो संदेश भेजता है वे तुम्हारे नंबर से आते हैं।",
+        "waiting_for_a_code": "कोड की प्रतीक्षा हो रही है...",
+        "waiting_for_scan": "स्कैन की प्रतीक्षा हो रही है...",
+        "scanned_confirm_on_your_phone": "स्कैन हो गया। अपने फ़ोन पर पुष्टि करें।",
+        "the_code_expired_try_again": "कोड की समय-सीमा समाप्त हो गई। पुनः प्रयास करें।",
+        "could_not_start_pairing": "पेयरिंग शुरू नहीं की जा सकी।",
+        "could_not_start_the_login_flow": "पेयरिंग प्रक्रिया शुरू नहीं की जा सकी।",
+        "whatsapp_pairing_qr_code": "WhatsApp पेयरिंग QR कोड",
+        "enable_the_whatsapp_channel": "WhatsApp चैनल सक्षम करें",
+        "who_can_message_the_bot": "एजेंट को कौन संदेश भेज सकता है",
+        "only_me_the_default": "केवल मैं (मेरे अपने संदेश)",
+        "me_plus_allowed_numbers": "मैं, साथ ही अनुमत नंबर",
+        "nobody_ignore_all_messages": "कोई नहीं (सभी संदेश अनदेखा करें)",
+        "anyone_who_messages_you": "बॉट को संदेश भेजने वाला कोई भी व्यक्ति",
+        "allowed_wa_ids": "अनुमत नंबर",
+        "allowed_numbers_empty_adds_nobody": "फ़ोन नंबर (देश कोड सहित अंक, बिना प्लस चिह्न के) जो एजेंट से बातचीत भी कर सकते हैं। खाली रहने पर तुम्हारे अलावा कोई नहीं जोड़ा जाता।",
+        "phone_number_placeholder": "447700900000",
+        "created_for_you_when_you_turn_this_on_if_it_does": "जब तुम इसे चालू करते हो तो यदि यह पहले से मौजूद नहीं है तो तुम्हारे लिए बना दिया जाता है।",
+        "group_participation_is_opt_in_per_group": "समूहों में भागीदारी प्रति समूह वैकल्पिक है: मेंशन मोड केवल तभी उत्तर देता है जब तुम्हें टैग किया जाए; नियम मोड कूलडाउन के साथ बिना पूछे भी मदद कर सकता है। यह अनौपचारिक WhatsApp Web प्रोटोकॉल का उपयोग करता है; उपयोग व्यक्तिगत स्तर तक सीमित रखें।",
+        "waiting_to_be_paired": "पेयरिंग की प्रतीक्षा",
+        "the_link_was_revoked": "लिंक रद्द कर दिया गया",
+        "blocked_by_whatsapp": "WhatsApp ने ब्लॉक किया",
+        "paired_but_not_connected": "पेयर है, लेकिन कनेक्ट नहीं",
+        "whatsapp_did_not_connect": "WhatsApp कनेक्ट नहीं हुआ: {{error}}",
+        "the_channel_is_enabled_but_not_running": "चैनल सक्षम है लेकिन चल नहीं रहा है। gateway को पुनः प्रारंभ करें।",
+        "show_pairing_code": "पेयरिंग कोड दिखाएँ",
+        "already_paired_unlink_then_restart": "पहले से पेयर है। कोई दूसरा डिवाइस पेयर करने के लिए, नीचे इस डिवाइस का लिंक हटाएँ और फिर gateway को पुनः प्रारंभ करें।",
+        "the_link_was_revoked_restart_to_pair_again": "लिंक रद्द कर दिया गया। फिर से डिवाइस पेयर करने के लिए gateway को पुनः प्रारंभ करें।",
+        "blocked_number_cannot_pair": "WhatsApp ने इस नंबर को ब्लॉक कर दिया है, इसलिए पेयरिंग शुरू नहीं हो सकती।",
+        "pairing_starts_when_the_channel_starts": "पेयरिंग कोड केवल तब मौजूद रहता है जब चैनल पेयरिंग कर रहा हो, और पेयरिंग चैनल के शुरू होने पर ही शुरू होती है। नीचे चैनल सक्षम करें, फिर gateway को पुनः प्रारंभ करें।",
+        "the_channel_is_not_running_enable_and_restart": "WhatsApp चैनल चल नहीं रहा है। नीचे इसे सक्षम करें, फिर gateway को पुनः प्रारंभ करें।",
+        "unlink_this_device": "इस डिवाइस का लिंक हटाएँ",
+        "revokes_the_linked_device_on_your_account": "तुम्हारे WhatsApp अकाउंट से इस लिंक किए गए डिवाइस को रद्द करता है और स्थानीय सत्र मिटा देता है। जब तक कोई डिवाइस दोबारा पेयर न हो, एजेंट पढ़ना और भेजना बंद कर देता है।",
+        "confirm_unlink": "लिंक हटाने की पुष्टि करें",
+        "unlinked_restart_to_pair_again": "लिंक हटा दिया गया। फिर से डिवाइस पेयर करने के लिए gateway को पुनः प्रारंभ करें।",
+        "unlinked_but_the_session_file_was_kept": "WhatsApp से लिंक हट गया, लेकिन स्थानीय सत्र फ़ाइल हटाई नहीं जा सकी। दोबारा पेयर करने से पहले उसे डेटा डायरेक्टरी से मिटा दें।",
+        "whatsapp_refused_the_unlink_still_linked": "WhatsApp ने लिंक हटाने से इनकार किया, इसलिए डिवाइस अभी भी लिंक है और स्थानीय सत्र रखा गया है। फिर कोशिश करें, या फ़ोन में लिंक किए गए डिवाइस से उसे रद्द करें।",
+        "channel_not_running_so_nothing_was_unlinked": "चैनल चल नहीं रहा है, इसलिए कुछ भी लिंक से नहीं हटाया गया। लिंक किया गया डिवाइस लिंक ही रहता है: उसे फ़ोन में लिंक किए गए डिवाइस से रद्द करें।",
+        "could_not_unlink_the_device": "डिवाइस का लिंक नहीं हटाया जा सका।",
+        "groups": "समूह",
+        "the_agent_ignores_every_group_not_listed": "जो समूह यहाँ सूची में नहीं हैं, एजेंट उन सभी को नज़रअंदाज़ करता है।",
+        "add_a_group": "समूह जोड़ें",
+        "your_groups_load_once_the_channel_is_connected": "चैनल कनेक्ट होने पर तुम्हारे समूह यहाँ दिखेंगे।",
+        "every_group_you_joined_is_already_listed": "तुम जिन समूहों में हो, वे सभी पहले से सूची में हैं।",
+        "how_the_agent_joins_in": "एजेंट कैसे शामिल होता है",
+        "mode_only_when_mentioned": "केवल मेंशन या कोट किए जाने पर",
+        "mode_also_when_the_rules_apply": "जब इसके नियम लागू हों तब भी",
+        "mode_off_keeping_the_entry": "बंद, प्रविष्टि बनी रहेगी",
+        "when_the_agent_may_speak": "एजेंट कब बोल सकता है",
+        "the_agent_stays_silent_unless_these_apply": "मुक्त पाठ। जब तक ये नियम स्पष्ट रूप से लागू न हों, एजेंट चुप रहता है।",
+        "rules_example_placeholder": "3D प्रिंटिंग के सवालों के जवाब देना",
+        "seconds_between_unprompted_replies": "बिना पूछे दिए गए उत्तरों के बीच सेकंड",
+        "remove_name_from_the_group_list": "समूह सूची से {{name}} हटाएँ",
+        "unofficial_protocol_ban_risk": "अनौपचारिक प्रोटोकॉल: WhatsApp जुड़े हुए नंबर को प्रतिबंधित कर सकता है। ऐसा नंबर न जोड़ें जिसे खोना तुम्हें सहन न हो।"
       },
       "remoteCrewPanel": {
         "your_crews": "Your crews",
@@ -12190,7 +12407,7 @@
         "label": "ब्राउज़र"
       },
       "channels": {
-        "description": "चैट प्लैटफ़ॉर्म जिन पर एजेंट संदेश भेज और प्राप्त कर सकता है — Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, WeChat",
+        "description": "चैट प्लैटफ़ॉर्म जिन पर एजेंट संदेश भेज और प्राप्त कर सकता है",
         "label": "चैनल"
       },
       "chat": {

@@ -840,6 +840,24 @@ def unlink_queued_temp_paths(kwargs: dict) -> None:
             pass
 
 
+def _unlink_session_queue(session: "_Session") -> None:
+    """Unlink temp files for every entry still queued on a popped session.
+
+    Every teardown path that pops a whole ``_Session`` out of ``_sessions``
+    (stale-provider eviction, ``reset``, RSS recycle, ``remove``,
+    ``remove_if_unclaimed``, ``destroy``, ``discard_conversation``,
+    ``drain_all_providers``) discards ``session.queue`` along with it.
+    Anything still sitting there never reaches ``_dispatch_queued``'s own
+    cleanup — that only runs for an entry that actually gets dispatched —
+    so this is the one place responsible for unlinking the images behind a
+    whole-session teardown, the same way ``cancel_queued``/``clear_queue``/
+    ``dequeue``'s cancelled-skip already do for a live session's own
+    piecemeal discards.
+    """
+    for _, _, kwargs in session.queue:
+        unlink_queued_temp_paths(kwargs)
+
+
 class SessionManager:
     """Thread-keyed LLM provider pool with warm session pre-spawning."""
 
@@ -1594,6 +1612,7 @@ class SessionManager:
                 del self._sessions[key]
                 dead = sess.provider
         if dead is not None:
+            await asyncio.to_thread(_unlink_session_queue, sess)
             try:
                 await dead.shutdown()
             except Exception:
@@ -2575,6 +2594,7 @@ class SessionManager:
         # cold-starts a context-free duplicate (thread split).
         key = self._fold_key(key)
         stale_provider = None
+        stale_session: "_Session | None" = None
         _claimed: "_Session | None" = None
         try:
             async with self._lock:
@@ -2630,6 +2650,7 @@ class SessionManager:
                                 "Session %s has dead provider — removing stale entry", key
                             )
                             stale_provider = sess.provider
+                            stale_session = sess
                             del self._sessions[key]
                             # Preserve session_map entry: the kiro-cli session
                             # files survive on disk, enabling lossless resume
@@ -2677,6 +2698,8 @@ class SessionManager:
             # Kill orphaned child processes (MCP servers, kiro-cli-chat)
             # outside the lock — shutdown() may involve signals/waitpid.
             if stale_provider is not None:
+                if stale_session is not None:
+                    await asyncio.to_thread(_unlink_session_queue, stale_session)
                 try:
                     await stale_provider.shutdown()
                 except Exception:
@@ -3261,6 +3284,7 @@ class SessionManager:
             # Same tick as the pop — see the docstring.
             self._session_map.clear_sid(key)
         if session:
+            await asyncio.to_thread(_unlink_session_queue, session)
             # Capture PID and child tree before shutdown clears them
             client = getattr(session.provider, "_client", None)
             raw_pid = getattr(client, "_pid", None) if client else None
@@ -3721,6 +3745,9 @@ class SessionManager:
                 popped = None
                 if self._sessions.get(key) is session:
                     popped = self._sessions.pop(key, None)
+            # popped is session by identity when non-None (see pop-by-identity
+            # above), but session's queue is abandoned in either branch below.
+            await asyncio.to_thread(_unlink_session_queue, session)
             if popped is None:
                 # A racing cold-start already replaced the entry — the map
                 # now points at a fresh, healthy session. Reap OUR old
@@ -4073,6 +4100,7 @@ class SessionManager:
             self._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
         if session:
+            await asyncio.to_thread(_unlink_session_queue, session)
             await session.provider.shutdown()
             # Reap any companion subagent runtime keyed by this parent (the
             # get_subagent_runtime fallback path). shutdown() covers the common
@@ -4390,6 +4418,7 @@ class SessionManager:
             self._compact_cooldown_until.pop(key, None)
             self._compact_pending_verdict.pop(key, None)
             self._origin_links.pop(key, None)
+        await asyncio.to_thread(_unlink_session_queue, session)
         await session.provider.shutdown()
         await self.release_subagent_runtime(key)
         logger.info("Removed unclaimed speculative session (map preserved): %s", key)
@@ -4408,6 +4437,7 @@ class SessionManager:
             self._compact_pending_verdict.pop(key, None)
         try:
             if session:
+                await asyncio.to_thread(_unlink_session_queue, session)
                 await session.provider.shutdown()
             # Reap any companion subagent runtime keyed by this parent (see remove()).
             await self.release_subagent_runtime(key)
@@ -4436,6 +4466,7 @@ class SessionManager:
             self._compact_pending_verdict.pop(key, None)
         try:
             if session:
+                await asyncio.to_thread(_unlink_session_queue, session)
                 await session.provider.shutdown()
             # Reap any companion subagent runtime keyed by this parent (see remove()).
             await self.release_subagent_runtime(key)
@@ -5481,12 +5512,19 @@ class SessionManager:
     async def drain_all_providers(self) -> list:
         """Pop all sessions and return their providers. Thread-safe."""
         providers = []
+        popped: list["_Session"] = []
         async with self._lock:
             keys = list(self._sessions.keys())
             for key in keys:
                 sess = self._sessions.pop(key, None)
                 if sess:
                     providers.append(sess.provider)
+                    popped.append(sess)
+        # Unlink off the lock: a bulk drain (every gateway shutdown/restart)
+        # can pop many sessions at once, and os.unlink is blocking I/O that
+        # would otherwise stall every other coroutine waiting on self._lock.
+        for sess in popped:
+            await asyncio.to_thread(_unlink_session_queue, sess)
         return providers
 
     async def drain_warm_pool(self) -> list:

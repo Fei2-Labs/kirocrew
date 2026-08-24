@@ -108,6 +108,45 @@ class TestFileLock:
             os.close(fd)
 
 
+class TestRenameNoReplace:
+    @pytest.mark.skipif(
+        not pc.RENAME_NOREPLACE_AVAILABLE,
+        reason="native atomic no-replace rename is unavailable",
+    )
+    def test_rename_is_atomic_and_preserves_an_existing_destination(self, tmp_path):
+        first = tmp_path / "first"
+        first.mkdir()
+        (first / "payload").write_text("published")
+        parent_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            pc.rename_noreplace("first", "published", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            assert not first.exists()
+            assert (tmp_path / "published" / "payload").read_text() == "published"
+
+            losing = tmp_path / "losing"
+            losing.mkdir()
+            destination = tmp_path / "occupied"
+            destination.mkdir(mode=0o700)
+            before = destination.stat()
+            with pytest.raises(FileExistsError):
+                pc.rename_noreplace(
+                    "losing",
+                    "occupied",
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            after = destination.stat()
+            assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+            assert losing.is_dir()
+        finally:
+            os.close(parent_fd)
+
+    def test_unavailable_native_contract_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(pc, "_RENAME_NOREPLACE_FN", None)
+        with pytest.raises(NotImplementedError):
+            pc.rename_noreplace("source", "target", src_dir_fd=-1, dst_dir_fd=-1)
+
+
 class TestProcessHelpers:
     def test_pid_exists_true_for_self(self):
         # The current process obviously exists — on POSIX via os.kill(0), on
@@ -1006,6 +1045,93 @@ class TestProcessIdentityPosix:
         assert isinstance(result, bool)
         if pc.IS_POSIX:
             assert result is False
+
+
+class TestProcessArgvMatchesExact:
+    """The strict identity check behind reclaiming a recorded-but-orphaned
+    child: the WHOLE argv must match, element for element, and every failure
+    answers False — an unconfirmable identity must never be signalled."""
+
+    def _spawn(self, token: str):
+        argv = [
+            sys.executable,
+            "-c",
+            f"import sys, time; sys.stdout.write('R'); sys.stdout.flush(); "
+            f"time.sleep(30)  # {token}",
+        ]
+        child = subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        ready = child.stdout.read(1)
+        assert ready == b"R", f"child did not signal readiness: {ready!r}"
+        return child, argv
+
+    @staticmethod
+    def _reap(child):
+        child.kill()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def test_exact_argv_matches_and_near_misses_do_not(self):
+        if pc.IS_POSIX:
+            # A plain binary that does NOT re-exec, so its kernel-visible argv
+            # is exactly the spawn argv on Linux AND macOS (a macOS framework
+            # python re-execs Python.app and rewrites argv[0], which is a
+            # property of the interpreter stand-in, not of the production
+            # targets — ssh and the aws v2 binary do not re-exec).
+            sleep_bin = shutil.which("sleep") or "/bin/sleep"
+            argv = [sleep_bin, "300"]
+            child = subprocess.Popen(
+                argv, start_new_session=True, stderr=subprocess.DEVNULL
+            )
+        else:
+            child, argv = self._spawn("kirocrew-argvexact-probe")
+        try:
+            if pc.IS_POSIX:
+                # Exact match: retry briefly for slow /proc population on
+                # loaded runners (same shape as the process_matches test).
+                deadline = time.monotonic() + 10.0
+                result = pc.process_argv_matches_exact(child.pid, argv)
+                while not result and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                    result = pc.process_argv_matches_exact(child.pid, argv)
+                assert result is True
+                # Anything less than the whole argv is a different process:
+                # a subset (prefix), a superset, and a one-element difference
+                # must all answer False — substring semantics are exactly what
+                # this function exists to NOT have.
+                assert pc.process_argv_matches_exact(child.pid, argv[:-1]) is False
+                assert pc.process_argv_matches_exact(child.pid, argv + ["-x"]) is False
+                changed = list(argv)
+                changed[-1] = changed[-1] + " "
+                assert pc.process_argv_matches_exact(child.pid, changed) is False
+            else:
+                # Windows: element-exact argv equality is not verifiable (the
+                # raw command line carries shell quoting, not a vector) — the
+                # guard fails closed even for the true argv.
+                assert pc.process_argv_matches_exact(child.pid, argv) is False
+        finally:
+            self._reap(child)
+
+    def test_unconfirmable_identities_answer_false(self):
+        # A pid that cannot exist, reserved pids, and an empty expectation all
+        # fail closed rather than raising.
+        assert pc.process_argv_matches_exact(2_000_000_000, ("x",)) is False
+        assert pc.process_argv_matches_exact(0, ("x",)) is False
+        assert pc.process_argv_matches_exact(1, ("x",)) is False
+        assert pc.process_argv_matches_exact(-5, ("x",)) is False
+        assert pc.process_argv_matches_exact(os.getpid(), ()) is False
+
+    def test_own_process_with_wrong_argv_is_false(self):
+        result = pc.process_argv_matches_exact(
+            os.getpid(), ("zzz-not-this-interpreter", "--nope")
+        )
+        assert result is False
 
 
 class TestProcessStartTime:
@@ -2123,6 +2249,31 @@ class TestFindPythonInterpreterReal:
 
         monkeypatch.setattr(pc.subprocess, "check_output", boom)
         assert pc.find_python_interpreter() is None
+
+    def test_version_gate_ignores_a_sitecustomize_decoy_on_pythonpath(
+        self, tmp_path, monkeypatch
+    ):
+        # The selection-side twin of test_origin_probe_ignores_pythonpath: at
+        # child startup the ``site`` module imports any ``sitecustomize.py``
+        # found on the caller's PYTHONPATH, and that module can monkeypatch
+        # ``sys.version_info`` — here forcing this real >= 3.10 interpreter to
+        # report 3.4, which would make the version gate reject it and steer
+        # selection. The gate runs the probe isolated (-I), so the decoy is
+        # never imported and the candidate is judged by its REAL version.
+        # This spawns a real child; the probe is a read-only version query
+        # that creates nothing, so no cwd pin is needed.
+        decoy = tmp_path / "decoy-pythonpath"
+        decoy.mkdir()
+        (decoy / "sitecustomize.py").write_text(
+            "import sys\nsys.version_info = (3, 4, 0, 'final', 0)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        # Every candidate name resolves to this suite's own interpreter — a
+        # real, runnable >= 3.10 CPython on every platform CI runs.
+        monkeypatch.setattr("shutil.which", lambda name: sys.executable)
+
+        assert pc.find_python_interpreter() == sys.executable
 
 
 class TestFindListeningPidsErrors:

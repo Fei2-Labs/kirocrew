@@ -1188,6 +1188,12 @@
         "setting": "Setting",
         "view": "View"
       }
+    },
+    "papyrus": {
+      "workspace": {
+        "co_author_conflict_discard_button": "Discard edits",
+        "co_author_conflict_discard_title": "Discard unsaved edits?"
+      }
     }
   },
   "components": {
@@ -1235,6 +1241,11 @@
     },
     "appHost": {
       "not_installed": "\"{{name}}\" is not installed"
+    },
+    "approvalCard": {
+      "approval_no_longer_pending": "This approval has expired or was already decided — the agent is no longer waiting on it.",
+      "decision_failed": "This decision may not have been recorded — the request failed.",
+      "decision_not_recorded_error": "This decision wasn't recorded: {{error}}"
     },
     "approvalModePicker": {
       "approval_mode_aria": "Approval mode: {{mode}}",
@@ -1771,6 +1782,7 @@
       "adding_2": "Adding...",
       "already_in_library": "Already in Library",
       "cannot_read_file": "Cannot read file",
+      "discard_changes_button": "Discard changes",
       "download_failed": "Download failed",
       "edit": "Edit",
       "failed_to_add_source": "Failed to add source",
@@ -2269,6 +2281,7 @@
       "desc_model": "Show or switch the current model",
       "desc_onboarding": "Replay setup import and the welcome tour",
       "desc_paste": "Paste an image from the clipboard",
+      "desc_plain": "Where things stand - or add a topic",
       "desc_prompts": "List or invoke saved prompts & agent SOPs",
       "desc_quit": "Quit the chat session",
       "desc_reply": "Reply to the last assistant message",
@@ -2326,6 +2339,7 @@
     },
     "trustDropdown": {
       "trust_all_base": "Trust all <mono>{{base}}</mono> commands",
+      "trust_all_tools_channel": "Trust all tools in this channel — persists across restarts",
       "trust_this_command": "Trust “<mono>{{cmd}}</mono>”"
     },
     "searchableSelect": {
@@ -2365,6 +2379,9 @@
       "webhook_unbound_short": "No tokens bound",
       "wire_what_it_works_with": "What it works with"
     },
+    "confirmDialog": {
+      "cancel": "Cancel"
+    },
     "crewWebhookSection": {
       "could_not_load_webhooks": "Could not load webhooks, so what wakes this crew is unknown right now.",
       "inbound_webhooks_are_switched_off": "Inbound webhooks are switched off, so nothing can call in — bound tokens included.",
@@ -2379,6 +2396,10 @@
       "unbound_tokens_can_wake_any_crew_other": "{{count}} tokens without a crew binding also exist; they can wake any crew, this one included.",
       "webhook": "Webhook",
       "webhooks_that_wake_this_crew": "Webhooks that wake this crew"
+    },
+    "shortcutsModal": {
+      "panel_toggles": "Panel toggles",
+      "unset": "Not set"
     }
   },
   "hooks": {
@@ -2426,7 +2447,10 @@
       "walk_back_mru_history": "Walk back MRU history",
       "stop_speaking": "Stop speaking",
       "toggle_focus_mode": "Toggle focus mode",
-      "jump_to_chat_letters": "Jump to chat 10 and beyond (letters follow the badge shown on each row)"
+      "jump_to_chat_letters": "Jump to chat 10 and beyond (letters follow the badge shown on each row)",
+      "toggle_left_sidebar": "Toggle left sidebar",
+      "toggle_session_panel": "Toggle session panel",
+      "toggle_side_panel": "Toggle side panel"
     },
     "useSceneInteraction": {
       "all_slots_are_occupied": "All slots are occupied",
@@ -2609,7 +2633,13 @@
       "unknown_2": "(unknown)",
       "update_failed": "update failed",
       "public_by_link_warning": "Published URLs are public-by-link: anyone with the link can view the content — it is served on the public internet with no authentication.",
-      "random_domain_note": "Content is served at a random *.cloudfront.net domain — don't publish anything you wouldn't put on the open internet."
+      "random_domain_note": "Content is served at a random *.cloudfront.net domain — don't publish anything you wouldn't put on the open internet.",
+      "recall_title": "Recall site?",
+      "recall_button": "Recall site",
+      "destroy_title": "Destroy site?",
+      "destroy_button": "Destroy site",
+      "remove_profile_title": "Remove profile?",
+      "remove_profile_button": "Remove profile"
     },
     "artifactDetailPage": {
       "agent_chat": "Agent chat",
@@ -2624,6 +2654,7 @@
       "comment_resolved": "Comment resolved",
       "copy_failed": "Copy failed",
       "could_not_overwrite": "Could not overwrite.",
+      "discard_changes_button": "Discard changes",
       "document_type": "Document type",
       "edit": "Edit",
       "edited": "Edited",
@@ -3618,11 +3649,14 @@
       "stub_failed": "Could not apply the change. It may already be saved without being live — the switches below now show the stored state.",
       "stub_not_live": "Saved, but the change is not live yet — the gateway could not start. The switch shows what is stored, not what is running.",
       "stub_restart_required": "Saved. Restart the gateway for this to take effect. Sessions already running keep the servers they started with.",
-      "stubbed_of_total": "{{stubbed}} of {{total}} stubbed",
+      "stubbed_of_total": "{{stubbed}} of {{total}} opted in to stubbing",
       "unsupported_platform": "Backend sharing needs Unix-domain sockets, so it is unavailable on this platform.",
       "view_assessment": "Sharing assessment",
       "view_servers": "Servers",
-      "views_aria": "MCP management views"
+      "views_aria": "MCP management views",
+      "state_direct_env": "direct (env)",
+      "state_direct_env_reason": "Not stubbed, but your opt-in stays saved.",
+      "state_direct_env_legend": "direct (env) — the server declares an environment key a shared backend would withhold, so {{productName}} does not stub it at all: the session launches it directly, with no shared backend and no server-authored UI."
     },
     "migrationPage": {
       "clean_up_old_entry": "Clean up old entry",
@@ -4104,6 +4138,7 @@
         "saved": "Saved.",
         "saved_restart_the_gateway_to_apply": "Saved. Restart the gateway to apply.",
         "saving": "Saving…",
+        "shared_channels": "Shared channels",
         "soft_context_threshold_must_be_a_number_between": "Soft context threshold must be a number between 1 and 100",
         "start_the_channel_at_gateway_startup": "Start the {{channel}} channel at gateway startup (requires a bot token).",
         "verified_with_channel_and_saved": "Verified with {{channel}} and saved. Restart the gateway to connect.",
@@ -4570,6 +4605,70 @@
         "sign_in_again": "Sign in again",
         "waiting_for_scan": "Waiting for scan…"
       },
+      "whatsAppPanel": {
+        "status_unavailable": "Status unavailable",
+        "setup_guide": "Setup guide",
+        "whatsapp": "WhatsApp",
+        "connected": "Connected",
+        "not_signed_in": "Not paired",
+        "pair_with_whatsapp": "Pair with WhatsApp",
+        "scan_the_code_from_linked_devices": "Scan the code with WhatsApp on your phone: Settings, Linked devices, Link a device.",
+        "signed_in_restart_the_gateway_to_start_receiving": "Paired. Restart the gateway to start receiving messages.",
+        "talk_to_your_agent_from_your_own_whatsapp": "Talk to your agent from your own WhatsApp account, paired as a linked device. Messages the agent sends come from your number.",
+        "waiting_for_a_code": "Waiting for a code...",
+        "waiting_for_scan": "Waiting for the scan...",
+        "scanned_confirm_on_your_phone": "Scanned. Confirm on your phone.",
+        "the_code_expired_try_again": "The code expired. Try again.",
+        "could_not_start_pairing": "Could not start pairing.",
+        "could_not_start_the_login_flow": "Could not start the pairing flow.",
+        "whatsapp_pairing_qr_code": "WhatsApp pairing QR code",
+        "enable_the_whatsapp_channel": "Enable the WhatsApp channel",
+        "who_can_message_the_bot": "Who can message the agent",
+        "only_me_the_default": "Only me (my own messages)",
+        "me_plus_allowed_numbers": "Me, plus allowed numbers",
+        "nobody_ignore_all_messages": "Nobody (ignore all messages)",
+        "anyone_who_messages_you": "Anyone who messages you",
+        "allowed_wa_ids": "Allowed numbers",
+        "allowed_numbers_empty_adds_nobody": "Phone numbers (digits with country code, no plus sign) that may also chat with the agent. Empty adds nobody beyond you.",
+        "phone_number_placeholder": "447700900000",
+        "created_for_you_when_you_turn_this_on_if_it_does": "Created for you when you turn this on, if it does not already exist.",
+        "group_participation_is_opt_in_per_group": "Group participation is opt-in per group: mention mode replies only when tagged; rules mode can also help unprompted, with a cooldown. Uses the unofficial WhatsApp Web protocol; keep usage personal-scale.",
+        "waiting_to_be_paired": "Waiting to be paired",
+        "the_link_was_revoked": "The link was revoked",
+        "blocked_by_whatsapp": "Blocked by WhatsApp",
+        "paired_but_not_connected": "Paired, but not connected",
+        "whatsapp_did_not_connect": "WhatsApp did not connect: {{error}}",
+        "the_channel_is_enabled_but_not_running": "The channel is enabled but not running. Restart the gateway.",
+        "show_pairing_code": "Show pairing code",
+        "already_paired_unlink_then_restart": "Already paired. To pair a different device, unlink this one below, then restart the gateway.",
+        "the_link_was_revoked_restart_to_pair_again": "The link was revoked. Restart the gateway to pair a device again.",
+        "blocked_number_cannot_pair": "WhatsApp has blocked this number, so pairing cannot start.",
+        "pairing_starts_when_the_channel_starts": "A pairing code exists only while the channel is pairing, and pairing begins when the channel starts. Enable the channel below, then restart the gateway.",
+        "the_channel_is_not_running_enable_and_restart": "The WhatsApp channel is not running. Enable it below, then restart the gateway.",
+        "unlink_this_device": "Unlink this device",
+        "revokes_the_linked_device_on_your_account": "Revokes this linked device on your WhatsApp account and deletes the local session. The agent stops reading and sending until a device is paired again.",
+        "confirm_unlink": "Confirm unlink",
+        "unlinked_restart_to_pair_again": "Unlinked. Restart the gateway to pair a device again.",
+        "unlinked_but_the_session_file_was_kept": "Unlinked from WhatsApp, but the local session file could not be removed. Delete it under the data home before pairing again.",
+        "whatsapp_refused_the_unlink_still_linked": "WhatsApp refused the unlink, so the device is still linked and the local session was kept. Try again, or revoke the device from your phone under Linked devices.",
+        "channel_not_running_so_nothing_was_unlinked": "The channel is not running, so nothing was unlinked. A linked device stays linked: revoke it from your phone under Linked devices.",
+        "could_not_unlink_the_device": "Could not unlink the device.",
+        "groups": "Groups",
+        "the_agent_ignores_every_group_not_listed": "The agent ignores every group that is not listed here.",
+        "add_a_group": "Add a group",
+        "your_groups_load_once_the_channel_is_connected": "Your groups appear here once the channel is connected.",
+        "every_group_you_joined_is_already_listed": "Every group you have joined is already listed.",
+        "how_the_agent_joins_in": "How the agent joins in",
+        "mode_only_when_mentioned": "Only when mentioned or quoted",
+        "mode_also_when_the_rules_apply": "Also when its rules apply",
+        "mode_off_keeping_the_entry": "Off, keeping the entry",
+        "when_the_agent_may_speak": "When the agent may speak",
+        "the_agent_stays_silent_unless_these_apply": "Free text. The agent stays silent unless these rules clearly apply.",
+        "rules_example_placeholder": "Answer questions about 3D printing",
+        "seconds_between_unprompted_replies": "Seconds between unprompted replies",
+        "remove_name_from_the_group_list": "Remove {{name}} from the group list",
+        "unofficial_protocol_ban_risk": "Unofficial protocol: WhatsApp may ban the linked number. Don't link a number you can't afford to lose."
+      },
       "channels": {
         "get_your_bot_credentials": "Get your bot credentials",
         "hard_below_soft_error": "Hard context threshold must be at or above the soft context threshold",
@@ -4579,12 +4678,23 @@
         "threshold_description": "Prompt to {{compact}} or {{new}} when the session context passes this percentage."
       },
       "discordPanel": {
+        "allowed_server_channel_ids": "Allowed server channel IDs",
         "allowed_server_thread_ids": "Allowed server thread IDs",
-        "allowlist_description": "Discord user IDs permitted to run the agent in DMs or approved threads. Empty = deny all (fail closed).",
-        "description": "Talk to your agent from Discord DMs or explicitly approved server threads over the Gateway WebSocket. Normal server channels are always ignored.",
+        "allowlist_description": "Discord user IDs permitted to run the agent in DMs, approved threads, or allowed channels. Empty = deny all (fail closed).",
+        "auto_thread_description": "A message in an allowed channel opens a fresh public thread, and the turn runs there instead of in the shared channel.",
+        "auto_thread_label": "Answer in a new thread",
+        "auto_thread_off_hint": "Auto-thread is off, so messages in the channels above are ignored. {{productName}} never answers in a shared channel itself.",
+        "channel_allowlist_description": "Optional. Approved users may also run the agent from these shared server channels. Empty = no shared channels.",
+        "channel_help": "With Developer Mode on, right-click the channel → <mono>Copy Channel ID</mono>. Use the channel's own ID, not the ID of a thread inside it.",
+        "channel_warning": "A shared channel is a wider disclosure boundary than a thread: everyone who can see the channel, and everyone who can open the public thread a turn runs in, can read what the agent writes and what its tools print. Only add a channel whose entire membership may see that.",
+        "description": "Talk to your agent from Discord DMs, approved server threads, or allowed server channels over the Gateway WebSocket. Every other server channel is ignored.",
         "empty_allowlist_hint": "No allowed user IDs: the bot rejects every message (fail closed). Add your Discord user ID below.",
-        "guide_body": "Create an app in the Discord Developer Portal, then copy the token from the <mono>Bot</mono> page. For DMs only, leave privileged intents off. For server threads, enable <mono>Message Content Intent</mono> and install with the <mono>bot</mono> scope plus View Channel, Read Message History, and Send Messages in Threads. Enable Discord Developer Mode, then right-click your name to copy your numeric user ID.",
+        "guide_body": "Create an app in the Discord Developer Portal, then copy the token from the <mono>Bot</mono> page. For DMs only, leave privileged intents off. For server threads, enable <mono>Message Content Intent</mono> and install with the <mono>bot</mono> and <mono>applications.commands</mono> scopes plus View Channel, Read Message History, and Send Messages in Threads. Enable Discord Developer Mode, then right-click your name to copy your numeric user ID.",
         "open_developer_portal": "Open Developer Portal",
+        "reactions_description": "Mark your message with an emoji for the phase the agent is in (queued → thinking → coding → done). Off leaves your message unmarked.",
+        "reactions_label": "Phase reactions",
+        "thinking_description": "Post a preview of the model's reasoning as its own subtext note above the answer. Off keeps the channel to the answer alone.",
+        "thinking_label": "Show thinking",
         "thread_allowlist_description": "Optional. Approved users may run the agent only in these exact Discord threads. Empty = DMs only.",
         "thread_help": "With Developer Mode on, right-click the thread → <mono>Copy Channel ID</mono>. Use the thread's ID, not its parent channel ID.",
         "thread_warning": "Thread mode enables Discord's global Message Content intent. Discord delivers content from every server channel the bot can see; Kiro Crew discards traffic outside approved threads. Everyone who can view an approved thread can read agent replies and tool output.",
@@ -4628,7 +4738,9 @@
         "preset_custom": "Custom",
         "record_prompt": "Press keys…",
         "custom_hint": "Use at least one modifier key.",
-        "turn_keyboard_shortcuts_on_or_off_globally": "Turn keyboard shortcuts on or off globally — {{mod}} + K (this reference) always works"
+        "turn_keyboard_shortcuts_on_or_off_globally": "Turn keyboard shortcuts on or off globally — {{mod}} + K (this reference) always works",
+        "clear_shortcut": "Clear",
+        "panel_toggles": "Panel toggles"
       },
       "reportProblemCard": {
         "support": "Support",
@@ -4723,7 +4835,7 @@
         "label": "Browser"
       },
       "channels": {
-        "description": "Chat platforms the agent can send and receive on — Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, WeChat",
+        "description": "Chat platforms the agent can send and receive on",
         "label": "Channels"
       },
       "chat": {

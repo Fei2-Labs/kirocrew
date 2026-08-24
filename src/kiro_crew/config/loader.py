@@ -152,6 +152,8 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "webex",
         "wecom",
         "weixin",
+        "whatsapp",
+        "feishu",
         "teams",
         "imessage",
         "dashboard",
@@ -198,6 +200,8 @@ CRED_MICROSOFT_APP_ID = "MICROSOFT_APP_ID"
 CRED_MICROSOFT_APP_PASSWORD = "MICROSOFT_APP_PASSWORD"
 CRED_MICROSOFT_APP_TENANT_ID = "MICROSOFT_APP_TENANT_ID"
 CRED_WEIXIN_TOKEN = "WEIXIN_TOKEN"  # iLink bot credential from the Settings QR flow
+CRED_FEISHU_APP_ID = "FEISHU_APP_ID"  # Feishu custom-app id (developer console)
+CRED_FEISHU_APP_SECRET = "FEISHU_APP_SECRET"
 CRED_JIRA_API_TOKEN = "JIRA_API_TOKEN"  # Jira Cloud/Server API token (resolved from .env)
 # kiro-cli's OWN model credential. Unlike the gateway-owned channel tokens
 # above, its rightful consumer is the agent subprocess itself (and the whoami
@@ -218,6 +222,8 @@ _CREDENTIAL_KEYS = (
     CRED_MICROSOFT_APP_PASSWORD,
     CRED_MICROSOFT_APP_TENANT_ID,
     CRED_WEIXIN_TOKEN,
+    CRED_FEISHU_APP_ID,
+    CRED_FEISHU_APP_SECRET,
     CRED_JIRA_API_TOKEN,
     CRED_KIRO_API_KEY,
 )
@@ -247,6 +253,20 @@ DEFAULT_AUTOCOMPACT_PCT = 70.0
 # unreachable and the early signal disappears for whoever did not change the
 # default. Kept here rather than in either consumer so the two cannot drift.
 CONTEXT_WARN_MARGIN_PCT = 20.0
+# session.pool_size — warm pool OFF by default. Each pooled slot is a full
+# kiro-cli process plus the MCP stdio servers its agent spec spawns (~109 MB per
+# backend), and a non-zero value is also reserved out of the memory term that
+# sizes the subagent cap (subagent.compute_max_subagents), so the cost is paid on
+# every host whether or not the pool is ever claimed. Cold start is instead
+# hidden by session.eager_spawn, which is on by default and pre-creates a slot's
+# session behind user think-time.
+#
+# Read by BOTH the SessionConfig field default and load()'s file-parse fallback,
+# because those are two independent paths to the same value: a home with no
+# config.json takes the field default, and a config.json that omits the key takes
+# the parse fallback. A literal in either place lets the two disagree, which is
+# invisible on disk — this constant is the only place the value is written.
+DEFAULT_POOL_SIZE = 0
 DEFAULT_MAX_PARALLEL_STEPS = (
     0  # 0 = auto: derive from agent.subagent_auto_max via compute_max_subagents
 )
@@ -1700,6 +1720,21 @@ class AgentConfig:
             "and additionally to 60s below the turn ceiling at load time.",
         ),
     )
+    session_control: bool = field(
+        default=False,
+        metadata=_meta(
+            "Session Control",
+            "Let one chat session open a new session, and stop or read another "
+            "session of yours. No session writes into another session's "
+            "conversation: reading returns a transcript tail, stopping cancels an "
+            "in-flight turn, and a created session starts empty for you to type "
+            "into. Off by default: the three tools ride on a server you may "
+            "already have assigned for other work, so reaching another session "
+            "waits for you to grant it here rather than arriving with an upgrade. "
+            "Sessions can only reach peers in the same workspace; incognito, "
+            "app-scoped and scheduled sessions are never addressable.",
+        ),
+    )
     subagent_cost_gb: float = field(
         default=0.5,
         metadata=_meta(
@@ -1883,7 +1918,7 @@ class SessionConfig:
         ),
     )
     pool_size: int = field(
-        default=0,
+        default=DEFAULT_POOL_SIZE,
         metadata=_meta(
             "Warm Pool Size",
             "Number of pre-spawned kiro-cli processes kept ready for instant session start. 0 disables.",
@@ -3441,6 +3476,18 @@ class SkillsConfig:
             "Local ~/.kiro/crew/skills/ takes precedence for duplicate names.",
         ),
     )
+    project_skills_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Project Skills",
+            "Whether a chat session may load skills from its own project's "
+            "<project>/.kiro/skills directory. Enabled by default, but a project's "
+            "skills are still only loaded after the operator grants that specific "
+            "directory trust, because a SKILL.md enters the agent's context and can "
+            "instruct it to run anything. Set false to make project skills "
+            "impossible regardless of any grant already recorded.",
+        ),
+    )
 
     def __post_init__(self) -> None:
         if self.max_triggered < 0:
@@ -4002,6 +4049,37 @@ def _clamp_security_bounds(data: dict) -> None:
                 TOOL_APPROVAL_TIMEOUT_MIN,
                 budget,
             )
+
+
+def _fail_closed_project_skills_config(
+    data: dict, *, config_source_unreadable: bool = False
+) -> None:
+    """Preserve the project-skills off-switch's fail-closed semantics.
+
+    Optional JSON Schema validation removes invalid fields before dataclass
+    construction. Normalizing this security switch first keeps an invalid
+    value distinct from an absent value, whose documented default is enabled.
+    """
+    if config_source_unreadable:
+        skills = data.get("skills")
+        if not isinstance(skills, dict):
+            skills = {}
+            data["skills"] = skills
+        skills["project_skills_enabled"] = False
+        return
+
+    if "skills" not in data:
+        return
+
+    skills = data["skills"]
+    if not isinstance(skills, dict):
+        data["skills"] = {"project_skills_enabled": False}
+        return
+
+    if "project_skills_enabled" in skills and not isinstance(
+        skills["project_skills_enabled"], bool
+    ):
+        skills["project_skills_enabled"] = False
 
 
 def _config_fingerprint() -> tuple:
@@ -5101,6 +5179,72 @@ class WeComConfig:
         )
 
 
+@dataclass
+class FeishuConfig:
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enabled",
+            "Enable the Feishu (Lark/飞书) channel. Requires FEISHU_APP_ID and "
+            "FEISHU_APP_SECRET environment variables to be set.",
+            tags=["feishu"],
+        ),
+    )
+    allowed_open_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Open IDs",
+            "Feishu open_ids allowed to DM the bot (deny-by-default: empty list "
+            "authorises nobody). Find your open_id via the Feishu developer console.",
+            tags=["feishu"],
+        ),
+    )
+    allow_group: bool = field(
+        default=False,
+        metadata=_meta(
+            "Allow Group Chat",
+            "Serve messages from group chats whose chat_id is in allowed_group_ids. "
+            "The bot must be @-mentioned in a group to receive the message.",
+            tags=["feishu"],
+        ),
+    )
+    allowed_group_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Group IDs",
+            "Feishu group chat_ids allowed to drive a turn (requires allow_group=true).",
+            tags=["feishu"],
+        ),
+    )
+    soft_threshold_pct: int = field(
+        default=80,
+        metadata=_meta(
+            "Soft Context Threshold %",
+            "When a conversation's context passes this, prompt the user to /compact "
+            "or /new instead of auto-compacting.",
+            tags=["feishu"],
+        ),
+    )
+    hard_threshold_pct: int = field(
+        default=95,
+        metadata=_meta(
+            "Hard Context Threshold %",
+            "Force a compaction when context reaches this so the window never overflows.",
+            tags=["feishu"],
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig can't make the soft nudge unreachable -- _maybe_notice
+        # checks ``pct >= hard`` first. Mirrors WeComConfig. The helper's floor
+        # is 1, not 0, because a 0% threshold reads as "always over" and would
+        # compact every turn -- a hand-rolled max(0, ...) admits exactly that.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
+
+
 def _coerce_int_ids(raw: object) -> list[int]:
     """Coerce a config value to a clean ``list[int]``, dropping anything invalid.
 
@@ -5139,6 +5283,49 @@ def _coerce_opaque_str_ids(raw: object) -> list[str]:
         s = str(u).strip()
         if s and s not in out:
             out.append(s)
+    return out
+
+
+_WHATSAPP_GROUP_MODES = ("mention", "rules", "off")
+_WHATSAPP_GROUP_COOLDOWN_DEFAULT = 120
+
+
+def _coerce_whatsapp_groups(raw: object) -> list[dict]:
+    """Coerce the whatsapp ``groups`` config value to sanitized rule entries.
+
+    Each entry needs at least a non-empty ``jid``; everything else gets a safe
+    default. Unknown ``mode`` values fall back to ``mention`` (never to an
+    unprompted-speech mode), and cooldown is clamped to >= 0. Fails closed on
+    shape: a non-list yields ``[]``, malformed entries are dropped, duplicate
+    JIDs keep the first entry.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        jid = str(entry.get("jid", "")).strip()
+        if not jid or jid in seen:
+            continue
+        seen.add(jid)
+        mode = str(entry.get("mode", "mention")).strip().lower()
+        if mode not in _WHATSAPP_GROUP_MODES:
+            mode = "mention"
+        try:
+            cooldown = int(entry.get("cooldown_s", _WHATSAPP_GROUP_COOLDOWN_DEFAULT))
+        except (TypeError, ValueError):
+            cooldown = _WHATSAPP_GROUP_COOLDOWN_DEFAULT
+        out.append(
+            {
+                "jid": jid,
+                "name": str(entry.get("name", "")).strip(),
+                "mode": mode,
+                "rules": str(entry.get("rules", "")).strip(),
+                "cooldown_s": max(0, cooldown),
+            }
+        )
     return out
 
 
@@ -5578,6 +5765,116 @@ class WeixinConfig:
 
 
 @dataclass
+class WhatsAppConfig:
+    """WhatsApp channel via a QR-linked personal account (WhatsApp Web protocol).
+
+    Pairs as a linked device on the operator's own WhatsApp account — there is
+    no bot token. Pairing state lives in a local session database under the
+    data home (``whatsapp/session.db``), created by the Settings > Channels QR
+    flow. Requires the optional ``whatsapp`` dependency extra
+    (``pip install 'kirocrew[whatsapp]'``).
+
+    Uses the unofficial WhatsApp Web protocol; automation on a personal
+    account is against WhatsApp's Terms of Service and carries a small risk
+    of the linked number being banned. Keep volumes personal-scale.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Enabled",
+            "Enable the WhatsApp channel (QR-linked personal account over the "
+            "WhatsApp Web protocol). Pair a device from Settings > Channels; "
+            "needs the 'whatsapp' dependency extra installed.",
+            tags=["whatsapp"],
+        ),
+    )
+    dm_policy: str = field(
+        default="self",
+        metadata=_meta(
+            "DM Policy",
+            "Who may command the agent in direct chats: 'self' (only the linked "
+            "account itself — your own messages, the default), 'allowlist' "
+            "(yourself plus allowed_wa_ids), 'open' (any sender), or 'disabled'. "
+            "Unknown values deny everyone (fail closed).",
+            tags=["whatsapp"],
+        ),
+    )
+    allowed_wa_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed WhatsApp IDs",
+            "Phone numbers (digits only, country code, no '+') additionally "
+            "permitted to DM the agent when dm_policy='allowlist'. Empty adds "
+            "nobody beyond the linked account.",
+            tags=["whatsapp"],
+        ),
+    )
+    groups: list[dict] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Group Rules",
+            "Per-group participation rules. Each entry: {'jid': group JID "
+            "(…@g.us), 'name': display label, 'mode': 'mention' (reply only "
+            "when @-mentioned or quoted, the default) | 'rules' (also speak "
+            "unprompted when the entry's rules say the agent can genuinely "
+            "help) | 'off', 'rules': free-text guidance for when to speak, "
+            "'cooldown_s': minimum seconds between unprompted replies "
+            "(default 120)}. Groups not listed are ignored entirely.",
+            tags=["whatsapp"],
+        ),
+    )
+    db_path: str = field(
+        default="",
+        metadata=_meta(
+            "Session DB Path",
+            "Read-only. The pairing session database always lives at "
+            "<data home>/whatsapp/session.db, because that path is what the "
+            "sensitive-path protection matches: it holds the linked-device keys, "
+            "and moving it elsewhere would take the credential out from behind "
+            "the one control that stops an agent reading it.",
+            tags=["whatsapp"],
+        ),
+    )
+    soft_threshold_pct: int = field(
+        default=80,
+        metadata=_meta(
+            "Soft Context Threshold %",
+            "Prompt the user to /compact or /new when context passes this percentage.",
+            tags=["whatsapp"],
+        ),
+    )
+    hard_threshold_pct: int = field(
+        default=95,
+        metadata=_meta(
+            "Hard Context Threshold %",
+            "Force a compaction when context passes this percentage.",
+            tags=["whatsapp"],
+        ),
+    )
+    session_folder: str = field(
+        default="",
+        metadata=_meta(
+            "Session Folder",
+            "Optional sidebar folder for sessions that start on this channel. "
+            "Empty (the default) leaves them unfiled; any other value is the "
+            "folder name, created when these settings are saved and marked with "
+            "the channel's brand mark. A configured folder that no longer exists "
+            "leaves conversations unfiled until the next save recreates it.",
+            tags=["whatsapp"],
+        ),
+    )
+
+    def __post_init__(self) -> None:
+        # Shared normalization: clamp both thresholds and guarantee soft <= hard
+        # so a misconfig can't make the soft nudge unreachable -- _maybe_notice
+        # checks ``pct >= hard`` first. Mirrors WeixinConfig.
+        self.soft_threshold_pct, self.hard_threshold_pct = _normalize_threshold_pair(
+            self.soft_threshold_pct, self.hard_threshold_pct
+        )
+
+
+@dataclass
 class DiscordConfig:
     enabled: bool = field(
         default=False,
@@ -5613,7 +5910,8 @@ class DiscordConfig:
         metadata=_meta(
             "Allowed Thread IDs",
             "Discord server thread IDs where approved users may run the agent. "
-            "Empty = DMs only. Normal server channels are always denied.",
+            "Empty = DMs only. A server channel is denied unless it is listed in "
+            "allowed_channel_ids, and a turn there still runs in a thread.",
             tags=["discord"],
         ),
     )
@@ -5638,6 +5936,23 @@ class DiscordConfig:
         metadata=_meta(
             "Soft Context Threshold %",
             "Prompt the user to !compact or !new when context passes this percentage.",
+            tags=["discord"],
+        ),
+    )
+    reactions_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Reactions Enabled",
+            "Show phase-aware emoji reactions on Discord messages during processing.",
+            tags=["discord"],
+        ),
+    )
+    show_thinking: bool = field(
+        default=False,
+        metadata=_meta(
+            "Show Thinking",
+            "Post the model's thinking/reasoning as a subtext note in Discord. "
+            "Off by default to keep responses concise.",
             tags=["discord"],
         ),
     )
@@ -6029,6 +6344,22 @@ class KiroCrewConfig:
             "WeChat", "Weixin (iLink personal WeChat) integration settings.", tags=["weixin"]
         ),
     )
+    whatsapp: WhatsAppConfig = field(
+        default_factory=WhatsAppConfig,
+        metadata=_meta(
+            "WhatsApp",
+            "WhatsApp (QR-linked personal account) integration settings.",
+            tags=["whatsapp"],
+        ),
+    )
+    feishu: FeishuConfig = field(
+        default_factory=FeishuConfig,
+        metadata=_meta(
+            "Feishu",
+            "Feishu (Lark/飞书) channel configuration.",
+            tags=["feishu"],
+        ),
+    )
     discord: DiscordConfig = field(
         default_factory=DiscordConfig,
         metadata=_meta("Discord", "Discord bot integration settings.", tags=["discord"]),
@@ -6212,6 +6543,7 @@ class KiroCrewConfig:
             pre_read_fp = _config_fingerprint()
             data = {}
             loaded_base = False
+            config_source_unreadable = False
             if path.exists():
                 try:
                     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -6219,8 +6551,10 @@ class KiroCrewConfig:
                         data = raw
                         loaded_base = True
                     else:
+                        config_source_unreadable = True
                         logger.warning("Config is not a JSON object, using defaults")
                 except (json.JSONDecodeError, OSError) as e:
+                    config_source_unreadable = True
                     logger.warning("Failed to load config from %s: %s", path, e)
 
             # Report -- never correct -- a stored BASE value that still holds a
@@ -6250,12 +6584,22 @@ class KiroCrewConfig:
                     if isinstance(raw_local, dict):
                         local_data = raw_local
                     else:
+                        config_source_unreadable = True
                         logger.warning("config.local.json is not a JSON object, ignoring")
                 except (json.JSONDecodeError, OSError) as e:
+                    config_source_unreadable = True
                     logger.warning("Failed to load config.local.json: %s", e)
 
             if local_data:
                 data = _deep_merge(data, local_data)
+
+            # A present source that cannot be read or parsed may contain the
+            # operator's hard-off switch. Preserve that unknown as disabled
+            # before either the defaults return or schema normalization can
+            # turn it into the enabled-by-default missing-field case.
+            _fail_closed_project_skills_config(
+                data, config_source_unreadable=config_source_unreadable
+            )
 
             # Return defaults only if neither file was successfully loaded. Seed
             # the default "kirocrew" agent in-memory (matching the on-disk
@@ -6266,6 +6610,9 @@ class KiroCrewConfig:
             # (existence checks only, no read/parse/validate).
             if not loaded_base and not local_data:
                 cfg = cls()
+                cfg.skills.project_skills_enabled = (
+                    data.get("skills", {}).get("project_skills_enabled", True) is True
+                )
                 kiro = cfg.agent.default_agent or "kirocrew"
                 cfg.agents["default"] = KiroCrewAgentConfig(
                     kiro_agent=kiro,
@@ -6275,6 +6622,8 @@ class KiroCrewConfig:
                 cfg.default_agent = "default"
                 return cfg
 
+            # Preserve fail-closed security semantics before advisory schema
+            # validation can replace malformed input with a missing-field default.
             # Validate against JSON Schema (advisory — never fatal)
             _validate_config_data(data)
             # Clamp security-relevant resource-limit knobs to their API ceilings
@@ -6310,6 +6659,12 @@ class KiroCrewConfig:
         weixin_data = data.get("weixin", {})
         if not isinstance(weixin_data, dict):
             weixin_data = {}
+        whatsapp_data = data.get("whatsapp", {})
+        if not isinstance(whatsapp_data, dict):
+            whatsapp_data = {}
+        feishu_data = data.get("feishu", {})
+        if not isinstance(feishu_data, dict):
+            feishu_data = {}
         discord_data = data.get("discord", {})
         if not isinstance(discord_data, dict):
             discord_data = {}
@@ -6526,6 +6881,14 @@ class KiroCrewConfig:
                     TOOL_APPROVAL_TIMEOUT_MIN,
                     TOOL_APPROVAL_TIMEOUT_MAX,
                 ),
+                # Absent means OFF, and a malformed value falls to False too. This
+                # switch grants one session reach into another, and the three tools
+                # ride on the `kirocrew-dashboard` server an operator may already
+                # have assigned for folder work -- so an upgrade must not hand an
+                # existing assignment stop-and-read over peer sessions that nobody
+                # granted. Both directions fail closed: `{"session_control":
+                # "false"}` is a truthy string and must not load as enabled either.
+                session_control=_safe_bool(agent_data.get("session_control", False), False),
                 subagent_cost_gb=_safe_float(agent_data.get("subagent_cost_gb", 0.5), 0.5),
                 subagent_cpu_cost_cores=_safe_float(
                     agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0
@@ -6587,7 +6950,12 @@ class KiroCrewConfig:
                     lo=AUTOCOMPACT_PCT_MIN,
                     hi=AUTOCOMPACT_PCT_MAX,
                 ),
-                pool_size=_safe_int(session_data.get("pool_size", 2), 2, 0, POOL_SIZE_MAX),
+                pool_size=_safe_int(
+                    session_data.get("pool_size", DEFAULT_POOL_SIZE),
+                    DEFAULT_POOL_SIZE,
+                    0,
+                    POOL_SIZE_MAX,
+                ),
                 pool_agent=str(session_data.get("pool_agent", "")),
                 pool_ttl_secs=_safe_int(session_data.get("pool_ttl_secs", 1800), 1800),
                 eager_spawn=bool(session_data.get("eager_spawn", True)),
@@ -6764,6 +7132,16 @@ class KiroCrewConfig:
                 soft_threshold_pct=_threshold_pct(weixin_data.get("soft_threshold_pct"), 80),
                 hard_threshold_pct=_threshold_pct(weixin_data.get("hard_threshold_pct"), 95),
             ),
+            whatsapp=WhatsAppConfig(
+                session_folder=_coerce_session_folder(whatsapp_data.get("session_folder")),
+                enabled=bool(whatsapp_data.get("enabled", False)),
+                dm_policy=str(whatsapp_data.get("dm_policy", "self") or "self"),
+                allowed_wa_ids=_coerce_str_ids(whatsapp_data.get("allowed_wa_ids")),
+                groups=_coerce_whatsapp_groups(whatsapp_data.get("groups")),
+                db_path=str(whatsapp_data.get("db_path", "")),
+                soft_threshold_pct=_threshold_pct(whatsapp_data.get("soft_threshold_pct"), 80),
+                hard_threshold_pct=_threshold_pct(whatsapp_data.get("hard_threshold_pct"), 95),
+            ),
             discord=DiscordConfig(
                 session_folder=_coerce_session_folder(discord_data.get("session_folder")),
                 enabled=bool(discord_data.get("enabled", False)),
@@ -6776,6 +7154,8 @@ class KiroCrewConfig:
                 allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
                 auto_thread=bool(discord_data.get("auto_thread", True)),
                 soft_threshold_pct=_threshold_pct(discord_data.get("soft_threshold_pct"), 80),
+                reactions_enabled=bool(discord_data.get("reactions_enabled", True)),
+                show_thinking=bool(discord_data.get("show_thinking", False)),
             ),
             webex=WebexConfig(
                 session_folder=_coerce_session_folder(webex_data.get("session_folder")),
@@ -6870,16 +7250,32 @@ class KiroCrewConfig:
             ),
             wecom=WeComConfig(
                 session_folder=_coerce_session_folder(wecom_data.get("session_folder")),
-                enabled=bool(wecom_data.get("enabled", False)),
+                # _safe_bool, not bool(): `bool("false")` is True, so a JSON string
+                # would read the operator's "off" as "on" -- enabling a channel,
+                # or opening it to every org member, from a config value that says the
+                # opposite. A non-bool must read as the default, not as truthy.
+                enabled=_safe_bool(wecom_data.get("enabled"), False),
                 allowed_users=[
                     u
-                    for u in wecom_data.get("allowed_users", [])
+                    for u in _safe_list(wecom_data.get("allowed_users"))
                     if isinstance(u, dict) and u.get("userid")
                 ],
-                allow_all_users=bool(wecom_data.get("allow_all_users", False)),
+                allow_all_users=_safe_bool(wecom_data.get("allow_all_users"), False),
                 ws_url=str(wecom_data.get("ws_url", "wss://openws.work.weixin.qq.com")),
                 soft_threshold_pct=_threshold_pct(wecom_data.get("soft_threshold_pct"), 80),
                 hard_threshold_pct=_threshold_pct(wecom_data.get("hard_threshold_pct"), 95),
+            ),
+            feishu=FeishuConfig(
+                enabled=_safe_bool(feishu_data.get("enabled"), False),
+                allowed_open_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_open_ids")),
+                # Shape-safe coercion rather than bool() / a raw comprehension:
+                # the schema type check already substitutes the default for a
+                # wrong-typed value, and these helpers keep the guarantee local
+                # to the parse (and dedupe + strip the opaque ou_/oc_ ids).
+                allow_group=_safe_bool(feishu_data.get("allow_group"), False),
+                allowed_group_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_group_ids")),
+                soft_threshold_pct=_safe_int(feishu_data.get("soft_threshold_pct", 80), 80),
+                hard_threshold_pct=_safe_int(feishu_data.get("hard_threshold_pct", 95), 95),
             ),
             dashboard=DashboardConfig(
                 url=dashboard_data.get("url", ""),
@@ -7226,6 +7622,9 @@ class KiroCrewConfig:
                 extra_paths=[
                     p for p in _safe_list(skills_data.get("extra_paths")) if isinstance(p, str)
                 ],
+                # Security off-switch: malformed values must not become truthy
+                # through Python coercion (for example, the string "false").
+                project_skills_enabled=(skills_data.get("project_skills_enabled", True) is True),
             ),
             session_summary=SessionSummaryConfig(
                 enabled=bool(session_summary_data.get("enabled", False)),
@@ -7315,6 +7714,8 @@ class KiroCrewConfig:
             "webex": asdict(self.webex),
             "wecom": asdict(self.wecom),
             "weixin": asdict(self.weixin),
+            "whatsapp": asdict(self.whatsapp),
+            "feishu": asdict(self.feishu),
             "teams": asdict(self.teams),
             "imessage": asdict(self.imessage),
             "dashboard": asdict(self.dashboard),

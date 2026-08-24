@@ -20,6 +20,10 @@ import pytest
 
 from kiro_crew.subagent import SubagentManager, validate_cwd
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 # ---------------------------------------------------------------------------
 # validate_cwd helper
 # ---------------------------------------------------------------------------

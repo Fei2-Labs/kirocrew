@@ -16,6 +16,10 @@ import pytest
 import kiro_crew.subagent as subagent
 from kiro_crew.subagent import compute_max_subagents, resolve_max_subagents
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 
 @pytest.fixture(autouse=True)
 def _no_learned_cost(monkeypatch):

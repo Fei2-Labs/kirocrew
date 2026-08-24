@@ -87,12 +87,67 @@ _TERMINAL_BOUND_REASONS = frozenset({"cycle_cap", "runtime_budget", APPROVAL_STA
 # dashboard turn-lifecycle hooks (notify_turn_complete / notify_user_input),
 # so they run on a fixed interval instead of an idle timer: the timer re-arms
 # itself right after every delivered fire.
-_CHANNEL_KEY_PREFIXES = ("slack:", "discord:", "telegram:", "whatsapp:", "unified:")
+#
+# This mirrors ``messaging.link.CHANNEL_SESSION_NAMESPACES``, spelled out here
+# rather than derived from it, for two independent reasons:
+#
+# 1. IMPORT WEIGHT. ``autonudge`` is imported at module scope by ``mcp_core``
+#    (i.e. by every MCP server process) and by the dashboard chat layer, and it
+#    depends only on config/security/platform_compat today. Naming
+#    ``kiro_crew.messaging.link`` runs ``messaging/__init__``, which pulls the
+#    driver/renderer/transport layer and, transitively, the ACP client, agent,
+#    hooks, artifacts, metrics and sqlite — measured at 48 additional
+#    ``kiro_crew`` modules to obtain one tuple of string literals.
+# 2. THIS IS A KEY-SHAPE QUESTION, NOT A LIVE-CAPABILITY ONE. ``is_channel_key``
+#    selects the RE-ARM STRATEGY and the expiry-notification metadata, so it has
+#    to answer identically whether or not the transport happens to be registered
+#    at this instant. Deriving it from a runtime ``supports_proactive_send``
+#    lookup fails toward the WRONG branch: a loop whose transport is momentarily
+#    absent would read as a dashboard slot, so ``_run_fire_cycle`` would stop
+#    self-re-arming it — and nothing else ever will, since
+#    ``notify_turn_complete`` never fires for a channel key — while the expiry
+#    notice would synthesize a ``dashboard:<namespace>:<id>`` jump link pointing
+#    at no slot.
+#
+# Membership therefore does NOT assert deliverability; it asserts "this key names
+# a conversation rather than a chat slot". Whether a nudge can actually be
+# delivered stays with the fail-closed ladder in ``dashboard/chat_runner.py``
+# (``_resolve_channel_target``: governance, then a REGISTERED transport, then
+# ``supports_proactive_send``), which logs its reason and degrades to a no-op.
+# So a namespace is listed even when nothing can currently be delivered to it,
+# and the two clearest cases are both here: ``whatsapp`` has no transport package
+# in this fork at all, and ``feishu`` ships one that declares
+# ``supports_proactive_send=False`` (its renderer only replies to an inbound
+# message id, so a nudge cycle has nowhere to put the answer). Both still classify
+# as channel keys, because the alternative is worse than a refusal: an unlisted key
+# is read as a dashboard slot and silently stops being re-armed, whereas a listed
+# one reaches the ladder and is refused with a logged reason. Being listed is
+# likewise not an arming permission — that is ``binding_key_for``, which is
+# narrower still and gated on an ownership check and a fire route.
+_CHANNEL_KEY_PREFIXES = (
+    "slack:",
+    "discord:",
+    "telegram:",
+    "wecom:",
+    "whatsapp:",
+    "webex:",
+    "teams:",
+    "weixin:",
+    "imessage:",
+    "feishu:",
+    "unified:",
+)
 
 
 def is_channel_key(key: str) -> bool:
     """True when *key* names a messaging-channel session (``slack:<ts>``,
-    ``discord:{agent}:direct:{user}`` ...) rather than a dashboard chat slot."""
+    ``discord:{agent}:direct:{user}`` ...) rather than a dashboard chat slot.
+
+    A CLASSIFICATION, not a permission: see :data:`_CHANNEL_KEY_PREFIXES` for why
+    the set is spelled out, and why membership says nothing about whether a nudge
+    can be delivered. Callers asking "may this session be armed?" want
+    :func:`binding_key_for` instead.
+    """
     return key.startswith(_CHANNEL_KEY_PREFIXES)
 
 
@@ -107,6 +162,18 @@ def binding_key_for(session_key: str) -> str | None:
 
     Single source of truth shared by the ``monitor_start`` MCP tool and the
     workflow ``ctx.nudge`` port so both agree on what "nudge-able" means.
+
+    NARROWER THAN :data:`_CHANNEL_KEY_PREFIXES` ON PURPOSE, and for a different
+    reason than that tuple's own exclusions. ``is_channel_key`` classifies a key's
+    SHAPE; this function answers whether an arm request can be honoured, which
+    additionally requires an ownership check in ``autonudge_authz`` and a fire
+    route in the gateway's ``_fire`` dispatcher — both implemented for ``slack:``
+    and ``discord:`` only. Passing a namespace through ahead of those two would
+    arm a loop that is denied at the chokepoint (or removed on its first fire
+    with "unsupported channel key"), which is strictly worse than refusing it
+    here: a clean "not supported from this session type" instead of a loop that
+    appears to exist and then dies. Widen this set only together with the
+    matching ownership check and fire route.
     """
     if not session_key:
         return None
@@ -252,6 +319,20 @@ _INSTANCE: "AutoNudgeService | None" = None
 
 def get_instance() -> "AutoNudgeService | None":
     return _INSTANCE
+
+
+def _current_task_or_none() -> "asyncio.Task[Any] | None":
+    """:func:`asyncio.current_task`, or ``None`` when no loop is running.
+
+    ``current_task`` raises ``RuntimeError: no running event loop`` outside a loop, and
+    ``stop()`` is reached from SYNCHRONOUS callers — the gateway's shutdown path and test
+    teardown — where nothing is running. There, no task can be "the current" one, which is
+    the answer this returns rather than an exception the caller would have to know about.
+    """
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
 
 
 @dataclass
@@ -566,8 +647,12 @@ class AutoNudgeService:
         logger.info("AutoNudge started")
 
     def stop(self) -> None:
-        for t in self._timers.values():
-            t.cancel()
+        # Through _cancel_timer, not a bare t.cancel() loop: shutdown is the likeliest
+        # moment for a timer's loop to be closing already, and one cancellation policy
+        # means this path inherits both of its guards instead of restating neither.
+        # It pops as it goes, so iterate over a snapshot of the keys.
+        for loop_id in list(self._timers):
+            self._cancel_timer(loop_id)
         self._timers.clear()
         global _INSTANCE
         if _INSTANCE is self:
@@ -657,9 +742,7 @@ class AutoNudgeService:
             # worker thread, and await it so a persistence failure still
             # propagates to the caller before the loop is reported armed.
             payload = self._serialize_state()
-            await asyncio.get_running_loop().run_in_executor(
-                None, self._write_state, payload
-            )
+            await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
             self._arm_from_deadline(loop)
         self._emit("added", loop)
         logger.info("AutoNudge: added loop %s on slot %s (idle=%ds)", loop.id, slot_key, idle_secs)
@@ -777,11 +860,7 @@ class AutoNudgeService:
                         "reasonless inactive update",
                         loop.id,
                     )
-                elif (
-                    stopped_reason in _TERMINAL_BOUND_REASONS
-                    and not active
-                    and not loop.active
-                ):
+                elif stopped_reason in _TERMINAL_BOUND_REASONS and not active and not loop.active:
                     logger.info(
                         "AutoNudge: loop %s already deactivated (%s) — %s bound "
                         "not overwriting it",
@@ -1033,12 +1112,45 @@ class AutoNudgeService:
         self._cancel_timer(loop.id)
 
     def _cancel_timer(self, loop_id: str) -> None:
+        """Retire one loop's timer task. The single cancellation policy.
+
+        Two conditions make a cancel wrong rather than merely redundant, and both are
+        stated here so no caller has to remember either:
+
+        * **The currently running timer task** (a self-re-arm from inside ``_timer``) is
+          about to return on its own, and cancelling it would inject a spurious
+          ``CancelledError`` into the finishing task.
+        * **A task whose event loop has already closed.** ``Task.cancel`` schedules the
+          cancellation through ``loop.call_soon``, which raises ``RuntimeError: Event loop
+          is closed`` — so this raises out of ``remove``/``remove_sync`` and the dashboard
+          handler above it answers 500. The service is a process-global singleton, so its
+          ``_timers`` outlive the loop that created them whenever one loop is replaced by
+          another: the gateway's own shutdown, and every test that drives a handler after
+          an earlier test's loop closed. Asked positively (``get_loop().is_closed()``)
+          rather than by catching the ``RuntimeError``, because a closed loop is the one
+          state where cancelling is a NO-OP by definition — the task can never run again —
+          and catching would also swallow a genuine scheduling fault.
+
+        The closed-loop question is asked FIRST because it needs no running loop of its
+        own, and ``stop()`` reaches here from synchronous callers (gateway shutdown, test
+        teardown) where ``asyncio.current_task()`` would raise instead of answering — hence
+        :func:`_current_task_or_none`.
+        """
         t = self._timers.pop(loop_id, None)
-        # Never cancel the currently running timer task (self-re-arm from inside
-        # _timer): it is about to return on its own, and cancelling it would
-        # inject a spurious CancelledError into the finishing task.
-        if t and not t.done() and t is not asyncio.current_task():
-            t.cancel()
+        if t is None or t.done():
+            return
+        # Closed-loop check FIRST: it needs no running loop of its own, so a dead timer is
+        # retired even from a synchronous caller.
+        if t.get_loop().is_closed():
+            logger.debug(
+                "AutoNudge: dropped loop %s's timer without cancelling — its event loop "
+                "has closed, so the task can no longer run",
+                loop_id,
+            )
+            return
+        if t is _current_task_or_none():
+            return
+        t.cancel()
 
     def _arm_timer(self, loop: NudgeLoop, delay: float | None = None) -> None:
         self._cancel_timer(loop.id)

@@ -340,6 +340,43 @@ def _reset_safety_override_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _restore_autonudge_singleton():
+    """Floor under ``autonudge._INSTANCE`` — the process-global service reference.
+
+    ``AutoNudgeService.start()`` publishes itself here and ``stop()`` clears it, so a test
+    that starts the service (or drives a dashboard handler that does) leaves a live
+    instance behind, holding timer TASKS created on that test's event loop. Every later
+    test in the same worker then reaches those tasks through the singleton, on a loop that
+    has since closed — which is how `test_dashboard_chat.py`'s
+    ``TestCloseBroadcastDurability`` came to answer 500 with no production-code change,
+    from a leak in a file that has nothing to do with it.
+
+    Restores what the test INHERITED rather than a pristine ``None``, so a leak from an
+    earlier test is not re-reported against every test after it. Restores silently rather
+    than failing: production really does publish this singleton, and a test driving that
+    code cannot avoid inheriting it — the damage is to other tests, and stopping it
+    propagating is the part that is never optional.
+
+    Retiring the leaked instance's timers goes through ``_cancel_timer``, which is the one
+    place that knows a task on a closed loop must be dropped rather than cancelled.
+    """
+    from kiro_crew import autonudge as _an
+
+    inherited = _an._INSTANCE
+    try:
+        yield
+    finally:
+        leaked = _an._INSTANCE
+        if leaked is not None and leaked is not inherited:
+            for loop_id in list(getattr(leaked, "_timers", {})):
+                try:
+                    leaked._cancel_timer(loop_id)
+                except Exception:  # noqa: BLE001 - teardown must not mask the test result
+                    pass
+        _an._INSTANCE = inherited
+
+
+@pytest.fixture(autouse=True)
 def _reset_reasoning_effort_globals():
     """Snapshot + restore the process-global reasoning-effort allowlist around
     each test. The allowlist is union-only/monotonic by design (persistence
@@ -1007,3 +1044,61 @@ def named_cron_caller(monkeypatch):
     key = "dashboard:conftest-slot"
     monkeypatch.setenv("KIROCREW_SESSION_KEY", key)
     return key
+
+
+#: Comfortably clear of both memory guards ``SubagentManager.spawn`` runs: the
+#: absolute floor (``agent.spawn_min_memory_gb``, 4 GB) and the posture tier
+#: (``agent.resource_critical_gb``, 2 GB).
+_HEALTHY_AVAILABLE_GB = 8.0
+
+
+@pytest.fixture
+def healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the host-memory readings ``SubagentManager.spawn`` consults.
+
+    ``spawn`` refuses -- returning before it registers anything in ``_tasks`` --
+    whenever the machine looks short of memory, and it does so twice: an
+    absolute floor (``check_memory_available`` against
+    ``agent.spawn_min_memory_gb``) and the posture tier
+    (``cached_admission_check``, which refuses while the cgroup-clamped reading
+    is CRITICAL). Both read the host the suite happens to be running on, so
+    without this the verdict is the operator's machine rather than the test's
+    own input.
+
+    The failure it produces is misleading, which is why it is worth a shared
+    fixture: a refusal IS a ``SubagentInfo`` -- a done one carrying ``error`` --
+    so ``assert info is not None`` still passes and the test dies one line later
+    on ``mgr._tasks[info.id]`` with a bare ``KeyError``. Measured on a CI runner
+    with ~0.5 GB free.
+
+    Only the HOST reading is pinned: a caller that names its own ``path`` is
+    feeding the ``/proc/meminfo`` parser a fixture file rather than asking about
+    this machine, so it still runs the real function and a parser regression
+    still goes red. A test that is actually ABOUT either guard patches it in its
+    own body, which lands on top of this and reverts to it.
+    """
+    import kiro_crew.resource_status as resource_status
+    import kiro_crew.subagent as subagent
+
+    real_check = subagent.check_memory_available
+
+    def _pinned_check(
+        min_gb: float | None = None, path: str | None = None
+    ) -> tuple[bool, float]:
+        if path is None:
+            return (True, _HEALTHY_AVAILABLE_GB)
+        if min_gb is None:
+            return real_check(path=path)
+        return real_check(min_gb=min_gb, path=path)
+
+    def _admit() -> resource_status.AdmissionDecision:
+        return resource_status.AdmissionDecision(
+            admitted=True,
+            posture=resource_status.POSTURE_AMPLE,
+            available_gb=_HEALTHY_AVAILABLE_GB,
+        )
+
+    monkeypatch.setattr(subagent, "check_memory_available", _pinned_check)
+    # Also keeps the 5s-TTL refresh thread behind the cached verdict from
+    # starting, so no test leaves one probing the host after it ends.
+    monkeypatch.setattr(subagent, "cached_admission_check", _admit)

@@ -3376,6 +3376,20 @@ def _reset_make_live_committed_latch():
     mod._MAKE_LIVE_COMMITTED = False
 
 
+@pytest.fixture(autouse=True)
+def _reset_shutdown_admission_state():
+    """``_SHUTDOWN_IN_PROGRESS`` is set by ``dev_fleet_cleanup`` and never cleared
+    in production (the process exits).  In-process pytest leaks the latched True
+    state into later tests that call ``_start_run`` directly, causing them to
+    raise RuntimeError instead of running normally.  Reset both the flag and the
+    lock around every test to mirror a fresh gateway process."""
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
+    yield
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
+
+
 def _mk_make_live_wt(tmp_path, *, venv: bool = False, dist: bool = False,
                      venv_exec: bool = True):
     """Build a fake worktree dir with optional .venv/bin/kirocrew and built dist.

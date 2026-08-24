@@ -1160,6 +1160,61 @@ class TestCronCli:
             ns = mock_cron.call_args[0][0]
             assert ns.agent is None
 
+    def test_cron_remove_emits_sel_audit(self):
+        # Single-job delete must be SEL-audited like cron.add/cron.update:
+        # after the job vanishes from crons.json the audit trail is the only
+        # way to tell a deliberate delete from data loss.
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel") as mock_sel,
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.remove_job.return_value = True
+            args = argparse.Namespace(cron_action="remove", job_id="abc123")
+            _cron(args)
+            mock_svc.remove_job.assert_called_once_with("abc123")
+            mock_sel.return_value.log_api_access.assert_called_once_with(
+                caller="cli",
+                operation="cron.remove",
+                outcome="allowed",
+                source="cli",
+                resources="job_id=abc123",
+            )
+
+    def test_cron_remove_not_found_audits_not_found(self):
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel") as mock_sel,
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.remove_job.return_value = False
+            args = argparse.Namespace(cron_action="remove", job_id="ghost")
+            _cron(args)
+            mock_sel.return_value.log_api_access.assert_called_once_with(
+                caller="cli",
+                operation="cron.remove",
+                outcome="not_found",
+                source="cli",
+                resources="job_id=ghost reason=not_found",
+            )
+
+    def test_cron_remove_succeeds_when_audit_raises(self, capsys):
+        # The first sel() of a process constructs the log and can raise; the
+        # job is already removed by then, so the command must still report the
+        # completed delete instead of crashing.
+        with (
+            patch("kiro_crew.cli_commands.CronService") as mock_svc_cls,
+            patch("kiro_crew.cli_commands.sel") as mock_sel,
+        ):
+            mock_svc = mock_svc_cls.return_value
+            mock_svc.remove_job.return_value = True
+            mock_sel.side_effect = RuntimeError("SEL trust root unavailable")
+            args = argparse.Namespace(cron_action="remove", job_id="abc123")
+            _cron(args)
+            out = capsys.readouterr()
+            assert "Removed job: abc123" in out.out
+            assert "audit log write failed" in out.err
+
 
 class TestPortEnvValidatedAtEntry:
     """`main()` rejects an unusable KIROCREW_PORT before any subcommand runs.
@@ -4047,6 +4102,7 @@ class TestSetupChannelGating:
             monkeypatch.setattr(cs, name, lambda *a, **k: None)
         monkeypatch.setattr(cs, "_setup_slack_tokens", lambda: calls.append("slack_tokens"))
         monkeypatch.setattr(cs, "_setup_slash_command", lambda: calls.append("slash_command"))
+        monkeypatch.setattr(cs, "_setup_whatsapp", lambda: calls.append("whatsapp"))
         # Conductor-skill step catches Exception and continues.
         monkeypatch.setattr(
             cs, "KiroCrewConfig", MagicMock(load=MagicMock(side_effect=RuntimeError("no config")))
@@ -4087,6 +4143,51 @@ class TestSetupChannelGating:
         calls = self._run_setup(monkeypatch, tmp_path, agent_only=True)
         assert calls == []
         out = capsys.readouterr().out
+        assert "--slack is ignored" not in out
+
+    def test_default_setup_names_whatsapp_among_the_connectable_channels(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The fallback blurb is where an operator learns which channels exist.
+        Omitting WhatsApp made the only channel with an install prerequisite the
+        one channel the wizard never mentions."""
+        self._run_setup(monkeypatch, tmp_path)
+        out = capsys.readouterr().out
+        assert "WhatsApp" in out
+        assert "setup --whatsapp" in out
+
+    def test_whatsapp_flag_opts_into_the_whatsapp_step_only(self, tmp_path, monkeypatch):
+        """--whatsapp runs its own step and NOT the Slack ones (there is no token
+        to collect and no slash command on WhatsApp)."""
+        calls = self._run_setup(monkeypatch, tmp_path, whatsapp=True)
+        assert calls == ["whatsapp"]
+
+    def test_both_flags_run_both_guided_setups(self, tmp_path, monkeypatch):
+        calls = self._run_setup(monkeypatch, tmp_path, slack=True, whatsapp=True)
+        assert calls == ["slack_tokens", "slash_command", "whatsapp"]
+
+    def test_the_whatsapp_flag_reaches_setup_from_the_command_line(self):
+        """The wizard-level tests call ``_setup_impl`` directly, so the argparse
+        flag and its plumbing need their own guard: without them
+        ``kirocrew setup --whatsapp`` exits 2 instead of running anything."""
+        import sys
+
+        argv = ["kirocrew", "setup", "--whatsapp"]
+        with patch.object(sys, "argv", argv), patch("kiro_crew.cli._setup") as mock_setup:
+            from kiro_crew.cli import main
+
+            main()
+            assert mock_setup.call_args.kwargs["whatsapp"] is True
+
+    def test_agent_only_with_whatsapp_warns_and_skips_the_step(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """--agent-only --whatsapp: the step is skipped, and the notice names the
+        flag the caller actually passed rather than only --slack."""
+        calls = self._run_setup(monkeypatch, tmp_path, agent_only=True, whatsapp=True)
+        assert calls == []
+        out = capsys.readouterr().out
+        assert "--whatsapp is ignored with --agent-only" in out
         assert "--slack is ignored" not in out
 
 

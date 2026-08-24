@@ -693,9 +693,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # spelled out inline before, with the target read from sys.executable and
         # the repo from the operator-configured checkout. Sandboxing it now would
         # refuse a step every platform has always run unsandboxed.
-        "dep_sync.py::interpreter_version",
-        "dep_sync.py::installed_console_script_target",
-        "dep_sync.py::installed_package_origin",
+        #
+        # The three interpreter probes (interpreter_version,
+        # installed_package_origin, installed_console_script_target) share one
+        # fixed-argv helper, _probe_interpreter, which is where their single
+        # spawn now lives: `<target python> -I -X utf8 -c <fixed probe>` with a
+        # neutral cwd, so the answer describes the venv instead of the caller.
+        "dep_sync.py::_probe_interpreter",
         "dep_sync.py::sync",
         "dep_sync.py::sync_or_reinstall",
         # Foreground last-resort restart (Make Live on hosts with no drivable
@@ -756,6 +760,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # created; the sole input is the operator-typed app name.
         "cli_commands.py::_register_app_crons_to_scheduler",
         "cli_doctor.py::_doctor",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``), used to drive the async Discord
+        # privileged-intent probe from the loop-less doctor path. No child
+        # process is created: the probe is one HTTPS GET to Discord's own
+        # ``/oauth2/applications/@me`` with a bot token read from the operator's
+        # own credential store, and every failure is folded into its result. Same
+        # classification as ``cli_doctor.py::_doctor`` above.
+        "cli_doctor.py::_discord_intent_grants",
         "cli_doctor.py::_doctor_mcp_tools",
         # Read-only diagnostic for the KAS backend section: ``<kiro-cli> acp
         # --help`` with a fully constant argv tail — the binary comes from
@@ -796,6 +808,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli_server.py::_logs_cmd",
         "cli_server.py::_spawn_detached_gateway",
         "cli_server.py::_update",
+        # Nested helper inside ``_update``, keyed separately because the audit
+        # keys by function name. Same class as its enclosing function, already
+        # allowlisted above: a read-only ``git rev-list --count --left-right
+        # HEAD...origin/<branch>`` on the install's own checkout, run on the
+        # one-shot ``kirocrew update`` path. Fixed argv with no shell; the only
+        # interpolated value is the branch name ``git rev-parse --abbrev-ref
+        # HEAD`` just reported, and it sits after the ``origin/`` prefix so it
+        # cannot become an option. Nothing agent-supplied, nothing written.
+        "cli_server.py::_divergence_verdict",
         "cli_server.py::_update_wheel",
         "cli_setup.py::_setup_electron",
         # Cursor Motion overlay renderer: `<this interpreter> -m
@@ -850,6 +871,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # classification as the other ``asyncio.run`` sites in this list.
         "connections/l0_probe.py::_run_record",
         "connections/l0_probe.py::main",
+        # Same classification as l0_probe: a CLI entry point driving an
+        # in-process aiohttp sweep with asyncio.run.
+        "connections/l1_smoke.py::main",
         "cloud/source.py::_git_tracked_files",
         "cloud/source.py::_tracked_tree_is_dirty",
         "cloud/source.py::_use_git_archive",
@@ -984,6 +1008,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # through the sandbox helper because sandbox imports platform_compat.
         "platform_compat.py::process_owner_uid",
         "platform_compat.py::process_matches",
+        # Same class as process_matches: a read-only process-attribute query
+        # (macOS ``ps -ww -o command= -p <pid>``; Linux reads /proc without
+        # spawning) whose only interpolated value is an int-guarded pid — the
+        # expected argv is compared IN PYTHON, never passed to the child. It is
+        # the strict identity check consulted before reclaiming a recorded
+        # forwarder pid, and cannot route through the sandbox helper because
+        # sandbox imports platform_compat.
+        "platform_compat.py::process_argv_matches_exact",
         # The single icacls chokepoint shared by restrict_to_owner (file shape)
         # and restrict_dir_to_owner (directory shape, inheritable grants). Both
         # public helpers delegate here, so this one entry covers the owner-only

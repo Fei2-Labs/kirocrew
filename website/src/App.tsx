@@ -1411,9 +1411,13 @@ export default function App() {
   // shown up while only the Main branch was gated.
   const advertisedNavItems = useMemo(
     () => NAV_ITEMS.filter(surfacePreviewEnabled),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- the revision is an
-    // invalidation token: what `surfacePreviewEnabled` reads lives in
-    // localStorage, not in React state, so nothing else here can express the dep.
+    // The revision is an invalidation token: what `surfacePreviewEnabled` reads
+    // lives in localStorage, not in React state, so nothing else here can
+    // express the dep. The directive stays on ONE line directly above the deps
+    // array -- `eslint-disable-next-line` targets the literal next line, so a
+    // rationale wrapped after it aims the directive at its own continuation and
+    // suppresses nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [previewFlagRevision],
   )
   // Apps nav reorder is dnd-kit sortable (mirrors QueueStack): rows reflow to
@@ -1797,6 +1801,12 @@ export default function App() {
         console.error('onCyclePrevModel failed', e)
       }
     },
+    // Panel toggles. The sidebar lives here in App; the session list and the
+    // activity panel live on the chat page and already listen for these window
+    // events (their in-header buttons dispatch the same ones).
+    onToggleLeftSidebar: () => toggleNav(),
+    onToggleSessionPanel: () => window.dispatchEvent(new Event('toggle-pin-chat-sidebar')),
+    onToggleSidePanel: () => window.dispatchEvent(new Event('toggle-activity-panel')),
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,
   // 2=first remote, … — matching the InstanceTabBar left-to-right tab order.

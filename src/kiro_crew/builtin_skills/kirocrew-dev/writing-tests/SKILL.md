@@ -217,6 +217,15 @@ stopped pruning an entry whose owner "must be dead", and one accused a planted `
 of executing when it had not. If the code *probes* the PID, pin the probe; if the number
 must never appear in real output, pick one no OS can allocate (`99999999999`).
 
+The host's free MEMORY is an input too, and the most-used probe of it is
+`SubagentManager.spawn`, which refuses — registering nothing in `_tasks` — on a
+pressured machine. A refusal is still a `SubagentInfo`, so the test dies a line
+later on a bare `KeyError`, not on the assert that would have named the cause. Any
+file driving `spawn` takes `pytestmark = pytest.mark.usefixtures("healthy_host_memory")`,
+and `test_subagent_spawn_host_pin.py` fails when a new one does not. The two guards it
+pins, and why it stays transparent for the parser's own tests, are in
+testing-conventions § Determinism 1.
+
 ## Rule 3 — Cross-platform: macOS, Linux (x86_64 + arm64), Windows
 
 - **Route POSIX calls through `platform_compat`.** See AGENTS.md's shim table. Most

@@ -136,6 +136,87 @@ function scanShadowedBindings(lines: string[]): number[] {
   return hits
 }
 
+/**
+ * A `compositionstart` subscription is the seed of a composition LATCH, and a
+ * latch hand-rolled beside a native handler is the second spelling this
+ * ratchet exists to prevent: its author re-derives the flag-and-timer
+ * semantics (the post-`compositionend` window, the stale-timer clear, the
+ * stranded-latch recovery) and reliably gets one of them wrong. So each
+ * subscription must feed the shared latch — `useImeGuard` for synthetic
+ * handlers, its `createImeLatch` factory for native ones (document-capture
+ * keydown listeners never see a synthetic event, so `claimEnter` is
+ * structurally unavailable to them; `useListKeyboardNav` is the reference
+ * consumer). The exemption is judged in a bounded window around EACH
+ * subscription, on comment-stripped lines: a whole-file test would let one
+ * sanctioned latch (or a mere comment mention) exempt every other
+ * subscription in the file. The window accepts either the shared-guard call
+ * itself or a handler delegating into a latch's own `onCompositionStart()`
+ * (both in-tree consumers wire it through a one-line arrow). A
+ * `compositionend`-only grace window (TerminalCompletion's xterm handler
+ * tracks a timestamp, not a latch) does not subscribe to `compositionstart`
+ * and stays out of scope — a structural distinction, not a pardoned file.
+ */
+const COMPOSITION_SUBSCRIBE = /addEventListener\(\s*['"]compositionstart['"]/
+const SHARED_LATCH = /\b(?:useImeGuard|createImeLatch)\(|\.onCompositionStart\(\)/
+const LATCH_WINDOW = 12
+
+function scanUnlatchedCompositionSubscribers(lines: string[]): number[] {
+  const code = lines.map(l => {
+    const t = l.trim()
+    return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*') ? '' : l
+  })
+  const hits: number[] = []
+  code.forEach((line, i) => {
+    if (!COMPOSITION_SUBSCRIBE.test(line)) return
+    const windowLines = code.slice(Math.max(0, i - LATCH_WINDOW), i + LATCH_WINDOW + 1)
+    if (!windowLines.some(l => SHARED_LATCH.test(l))) hits.push(i + 1)
+  })
+  return hits
+}
+
+/**
+ * An `Enter → blur` commit that consults NO composition signal at all.
+ *
+ * Every rule above needs the site to have referenced a signal — they police a
+ * guard that is written WRONGLY. None of them can see a guard that is simply
+ * ABSENT, and the absent one is the shape that spreads by copy: the panel this
+ * rule was added for carried `if (e.key === 'Enter') e.currentTarget.blur()`
+ * twice, on a folder-name field and a group cooldown, both copied from a
+ * sibling channel panel BEFORE that sibling grew its guard. The whole tree was
+ * otherwise clean, so nothing failed and no reviewer of either file could have
+ * seen what the other one did.
+ *
+ * `blur()` on an Enter branch is the scoping signal, and it is a narrow one: in
+ * this tree that spelling exists only to commit a text field on Enter, which is
+ * exactly the action an IME's committing keydown must not trigger. The element
+ * is cleared when the guard appears anywhere in its span — the signal call
+ * itself, or a `bindEnter`/`bindComposition` spread that carries it — so a site
+ * using the sanctioned shape in any of its spellings passes.
+ */
+const ENTER_BLUR = /key === 'Enter'|key !== 'Enter'/
+const BLUR_COMMIT = /\.blur\(\)/
+const GUARD_PRESENT = /ime\.(?:isComposing|claimEnter)\(|\.\.\.\w+\.bind(?:Enter|Composition)\b/
+/** Lines of the handler/element around `i`, bounded by this tree's formatting. */
+const COMMIT_WINDOW = 10
+
+function scanUnguardedEnterBlurCommits(lines: string[]): number[] {
+  const code = lines.map(l => {
+    const t = l.trim()
+    return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*') ? '' : l
+  })
+  const hits: number[] = []
+  code.forEach((line, i) => {
+    if (!ENTER_BLUR.test(line)) return
+    const window = code.slice(i, i + COMMIT_WINDOW + 1)
+    // The commit has to be on this branch, not merely later in the file.
+    if (!window.some(l => BLUR_COMMIT.test(l))) return
+    // The guard may sit above (an early return) or on the element (a spread).
+    const span = code.slice(Math.max(0, i - COMMIT_WINDOW), i + COMMIT_WINDOW + 1)
+    if (!span.some(l => GUARD_PRESENT.test(l))) hits.push(i + 1)
+  })
+  return hits
+}
+
 describe('IME Enter claim ratchet', () => {
   it('routes every Enter-submit branch through the guard', () => {
     const offenders: string[] = []
@@ -184,6 +265,27 @@ describe('IME Enter claim ratchet', () => {
     expect(offenders).toEqual([])
   })
 
+  it('never commits an Enter to blur with no composition guard at all', () => {
+    // The rules above all require the site to have NAMED a composition signal,
+    // so each one polices a guard written wrongly and none can see one that is
+    // absent. `WhatsAppPanel` shipped the absent form twice, copied from
+    // `WeixinPanel` before that panel grew its own guard: a CJK operator
+    // pressing Enter to accept a candidate persisted the intermediate
+    // composition text as the folder name. A behavioural test per panel could
+    // not have caught it — the second copy was in a component nobody had
+    // written an IME test for.
+    const offenders: string[] = []
+    for (const rel of sourceFiles()) {
+      if (rel === 'hooks/useImeGuard.ts') continue
+      const lines = readFileSync(join(SRC, rel), 'utf8').split('\n')
+      for (const n of scanUnguardedEnterBlurCommits(lines)) offenders.push(`${rel}:${n}`)
+    }
+    // An entry here commits a text field on an Enter it never checked. Add the
+    // early return (`if (ime.isComposing(e)) return`) before the blur, and the
+    // `bindComposition` spread that tracks the latch it reads.
+    expect(offenders).toEqual([])
+  })
+
   it('never lets a standalone copy of a bound prop sit on an element that spreads a binding', () => {
     // JSX resolves duplicate props by last-one-wins, so a standalone `onBlur` after the
     // spread drops the latch reset and a standalone one before it drops the caller's own
@@ -208,6 +310,26 @@ describe('IME Enter claim ratchet', () => {
     // Pass the handler INTO bindComposition/bindEnter({ onFocus, onBlur, … }) so both
     // run — or, for an `onKeyDown` beside bindEnter, keep the site's own handler and
     // claim the Enter branch instead of spreading bindEnter.
+    expect(offenders).toEqual([])
+  })
+
+  it('never hand-rolls a composition latch beside a native handler', () => {
+    // A `compositionstart` subscription outside the guard module must feed the
+    // shared latch (`useImeGuard` / `createImeLatch`), never a private flag —
+    // the native-event twin of the one-line rule above. `useListKeyboardNav`
+    // shipped exactly the gap this pins: a document-capture Enter dispatch
+    // with no composition reference at all, which on WebKit activated the
+    // highlighted picker row with the keydown that committed an IME candidate.
+    const offenders: string[] = []
+    for (const rel of sourceFiles()) {
+      if (rel === 'hooks/useImeGuard.ts') continue
+      const lines = readFileSync(join(SRC, rel), 'utf8').split('\n')
+      for (const n of scanUnlatchedCompositionSubscribers(lines)) {
+        offenders.push(`${rel}:${n}`)
+      }
+    }
+    // An entry here tracks composition with its own state. Consume
+    // `createImeLatch()` (native handlers) or `useImeGuard()` (synthetic).
     expect(offenders).toEqual([])
   })
 
@@ -244,7 +366,11 @@ describe('IME Enter claim ratchet', () => {
     // the only place that can make that unreachable, so it must not hand out a
     // recovery-less binding for a caller to pick by mistake.
     const hook = readFileSync(join(SRC, 'hooks/useImeGuard.ts'), 'utf8')
-    const returned = /return \{([^}]*)\}/.exec(hook)?.[1] ?? ''
+    // Anchor on the hook itself: the file also exports the `createImeLatch`
+    // factory (the tracked latch shared with native-event consumers), whose
+    // own `return {` would otherwise be the first match.
+    const hookBody = hook.slice(hook.indexOf('export function useImeGuard'))
+    const returned = /return \{([^}]*)\}/.exec(hookBody)?.[1] ?? ''
     expect(returned).toContain('bindComposition')
     expect(returned.split(',').map(s => s.trim())).not.toContain('composition')
     // Every binding the hook returns carries onBlur.
@@ -345,6 +471,78 @@ describe('ratchet rule fixtures', () => {
           if (ime.isComposing(e)) return
           e.currentTarget.blur()
         }
+      }}`))).toHaveLength(1)
+  })
+
+  it('flags a compositionstart subscription that feeds a private flag, not the shared latch', () => {
+    const handRolled = jsx(`
+      let composing = false
+      document.addEventListener('compositionstart', () => { composing = true }, true)
+      document.addEventListener('compositionend', () => { composing = false }, true)`)
+    expect(scanUnlatchedCompositionSubscribers(handRolled)).toHaveLength(1)
+    // The sanctioned shapes: the same subscription feeding the shared latch,
+    // via the factory call or a handler delegating into it.
+    expect(scanUnlatchedCompositionSubscribers(jsx(`
+      const latch = createImeLatch()
+      document.addEventListener('compositionstart', () => latch.onCompositionStart(), true)`))).toHaveLength(0)
+    expect(scanUnlatchedCompositionSubscribers(jsx(`
+      const onStart = () => imeRef.current.onCompositionStart()
+      el.addEventListener('compositionstart', onStart)`))).toHaveLength(0)
+    // A compositionend-only grace window (TerminalCompletion's xterm handler)
+    // is a timestamp, not a latch, and stays out of scope.
+    expect(scanUnlatchedCompositionSubscribers(jsx(`
+      ta.addEventListener('compositionend', done)`))).toHaveLength(0)
+    // The exemption is per subscription and ignores comments: a hand-rolled
+    // flag is still flagged when the sanctioned latch is merely mentioned in
+    // a nearby comment, or lives elsewhere in the same file beyond the window.
+    expect(scanUnlatchedCompositionSubscribers(jsx(`
+      // the shared guard is createImeLatch(), which this deliberately skips
+      let composing = false
+      document.addEventListener('compositionstart', () => { composing = true }, true)`))).toHaveLength(1)
+  })
+
+  it('flags an Enter-to-blur commit that names no composition signal', () => {
+    // The exact shape WhatsAppPanel shipped twice.
+    expect(scanUnguardedEnterBlurCommits(jsx(`
+      <input
+        onChange={setFolderName}
+        onBlur={commitFolderName}
+        onKeyDown={e => {
+          if (e.key === 'Enter') e.currentTarget.blur()
+        }}
+      />`))).toHaveLength(1)
+    // The sanctioned shape: the early return plus the tracking spread.
+    expect(scanUnguardedEnterBlurCommits(jsx(`
+      <input
+        onChange={setFolderName}
+        {...ime.bindComposition({ onBlur: commitFolderName })}
+        onKeyDown={e => {
+          if (e.key !== 'Enter') return
+          if (ime.isComposing(e)) return
+          e.currentTarget.blur()
+        }}
+      />`))).toHaveLength(0)
+    // `claimEnter` is the textarea remedy and clears the rule too.
+    expect(scanUnguardedEnterBlurCommits(jsx(`
+      onKeyDown={e => {
+        if (e.key !== 'Enter') return
+        if (!ime.claimEnter(e)) return
+        e.currentTarget.blur()
+      }}`))).toHaveLength(0)
+    // Scoped to a COMMIT: an Enter branch that does something other than blur a
+    // field is a different structure and out of scope, as is a blur that no
+    // Enter branch reaches.
+    expect(scanUnguardedEnterBlurCommits(jsx(`
+      onKeyDown={e => {
+        if (e.key === 'Enter') onSelect(row)
+      }}`))).toHaveLength(0)
+    expect(scanUnguardedEnterBlurCommits(jsx(`
+      const dismiss = () => inputRef.current?.blur()`))).toHaveLength(0)
+    // A guard mentioned only in a comment does not launder the site.
+    expect(scanUnguardedEnterBlurCommits(jsx(`
+      onKeyDown={e => {
+        // ime.isComposing is handled upstream, honestly
+        if (e.key === 'Enter') e.currentTarget.blur()
       }}`))).toHaveLength(1)
   })
 })

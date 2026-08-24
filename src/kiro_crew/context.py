@@ -32,6 +32,7 @@ from kiro_crew.hooks import (
 from kiro_crew.learn import LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.metrics.provider import get_recorder
+from kiro_crew.quick_prompts import expand_quick_prompt
 from kiro_crew.security import (
     audit_injection_dropped,
     contains_injection,
@@ -639,6 +640,8 @@ _RUNTIME_DISPLAY = {
     "telegram": "Telegram",
     "wecom": "WeCom",
     "weixin": "Weixin",
+    "whatsapp": "WhatsApp",
+    "feishu": "Feishu",
     "webex": "Webex",
     "teams": "Microsoft Teams",
     "imessage": "iMessage",
@@ -683,6 +686,8 @@ def _resolve_runtime_source(session_key: str, runtime_source: str | None = None)
             "telegram",
             "wecom",
             "weixin",
+            "whatsapp",
+            "feishu",
             "webex",
             "teams",
             "imessage",
@@ -2355,6 +2360,7 @@ class ContextBuilder:
                 budget=caps.skills if lazy_skills else None,
                 only=skill_globs or None,
                 project_dir=project,
+                project_body_budget=caps.skills,
             )
             if skills_ctx:
                 if lazy_skills and len(skills_ctx) > caps.skills:
@@ -2688,6 +2694,7 @@ class ContextBuilder:
                     budget=caps.skills if lazy_skills else None,
                     only=_globs or None,
                     project_dir=project,
+                    project_body_budget=caps.skills,
                 )
                 if skills_ctx:
                     if lazy_skills and len(skills_ctx) > caps.skills:
@@ -2896,16 +2903,18 @@ class ContextBuilder:
 
         # Triggered skills (on-demand, any message) — skip for custom agents.
         # A match injects the skill's full body by DEFAULT, unchanged. A skill
-        # that declares itself an offer rather than a mandate opts out with
-        # `inject_on_trigger: false` and contributes a pointer line instead:
-        # word-overlap matching pulls in large unrelated skills often enough
-        # that body price per match is the largest single block of assembled
-        # context, and ACP replays native history so a body already sent earlier
-        # in the conversation is still in the window.
+        # unconfined skill that declares itself an offer rather than a mandate
+        # opts out with `inject_on_trigger: false` and contributes a pointer line
+        # instead. Confined project skills always take the body path so every
+        # read stays behind descriptor confinement. Word-overlap matching pulls
+        # in large unrelated skills often enough that body price per match is
+        # the largest single block of assembled context, and ACP replays native
+        # history so a body already sent earlier in the conversation is still
+        # in the window.
         if not is_custom and not minimal_context:
             triggered = self.skills.get_triggered_skills(text, project_dir=project)
             if triggered:
-                enforced, pointer_only = self.skills.split_triggered(triggered)
+                enforced, pointer_only = self.skills.split_triggered(triggered, project)
                 # Log the split, not just the match: a pointed-at skill the
                 # agent declines to read leaves no other trace, so without this
                 # "the skill stopped being followed" is indistinguishable from
@@ -2917,7 +2926,13 @@ class ContextBuilder:
                     ", ".join(pointer_only) or "-",
                 )
                 for name in enforced:
-                    content = self.skills.load_skill(name)
+                    # project_dir, not project-blind: get_triggered_skills and
+                    # split_triggered above are both project-aware, so a trusted
+                    # project's skill can reach here -- and loading it blind
+                    # returned None, making a matched skill contribute nothing at
+                    # all. The project branch reads through the containment-checked
+                    # reader, so this is confined like every other project read.
+                    content = self.skills.load_skill(name, project)
                     if content:
                         stripped = self.skills.strip_frontmatter(content)
                         parts.append(f"[Skill: {name}]\n{stripped}\n[End of skill]\n\n")
@@ -2926,7 +2941,7 @@ class ContextBuilder:
                         # positive, pointer-only, or undelivered) must not earn
                         # ranking weight in the lazy-load hotness ledger.
                         self.skills._record_use(name)
-                hint = self.skills.trigger_hint(pointer_only)
+                hint = self.skills.trigger_hint(pointer_only, project)
                 if hint:
                     parts.append(hint)
 
@@ -2966,6 +2981,39 @@ class ContextBuilder:
         # forge a second boundary after the request header above. This covers the
         # HOOK_MODIFY path too — a transform hook may re-emit untrusted input.
         turn_text = hook_result.text if hook_result.action == HOOK_MODIFY else text
+        # Quick prompts (``/plain``) are macros, not commands: the token the user
+        # opened with is replaced by the instruction it stands for. It happens
+        # HERE, in the one function every inbound surface funnels through, so a
+        # single registry row works from the dashboard composer, Telegram, Slack,
+        # Discord, a subagent and a cron turn — rather than once per dispatcher.
+        # After the hook layer, so a transform hook still sees what the user
+        # actually typed, and a hook that rewrites a turn INTO a quick prompt is
+        # honoured too. Before marker neutralization, so the spliced instruction
+        # is scrubbed on the same terms as any other turn text.
+        #
+        # The token has to be matched against the USER'S OWN SLICE, not the whole
+        # turn. A dashboard turn can arrive with an envelope PREFIXED to it — a
+        # drained memory block, a compaction notice — which is exactly what
+        # ``user_text_range`` describes. Anchoring on the whole turn would miss a
+        # prefixed ``/plain`` and silently send the literal token to the model, so
+        # the match runs on ``text[start:end]`` and the expansion is spliced back
+        # into that slice's place. Where no range is given (channels, cron, a
+        # subagent) the whole turn IS the user's text, and a rewriting hook's
+        # output is likewise the turn in full.
+        _quick_prompt: str | None = None
+        _quick_at = 0
+        if hook_result.action == HOOK_MODIFY or user_text_range is None:
+            _quick_prompt = expand_quick_prompt(turn_text)
+            if _quick_prompt is not None:
+                turn_text = _quick_prompt
+        else:
+            _q0, _q1 = user_text_range
+            _q0 = max(0, min(_q0, len(turn_text)))
+            _q1 = max(_q0, min(_q1, len(turn_text)))
+            _quick_prompt = expand_quick_prompt(turn_text[_q0:_q1])
+            if _quick_prompt is not None:
+                turn_text = turn_text[:_q0] + _quick_prompt + turn_text[_q1:]
+                _quick_at = _q0
         _marker_spans = _structural_marker_spans(turn_text)
         _turn_neutralized = _apply_marker_spans(turn_text, _marker_spans)
         # Where the user's own text lands is resolved HERE rather than
@@ -2975,10 +3023,22 @@ class ContextBuilder:
         # text), and the final _MULTIBYTE_TABLE fold. A caller measuring the
         # pre-transform message cannot know the post-transform offsets.
         if user_text_range is not None:
-            if hook_result.action == HOOK_MODIFY:
-                # A transform hook replaced the whole turn, so the caller's
-                # bounds describe text that no longer exists. The hook's output
-                # IS the user's turn now, so attribute all of it.
+            if _quick_prompt is not None:
+                # A quick prompt REPLACED the user's slice with injected
+                # instruction text. None of it is their typing — they typed a
+                # token that no longer exists in the turn — so their span is
+                # EMPTY, anchored where that slice began. This is the rule
+                # attributable_user_chars() already states for the sibling
+                # @prompt replacement (credit 0). Claiming the whole replacement,
+                # as a rewriting hook legitimately does, would report generated
+                # instructions as the user's own words and underreport Crew-added
+                # context in the per-turn breakdown.
+                _u0, _u1 = _quick_at, _quick_at
+            elif hook_result.action == HOOK_MODIFY:
+                # A transform hook replaced the whole turn, so the caller's bounds
+                # describe text that no longer exists. The hook's output IS the
+                # user's turn now, so attribute all of it rather than clamping
+                # stale offsets into the middle of it.
                 _u0, _u1 = 0, len(turn_text)
             else:
                 _u0, _u1 = user_text_range

@@ -143,6 +143,9 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(mod, "_LIVE_CHECK_AT", 0.0)
     monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
     monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+    # Shutdown admission state: each test starts with a clean (non-shutdown) process.
+    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
 
 
 # --------------------------------------------------------------------------

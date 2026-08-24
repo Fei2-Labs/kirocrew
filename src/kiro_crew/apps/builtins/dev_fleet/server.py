@@ -58,6 +58,7 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.env import find_node_tool, node_bin_dirs
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.instances import run_marker
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform import boot_platform
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
@@ -497,8 +498,8 @@ except ImportError as exc:
 
 # --- async run tracking ---
 _RUNS: dict[str, dict] = {}
-_RUNS_LOCK = asyncio.Lock()
-_SYNC_LOCK = asyncio.Lock()
+_RUNS_LOCK = LoopBoundLock()
+_SYNC_LOCK = LoopBoundLock()
 
 
 def _find_cli() -> list[str]:
@@ -1229,6 +1230,18 @@ async def _kill_tree(pid: int) -> None:
 # gateway cleanup can kill process trees instead of orphaning pip/npm.
 _ACTIVE_RUNS: dict[str, tuple[asyncio.Task, Any]] = {}
 
+# Shutdown admission control: once dev_fleet_cleanup starts, no new run may
+# register in _ACTIVE_RUNS.  The lock is held only for the two fast dict
+# operations that constitute the critical section (read flag + register, or
+# set flag + snapshot) — it is never held across slow kill/await calls, so
+# there is no risk of asyncio lock contention or done-callback deadlocks.
+# LoopBoundLock (not a bare asyncio.Lock) because a module-global primitive
+# binds to the import-time loop and raises RuntimeError from any other loop
+# (Python 3.10+, see #4800) — this module is imported once but serves
+# whichever loop the gateway runs.
+_SHUTDOWN_ADMISSION_LOCK = LoopBoundLock()
+_SHUTDOWN_IN_PROGRESS = False
+
 
 _RUNS_MAX_COMPLETED = 50
 
@@ -1391,7 +1404,18 @@ async def _start_run(
                     pass
 
     task = asyncio.create_task(worker())
-    _ACTIVE_RUNS[rid] = (task, None)
+    # Register under the admission lock so this insertion is atomic with
+    # respect to dev_fleet_cleanup's flag-set + snapshot.  The lock is held
+    # only for these two dict writes (< 1 µs) — never across slow I/O — so
+    # it cannot stall cleanup or introduce done-callback deadlocks.
+    async with _SHUTDOWN_ADMISSION_LOCK:
+        if _SHUTDOWN_IN_PROGRESS:
+            # Cleanup has already snapshotted _ACTIVE_RUNS; cancelling the
+            # task here keeps the worker from running to completion after the
+            # gateway exits and mutating shared checkout state.
+            task.cancel()
+            raise RuntimeError("dev-fleet shutdown in progress: run refused")
+        _ACTIVE_RUNS[rid] = (task, None)
     task.add_done_callback(lambda _t: _ACTIVE_RUNS.pop(rid, None))
     return rid
 
@@ -2864,7 +2888,7 @@ async def _pod_logs(name: str, n: int = 120) -> dict:
 # Per-worktree provisioning single-flight: name -> run id. Repeated POSTs
 # must not concurrently recreate .venv / dist for the same checkout.
 _PROVISION_INFLIGHT: dict[str, str] = {}
-_PROVISION_LOCK = asyncio.Lock()
+_PROVISION_LOCK = LoopBoundLock()
 
 
 async def _pod_provision(name: str) -> dict:
@@ -3891,11 +3915,11 @@ async def _sync_start_locked() -> dict:
 # Per-worktree mutation locks: two concurrent /rebase requests for the same
 # checkout could both pass the clean-state check, then one's failure path
 # would `rebase --abort` the OTHER's in-flight rebase.
-_WT_LOCKS: dict[str, asyncio.Lock] = {}
+_WT_LOCKS: dict[str, LoopBoundLock] = {}
 
 
-def _wt_lock(name: str) -> asyncio.Lock:
-    return _WT_LOCKS.setdefault(name, asyncio.Lock())
+def _wt_lock(name: str) -> LoopBoundLock:
+    return _WT_LOCKS.setdefault(name, LoopBoundLock())
 
 
 async def _rebase(name: str) -> dict:
@@ -3952,7 +3976,7 @@ _PRUNE_STATE: dict = {
     "running": False, "total": 0, "done": 0, "current": None,
     "results": [], "items": {},
 }
-_PRUNE_LOCK = asyncio.Lock()
+_PRUNE_LOCK = LoopBoundLock()
 # Cap on concurrent per-item prune phases (fresh gh verdict + pod shutdown).
 _PRUNE_CONCURRENCY = 4
 # Serializes the destructive git mutations (`git worktree remove` +
@@ -3961,7 +3985,10 @@ _PRUNE_CONCURRENCY = 4
 # mutate the shared MAIN_REPO ``.git`` state (worktree admin dir + packed-refs).
 # Uncontended in the sequential paths; only the parallel prune workers ever
 # queue on it.
-_GIT_MUTATION_LOCK = asyncio.Lock()
+# LoopBoundLock excludes within one loop only. That covers every contender
+# here: all acquirers are aiohttp handlers and tasks on the app's single
+# gateway loop — no worker thread runs its own loop against this .git.
+_GIT_MUTATION_LOCK = LoopBoundLock()
 
 
 async def _prunable(path: str, branch: str | None) -> dict:
@@ -4678,10 +4705,20 @@ async def dev_fleet_startup(app: web.Application) -> None:
 
 async def dev_fleet_cleanup(app: web.Application) -> None:
     """Cancel and await background tasks so a stopped runner leaves nothing behind."""
-    global _refresher_task, _warm_task, _reaper_task
+    global _refresher_task, _warm_task, _reaper_task, _SHUTDOWN_IN_PROGRESS
+    # Close the admission window first: set the flag and snapshot _ACTIVE_RUNS
+    # atomically under the admission lock.  The lock is held only for these two
+    # fast dict operations — no I/O, no awaits — so it cannot stall any in-
+    # flight handler or create done-callback deadlocks.  Once we drop the lock,
+    # _SHUTDOWN_IN_PROGRESS is True and _start_run will refuse new registrations,
+    # so the snapshot is complete: every run that could ever be in _ACTIVE_RUNS
+    # is either already in `active_snapshot` or will be refused by _start_run.
+    async with _SHUTDOWN_ADMISSION_LOCK:
+        _SHUTDOWN_IN_PROGRESS = True
+        active_snapshot = list(_ACTIVE_RUNS.items())
     # Kill active sync/provision subprocess trees first, then cancel workers —
     # otherwise a gateway restart leaves pip/npm mutating shared checkouts.
-    for rid, (task, proc) in list(_ACTIVE_RUNS.items()):
+    for rid, (task, proc) in active_snapshot:
         if proc is not None and proc.returncode is None:
             await _kill_tree(proc.pid)
             try:
@@ -4831,7 +4868,7 @@ _LIVE_GATEWAY_LABEL = "dev.kirocrew.gateway"
 # second concurrent request fails fast with ``busy`` rather than queueing (a
 # queued cutover could apply a stale target after the winner already restarted
 # the gateway out from under us).
-_MAKE_LIVE_LOCK = asyncio.Lock()
+_MAKE_LIVE_LOCK = LoopBoundLock()
 
 # Process-local "cutover committed" latch. ``systemd-run --collect ... restart``
 # only SCHEDULES the restart and returns immediately, so ``_MAKE_LIVE_LOCK`` is

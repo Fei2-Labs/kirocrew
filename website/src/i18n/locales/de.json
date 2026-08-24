@@ -1957,6 +1957,17 @@
           "connect_repo": "Repo verbinden",
           "general": "Allgemein",
           "repository_settings": "Repository-Einstellungen"
+        },
+        "depsSection": {
+          "title": "Abhängigkeiten",
+          "blocked_by": "Blockiert durch",
+          "blocking": "Blockiert",
+          "state_open": "open",
+          "state_closed": "closed",
+          "state_merged": "merged",
+          "source_native": "native",
+          "source_inferred": "inferred",
+          "open_here": "{{sigil}}{{number}} hier öffnen"
         }
       },
       "connectPanel": {
@@ -2223,7 +2234,8 @@
         },
         "registry": {
           "overview": "Übersicht",
-          "tagging": "Verschlagwortung"
+          "tagging": "Verschlagwortung",
+          "graph": "Graph"
         },
         "settings": {
           "generalSettings": {
@@ -2383,6 +2395,45 @@
           "untagged_issues": "Issues ohne Label",
           "what_you_see_below_is_the_previous_result_not_th": "was Sie unten sehen, ist das vorherige Ergebnis, nicht der aktuelle Zustand.",
           "write_every_staged_label_to": "Alle vorgemerkten Labels nach {{provider}} schreiben"
+        },
+        "graphView": {
+          "header": "ABHÄNGIGKEITEN",
+          "views_label": "Abhängigkeitsansichten",
+          "tab_frontier": "FRONTIER",
+          "tab_focus": "FOKUS-BAUM",
+          "jump_label": "Zu Vorgang springen",
+          "jump_placeholder": "zu Vorgang # springen…",
+          "loading": "Abhängigkeiten werden geladen…",
+          "refresh": "Abhängigkeitsdaten aktualisieren",
+          "ready_count": "{{n}} neu freigegeben",
+          "frontier_heading": "FRONTIER",
+          "frontier_sub": "{{ready}} neu freigegeben · {{waiting}} warten noch",
+          "no_frontier": "Keine offenen Vorgänge mit erfassten Abhängigkeiten.",
+          "waiting_heading": "WARTEN ({{n}})",
+          "more_waiting": "… +{{n}} weitere",
+          "why_all_satisfied": "Alle Blocker erfüllt: {{refs}}",
+          "why_waiting": "Wartet auf {{refs}}",
+          "why_satisfied": "Bereits erfüllt: {{refs}}",
+          "open_tree": "Baum öffnen →",
+          "frontier_caption": "Bei neu freigegebenen Vorgängen ist jeder erfasste Blocker geschlossen oder gemergt. Öffne einen Vorgang für den Grund oder öffne seinen Baum.",
+          "focus_caption": "Der gesamte aktive Abhängigkeitsbaum des gewählten Vorgangs. Klick auf einen Knoten setzt ihn als Wurzel, Enter öffnet ihn. Gestrichelt = abgeleitet, durchgestrichen = erfüllt.",
+          "focus_empty": "Wähle einen Vorgang, um seinen Abhängigkeitsbaum zu zeichnen.",
+          "tree_stat": "Baum von {{kind}}-{{number}}: {{nodes}} Knoten · {{edges}} aktive Kanten",
+          "ghost_satisfied": "erfüllt",
+          "ci_fail": "CI FEHLGESCHLAGEN",
+          "led_wait": "WAIT",
+          "led_ready": "RDY",
+          "led_run": "RUN",
+          "led_done": "DONE",
+          "led_open": "OPEN",
+          "aria_tree": "Abhängigkeitsbaum von {{kind}}-{{number}}: {{nodes}} Knoten, {{edges}} aktive Kanten",
+          "aria_node": "{{kind}}-{{number}}, {{state}}: {{title}}",
+          "empty_board": "UNBESTÜCKTE PLATINE",
+          "empty_title": "Noch keine Abhängigkeiten",
+          "empty_blurb": "Dieses Repository hat keine zeichenbaren Abhängigkeitskanten. Setze eine native Abhängigkeit mit gh issue edit --add-blocked-by, oder Issue Radar leitet Kanten beim nächsten Sync aus Querverweisen ab.",
+          "empty_unavailable_title": "Abhängigkeitsdaten nicht verfügbar",
+          "empty_unavailable_blurb": "Der Abhängigkeitsgraph konnte nicht geladen werden. Die deps-Route ist für dieses Repository womöglich noch nicht aktiv. Danach erneut versuchen.",
+          "retry": "ERNEUT VERSUCHEN"
         }
       },
       "welcomeCarousel": {
@@ -3857,7 +3908,9 @@
         "co_author": "Koautor",
         "co_author_conflict": "Co-Autor hat diese Datei geändert",
         "co_author_conflict_discard": "Meine Änderungen verwerfen und neu laden",
+        "co_author_conflict_discard_button": "Änderungen verwerfen",
         "co_author_conflict_discard_confirm": "Nicht gespeicherte Änderungen an „{{file}}“ verwerfen und die Version des Co-Autors laden? Dies kann nicht rückgängig gemacht werden.",
+        "co_author_conflict_discard_title": "Nicht gespeicherte Änderungen verwerfen?",
         "commit_and_push": "Committen & senden",
         "commit_message_prompt": "Beschreibe diesen Commit. Er erfasst jede Änderung im Papier.",
         "compile": "Kompilieren",
@@ -4180,6 +4233,10 @@
           "advance_to_design": "Freigeben → Design",
           "advance_to_tasks": "Freigeben → Aufgaben",
           "an_agent_will_work_through_the_task_list": "Ein Agent arbeitet die Aufgabenliste ab",
+          "approved": "Freigegeben",
+          "approved_by_user": "Freigegeben von {{user}}",
+          "archive_this_spec": "Diese Spec archivieren",
+          "changed_since_approval": "Seit der Freigabe geändert",
           "clear": "Leeren",
           "close_esc": "Schließen (Esc)",
           "close_review_view": "Prüfansicht schließen",
@@ -4187,24 +4244,30 @@
           "drafting_design": "Design wird erstellt…",
           "drafting_tasks": "Aufgaben werden erstellt…",
           "drag_or_use_to_resize": "Ziehen oder ← → verwenden, um die Größe zu ändern",
+          "duplicate_this_spec": "Diese Spec duplizieren",
           "expand_document_for_review": "Dokument zur Prüfung vergrößern",
           "expand_for_review_esc_to_close": "Zur Prüfung vergrößern (Esc schließt)",
+          "name_for_the_copy": "Name für die Kopie",
           "pause": "Pausieren",
           "pausing": "Wird pausiert…",
           "pending_comment_one": "{{count}} offener Kommentar",
           "pending_comment_other": "{{count}} offene Kommentare",
           "remove_comment_on": "Kommentar zu {{document}} entfernen",
+          "rename_this_spec_label_the_folder_name_stays": "Benenne die Bezeichnung dieser Spec um. Ordner- und Branch-Name bleiben gleich.",
           "resize_document_panel": "Größe des Dokumentbereichs ändern",
+          "restore_this_spec": "Diese Spec wiederherstellen",
           "review_document": "{{document}} prüfen",
           "send_all_to_agent": "Alle an den Agenten senden",
           "sending": "Wird gesendet…",
+          "spec_label": "Spec-Bezeichnung",
           "start_building": "Umsetzung starten",
           "starting": "Wird gestartet…",
           "tab_design": "Design",
           "tab_requirements": "Anforderungen",
           "tab_tasks": "Aufgaben",
-          "tells_the_agent_this_phase_is_approved_and_to_mo": "Teilt dem Agenten mit, dass diese Phase freigegeben ist und er weitermachen soll — genau wie eine Eingabe im Chat",
+          "tells_the_agent_this_phase_is_approved_and_to_mo": "Hält deine Freigabe dieser Version fest und sagt dem Agenten dann, dass er weitermachen soll",
           "the_agent_is_writing_the_next_document": "Genehmigt — der Agent schreibt das nächste Dokument",
+          "this_document_changed_after_it_was_approved": "Dieses Dokument hat sich nach der Freigabe geändert",
           "working": "arbeitet…"
         },
         "specRail": {
@@ -4237,6 +4300,17 @@
           "tool_calls": "Tool-Aufrufe",
           "turns": "Runden",
           "worktree": "Worktree"
+        },
+        "taskList": {
+          "done": "Fertig",
+          "done_of_total": "{{done}} von {{total}} Aufgaben fertig",
+          "no_tasks_yet": "Noch keine Aufgaben. Sobald das Design freigegeben ist, landet die geordnete Aufgabenliste hier und du kannst Aufgaben einzeln ausführen.",
+          "pause_the_build_first": "Pausiere die Umsetzung, bevor du eine einzelne Aufgabe ausführst",
+          "run": "Ausführen",
+          "run_only_this_task_and_stop": "Nur diese Aufgabe ausführen und dann anhalten",
+          "run_task": "Aufgabe ausführen: {{task}}",
+          "starting": "Wird gestartet…",
+          "task_progress": "Aufgabenfortschritt"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "Beschreiben Sie, was Sie bauen möchten, beantworten Sie einige Fragen und erhalten Sie einen geprüften Plan — Anforderungen, Design und Aufgaben — den ein Agent umsetzen kann.",
@@ -4533,8 +4607,11 @@
       "this_app_provides_agents_and_skills_but_no_visua": "Diese App stellt Agenten und Skills bereit, aber keine visuelle Oberfläche.\n            Verwenden Sie ihre Agenten aus dem Chat."
     },
     "approvalCard": {
+      "approval_no_longer_pending": "Diese Genehmigung ist abgelaufen oder wurde bereits entschieden — der Agent wartet nicht mehr darauf.",
       "approve": "Genehmigen",
       "approved": "Genehmigt",
+      "decision_failed": "Diese Entscheidung wurde möglicherweise nicht gespeichert — die Anfrage ist fehlgeschlagen.",
+      "decision_not_recorded_error": "Diese Entscheidung wurde nicht gespeichert: {{error}}",
       "reject": "Ablehnen",
       "rejected": "Abgelehnt",
       "running": "Läuft:",
@@ -4690,8 +4767,10 @@
     },
     "artifactBody": {
       "artifact": "Artefakt: {{slug}}",
+      "could_not_render": "Dieses Artefakt konnte nicht dargestellt werden",
       "image_could_not_be_loaded": "Bild konnte nicht geladen werden",
-      "rendering": "Wird gerendert…"
+      "rendering": "Wird gerendert…",
+      "retry": "Wiederholen"
     },
     "artifactChatPanel": {
       "agent_chat": "Agenten-Chat",
@@ -5580,6 +5659,7 @@
       "collapse_unchanged": "Unveränderte ausblenden",
       "copy_content": "Inhalt kopieren",
       "copy_path": "Pfad kopieren",
+      "discard_changes_button": "Änderungen verwerfen",
       "discard_unsaved_changes": "Nicht gespeicherte Änderungen verwerfen?",
       "download": "Herunterladen",
       "download_failed": "Download fehlgeschlagen",
@@ -6294,7 +6374,9 @@
       "search_everywhere": "Überall suchen",
       "show_or_focus_the_kiro_crew_window": "{{productName}}-Fenster anzeigen oder fokussieren",
       "use_ctrl_not_option_for_chat_1_9": "⌃ Strg (nicht ⌥ Option) für Chat 1–9 verwenden",
-      "use_ctrl_not_option_for_chat_1_to_9": "Strg (nicht Option) für Chat 1 bis 9 verwenden"
+      "use_ctrl_not_option_for_chat_1_to_9": "Strg (nicht Option) für Chat 1 bis 9 verwenden",
+      "panel_toggles": "Panels umschalten",
+      "unset": "Nicht festgelegt"
     },
     "sidePanelLayout": {
       "update_available": "Aktualisierung verfügbar"
@@ -6361,11 +6443,32 @@
       "triggers": "Auslöser",
       "what_this_skill_does_and_when_the_agent_should_u": "Was dieser Skill tut und wann der Agent ihn verwenden soll"
     },
+    "projectSkillsTrust": {
+      "body": "${{skill}} kommt aus dem eigenen .kiro/skills-Ordner dieses Projekts.",
+      "confirm": "Diesem Ordner vertrauen",
+      "consequence": "Wenn du diesem Ordner vertraust, dürfen seine Skill-Dateien in den Kontext dieses Chats gelangen, wo sie den Agenten anweisen können, Befehle auszuführen. Vertraue nur einem Projekt, das du kennst.",
+      "decline": "Jetzt nicht",
+      "decline_consequence": "Wenn du ablehnst, wird nichts geladen und deine Nachricht bleibt, wie du sie eingegeben hast.",
+      "grant_failed": "Vertrauen für diesen Ordner konnte nicht gespeichert werden.",
+      "title": "Den Skills dieses Projekts vertrauen?",
+      "withdraw_hint": "Du kannst das später auf der Einstellungsseite Skills widerrufen.",
+      "working": "Vertrauen wird erteilt…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "Dieser Ordner existiert nicht mehr.",
+      "hint": "Diese Projektordner dürfen ihre eigenen Skills in einen Chat laden. Widerrufe einen Ordner, damit seine Skills nicht mehr geladen werden.",
+      "revoke": "Widerrufen",
+      "revoke_failed": "Vertrauen für diesen Ordner konnte nicht widerrufen werden.",
+      "revoking": "Wird widerrufen…",
+      "title": "Vertraute Projektordner"
+    },
     "skillPickerMenu": {
       "loading_skills": "Skills werden geladen…",
       "no_matching_skills": "Keine passenden Skills",
       "no_matching_skills_ctrl_enter_sends": "Keine passenden Skills — Ctrl+Enter sendet die Nachricht",
-      "no_matching_skills_enter_sends": "Keine passenden Skills — Enter sendet die Nachricht"
+      "no_matching_skills_enter_sends": "Keine passenden Skills — Enter sendet die Nachricht",
+      "trust_needed_badge": "Vertrauen nötig",
+      "trust_needed_hint": "Aus diesem Projekt. Auswählen, um zu prüfen und dem Ordner zu vertrauen."
     },
     "slashCommandMenu": {
       "desc_agent": "Aktiven Agenten wechseln oder verwalten",
@@ -6387,6 +6490,7 @@
       "desc_model": "Aktuelles Modell anzeigen oder wechseln",
       "desc_onboarding": "Einrichtungsimport und Willkommenstour erneut durchlaufen",
       "desc_paste": "Ein Bild aus der Zwischenablage einfügen",
+      "desc_plain": "Wo alles steht — oder ein Thema angeben",
       "desc_prompts": "Gespeicherte Prompts & Agenten-SOPs auflisten oder aufrufen",
       "desc_quit": "Die Chat-Sitzung beenden",
       "desc_reply": "Auf die letzte Assistentennachricht antworten",
@@ -6520,6 +6624,7 @@
       "trust": "Vertrauen",
       "trust_all_base": "Allen <mono>{{base}}</mono>-Befehlen vertrauen",
       "trust_all_tools": "Allen Werkzeugen vertrauen",
+      "trust_all_tools_channel": "Allen Werkzeugen in diesem Kanal vertrauen — bleibt nach Neustarts bestehen",
       "trust_this_command": "„<mono>{{cmd}}</mono>“ vertrauen"
     },
     "tunnelStatus": {
@@ -6703,12 +6808,14 @@
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "Markieren nicht möglich: Widget hat keinen Slug und keinen Nachrichtenkontext",
+      "could_not_render": "Dieses Widget konnte nicht dargestellt werden",
       "download_as_html": "Als HTML herunterladen",
       "expand": "Aufklappen",
       "minimize": "Minimieren",
       "open_in_new_tab": "In neuem Tab öffnen",
       "remove_artifact_from_library": "Artefakt {{name}} aus der Bibliothek entfernen",
       "rendering": "Wird gerendert…",
+      "retry": "Wiederholen",
       "save_failed": "Speichern fehlgeschlagen",
       "star_as_artifact": "Als Artefakt markieren",
       "starred_as_click_to_remove": "Markiert als „{{name}}“ — klicken, um die Markierung zu entfernen"
@@ -6824,6 +6931,9 @@
       "confirm_button": "Bestaetigen und aktivieren",
       "withdraw": "Bestaetigung zuruecknehmen"
     },
+    "confirmDialog": {
+      "cancel": "Abbrechen"
+    },
     "crewWebhookSection": {
       "could_not_load_webhooks": "Webhooks konnten nicht geladen werden, daher ist gerade unbekannt, was diese Crew weckt.",
       "inbound_webhooks_are_switched_off": "Eingehende Webhooks sind abgeschaltet — nichts kann anrufen, gebundene Tokens eingeschlossen.",
@@ -6888,7 +6998,10 @@
       "switch_to_remote_crew": "Zu Remote-Crew {{n}} wechseln",
       "walk_back_mru_history": "MRU-Verlauf zurückgehen",
       "stop_speaking": "Vorlesen stoppen",
-      "toggle_focus_mode": "Fokusmodus umschalten"
+      "toggle_focus_mode": "Fokusmodus umschalten",
+      "toggle_left_sidebar": "Linke Seitenleiste umschalten",
+      "toggle_session_panel": "Sitzungsbereich umschalten",
+      "toggle_side_panel": "Seitenpanel umschalten"
     },
     "usePanelTabs": {
       "artifacts": "Artefakte",
@@ -7412,7 +7525,13 @@
       "public_by_link_warning": "Veröffentlichte URLs sind per Link öffentlich: Jeder mit dem Link kann den Inhalt sehen – er wird ohne Authentifizierung im öffentlichen Internet bereitgestellt.",
       "random_domain_note": "Inhalte werden unter einer zufälligen *.cloudfront.net-Domain bereitgestellt – veröffentlichen Sie nichts, was Sie nicht ins offene Internet stellen würden.",
       "cloud_deployment_disabled": "Cloud deployment is disabled",
-      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake."
+      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake.",
+      "recall_title": "Website zurückziehen?",
+      "recall_button": "Website zurückziehen",
+      "destroy_title": "Website zerstören?",
+      "destroy_button": "Website zerstören",
+      "remove_profile_title": "Profil entfernen?",
+      "remove_profile_button": "Profil entfernen"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· eine neuere Version ist in der Remote-Kopie verfügbar",
@@ -7444,6 +7563,7 @@
       "copy_failed": "Kopieren fehlgeschlagen",
       "could_not_overwrite": "Überschreiben nicht möglich.",
       "created": "Erstellt",
+      "discard_changes_button": "Änderungen verwerfen",
       "discard_unsaved_changes": "Nicht gespeicherte Änderungen verwerfen?",
       "document_type": "Dokumenttyp",
       "download": "Herunterladen",
@@ -7778,9 +7898,6 @@
         "stopped": "Gestoppt",
         "subagent": "Subagent {{label}}",
         "subagents": "Subagenten",
-        "trusted": "Vertrauenswürdig",
-        "trusted_base": "Vertrauenswürdige Basis",
-        "trusted_command": "Vertrauenswürdiger Befehl",
         "waiting_for_output": "Warten auf Ausgabe…",
         "waiting_to_start_queued_behind_the_concurrency_l": "wartet auf den Start — in der Warteschlange hinter der Parallelitätsgrenze",
         "workflows": "Workflows",
@@ -7943,6 +8060,9 @@
         "recovered_continuing": "Fortsetzung automatisch gesendet",
         "resuming_the_interrupted_turn": "unterbrochener Zug wird fortgesetzt",
         "safety_policy_continuing": "Sicherheitsrichtlinie hat den Aufruf blockiert · Fortsetzung automatisch gesendet",
+        "safety_policy_told_in_turn": "Sicherheitsrichtlinie hat den Aufruf blockiert · dem Agenten wurde der Grund noch in diesem Zug mitgeteilt",
+        "invalid_name_told_in_turn": "der Werkzeugname hat die Validierung nicht bestanden · dem Agenten wurde der Grund noch in diesem Zug mitgeteilt",
+        "hook_fault_told_in_turn": "ein Hook ist vor dem Aufruf fehlgeschlagen · dem Agenten wurde der Grund noch in diesem Zug mitgeteilt",
         "session_busy_continuing": "Sitzung beschäftigt · Fortsetzung automatisch gesendet",
         "subagents_finished": "Subagenten abgeschlossen",
         "system_notice": "Systemhinweis",
@@ -8087,7 +8207,8 @@
         "expand_model_reasoning": "Denkprozess des Modells aufklappen",
         "hide_reasoning": "Denkprozess ausblenden",
         "show_reasoning": "Denkprozess anzeigen",
-        "thinking": "Denkt nach"
+        "thinking": "Denkt nach",
+        "thought_process": "Denkprozess"
       },
       "toolCallLine": {
         "aria_hide_diff": "Diff ausblenden",
@@ -9395,11 +9516,14 @@
       "stub_failed": "Die Änderung konnte nicht angewendet werden. Sie ist möglicherweise gespeichert, aber nicht aktiv — die Schalter unten zeigen jetzt den gespeicherten Stand.",
       "stub_not_live": "Gespeichert, aber noch nicht aktiv — das Gateway konnte nicht starten. Der Schalter zeigt den gespeicherten Stand, nicht den laufenden.",
       "stub_restart_required": "Gespeichert. Starte das Gateway neu, damit die Änderung wirksam wird. Bereits laufende Sitzungen behalten die Server, mit denen sie gestartet sind.",
-      "stubbed_of_total": "{{stubbed}} von {{total}} mit Stub",
+      "stubbed_of_total": "{{stubbed}} von {{total}} für Stub ausgewählt",
       "unsupported_platform": "Das Teilen von Backends benötigt Unix-Domain-Sockets und ist auf dieser Plattform nicht verfügbar.",
       "view_assessment": "Freigabebewertung",
       "view_servers": "Server",
-      "views_aria": "MCP-Verwaltungsansichten"
+      "views_aria": "MCP-Verwaltungsansichten",
+      "state_direct_env": "direkt (env)",
+      "state_direct_env_reason": "Kein Stub, aber Ihre Auswahl bleibt gespeichert.",
+      "state_direct_env_legend": "direkt (env) — der Server deklariert einen Umgebungsschlüssel, den ein geteiltes Backend zurückhalten würde, daher erstellt {{productName}} gar keinen Stub: die Sitzung startet ihn selbst, ohne geteiltes Backend und ohne servereigene Oberfläche."
     },
     "migrationPage": {
       "app_migration": "App-Migration",
@@ -10358,8 +10482,21 @@
       "detail_last_used": "Zuletzt verwendet",
       "detail_size": "Größe",
       "detail_turns": "Dialogschritte",
+      "emptied": "{{size}} freigegeben.",
+      "empty_failed": "Nach {{freed}} freigegebenem Speicher beendet.",
+      "empty_kept": "{{freed}} freigegeben, aber nicht alles konnte gelöscht werden.",
+      "empty_not_started": "Leeren des Papierkorbs konnte nicht gestartet werden. Bitte erneut versuchen.",
+      "emptying": "Papierkorb wird geleert",
+      "emptying_leave_ok": "Der Vorgang läuft weiter, wenn Sie diese Seite verlassen.",
+      "emptying_progress": "{{freed}} von {{total}} freigegeben",
       "heading": "Sitzungsspeicher",
       "in_use": "in Verwendung",
+      "kept_incomplete": "Ein Stapel konnte nicht von der Festplatte entfernt werden und wird daher weiterhin aufgeführt.",
+      "kept_next_step": "Stellen Sie aus diesem Stapel wieder her, was möglich ist; das Gateway-Log nennt die Datei, die das Löschen blockiert hat.",
+      "kept_outside_root": "Ein Stapel verweist nicht mehr in den Papierkorb und wurde daher unangetastet gelassen.",
+      "kept_unknown": "Ein Stapel wurde aus einem Grund behalten, den diese Version nicht kennt.",
+      "kept_unlisted_files": "Ein Stapel enthält eine Datei, die sein Manifest nicht aufführt; sie zu löschen könnte die einzige Kopie einer Sitzung vernichten.",
+      "kept_unreadable": "Ein Stapel konnte nicht vollständig gelesen werden und wurde daher unangetastet gelassen.",
       "move_to_trash_bulk": "In den Papierkorb verschieben",
       "move_to_trash_single": "In den Papierkorb verschieben",
       "next_page": "Weiter",
@@ -10391,7 +10528,9 @@
       "trash_empty": "leer",
       "trash_note": "Belegt noch Festplattenspeicher bis zum Leeren. Nichts hier wird automatisch entfernt.",
       "trash_summary": "{{sessions}} Sitzungen · {{size}}",
-      "unknown_session": "eine nicht gelistete Sitzung"
+      "unknown_session": "eine nicht gelistete Sitzung",
+      "busy_emptying": "Papierkorb wird geleert. Einige Aktionen pausieren bis zum Abschluss.",
+      "empty_failed_next_step": "Versuchen Sie „Endgültig löschen“ erneut. Details stehen im Gateway-Log."
     },
     "sessionsTab": {
       "agent": "Agent",
@@ -10573,7 +10712,8 @@
         "file_sessions_in_folder": "Sitzungen in einem Ordner ablegen",
         "file_sessions_in_folder_desc": "Neue {{channel}}-Sitzungen landen in einem Ordner in der Seitenleiste, statt ohne Ordner zu bleiben.",
         "session_folder_name": "Ordnername",
-        "session_folder_name_desc": "Wird beim Speichern dieser Einstellungen angelegt, falls er noch nicht existiert."
+        "session_folder_name_desc": "Wird beim Speichern dieser Einstellungen angelegt, falls er noch nicht existiert.",
+        "shared_channels": "Gemeinsame Kanäle"
       },
       "browserPanel": {
         "use_builtin_label": "Integrierten Browser verwenden",
@@ -10861,12 +11001,23 @@
         "start_a_gateway_on_this_machine_turn_it_off_to_u": "Startet ein Gateway auf diesem Rechner. Deaktivieren, um Kiro Crew nur als Client zu verwenden: die Verbindung geht dann an das konfigurierte Gateway, anstatt hier eines zu starten. Wird beim nächsten Start der App wirksam."
       },
       "discordPanel": {
+        "allowed_server_channel_ids": "Erlaubte Server-Kanal-IDs",
         "allowed_server_thread_ids": "Erlaubte Server-Thread-IDs",
-        "allowlist_description": "Discord-Benutzer-IDs, die den Agenten in Direktnachrichten oder genehmigten Threads ausführen dürfen. Leer = alle ablehnen (fail closed).",
-        "description": "Sprich mit deinem Agenten aus Discord-Direktnachrichten oder ausdrücklich genehmigten Server-Threads über das Gateway-WebSocket. Normale Server-Kanäle werden immer ignoriert.",
+        "allowlist_description": "Discord-Benutzer-IDs, die den Agenten in Direktnachrichten, genehmigten Threads oder erlaubten Kanälen ausführen dürfen. Leer = alle ablehnen (fail closed).",
+        "auto_thread_description": "Eine Nachricht in einem erlaubten Kanal öffnet einen neuen öffentlichen Thread, und der Durchlauf läuft dort statt im gemeinsamen Kanal.",
+        "auto_thread_label": "In einem neuen Thread antworten",
+        "auto_thread_off_hint": "Der automatische Thread ist aus, daher werden Nachrichten in den Kanälen oben ignoriert. {{productName}} antwortet nie im gemeinsamen Kanal selbst.",
+        "channel_allowlist_description": "Optional. Genehmigte Benutzer dürfen den Agenten auch aus diesen gemeinsamen Server-Kanälen ausführen. Leer = keine gemeinsamen Kanäle.",
+        "channel_help": "Wenn der Developer Mode aktiviert ist, klicke mit der rechten Maustaste auf den Kanal → <mono>Copy Channel ID</mono>. Verwende die ID des Kanals, nicht die eines Threads darin.",
+        "channel_warning": "Ein gemeinsamer Kanal ist eine breitere Offenlegungsgrenze als ein Thread: Alle, die den Kanal sehen, und alle, die den öffentlichen Thread öffnen können, in dem ein Durchlauf läuft, können lesen, was der Agent schreibt und was seine Werkzeuge ausgeben. Füge einen Kanal nur hinzu, wenn seine gesamte Mitgliedschaft das sehen darf.",
+        "description": "Sprich mit deinem Agenten aus Discord-Direktnachrichten, genehmigten Server-Threads oder erlaubten Server-Kanälen über das Gateway-WebSocket. Alle anderen Server-Kanäle werden ignoriert.",
         "empty_allowlist_hint": "Keine erlaubten Benutzer-IDs: Der Bot weist jede Nachricht ab (fail closed). Füge unten deine Discord-Benutzer-ID hinzu.",
-        "guide_body": "Erstelle im Discord Developer Portal eine App und kopiere dann das Token von der Seite <mono>Bot</mono>. Wenn du nur Direktnachrichten nutzt, lass die privilegierten Intents aus. Für Server-Threads aktiviere <mono>Message Content Intent</mono> und installiere die App mit dem Scope <mono>bot</mono> sowie View Channel, Read Message History und Send Messages in Threads. Aktiviere Discord Developer Mode und klicke dann mit der rechten Maustaste auf deinen Namen, um deine numerische Benutzer-ID zu kopieren.",
+        "guide_body": "Erstelle im Discord Developer Portal eine App und kopiere dann das Token von der Seite <mono>Bot</mono>. Wenn du nur Direktnachrichten nutzt, lass die privilegierten Intents aus. Für Server-Threads aktiviere <mono>Message Content Intent</mono> und installiere die App mit den Scopes <mono>bot</mono> und <mono>applications.commands</mono> sowie View Channel, Read Message History und Send Messages in Threads. Aktiviere Discord Developer Mode und klicke dann mit der rechten Maustaste auf deinen Namen, um deine numerische Benutzer-ID zu kopieren.",
         "open_developer_portal": "Developer Portal öffnen",
+        "reactions_description": "Markiert deine Nachricht mit einem Emoji für die Phase, in der der Agent gerade ist (in Warteschlange → denkt → programmiert → fertig). Deaktiviert bleibt deine Nachricht unmarkiert.",
+        "reactions_label": "Phasenreaktionen",
+        "thinking_description": "Postet eine Vorschau der Überlegungen des Modells als eigene Kleintext-Notiz über der Antwort. Deaktiviert bleibt im Kanal nur die Antwort.",
+        "thinking_label": "Denkprozess anzeigen",
         "thread_allowlist_description": "Optional. Genehmigte Benutzer dürfen den Agenten nur in genau diesen Discord-Threads ausführen. Leer = nur Direktnachrichten.",
         "thread_help": "Wenn der Developer Mode aktiviert ist, klicke mit der rechten Maustaste auf den Thread → <mono>Copy Channel ID</mono>. Verwende die ID des Threads, nicht die des übergeordneten Kanals.",
         "thread_warning": "Der Thread-Modus aktiviert Discords globalen Message Content Intent. Discord liefert Inhalte aus jedem Server-Kanal, den der Bot sehen kann; Kiro Crew verwirft Verkehr außerhalb genehmigter Threads. Alle, die einen genehmigten Thread sehen können, können Agentenantworten und Werkzeugausgaben lesen.",
@@ -11371,7 +11522,9 @@
         "record_prompt": "Tasten drücken…",
         "search": "Suchen",
         "turn_keyboard_shortcuts_on_or_off_globally": "Tastenkürzel global ein- oder ausschalten — {{mod}} + K (diese Übersicht) funktioniert immer",
-        "use_ctrl_not_option_for_chat_1_9": "⌃ Strg (nicht ⌥ Option) für Chat 1–9 verwenden"
+        "use_ctrl_not_option_for_chat_1_9": "⌃ Strg (nicht ⌥ Option) für Chat 1–9 verwenden",
+        "clear_shortcut": "Leeren",
+        "panel_toggles": "Panels umschalten"
       },
       "skillsPanel": {
         "analyze_each_completed_session_and_draft_a_reusa": "Jede abgeschlossene Sitzung analysieren und eine wiederverwendbare SKILL.md entwerfen, wenn die Sitzung ein wiederkehrendes Verfahren zeigt — eines, das eine künftige Sitzung an einem anderen Ziel erneut ausführen würde. Standardmäßig aus. Entwürfe werden in der Warteschlange auf dem Tab „Skills“ zur Überprüfung bereitgestellt — nichts geht ohne Ihre Genehmigung live (siehe unten).",
@@ -11454,7 +11607,7 @@
         "installs_mlx_whisper_via_pipx_ffmpeg_apple_silic": "Installiert mlx-whisper über pipx + ffmpeg. Nur Apple Silicon (arm64).",
         "installs_openai_whisper_ffmpeg_uses_system_pytho": "Installiert openai-whisper + ffmpeg. Nutzt das System-python3 (≥ 3.10).",
         "language": "Sprache",
-        "larger_models_are_more_accurate_but_slower_to_ru": "Größere Modelle sind genauer, laufen aber langsamer",
+        "larger_models_are_more_accurate_but_slower_to_ru": "Größere Modelle sind genauer, laufen aber langsamer. Ein Modell wird bei der ersten Verwendung heruntergeladen; das erste Diktat nach einem Modellwechsel kann daher hängen wirken oder das Zeitlimit überschreiten, bis der Download abgeschlossen ist.",
         "microphone": "Mikrofon",
         "microphone_2": "Mikrofon {{n}}",
         "mlx_model": "MLX-Modell",
@@ -11491,7 +11644,7 @@
         "us_east_1": "us-east-1",
         "whisper_and_mlx_run_locally_transcribe_calls_aws": "Whisper, MLX und Apple Speech laufen lokal; Transcribe ruft AWS auf",
         "whisper_installed_but_ffmpeg_is_missing_voice_tr": "Whisper ist installiert, aber ffmpeg fehlt — die Sprachtranskription benötigt ffmpeg.",
-        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Whisper-Modell, das auf Apple MLX (Metal GPU) läuft. Wird bei der ersten Nutzung heruntergeladen.",
+        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Whisper-Modell, das auf Apple MLX (Metal GPU) läuft. Wird bei der ersten Nutzung heruntergeladen; das erste Diktat kann daher hängen wirken oder das Zeitlimit überschreiten, bis der Download abgeschlossen ist.",
         "ptt_altgr_note": "Auf den meisten Windows- und Linux-Tastaturen ist die rechte Alt-Taste AltGr und hilft beim Tippen von Sonderzeichen — eine einzelne Wahltaste kann hier also nicht der Standard sein.",
         "ptt_heading": "Diktat mit einer Taste starten",
         "ptt_heading_desc": "Drücke eine Taste, um zu sprechen, statt auf das Mikrofonsymbol zu klicken. Rechte Wahltaste ⌥ funktioniert sofort — du kannst hier alles so lassen.",
@@ -11740,6 +11893,70 @@
         "wechat_login_qr_code": "WeChat-Anmelde-QR-Code",
         "who_can_message_the_bot": "Wer dem Bot schreiben darf",
         "wxid": "wxid_…"
+      },
+      "whatsAppPanel": {
+        "status_unavailable": "Status nicht verfügbar",
+        "setup_guide": "Einrichtungsanleitung",
+        "whatsapp": "WhatsApp",
+        "connected": "Verbunden",
+        "not_signed_in": "Nicht gekoppelt",
+        "pair_with_whatsapp": "Mit WhatsApp koppeln",
+        "scan_the_code_from_linked_devices": "Scanne den Code mit WhatsApp auf deinem Telefon: Einstellungen, Verknüpfte Geräte, Gerät verknüpfen.",
+        "signed_in_restart_the_gateway_to_start_receiving": "Gekoppelt. Starte das Gateway neu, um Nachrichten zu empfangen.",
+        "talk_to_your_agent_from_your_own_whatsapp": "Sprich mit deinem Agenten über dein eigenes WhatsApp-Konto, gekoppelt als verknüpftes Gerät. Nachrichten des Agenten kommen von deiner Nummer.",
+        "waiting_for_a_code": "Warte auf einen Code...",
+        "waiting_for_scan": "Warte auf den Scan...",
+        "scanned_confirm_on_your_phone": "Gescannt. Bestätige auf deinem Telefon.",
+        "the_code_expired_try_again": "Der Code ist abgelaufen. Versuche es erneut.",
+        "could_not_start_pairing": "Kopplung konnte nicht gestartet werden.",
+        "could_not_start_the_login_flow": "Der Kopplungsvorgang konnte nicht gestartet werden.",
+        "whatsapp_pairing_qr_code": "WhatsApp-Kopplungs-QR-Code",
+        "enable_the_whatsapp_channel": "WhatsApp-Kanal aktivieren",
+        "who_can_message_the_bot": "Wer dem Agenten schreiben darf",
+        "only_me_the_default": "Nur ich (meine eigenen Nachrichten)",
+        "me_plus_allowed_numbers": "Ich und die erlaubten Nummern",
+        "nobody_ignore_all_messages": "Niemand (alle Nachrichten ignorieren)",
+        "anyone_who_messages_you": "Jeder, der dem Bot schreibt",
+        "allowed_wa_ids": "Erlaubte Nummern",
+        "allowed_numbers_empty_adds_nobody": "Telefonnummern (Ziffern mit Ländervorwahl, ohne Pluszeichen), die ebenfalls mit dem Agenten chatten dürfen. Leer fügt niemanden außer dir hinzu.",
+        "phone_number_placeholder": "447700900000",
+        "created_for_you_when_you_turn_this_on_if_it_does": "Wird beim Aktivieren für dich erstellt, falls es noch nicht existiert.",
+        "group_participation_is_opt_in_per_group": "Die Teilnahme an Gruppen erfolgt pro Gruppe und ist optional: Der Erwähnungsmodus antwortet nur, wenn du getaggt wirst; der Regelmodus kann auch unaufgefordert helfen, mit einer Abklingzeit. Nutzt das inoffizielle WhatsApp-Web-Protokoll; halte die Nutzung im persönlichen Rahmen.",
+        "waiting_to_be_paired": "Warte auf die Kopplung",
+        "the_link_was_revoked": "Die Verknüpfung wurde aufgehoben",
+        "blocked_by_whatsapp": "Von WhatsApp gesperrt",
+        "paired_but_not_connected": "Gekoppelt, aber nicht verbunden",
+        "whatsapp_did_not_connect": "WhatsApp hat sich nicht verbunden: {{error}}",
+        "the_channel_is_enabled_but_not_running": "Der Kanal ist aktiviert, läuft aber nicht. Starte das Gateway neu.",
+        "show_pairing_code": "Kopplungscode anzeigen",
+        "already_paired_unlink_then_restart": "Bereits gekoppelt. Um ein anderes Gerät zu koppeln, hebe unten die Verknüpfung dieses Geräts auf und starte das Gateway neu.",
+        "the_link_was_revoked_restart_to_pair_again": "Die Verknüpfung wurde aufgehoben. Starte das Gateway neu, um erneut ein Gerät zu koppeln.",
+        "blocked_number_cannot_pair": "WhatsApp hat diese Nummer gesperrt, daher kann die Kopplung nicht starten.",
+        "pairing_starts_when_the_channel_starts": "Ein Kopplungscode existiert nur, während der Kanal koppelt, und die Kopplung beginnt beim Start des Kanals. Aktiviere den Kanal unten und starte dann das Gateway neu.",
+        "the_channel_is_not_running_enable_and_restart": "Der WhatsApp-Kanal läuft nicht. Aktiviere ihn unten und starte dann das Gateway neu.",
+        "unlink_this_device": "Verknüpfung dieses Geräts aufheben",
+        "revokes_the_linked_device_on_your_account": "Hebt die Verknüpfung dieses Geräts in deinem WhatsApp-Konto auf und löscht die lokale Sitzung. Der Agent liest und sendet nichts mehr, bis wieder ein Gerät gekoppelt ist.",
+        "confirm_unlink": "Aufheben bestätigen",
+        "unlinked_restart_to_pair_again": "Verknüpfung aufgehoben. Starte das Gateway neu, um wieder ein Gerät zu koppeln.",
+        "unlinked_but_the_session_file_was_kept": "Verknüpfung bei WhatsApp aufgehoben, aber die lokale Sitzungsdatei konnte nicht entfernt werden. Lösche sie im Datenverzeichnis, bevor du erneut koppelst.",
+        "whatsapp_refused_the_unlink_still_linked": "WhatsApp hat das Aufheben abgelehnt, das Gerät ist also weiterhin verknüpft und die lokale Sitzung wurde behalten. Versuche es erneut oder entferne das Gerät auf deinem Telefon unter Verknüpfte Geräte.",
+        "channel_not_running_so_nothing_was_unlinked": "Der Kanal läuft nicht, es wurde also nichts aufgehoben. Ein verknüpftes Gerät bleibt verknüpft: entferne es auf deinem Telefon unter Verknüpfte Geräte.",
+        "could_not_unlink_the_device": "Die Verknüpfung des Geräts konnte nicht aufgehoben werden.",
+        "groups": "Gruppen",
+        "the_agent_ignores_every_group_not_listed": "Der Agent ignoriert jede Gruppe, die hier nicht aufgeführt ist.",
+        "add_a_group": "Gruppe hinzufügen",
+        "your_groups_load_once_the_channel_is_connected": "Deine Gruppen erscheinen hier, sobald der Kanal verbunden ist.",
+        "every_group_you_joined_is_already_listed": "Jede Gruppe, in der du bist, ist bereits aufgeführt.",
+        "how_the_agent_joins_in": "Wie sich der Agent beteiligt",
+        "mode_only_when_mentioned": "Nur bei Erwähnung oder Zitat",
+        "mode_also_when_the_rules_apply": "Auch wenn seine Regeln zutreffen",
+        "mode_off_keeping_the_entry": "Aus, Eintrag bleibt erhalten",
+        "when_the_agent_may_speak": "Wann der Agent sprechen darf",
+        "the_agent_stays_silent_unless_these_apply": "Freier Text. Der Agent bleibt still, solange diese Regeln nicht klar zutreffen.",
+        "rules_example_placeholder": "Fragen zum 3D-Druck beantworten",
+        "seconds_between_unprompted_replies": "Sekunden zwischen unaufgeforderten Antworten",
+        "remove_name_from_the_group_list": "{{name}} aus der Gruppenliste entfernen",
+        "unofficial_protocol_ban_risk": "Unoffizielles Protokoll: WhatsApp kann die verknüpfte Nummer sperren. Verknüpfe keine Nummer, deren Verlust du nicht verkraftest."
       },
       "remoteCrewPanel": {
         "your_crews": "Your crews",
@@ -12189,7 +12406,7 @@
         "label": "Browser"
       },
       "channels": {
-        "description": "Chat-Plattformen, über die der Agent senden und empfangen kann — Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, WeChat",
+        "description": "Chat-Plattformen, über die der Agent senden und empfangen kann",
         "label": "Kanäle"
       },
       "chat": {

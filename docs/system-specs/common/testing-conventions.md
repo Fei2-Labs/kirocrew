@@ -151,6 +151,17 @@ one scope down:
   undoes it, so a test driving that code cannot avoid it.
   `log_redaction.uninstall_log_redaction()` exists for a test that wants to assert on
   the uninstalled state itself.
+* `_restore_autonudge_singleton` puts `autonudge._INSTANCE` back to whatever the test
+  inherited. `AutoNudgeService.start()` publishes itself there and `stop()` clears it, so
+  a test that starts the service — or drives a dashboard handler that does — leaves a live
+  instance holding timer TASKS created on that test's event loop. Every later test in the
+  same worker then reaches those tasks through the singleton on a loop that has since
+  closed, which is how `test_dashboard_chat.py`'s `TestCloseBroadcastDurability` came to
+  answer 500 from a leak in an unrelated file. Restored rather than blamed, for the same
+  reason the CWD restore is: production really does publish this singleton. The teardown
+  retires the leaked instance's timers through `_cancel_timer`, which is the one place
+  that knows a task on a closed loop must be DROPPED rather than cancelled — `Task.cancel`
+  schedules through `loop.call_soon` and raises `RuntimeError: Event loop is closed`.
 
 It registers the xdist worker budget too — the policy is in the repo-root
 `xdist_budget.py`, a plain module rather than a second conftest, because the module
@@ -640,7 +651,7 @@ rest of the list, which is why a single-file run needs no `--override-ini` at al
 | Debugging a specific failure | `pytest --lf` with the override, or `-k "test_name" -n0` |
 | One file | `pytest test/test_foo.py -n0 -q` |
 | Small-RAM laptop | Run a subset. For a full run, let the budget clamp `-n auto` and expect it to be slow; do not raise it. |
-| Checkpoint before committing | `scripts/check_black_formatting.py && isort && flake8 && mypy && python -m pytest` |
+| Checkpoint before committing | `scripts/check_black_formatting.py && scripts/check_subprocess_encoding.py && isort && flake8 && mypy && python -m pytest` |
 
 ## Determinism: the five flake classes
 
@@ -673,6 +684,38 @@ body = os.urandom(20_000)
 # RIGHT: same entropy, same code path, one outcome
 body = random.Random(20260803).randbytes(20_000)
 ```
+
+**Host MEMORY is the other one, and it fails with a misleading exception.**
+`SubagentManager.spawn` refuses — returning before it registers anything in
+`_tasks` — while the machine looks short of memory, and it does so twice: an
+absolute floor (`check_memory_available` against `agent.spawn_min_memory_gb`) and
+the posture tier (`cached_admission_check`, refusing while the cgroup-clamped
+reading is CRITICAL). What makes it expensive to diagnose is that a refusal IS a
+`SubagentInfo` — a done one carrying `error` — so `assert info is not None` still
+passes and the test dies on the NEXT line, at `await mgr._tasks[info.id]`, with a
+bare `KeyError` naming an id nothing else mentions. Measured on a CI runner with
+~0.5 GB free.
+
+Fix: pin the reading with `healthy_host_memory` (`test/conftest.py`), which any
+file driving `spawn` opts into at module scope:
+
+```python
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+```
+
+It pins only the HOST reading — a caller that names its own `path` is feeding the
+`/proc/meminfo` parser a fixture file rather than asking about this machine, so
+those tests still run the real function and a parser regression still goes red. A
+test that is actually ABOUT either guard patches it in its own body, which lands on
+top of the fixture and reverts to it.
+
+Opt-in rather than autouse, because the pin is not free of consequence: the tests
+that drive the probe with no `path` and stub `safe_read_file` underneath it —
+`test_subagent_coverage.py::TestCheckMemoryAvailable` — never reach their own stub
+once the reading is pinned. `test_subagent_spawn_host_pin.py` is what keeps opt-in
+from decaying into "whoever remembered": a module that names `SubagentManager` and
+calls `.spawn(` must be pinned or excluded with a reason, so the next spawning test
+file cannot land unpinned.
 
 ### 2. Wall-clock races
 

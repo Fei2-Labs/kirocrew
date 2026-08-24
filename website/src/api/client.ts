@@ -13,6 +13,7 @@ import type {
   SessionInventoryList,
   SessionLaneKey,
   SessionStorageCleanup,
+  SessionStorageEmptyJob,
   SessionStorageReport,
   SessionTrashResult,
   UpdateCheckResult,
@@ -358,7 +359,15 @@ export interface DiscordConfigData {
   enabled: boolean
   allowed_user_ids: string[]
   allowed_thread_ids: string[]
+  /** Shared server channels an approved user may start a turn in. */
+  allowed_channel_ids: string[]
+  /** Promote an allowed-channel message into a fresh public thread. Default on. */
+  auto_thread: boolean
   soft_threshold_pct: number
+  /** Phase-reaction ladder on the user's own message. Default on. */
+  reactions_enabled: boolean
+  /** Surface the model's reasoning as a Discord subtext note. Default off. */
+  show_thinking: boolean
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -388,7 +397,11 @@ export interface DiscordConfigSave {
   enabled: boolean
   allowed_user_ids: string[]
   allowed_thread_ids: string[]
+  allowed_channel_ids: string[]
+  auto_thread: boolean
   soft_threshold_pct: number
+  reactions_enabled: boolean
+  show_thinking: boolean
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -566,6 +579,55 @@ export interface WeixinConfigSave {
   dm_policy: string
   allowed_user_ids: string[]
   disconnect: boolean
+  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
+  session_folder?: string
+}
+
+/** One opted-in WhatsApp group, as stored in config and edited in the panel. */
+export interface WhatsAppGroup {
+  /** The group JID (e.g. 1203...@g.us). */
+  jid: string
+  /** Human label shown in the editor (from get_joined_groups or typed in). */
+  name: string
+  /** How the agent participates: only when @-mentioned, when its rules say it
+   *  can help, or off (opted out while kept in the list). */
+  mode: 'mention' | 'rules' | 'off'
+  /** Free-text rules injected when mode='rules' — when the agent may speak. */
+  rules: string
+  /** Minimum seconds between agent replies in this group (anti-flood). */
+  cooldown_s: number
+}
+
+/** WhatsApp (personal account, QR-paired via neonize) config from
+ *  GET /api/whatsapp/config. There is no credential field: pairing is done by
+ *  QR scan and the session lives server-side in the neonize SQLite store, so
+ *  the client only ever sees connection status + policy. */
+export interface WhatsAppConfigData {
+  configured: boolean
+  connected: boolean
+  connect_error: string
+  read_only: boolean
+  enabled: boolean
+  /** Who may DM the agent: only the linked number (self), an allow-list, anyone
+   *  (open), or nobody (disabled). */
+  dm_policy: 'self' | 'allowlist' | 'open' | 'disabled'
+  /** Allowed WhatsApp numbers (digits only, no @-suffix) when dm_policy is
+   *  'allowlist'. Empty = deny all (fail closed). */
+  allowed_wa_ids: string[]
+  groups: WhatsAppGroup[]
+  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
+  session_folder?: string
+  /** Pairing/connection lifecycle: unpaired → pairing → connected, or a terminal
+   *  logged_out / banned / error. Drives the status badge. */
+  state: 'unpaired' | 'pairing' | 'connected' | 'logged_out' | 'banned' | 'error'
+}
+
+/** Writable WhatsApp config fields sent to PUT /api/whatsapp/config. */
+export interface WhatsAppConfigSave {
+  enabled: boolean
+  dm_policy: 'self' | 'allowlist' | 'open' | 'disabled'
+  allowed_wa_ids: string[]
+  groups: WhatsAppGroup[]
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -1164,7 +1226,8 @@ function trackArtifactWrite(url: string, res: Promise<Response>): Promise<Respon
 const projectHeader = (projectKey?: string): HeadersInit | undefined =>
   projectKey ? { 'X-Steering-Project': projectKey } : undefined
 
-const get = (url: string) => fetch(url, { headers: { ..._sk } })
+const get = (url: string, sessionKey?: string) =>
+  fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) } })
 const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'POST',
@@ -1640,8 +1703,12 @@ export const api = {
   sessionStorageRestore: (batchId: string, uids?: string[]) =>
     post('/api/system/session-storage/restore', uids ? { batch_id: batchId, uids } : { batch_id: batchId })
       .then(j) as Promise<{ restored: number }>,
+  /** Starts an empty and returns the job; the delete outlives this request. */
   sessionStorageEmpty: (batchIds: string[]) =>
-    post('/api/system/session-storage/empty', { batch_ids: batchIds }).then(j) as Promise<{ freed_bytes: number }>,
+    post('/api/system/session-storage/empty', { batch_ids: batchIds }).then(j) as Promise<SessionStorageEmptyJob>,
+  /** The running or last-finished empty. Cheap — no store is walked, so it polls. */
+  sessionStorageEmptyStatus: () =>
+    get('/api/system/session-storage/empty').then(j) as Promise<{ job: SessionStorageEmptyJob | null }>,
   /** Session inventory — the flat list contract (§1). */
   sessionInventory: () =>
     get('/api/system/session-storage/sessions').then(j) as Promise<SessionInventoryList>,
@@ -2037,7 +2104,26 @@ export const api = {
   prompts: () => fetch('/api/prompts').then(j),
   promptDetail: (name: string) => fetch('/api/prompts/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
   // Skills
-  skills: () => fetch('/api/skills').then(j),
+  // sessionKey names the REAL chat slot so the server can resolve THIS chat's
+  // project and include its `<project>/.kiro/skills`. Without it the shared
+  // `dashboard:ui` placeholder makes the server fall back to "the one project
+  // every slot shares", so workspace skills leak between chats on different
+  // projects and vanish entirely when two chats disagree (#2457, #3551).
+  skills: (sessionKey?: string) => get('/api/skills', sessionKey).then(j),
+  /** Project-skills trust: this chat's grant state plus every stored grant. */
+  skillTrust: (sessionKey?: string) => get('/api/skills/-/trust', sessionKey).then(j),
+  /** Grant trust to THIS chat's project. The server takes the directory from
+   *  the slot, not from us — a caller-supplied path would let any caller
+   *  consent for a directory the operator never opened. */
+  // expectedKey is the canonical identity returned by the consent snapshot. It
+  // is a confirmation, not a selector: the server still derives the directory
+  // from the requesting slot and refuses when the current key differs.
+  grantSkillTrust: (sessionKey: string | undefined, expectedKey: string) =>
+    post('/api/skills/-/trust', { expected_key: expectedKey }, sessionKey).then(j),
+  /** Revoke a grant. `path` is optional — omitted revokes this chat's project. */
+  revokeSkillTrust: (path?: string, sessionKey?: string) =>
+    del('/api/skills/-/trust' + (path ? '?path=' + encodeURIComponent(path) : ''),
+        undefined, sessionKey).then(j),
   skill: (name: string) => fetch('/api/skills/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
   /** List the file tree under a skill's directory.  The ``/-/`` separator
    *  disambiguates from a nested skill whose last segment is ``tree``. */
@@ -2855,6 +2941,17 @@ export const api = {
   updateArtifactSharing: (slug: string, body: { visibility: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[] }) =>
     patch(`/api/artifacts/${encodeURIComponent(slug)}/sharing`, body).then(j),
   unpublishArtifact: (slug: string) => del(`/api/artifacts/${encodeURIComponent(slug)}/publish`).then(j),
+  /** Stash model-authored HTML and get back a URL a sandboxed iframe can load.
+   *
+   *  Artifact and widget frames cannot use a `blob:` URL: some WebKit-based
+   *  in-app browsers refuse the load outright and can take the page down with
+   *  it, and a sandboxed `srcdoc` frame blank-renders on WebKit. The returned
+   *  URL carries a short-lived client-bound token and the response pins
+   *  `Content-Security-Policy: sandbox`, so the document keeps an opaque origin
+   *  even opened top-level. See dashboard/handlers/sandbox_doc.py.
+   */
+  sandboxDocUrl: (html: string) =>
+    post('/api/sandbox-doc', { html }).then(j) as Promise<{ url: string }>,
   refreshArtifactSharing: (slug: string) => post(`/api/artifacts/${encodeURIComponent(slug)}/publish/refresh`, {}).then(j),
   pullLatest: (slug: string) =>
     post(`/api/artifacts/${encodeURIComponent(slug)}/pull-latest`, {}).then(j),
@@ -2926,6 +3023,25 @@ export const api = {
   saveWeixinConfig: (body: Partial<WeixinConfigSave>) => put('/api/weixin/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean }>,
   weixinQrStart: () => post('/api/channels/weixin/qr/start', {}).then(j) as Promise<{ session_id: string; qrcode_img_content: string; error?: string }>,
   weixinQrStatus: (sessionId: string) => get(`/api/channels/weixin/qr/status?session_id=${encodeURIComponent(sessionId)}`).then(j) as Promise<{ status: string; connected?: boolean; account_id?: string; error?: string }>,
+
+  // WhatsApp (personal account, QR-paired via neonize) — QR pairing flow. The
+  // session lives server-side in the neonize SQLite store; the client only ever
+  // sees connection status + policy, never a credential.
+  getWhatsAppConfig: () => get('/api/whatsapp/config').then(j) as Promise<WhatsAppConfigData>,
+  saveWhatsAppConfig: (body: Partial<WhatsAppConfigSave>) => put('/api/whatsapp/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean }>,
+  // `state` is the live client's pairing state, and it is the only authority on
+  // whether a rotating code exists: the endpoint REPORTS pairing rather than
+  // starting it (pairing begins inside the channel's own connect()), so a caller
+  // that ignores this field renders a wait for a code that will never arrive.
+  whatsAppQrStart: () => post('/api/channels/whatsapp/qr/start', {}).then(j) as Promise<{ ok: boolean; state?: string; error?: string }>,
+  whatsAppQrStatus: () => get('/api/channels/whatsapp/qr/status').then(j) as Promise<{ state: string; qr_data_url: string | null; detail: string }>,
+  // Two distinguishable successes: a bare `ok` means the device is unlinked and
+  // the local session is gone, while `code: 'session_file_kept'` means the device
+  // IS unlinked but the store holding its keys survived. A refused logout is an
+  // ApiError(502) carrying `code: 'logout_failed'`, the device is still linked
+  // there, and the session is kept deliberately so a retry is possible.
+  whatsAppUnlink: () => post('/api/channels/whatsapp/unlink', {}).then(j) as Promise<{ ok: boolean; warning?: string; code?: string }>,
+  getWhatsAppGroups: () => get('/api/whatsapp/groups').then(j) as Promise<{ groups: { jid: string; name: string }[] }>,
 
   // Auto-research
   researchValidate: (body: object) => post("/api/apps/auto-research/validate", body).then(j),

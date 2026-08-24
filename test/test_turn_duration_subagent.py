@@ -33,6 +33,10 @@ from kiro_crew.acp.types import TurnUsage
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.subagent import SubagentManager
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 # Implausibly large: no unit-test turn runs ~16 minutes, so a row carrying this
 # value can only have come from the provider, never from the local wall clock.
 _PROVIDER_DURATION_MS = 987654

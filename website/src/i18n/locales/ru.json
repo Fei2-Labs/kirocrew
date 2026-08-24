@@ -2007,6 +2007,17 @@
           "connect_repo": "Подключить репозиторий",
           "general": "Общие",
           "repository_settings": "Настройки репозитория"
+        },
+        "depsSection": {
+          "title": "Зависимости",
+          "blocked_by": "Заблокировано",
+          "blocking": "Блокирует",
+          "state_open": "open",
+          "state_closed": "closed",
+          "state_merged": "merged",
+          "source_native": "native",
+          "source_inferred": "inferred",
+          "open_here": "Открыть {{sigil}}{{number}} здесь"
         }
       },
       "connectPanel": {
@@ -2277,7 +2288,8 @@
         },
         "registry": {
           "overview": "Обзор",
-          "tagging": "Расстановка меток"
+          "tagging": "Расстановка меток",
+          "graph": "Граф"
         },
         "settings": {
           "generalSettings": {
@@ -2437,6 +2449,45 @@
           "untagged_issues": "Задачи без меток",
           "what_you_see_below_is_the_previous_result_not_th": "то, что вы видите ниже — предыдущий результат, а не текущее состояние.",
           "write_every_staged_label_to": "Записать все подготовленные метки в {{provider}}"
+        },
+        "graphView": {
+          "header": "ЗАВИСИМОСТИ",
+          "views_label": "Виды зависимостей",
+          "tab_frontier": "ФРОНТ",
+          "tab_focus": "ДЕРЕВО ФОКУСА",
+          "jump_label": "Перейти к элементу",
+          "jump_placeholder": "перейти к элементу #…",
+          "loading": "Загрузка зависимостей…",
+          "refresh": "Обновить данные о зависимостях",
+          "ready_count": "Разблокировано {{n}}",
+          "frontier_heading": "ФРОНТ",
+          "frontier_sub": "Разблокировано {{ready}} · ещё ждут {{waiting}}",
+          "no_frontier": "Нет открытых элементов с учтёнными зависимостями.",
+          "waiting_heading": "В ОЖИДАНИИ ({{n}})",
+          "more_waiting": "… ещё +{{n}}",
+          "why_all_satisfied": "Все блокеры выполнены: {{refs}}",
+          "why_waiting": "Ожидает {{refs}}",
+          "why_satisfied": "Уже выполнены: {{refs}}",
+          "open_tree": "открыть дерево →",
+          "frontier_caption": "У разблокированных элементов все учтённые блокеры закрыты или смерджены. Откройте элемент, чтобы увидеть причину, или откройте его дерево.",
+          "focus_caption": "Всё активное дерево зависимостей выбранного элемента. Клик по узлу делает его корнем, Enter открывает. Пунктир — выведено, зачёркнуто — выполнено.",
+          "focus_empty": "Выберите элемент, чтобы построить его дерево зависимостей.",
+          "tree_stat": "дерево {{kind}}-{{number}}: {{nodes}} узлов · {{edges}} активных рёбер",
+          "ghost_satisfied": "выполнено",
+          "ci_fail": "СБОЙ CI",
+          "led_wait": "WAIT",
+          "led_ready": "RDY",
+          "led_run": "RUN",
+          "led_done": "DONE",
+          "led_open": "OPEN",
+          "aria_tree": "Дерево зависимостей {{kind}}-{{number}}: {{nodes}} узлов, {{edges}} активных рёбер",
+          "aria_node": "{{kind}}-{{number}}, {{state}}: {{title}}",
+          "empty_board": "ПУСТАЯ ПЛАТА",
+          "empty_title": "Зависимостей пока нет",
+          "empty_blurb": "В этом репозитории нет рёбер зависимостей. Задайте нативную зависимость через gh issue edit --add-blocked-by, либо Issue Radar выведет их из перекрёстных ссылок при следующей синхронизации.",
+          "empty_unavailable_title": "Данные о зависимостях недоступны",
+          "empty_unavailable_blurb": "Не удалось загрузить граф. Возможно, маршрут deps ещё не включён для этого репозитория. Повторите позже.",
+          "retry": "ПОВТОРИТЬ"
         }
       },
       "welcomeCarousel": {
@@ -3941,7 +3992,9 @@
         "co_author": "Соавтор",
         "co_author_conflict": "Соавтор изменил этот файл",
         "co_author_conflict_discard": "Отменить мои правки и перезагрузить",
+        "co_author_conflict_discard_button": "Отменить правки",
         "co_author_conflict_discard_confirm": "Отменить несохранённые правки в «{{file}}» и загрузить версию соавтора? Это действие нельзя отменить.",
+        "co_author_conflict_discard_title": "Отменить несохранённые правки?",
         "commit_and_push": "Зафиксировать и отправить",
         "commit_message_prompt": "Опишите этот коммит. В него войдут все изменения статьи.",
         "compile": "Скомпилировать",
@@ -4274,6 +4327,10 @@
           "advance_to_design": "Согласовать → Дизайн",
           "advance_to_tasks": "Согласовать → Задачи",
           "an_agent_will_work_through_the_task_list": "Агент пройдёт по списку задач",
+          "approved": "Согласовано",
+          "approved_by_user": "Согласовал {{user}}",
+          "archive_this_spec": "Архивировать эту спеку",
+          "changed_since_approval": "Изменено после согласования",
           "clear": "Очистить",
           "close_esc": "Закрыть (Esc)",
           "close_review_view": "Закрыть режим просмотра",
@@ -4281,8 +4338,10 @@
           "drafting_design": "Составление дизайна…",
           "drafting_tasks": "Составление задач…",
           "drag_or_use_to_resize": "Потяните или используйте ← →, чтобы изменить размер",
+          "duplicate_this_spec": "Дублировать эту спеку",
           "expand_document_for_review": "Развернуть документ для проверки",
           "expand_for_review_esc_to_close": "Развернуть для проверки (Esc закрывает)",
+          "name_for_the_copy": "Название копии",
           "pause": "Пауза",
           "pausing": "Приостановка…",
           "pending_comment_few": "{{count}} неотправленных комментария",
@@ -4290,17 +4349,21 @@
           "pending_comment_one": "{{count}} неотправленный комментарий",
           "pending_comment_other": "{{count}} неотправленных комментария",
           "remove_comment_on": "Удалить комментарий к {{document}}",
+          "rename_this_spec_label_the_folder_name_stays": "Измените подпись этой спеки. Имя папки и ветки останутся теми же.",
           "resize_document_panel": "Изменить размер панели документа",
+          "restore_this_spec": "Восстановить эту спеку",
           "review_document": "Проверить {{document}}",
           "send_all_to_agent": "Отправить всё агенту",
           "sending": "Отправка…",
+          "spec_label": "Подпись спеки",
           "start_building": "Начать сборку",
           "starting": "Запуск…",
           "tab_design": "Дизайн",
           "tab_requirements": "Требования",
           "tab_tasks": "Задачи",
-          "tells_the_agent_this_phase_is_approved_and_to_mo": "Сообщает агенту, что этот этап согласован и можно двигаться дальше — то же, что написать это в чате",
+          "tells_the_agent_this_phase_is_approved_and_to_mo": "Записывает ваше согласование этой версии, а затем говорит агенту двигаться дальше",
           "the_agent_is_writing_the_next_document": "Одобрено — агент пишет следующий документ",
+          "this_document_changed_after_it_was_approved": "Этот документ изменился после согласования",
           "working": "работает…"
         },
         "specRail": {
@@ -4333,6 +4396,17 @@
           "tool_calls": "Вызовы инструментов",
           "turns": "Циклы",
           "worktree": "Рабочее дерево"
+        },
+        "taskList": {
+          "done": "Готово",
+          "done_of_total": "Готово {{done}} из {{total}} задач",
+          "no_tasks_yet": "Задач пока нет. После согласования дизайна здесь появится упорядоченный список задач, и вы сможете запускать их по одной.",
+          "pause_the_build_first": "Поставьте сборку на паузу, прежде чем запускать отдельную задачу",
+          "run": "Запустить",
+          "run_only_this_task_and_stop": "Запустить только эту задачу и остановиться",
+          "run_task": "Запустить задачу: {{task}}",
+          "starting": "Запуск…",
+          "task_progress": "Прогресс по задачам"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "Опишите, что вы хотите создать, ответьте на несколько вопросов и получите проверенный план — требования, дизайн и задачи — который сможет выполнить агент.",
@@ -4663,8 +4737,11 @@
       "this_app_provides_agents_and_skills_but_no_visua": "Это приложение предоставляет агентов и навыки, но не имеет визуального интерфейса.\n            Используйте его агентов из чата."
     },
     "approvalCard": {
+      "approval_no_longer_pending": "Срок этого запроса на одобрение истёк, или решение уже принято — агент больше его не ждёт.",
       "approve": "Разрешить",
       "approved": "Разрешено",
+      "decision_failed": "Возможно, это решение не было записано — запрос не выполнен.",
+      "decision_not_recorded_error": "Это решение не было записано: {{error}}",
       "reject": "Отклонить",
       "rejected": "Отклонено",
       "running": "Выполняется:",
@@ -4832,8 +4909,10 @@
     },
     "artifactBody": {
       "artifact": "Артефакт: {{slug}}",
+      "could_not_render": "Не удалось отобразить этот артефакт",
       "image_could_not_be_loaded": "Не удалось загрузить изображение",
-      "rendering": "Отрисовка…"
+      "rendering": "Отрисовка…",
+      "retry": "Повторить"
     },
     "artifactChatPanel": {
       "agent_chat": "Чат с агентом",
@@ -5746,6 +5825,7 @@
       "collapse_unchanged": "Свернуть неизменённые",
       "copy_content": "Копировать содержимое",
       "copy_path": "Копировать путь",
+      "discard_changes_button": "Отбросить изменения",
       "discard_unsaved_changes": "Отбросить несохранённые изменения?",
       "download": "Скачать",
       "download_failed": "Не удалось скачать",
@@ -6472,7 +6552,9 @@
       "search_everywhere": "Искать везде",
       "show_or_focus_the_kiro_crew_window": "Показать окно {{productName}} или переключиться на него",
       "use_ctrl_not_option_for_chat_1_9": "Используйте ⌃ Ctrl (не ⌥ Option) для чатов 1–9",
-      "use_ctrl_not_option_for_chat_1_to_9": "Используйте Ctrl (не Option) для чатов с 1 по 9"
+      "use_ctrl_not_option_for_chat_1_to_9": "Используйте Ctrl (не Option) для чатов с 1 по 9",
+      "panel_toggles": "Переключение панелей",
+      "unset": "Не задано"
     },
     "sidePanelLayout": {
       "update_available": "доступно обновление"
@@ -6541,11 +6623,32 @@
       "triggers": "Триггеры",
       "what_this_skill_does_and_when_the_agent_should_u": "Что делает этот навык и когда агент должен его использовать"
     },
+    "projectSkillsTrust": {
+      "body": "${{skill}} взят из собственной папки .kiro/skills этого проекта.",
+      "confirm": "Доверять этой папке",
+      "consequence": "Если доверять этой папке, её файлы навыков попадут в контекст этого чата, где смогут указывать агенту выполнять команды. Доверяй только проекту, который узнаёшь.",
+      "decline": "Не сейчас",
+      "decline_consequence": "Если откажешься, ничего не загрузится, а твоё сообщение останется таким, каким ты его набрал.",
+      "grant_failed": "Не удалось сохранить доверие для этой папки.",
+      "title": "Доверять навыкам этого проекта?",
+      "withdraw_hint": "Отозвать это можно позже на странице настроек «Навыки».",
+      "working": "Установка доверия…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "Эта папка больше не существует.",
+      "hint": "Эти папки проектов могут загружать свои скиллы в чат. Отзови папку, чтобы её скиллы больше не загружались.",
+      "revoke": "Отозвать",
+      "revoke_failed": "Не удалось отозвать доверие для этой папки.",
+      "revoking": "Отзываем…",
+      "title": "Доверенные папки проектов"
+    },
     "skillPickerMenu": {
       "loading_skills": "Загрузка навыков…",
       "no_matching_skills": "Нет подходящих навыков",
       "no_matching_skills_ctrl_enter_sends": "Нет подходящих навыков — Ctrl+Enter отправит сообщение",
-      "no_matching_skills_enter_sends": "Нет подходящих навыков — Enter отправит сообщение"
+      "no_matching_skills_enter_sends": "Нет подходящих навыков — Enter отправит сообщение",
+      "trust_needed_badge": "Нужно доверие",
+      "trust_needed_hint": "Из этого проекта. Выбери его, чтобы просмотреть и доверять папке."
     },
     "slashCommandMenu": {
       "desc_agent": "Переключить активного агента или управлять им",
@@ -6567,6 +6670,7 @@
       "desc_model": "Показать или сменить текущую модель",
       "desc_onboarding": "Повторить импорт настроек и вводный тур",
       "desc_paste": "Вставить изображение из буфера обмена",
+      "desc_plain": "Текущее положение дел или указанная тема",
       "desc_prompts": "Показать или вызвать сохранённые промпты и регламенты агента",
       "desc_quit": "Завершить сессию чата",
       "desc_reply": "Ответить на последнее сообщение ассистента",
@@ -6700,6 +6804,7 @@
       "trust": "Доверять",
       "trust_all_base": "Доверять всем командам <mono>{{base}}</mono>",
       "trust_all_tools": "Доверять всем инструментам",
+      "trust_all_tools_channel": "Доверять всем инструментам в этом канале — сохраняется после перезапуска",
       "trust_this_command": "Доверять «<mono>{{cmd}}</mono>»"
     },
     "tunnelStatus": {
@@ -6883,12 +6988,14 @@
     },
     "widgetFrame": {
       "cannot_star_widget_has_no_slug_or_message_contex": "Нельзя добавить в избранное: у виджета нет slug или контекста сообщения",
+      "could_not_render": "Не удалось отобразить этот виджет",
       "download_as_html": "Скачать как HTML",
       "expand": "Развернуть",
       "minimize": "Свернуть",
       "open_in_new_tab": "Открыть в новой вкладке",
       "remove_artifact_from_library": "Удалить артефакт {{name}} из библиотеки",
       "rendering": "Отрисовка…",
+      "retry": "Повторить",
       "save_failed": "не удалось сохранить",
       "star_as_artifact": "В избранное как артефакт",
       "starred_as_click_to_remove": "В избранном как «{{name}}» — нажми, чтобы убрать"
@@ -7004,6 +7111,9 @@
       "confirm_button": "Подтвердить и включить",
       "withdraw": "Отозвать подтверждение"
     },
+    "confirmDialog": {
+      "cancel": "Отмена"
+    },
     "crewWebhookSection": {
       "could_not_load_webhooks": "Не удалось загрузить webhooks, поэтому сейчас неизвестно, что будит эту команду.",
       "inbound_webhooks_are_switched_off": "Входящие webhooks выключены: ни один вызов не пройдёт, включая привязанные токены.",
@@ -7070,7 +7180,10 @@
       "switch_to_remote_crew": "Переключиться на удалённую команду {{n}}",
       "walk_back_mru_history": "Назад по истории MRU",
       "stop_speaking": "Остановить речь",
-      "toggle_focus_mode": "Переключить режим фокусировки"
+      "toggle_focus_mode": "Переключить режим фокусировки",
+      "toggle_left_sidebar": "Показать или скрыть левую боковую панель",
+      "toggle_session_panel": "Показать или скрыть панель сессий",
+      "toggle_side_panel": "Показать или скрыть боковую панель"
     },
     "usePanelTabs": {
       "artifacts": "Артефакты",
@@ -7612,7 +7725,13 @@
       "public_by_link_warning": "Опубликованные URL общедоступны по ссылке: любой, у кого есть ссылка, может просмотреть контент — он доступен в общедоступном интернете без аутентификации.",
       "random_domain_note": "Контент доступен на случайном домене *.cloudfront.net — не публикуйте то, что не разместили бы в открытом интернете.",
       "cloud_deployment_disabled": "Cloud deployment is disabled",
-      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake."
+      "cloud_deployment_disabled_detail": "This installation does not permit provisioning infrastructure in a cloud account, so artifact deployment is unavailable. Contact your administrator if you believe this is a mistake.",
+      "recall_title": "Отозвать сайт?",
+      "recall_button": "Отозвать сайт",
+      "destroy_title": "Уничтожить сайт?",
+      "destroy_button": "Уничтожить сайт",
+      "remove_profile_title": "Удалить профиль?",
+      "remove_profile_button": "Удалить профиль"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· в удалённой копии доступна более новая версия",
@@ -7644,6 +7763,7 @@
       "copy_failed": "Не удалось скопировать",
       "could_not_overwrite": "Не удалось перезаписать.",
       "created": "Создано",
+      "discard_changes_button": "Отбросить изменения",
       "discard_unsaved_changes": "Отменить несохранённые изменения?",
       "document_type": "Тип документа",
       "download": "Скачать",
@@ -7984,9 +8104,6 @@
         "stopped": "Остановлено",
         "subagent": "Субагент {{label}}",
         "subagents": "Субагенты",
-        "trusted": "Доверено",
-        "trusted_base": "Доверенная базовая команда",
-        "trusted_command": "Доверенная команда",
         "waiting_for_output": "Ожидание вывода…",
         "waiting_to_start_queued_behind_the_concurrency_l": "ожидает запуска — в очереди из-за лимита одновременных запусков",
         "workflows": "Рабочие процессы",
@@ -8151,6 +8268,9 @@
         "recovered_continuing": "продолжение отправлено автоматически",
         "resuming_the_interrupted_turn": "продолжаем прерванный ход",
         "safety_policy_continuing": "политика безопасности заблокировала вызов · продолжение отправлено автоматически",
+        "safety_policy_told_in_turn": "политика безопасности заблокировала вызов · агенту сообщена причина в этом же ходе",
+        "invalid_name_told_in_turn": "имя инструмента не прошло проверку · агенту сообщена причина в этом же ходе",
+        "hook_fault_told_in_turn": "хук завершился ошибкой до вызова · агенту сообщена причина в этом же ходе",
         "session_busy_continuing": "сеанс занят · продолжение отправлено автоматически",
         "subagents_finished": "Подагенты завершены",
         "system_notice": "Системное уведомление",
@@ -8297,7 +8417,8 @@
         "expand_model_reasoning": "Развернуть рассуждения модели",
         "hide_reasoning": "Скрыть рассуждения",
         "show_reasoning": "Показать рассуждения",
-        "thinking": "Размышление"
+        "thinking": "Размышление",
+        "thought_process": "Ход размышлений"
       },
       "toolCallLine": {
         "aria_hide_diff": "Скрыть diff",
@@ -9629,11 +9750,14 @@
       "stub_failed": "Не удалось применить изменение. Возможно, оно уже сохранено, но не действует — переключатели ниже теперь показывают сохранённое состояние.",
       "stub_not_live": "Сохранено, но пока не действует — шлюз не удалось запустить. Переключатель показывает сохранённое состояние, а не работающее.",
       "stub_restart_required": "Сохранено. Чтобы изменение вступило в силу, перезапустите шлюз. Уже запущенные сессии продолжают использовать серверы, с которыми они начались.",
-      "stubbed_of_total": "{{stubbed}} из {{total}} с заглушкой",
+      "stubbed_of_total": "выбрано для заглушки: {{stubbed}} из {{total}}",
       "unsupported_platform": "Общие бэкенды требуют Unix-сокетов, поэтому на этой платформе недоступны.",
       "view_assessment": "Оценка совместного использования",
       "view_servers": "Серверы",
-      "views_aria": "Представления управления MCP"
+      "views_aria": "Представления управления MCP",
+      "state_direct_env": "напрямую (env)",
+      "state_direct_env_reason": "Заглушки нет, но ваш выбор сохранён.",
+      "state_direct_env_legend": "напрямую (env) — сервер объявляет ключ окружения, который общий бекенд не передаст, поэтому {{productName}} вообще не создаёт заглушку: сеанс запускает его сам, без общего бекенда и без собственного интерфейса сервера."
     },
     "migrationPage": {
       "app_migration": "Миграция приложения",
@@ -10609,8 +10733,21 @@
       "detail_last_used": "Последнее использование",
       "detail_size": "Размер",
       "detail_turns": "Ходы",
+      "emptied": "Освобождено {{size}}.",
+      "empty_failed": "Остановлено после освобождения {{freed}}.",
+      "empty_kept": "Освобождено {{freed}}, но удалить удалось не всё.",
+      "empty_not_started": "Не удалось начать очистку корзины. Попробуйте снова.",
+      "emptying": "Очистка корзины",
+      "emptying_leave_ok": "Операция продолжится, если вы покинете эту страницу.",
+      "emptying_progress": "Освобождено {{freed}} из {{total}}",
       "heading": "Хранилище сессий",
       "in_use": "используется",
+      "kept_incomplete": "Одну партию не удалось удалить с диска, поэтому она всё ещё в списке.",
+      "kept_next_step": "Восстановите из этой партии то, что можно; в журнале шлюза указан файл, который помешал удалению.",
+      "kept_outside_root": "Одна партия больше не находится внутри корзины, поэтому оставлена нетронутой.",
+      "kept_unknown": "Одна партия сохранена по причине, неизвестной этой версии.",
+      "kept_unlisted_files": "Одна партия содержит файл, не указанный в её манифесте; удаление может уничтожить единственную копию сеанса.",
+      "kept_unreadable": "Одну партию не удалось прочитать полностью, поэтому она оставлена нетронутой.",
       "move_to_trash_bulk": "Переместить в корзину",
       "move_to_trash_single": "Переместить в корзину",
       "next_page": "Далее",
@@ -10644,7 +10781,9 @@
       "trash_empty": "пусто",
       "trash_note": "Всё ещё занимает место на диске до очистки. Ничего здесь не удаляется автоматически.",
       "trash_summary": "{{sessions}} сессий · {{size}}",
-      "unknown_session": "сессия вне списка"
+      "unknown_session": "сессия вне списка",
+      "busy_emptying": "Корзина очищается. Некоторые действия приостановлены до завершения.",
+      "empty_failed_next_step": "Повторите «Удалить навсегда». Подробности в журнале шлюза."
     },
     "sessionsTab": {
       "agent": "Агент",
@@ -10830,7 +10969,8 @@
         "file_sessions_in_folder": "Складывать сессии в папку",
         "file_sessions_in_folder_desc": "Новые сессии из {{channel}} попадают в папку на боковой панели, а не остаются без папки.",
         "session_folder_name": "Название папки",
-        "session_folder_name_desc": "Создаётся при сохранении этих настроек, если её ещё нет."
+        "session_folder_name_desc": "Создаётся при сохранении этих настроек, если её ещё нет.",
+        "shared_channels": "Общие каналы"
       },
       "browserPanel": {
         "use_builtin_label": "Использовать встроенный браузер",
@@ -11118,12 +11258,23 @@
         "start_a_gateway_on_this_machine_turn_it_off_to_u": "Запускает шлюз на этом компьютере. Отключите, чтобы использовать Kiro Crew только как клиент: подключение пойдёт к настроенному шлюзу, а не к локальному. Изменение вступит в силу при следующем запуске приложения."
       },
       "discordPanel": {
+        "allowed_server_channel_ids": "Разрешённые ID каналов сервера",
         "allowed_server_thread_ids": "Разрешённые ID веток сервера",
-        "allowlist_description": "ID пользователей Discord, которым разрешено запускать агента в личных сообщениях или в одобренных ветках. Пусто = запретить всем (запрет по умолчанию).",
-        "description": "Общайся с агентом из личных сообщений Discord или из явно одобренных веток сервера через WebSocket шлюза. Обычные каналы сервера всегда игнорируются.",
+        "allowlist_description": "ID пользователей Discord, которым разрешено запускать агента в личных сообщениях, одобренных ветках или разрешённых каналах. Пусто = запретить всем (запрет по умолчанию).",
+        "auto_thread_description": "Сообщение в разрешённом канале открывает новую публичную ветку, и ход выполняется там, а не в общем канале.",
+        "auto_thread_label": "Отвечать в новой ветке",
+        "auto_thread_off_hint": "Автоветка отключена, поэтому сообщения в каналах выше игнорируются. {{productName}} никогда не отвечает в общем канале напрямую.",
+        "channel_allowlist_description": "Необязательно. Одобренные пользователи могут запускать агента и из этих общих каналов сервера. Пусто = общих каналов нет.",
+        "channel_help": "Когда включён Developer Mode, щёлкни по каналу правой кнопкой → <mono>Copy Channel ID</mono>. Используй ID самого канала, а не ID ветки внутри него.",
+        "channel_warning": "Общий канал задаёт более широкую границу раскрытия, чем ветка: все, кто видит канал, и все, кто может открыть публичную ветку, где идёт ход, прочитают и то, что пишет агент, и то, что выводят его инструменты. Добавляй канал только если это можно показать всем его участникам.",
+        "description": "Общайся с агентом из личных сообщений Discord, одобренных веток сервера или разрешённых каналов сервера через WebSocket шлюза. Все остальные каналы сервера игнорируются.",
         "empty_allowlist_hint": "Разрешённых ID нет: бот отклоняет любое сообщение (запрет по умолчанию). Добавь свой ID пользователя Discord ниже.",
-        "guide_body": "Создай приложение в Discord Developer Portal, затем скопируй токен со страницы <mono>Bot</mono>. Если нужны только личные сообщения, привилегированные intents можно не включать. Для веток сервера включи <mono>Message Content Intent</mono> и установи приложение со скоупом <mono>bot</mono> и разрешениями View Channel, Read Message History и Send Messages in Threads. Включи Discord Developer Mode, затем щёлкни правой кнопкой по своему имени и скопируй числовой ID пользователя.",
+        "guide_body": "Создай приложение в Discord Developer Portal, затем скопируй токен со страницы <mono>Bot</mono>. Если нужны только личные сообщения, привилегированные intents можно не включать. Для веток сервера включи <mono>Message Content Intent</mono> и установи приложение со скоупами <mono>bot</mono> и <mono>applications.commands</mono> и разрешениями View Channel, Read Message History и Send Messages in Threads. Включи Discord Developer Mode, затем щёлкни правой кнопкой по своему имени и скопируй числовой ID пользователя.",
         "open_developer_portal": "Открыть Developer Portal",
+        "reactions_description": "Отмечать твоё сообщение эмодзи того этапа, на котором находится агент (в очереди → размышление → написание кода → готово). Если выключено, сообщение остаётся без отметки.",
+        "reactions_label": "Реакции по этапам",
+        "thinking_description": "Публиковать превью размышлений модели отдельной мелкой заметкой над ответом. Если выключено, в канале остаётся только ответ.",
+        "thinking_label": "Показывать размышления",
         "thread_allowlist_description": "Необязательно. Одобренные пользователи могут запускать агента только в этих конкретных ветках Discord. Пусто = только личные сообщения.",
         "thread_help": "Когда включён Developer Mode, щёлкни по ветке правой кнопкой → <mono>Copy Channel ID</mono>. Используй ID самой ветки, а не ID родительского канала.",
         "thread_warning": "Режим веток включает глобальный intent Message Content в Discord. Discord присылает содержимое из каждого канала сервера, который видит бот; Kiro Crew отбрасывает трафик вне одобренных веток. Любой, кто видит одобренную ветку, может читать ответы агента и вывод инструментов.",
@@ -11628,7 +11779,9 @@
         "record_prompt": "Нажмите клавиши…",
         "search": "Поиск",
         "turn_keyboard_shortcuts_on_or_off_globally": "Включить или отключить сочетания клавиш глобально — {{mod}} + K (эта справка) работает всегда",
-        "use_ctrl_not_option_for_chat_1_9": "Использовать ⌃ Ctrl (а не ⌥ Option) для чатов 1–9"
+        "use_ctrl_not_option_for_chat_1_9": "Использовать ⌃ Ctrl (а не ⌥ Option) для чатов 1–9",
+        "clear_shortcut": "Очистить",
+        "panel_toggles": "Переключение панелей"
       },
       "skillsPanel": {
         "analyze_each_completed_session_and_draft_a_reusa": "Анализировать каждую завершённую сессию и составлять черновик переиспользуемого SKILL.md, когда она демонстрирует повторяющуюся процедуру — такую, которую будущая сессия, работая над другой целью, выполнила бы снова. По умолчанию выключено. Черновики попадают в очередь ожидания на вкладке «Навыки» для проверки — ничего не публикуется без вашего одобрения (см. ниже).",
@@ -11711,7 +11864,7 @@
         "installs_mlx_whisper_via_pipx_ffmpeg_apple_silic": "Устанавливает mlx-whisper через pipx и ffmpeg. Только Apple Silicon (arm64).",
         "installs_openai_whisper_ffmpeg_uses_system_pytho": "Устанавливает openai-whisper и ffmpeg. Использует системный python3 (≥ 3.10).",
         "language": "Язык",
-        "larger_models_are_more_accurate_but_slower_to_ru": "Более крупные модели точнее, но работают медленнее",
+        "larger_models_are_more_accurate_but_slower_to_ru": "Более крупные модели точнее, но работают медленнее. Модель загружается при первом использовании, поэтому первая диктовка после смены модели может казаться зависшей или завершиться по тайм-ауту, пока загрузка не завершится.",
         "microphone": "Микрофон",
         "microphone_2": "Микрофон {{n}}",
         "mlx_model": "Модель MLX",
@@ -11748,7 +11901,7 @@
         "us_east_1": "us-east-1",
         "whisper_and_mlx_run_locally_transcribe_calls_aws": "Whisper, MLX и Apple Speech работают локально; Transcribe обращается к AWS",
         "whisper_installed_but_ffmpeg_is_missing_voice_tr": "Whisper установлен, но ffmpeg отсутствует — для голосовой транскрибации нужен ffmpeg.",
-        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Модель Whisper на Apple MLX (Metal GPU). Загружается при первом использовании.",
+        "whisper_model_running_on_apple_mlx_metal_gpu_dow": "Модель Whisper на Apple MLX (Metal GPU). Загружается при первом использовании, поэтому первая диктовка может казаться зависшей или завершиться по тайм-ауту, пока загрузка не завершится.",
         "ptt_altgr_note": "На большинстве клавиатур Windows и Linux правая клавиша Alt — это AltGr, которая помогает набирать символы с диакритикой, поэтому одиночный Option не может быть здесь значением по умолчанию.",
         "ptt_heading": "Начинать диктовку клавишей",
         "ptt_heading_desc": "Нажмите клавишу, чтобы говорить, вместо щелчка по микрофону. Правый Option ⌥ работает сразу — здесь можно ничего не менять.",
@@ -11997,6 +12150,70 @@
         "wechat_login_qr_code": "QR-код для входа в WeChat",
         "who_can_message_the_bot": "Кто может писать боту",
         "wxid": "wxid_…"
+      },
+      "whatsAppPanel": {
+        "status_unavailable": "Статус недоступен",
+        "setup_guide": "Руководство по настройке",
+        "whatsapp": "WhatsApp",
+        "connected": "Подключено",
+        "not_signed_in": "Не привязано",
+        "pair_with_whatsapp": "Привязать через WhatsApp",
+        "scan_the_code_from_linked_devices": "Отсканируйте код с помощью WhatsApp на телефоне: Настройки, Связанные устройства, Привязка устройства.",
+        "signed_in_restart_the_gateway_to_start_receiving": "Привязано. Перезапустите gateway, чтобы начать получать сообщения.",
+        "talk_to_your_agent_from_your_own_whatsapp": "Общайтесь со своим агентом из собственного аккаунта WhatsApp, привязанного как связанное устройство. Сообщения, которые отправляет агент, приходят с вашего номера.",
+        "waiting_for_a_code": "Ожидание кода...",
+        "waiting_for_scan": "Ожидание сканирования...",
+        "scanned_confirm_on_your_phone": "Отсканировано. Подтвердите на телефоне.",
+        "the_code_expired_try_again": "Срок действия кода истёк. Попробуйте снова.",
+        "could_not_start_pairing": "Не удалось начать привязку.",
+        "could_not_start_the_login_flow": "Не удалось начать процесс привязки.",
+        "whatsapp_pairing_qr_code": "QR-код привязки WhatsApp",
+        "enable_the_whatsapp_channel": "Включить канал WhatsApp",
+        "who_can_message_the_bot": "Кто может писать агенту",
+        "only_me_the_default": "Только я (мои собственные сообщения)",
+        "me_plus_allowed_numbers": "Я и разрешённые номера",
+        "nobody_ignore_all_messages": "Никто (игнорировать все сообщения)",
+        "anyone_who_messages_you": "Любой, кто напишет боту",
+        "allowed_wa_ids": "Разрешённые номера",
+        "allowed_numbers_empty_adds_nobody": "Номера телефонов (цифры с кодом страны, без знака плюс), которые также могут общаться с агентом. Пусто — никто, кроме вас, не добавляется.",
+        "phone_number_placeholder": "447700900000",
+        "created_for_you_when_you_turn_this_on_if_it_does": "Создаётся для вас при включении этой опции, если ещё не существует.",
+        "group_participation_is_opt_in_per_group": "Участие в группах включается отдельно для каждой группы: режим упоминания отвечает только когда вас отметили; режим правил также может помогать без запроса, с паузой между ответами. Использует неофициальный протокол WhatsApp Web; используйте в личных масштабах.",
+        "waiting_to_be_paired": "Ожидание привязки",
+        "the_link_was_revoked": "Привязка отозвана",
+        "blocked_by_whatsapp": "Заблокировано в WhatsApp",
+        "paired_but_not_connected": "Привязано, но нет подключения",
+        "whatsapp_did_not_connect": "WhatsApp не подключился: {{error}}",
+        "the_channel_is_enabled_but_not_running": "Канал включён, но не запущен. Перезапустите gateway.",
+        "show_pairing_code": "Показать код привязки",
+        "already_paired_unlink_then_restart": "Уже привязано. Чтобы привязать другое устройство, отвяжите это ниже и перезапустите gateway.",
+        "the_link_was_revoked_restart_to_pair_again": "Привязка отозвана. Перезапустите gateway, чтобы привязать устройство снова.",
+        "blocked_number_cannot_pair": "WhatsApp заблокировал этот номер, поэтому привязка не может начаться.",
+        "pairing_starts_when_the_channel_starts": "Код привязки существует только пока канал выполняет привязку, а привязка начинается при запуске канала. Включите канал ниже и перезапустите gateway.",
+        "the_channel_is_not_running_enable_and_restart": "Канал WhatsApp не запущен. Включите его ниже и перезапустите gateway.",
+        "unlink_this_device": "Отвязать это устройство",
+        "revokes_the_linked_device_on_your_account": "Отзывает это связанное устройство в вашем аккаунте WhatsApp и удаляет локальную сессию. Агент перестаёт читать и отправлять сообщения, пока устройство не будет привязано снова.",
+        "confirm_unlink": "Подтвердить отвязку",
+        "unlinked_restart_to_pair_again": "Отвязано. Перезапустите gateway, чтобы привязать устройство снова.",
+        "unlinked_but_the_session_file_was_kept": "Отвязано от WhatsApp, но локальный файл сессии не удалось удалить. Удалите его в каталоге данных перед повторной привязкой.",
+        "whatsapp_refused_the_unlink_still_linked": "WhatsApp отклонил отвязку, поэтому устройство всё ещё связано, а локальная сессия сохранена. Попробуйте снова или отзовите устройство на телефоне в разделе Связанные устройства.",
+        "channel_not_running_so_nothing_was_unlinked": "Канал не запущен, поэтому ничего не отвязано. Связанное устройство остаётся связанным: отзовите его на телефоне в разделе Связанные устройства.",
+        "could_not_unlink_the_device": "Не удалось отвязать устройство.",
+        "groups": "Группы",
+        "the_agent_ignores_every_group_not_listed": "Агент игнорирует любую группу, которой нет в этом списке.",
+        "add_a_group": "Добавить группу",
+        "your_groups_load_once_the_channel_is_connected": "Ваши группы появятся здесь, когда канал подключится.",
+        "every_group_you_joined_is_already_listed": "Все группы, в которых вы состоите, уже в списке.",
+        "how_the_agent_joins_in": "Как агент участвует",
+        "mode_only_when_mentioned": "Только при упоминании или цитировании",
+        "mode_also_when_the_rules_apply": "Также когда действуют его правила",
+        "mode_off_keeping_the_entry": "Выключено, запись сохраняется",
+        "when_the_agent_may_speak": "Когда агент может говорить",
+        "the_agent_stays_silent_unless_these_apply": "Свободный текст. Агент молчит, пока эти правила явно не применимы.",
+        "rules_example_placeholder": "Отвечать на вопросы о 3D-печати",
+        "seconds_between_unprompted_replies": "Секунд между ответами без запроса",
+        "remove_name_from_the_group_list": "Убрать {{name}} из списка групп",
+        "unofficial_protocol_ban_risk": "Неофициальный протокол: WhatsApp может заблокировать привязанный номер. Не привязывайте номер, потерю которого вы не можете себе позволить."
       },
       "remoteCrewPanel": {
         "your_crews": "Your crews",
@@ -12464,7 +12681,7 @@
         "label": "Браузер"
       },
       "channels": {
-        "description": "Платформы для общения, через которые агент может отправлять и получать сообщения — Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, WeChat",
+        "description": "Платформы для общения, через которые агент может отправлять и получать сообщения",
         "label": "Каналы"
       },
       "chat": {

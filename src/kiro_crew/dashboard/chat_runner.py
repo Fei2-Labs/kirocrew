@@ -75,7 +75,6 @@ from kiro_crew.dashboard.chat_title import (
 from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
     _MAX_TOOL_PURPOSE,
-    _SLASH_COMMANDS,
     ResetCause,
     _append_compaction_notice,
     _apply_incognito_prefix,
@@ -95,11 +94,13 @@ from kiro_crew.dashboard.chat_utils import (
     build_recovery_requeue,
     effective_session_key,
     expire_slack_options,
+    is_harness_slash_command,
     is_system_injection_item,
     mirror_is_paused,
     remember_slack_options,
     slack_mirror_is_paused,
     slot_history_key,
+    user_text_span,
 )
 from kiro_crew.dashboard.handlers import (
     MAX_PROMPT_BYTES,
@@ -117,6 +118,9 @@ from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
     CRON_NOTIFY_RE,
+    DENY_CAUSE_HOOK_ERROR,
+    DENY_CAUSE_INVALID_NAME,
+    DENY_CAUSE_POLICY,
     HOOK_CONTINUATION_RECOVERY_PREFIX,
     HOOK_HALTED_RECOVERY_PREFIX,
     NATIVE_SUBAGENT_DONE_RESULT_CAP,
@@ -125,6 +129,7 @@ from kiro_crew.dashboard.state import (
     NATIVE_SUBAGENT_OUTPUT_TAIL,
     NATIVE_SUBAGENT_TERMINAL_KEEP,
     NATIVE_SUBAGENT_TERMINAL_TTL_SECS,
+    REFUSAL_INBAND_RECOVERY_PREFIX,
     REFUSAL_RECOVERY_PREFIX,
     STALE_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
@@ -135,6 +140,7 @@ from kiro_crew.dashboard.state import (
     _ChatSlot,
     _mark_permission_resolved,
     build_refusal_recovery_prompt,
+    build_refusal_steer_notice,
     build_stale_recovery_prompt,
     build_tool_stall_recovery_prompt,
     context_entry_expired,
@@ -181,7 +187,7 @@ from kiro_crew.mcp_discovery import kirocrew_managed_names
 from kiro_crew.members import record_activity
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
-from kiro_crew.messaging.renderer import chunk_text
+from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform import redact_via_context
@@ -199,6 +205,7 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_RESULT,
     LLMEvent,
 )
+from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import (
     StreamRedactor,
@@ -480,6 +487,102 @@ def _redacted_hook_block(event: Any, pre_hook_results: Any) -> tuple[str, str]:
     )
 
 
+def _refined_tool_row_content(existing: str, new_title: str) -> str | None:
+    """The rewritten content for a tool row a ``tool_call_update`` refines, or None.
+
+    kiro-cli sends the resolved title after a permission is answered, and the row
+    is re-rendered as ``"<icon> <title>"``, preserving whichever leading icon the
+    row already carries (🔧 running / ✅ done / 🚫 refused).
+
+    Returns None for a REFUSAL row, which must be left alone: it is terminal (the
+    tool will not run, so a better title adds nothing) and its content is
+    ``"🚫 <title> — <reason>"``, so re-rendering from the title alone deletes the
+    reason. That tail is the user's only visible explanation, and the model has
+    already been told the reason in-band — dropping it leaves the human looking at
+    a blocked row with no cause while the agent acts on one they cannot see.
+    """
+    prefix = existing[:1] if existing[:1] in ("🔧", "✅", "🚫") else "🔧"
+    if prefix == "🚫":
+        return None
+    return f"{prefix} {new_title}"
+
+
+async def _steer_policy_notice(
+    client: Any,
+    title: str,
+    reason: str,
+    notices: list[str],
+    slot: Any = None,
+    state: Any = None,
+    *,
+    cause: str = DENY_CAUSE_POLICY,
+) -> bool:
+    """Hand a deny reason to the model IN-BAND, before the rejection is answered.
+
+    Must be called while the ``session/request_permission`` is still unanswered.
+    That ordering is the whole mechanism: the turn is provably in flight (the
+    backend is blocked on our response), so ``_session/steer`` is queued instead
+    of dropped, and the backend folds it in at the next model-inference boundary
+    — the one right after the rejected tool resolves. The model reads the real
+    reason inside the SAME turn, so the fallback recovery continuation (a second
+    billed turn) is not needed.
+
+    Opt-in by positive capability, never by harness identity: a backend outside
+    ``ACP_BACKENDS_STEER`` has no ``_session/steer``, reports
+    ``supports_steer`` False, and keeps the recovery-continuation behaviour
+    unchanged. ``getattr`` guards the attribute because the reject paths also run
+    against minimal test doubles.
+
+    Appends the notice to *notices* (the turn's pending list, settled later by the
+    ``steering_consumed`` echo) and returns whether it was written. Best-effort:
+    steering is an optimisation on top of a fallback that still works, so a
+    failure here must never turn a clean policy block into a turn error.
+
+    *cause* picks the notice's cause-specific wording; see
+    :func:`build_refusal_steer_notice`. Every deny path that reaches a model runs
+    through here, so a new one states its cause rather than inheriting "policy".
+    """
+    if not getattr(client, "supports_steer", False):
+        return False
+    notice = build_refusal_steer_notice(title, reason, cause=cause)
+    if not notice:
+        return False
+    try:
+        sent = await client.steer(notice)
+    except Exception:
+        logger.debug("policy-notice steer failed; falling back to recovery turn", exc_info=True)
+        return False
+    if not sent:
+        return False
+    notices.append(notice)
+    # Display-only row, appended ONLY once the steer is actually on the wire: it
+    # tells the person a policy blocked the call and why, rendered by the same
+    # blocked-tool card the recovery continuation used to produce. Nothing is
+    # queued and no turn is dispatched (the agent already has the reason), which
+    # is why the marker's own copy does not claim a recovery. Appending it when
+    # the steer had NOT been written would assert an explanation the model never
+    # received. Best-effort for the same reason as the steer itself.
+    if slot is not None:
+        try:
+            # The cause rides the MARKER line, following the
+            # HOOK_HALTED_RECOVERY_PREFIX precedent (`… #<depth>`): the card's
+            # always-visible summary has to name the right cause. Rendering one
+            # "safety policy blocked the call" line for all three would tell the
+            # person to go audit a security rule that does not exist — the same
+            # cause-blind wording this change removes for the model, left in place
+            # for the human.
+            slot.append(
+                "inject",
+                f"{REFUSAL_INBAND_RECOVERY_PREFIX} {cause}\n{notice}",
+                "msg msg-inject",
+            )
+            if state is not None:
+                state.push_slots_update()
+        except Exception:
+            logger.debug("policy-notice display row failed", exc_info=True)
+    return True
+
+
 async def _reject_hook_blocked(
     client: Any,
     slot: Any,
@@ -488,17 +591,23 @@ async def _reject_hook_blocked(
     session_key: str,
     pre_hook_results: Any,
     refusal_reasons: list[tuple[str, str]],
+    refusal_notices: list[str] | None,
     metadata: dict | None = None,
 ) -> None:
     """Deny a tool a PreToolUse hook blocked, and record WHY for the model.
 
-    Four things have to happen together: reject the call, show the user a blocked
-    row, audit the denial, and append the hook's reason to ``refusal_reasons`` so
-    the recovery nudge tells the model what it did wrong. Doing the first three
-    without the fourth is the defect this fixes — the turn dies silently and the
-    model stalls with no reason to adapt to, while every other signal looks
-    correct. They live here rather than at each permission path so a path added
-    later cannot deny by omission.
+    Five things have to happen together: reject the call, show the user a blocked
+    row, audit the denial, tell the model the reason in-band, and append that
+    reason to ``refusal_reasons`` so the fallback recovery nudge can carry it when
+    the in-band notice could not be delivered. Doing the first three without the
+    last two is the defect this fixes — the turn dies silently and the model
+    stalls with no reason to adapt to, while every other signal looks correct.
+    They live here rather than at each permission path so a path added later
+    cannot deny by omission.
+
+    ``refusal_notices`` is the turn's pending in-band notice list; omitted (None)
+    means the caller wants the fallback-only behaviour, which is what the direct
+    unit tests of this helper exercise.
     """
     # event.title prefers the model's own `description` field (_select_tool_title),
     # so it is LLM-controlled display text. Redact once up front and use that
@@ -506,6 +615,10 @@ async def _reject_hook_blocked(
     # ConversationLog, and the sibling reject path (_safe_reject_title) redacts for
     # both that row and the audit.
     title, reason = _redacted_hook_block(event, pre_hook_results)
+    # BEFORE reject_tool: the unanswered permission request is what proves the
+    # turn is still in flight, so the steer is queued rather than dropped.
+    if refusal_notices is not None:
+        await _steer_policy_notice(client, title, reason, refusal_notices, slot)
     await client.reject_tool(event.request_id)
     slot.append("tool", f"🚫 {title} (hook blocked)", "msg msg-tool")
     sel().log_tool_invocation(
@@ -528,19 +641,47 @@ async def _reject_invalid_tool(
     *,
     session_key: str,
     error: Exception,
+    refusal_reasons: list[tuple[str, str]],
+    refusal_notices: list[str] | None,
+    state: Any = None,
     metadata: dict | None = None,
 ) -> None:
     """Deny a tool whose display name failed validation, on redacted surfaces.
 
-    Reject, blocked row, and audit live together so a permission path added
-    later cannot publish the raw model-authored title by omission: the title
-    is redacted once here and used for both the transcript row (broadcast to
-    the dashboard AND persisted to the ConversationLog) and the audit
-    ``tool_name``. The validation *error* needs no redaction —
+    Reject, blocked row, audit, the in-band notice, and the fallback entry live
+    together so a permission path added later cannot deny by omission: the title
+    is redacted once here and used for the transcript row (broadcast to the
+    dashboard AND persisted to the ConversationLog), the audit ``tool_name``, and
+    the notice. The validation *error* needs no redaction —
     ``_validate_tool_name`` raises only fixed messages that never echo the
     offending name.
+
+    This is the deny the model can actually FIX: the rejected name is its own
+    output, so being told which validation failed lets it reissue the call inside
+    the same turn. Without that it reads kiro-cli's "User denied tool execution",
+    concludes the person refused the action, and abandons a call nobody objected
+    to.
+
+    ``refusal_notices`` is REQUIRED and may be ``None`` for fallback-only callers.
+    Required rather than defaulted because an omitted notice list is invisible at
+    the call site and silently restores the pre-notice behaviour — which is
+    exactly the by-omission gap this change set out to close, and which a default
+    would let a future call site re-open while compiling and passing tests.
     """
     title = _redact_display_text(event.title)
+    _reason = str(error)
+    # BEFORE reject_tool: the unanswered permission request is what proves the
+    # turn is still in flight, so the steer is queued rather than dropped.
+    if refusal_notices is not None:
+        await _steer_policy_notice(
+            client,
+            title,
+            _reason,
+            refusal_notices,
+            slot,
+            state,
+            cause=DENY_CAUSE_INVALID_NAME,
+        )
     await client.reject_tool(event.request_id)
     slot.append("tool", f"🚫 {title} (invalid: {error})", "msg msg-tool")
     sel().log_tool_invocation(
@@ -554,6 +695,11 @@ async def _reject_invalid_tool(
         error=f"validation_failed: {error}",
         metadata=metadata,
     )
+    # The fallback's input. Without this entry a harness with no steer — or a
+    # steer that was never folded in — leaves this deny with NO channel to the
+    # model at all, while the policy path still gets its continuation. The
+    # in-band notice is the primary path, never the only one.
+    refusal_reasons.append((title, _reason))
 
 
 async def _reject_hook_error(
@@ -563,17 +709,39 @@ async def _reject_hook_error(
     *,
     session_key: str,
     error: str,
+    refusal_reasons: list[tuple[str, str]],
+    refusal_notices: list[str] | None,
+    state: Any = None,
     metadata: dict | None = None,
 ) -> None:
     """Deny a tool whose PreToolUse hook fire raised, on redacted surfaces.
 
-    Same chokepoint shape as :func:`_reject_invalid_tool`: the model-authored
-    title is redacted once and reaches the blocked row and the audit only in
-    that form. *error* is the hook exception text; hooks are fired with the
-    tool name and parsed input, so an exception that wraps its inputs can
-    carry model-authored text — redact it before the audit too.
+    Same chokepoint shape as :func:`_reject_invalid_tool`, including the same
+    REQUIRED ``refusal_notices`` for the same reason: the model-authored title is
+    redacted once and reaches the blocked row, the audit, the in-band notice and
+    the fallback entry only in that form. *error* is the hook exception text;
+    hooks are fired with the tool name and parsed input, so an exception that
+    wraps its inputs can carry model-authored text — redact it before the audit
+    AND before it reaches the model.
+
+    The notice matters most here because nothing judged the call: a hook faulted
+    while deciding it. Left with kiro-cli's "User denied tool execution" the model
+    infers a refusal that never happened and routes around an action that was
+    never actually denied.
     """
     title = _redact_display_text(event.title)
+    _safe_error = _redact_display_text(error)
+    # BEFORE reject_tool, for the same in-flight-turn reason as the sibling paths.
+    if refusal_notices is not None:
+        await _steer_policy_notice(
+            client,
+            title,
+            _safe_error,
+            refusal_notices,
+            slot,
+            state,
+            cause=DENY_CAUSE_HOOK_ERROR,
+        )
     await client.reject_tool(event.request_id)
     slot.append("tool", f"🚫 {title} (hook error)", "msg msg-tool")
     sel().log_tool_invocation(
@@ -584,9 +752,12 @@ async def _reject_hook_error(
         tool_kind=event.tool_kind,
         outcome="hook_error",
         request_id=event.request_id,
-        error=_redact_display_text(error),
+        error=_safe_error,
         metadata=metadata,
     )
+    # See _reject_invalid_tool: the fallback needs an entry or this deny reaches
+    # the model through no channel at all when the steer could not be delivered.
+    refusal_reasons.append((title, _safe_error))
 
 
 def _is_bedrock_profile_id(model: str) -> bool:
@@ -2755,9 +2926,16 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     # credential/token regexes apply (not just the OSS baseline).
     text = redact_via_context(assistant_text)
     # Split on the channel's max message length so a long reply mirrors in full
-    # rather than being hard-truncated by the transport (Telegram caps at 4096),
-    # matching the Slack leg's split_message chunking.
-    parts = chunk_text(text, transport.capabilities.max_message_chars)
+    # rather than being hard-truncated by the transport (Telegram caps at 4096,
+    # and its client slices at that width), matching the Slack leg's chunking.
+    #
+    # Fence-safe, not fixed-width: a blind slice through a code block leaves part
+    # two with no opener, so every line in it reads as prose and a channel's
+    # dialect converter rewrites the `**`, `#` and `- ` INSIDE the code. Cron log
+    # and diff dumps are exactly that shape. The shared splitter seals each chunk
+    # with a synthetic closer and reopens the next with the original opener line,
+    # so each part stands alone and no channel needs to re-derive it.
+    parts = split_markdown_safe(text, transport.capabilities.max_message_chars)
     try:
         for part in parts:
             await transport.send_message(link.channel_id, part, thread_id=link.thread_id)
@@ -3076,7 +3254,7 @@ def _expand_dollar_skills(
         return message, 0
     skills = _get_skills(state)
     try:
-        resolved = skills.resolve_dollar_skills(message)
+        resolved = skills.resolve_dollar_skills(message, slot.project or None)
     except Exception:
         logger.exception("dollar-skill resolution failed")
         # Audit the failed resolution attempt — the security-controls guideline
@@ -3714,7 +3892,17 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         # apply _redact_for_display, and every queue_* broadcast (including the
         # queue_push below) sanitizes. Sanitizing at insert would corrupt the
         # delivered message relative to the normal queue path.
-        qid = slot.queue_insert(0, steer_msg)
+        #
+        # Carry the delivery id the steer registered under. The drain unions every
+        # consumed entry's meta onto the row it writes, so this reaches the row even
+        # when several queued items are merged into one — which is the only way the
+        # steer's caller can tell "already persisted by the drain" from "consumed by
+        # the turn" after both bookkeeping lists have emptied.
+        _meta: dict | None = None
+        _did = getattr(slot, "_steer_delivery_ids", {}).pop(steer_msg, "")
+        if _did:
+            _meta = {"steer_delivery_id": _did}
+        qid = slot.queue_insert(0, steer_msg, meta=_meta)
         try:
             content, _ = redact_exfiltration_urls(steer_msg)
             content, _ = redact_credentials(content)
@@ -4039,19 +4227,6 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     cron_label = match.group(1) if match else "cron"
     cron_label, _ = redact_exfiltration_urls(cron_label)
     cron_label, _ = redact_credentials(cron_label)
-    # Structured completion facts stamped at enqueue time (gateway _subagent_done)
-    # ride through to the row so the card reads them instead of re-parsing the
-    # header prose. Only a single, un-merged system injection carries
-    # them: a merge concatenates several entries under one synthetic header, for
-    # which per-entry facts are meaningless — subagent completions never merge
-    # (they drain one at a time and break any user-message merge), so this only
-    # fires on the shape it was computed for.
-    _row_meta = consumed[0].get("meta") if (is_subagent and len(consumed) == 1) else None
-    # When synthesis is pending, mark the completion so the frontend can collapse
-    # the per-completion assistant response that follows (it will be restated by
-    # the synthesis turn).
-    if is_subagent and slot._pending_synthesis and isinstance(_row_meta, dict):
-        _row_meta = {**_row_meta, "synthesisPending": True}
     if is_subagent:
         row_role = "subagent"
     elif is_cron or is_recovery:
@@ -4066,6 +4241,38 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         row_cls = "msg msg-inject"
     else:
         row_cls = "msg msg-u"
+    # Provenance a producer attached to the queue entry belongs on the row the
+    # drain writes, not only on the entry that is about to disappear.
+    _drained_meta: dict = {}
+    # Delivery ids ACCUMULATE; everything else is last-writer-wins. A merge folds
+    # several queued messages into one row, and each may carry its own steer's id —
+    # a plain `update` would keep only the last, and every other caller would see
+    # no row for its delivery and append a duplicate. The row stands for all of
+    # them, so it has to name all of them.
+    #
+    # Accumulating generally does not undo the narrow rule above: per-entry
+    # subagent facts would be meaningless on a merged row, but a subagent
+    # completion never merges (it drains alone and breaks any user-message
+    # merge), so a merged row cannot carry them in the first place.
+    _drained_ids: list[str] = []
+    for item in consumed:
+        _item_meta = item.get("meta")
+        if isinstance(_item_meta, dict):
+            _one = _item_meta.get("steer_delivery_id")
+            if isinstance(_one, str) and _one:
+                _drained_ids.append(_one)
+            _many = _item_meta.get("steer_delivery_ids")
+            if isinstance(_many, list):
+                _drained_ids.extend(x for x in _many if isinstance(x, str) and x)
+            _drained_meta.update(_item_meta)
+    if _drained_ids:
+        _drained_meta.pop("steer_delivery_id", None)
+        _drained_meta["steer_delivery_ids"] = _drained_ids
+    # When synthesis is pending, mark the completion so the frontend can collapse
+    # the per-completion assistant response that follows (it will be restated by
+    # the synthesis turn).
+    if is_subagent and slot._pending_synthesis and _drained_meta:
+        _drained_meta["synthesisPending"] = True
     # Durable provenance for every `inject` row. `cls` is NOT persisted for this
     # role (chat_persistence only keeps it for `role == "system"`), and the
     # frontend's `meta.cronLabel` exists on the wire only because parse_cls_meta
@@ -4077,6 +4284,12 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     # message verbatim when the turn emitted nothing, and that row must keep
     # rendering as speech. `synthetic_payload` is the existing answer to exactly
     # that question, so reuse it rather than inventing a second signal.
+    #
+    # Folded into the drained meta rather than a separate `_row_meta`: this drain
+    # now unions the meta of EVERY consumed entry (a merged row names all of its
+    # steer delivery ids), so the drained mapping is the one the row write reads.
+    # An `inject` row and a `subagent` row are mutually exclusive by `row_role`,
+    # so these two provenance blocks can never both fire on one row.
     if row_role == "inject":
         if is_cron:
             _inject_kind = "cron"
@@ -4087,12 +4300,12 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         _inject_meta: dict = {"injectKind": _inject_kind}
         if is_cron:
             _inject_meta["cronLabel"] = cron_label
-        _row_meta = {**_row_meta, **_inject_meta} if isinstance(_row_meta, dict) else _inject_meta
+        _drained_meta.update(_inject_meta)
     slot.append(
         row_role,
         next_msg,
         row_cls,
-        meta=_row_meta if isinstance(_row_meta, dict) else None,
+        meta=_drained_meta or None,
     )
 
     # Per-turn consumption cell for a drained sub-agent completion (see
@@ -4653,10 +4866,17 @@ async def _run_chat(
     # graceful-cancel and empty-re-queue paths that reach the success check.
     _turn_landed = False
     # Recoverable tool refusals (host-gate policy deny / read-only bash gate)
-    # recorded during this turn as (redacted_title, reason). If non-empty when
-    # the turn ends — and the user did not stop it — a recovery continuation is
-    # enqueued so the model learns why and can adapt instead of stalling.
+    # recorded during this turn as (redacted_title, reason). Each deny also gets
+    # its reason steered in-band (see _refusal_notices); this ledger is what the
+    # FALLBACK continuation carries when that could not be delivered.
     _refusal_reasons: list[tuple[str, str]] = []
+    # In-band policy notices steered into THIS turn (see _steer_policy_notice).
+    # The list holds only those still unconfirmed: the `steering_consumed` echo
+    # settles entries out of it and counts them here instead, so the total ever
+    # written stays derivable as list + settled WITHOUT any bookkeeping at the
+    # deny sites — a path added later cannot forget to increment a counter.
+    _refusal_notices: list[str] = []
+    _refusal_notices_settled = 0
     # Track how deep an unbroken hook-continuation run is, so the Stop hook can
     # see it: each consecutive hook continuation is one deeper; any other turn
     # (a real user message, a refusal recovery) breaks the run and resets it.
@@ -4679,7 +4899,10 @@ async def _run_chat(
     # ── Slash commands: detect early, before session acquisition ──
     first_word = message.split()[0] if message.strip() else ""
     _is_cc_provider = KiroCrewConfig.load().agent.provider == "claude_code"
-    is_slash = (first_word.startswith("/") and _is_cc_provider) or first_word in _SLASH_COMMANDS
+    # Named rather than inlined so the quick-prompt exception is one testable rule
+    # instead of a condition only reachable by driving this whole function: a macro
+    # must NOT be forwarded to the harness as a command.
+    is_slash = is_harness_slash_command(first_word, cc_provider=_is_cc_provider)
 
     # Block dangerous/local-only commands before acquiring a session
     if first_word in _BLOCKED_SLASH_COMMANDS:
@@ -5157,7 +5380,15 @@ async def _run_chat(
         # neutralization, the multibyte fold, a rewriting hook) are NOT applied
         # here — build_message maps these bounds to their final position itself.
         user_typed_len = len(message)
-        prompt_expanded = False
+        # A quick prompt is a REPLACING expansion, the same class as @prompt: the
+        # instruction the model receives is injected content, not the user's typing,
+        # so none of it is attributable to them. This flag drives the FALLBACK
+        # attribution path (used when the authoritative span cannot be re-derived
+        # after post-assembly prefixes). It must NOT also shorten the span handed to
+        # build_message -- that span is how the matcher FINDS the token, and zeroing
+        # it stops the expansion entirely. `user_text_span` keeps the two apart.
+        _is_quick_prompt = first_word.lower() in QUICK_PROMPTS
+        prompt_expanded = _is_quick_prompt
         if message.startswith("@") and not is_slash and _prompt_depth < 1:
             original = message
             message, _status = _expand_prompt_mention(message, state, slot)
@@ -5210,7 +5441,16 @@ async def _run_chat(
         # Skipped for slash commands; _prompt_depth<1 blocks the recursive _run_chat
         # path. Token is left literal; resolved bodies are appended.
         if "$" in message and not is_slash and not prompt_expanded and _prompt_depth < 1:
-            message, _n_skills = _expand_dollar_skills(message, state, slot, session_key)
+            # Offloaded: expansion walks the skills tree(s) and reads skill
+            # bodies, which is filesystem work that must not run on the event
+            # loop — a large tree would stall the gateway heartbeat and every
+            # other chat. The walk predates project-aware resolution; adding a
+            # trusted project's own root made an existing on-loop cost worse
+            # rather than introducing it, so the fix is to move the whole call
+            # off the loop instead of narrowing what it may discover.
+            message, _n_skills = await asyncio.to_thread(
+                _expand_dollar_skills, message, state, slot, session_key
+            )
             if _n_skills:
                 sel().log_tool_invocation(
                     session_key=session_key,
@@ -5440,10 +5680,11 @@ async def _run_chat(
                 exclude_last_n=1,
                 folder_path=folder_path,
                 model_window=model_window,
-                user_text_range=(
+                user_text_range=user_text_span(
                     _user_prepend_offset,
-                    _user_prepend_offset
-                    + attributable_user_chars(user_typed_len, prompt_expanded=prompt_expanded),
+                    user_typed_len,
+                    quick_prompt=_is_quick_prompt,
+                    prompt_expanded=prompt_expanded,
                 ),
                 user_span_out=_user_span,
                 needs_reinjection=_needs_reinjection,
@@ -5987,11 +6228,16 @@ async def _run_chat(
                         if m.get("meta", {}).get("tool_call_id") != _tcid_upd:
                             continue
                         if _title_upd:
-                            existing = m.get("content", "") or ""
-                            prefix = existing[:1] if existing[:1] in ("🔧", "✅", "🚫") else "🔧"
-                            _patched_content = f"{prefix} {_title_upd}"
-                            m["content"] = _patched_content
-                            slot.invalidate_source_links()
+                            _refined = _refined_tool_row_content(
+                                m.get("content", "") or "", _title_upd
+                            )
+                            # None == a refusal row: keep its reason (see the
+                            # helper). Meta patches below still apply; only the
+                            # content rewrite is skipped.
+                            if _refined is not None:
+                                _patched_content = _refined
+                                m["content"] = _patched_content
+                                slot.invalidate_source_links()
                         if _meta_patch:
                             m_meta = m.setdefault("meta", {})
                             m_meta.update(_meta_patch)
@@ -6285,7 +6531,6 @@ async def _run_chat(
                         resolved_agent=read_effective_agent(client),
                     )
                     if tool_result.action == TOOL_DENY:
-                        await client.reject_tool(event.request_id)
                         # Surface WHY: carry the deny reason into the pill so
                         # the user sees "Blocked by security policy: ..." rather
                         # than an opaque "(blocked)" (or, on the claude provider,
@@ -6294,6 +6539,17 @@ async def _run_chat(
                         _deny_title = _redact_display_text(event.title)
                         _deny_msg, _ = redact_exfiltration_urls(_deny_reason)
                         _deny_msg, _ = redact_credentials(_deny_msg)
+                        # In-band first, and BEFORE the rejection goes on the
+                        # wire: holding the unanswered permission request is what
+                        # guarantees the turn is still in flight, so the notice is
+                        # queued and folded in at the boundary after this tool
+                        # resolves. Without it the model only ever sees kiro-cli's
+                        # generic "User denied tool execution" and concludes the
+                        # user cancelled.
+                        await _steer_policy_notice(
+                            client, _deny_title, _deny_msg, _refusal_notices, slot, state
+                        )
+                        await client.reject_tool(event.request_id)
                         slot.append(
                             "tool",
                             f"🚫 {_deny_title} — {_deny_msg}",
@@ -6353,7 +6609,14 @@ async def _run_chat(
                             )
                         except ValueError as e:
                             await _reject_invalid_tool(
-                                client, slot, event, session_key=session_key, error=e
+                                client,
+                                slot,
+                                event,
+                                session_key=session_key,
+                                error=e,
+                                refusal_notices=_refusal_notices,
+                                state=state,
+                                refusal_reasons=_refusal_reasons,
                             )
                         else:
                             # Declarative auto-approve must NOT bypass scripted
@@ -6378,6 +6641,9 @@ async def _run_chat(
                                     event,
                                     session_key=session_key,
                                     error=str(hook_exc),
+                                    refusal_reasons=_refusal_reasons,
+                                    refusal_notices=_refusal_notices,
+                                    state=state,
                                 )
                                 continue
                             if _pre_tool_hooks_should_block(pre_hook_results):
@@ -6388,6 +6654,7 @@ async def _run_chat(
                                     session_key=session_key,
                                     pre_hook_results=pre_hook_results,
                                     refusal_reasons=_refusal_reasons,
+                                    refusal_notices=_refusal_notices,
                                 )
                                 continue
                             await client.approve_tool(event.request_id)
@@ -6421,7 +6688,14 @@ async def _run_chat(
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
                         await _reject_invalid_tool(
-                            client, slot, event, session_key=session_key, error=e
+                            client,
+                            slot,
+                            event,
+                            session_key=session_key,
+                            error=e,
+                            refusal_notices=_refusal_notices,
+                            state=state,
+                            refusal_reasons=_refusal_reasons,
                         )
                         continue
                     try:
@@ -6436,7 +6710,14 @@ async def _run_chat(
                         )
                     except Exception as hook_exc:
                         await _reject_hook_error(
-                            client, slot, event, session_key=session_key, error=str(hook_exc)
+                            client,
+                            slot,
+                            event,
+                            session_key=session_key,
+                            error=str(hook_exc),
+                            refusal_notices=_refusal_notices,
+                            state=state,
+                            refusal_reasons=_refusal_reasons,
                         )
                         continue
                     if _pre_tool_hooks_should_block(pre_hook_results):
@@ -6447,6 +6728,7 @@ async def _run_chat(
                             session_key=session_key,
                             pre_hook_results=pre_hook_results,
                             refusal_reasons=_refusal_reasons,
+                            refusal_notices=_refusal_notices,
                         )
                         continue
                     _pre_tool_hooks_fired = True
@@ -6519,22 +6801,19 @@ async def _run_chat(
                                 event.title, is_shell=event.is_shell
                             )
                         except ValueError as e:
-                            await client.reject_tool(event.request_id)
-                            _safe = _redact_display_text(event.title)
-                            slot.append(
-                                "tool",
-                                f"🚫 {_safe} (invalid: {e})",
-                                "msg msg-tool",
-                            )
-                            sel().log_tool_invocation(
+                            await _reject_invalid_tool(
+                                client,
+                                slot,
+                                event,
                                 session_key=session_key,
-                                agent=slot.agent or "kirocrew",
-                                source="dashboard",
-                                tool_name=_safe,
-                                tool_kind=event.tool_kind,
-                                outcome="rejected",
-                                request_id=event.request_id,
-                                metadata={"reason": "invalid_tool_name", "pattern": matched},
+                                error=e,
+                                refusal_notices=_refusal_notices,
+                                state=state,
+                                metadata={
+                                    "reason": "invalid_tool_name",
+                                    "pattern": matched,
+                                },
+                                refusal_reasons=_refusal_reasons,
                             )
                             continue
                         await client.approve_tool(event.request_id)
@@ -6608,18 +6887,19 @@ async def _run_chat(
                     try:
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
-                        await client.reject_tool(event.request_id)
-                        _safe = _redact_display_text(event.title)
-                        slot.append("tool", f"🚫 {_safe} (invalid: {e})", "msg msg-tool")
-                        sel().log_tool_invocation(
+                        await _reject_invalid_tool(
+                            client,
+                            slot,
+                            event,
                             session_key=session_key,
-                            agent=slot.agent or "kirocrew",
-                            source="dashboard",
-                            tool_name=_safe,
-                            tool_kind=event.tool_kind,
-                            outcome="rejected",
-                            request_id=event.request_id,
-                            metadata={"reason": "invalid_tool_name", "pattern": "browser_cli"},
+                            error=e,
+                            refusal_notices=_refusal_notices,
+                            state=state,
+                            metadata={
+                                "reason": "invalid_tool_name",
+                                "pattern": "browser_cli",
+                            },
+                            refusal_reasons=_refusal_reasons,
                         )
                         continue
                     await client.approve_tool(event.request_id)
@@ -6667,6 +6947,9 @@ async def _run_chat(
                                 session_key=session_key,
                                 error=e,
                                 metadata={"reason": "trust_reads"},
+                                refusal_reasons=_refusal_reasons,
+                                refusal_notices=_refusal_notices,
+                                state=state,
                             )
                             continue
                         await client.approve_tool(event.request_id)
@@ -6699,7 +6982,14 @@ async def _run_chat(
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
                         await _reject_invalid_tool(
-                            client, slot, event, session_key=session_key, error=e
+                            client,
+                            slot,
+                            event,
+                            session_key=session_key,
+                            error=e,
+                            refusal_notices=_refusal_notices,
+                            state=state,
+                            refusal_reasons=_refusal_reasons,
                         )
                         continue
                     if not _pre_tool_hooks_fired:
@@ -6717,7 +7007,14 @@ async def _run_chat(
                             )
                         except Exception as hook_exc:
                             await _reject_hook_error(
-                                client, slot, event, session_key=session_key, error=str(hook_exc)
+                                client,
+                                slot,
+                                event,
+                                session_key=session_key,
+                                error=str(hook_exc),
+                                refusal_notices=_refusal_notices,
+                                state=state,
+                                refusal_reasons=_refusal_reasons,
                             )
                             continue
                         if _pre_tool_hooks_should_block(pre_hook_results):
@@ -6728,6 +7025,7 @@ async def _run_chat(
                                 session_key=session_key,
                                 pre_hook_results=pre_hook_results,
                                 refusal_reasons=_refusal_reasons,
+                                refusal_notices=_refusal_notices,
                             )
                             continue
                     # always=False — KiroCrew owns trust scope; per-call request_permission
@@ -7034,6 +7332,9 @@ async def _run_chat(
                             session_key=session_key,
                             error=e,
                             metadata={"reason": "interactive"},
+                            refusal_reasons=_refusal_reasons,
+                            refusal_notices=_refusal_notices,
+                            state=state,
                         )
                         break
                     try:
@@ -7054,6 +7355,9 @@ async def _run_chat(
                             session_key=session_key,
                             error=str(hook_exc),
                             metadata={"reason": "interactive"},
+                            refusal_reasons=_refusal_reasons,
+                            refusal_notices=_refusal_notices,
+                            state=state,
                         )
                         break
                     if _pre_tool_hooks_should_block(pre_hook_results):
@@ -7064,6 +7368,7 @@ async def _run_chat(
                             session_key=session_key,
                             pre_hook_results=pre_hook_results,
                             refusal_reasons=_refusal_reasons,
+                            refusal_notices=_refusal_notices,
                             metadata={"reason": "interactive"},
                         )
                     else:
@@ -7130,6 +7435,15 @@ async def _run_chat(
                     continue
             elif event.kind == EVENT_STEER_CONSUMED:
                 _settle_consumed_steers(slot, event.text or "")
+                if _refusal_notices:
+                    # Same echo, same parser as the user-steer ledger, but
+                    # settle_all_on_empty stays False here: an empty echo is no
+                    # evidence, and treating it as delivery would drop the
+                    # fallback continuation and leave the model holding
+                    # kiro-cli's "User denied tool execution" uncorrected.
+                    _still_pending = settle_consumed_steers(_refusal_notices, event.text or "")
+                    _refusal_notices_settled += len(_refusal_notices) - len(_still_pending)
+                    _refusal_notices[:] = _still_pending
             elif event.kind == EVENT_COMPACTION_STATUS:
                 logger.debug("Main loop: compaction event text=%r", event.text)
                 if _broadcast_compaction_result(state, slot, event):
@@ -8194,17 +8508,26 @@ async def _run_chat(
                 )
                 state.push_slots_update()
 
-        # ── Tool-refusal recovery ──────────────────────────────────────────
-        # A recoverable refusal (host-gate policy deny or the read-only bash
-        # gate) ended this turn early via kiro-cli's tool-interrupted marker.
-        # Hand the reason back to the model as a continuation so it can adapt —
-        # an allowed alternative, a different tool, or a reasoned stop — instead
-        # of stalling for the user. Skipped on a user stop or when a session
-        # reset is already re-queuing. No turn cap by design: the model decides
-        # when to stop, and the user's Stop button stays the hard breaker. The
-        # finally block's dequeue loop picks this up and dispatches it.
+        # ── Tool-refusal recovery (FALLBACK) ───────────────────────────────
+        # The primary path already ran: each deny steered its reason into this
+        # turn before answering the permission request, so a model on a
+        # steer-capable backend has been told and no extra turn is owed. This
+        # continuation covers what that could not reach — a backend without
+        # mid-turn steer, or a notice the backend never echoed as folded in
+        # (the turn died before a model-inference boundary). Then hand the
+        # reason back so the model can adapt — an allowed alternative, a
+        # different tool, or a reasoned stop — instead of stalling for the user.
+        # Skipped on a user stop or when a session reset is already re-queuing.
+        # No turn cap by design: the model decides when to stop, and the user's
+        # Stop button stays the hard breaker. The finally block's dequeue loop
+        # picks this up and dispatches it.
         if should_queue_refusal_recovery(
-            _refusal_reasons, slot._stopping, needs_session_reset, _stop_reason
+            _refusal_reasons,
+            slot._stopping,
+            needs_session_reset,
+            _stop_reason,
+            notices_sent=len(_refusal_notices) + _refusal_notices_settled,
+            notices_pending=len(_refusal_notices),
         ):
             _recovery_body = build_refusal_recovery_prompt(_refusal_reasons)
             if _recovery_body:

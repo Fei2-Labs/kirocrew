@@ -80,6 +80,7 @@ from kiro_crew.llm_helpers import (
     record_interaction_event,
     save_conversation_turn_off_loop,
 )
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.platform import current_context
@@ -2471,7 +2472,9 @@ async def maybe_handle_keyword_command(
 
     # ── Natural language cron: intercept wakeup patterns ──
     if cron_service:
-        cron_reply = await _handle_cron_command(text, cron_service, channel, reply_ts)
+        cron_reply = await _handle_cron_command(
+            text, cron_service, channel, reply_ts, user_id=user_id
+        )
         if cron_reply:
             await slack.post_message(channel, cron_reply, reply_ts)
             if conversation_log and not _is_slack_restricted(session_key):
@@ -4173,22 +4176,16 @@ async def handle_message(
 
 # ── Slack thread auto-title ─────────────────────────────────────────────
 
-_auto_title_lock: asyncio.Lock | None = None
-_auto_title_lock_loop: asyncio.AbstractEventLoop | None = None
+_auto_title_lock = LoopBoundLock()
 
 
-def _get_auto_title_lock() -> asyncio.Lock:
-    """Return an auto-title lock bound to the current event loop (Python 3.10 compat).
+def _get_auto_title_lock() -> LoopBoundLock:
+    """Return the auto-title lock (loop-bound; rebinds when the running loop changes).
 
-    Lazily created inside a running loop, and rebound when the running loop
-    changes: a cached ``asyncio.Lock`` raises ``RuntimeError`` when acquired
-    from a different loop than the one it was first used on.
+    A cached ``asyncio.Lock`` raises ``RuntimeError`` when acquired from a
+    different loop than the one it was first used on; ``LoopBoundLock`` is the
+    shared fix for that class (issue #4800).
     """
-    global _auto_title_lock, _auto_title_lock_loop
-    loop = asyncio.get_running_loop()
-    if _auto_title_lock is None or _auto_title_lock_loop is not loop:
-        _auto_title_lock = asyncio.Lock()
-        _auto_title_lock_loop = loop
     return _auto_title_lock
 
 
@@ -4271,9 +4268,24 @@ async def _maybe_auto_title_slack(
             resources=f"{channel}:{session_key}",
         )
         logger.info("Slack thread auto-titled: %s → %r", session_key, title)
-    except Exception:
+    except asyncio.TimeoutError:
+        # Routine transient: the 30s cap on the title stream. Not the masking
+        # concern below — a slow model is expected operational noise, and the
+        # popped claim already schedules a retry on the next exchange.
+        _titled_threads.pop(session_key, None)
+        logger.debug("Slack thread auto-title timed out for %s", session_key)
+    except Exception as exc:
         _titled_threads.pop(session_key, None)  # allow retry on transient failure
-        logger.debug("Slack thread auto-title failed for %s", session_key, exc_info=True)
+        # WARNING, not debug: this blanket handler runs on a fire-and-forget
+        # task, so it is the only place a real defect surfaces. Logged at debug
+        # it masked a deterministic cross-loop RuntimeError into three separate
+        # order-dependent CI flake classes (#4177, #4789 — see #4800).
+        logger.warning(
+            "Slack thread auto-title failed for %s (%s)",
+            session_key,
+            type(exc).__name__,
+            exc_info=True,
+        )
 
 
 async def _reject_orphaned_tool(provider: LLMProvider, request_id: "str | int") -> None:
@@ -4739,8 +4751,12 @@ def _build_approval_blocks(event: LLMEvent, is_dm: bool = True, source: str = ""
     return blocks
 
 
-async def _remove_all_jobs(cron_service: CronService) -> str:
-    """Remove all cron jobs and return a summary (event-loop-safe)."""
+async def _remove_all_jobs(cron_service: CronService, user_id: str) -> str:
+    """Remove all cron jobs and return a summary (event-loop-safe).
+
+    ``user_id`` is the Slack caller, threaded through for SEL audit
+    attribution (empty falls back to the surface name).
+    """
     jobs = cron_service.list_jobs(include_disabled=True)
     if not jobs:
         return "No cron jobs to remove."
@@ -4756,9 +4772,28 @@ async def _remove_all_jobs(cron_service: CronService) -> str:
     # "busy" reply as the single-job remove/pause/resume paths rather than
     # aborting the Slack message handler.
     try:
-        await cron_service.remove_jobs([j.id for j in jobs])
+        removed_ids, missing_ids = await cron_service.remove_jobs([j.id for j in jobs])
     except CronStoreBusy:
         return "⏳ Cron store busy — try again in a moment."
+    # SEL audit: the Slack plural path must leave the same cron.batch_delete
+    # record the dashboard's plural path already emits (MCP's cron_remove_all
+    # logs its own authz-scoped tool event instead) — after the jobs
+    # vanish from crons.json the trail is the only way to tell a deliberate
+    # remove-all from data loss. Best-effort and exception-contained: the
+    # first sel() of a process CONSTRUCTS the log and can raise, and the jobs
+    # are already removed — audit unavailability must not fail the command.
+    try:
+        sel().log_api_access(
+            caller=user_id or "slack",
+            operation="cron.batch_delete",
+            outcome="ok" if removed_ids else "failed",
+            source="slack",
+            resources=(
+                f"requested={[j.id for j in jobs]} deleted={removed_ids} failed={missing_ids}"
+            ),
+        )
+    except Exception:
+        logger.warning("SEL audit for Slack cron remove-all failed", exc_info=True)
     return f"✅ Removed {len(lines)} cron job(s):\n" + "\n".join(lines)
 
 
@@ -4796,7 +4831,7 @@ def _do_spawn(task: str, manager: SubagentManager, session_key: str = "") -> str
 
 
 async def _handle_cron_command(
-    text: str, cron_service: CronService, channel: str, thread_ts: str
+    text: str, cron_service: CronService, channel: str, thread_ts: str, user_id: str = ""
 ) -> str | None:
     """Handle cron keyword commands. Returns reply or None.
 
@@ -4804,6 +4839,10 @@ async def _handle_cron_command(
     event-loop-safe ``*_async`` variants instead of parking the Slack gateway
     loop on the store lock; a contended store yields a "busy, retry" reply
     rather than a stall.
+
+    ``user_id`` is the Slack caller, threaded through so the destructive
+    branches can attribute their SEL audit events to the human who issued
+    the command (per-caller identity, matching the dashboard/MCP/CLI paths).
     """
     t = text.strip().lower()
     parts = t.split()
@@ -4859,11 +4898,32 @@ async def _handle_cron_command(
 
     if action == "remove":
         if job_id == "all":
-            return await _remove_all_jobs(cron_service)
+            return await _remove_all_jobs(cron_service, user_id=user_id)
         try:
             removed = await cron_service.remove_job_async(job_id)
         except CronStoreBusy:
             return "⏳ Cron store busy — try again in a moment."
+        # SEL audit: single delete records the affected job and outcome, the
+        # same cron.remove shape PR #5405 introduces for the dashboard/MCP/CLI
+        # single-delete paths (on base, the plural cron.batch_delete is the
+        # only audited removal so far). Written only after the store mutation
+        # settled — a busy store returns above with no mutation to audit.
+        # Exception-contained: the first sel() of a process CONSTRUCTS the log
+        # and can raise, and the job is already removed — a completed delete
+        # must not surface as a crashed command because the audit trail is
+        # unavailable.
+        try:
+            sel().log_api_access(
+                caller=user_id or "slack",
+                operation="cron.remove",
+                outcome="allowed" if removed else "not_found",
+                source="slack",
+                resources=f"job_id={job_id}",
+            )
+        except Exception:
+            logger.warning(
+                "SEL audit for Slack cron remove failed (job %s)", job_id, exc_info=True
+            )
         if removed:
             return f"✅ Removed cron job `{job_id}`"
         return f"❌ Job `{job_id}` not found"

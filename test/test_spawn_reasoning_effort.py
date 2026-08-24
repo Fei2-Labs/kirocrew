@@ -22,6 +22,10 @@ import pytest
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.validation import SPAWN_RUN_SCHEMA, ValidationError, validate_tool_args
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 
 def _run_tool(args: dict[str, Any]) -> tuple[list[dict], str]:
     """Run spawn_run and return (POSTed bodies, returned text)."""
