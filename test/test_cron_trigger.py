@@ -14,6 +14,16 @@ from kiro_crew.mcp_cron import _call_tool_inner
 # ── Fixtures ──
 
 
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
+
+
 class _MockDashboardHandler(BaseHTTPRequestHandler):
     """Minimal mock of the dashboard /api/crons/{id}/run endpoint."""
 
@@ -213,13 +223,26 @@ class TestCronTriggerMCP:
         port, cfg_dir = mock_dashboard
         monkeypatch.setenv("KIROCREW_HOME", str(cfg_dir))
         from kiro_crew import mcp_cron
+        from kiro_crew.cron import CronService
+
+        # The ownership gate reads the stored row, so the job has to exist and be
+        # owned by this caller. It used to be reachable without either, because an
+        # unidentified caller was waved through -- which also meant a nonexistent
+        # id could be POSTed to the dashboard.
+        svc = CronService(base_dir=cfg_dir)
+        job = svc.add_job(
+            name="test-job-name",
+            message="go",
+            every_secs=120,
+            session_key="dashboard:conftest-slot",
+        )
         with patch.object(mcp_cron, "config_dir", return_value=cfg_dir), \
              patch.object(
                  mcp_cron, "resolve_serving_port", lambda: port
              ):
-            result = _call_tool_inner("cron_trigger", {"job_id": "abc12345"})
+            result = _call_tool_inner("cron_trigger", {"job_id": job.id})
         assert "test-job-name" in result
-        assert "abc12345" in result
+        assert job.id in result
         assert "executing now" in result
 
     def test_trigger_invalid_id(self, monkeypatch, tmp_path):

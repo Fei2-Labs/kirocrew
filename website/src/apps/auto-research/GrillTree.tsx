@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Check, Circle, Search, Plus, Trash2, HelpCir
 import { GrillNode, GrillAction, nodeDepth } from './grillTreeModel'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 const MAX_DEPTH = 4        // mirrors backend _MAX_GRILL_DEPTH
 const SOFT_LIMIT = 25      // soft "tree getting large" advisory (no hard cap)
 
@@ -26,6 +27,7 @@ function AutoGrow({ value, onChange, onSubmit, placeholder, className = '', aria
   ariaLabel?: string
 }) {
   const ref = useRef<HTMLTextAreaElement>(null)
+  const ime = useImeGuard()
   useEffect(() => {
     const el = ref.current
     if (el) { el.style.height = 'auto'; el.style.height = `${el.scrollHeight}px` }
@@ -34,7 +36,8 @@ function AutoGrow({ value, onChange, onSubmit, placeholder, className = '', aria
     <textarea ref={ref} rows={1} aria-label={ariaLabel} placeholder={placeholder}
               className={`resize-none overflow-hidden ${className}`}
               value={value} onChange={e => onChange(e.target.value)}
-              onKeyDown={e => { if (onSubmit && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit(value) } }} />
+              {...ime.bindComposition<HTMLTextAreaElement>()}
+              onKeyDown={e => { if (onSubmit && e.key === 'Enter' && !e.shiftKey && ime.claimEnter(e)) onSubmit(value) }} />
   )
 }
 
@@ -107,7 +110,7 @@ export default function GrillTree({ tree, dispatch, onExpand }: Props) {
           ) : <span className="text-warn mt-0.5">◆</span>}
 
           {node.kind === 'research' ? (
-            <AutoGrow className="flex-1 bg-transparent text-text border-b border-transparent focus:border-border outline-none"
+            <AutoGrow className="flex-1 bg-transparent text-text border-b border-transparent focus-visible:border-border outline-none"
                       ariaLabel={i18nT('apps.autoResearch.grillTree.research_question')}
                       value={node.text} onChange={t => dispatch({ type: 'edit', id: node.id, text: t })} />
           ) : <span className="flex-1 text-text">{node.text}</span>}

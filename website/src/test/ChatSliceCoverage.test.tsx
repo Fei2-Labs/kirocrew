@@ -1211,6 +1211,36 @@ describe('chatSlice thunks', () => {
     expect(chat(store).creatingSlot).toBe(false)
   })
 
+  // An activated create must not publish the slot until the server has
+  // recorded the project: anything observing the optimistic slot earlier
+  // (a roster fetch keyed to it, a turn sent into it) would run against the
+  // default checkout, and a roster cached under the optimistic (slot, project)
+  // identity would never refetch.
+  it('scopes an activated create before publishing the slot', async () => {
+    apiMock.createChatSlot.mockResolvedValue({ key: 'fg-slot' })
+    apiMock.deleteChatSlot.mockResolvedValue({})
+    const store = makeStore()
+    apiMock.chatSlotProject.mockImplementation(async () => {
+      expect(root(store).dashboard.slots.map(s => s.key)).not.toContain('fg-slot')
+      return {}
+    })
+    await store.dispatch(createSlot({ project: '/tmp/wt' }))
+    expect(apiMock.chatSlotProject).toHaveBeenCalledWith('fg-slot', '/tmp/wt')
+    expect(root(store).dashboard.slots.map(s => s.key)).toContain('fg-slot')
+  })
+
+  it('deletes an unscoped activated session rather than publishing it', async () => {
+    apiMock.createChatSlot.mockResolvedValue({ key: 'fg-slot' })
+    apiMock.chatSlotProject.mockRejectedValue(new Error('scope failed'))
+    apiMock.deleteChatSlot.mockResolvedValue({})
+    const store = makeStore()
+    const result = await store.dispatch(createSlot({ project: '/tmp/wt' }))
+    expect(result.type).toBe('chat/createSlot/rejected')
+    expect(apiMock.deleteChatSlot).toHaveBeenCalledWith('fg-slot')
+    expect(root(store).dashboard.slots.map(s => s.key)).not.toContain('fg-slot')
+    expect(chat(store).creatingSlot).toBe(false)
+  })
+
   it('resyncs the slots list when a delete fails on the server', async () => {
     apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
     apiMock.deleteChatSlot.mockRejectedValue(new Error('500'))
@@ -1242,7 +1272,7 @@ describe('chatSlice thunks', () => {
     await Promise.resolve()
 
     // The peer's transcript is still in flight...
-    expect(apiMock.chatSlotDetail).toHaveBeenCalledWith('peer')
+    expect(apiMock.chatSlotDetail).toHaveBeenCalledWith('peer', expect.any(Number))
     // ...yet the tab is already gone and focus already moved.
     expect(root(store).dashboard.slots.map(s => s.key)).not.toContain('doomed')
     expect(chat(store).activeSlot).toBe('peer')

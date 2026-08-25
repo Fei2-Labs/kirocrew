@@ -69,17 +69,17 @@ describe('useImeGuard', () => {
     expect(result.current.isComposing(key())).toBe(false)
   })
 
-  it('the composition binding carries the latch recovery, and composes a caller onBlur', () => {
+  it('the composition binding carries the latch recovery, and composes caller handlers', () => {
     // There is no recovery-less binding to pick. A composition abandoned without a
     // `compositionend` latches the guard, and since claimEnter consumes what it
     // declines, a surface missing the reset stops sending SILENTLY. Shipping the reset
     // with the tracking is what makes that unreachable rather than merely documented.
-    // A caller's own blur handler is composed, never replaced — the earlier shape,
+    // A caller's own blur/focus handler is composed, never replaced — the earlier shape,
     // where a consumer spread the binding and then declared its own `onBlur`, dropped
     // the reset without a word.
     const { result } = renderHook(() => useImeGuard())
     expect(Object.keys(result.current.bindComposition()).sort())
-      .toEqual(['onBlur', 'onCompositionEnd', 'onCompositionStart'])
+      .toEqual(['onBlur', 'onCompositionEnd', 'onCompositionStart', 'onFocus'])
 
     const onBlur = vi.fn()
     const bound = result.current.bindComposition<HTMLTextAreaElement>({ onBlur })
@@ -88,6 +88,22 @@ describe('useImeGuard', () => {
     act(() => bound.onBlur({} as React.FocusEvent<HTMLTextAreaElement>))
     expect(result.current.isComposing(key())).toBe(false)
     expect(onBlur).toHaveBeenCalledTimes(1)
+  })
+
+  it('the composition binding resets a stale latch on focus, and composes a caller onFocus', () => {
+    // One hook instance is routinely shared across sibling inputs. A latch stranded
+    // by the previous element (composition abandoned mid-flight) must not decline
+    // the first Enter on the next one, so the reset rides in the binding's onFocus
+    // — the site-level `onFocus={() => ime.reset()}` copies this replaces could be
+    // dropped by omission on a new consumer.
+    const { result } = renderHook(() => useImeGuard())
+    const onFocus = vi.fn()
+    const bound = result.current.bindComposition<HTMLInputElement>({ onFocus })
+    act(() => result.current.onCompositionStart())
+    expect(result.current.isComposing(key())).toBe(true)
+    act(() => bound.onFocus({} as React.FocusEvent<HTMLInputElement>))
+    expect(result.current.isComposing(key())).toBe(false)
+    expect(onFocus).toHaveBeenCalledTimes(1)
   })
 
   it('clears pending timer on unmount (no stale timer callbacks after teardown)', () => {
@@ -124,6 +140,19 @@ describe('useImeGuard', () => {
       expect(result.current.isComposing(key())).toBe(false)
       // user callback still invoked
       expect(onBlur).toHaveBeenCalledTimes(1)
+    })
+
+    it('onFocus resets a stale latch AND forwards user callback', () => {
+      const onFocus = vi.fn()
+      const { result } = renderHook(() => useImeGuard())
+      act(() => result.current.onCompositionStart())
+      expect(result.current.isComposing(key())).toBe(true)
+
+      const props = result.current.bindEnter<HTMLInputElement>({ onFocus })
+      act(() => props.onFocus({} as React.FocusEvent<HTMLInputElement>))
+
+      expect(result.current.isComposing(key())).toBe(false)
+      expect(onFocus).toHaveBeenCalledTimes(1)
     })
 
     it('Escape resets composingRef BEFORE invoking onEscape (order matters)', () => {
@@ -248,6 +277,82 @@ describe('useImeGuard', () => {
         expect(after.preventDefault).toHaveBeenCalledTimes(1)
       } finally {
         vi.useRealTimers()
+      }
+    })
+  })
+
+  describe('claimKey (synthetic delegate onto the instance latch)', () => {
+    // The delegate hands e.nativeEvent to ImeLatch.claimKey, so consumption
+    // happens on the NATIVE half: stopPropagation always on a decline,
+    // preventDefault only when both native signals are clear (the tracked
+    // latch window). The delegate itself stops the SYNTHETIC propagation on
+    // a decline — React walks its own flag for component ancestors, which
+    // the native call does not set. An ACCEPTED key is left untouched —
+    // unlike claimEnter, the caller consumes it as part of acting (a trap's
+    // own preventDefault).
+    const tabKey = (opts: { isComposing?: boolean; keyCode?: number } = {}) => {
+      const preventDefault = vi.fn()
+      const stopPropagation = vi.fn()
+      const syntheticStopPropagation = vi.fn()
+      const e = {
+        stopPropagation: syntheticStopPropagation,
+        nativeEvent: {
+          isComposing: opts.isComposing ?? false,
+          keyCode: opts.keyCode ?? 9,
+          preventDefault,
+          stopPropagation,
+        },
+      } as unknown as React.KeyboardEvent
+      return { e, preventDefault, stopPropagation, syntheticStopPropagation }
+    }
+
+    it('reports true and leaves the key untouched when no composition is in flight', () => {
+      const { result } = renderHook(() => useImeGuard())
+      const { e, preventDefault, stopPropagation, syntheticStopPropagation } = tabKey()
+      expect(result.current.claimKey(e)).toBe(true)
+      expect(preventDefault).not.toHaveBeenCalled()
+      expect(stopPropagation).not.toHaveBeenCalled()
+      expect(syntheticStopPropagation).not.toHaveBeenCalled()
+    })
+
+    it('declines and consumes inside the tracked-latch window (native signals clear)', () => {
+      // The WebKit hazard: the committing keydown arrives after compositionend
+      // with isComposing already false, so only the latch can see it — and the
+      // browser WOULD act on it, so the decline must own both halves.
+      vi.useFakeTimers()
+      try {
+        const { result } = renderHook(() => useImeGuard())
+        act(() => {
+          result.current.onCompositionStart()
+          result.current.onCompositionEnd()
+        })
+        const { e, preventDefault, stopPropagation, syntheticStopPropagation } = tabKey()
+        expect(result.current.claimKey(e)).toBe(false)
+        expect(preventDefault).toHaveBeenCalledTimes(1)
+        expect(stopPropagation).toHaveBeenCalledTimes(1)
+        expect(syntheticStopPropagation).toHaveBeenCalledTimes(1)
+
+        act(() => { vi.advanceTimersByTime(50) })
+        const after = tabKey()
+        expect(result.current.claimKey(after.e)).toBe(true)
+        expect(after.preventDefault).not.toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('declines a mid-composition key without cancelling its default action', () => {
+      // A native signal set means the browser is consuming the key for the
+      // IME itself (candidate navigation, or the commit) — cancelling that
+      // would eat the user's composition. Propagation still stops on BOTH
+      // halves: the key is not the caller's, and not any ancestor's either.
+      const { result } = renderHook(() => useImeGuard())
+      for (const opts of [{ isComposing: true }, { keyCode: 229 }]) {
+        const { e, preventDefault, stopPropagation, syntheticStopPropagation } = tabKey(opts)
+        expect(result.current.claimKey(e)).toBe(false)
+        expect(preventDefault).not.toHaveBeenCalled()
+        expect(stopPropagation).toHaveBeenCalledTimes(1)
+        expect(syntheticStopPropagation).toHaveBeenCalledTimes(1)
       }
     })
   })

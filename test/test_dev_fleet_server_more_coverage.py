@@ -143,6 +143,9 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(mod, "_LIVE_CHECK_AT", 0.0)
     monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
     monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+    # Shutdown admission state: each test starts with a clean (non-shutdown) process.
+    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
 
 
 # --------------------------------------------------------------------------
@@ -378,8 +381,10 @@ async def test_pr_query_one_none_on_empty_result(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pr_query_one_moves_body_to_internal_key(monkeypatch):
-    """``body`` becomes ``_body`` so _redact_pr drops it from the payload."""
-    payload = json.dumps([{"number": 7, "state": "OPEN", "body": None}])
+    """Body and head identity become internal fields omitted from the payload."""
+    payload = json.dumps([
+        {"number": 7, "state": "OPEN", "body": None, "headRefOid": "a" * 40}
+    ])
     seen = _run_cmd_queue(monkeypatch, [(0, payload, "")])
 
     pr = await mod._pr_query_one("o/r", "feat/x")
@@ -387,7 +392,9 @@ async def test_pr_query_one_moves_body_to_internal_key(monkeypatch):
     assert pr is not None
     assert pr["_repo"] == "o/r"
     assert pr["_body"] == ""
+    assert pr["_head_oid"] == "a" * 40
     assert "body" not in pr
+    assert "headRefOid" not in pr
     assert "--head" in seen[0] and "feat/x" in seen[0]
 
 
@@ -1188,3 +1195,163 @@ async def test_gateway_service_active_false_when_foreground_confined(monkeypatch
     monkeypatch.setattr(mod, "_foreground_backend", lambda: pytest.fail("not eligible"))
 
     assert await mod._gateway_service_active() is False
+
+
+# --- stale sync lock race (issue #4906) ---
+
+
+@pytest.mark.asyncio
+async def test_sync_allows_new_run_when_prior_task_done_but_status_stale(monkeypatch):
+    """When the subprocess has exited (proc.returncode is not None) but _RUNS
+    status is still 'running' (stale due to a lock-acquisition race), _sync()
+    should await the task briefly, then allow a new sync."""
+    import asyncio
+
+    # Simulate a completed task with a process that has already exited
+    done_task = asyncio.ensure_future(asyncio.sleep(0))
+    await done_task  # let it complete
+
+    # Mock a subprocess whose returncode signals exit
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0  # process exited
+
+    old_rid = "stale-run-001"
+    monkeypatch.setattr(mod, "_SYNC_RID", old_rid)
+    monkeypatch.setattr(mod, "_SYNC_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS", {
+        old_rid: {"status": "running", "exit_code": None, "output": []},
+    })
+    # Task done + proc.returncode set — simulates the race window
+    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {old_rid: (done_task, mock_proc)})
+
+    # _sync_start_locked would normally start a new sync; mock it to confirm
+    # we reach it (rather than getting the 'already running' refusal)
+    new_rid = "new-run-002"
+    monkeypatch.setattr(mod, "_sync_start_locked", AsyncMock(
+        return_value={"ok": True, "run_id": new_rid}
+    ))
+
+    result = await mod._sync()
+    assert result["ok"] is True
+    assert result["run_id"] == new_rid
+
+
+@pytest.mark.asyncio
+async def test_sync_refuses_when_task_genuinely_running(monkeypatch):
+    """When the subprocess is still alive (proc.returncode is None), _sync()
+    should correctly refuse."""
+    import asyncio
+
+    # A task that hasn't completed yet
+    never_done = asyncio.get_event_loop().create_future()
+    running_task = asyncio.ensure_future(never_done)
+
+    # Mock a subprocess still running
+    mock_proc = MagicMock()
+    mock_proc.returncode = None  # process still alive
+
+    old_rid = "active-run-001"
+    monkeypatch.setattr(mod, "_SYNC_RID", old_rid)
+    monkeypatch.setattr(mod, "_SYNC_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS", {
+        old_rid: {"status": "running", "exit_code": None, "output": []},
+    })
+    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {old_rid: (running_task, mock_proc)})
+
+    result = await mod._sync()
+    assert result["ok"] is False
+    assert "already running" in result["error"]
+    assert result["run_id"] == old_rid
+
+    # Cleanup
+    never_done.set_result(None)
+    await running_task
+
+
+@pytest.mark.asyncio
+async def test_sync_allows_new_run_when_task_absent_from_active_runs(monkeypatch):
+    """When the run is not in _ACTIVE_RUNS at all (task completed and was
+    cleaned up by done_callback), _sync() should allow a new sync."""
+    import asyncio
+
+    old_rid = "gone-run-001"
+    monkeypatch.setattr(mod, "_SYNC_RID", old_rid)
+    monkeypatch.setattr(mod, "_SYNC_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS", {
+        old_rid: {"status": "running", "exit_code": None, "output": []},
+    })
+    # Empty — task was already cleaned up by done_callback
+    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {})
+
+    monkeypatch.setattr(mod, "_sync_start_locked", AsyncMock(
+        return_value={"ok": True, "run_id": "fresh-run"}
+    ))
+
+    result = await mod._sync()
+    assert result["ok"] is True
+    assert result["run_id"] == "fresh-run"
+
+
+@pytest.mark.asyncio
+async def test_sync_proc_not_yet_spawned_refuses(monkeypatch):
+    """When the active entry has proc=None (subprocess not yet spawned),
+    _sync() should refuse — the sync is genuinely starting up."""
+    import asyncio
+
+    never_done = asyncio.get_event_loop().create_future()
+    running_task = asyncio.ensure_future(never_done)
+
+    old_rid = "spawning-run-001"
+    monkeypatch.setattr(mod, "_SYNC_RID", old_rid)
+    monkeypatch.setattr(mod, "_SYNC_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS", {
+        old_rid: {"status": "running", "exit_code": None, "output": []},
+    })
+    # proc=None means subprocess hasn't been spawned yet
+    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {old_rid: (running_task, None)})
+
+    result = await mod._sync()
+    assert result["ok"] is False
+    assert "already running" in result["error"]
+
+    # Cleanup
+    never_done.set_result(None)
+    await running_task
+
+
+@pytest.mark.asyncio
+async def test_sync_refuses_when_worker_cleanup_times_out(monkeypatch):
+    """When the process exited but the worker task does not complete within
+    the 2s bounded wait (cleanup is slow), _sync() should refuse rather
+    than starting a concurrent sync against the same worktree."""
+    import asyncio
+
+    # A task that will NOT complete within 2s (simulates slow cleanup)
+    never_done = asyncio.get_event_loop().create_future()
+    slow_task = asyncio.ensure_future(never_done)
+
+    # Mock a subprocess that has exited (returncode set)
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    old_rid = "slow-cleanup-001"
+    monkeypatch.setattr(mod, "_SYNC_RID", old_rid)
+    monkeypatch.setattr(mod, "_SYNC_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS_LOCK", asyncio.Lock())
+    monkeypatch.setattr(mod, "_RUNS", {
+        old_rid: {"status": "running", "exit_code": None, "output": []},
+    })
+    # Process exited but task won't finish (simulating slow cleanup)
+    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {old_rid: (slow_task, mock_proc)})
+
+    result = await mod._sync()
+    assert result["ok"] is False
+    assert "already running" in result["error"]
+
+    # Cleanup
+    never_done.set_result(None)
+    await slow_task

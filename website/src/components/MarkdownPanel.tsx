@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router-dom'
 import { RefreshCw, Ellipsis, ChevronRight, Columns2, Hash, WrapText, FoldVertical, Maximize2, Minimize2, MessageSquare, MessageSquarePlus, Copy, BookOpen, BookmarkPlus, Camera, Check, X, Component, FileText, FileDiff, Folders, TriangleAlert, CaseSensitive, ChevronUp, ChevronDown } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import DetailPanel from './DetailPanel'
+import { useConfirm } from './ConfirmDialog'
 import Clickable from './Clickable'
 import { CommentPopover, CommentList, formatCommentsMessage, type InlineComment } from './CommentOverlay'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -175,6 +176,10 @@ interface Props {
   filePath: string
   content: string
   onContentChange: (c: string) => void
+  /** Disk-originated content (file watch, Refresh). Document tabs restamp
+   *  their saved baseline here so a re-open still treats the tab as clean;
+   *  omitted by other hosts, which fall back to onContentChange. */
+  onDiskContent?: (c: string) => void
   onSave: (filePath: string, content: string) => Promise<void>
   onClose: () => void
   liveWatch?: boolean
@@ -213,10 +218,17 @@ interface Props {
   /** Called once a reveal has landed, so the owner can drop the target and keep
    *  it a true one-shot. */
   onRevealConsumed?: () => void
+  /** Stable cross-remount identity (slot + tab id) for the embedded body's
+   *  scroll position — a chat-slot switch unmounts the whole tab body, and
+   *  this is what lets the document come back where the user left it (see
+   *  `useScrollMemory`). Omitted by hosts without that lifecycle. */
+  scrollMemoryKey?: string
 }
 
 import { PierreFilePair, type PierreEditorHandle, type RevealTarget } from '../pierre'
 import { i18nT } from '../i18n/t'
+import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
+import { useScrollMemory } from '../hooks/useScrollMemory'
 
 /**
  * File types that render through a dedicated viewer instead of a text editor.
@@ -817,7 +829,8 @@ export interface MarkdownPanelHandle {
   requestNavigate: (nav: (stillClean: () => boolean) => void) => void
 }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onSave, onClose, liveWatch, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
+  const ime = useImeGuard()
   const qc = useQueryClient()
   // Code files (non-rich, non-markdown) have no meaningful preview — their
   // "preview" was just a read-only render of the same text. They open
@@ -866,6 +879,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // the moment they are about to discard the buffer.
   const dirtyRef = useRef(dirty)
   dirtyRef.current = dirty
+  const { confirm, confirmDialog, confirmOpen } = useConfirm()
   // When a saved baseline is provided (inline preview), keep `dirty` derived
   // from content-vs-disk so a RESTORED draft is dirty and the close guard fires.
   // No-op for document tabs (savedBaseline undefined) — they keep the manual
@@ -943,6 +957,12 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   const [refreshing, setRefreshing] = useState(false)
   const [hintDismissed, setHintDismissed] = useState(() => localStorage.getItem(HINT_KEY) === '1')
   const [fullscreen, setFullscreen] = useState(false)
+  // Shared IME latch for the full-screen preview's Tab trap: a Tab that lands
+  // during an IME composition (or its post-`compositionend` window) is
+  // choosing a candidate, not leaving the field, so the trap must decline it
+  // instead of yanking focus and aborting the composition
+  // (`useDialogFocusTrap` is the reference consumer of the same seam).
+  const fsImeLatch = useDocumentImeLatch(fullscreen)
   const fileName = filePath.split('/').pop() || filePath
   // Artifact + knowledge state power the header star/knowledge toggles and
   // the ⋯ menu's Snapshot entry (same query cache as the OverflowMenu's own
@@ -951,6 +971,16 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   const artifactState = useFileArtifactState(filePath, content)
   const previewRef = useRef<HTMLDivElement>(null)
   const sidePanelScrollRef = useRef<HTMLDivElement>(null)
+  // Cross-remount scroll memory for the embedded (side-panel) scroll box —
+  // a chat-slot switch unmounts the whole tab body. A pending line reveal is
+  // an explicit scroll target that outranks memory, so its presence at first
+  // ready suppresses the restore for this mount; recording continues.
+  const scrollMemory = useScrollMemory(
+    scrollMemoryKey,
+    sidePanelScrollRef,
+    content !== '',
+    { suppressRestore: !!revealLine },
+  )
   const fullscreenPreviewRef = useRef<HTMLDivElement>(null)
   const fullscreenBodyRef = useRef<HTMLDivElement>(null)
   const ext = extOf(filePath)
@@ -1095,14 +1125,15 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   }, [editing, diffMode, isMarkdown])
 
   const findBar = findOpen ? (
-    <div data-mc-mdpanel className="absolute top-2 right-3 z-30 flex items-center gap-1.5 bg-bg-elevated border border-border rounded-lg shadow-md px-2.5 py-1.5 text-[13px]">
+    <div data-mc-mdpanel className="absolute top-2 right-3 z-30 flex items-center gap-1.5 bg-bg-elevated border border-border focus-within:border-accent rounded-lg shadow-md px-2.5 py-1.5 text-[13px]">
       <input
         ref={findInputRef}
         type="text"
         value={findTerm}
         onChange={(e) => setFindTerm(e.target.value)}
+        {...ime.bindComposition()}
         onKeyDown={(e) => {
-          if (e.key === 'Enter') { e.preventDefault(); stepFind(e.shiftKey ? -1 : 1) }
+          if (e.key === 'Enter') { if (!ime.claimEnter(e)) return; stepFind(e.shiftKey ? -1 : 1) }
           if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeFind() }
         }}
         placeholder={i18nT('components.markdownPanel.find_in_document')}
@@ -1122,7 +1153,10 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
 
   useFileWatch(
     liveWatch && !editing && !dirty ? filePath : null,
-    useCallback((c: string) => { onContentChange(c) }, [onContentChange]),
+    // A watch-fired change IS the disk truth, so route it through
+    // onDiskContent when the host can restamp its saved baseline; falling
+    // back to onContentChange keeps non-tab hosts unchanged.
+    useCallback((c: string) => { (onDiskContent ?? onContentChange)(c) }, [onDiskContent, onContentChange]),
   )
 
 
@@ -1162,10 +1196,16 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       if (onRefresh) { await onRefresh(filePath) }
       else {
         const res = await fetch(fileReadUrl(filePath))
-        if (res.ok) onContentChange(await res.text())
+        if (!res.ok) return
+        const text = await res.text()
+        // The read is async, and the dirty check above ran at click time:
+        // anything typed while it was in flight made the buffer dirty, and
+        // these disk bytes must not clobber that work.
+        if (dirtyRef.current) return
+        ;(onDiskContent ?? onContentChange)(text)
       }
     } finally { setRefreshing(false) }
-  }, [filePath, onContentChange, onRefresh, refreshing, dirty])
+  }, [filePath, onContentChange, onDiskContent, onRefresh, refreshing, dirty])
 
   // Discard pending edits (matches the artifact detail page's Cancel button).
   // Re-reads the file from disk into the buffer, clearing dirty. Confirms first
@@ -1174,18 +1214,25 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   const canPreview = isMarkdown
   const handleCancel = useCallback(async () => {
     if (!dirty) { if (canPreview) setEditing(false); return }
-    if (!window.confirm(i18nT('components.markdownPanel.discard_unsaved_changes'))) return
+    if (!(await confirm({
+      title: i18nT('components.markdownPanel.discard_unsaved_changes'),
+      confirmLabel: i18nT('components.markdownPanel.discard_changes_button'),
+    }))) return
     setRefreshing(true)
     try {
       if (onRefresh) { await onRefresh(filePath) }
       else {
         const res = await fetch(fileReadUrl(filePath))
-        if (res.ok) onContentChange(await res.text())
+        // Cancel means "match the disk", so the re-read moves the saved
+        // baseline too (onDiskContent), the same as Refresh — otherwise the
+        // stale baseline could later read a deliberate edit back to it as
+        // clean and let a close discard that work.
+        if (res.ok) (onDiskContent ?? onContentChange)(await res.text())
       }
       setDirty(false)
       if (canPreview) setEditing(false)
     } finally { setRefreshing(false) }
-  }, [dirty, filePath, onContentChange, onRefresh, canPreview])
+  }, [dirty, filePath, onContentChange, onDiskContent, onRefresh, canPreview, confirm])
 
   const resolveSelectionCoords = useCallback((fallbackText?: string) => {
     const sel = window.getSelection()
@@ -1512,10 +1559,13 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     return () => ro.disconnect()
   }, [])
 
-  const guardedClose = useCallback(() => {
-    if (dirty && !window.confirm(i18nT('components.markdownPanel.discard_unsaved_changes'))) return
+  const guardedClose = useCallback(async () => {
+    if (dirty && !(await confirm({
+      title: i18nT('components.markdownPanel.discard_unsaved_changes'),
+      confirmLabel: i18nT('components.markdownPanel.discard_changes_button'),
+    }))) return
     onClose()
-  }, [dirty, onClose])
+  }, [dirty, onClose, confirm])
   const guardedNavigate = useCallback((nav: (stillClean: () => boolean) => void) => {
     // Navigation never destroys this buffer, so there is nothing to confirm: a
     // dirty tab is left exactly as it is and the new file opens as its own tab.
@@ -1531,16 +1581,26 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // Expose the guarded close so an external control (e.g. the Files-tab inline
   // preview's "Back to files" bar) routes through the same dirty confirmation
   // instead of unmounting the editor and silently dropping unsaved edits.
-  useImperativeHandle(ref, () => ({ requestClose: guardedClose, requestNavigate: guardedNavigate }), [guardedClose, guardedNavigate])
+  // `requestClose` deliberately swallows guardedClose's promise: the handle's
+  // contract is fire-and-forget (() => void), and an imperative caller that
+  // received the promise could `act()` on it un-awaited and wedge React's act
+  // scope in tests — the close outcome is observable via onClose only.
+  useImperativeHandle(ref, () => ({ requestClose: () => { void guardedClose() }, requestNavigate: guardedNavigate }), [guardedClose, guardedNavigate])
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
+      // While the discard-confirm dialog is open, the keyboard belongs to it.
+      // Escape dismisses it via the dialog's own handler (re-running the guard
+      // here would re-open the dialog the same keystroke just closed), and the
+      // save shortcut must not fire — a mid-dialog Cmd+S would persist the very
+      // draft the user is about to confirm discarding.
+      if (confirmOpen) return
       if (e.key === 'Escape') { if (popover) { setPopover(null); clearHighlightMarks() } else if (fullscreen) setFullscreen(false); else guardedClose() }
       if ((e.metaKey || e.ctrlKey) && e.key === 's' && editing && dirty) { e.preventDefault(); handleSaveRef.current() }
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)
-  }, [guardedClose, editing, dirty, fullscreen, popover, clearHighlightMarks])
+  }, [guardedClose, editing, dirty, fullscreen, popover, clearHighlightMarks, confirmOpen])
 
   const handleChange = useCallback((v: string) => { onContentChange(v); setDirty(true) }, [onContentChange])
   const clearPopover = useCallback(() => { setPopover(null); clearHighlightMarks() }, [clearHighlightMarks])
@@ -1689,7 +1749,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           {/* In markdown preview the scroll box runs flush to the panel's right
               border so the overlay scrollbar and outline rail share that edge;
               pr-6 keeps the text clear of the ticks. */}
-          <div ref={sidePanelScrollRef} className={`flex-1 min-h-0 overflow-auto ${isMarkdown && !editing ? 'scrollbar-overlay pr-6' : ''}`}>
+          <div ref={sidePanelScrollRef} onScroll={scrollMemory.onScroll} className={`flex-1 min-h-0 overflow-auto ${isMarkdown && !editing ? 'scrollbar-overlay pr-6' : ''}`}>
             {zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
             {!zeroDiff && !diffChecking && !isRichType && (
               <DiffViewBlock flush sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />
@@ -1717,9 +1777,29 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       // The onKeyDown here implements a focus trap for the modal dialog; a
       // role="dialog"/aria-modal container legitimately owns keyboard handling.
       // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-      <div className="fixed inset-0 z-[9999] bg-bg flex flex-col" role="dialog" aria-modal="true" aria-label={i18nT('components.markdownPanel.full_screen_file_preview')}
+      <div className="fixed inset-0 z-[9999] bg-bg flex flex-col p-safe" role="dialog" aria-modal="true" aria-label={i18nT('components.markdownPanel.full_screen_file_preview')}
         ref={el => { if (el && !el.dataset.focused) { el.dataset.focused = '1'; const first = el.querySelector<HTMLElement>('button:not([disabled]),textarea,input,a[href],select,[tabindex]:not([tabindex="-1"])'); first?.focus() } }}
-        onKeyDown={e => { if (e.key === 'Tab') { const focusable = e.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]),textarea,input,a[href],select,[tabindex]:not([tabindex="-1"])'); if (focusable.length === 0) return; const first = focusable[0], last = focusable[focusable.length - 1]; if (e.shiftKey) { if (document.activeElement === first) { e.preventDefault(); last.focus() } } else { if (document.activeElement === last) { e.preventDefault(); first.focus() } } } }}>
+        onKeyDown={e => {
+          if (e.key !== 'Tab') return
+          const focusable = e.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]),textarea,input,a[href],select,[tabindex]:not([tabindex="-1"])')
+          if (focusable.length === 0) return
+          const first = focusable[0], last = focusable[focusable.length - 1]
+          const wrapsBackward = e.shiftKey && document.activeElement === first
+          const wrapsForward = !e.shiftKey && document.activeElement === last
+          // A mid-dialog Tab is the browser's to move, and not the trap's to
+          // claim. A boundary Tab the IME owns must not cycle focus — the user
+          // is choosing a candidate, not leaving the field — so `claimKey`
+          // (native-event contract in useImeGuard.ts) runs before the
+          // preventDefault() and focus move.
+          if (!wrapsBackward && !wrapsForward) return
+          // `claimKey` consumes the native event (document/window listeners),
+          // but React 17+ checks the SYNTHETIC propagation flag when walking
+          // component ancestors — stop that half too so a declined Tab cannot
+          // trigger an ancestor's own keyboard handling.
+          if (!fsImeLatch.claimKey(e.nativeEvent)) { e.stopPropagation(); return }
+          e.preventDefault()
+          ;(wrapsBackward ? last : first).focus()
+        }}>
 
         {/* Header — pl-20 clears macOS traffic-light buttons */}
         <div className="flex items-center justify-between pl-20 pr-6 h-12 shrink-0 border-b border-border">
@@ -1759,6 +1839,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
       </div>,
       document.body
     )}
+    {confirmDialog}
     </>
   )
 }))

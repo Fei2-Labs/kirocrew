@@ -79,30 +79,15 @@ def _get_app(route: str, handler) -> web.Application:
 # ── /api/file-read ──
 
 
-# Every test below that hands a real `tmp_path` to the file-read/write/watch
-# endpoints is POSIX-only, because the PRODUCT rejects native Windows paths
-# before any branch under test is reached: FILE_READ_SCHEMA / FILE_WRITE_SCHEMA
-# in validation.py pin `path` to `^[~/][-\w.@~/ ]+$`, which admits neither the
-# `C:` drive prefix nor a backslash separator. A Windows tmp_path like
-# `C:\Users\runneradmin\AppData\Local\Temp\pytest-...` therefore 400s as
-# "invalid input" no matter what the endpoint would otherwise do.
-#
-# This is the same defect class as deploy's `_LOCAL_DIR_RE` (reported from the
-# first coverage wave): a POSIX-shaped allowlist guarding a path that reaches
-# real file I/O. Widening it is security-relevant and belongs in its own
-# reviewed change, NOT in a coverage PR -- so these classes are skipped on
-# win32 and will start covering Windows for free once the schema is fixed.
-_WINDOWS_PATH_DEFECT = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason=(
-        "FILE_READ/WRITE_SCHEMA reject native Windows paths (no drive letter or "
-        "backslash in the allowed pattern), so every request 400s before the "
-        "branch under test -- product defect, not a test defect"
-    ),
-)
-
-
-@_WINDOWS_PATH_DEFECT
+# Every test below hands a real `tmp_path` to the file-read/write/watch
+# endpoints, so it exercises a native Windows path on Windows and a POSIX one
+# elsewhere. That works because `_FS_PATH_PATTERN` in validation.py -- the
+# syntax gate FILE_READ_SCHEMA / FILE_WRITE_SCHEMA pin `path` to -- admits the
+# `C:` drive prefix and the backslash separator alongside the POSIX shapes.
+# Before it did, a Windows `tmp_path` like
+# `C:\Users\runneradmin\AppData\Local\Temp\pytest-...` 400'd as "invalid input"
+# ahead of every branch under test, so these three classes were skipped on
+# win32 and the endpoints had no Windows coverage at all.
 class TestFileRead:
     @staticmethod
     def _client_app() -> web.Application:
@@ -257,7 +242,6 @@ class TestFileRead:
 # ── /api/file-write ──
 
 
-@_WINDOWS_PATH_DEFECT
 class TestFileWrite:
     @staticmethod
     def _client_app() -> web.Application:
@@ -433,6 +417,28 @@ class TestFileRaw:
             assert "not a recognized format" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
+    async def test_riff_wave_audio_is_not_served_as_an_image(self, tmp_path, mock_sel):
+        # RIFF alone is not WebP: the shared sniffer checks the form tag at
+        # offset 8, so a WAVE audio file is not a recognized format here.
+        f = tmp_path / "sound.webp"
+        f.write_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 8)
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-raw?path={f}")
+            assert resp.status == 403
+            assert "not a recognized format" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_png_signature_is_not_recognized(self, tmp_path, mock_sel):
+        # The shared sniffer requires PNG's full 8-byte signature; the old
+        # local table matched a 4-byte prefix. Aligning every consumer on the
+        # canonical signature is the point of the de-duplication.
+        f = tmp_path / "trunc.png"
+        f.write_bytes(b"\x89PNGxxxx" + b"\x00" * 8)
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-raw?path={f}")
+            assert resp.status == 403
+
+    @pytest.mark.asyncio
     async def test_forbidden_path_is_400(self, mock_sel):
         with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=None):
             async with TestClient(TestServer(self._client_app())) as client:
@@ -485,7 +491,6 @@ class TestFileRaw:
 # ── /api/file-watch ──
 
 
-@_WINDOWS_PATH_DEFECT
 class TestFileWatch:
     @staticmethod
     def _client_app() -> web.Application:
@@ -1173,6 +1178,27 @@ class TestContentMatchesExt:
         assert files_mod._content_matches_ext(".gif", b"GIF89a")
         assert files_mod._content_matches_ext(".pdf", b"%PDF-1.4")
         assert files_mod._content_matches_ext(".gz", b"\x1f\x8b\x08")
+
+    def test_raster_accept_set_is_unchanged_by_the_shared_sniffer(self):
+        # Snapshot of the accept-set from before the shared-sniffer migration:
+        # every raster extension still accepts its own true signature.
+        accepted = {
+            ".png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
+            ".jpg": b"\xff\xd8\xff\xe0" + b"\x00" * 12,
+            ".jpeg": b"\xff\xd8\xff\xe1" + b"\x00" * 12,
+            ".gif": b"GIF87a" + b"\x00" * 10,
+            ".bmp": b"BM" + b"\x00" * 14,
+            ".webp": b"RIFF\x10\x00\x00\x00WEBPVP8 ",
+        }
+        for ext, payload in accepted.items():
+            assert files_mod._content_matches_ext(ext, payload), ext
+
+    def test_a_riff_wave_payload_is_rejected_for_every_raster_ext(self):
+        # A RIFF/WAVE audio file shares WebP's RIFF prefix; the shared sniffer
+        # checks the form tag at offset 8, so it is not an image of any kind.
+        wave = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 8
+        for ext in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+            assert not files_mod._content_matches_ext(ext, wave), ext
 
     def test_unsignable_extensions_pass_through(self):
         # No reliable magic for text or SVG: the extension allowlist is the gate.

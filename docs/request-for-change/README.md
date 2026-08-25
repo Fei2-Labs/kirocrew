@@ -11,13 +11,19 @@ Last audited **2026-08-03** against main `0ab6ed48`. Every status below was
 verified against the code (definitions *and* callers) and against merged/open PR
 history, not taken from the document's own claims. The `rfc-tailnet-dashboard-access`
 row was added later and re-verified against `429cbad8`, and `rfc-session-address-model`
-was added later still and verified against `b23ab77af`; the other rows have
-not been re-audited since 2026-08-03.
+was added later still and verified against `b23ab77af`; the
+`rfc-everything-is-an-app` and `rfc-amend-tenets-everything-is-an-app` rows
+were added
+2026-08-18 and verified against `e6b06685e`; the other rows have
+not been re-audited since 2026-08-03. The durable-run-coordinator row was added
+2026-08-22 and the orchestrator-chat-sessions row was re-audited at
+`c4f253891`.
 
 | Document | Status | What is actually on main |
 |---|---|---|
+| [rfc-durable-run-coordinator.md](rfc-durable-run-coordinator.md) | `draft` | Nothing. Design and seven-PR additive migration stack only; the existing in-memory manager and run folders remain authoritative |
 | [rfc-issue-radar-crews.md](rfc-issue-radar-crews.md) | `draft` | Nothing. Design of record only; `crew_brief.md` and `crew_ledger_spec.md` sit beside the Issue Radar backend as companion specs, also unimplemented |
-| [rfc-orchestrator-chat-sessions.md](rfc-orchestrator-chat-sessions.md) | `in-progress` | Nothing yet — all of it is in open PR [#1295](https://github.com/kirodotdev/KiroCrew/pull/1295) (`feat/crew-mode`) |
+| [rfc-orchestrator-chat-sessions.md](rfc-orchestrator-chat-sessions.md) | `partial` | Crew Mode shipped in [#1295](https://github.com/kirodotdev/KiroCrew/pull/1295) and has since received store and routing fixes. The implementation deliberately diverges from the RFC in at least three places: no snapshot-generation CAS, no `release` decision action, and immediate per-result delivery instead of burst coalescing |
 | [rfc-channel-plugin-architecture.md](rfc-channel-plugin-architecture.md) | `partial` | Shared turn pipeline shipped; **4 of 7** channels adopted. Registry/seam collapse, telegram+discord, Feishu unstarted. Its §9 address rule is separately half-shipped — audit this row alongside [rfc-session-address-model.md](rfc-session-address-model.md) |
 | [rfc-session-address-model.md](rfc-session-address-model.md) | `partial` | The dashboard half of the channel-plugin RFC's §9 rule 1 shipped ([#1366](https://github.com/kirodotdev/KiroCrew/pull/1366) plus four follow-ups): a chat-app conversation opened in a dashboard tab is no longer copied into a second session, and `has_dashboard_surface` (7 callers) replaced the name-prefix capability tests. All four phases it proposes are unstarted — 23 named key converters and 5 copies of the session-type ladder remain, surface capability is still one boolean, and an unbound channel tab still starts a second session against the same transcript file |
 | [rfc-local-notification-bus.md](rfc-local-notification-bus.md) | `partial` | Phases 1/3/4 complete. Phase 2 wired but has no producer; Phase 5 shipped 2 of 3 |
@@ -25,7 +31,7 @@ not been re-audited since 2026-08-03.
 | [rfc-workspace-config-evolution.md](rfc-workspace-config-evolution.md) | `partial` | Phases 1–2 shipped. Phase 3's vector isolation was **reversed** on purpose; Phase 4 unstarted |
 | [rfc-resumable-subagent-sessions.md](rfc-resumable-subagent-sessions.md) | `partial` | Phase 0 ran and **redirected the design**: continuable conversations shipped instead of the record-store ladder |
 | [rfc-i18n-measurement.md](rfc-i18n-measurement.md) | `partial` | Overflow gate shipped, `localeCompare` migration partial. All three *measurement* proposals unstarted |
-| [rfc-appstore-official-registry.md](rfc-appstore-official-registry.md) | `accepted` | Nothing in this repo. Rollout R1 merged in the sibling `KiroCrewApps` repo |
+| [rfc-appstore-official-registry.md](rfc-appstore-official-registry.md) | `partial` | The official fetch and editorial-driven Discover are live (`apps/official_catalog.py`, `apps/official_editorial.py`); signature verification and tombstone resolution are deliberately absent and fail closed. **§4 diverged** — four of its decisions about categories were reversed in the sibling `KiroCrewApps` repo; the note at its head says which |
 | [rfc-notification-bridge.md](rfc-notification-bridge.md) | `accepted` | Nothing — zero implementation code |
 | [rfc-tips-kit.md](rfc-tips-kit.md) | `draft` | Nothing. T1 was built and **retracted** ([#775](https://github.com/kirodotdev/KiroCrew/pull/775)); the design section needs revising first |
 | [rfc-update-architecture.md](rfc-update-architecture.md) | `draft` | Nothing — zero of three phases |
@@ -38,6 +44,10 @@ not been re-audited since 2026-08-03.
 | [rfc-navigation-placement-seam.md](rfc-navigation-placement-seam.md) | `draft` | Nothing. Verified at `2a665e735`: `UISidebar` ships in the manifest and no frontend code reads `ui.sidebar`; `appNavTarget` still resolves `pages[0]` only, and `registerBuiltinSurface` is not one of the nine edition seams |
 | [rfc-append-only-session-transcript.md](rfc-append-only-session-transcript.md) | `draft` | Nothing. Verified at `2a665e735`: `_save_slot_to_history` still re-serializes the whole in-memory window on every flush, and `rewrite_session` / `sliding_window` still have no production caller |
 | [version-compliance-framework.md](version-compliance-framework.md) | `draft` | Nothing. Framework doc, not an RFC; premise is pre-fork and stale |
+| [rfc-everything-is-an-app.md](rfc-everything-is-an-app.md) | `draft` | Nothing. Phase 0's boundary section is in this document's own branch and not yet merged; the eleven declared-but-unread manifest fields it inventories are all still declared and still unread |
+| [rfc-amend-tenets-everything-is-an-app.md](rfc-amend-tenets-everything-is-an-app.md) | `draft` | Nothing. `TENETS.md` still carries seven tenets on main. `git log --follow` on it shows two commits and no prior amendment, and `grep -i tenet` returns zero hits in `GOVERNANCE.md` |
+| [rfc-crew-projects.md](rfc-crew-projects.md) | `draft` | Nothing. Verified at `5cd92ff99`: no project manifest format exists, `slot.project` is a bare directory path, and `grep -ril "confluence\|servicenow" src/kiro_crew` returns zero hits |
+| [rfc-tool-derived-diff-cards.md](rfc-tool-derived-diff-cards.md) | `in-progress` | Ships with [#5012](https://github.com/kirodotdev/KiroCrew/pull/5012): dashboard diff-card/summary promotion + runtime-selected prompt rule. The messaging `OutputEvent` extension (§3.3) is unstarted |
 
 Nothing in this directory is `implemented` or `superseded` today.
 
@@ -95,7 +105,10 @@ calls out its own, but the patterns are worth knowing before you trust any of th
    what shipped (continuable conversations) is not what the phases below it
    describe. `rfc-workspace-config-evolution.md` had its Phase 3 vector-store
    isolation affirmatively reversed by a later commit. Neither document was
-   revised afterwards.
+   revised afterwards. `rfc-appstore-official-registry.md` is the same pattern
+   caught late but *revised*: four of §4's decisions about categories were
+   reversed as R1 shipped, and the section now opens with a note saying which,
+   so the reasoning survives as a record without still reading as the contract.
 2. **The credit is not the RFC's.** `rfc-i18n-measurement.md` shows `partial`,
    but the proposals that shipped were already in flight under a separate
    program, one of them merging 18 hours before the document did.

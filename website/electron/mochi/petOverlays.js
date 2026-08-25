@@ -111,23 +111,25 @@ function hasBlankedOverlay() {
 
 /**
  * Re-arm every overlay hidden on an error page by reloading it with the
- * (baseUrl, token) the host ALREADY resolved for the current target this
+ * (baseUrl, token, viaCookie) the host ALREADY resolved for the current target this
  * reconcile tick. The host owns target resolution AND switches, so this takes
  * concrete values rather than resolving again — no provider seam, no retry
  * budget, and no superseded-window race (the reload is synchronous inside the
- * tick). An empty token means no usable credential yet: stay blank and let the
- * next tick try. Recovering an expired cookie and a transient 5xx share this one
- * path.
+ * tick). A minted credential goes on the URL; a borrowed session uses the
+ * overlay's default BrowserWindow session. An absent credential means stay
+ * blank and let the next tick try. Recovering an expired cookie and a transient
+ * 5xx share this one path.
  */
-function rearmBlankedOverlays(baseUrl, token) {
-  if (!baseUrl || !token) return;
+function rearmBlankedOverlays(baseUrl, token, viaCookie = false) {
+  if (!baseUrl || (!token && !viaCookie)) return;
+  const pageToken = viaCookie ? "" : token;
   for (const [, win] of overlays) {
     if (win.isDestroyed() || !overlayBlanked.has(win)) continue;
     // Refresh the shared target so overlays built LATER for other displays load
     // the same fresh origin + token.
     currentBaseUrl = baseUrl;
-    currentToken = token;
-    win.loadURL(mochiPageUrl(currentBaseUrl, "pet.html", token));
+    currentToken = pageToken;
+    win.loadURL(mochiPageUrl(currentBaseUrl, "pet.html", pageToken));
   }
 }
 
@@ -182,6 +184,19 @@ let currentBaseUrl = "";
 let currentToken = "";
 let ipcBound = false;
 let displayListenersBound = false;
+/**
+ * Synchronized hide-all policy; index.js remains authoritative because its
+ * toggle also owns the panel window's visibility.
+ */
+let petWindowsHidden = false;
+
+function canRevealOverlay(win) {
+  return !petWindowsHidden && !overlayBlanked.has(win);
+}
+
+function setPetWindowsHidden(hidden) {
+  petWindowsHidden = Boolean(hidden);
+}
 
 /** @type {{x:number,y:number,w:number,h:number}|null} */
 let petHitbox = null;
@@ -657,6 +672,13 @@ function createOverlayForDisplay(display) {
     hasShadow: false,
     enableLargerThanScreen: true,
     show: false,
+    // Deliver the FIRST click to the page. This overlay is never focusable and is
+    // shown inactive, so on macOS every click is a first-mouse click and would
+    // otherwise be eaten activating a window that can never activate — leaving the
+    // pet hoverable but unclickable. Constructor-only: there is no
+    // `setAcceptFirstMouse()` on BrowserWindow, and the optional call that used to
+    // sit below hid that fact.
+    acceptFirstMouse: true,
     webPreferences: {
       preload: path.join(__dirname, "pet-preload.js"),
       contextIsolation: true,
@@ -668,7 +690,6 @@ function createOverlayForDisplay(display) {
   });
 
   win.setFocusable(false);
-  win.setAcceptFirstMouse?.(true);
   win.setIgnoreMouseEvents(true, { forward: true });
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   // INVISIBLE TO SCREEN CAPTURE (macOS NSWindowSharingNone, Windows
@@ -748,14 +769,51 @@ function wireHandshake(win, displayId, pos) {
     };
     send();
     setTimeout(send, 300);
-    // Never reveal an overlay currently hidden on a gateway error page (see the
-    // did-navigate latch): showing it would blanket the display with an
-    // uncloseable page. A healed reload clears the latch and re-fires
-    // did-finish-load, which then shows the pet.
-    if (!overlayBlanked.has(win) && !win.isVisible()) win.showInactive();
+    // Never reveal an overlay while hide-all is active or while it is latched on
+    // a gateway error page. A later restore or healed reload re-fires the shared
+    // reveal policy.
+    if (canRevealOverlay(win) && !win.isVisible()) win.showInactive();
     startHitPoll();
     assertHostStaysInDock();
   });
+}
+
+/**
+ * The display events that make the overlay set stale.
+ *
+ * Named once so binding and unbinding cannot drift apart: an event added to the
+ * bind side but forgotten on the unbind side is the exact shape of the leak
+ * below.
+ */
+const DISPLAY_EVENTS = ["display-added", "display-removed", "display-metrics-changed"];
+
+/**
+ * Bind the display listeners, once per live pet.
+ *
+ * Paired with `unbindDisplayListeners` in `closePetWindow`. The pairing is the
+ * whole point: this used to be a ONE-WAY latch that was never released, so the
+ * handler outlived every teardown and kept rebuilding overlays for a pet that
+ * was no longer supposed to exist.
+ */
+function bindDisplayListeners() {
+  if (displayListenersBound) return;
+  displayListenersBound = true;
+  for (const event of DISPLAY_EVENTS) screen.on(event, onDisplayChange);
+}
+
+/**
+ * Release the display listeners on teardown.
+ *
+ * Without this, a disabled Mochi still flashed its pet back onto the desktop
+ * (#4673): macOS fires `display-metrics-changed` on a space switch and on wake
+ * from sleep, the leaked handler found an empty overlay map, rebuilt one overlay
+ * per display and `wireHandshake` revealed them — visible until the host's next
+ * 5s reconcile tick tore them down again.
+ */
+function unbindDisplayListeners() {
+  if (!displayListenersBound) return;
+  displayListenersBound = false;
+  for (const event of DISPLAY_EVENTS) screen.removeListener(event, onDisplayChange);
 }
 
 /**
@@ -765,6 +823,14 @@ function wireHandshake(win, displayId, pos) {
  * slip); it is ported once here.
  */
 function onDisplayChange() {
+  // No live overlay means there is no pet on screen, so there is nothing to
+  // rebuild — REBUILDING would CREATE one, which is the opposite of what a
+  // torn-down pet wants. Belt to `unbindDisplayListeners`' braces: the unbind
+  // stops the event arriving at all, and this makes the handler itself correct
+  // for an event already dispatched when teardown ran, and for any future
+  // caller that binds without checking.
+  if (overlays.size === 0) return;
+
   const newDisplays = screen.getAllDisplays();
   const newIds = new Set(newDisplays.map((d) => d.id));
 
@@ -843,17 +909,16 @@ function openPetWindow(baseUrl, token = "") {
     wireHandshake(win, d.id, startPos);
   }
 
-  if (!displayListenersBound) {
-    displayListenersBound = true;
-    screen.on("display-added", onDisplayChange);
-    screen.on("display-removed", onDisplayChange);
-    screen.on("display-metrics-changed", onDisplayChange);
-  }
+  bindDisplayListeners();
 
   return getActiveOverlay();
 }
 
 function closePetWindow() {
+  // FIRST, before any window closes: a `close()` can synchronously reshape the
+  // display arrangement (an overlay leaving a space), and a listener still bound
+  // at that moment would re-enter this module mid-teardown.
+  unbindDisplayListeners();
   stopHitPoll();
   stopDragPolling();
   for (const win of [...overlays.values()]) {
@@ -874,6 +939,7 @@ function closePetWindow() {
  * screen-saver level can stay above the menu bar even when hidden.
  */
 function hidePetWindow() {
+  petWindowsHidden = true;
   let wasVisible = false;
   for (const win of overlays.values()) {
     if (win.isDestroyed()) continue;
@@ -885,6 +951,7 @@ function hidePetWindow() {
 }
 
 function showPetWindow() {
+  petWindowsHidden = false;
   for (const win of overlays.values()) {
     if (win.isDestroyed()) continue;
     win.setAlwaysOnTop(true, "screen-saver");
@@ -892,7 +959,7 @@ function showPetWindow() {
     // overlay currently hidden on a gateway error page (same guard as the
     // load-finished handler), or CMD+SHIFT+H would bring the uncloseable page
     // back after a persisted auth failure.
-    if (!overlayBlanked.has(win) && !win.isVisible()) win.showInactive();
+    if (canRevealOverlay(win) && !win.isVisible()) win.showInactive();
   }
 }
 
@@ -976,9 +1043,8 @@ async function transferPetToDisplayById(displayId, localX, localY) {
           resolve(true);
         }, 300);
       });
-      // Do not reveal an overlay hidden on a gateway error page (see the
-      // did-navigate latch); a healed reload clears the latch and shows it.
-      if (!overlayBlanked.has(win) && !win.isVisible()) win.showInactive();
+      // Transfers obey the same hide-all/error-page reveal policy as loads.
+      if (canRevealOverlay(win) && !win.isVisible()) win.showInactive();
     });
   }
 
@@ -992,6 +1058,7 @@ module.exports = {
   closePetWindow,
   hidePetWindow,
   showPetWindow,
+  setPetWindowsHidden,
   isPetWindowOpen,
   getActiveOverlay,
   getActiveDisplayId,

@@ -4,6 +4,7 @@ import { gradientFor } from '../components/appstore/gradient'
 import {
   sourceLabel,
   isVerified,
+  isRegistrySourced,
   normalizeRegistryApp,
   normalizeInstalledApp,
   normalizeInstalledApps,
@@ -142,6 +143,55 @@ describe('provenance helpers', () => {
   })
 })
 
+describe('isRegistrySourced', () => {
+  it('reads the registry: prefix the gateway records on a cloned app', () => {
+    expect(isRegistrySourced({ source: 'registry:secretary' })).toBe(true)
+    expect(isRegistrySourced({ source: 'registry:secretary', origin: 'local' })).toBe(true)
+  })
+
+  it('treats a directory install as local however the path is spelled', () => {
+    expect(isRegistrySourced({ source: '/home/u/apps/orchestrator-switch' })).toBe(false)
+    // A path that merely CONTAINS the word must not read as a registry ref —
+    // only the prefix the gateway writes counts.
+    expect(isRegistrySourced({ source: '/home/u/registry:copy' })).toBe(false)
+    expect(isRegistrySourced({ source: 'C:\\apps\\orchestrator-switch' })).toBe(false)
+  })
+
+  it('falls back to origin for a record written before source was stored', () => {
+    expect(isRegistrySourced({ origin: 'registry' })).toBe(true)
+    expect(isRegistrySourced({ origin: 'local' })).toBe(false)
+    expect(isRegistrySourced({})).toBe(false)
+    // A stored source always wins over origin — it is the value the backend's
+    // own update branch reads.
+    expect(isRegistrySourced({ source: '/srv/app', origin: 'registry' })).toBe(false)
+  })
+
+  it('survives a non-string source from an index-controlled catalog row', () => {
+    // The detail page spreads a CATALOG row into its app object when the
+    // installed-record fetch fails, and registry.py copies index keys verbatim
+    // for a row it has not installed — so `source` can arrive as an object even
+    // though the type says string. This runs inside the autoAction effect, where
+    // an unguarded startsWith throws and Sync never dispatches.
+    const objectSource = { source: { type: 'git' }, origin: 'registry' } as unknown as
+      Parameters<typeof isRegistrySourced>[0]
+    expect(() => isRegistrySourced(objectSource)).not.toThrow()
+    expect(isRegistrySourced(objectSource)).toBe(true)
+
+    // With no usable origin either, it must answer false (treat as path-installed
+    // and let the update endpoint report the real problem) rather than throw.
+    const noOrigin = { source: { type: 'git' } } as unknown as
+      Parameters<typeof isRegistrySourced>[0]
+    expect(() => isRegistrySourced(noOrigin)).not.toThrow()
+    expect(isRegistrySourced(noOrigin)).toBe(false)
+
+    for (const bad of [42, true, [], {}]) {
+      const app = { source: bad } as unknown as Parameters<typeof isRegistrySourced>[0]
+      expect(() => isRegistrySourced(app)).not.toThrow()
+      expect(isRegistrySourced(app)).toBe(false)
+    }
+  })
+})
+
 describe('server-computed trust fields (issue #580)', () => {
   it('isVerified prefers the server verified field over client derivation', () => {
     // Server verified:false wins over a spoofed author/origin — the server
@@ -263,6 +313,49 @@ describe('normalizeInstalledApp', () => {
     // The reads the Apps page and the detail page make, without a gate.
     expect(() => out.manifest.agents.map(a => a.split('/').pop()).join(', ')).not.toThrow()
     expect(() => out.manifest.crons.map(c => c.name).join(', ')).not.toThrow()
+  })
+
+  it('coerces every art field, so a wrong TYPE cannot reach a render site', () => {
+    // `app.json` is JSON from disk: a field's type is no more guaranteed than its
+    // presence. Coercing here is what keeps `"iconPath": {}` from reaching a bare
+    // `startsWith` and `"screenshotsDark": {}` a bare `.map` — each of which threw
+    // on the surface that read it rather than degrading to no art.
+    const out = normalizeInstalledApp({
+      name: 'wrong-types',
+      manifest: {
+        iconUrl: {}, iconUrlDark: 1, iconPath: [], iconPathDark: true,
+        heroImage: {}, heroImageDark: 0, heroImageDetail: [], heroImageDetailDark: null,
+        repo: {}, screenshots: { 0: 'a.png' }, screenshotsDark: {},
+      },
+    } as unknown as InstalledApp)
+    const m = out.manifest
+    for (const v of [m.iconUrl, m.iconUrlDark, m.iconPath, m.iconPathDark,
+      m.heroImage, m.heroImageDark, m.heroImageDetail, m.heroImageDetailDark, m.repo]) {
+      expect(v).toBe('')
+    }
+    expect(m.screenshots).toEqual([])
+    expect(m.screenshotsDark).toEqual([])
+    // The reads the store surfaces make, without a gate.
+    expect(() => (m.iconPath as string).startsWith('/')).not.toThrow()
+    expect(() => (m.screenshotsDark as string[]).map(s => s)).not.toThrow()
+  })
+
+  it('keeps a published art field as written', () => {
+    // The coercion must not erase a legitimate value — a built-in's absolute icon
+    // and an external app's repo-relative paths both survive untouched.
+    const out = normalizeInstalledApp({
+      name: 'real-art',
+      manifest: {
+        iconUrl: '/app-assets/real/icon.svg', iconPath: 'assets/icon.webp',
+        heroImageDetail: 'assets/hero-detail.webp', repo: 'octocat/real',
+        screenshotsDark: ['assets/dark-1.webp'],
+      },
+    } as unknown as InstalledApp)
+    expect(out.manifest.iconUrl).toBe('/app-assets/real/icon.svg')
+    expect(out.manifest.iconPath).toBe('assets/icon.webp')
+    expect(out.manifest.heroImageDetail).toBe('assets/hero-detail.webp')
+    expect(out.manifest.repo).toBe('octocat/real')
+    expect(out.manifest.screenshotsDark).toEqual(['assets/dark-1.webp'])
   })
 
   it('keeps published list contents and every non-list manifest field', () => {

@@ -21,6 +21,7 @@ import { useCloudDeploymentEnabled } from '../hooks/useCloudDeploymentEnabled'
 import type { Artifact, WebAppMetadata } from '../types'
 
 import { i18nT } from '../i18n/t'
+import { fmtNumber } from '../i18n/format'
 function statusBadgeVariant(status: string): 'ok' | 'warn' | 'err' | 'aim' {
   switch (status) {
     case 'live': return 'ok'
@@ -132,7 +133,7 @@ function CostPills({ cost, label }: { cost: WebAppMetadata['cost']; label: strin
             key={i}
             className="inline-flex items-baseline gap-1.5 rounded-full border border-border bg-bg-elevated px-2.5 py-1"
           >
-            <span className="text-[11px] text-muted">{Number(e.views ?? 0).toLocaleString()} {i18nT('components.webAppArtifactCard.views')}</span>
+            <span className="text-[11px] text-muted">{fmtNumber(Number(e.views ?? 0))} {i18nT('components.webAppArtifactCard.views')}</span>
             <span className="text-[12px] font-medium text-text-strong">${Number(e.usd ?? 0).toFixed(4)}</span>
           </span>
         ))}

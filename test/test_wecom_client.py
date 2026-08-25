@@ -576,7 +576,7 @@ class TestConcurrentSends:
 
 
 class TestThresholdClamp:
-    """WeComConfig.__post_init__ clamps to [0,100] and enforces soft <= hard."""
+    """WeComConfig.__post_init__ clamps to [1,100] and enforces soft <= hard."""
 
     def test_soft_above_hard_is_lowered_to_hard(self) -> None:
         from kiro_crew.config.loader import WeComConfig
@@ -589,7 +589,7 @@ class TestThresholdClamp:
         from kiro_crew.config.loader import WeComConfig
 
         c = WeComConfig(soft_threshold_pct=-10, hard_threshold_pct=200)
-        assert c.soft_threshold_pct == 0
+        assert c.soft_threshold_pct == 1
         assert c.hard_threshold_pct == 100
 
 

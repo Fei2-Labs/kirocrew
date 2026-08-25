@@ -30,6 +30,8 @@ from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NO
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
 from kiro_crew.config.loader import (
     _VALID_STT_PROVIDERS,
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     MAX_SUBAGENTS_FIXED_FLOOR,
     SUBAGENT_AUTO_MAX_CEILING,
     SUBAGENT_MAX_TURNS_CEILING,
@@ -45,6 +47,7 @@ from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
 from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.transcribe import BREW_PATH_DIRS, ensure_ffmpeg_in_path, find_brew, is_available
 
 logger = logging.getLogger(__name__)
@@ -52,6 +55,17 @@ logger = logging.getLogger(__name__)
 _STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 _DIST_DIR = _STATIC_DIR / "dist"
 _DIST_INDEX = _DIST_DIR / "index.html"
+# mtime-keyed cache of the SPA shell HTML.  Each request stat()s _DIST_INDEX
+# (cheap) and re-reads the file only when its mtime_ns differs from the cached
+# key, so a Vite rebuild that rewrites index.html (new hashed asset refs) is
+# picked up on the very next request WITHOUT a gateway restart — the cache
+# never pins a pre-rebuild shell.  A missing-then-present bundle also self-heals
+# because a FileNotFoundError is never cached.  The stat replaces a full
+# read_text of the bundle on the hot path, which is the win.
+# SECURITY CONTRACT: the cached value must stay ``None`` or equal the static,
+# secret-free bundle — never inject per-request/dynamic data.  Pinned by
+# test_served_shell_is_auth_independent.
+_INDEX_HTML_CACHE: tuple[int, str] | None = None
 _SSE_INTERVAL_SECS = 5
 
 # Sentinel returned in place of sensitive config values in API responses. Kept
@@ -145,6 +159,29 @@ def _sel():
 # ── Page ──
 
 
+def _resolve_index_html() -> str:
+    """Return the SPA shell HTML, using the mtime-keyed cache.
+
+    Runs entirely in a worker thread (see ``index``): performs the blocking
+    ``stat()`` and, only on first load or after a rebuild changed the mtime, the
+    blocking ``read_text()``. A ``FileNotFoundError`` returns the static fallback
+    and is never cached, so a transiently-absent dist self-heals on the next
+    request (e.g. after a dev build). SECURITY CONTRACT: the cached value is
+    solely the on-disk bundle — never per-request/dynamic data.
+    """
+    global _INDEX_HTML_CACHE
+    try:
+        mtime = _DIST_INDEX.stat().st_mtime_ns
+        cached = _INDEX_HTML_CACHE
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        html = _DIST_INDEX.read_text(encoding="utf-8")
+        _INDEX_HTML_CACHE = (mtime, html)
+        return html
+    except FileNotFoundError:
+        return _DASHBOARD_HTML_NOT_FOUND
+
+
 async def index(request: web.Request) -> web.Response:
     """Serve the React dashboard SPA shell (``static/dist/index.html``).
 
@@ -163,10 +200,16 @@ async def index(request: web.Request) -> web.Response:
     would leak it across the auth boundary. Keep dynamic data behind gated
     ``/api/*`` routes. Pinned by test_served_shell_is_auth_independent.
     """
-    try:
-        html = _DIST_INDEX.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        html = _DASHBOARD_HTML_NOT_FOUND
+    # Resolve the shell entirely off the event loop: the stat() + conditional
+    # read_text() are the only blocking calls, and even a bare stat() can stall
+    # the loop on slow/network-backed storage. Route through the dedicated
+    # discovery_executor rather than the shared default thread pool: index() is
+    # served UNAUTHENTICATED on the cold-start path, so a remote SPA GET flood on
+    # slow storage must not be able to saturate the pool other gateway work
+    # (DNS, etc.) depends on. The mtime cache still serves repeat requests
+    # without a read.
+    loop = asyncio.get_running_loop()
+    html = await loop.run_in_executor(discovery_executor(), _resolve_index_html)
     return web.Response(text=html, content_type="text/html")
 
 
@@ -695,8 +738,6 @@ def _pip_install_channel_available() -> bool:
     it there recreates the press-and-nothing-changes failure this surface
     exists to avoid:
 
-    - a frozen backend: its import set is fixed at build time (the packaging
-      spec excludes the voice extra), so no install can become importable;
     - the desktop app's bundled interpreter (see
       :func:`platform_compat.is_bundled_interpreter`): pip may exist, but a
       pip install writes into the code-signed bundle — breaking launches and
@@ -707,8 +748,6 @@ def _pip_install_channel_available() -> bool:
       pip refuses to install. Checked only outside a venv: inside one, pip
       works and deliberately ignores the marker, so a venv returns True.
     """
-    if getattr(sys, "frozen", False):
-        return False
     if platform_compat.is_bundled_interpreter():
         return False
     if importlib.util.find_spec("pip") is None:
@@ -772,9 +811,25 @@ def _stt_prereq_commands(provider: str = "whisper") -> list[str]:
             # happens in-process, so a system python or ``--user`` install is
             # not importable here.
             if os.name == "nt":
-                # POSIX quoting is wrong for Windows shells; ``&`` is
-                # PowerShell's call operator for a quoted executable path.
-                cmds.append(f'& "{sys.executable}" -m pip install "kirocrew[voice]"')
+                # The user's shell is unknowable here (they may paste this into
+                # PowerShell OR cmd), so the form must be SILENT-CORRUPTION-FREE
+                # in both, and PowerShell is the harder shell: a double-quoted
+                # string still expands ``$name`` and honours backtick escapes,
+                # and so does a bare unquoted token — both are legal path
+                # characters, so either form silently rewrites an interpreter
+                # under e.g. ``C:\tools\$python\...`` into a path that does not
+                # exist. Single quotes are PowerShell's LITERAL form (no
+                # expansion, no escapes, spaces included), with ``&`` invoking
+                # the quoted path, so the interpreter reaches pip byte-for-byte
+                # — including the all-users ``C:\Program Files\...`` layout an
+                # unquoted form cannot express. cmd performs no ``$`` or
+                # backtick processing at all and rejects the leading ``&``
+                # loudly ("... was unexpected"), so a cmd user gets a clear
+                # error to re-quote for, never a corrupted install. A literal
+                # single quote in the path is escaped by doubling, PowerShell's
+                # own rule.
+                exe = sys.executable.replace("'", "''")
+                cmds.append(f"& '{exe}' -m pip install kirocrew[voice]")
             else:
                 cmds.append(f"{shlex.quote(sys.executable)} -m pip install 'kirocrew[voice]'")
         # The non-streaming path remuxes the browser's .webm through ffmpeg, and
@@ -873,16 +928,24 @@ def _find_suitable_python() -> str | None:
         # True => skip this interpreter and keep searching. A probe failure
         # (can't even run it) also counts as unusable.
         try:
+            # PYTHONIOENCODING pins the CHILD's emit side: piped stdout on
+            # Windows otherwise re-encodes with the ANSI code page, which the
+            # UTF-8 decode below cannot undo.
+            child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
             ver = subprocess.check_output(
-                [p, "-c", "import sys; print(sys.version)"], timeout=5, text=True
+                [p, "-c", "import sys; print(sys.version)"],
+                timeout=5,
+                env=child_env,
+                **UTF8_TEXT,
             )
             if "free-threading" in ver:
                 return True
             subprocess.check_output(
                 [p, "-m", "pip", "--version"],
                 timeout=5,
-                text=True,
                 stderr=subprocess.DEVNULL,
+                env=child_env,
+                **UTF8_TEXT,
             )
             return False
         except Exception:
@@ -922,8 +985,10 @@ async def api_stt_install(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "code": "stt_no_local_install",
-                "error": "AWS Transcribe has no local install;"
-                " run the prerequisite command to add the 'voice' extra instead",
+                "error": (
+                    "AWS Transcribe has no local install;"
+                    " run the prerequisite command to add the 'voice' extra instead"
+                ),
             },
             status=400,
         )
@@ -1002,8 +1067,10 @@ async def api_stt_install(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "ok": True,
-                "ffmpeg": shutil.which("ffmpeg") is not None
-                or os.path.isfile(os.path.expanduser("~/ffmpeg/ffmpeg")),
+                "ffmpeg": (
+                    shutil.which("ffmpeg") is not None
+                    or os.path.isfile(os.path.expanduser("~/ffmpeg/ffmpeg"))
+                ),
             }
         )
     except asyncio.TimeoutError:
@@ -1079,9 +1146,7 @@ def _build_stt_install_script(provider: str = "whisper") -> str:
     if provider in ("mlx", "parakeet"):
         pipx_pkg = "parakeet-mlx" if provider == "parakeet" else "mlx-whisper"
         verify_bin = "parakeet-mlx" if provider == "parakeet" else "mlx_whisper"
-        return (
-            prelude
-            + rf"""
+        return prelude + rf"""
 [ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
 
 if ! command -v brew >/dev/null 2>&1; then
@@ -1102,7 +1167,6 @@ pipx install --force {pipx_pkg} 2>&1 || {{ echo "ERROR: pipx install {pipx_pkg} 
 
 echo "Done. {verify_bin}=$(command -v {verify_bin} 2>/dev/null || echo 'check PATH') ffmpeg=$(command -v ffmpeg 2>/dev/null || echo 'MISSING')"
 """
-        )
     return prelude + r"""
 # Pick up ffmpeg from ~/ffmpeg if installed there
 [ -d "$HOME/ffmpeg" ] && export PATH="$HOME/ffmpeg:$PATH"
@@ -1252,20 +1316,33 @@ async def api_sel_events(request: web.Request) -> web.Response:
 
 
 async def api_sel_verify(request: web.Request) -> web.Response:
-    """GET /api/sel/verify — verify HMAC chain integrity."""
+    """GET /api/sel/verify — verify HMAC chain integrity.
+
+    ``integrity`` is ``unverifiable`` when the segment dir refused to pin (or
+    was swapped mid-verification): the rotated segments were not checked, and
+    the endpoint must not answer ``ok`` over the live log alone (#5051
+    review). ``detail`` carries the reason and is empty when verifiable.
+    """
 
     # Same offload rationale as api_sel_events, including deferring _sel() into
     # the callable: verify_integrity() reads the whole log file to check the HMAC
     # chain end to end and must not run on the event loop.
-    total, valid = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), lambda: _sel().verify_integrity()
+    result = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), lambda: _sel().verify_integrity(detailed=True)
     )
+    if not result.history_verifiable:
+        integrity = "unverifiable"
+    elif result.total == result.valid:
+        integrity = "ok"
+    else:
+        integrity = "compromised"
     return web.json_response(
         {
-            "total": total,
-            "valid": valid,
-            "integrity": "ok" if total == valid else "compromised",
-            "tampered": total - valid,
+            "total": result.total,
+            "valid": result.valid,
+            "integrity": integrity,
+            "tampered": result.total - result.valid,
+            "detail": result.reason,
         }
     )
 
@@ -1384,132 +1461,185 @@ async def api_kirocrew_config(request: web.Request) -> web.Response:
         agent_settings = body.get("agent")
         if not isinstance(agent_settings, dict):
             return _deny("agent must be an object")
-        path = config_path()
+        cfg_path = config_path()
+        # Validate-only (CPU-bound) before acquiring the lock — fail fast on
+        # obviously-bad input so the lock hold is as short as possible.
+        # The actual read-modify-write is serialised under _get_config_lock and
+        # offloaded to a thread so it neither races concurrent writers (lost-write
+        # bug) nor blocks the event loop (event-loop-stall bug).  This mirrors the
+        # pattern used by the sibling PATCH handler (~line 2031).
+        from kiro_crew.config.loader import ConfigReadError, update_config_locked  # noqa: F811
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
+
+        # Carry the validation error and result out of the mutate callback.
+        # Validation that depends on the *persisted* ceiling (max_subagents bound)
+        # runs inside the callback where it can read the current config; the
+        # callback also emits the "no recognized settings provided" 400, so no
+        # pre-lock key-recognition check is needed.
+        _validation_error: list[tuple[str, int]] = []
+        _result: dict[str, object] = {}
+
+        def _mutate_config_put(data: dict) -> dict | None:
+            if not isinstance(data.get("agent"), dict):
+                data["agent"] = {}
+            agent = data["agent"]
+            # Snapshot BEFORE mutation for the restart-hint truthfulness guard.
+            # The dashboard sends all settings on every save so "was applied" !=
+            # "was changed" — see the no-op-save comments in messaging.py.
+            before = dict(agent)
+
+            limits = {"subagent_max_turns": SUBAGENT_MAX_TURNS_CEILING}
+            applied: list[str] = []
+            for key, upper in limits.items():
+                if key in agent_settings:
+                    val = agent_settings[key]
+                    if isinstance(val, bool) or not isinstance(val, int) or val < 1 or val > upper:
+                        _validation_error.append(
+                            (f"{key} must be an integer between 1 and {upper}", 400)
+                        )
+                        return None
+                    agent[key] = val
+                    applied.append(key)
+
+            # Capture the hard cap from the *persisted* config BEFORE applying any
+            # subagent_auto_max from this request — deny-by-default prevents a
+            # same-request ceiling-raise+spend.
+            persisted_hard_cap = agent.get("subagent_auto_max", 16)
+            if (
+                not isinstance(persisted_hard_cap, int)
+                or isinstance(persisted_hard_cap, bool)
+                or persisted_hard_cap < 3
+            ):
+                persisted_hard_cap = 16
+            persisted_hard_cap = min(persisted_hard_cap, SUBAGENT_AUTO_MAX_CEILING)
+
+            if "subagent_auto_max" in agent_settings:
+                val = agent_settings["subagent_auto_max"]
+                if (
+                    isinstance(val, bool)
+                    or not isinstance(val, int)
+                    or val < 3
+                    or val > SUBAGENT_AUTO_MAX_CEILING
+                ):
+                    _validation_error.append(
+                        (
+                            "subagent_auto_max must be an integer between 3 and "
+                            f"{SUBAGENT_AUTO_MAX_CEILING}",
+                            400,
+                        )
+                    )
+                    return None
+                agent["subagent_auto_max"] = val
+                applied.append("subagent_auto_max")
+
+            if "max_subagents" in agent_settings:
+                val = agent_settings["max_subagents"]
+                hard_cap = persisted_hard_cap
+                if (
+                    isinstance(val, bool)
+                    or not isinstance(val, int)
+                    or (val != 0 and not (MAX_SUBAGENTS_FIXED_FLOOR <= val <= hard_cap))
+                ):
+                    _validation_error.append(
+                        (
+                            f"max_subagents must be 0 (auto) or an integer between "
+                            f"{MAX_SUBAGENTS_FIXED_FLOOR} and {hard_cap}",
+                            400,
+                        )
+                    )
+                    return None
+                agent["max_subagents"] = val
+                applied.append("max_subagents")
+
+            for key in ("conductor_skill",):
+                if key in agent_settings:
+                    val = agent_settings[key]
+                    if not isinstance(val, bool):
+                        _validation_error.append((f"{key} must be a boolean", 400))
+                        return None
+                    agent[key] = val
+                    applied.append(key)
+
+            if not applied:
+                _validation_error.append(("no recognized settings provided", 400))
+                return None
+
+            restart_required = any(
+                key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key)
+                for key in applied
+            )
+            _result["applied"] = applied
+            _result["restart_required"] = restart_required
+            return data
+
         try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except Exception:
+            async with _get_config_lock():
+                try:
+                    # update_config_locked returns the final config dict (after
+                    # mutation); use it directly rather than re-reading from disk
+                    # (a blocking read on the loop, and it writes the callback's
+                    # output verbatim — there is no concurrent merge to observe).
+                    final = await asyncio.to_thread(
+                        update_config_locked, cfg_path, mutate=_mutate_config_put
+                    )
+                except ConfigReadError:
+                    _sel().log_api_access(
+                        caller=caller,
+                        operation="config.update",
+                        outcome="error",
+                        error="config.json is corrupt",
+                    )
+                    return web.json_response(
+                        {"error": "config.json is corrupt", "code": "config_corrupt"},
+                        status=500,
+                    )
+
+                if _validation_error:
+                    msg, status = _validation_error[0]
+                    return _deny(msg, status)
+
+                applied: list[str] = _result["applied"]  # type: ignore[assignment]
+                agent = final.get("agent") or {}
+                _sel().log_api_access(
+                    caller=caller,
+                    operation="config.update",
+                    outcome="ok",
+                    resources=",".join(applied),
+                )
+                # Regenerate or clean up conductor skill on toggle. Held INSIDE
+                # the lock so a concurrent enable/disable cannot interleave and
+                # leave the persisted flag disagreeing with the skill file on
+                # disk (config says enabled while SKILL.md is absent, or vice
+                # versa).
+                if "conductor_skill" in applied:
+                    if agent.get("conductor_skill"):
+                        from kiro_crew.dashboard.handlers.agents import (  # noqa: F811
+                            _regen_conductor,
+                        )
+
+                        _regen_conductor()
+                    else:
+                        try:
+                            from kiro_crew.skills import SkillsLoader  # noqa: F811
+
+                            p = SkillsLoader()._dir / "conductor" / "SKILL.md"
+                            if p.exists():
+                                p.unlink()
+                        except Exception:
+                            logger.exception("Failed to clean up conductor skill")
+        except OSError:
             _sel().log_api_access(
                 caller=caller,
                 operation="config.update",
                 outcome="error",
-                error="config.json is corrupt",
+                error="config.json write failed",
             )
-            return web.json_response({"error": "config.json is corrupt"}, status=500)
-        if not isinstance(data.get("agent"), dict):
-            data["agent"] = {}
-        agent = data["agent"]
-        # Snapshot the persisted values BEFORE any mutation. The dashboard sends
-        # all four settings on every save and enables Save whenever any one is
-        # dirty, so "was applied" is not "was changed" -- keying the restart hint
-        # off the raw applied list would flag a restart for a conductor-only save.
-        # Same truthfulness guard as handlers/messaging.py (see its no-op-save
-        # comments) so the flag stays trustworthy enough to act on.
-        before = dict(agent)
-        # subagent_max_turns keeps the generic 1..N validation; max_subagents is
-        # special — 0 is the "auto-size" sentinel and its upper bound is the
-        # configured hard cap (dynamic-subagent-sizing.md §5.5/§6).
-        limits = {"subagent_max_turns": SUBAGENT_MAX_TURNS_CEILING}
-        applied: list[str] = []
-        for key, upper in limits.items():
-            if key in agent_settings:
-                val = agent_settings[key]
-                if isinstance(val, bool) or not isinstance(val, int) or val < 1 or val > upper:
-                    return _deny(f"{key} must be an integer between 1 and {upper}")
-                agent[key] = val
-                applied.append(key)
-        # Capture the hard cap from the *persisted* config BEFORE applying any
-        # subagent_auto_max from this request. max_subagents is bounded by this
-        # persisted value only: a same-request raise of subagent_auto_max must NOT
-        # widen the bound (deny-by-default — prevents
-        # {subagent_auto_max: 9999, max_subagents: 9999} bypass). A higher ceiling
-        # only takes effect for max_subagents on a *subsequent* request.
-        persisted_hard_cap = agent.get("subagent_auto_max", 16)
-        if (
-            not isinstance(persisted_hard_cap, int)
-            or isinstance(persisted_hard_cap, bool)
-            or persisted_hard_cap < 3
-        ):
-            persisted_hard_cap = 16
-        # Clamp to the absolute ceiling even when read from persisted config: a
-        # corrupt or hand-edited config (e.g. {"subagent_auto_max": 9999}) must not
-        # be trusted to widen the concurrency bound (deny-by-default).
-        persisted_hard_cap = min(persisted_hard_cap, SUBAGENT_AUTO_MAX_CEILING)
-        # subagent_auto_max is now persistable (so the dashboard can raise/lower the
-        # auto-size ceiling), but carries its own absolute upper bound
-        # (SUBAGENT_AUTO_MAX_CEILING) so it can never be set arbitrarily high.
-        if "subagent_auto_max" in agent_settings:
-            val = agent_settings["subagent_auto_max"]
-            if (
-                isinstance(val, bool)
-                or not isinstance(val, int)
-                or val < 3
-                or val > SUBAGENT_AUTO_MAX_CEILING
-            ):
-                return _deny(
-                    "subagent_auto_max must be an integer between 3 and "
-                    f"{SUBAGENT_AUTO_MAX_CEILING}"
-                )
-            agent["subagent_auto_max"] = val
-            applied.append("subagent_auto_max")
-        # max_subagents: 0 = auto-size; otherwise a fixed pin in
-        # [MAX_SUBAGENTS_FIXED_FLOOR, persisted_hard_cap]. The bound is the
-        # persisted ceiling captured above, never this request's value. A pin of
-        # 1 or 2 is rejected — it would disable auto-sizing and run below the
-        # default (0 is the only way to request the host-safe auto cap).
-        if "max_subagents" in agent_settings:
-            val = agent_settings["max_subagents"]
-            hard_cap = persisted_hard_cap
-            if (
-                isinstance(val, bool)
-                or not isinstance(val, int)
-                or (val != 0 and not (MAX_SUBAGENTS_FIXED_FLOOR <= val <= hard_cap))
-            ):
-                return _deny(
-                    f"max_subagents must be 0 (auto) or an integer between "
-                    f"{MAX_SUBAGENTS_FIXED_FLOOR} and {hard_cap}"
-                )
-            agent["max_subagents"] = val
-            applied.append("max_subagents")
-        # Boolean toggles
-        for key in ("conductor_skill",):
-            if key in agent_settings:
-                val = agent_settings[key]
-                if not isinstance(val, bool):
-                    return _deny(f"{key} must be a boolean")
-                agent[key] = val
-                applied.append(key)
-        if not applied:
-            return _deny("no recognized settings provided")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-        _sel().log_api_access(
-            caller=caller,
-            operation="config.update",
-            outcome="ok",
-            resources=",".join(applied),
-        )
-        # Regenerate or clean up conductor skill on toggle.
-        if "conductor_skill" in applied:
-            if agent.get("conductor_skill"):
-                from kiro_crew.dashboard.handlers.agents import _regen_conductor  # noqa: F811
+            return web.json_response(
+                {"error": "failed to write config file", "code": "config_write_failed"},
+                status=500,
+            )
 
-                _regen_conductor()
-            else:
-                try:
-                    from kiro_crew.skills import SkillsLoader  # noqa: F811
-
-                    p = SkillsLoader()._dir / "conductor" / "SKILL.md"
-                    if p.exists():
-                        p.unlink()
-                except Exception:
-                    logger.exception("Failed to clean up conductor skill")
-        # A startup-read key that was merely re-sent with its existing value did
-        # not change the enforced cap, so it must not raise the hint.
-        restart_required = any(
-            key in _STARTUP_READ_AGENT_KEYS and agent.get(key) != before.get(key) for key in applied
-        )
+        restart_required: bool = _result["restart_required"]  # type: ignore[assignment]
         return web.json_response({"ok": True, "restart_required": restart_required})
 
     cfg = KiroCrewConfig.load()
@@ -1551,7 +1681,9 @@ def _active_advertised_ids(request: web.Request) -> list[str] | None:
     return None
 
 
-def _validate_role_model(value: str, request: web.Request) -> str | None:
+def _validate_role_model(
+    value: str, request: web.Request, provider: str | None = None
+) -> str | None:
     """Reject a per-role model pin the account cannot use; ``None`` = allow.
 
     ``""`` / ``"auto"`` always allow (they defer to the chat default). Otherwise
@@ -1561,13 +1693,17 @@ def _validate_role_model(value: str, request: web.Request) -> str | None:
     (:func:`model_is_unusable`, #1596) so the picker and the wire cannot disagree.
     No advertised set => accept (entitlement unknowable; don't accuse on no
     evidence), matching that predicate's own conservative default.
+
+    *provider* is forwarded to :func:`_model_rejected_reason` so a caller holding
+    an already-loaded config does not pay a second synchronous config read; the
+    remaining work is in-memory. Omit it and the provider is resolved there.
     """
     if not value or value == "auto":
         return None
     from kiro_crew.acp.client import model_is_unusable
     from kiro_crew.dashboard.chat_handlers import _model_rejected_reason
 
-    reason = _model_rejected_reason(value)
+    reason = _model_rejected_reason(value, provider=provider)
     if reason:
         return reason
     advertised = _active_advertised_ids(request)
@@ -1626,6 +1762,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
         "validate_fn": _validate_role_model,
     },
+    # Throttle-exhaustion fallback model. Single value: "auto" (default) defers
+    # to the backend's availability-aware routing; a concrete id is tried first
+    # with "auto" as the final fallthrough; "" disables the feature. Same
+    # grammar + entitlement validation as the role-model pins ("" / "auto"
+    # always allow), so the dropdown and the wire cannot disagree.
+    "agent.fallback_model": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "validate_fn": _validate_role_model,
+    },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
     # Per-role reasoning effort, paired with role_models. Same enum as the chat
     # default; "" = inherit. Applies only on reasoning-capable models.
@@ -1647,7 +1794,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.completion_keep_chars": {"type": "int", "min": 0, "max": RESULT_FILE_MAX_BYTES},
     "agent.soft_stop_budget_secs": {"type": "float", "min": 0.5, "max": 60.0},
     "session.timeout_secs": {"type": "int", "min": 0, "max": 86400},
-    "session.autocompact_pct": {"type": "float", "min": 5.0, "max": 90.0},
+    # Range shared with the load-time clamp in config/loader.py — one constant
+    # pair, so the write gate and the load path cannot drift (issue #4734).
+    "session.autocompact_pct": {
+        "type": "float",
+        "min": AUTOCOMPACT_PCT_MIN,
+        "max": AUTOCOMPACT_PCT_MAX,
+    },
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
     "session.pool_ttl_secs": {"type": "int", "min": 0, "max": 7200},
@@ -1660,6 +1813,21 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "auto_update": {"type": "bool"},
     "dashboard.mcp_probe_timeout_secs": {"type": "int", "min": 5, "max": 120},
     "dashboard.recent_tint_count": {"type": "int", "min": 0, "max": 10},
+    # Per-version snooze/skip verdict for the proactive update popup, written
+    # as ONE atomic record: the three fields only mean anything together, so
+    # per-field writes would open both a crash window (old verdict paired
+    # with a new version) and a two-client interleave that reassembles a
+    # verdict nobody expressed. Persisted in gateway config (not browser
+    # storage) so the decision holds across browsers and the desktop app's
+    # embedded dashboard.
+    "dashboard.update_nudge": {
+        "type": "dict",
+        "keys": {
+            "version": {"type": "str", "max_len": 128},
+            "snoozed_until": {"type": "float", "min": 0.0, "max": 4102444800.0},
+            "skipped": {"type": "bool"},
+        },
+    },
     # Default shell for the built-in terminal panel (Settings → Display →
     # Terminal). "" = unset, use $SHELL / the platform default. The executable
     # check lives as an off-loop special case in the PATCH handler (a PATH
@@ -1907,6 +2075,54 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             reason = validate_fn(value, request)
             if reason:
                 return _deny(reason, f"{path_key}={value}")
+    elif spec["type"] == "dict":
+        # One-level record written ATOMICALLY as a single value, for settings
+        # where multiple scalar fields form one verdict and a partial write is
+        # itself the bug (e.g. the update popup's version+snooze+skip record).
+        # Strict by design: every declared key present, no undeclared keys,
+        # each value validated against its scalar subspec — so this cannot
+        # become a generic JSON passthrough.
+        if not isinstance(value, dict):
+            return _deny("must be an object", f"{path_key}={value}")
+        keys_spec = spec["keys"]
+        unknown = set(value) - set(keys_spec)
+        if unknown:
+            return _deny(f"unknown key(s): {sorted(unknown)}", f"{path_key}={value}")
+        missing = set(keys_spec) - set(value)
+        if missing:
+            return _deny(f"missing key(s): {sorted(missing)}", f"{path_key}={value}")
+        validated: dict = {}
+        for sub_key, sub_spec in keys_spec.items():
+            sub_val = value[sub_key]
+            if sub_spec["type"] == "str":
+                if not isinstance(sub_val, str):
+                    return _deny(f"{sub_key} must be a string", f"{path_key}={value}")
+                if len(sub_val) > sub_spec.get("max_len", 256):
+                    return _deny(
+                        f"{sub_key} must be at most {sub_spec.get('max_len', 256)} characters",
+                        f"{path_key}={value}",
+                    )
+            elif sub_spec["type"] == "bool":
+                if not isinstance(sub_val, bool):
+                    return _deny(f"{sub_key} must be a boolean", f"{path_key}={value}")
+            elif sub_spec["type"] == "float":
+                # bool is an int subclass; refuse it before coercion so
+                # `true` cannot silently store 1.0.
+                if isinstance(sub_val, bool):
+                    return _deny(f"{sub_key} must be a number", f"{path_key}={value}")
+                try:
+                    sub_val = float(sub_val)
+                except (TypeError, ValueError):
+                    return _deny(f"{sub_key} must be a number", f"{path_key}={value}")
+                if not math.isfinite(sub_val):
+                    return _deny(f"{sub_key} must be a finite number", f"{path_key}={value}")
+                lo, hi = sub_spec.get("min", 0.0), sub_spec.get("max", 999999.0)
+                if sub_val < lo or sub_val > hi:
+                    return _deny(f"{sub_key} must be between {lo} and {hi}", f"{path_key}={value}")
+            else:
+                return _deny("unsupported config type", f"{path_key}={value}", 500)
+            validated[sub_key] = sub_val
+        value = validated
     else:
         return _deny("unsupported config type", f"{path_key}={value}", 500)
 
@@ -1927,8 +2143,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             _log_sel("denied", f"{path_key}={value}")
             return web.json_response(
                 {
-                    "error": "must be an executable shell (an absolute path or a "
-                    "command on PATH); leave empty to use the system default",
+                    "error": (
+                        "must be an executable shell (an absolute path or a "
+                        "command on PATH); leave empty to use the system default"
+                    ),
                     "code": "shell_not_executable",
                 },
                 status=400,
@@ -2063,6 +2281,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         for slot in state._slots.values():
             if slot.model:
                 slot.model = ""
+                # Deliberate model change: bump the pick generation so the
+                # fallback restore probe drops any sticky state instead of
+                # restoring a model id from the previous provider.
+                slot._model_pick_gen += 1
         state.push_slots_update()
         logger.info(
             "Provider switched to %s — config rebuilt, factory reloaded, slot models cleared", value

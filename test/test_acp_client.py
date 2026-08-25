@@ -28,6 +28,8 @@ from kiro_crew.acp.client import (
     _resolve_vendored_claude_acp,
     _substitute_model_from_advisory,
     _vendored_claude_acp_roots,
+    format_command_result,
+    parse_slash_command,
 )
 from kiro_crew.acp.liveness import (
     VERDICT_DEAD,
@@ -35,7 +37,11 @@ from kiro_crew.acp.liveness import (
     VERDICT_WORKING,
     LivenessOracle,
 )
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpPromptStats
+from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
+    JSONRPC_METHOD_NOT_FOUND,
+    AcpPromptStats,
+)
 
 # Windows lacks os.killpg and POSIX process-tree APIs (ps, /proc).
 # Tests that exercise these paths are skipped on Windows.
@@ -3307,6 +3313,87 @@ class TestMakeUnifiedDiff:
         result = _make_unified_diff("", "x\n" * 5000, "file.py", max_len=100)
         assert len(result) <= 100
 
+    def test_truncation_cuts_at_line_boundary_and_is_marked(self):
+        """A cut diff ends with the ``\\ diff truncated`` annotation on its own
+        line (unified-diff escape convention — renderers skip it), never with a
+        garbled half-row, so downstream +/- counting can detect understatement."""
+        from kiro_crew.acp._dispatch import DIFF_TRUNCATION_MARK
+
+        result = _make_unified_diff("", "wordwordword\n" * 5000, "file.py", max_len=200)
+        assert len(result) <= 200
+        assert result.endswith("\n" + DIFF_TRUNCATION_MARK)
+        # Every line before the marker is a complete diff row from the
+        # original (starts with a diff prefix, never a mid-word fragment).
+        body_lines = result.split("\n")[:-1]
+        assert all(
+            line.startswith(("---", "+++", "@@", "+", "-", " ")) for line in body_lines if line
+        )
+
+    def test_under_cap_diff_is_not_marked(self):
+        from kiro_crew.acp._dispatch import DIFF_TRUNCATION_MARK
+
+        result = _make_unified_diff("old\n", "new\n", "file.py")
+        assert DIFF_TRUNCATION_MARK not in result
+
+
+class TestDeriveEditDiff:
+    """Bare-JSON edit payloads derive a diff from their own arguments, so a
+    tool_call with no diff content block still displays what changed."""
+
+    def test_create_content_becomes_addition_diff(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff({"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"})
+        assert "+x = 1" in diff
+        assert "+y = 2" in diff
+        assert "+++ /a/new.py" in diff
+
+    def test_str_replace_pair_becomes_replace_hunk(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff(
+            {"path": "/a/b.py", "command": "strReplace", "oldStr": "x = 1\n", "newStr": "x = 2\n"}
+        )
+        assert "-x = 1" in diff
+        assert "+x = 2" in diff
+
+    def test_unrecognized_shapes_yield_empty(self):
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert derive_edit_diff({"path": "/a/b", "command": "create"}) == ""
+        assert derive_edit_diff({"command": "create", "fileText": "x"}) == ""  # no path
+        assert derive_edit_diff("not a dict") == ""
+        assert derive_edit_diff(None) == ""
+
+    def test_non_string_arguments_never_reach_difflib(self):
+        """Malformed args (numeric path, dict oldStr) must yield "" instead of
+        letting a TypeError out of difflib abort the whole dispatch mid-turn."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"}) == ""
+        assert derive_edit_diff({"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}) == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        assert derive_edit_diff({"path": ["/a"], "command": "create", "fileText": "x"}) == ""
+        assert derive_edit_diff({"path": "/a/b", "command": "create", "fileText": 7}) == ""
+
+    def test_insert_with_line_number_derives_positioned_hunk(self):
+        """An insert IS additions-only, so with a line number the derived
+        hunk is exact: zero old lines at insertLine, additions after it."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        diff = derive_edit_diff(
+            {"path": "/a/b.py", "command": "insert", "insertLine": 4, "content": "x = 1\ny = 2"}
+        )
+        assert "@@ -4,0 +5,2 @@" in diff
+        assert "+x = 1" in diff
+        assert "+y = 2" in diff
+
+    def test_insert_without_line_number_derives_nothing(self):
+        """Without a line number the hunk position would be a guess — the
+        row keeps its fold-proof trace via the file_changes snapshot."""
+        from kiro_crew.acp._dispatch import derive_edit_diff
+
+        assert derive_edit_diff({"path": "/a/b.py", "command": "insert", "content": "x = 1"}) == ""
+
     def test_no_trailing_newline(self):
         result = _make_unified_diff("old", "new", "file.py")
         assert "-old" in result
@@ -5728,50 +5815,50 @@ class TestReadNewToolResultsSync:
 
 
 class TestFormatCommandResult:
-    """Tests for _format_command_result."""
+    """Tests for format_command_result."""
 
     def test_structured_data_with_message(self):
-        result = AcpClient._format_command_result({"data": {"key": "value"}, "message": "Done"})
+        result = format_command_result({"data": {"key": "value"}, "message": "Done"})
         assert "Done" in result
         assert "```json" in result
         assert '"key"' in result
 
     def test_structured_data_without_message(self):
-        result = AcpClient._format_command_result({"data": {"key": "val"}, "message": ""})
+        result = format_command_result({"data": {"key": "val"}, "message": ""})
         assert "```json" in result
         assert '"key"' in result
 
     def test_agent_model_filtered(self):
-        result = AcpClient._format_command_result(
+        result = format_command_result(
             {"data": {"agent": "x", "model": "y"}, "message": ""}
         )
         # Only agent/model → display is empty → falls through to message
         assert result == ""
 
     def test_message_only(self):
-        result = AcpClient._format_command_result({"message": "hello"})
+        result = format_command_result({"message": "hello"})
         assert result == "hello"
 
     def test_empty_result(self):
-        result = AcpClient._format_command_result({})
+        result = format_command_result({})
         assert result == ""
 
 
 class TestParseSlashCommand:
-    """Tests for _parse_slash_command."""
+    """Tests for parse_slash_command."""
 
     def test_simple_command(self):
-        name, args = AcpClient._parse_slash_command("/compact")
+        name, args = parse_slash_command("/compact")
         assert name == "compact"
         assert args == {}
 
     def test_command_with_value(self):
-        name, args = AcpClient._parse_slash_command("/agent planner")
+        name, args = parse_slash_command("/agent planner")
         assert name == "agent"
         assert args == {"value": "planner"}
 
     def test_command_with_multi_word_value(self):
-        name, args = AcpClient._parse_slash_command("/usage detailed view")
+        name, args = parse_slash_command("/usage detailed view")
         assert name == "usage"
         assert args == {"value": "detailed view"}
 
@@ -7130,7 +7217,6 @@ class TestProcessMessageUnknownServerRequest:
 
     @pytest.mark.asyncio
     async def test_reject_sends_method_not_found_error(self, tmp_path):
-        from kiro_crew.acp.client import _JSONRPC_METHOD_NOT_FOUND
         from kiro_crew.acp.types import JsonRpcMessage
 
         client = AcpClient(work_dir=tmp_path)
@@ -7143,7 +7229,7 @@ class TestProcessMessageUnknownServerRequest:
         written = client._process.stdin.write.call_args[0][0].decode()
         payload = json.loads(written)
         assert payload["id"] == 42
-        assert payload["error"]["code"] == _JSONRPC_METHOD_NOT_FOUND
+        assert payload["error"]["code"] == JSONRPC_METHOD_NOT_FOUND
         assert "terminal/create" in payload["error"]["message"]
 
     @pytest.mark.asyncio
@@ -9462,25 +9548,25 @@ class TestAcpClientIsShellSignal:
         assert not_shell.is_shell is False
 
 
-class TestSpawnEnvChannelCredentialScrub:
-    """The default auto/standard ACP spawn path scrubs gateway channel creds.
+class TestSpawnEnvScrub:
+    """The default auto/standard ACP spawn path applies the full child scrub.
 
-    Guards the exact production path Codex flagged: ``AcpClient._spawn`` copies a
-    raw ``os.environ`` and calls ``wrap_argv`` directly (not
-    ``sandboxed_spawn_argv``), and the default tier's launcher does NOT strip
-    ``_AGENT_DENIED_ENV_KEYS`` — so the parent-level ``scrub_agent_denied_env``
-    must remove them before the child inherits the environment.
+    The parent-side enforcement is mandatory for raw Windows Kiro delegation;
+    POSIX launchers apply the same sensitive/Python scrub inline.
     """
 
     @pytest.mark.asyncio
-    async def test_client_spawn_scrubs_channel_creds_on_default_auto(self, monkeypatch):
+    async def test_client_spawn_scrubs_sensitive_env_on_default_auto(self, monkeypatch):
         monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "0000:FAKE-telegram")
         monkeypatch.setenv("WECOM_BOT_ID", "FAKE-wecom-bot")
         monkeypatch.setenv("WECOM_SECRET", "FAKE-wecom-secret")
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-FAKE")
         monkeypatch.setenv("KIROCREW_OWNER_ID", "U_FAKE_OWNER")
-        # A credential the standard sandbox intentionally exposes + a benign key
-        # must both survive the parent scrub.
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "FAKE-secret")
+        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/fake-agent.sock")
+        monkeypatch.setenv("PYTHONPATH", "/gateway/pythonpath")
+        monkeypatch.setenv("PYTHONHOME", "/gateway/pythonhome")
+        # AWS account identity and a benign key are not denied.
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "FAKE-akid")
         monkeypatch.setenv("KIROCREW_UNRELATED_KEEPME", "keep-this-value")
 
@@ -9517,8 +9603,12 @@ class TestSpawnEnvChannelCredentialScrub:
             "WECOM_SECRET",
             "SLACK_BOT_TOKEN",
             "KIROCREW_OWNER_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "PYTHONPATH",
+            "PYTHONHOME",
         ):
-            assert key not in env, f"{key} leaked into default-auto ACP child env"
+            assert key not in env, f"{key} leaked into ACP child env"
         assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
         assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
 

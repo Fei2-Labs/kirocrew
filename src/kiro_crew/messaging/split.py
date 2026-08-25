@@ -1,9 +1,10 @@
 """Fence-safe markdown splitting, shared by every messaging channel.
 
-Six splitters grew independently — Discord and Telegram each carry a
+Six splitters grew independently — Telegram carries a
 ``_split_text``/``_split_markdown`` pair, ``messaging/renderer.py`` chunks blind
 fixed-width, and Slack, Webex and Weixin have their own — so a fix landed in one
-never reached the others. This module is the single engine they converge on.
+never reached the others. This module is the single engine they converge on, and
+Discord is the first channel on it.
 
 Three properties make it safe for the shared path:
 
@@ -53,17 +54,85 @@ path is what made this ladder bypassable at budgets a fence's scaffolding
 consumes whole, and an exhaustive small-space oracle in the tests pins the
 property rather than the instances.
 
-Deliberately out of scope (callers needing these wrap this function): pipe
+Byte-capped platforms wrap the character splitter with
+:func:`split_markdown_bytes`, which measures the produced chunks and shrinks the
+character budget until they fit. Still out of scope for callers to wrap: pipe
 table conversion, rendered-length budgeting for channels that inflate the
-source, and byte or UTF-16 length limits.
+source, and UTF-16 length limits.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 
-__all__ = ["split_markdown_safe"]
+__all__ = [
+    "split_markdown_safe",
+    "split_markdown_bytes",
+    "chunk_utf8_bytes",
+    "iter_fence_spans",
+    "iter_fence_lines",
+    "open_fence_at_end",
+    "truncate_utf8",
+    "FENCE_OUTSIDE",
+    "FENCE_OPEN",
+    "FENCE_BODY",
+    "FENCE_CLOSE",
+]
+
+#: Per-line fence roles yielded by :func:`iter_fence_lines`. Named rather than
+#: booleans because a caller distinguishes four cases, not two: outside a fence,
+#: the opener, content, and the closer.
+FENCE_OUTSIDE = "outside"
+FENCE_OPEN = "open"
+FENCE_BODY = "body"
+FENCE_CLOSE = "close"
+
+# How many times :func:`split_markdown_bytes` may shrink its character budget
+# before falling back to byte slicing. Each round strictly reduces the budget,
+# so this only bounds the work: the ratio step converges in two or three rounds
+# even for all-4-byte input, and the extra headroom absorbs a document whose
+# heavy characters are unevenly distributed.
+_BYTE_SHRINK_ROUNDS = 6
+
+# Below this the character budget is too small for the fence ladder to make
+# meaningful cuts, so shrinking further just degrades every chunk. The byte
+# slicer takes over instead.
+_MIN_BYTE_SHRINK_LIMIT = 16
+
+
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    """Truncate *text* to at most *max_bytes* UTF-8 bytes without splitting a
+    code point.
+
+    The exact guard for a channel whose wire limit is denominated in BYTES. A
+    reply can sit under a CHARACTER cap and still be over the byte cap — one CJK
+    character is three bytes and an emoji four — and a platform that refuses the
+    oversize send gives the user nothing at all, so this is the last thing
+    between an authored answer and a rejected frame.
+
+    ``errors="ignore"`` on the decode is what drops a trailing partial sequence
+    rather than raising, so the cut lands on the largest whole-code-point prefix
+    that fits. A non-positive *max_bytes* disables the guard and returns *text*
+    unchanged, matching :func:`split_markdown_safe`'s treatment of a non-positive
+    ``limit``: a caller with no budget to enforce must not lose its whole message
+    to a zero.
+
+    This TRUNCATES, and therefore loses the tail: it is a backstop, not a
+    delivery strategy. A caller with more text than one message may hold splits
+    first — ``split_markdown_safe`` against a byte-safe character budget, which
+    a byte-capped channel derives as ``<its byte budget> // 4`` so the character
+    splitter is byte-safe in the worst case — and reaches this only for a chunk
+    that still does not fit.
+    """
+    if max_bytes <= 0:
+        return text
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
 
 # An opener is <=3 spaces of indent + a run of >=3 backticks/tildes + an info
 # string. A backtick fence's info string may not contain a backtick (otherwise
@@ -278,6 +347,102 @@ def split_markdown_safe(text: str, limit: int, *, reserve: int = 0) -> list[str]
     return out
 
 
+def chunk_utf8_bytes(text: str, max_bytes: int) -> list[str]:
+    """Split *text* into chunks of at most *max_bytes* UTF-8 bytes.
+
+    Lossless and code-point-safe: the concatenation of the result always equals
+    the input, and no chunk ends mid-sequence. Slicing the ENCODED bytes and
+    re-decoding with ``errors="ignore"`` finds the largest whole-code-point
+    prefix; the loop then resumes from exactly the characters consumed.
+
+    This is the byte-limit primitive, with no markdown awareness at all — it
+    will happily cut through a fence. Callers wanting fence-safe chunks under a
+    byte cap use :func:`split_markdown_bytes`, which only falls back here for a
+    fragment that admits no clean cut. A non-positive *max_bytes* disables
+    chunking, matching ``chunk_text``.
+    """
+    if not text:
+        return []
+    if max_bytes <= 0:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        encoded = remaining.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            chunks.append(remaining)
+            break
+        piece = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        if not piece:
+            # max_bytes is smaller than this single code point. Emitting it
+            # whole overshoots the budget by a couple of bytes; dropping it
+            # would lose content and looping would never terminate.
+            piece = remaining[0]
+        chunks.append(piece)
+        remaining = remaining[len(piece) :]
+    return chunks
+
+
+def split_markdown_bytes(text: str, max_bytes: int, *, reserve: int = 0) -> list[str]:
+    """Fence-safe split under a UTF-8 BYTE budget rather than a character one.
+
+    :func:`split_markdown_safe` counts characters, which is the right measure
+    for most platforms and the wrong one for a platform whose limit is bytes
+    (Webex caps a message at 7439 bytes): a chunk of CJK text can sit well under
+    a character budget and still be rejected, and a send path that truncates the
+    overflow loses the tail silently.
+
+    Measure, don't predict. A budget of ``max_bytes`` characters cannot overflow
+    for ASCII, so the first attempt is the common case and costs one pass. When
+    a chunk does measure over, the character budget is shrunk by the observed
+    overflow ratio and the split is retried — reading the real encoded length
+    beats reasoning about worst-case bytes per character, which would divide the
+    budget by four and fragment every ASCII answer into quarters.
+
+    A chunk that still does not fit after the ladder is byte-sliced through
+    :func:`chunk_utf8_bytes`, and only that chunk: a fence spanning a cut is a
+    rendering defect, but a lost tail is data loss, so the byte cap wins when
+    the two conflict. This is reachable for input the character splitter itself
+    documents as over-budget — a single line longer than the whole budget, or a
+    budget too small to hold a line's fence scaffolding.
+
+    ``reserve`` holds back bytes for something the caller appends to every
+    chunk, matching :func:`split_markdown_safe`. Empty text yields ``[]``; text
+    that already fits, a non-positive *max_bytes*, and a *reserve* consuming the
+    whole budget all yield ``[text]`` unchanged.
+    """
+    if not text:
+        return []
+    budget = max_bytes - reserve
+    if max_bytes <= 0 or budget <= 0:
+        return [text]
+    if len(text.encode("utf-8")) <= budget:
+        return [text]
+
+    limit = budget
+    chunks = split_markdown_safe(text, limit)
+    for _ in range(_BYTE_SHRINK_ROUNDS):
+        widest = max(len(c.encode("utf-8")) for c in chunks)
+        if widest <= budget:
+            return chunks
+        if limit <= _MIN_BYTE_SHRINK_LIMIT:
+            break
+        # Scale the character budget by how far the worst chunk overshot, and
+        # always make progress: integer rounding on a near-miss could otherwise
+        # reproduce the same limit and spin out the rounds for nothing.
+        scaled = limit * budget // widest
+        limit = max(_MIN_BYTE_SHRINK_LIMIT, min(scaled, limit - 1))
+        chunks = split_markdown_safe(text, limit)
+
+    out: list[str] = []
+    for chunk in chunks:
+        if len(chunk.encode("utf-8")) <= budget:
+            out.append(chunk)
+        else:
+            out.extend(chunk_utf8_bytes(chunk, budget))
+    return out
+
+
 def _lines(text: str) -> list[_Frag]:
     """Split *text* on ``\\n`` into fragments that rejoin to it exactly.
 
@@ -311,6 +476,85 @@ def _advance(fence: _Fence | None, line: str) -> _Fence | None:
     if m:
         return _Fence(char=m.group(1)[0], length=len(m.group(1)), opener=body)
     return None
+
+
+def open_fence_at_end(text: str) -> tuple[str, int, str] | None:
+    """Return ``(character, length, opener)`` for the fence open at text's end."""
+    fence: _Fence | None = None
+    for line, _full, _terminated in _lines(text):
+        fence = _advance(fence, line)
+    return (fence.char, fence.length, fence.opener) if fence else None
+
+
+def iter_fence_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Yield ``(start, end)`` character spans of *text* inside a fenced code block.
+
+    Each span covers the opener line through the end of the closer line, so
+    everything a fence encloses -- and the delimiter lines themselves -- falls
+    inside one. A fence left open runs to the end of *text*: content after a
+    dangling opener renders as code. Spans are yielded in order and never overlap.
+
+    This is the whole-text view of the same machine :func:`split_markdown_safe`
+    runs on: both drive :func:`_advance`, so the open/close rule -- which run
+    length closes which fence character -- exists once. A consumer that needs to
+    know "is this offset inside code?" uses this instead of re-deriving the rule,
+    because a second spelling of it diverges on the next CommonMark fix. Line
+    boundaries come from :func:`_lines` for the same reason.
+    """
+    fence: _Fence | None = None
+    open_at = 0
+    pos = 0
+    # _lines rejoins to `text` exactly, so `pos` tracks true character offsets
+    # and reaches len(text) on the final line -- no clamping needed.
+    for line, _full, _terminated in _lines(text):
+        line_start = pos
+        pos += len(line)
+        after = _advance(fence, line)
+        if fence is None and after is not None:
+            open_at = line_start
+        elif fence is not None and after is None:
+            yield open_at, pos
+        fence = after
+    if fence is not None:
+        yield open_at, len(text)
+
+
+def iter_fence_lines(text: str) -> Iterator[tuple[str, str]]:
+    """Yield ``(line, role)`` for every logical line of *text*.
+
+    ``line`` is the line without its terminator (``\\n``, and a ``\\r`` before
+    it). ``role`` is one of :data:`FENCE_OUTSIDE`, :data:`FENCE_OPEN`,
+    :data:`FENCE_BODY`, :data:`FENCE_CLOSE`.
+
+    This is the per-LINE view of the machine :func:`iter_fence_spans` views as
+    character spans, and it exists for the one thing spans cannot answer: which
+    lines are the delimiters. A channel whose own markup has a single code
+    marker and no info string (WhatsApp: always ```````, never
+    `````python``) has to REWRITE the delimiter lines while
+    leaving the content between them byte-exact, and telling those apart from a
+    span plus offsets is ambiguous for a fence left open -- its last line is
+    content, but it sits where a closer would. Deriving it from a second fence
+    regex is what this module exists to prevent.
+
+    A fence left open yields no :data:`FENCE_CLOSE`, which is how a caller
+    detects it: the block is unterminated and the caller owns what to append.
+    """
+    fence: _Fence | None = None
+    for line, _full, _terminated in _lines(text):
+        body = line[:-1] if line.endswith("\n") else line
+        if body.endswith("\r"):
+            body = body[:-1]
+        before = fence
+        fence = _advance(fence, line)
+        if before is None and fence is not None:
+            role = FENCE_OPEN
+        elif before is not None and fence is None:
+            role = FENCE_CLOSE
+        elif fence is not None:
+            role = FENCE_BODY
+        else:
+            role = FENCE_OUTSIDE
+        yield body, role
 
 
 def _safe_cut(fence: _Fence | None, frag: str, room: int) -> int:

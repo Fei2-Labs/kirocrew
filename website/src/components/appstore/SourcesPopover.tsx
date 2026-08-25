@@ -9,13 +9,13 @@
 import { useState } from 'react'
 import { Database, FolderOpen } from 'lucide-react'
 import { api } from '../../api/client'
-import { useQueryClient } from '@tanstack/react-query'
 import { recordEvent } from '../../rum'
 import { Btn, Input, IconButton } from '../ui'
 import { Popover, PopoverTrigger, PopoverContent } from '../ui/popover'
 import RegistryManager from '../RegistryManager'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 export default function SourcesPopover({ open, onOpenChange, onError, onInstalled }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -25,7 +25,7 @@ export default function SourcesPopover({ open, onOpenChange, onError, onInstalle
   // closes and a freshly-installed (disabled) app is invisible in the sidebar.
   onInstalled?: (name: string) => void
 }) {
-  const queryClient = useQueryClient()
+  const ime = useImeGuard()
   const [installPath, setInstallPath] = useState('')
   const [installing, setInstalling] = useState(false)
 
@@ -37,7 +37,8 @@ export default function SourcesPopover({ open, onOpenChange, onError, onInstalle
       const installedName = result.name || installPath.trim()
       recordEvent('app_install', { app: installedName, source: 'local' })
       setInstallPath('')
-      queryClient.invalidateQueries({ queryKey: ['apps'] })
+      // Cache invalidation (['apps'] + ['registry']) is owned by the
+      // mc:apps-changed listener in App.tsx, for every dispatch site at once.
       window.dispatchEvent(new Event('mc:apps-changed'))
       onInstalled?.(installedName)
       onOpenChange(false)
@@ -68,7 +69,7 @@ export default function SourcesPopover({ open, onOpenChange, onError, onInstalle
               placeholder={i18nT('components.appstore.sourcesPopover.path_to_app_directory')}
               value={installPath}
               onChange={(e: React.ChangeEvent<HTMLInputElement>) => setInstallPath(e.target.value)}
-              onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => e.key === 'Enter' && handleInstall()}
+              {...ime.bindEnter({ onEnter: () => handleInstall() })}
               className="flex-1"
             />
             <Btn onClick={handleInstall} disabled={installing || !installPath.trim()}>

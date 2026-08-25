@@ -28,7 +28,7 @@ import { describe, it, expect } from 'vitest'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { CATALOGS as RUNTIME_CATALOGS } from './index'
+import { CATALOGS as RUNTIME_CATALOGS } from './catalogs'
 import { DEFAULT_LANGUAGE } from './languages'
 import pluralKeys from './pluralKeys.json'
 
@@ -37,7 +37,7 @@ import pluralKeys from './pluralKeys.json'
  * raise it. A rise means a new key was added and nothing uses it — usually a typo at
  * the call site, or copy that was deleted without its key.
  */
-const BASELINE = 31
+const BASELINE = 30
 
 const SRC = join(__dirname, '..')
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/

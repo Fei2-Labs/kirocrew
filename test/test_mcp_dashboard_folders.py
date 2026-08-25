@@ -1052,12 +1052,14 @@ class TestASubagentCannotOutrankItsParent:
         assert "Other app" not in out
 
 
-class TestAppsCannotReshapeTheSharedFolderTree:
-    """Folders are one tree per instance with no owner, so an app gets no
-    tree-shaping authority — there is no app-private folder to bound it to.
+class TestTheFolderPolicyIsTheEndpointsNotThisServers:
+    """Folders carry an owner now, so an app HAS a folder of its own to write to
+    and this server stops deciding the policy: the tool call reaches the
+    endpoint, which bounds the write to the caller's own folders under the store
+    lock. A second copy of that rule here could only drift or race it.
 
-    What an app keeps is what is already scoped to it: reading the tree, and
-    filing its OWN sessions into a folder that exists.
+    What this layer still decides is the one thing the endpoint cannot — whether
+    the caller can be placed at all.
     """
 
     @staticmethod
@@ -1075,27 +1077,41 @@ class TestAppsCannotReshapeTheSharedFolderTree:
             return_value=f"dashboard:{slot}",
         )
 
-    def test_an_app_cannot_create_a_folder(self) -> None:
+    def test_an_apps_create_reaches_the_endpoint(self) -> None:
+        """Previously refused here outright; the endpoint now stamps the owner."""
+        made = {"id": "new000000001", "name": "Radar output", "parent_id": ""}
         with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
             "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._post") as mock_post:
+        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
             out = _call_tool_inner("chat_folder_create", {"name": "Radar output"})
-        assert out.startswith("Error:")
-        assert "not available to an app" in out
-        mock_post.assert_not_called()
+        assert not out.startswith("Error:")
+        assert mock_post.called
 
-    def test_an_app_cannot_move_a_folder(self) -> None:
+    def test_an_apps_move_reaches_the_endpoint(self) -> None:
+        moved = {"id": "fldr00000002", "name": "0811", "parent_id": "fldr00000003"}
         with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
             "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._patch") as mock_patch:
+        ), patch("kiro_crew.mcp_dashboard._patch", return_value=moved) as mock_patch:
+            out = _call_tool_inner(
+                "chat_folder_move", {"folder": "kirocrew/0811", "new_parent": "Travel"}
+            )
+        assert not out.startswith("Error:")
+        assert mock_patch.called
+
+    def test_the_endpoints_ownership_refusal_is_surfaced_not_reinvented(self) -> None:
+        """The tool must report the endpoint's verdict rather than pre-judging
+        it — that is what keeps one rule in one place."""
+        denied = {"error": "this app does not own that folder", "code": "folder_not_owned"}
+        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
+            "chat-1-100"
+        ), patch("kiro_crew.mcp_dashboard._patch", return_value=denied):
             out = _call_tool_inner(
                 "chat_folder_move", {"folder": "kirocrew/0811", "new_parent": "Travel"}
             )
         assert out.startswith("Error:")
-        mock_patch.assert_not_called()
+        assert "does not own that folder" in out
 
     def test_an_app_can_still_file_its_own_session(self) -> None:
-        """The refusal is about SHARED STRUCTURE, not about the app's own work."""
         with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
             "chat-1-100"
         ), patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch:
@@ -1133,6 +1149,105 @@ class TestAppsCannotReshapeTheSharedFolderTree:
         assert out.startswith("Error:")
         assert "cannot verify which session is calling" in out
         mock_post.assert_not_called()
+
+    def test_an_app_owned_linked_session_is_refused(self) -> None:
+        """A channel- or cron-bound slot runs under linked_session_key, and the
+        endpoint's staleness guard is dashboard:-only BY DESIGN -- for any other
+        shape, absence cannot be told from "never had a slot". So this layer,
+        which resolved the scope positively, has to refuse it."""
+
+        def rows(path: str) -> list[dict]:
+            if path == "/api/chat/folders":
+                return [dict(f) for f in _FOLDERS]
+            return [
+                {
+                    "key": "chat-5-500",
+                    "title": "Radar channel",
+                    "folder_id": "",
+                    "app": "issue-radar",
+                    "linked_session_key": "channel:C123",
+                }
+            ]
+
+        with patch("kiro_crew.mcp_dashboard._get", side_effect=rows), patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
+            return_value="channel:C123",
+        ), patch("kiro_crew.mcp_dashboard._post") as mock_post:
+            out = _call_tool_inner("chat_folder_create", {"name": "Runs"})
+        assert out.startswith("Error:")
+        assert "channel- or schedule-bound" in out
+        mock_post.assert_not_called()
+
+    def test_a_channel_session_with_no_app_still_works(self) -> None:
+        """The refusal is scoped to an APP-owned linked session. A person's own
+        channel session never had an app and keeps full authority."""
+
+        def rows(path: str) -> list[dict]:
+            if path == "/api/chat/folders":
+                return [dict(f) for f in _FOLDERS]
+            return [{"key": "chat-5-500", "title": "Mine", "folder_id": "", "app": ""}]
+
+        made = {"id": "new000000001", "name": "Runs", "parent_id": ""}
+        with patch("kiro_crew.mcp_dashboard._get", side_effect=rows), patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
+            return_value="slack:T1/C1",
+        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
+            out = _call_tool_inner("chat_folder_create", {"name": "Runs"})
+        assert not out.startswith("Error:")
+        assert mock_post.called
+
+
+class TestEveryFolderWriteCarriesTheVerifiedKey:
+    """The endpoint's ownership rule is only as good as the identity that
+    reaches it, so the key the gate STRICTLY verified must be the key the write
+    sends. The write helpers default to the lenient resolver, whose /proc
+    ancestor walk can land on a different slot -- for an app-owned session that
+    makes the write arrive looking like the unconfined person, which would check
+    one identity and write under another.
+    """
+
+    @staticmethod
+    def _mixed(path: str) -> list[dict]:
+        if path == "/api/chat/folders":
+            return [dict(f) for f in _FOLDERS]
+        return [
+            {"key": "chat-1-100", "title": "Radar run", "folder_id": "", "app": "issue-radar"},
+        ]
+
+    def _as(self, slot: str) -> Any:
+        return patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
+            return_value=f"dashboard:{slot}",
+        )
+
+    def test_create_sends_the_verified_key(self) -> None:
+        made = {"id": "new000000001", "name": "Runs", "parent_id": ""}
+        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
+            "chat-1-100"
+        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
+            _call_tool_inner("chat_folder_create", {"name": "Runs"})
+        assert mock_post.call_args.kwargs["session_key"] == "dashboard:chat-1-100"
+
+    def test_mkdir_p_segments_are_created_under_the_verified_key(self) -> None:
+        """The intermediate segments are real folders, so each write needs it too."""
+        made = {"id": "new000000001", "name": "seg", "parent_id": ""}
+        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
+            "chat-1-100"
+        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
+            _call_tool_inner("chat_folder_create", {"name": "Leaf", "parent": "Fresh/Deep"})
+        assert mock_post.call_count > 1
+        for call in mock_post.call_args_list:
+            assert call.kwargs["session_key"] == "dashboard:chat-1-100"
+
+    def test_move_sends_the_verified_key(self) -> None:
+        moved = {"id": "fldr00000002", "name": "0811", "parent_id": "fldr00000003"}
+        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
+            "chat-1-100"
+        ), patch("kiro_crew.mcp_dashboard._patch", return_value=moved) as mock_patch:
+            _call_tool_inner(
+                "chat_folder_move", {"folder": "kirocrew/0811", "new_parent": "Travel"}
+            )
+        assert mock_patch.call_args.kwargs["session_key"] == "dashboard:chat-1-100"
 
 
 class TestTheSessionListIsScopedToTheCaller:
@@ -1260,6 +1375,91 @@ class TestPrivateSessionsAreInvisible:
         mock_patch.assert_not_called()
 
 
+class TestTheVerifiedCallerKeyReachesTheRequest:
+    """The gate resolves the caller strictly; the request must SEND that key.
+
+    Gating on `_resolve_session_key_strict` and then letting the request helper
+    resolve again authorizes the check and the action as potentially different
+    sessions: the lenient walk reads mutable process state, so what it answers
+    at request time need not be what the gate approved. The endpoint authorizes
+    on the key it receives, which makes the sent key the security-relevant one.
+    """
+
+    VERIFIED = "dashboard:chat-verified"
+
+    def test_create_carries_the_verified_key(self):
+        with patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
+        ), patch(
+            "kiro_crew.mcp_dashboard._post", return_value={"target": "chat-2", "title": "w"}
+        ) as post:
+            _call_tool_inner("session_create", {"title": "worker"})
+        assert post.call_args.kwargs["session_key"] == self.VERIFIED
+
+    def test_stop_carries_the_verified_key(self):
+        with patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
+        ), patch("kiro_crew.mcp_dashboard._post", return_value={"ok": True}) as post:
+            _call_tool_inner("session_stop", {"target": "peer"})
+        assert post.call_args.kwargs["session_key"] == self.VERIFIED
+
+    def test_read_carries_the_verified_key(self):
+        with patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
+        ), patch(
+            "kiro_crew.mcp_dashboard._get", return_value={"messages": [], "total": 0}
+        ) as get:
+            _call_tool_inner("session_read_message", {"target": "peer"})
+        # `_get` takes the key positionally, matching its signature.
+        assert get.call_args.args[1] == self.VERIFIED
+
+    def test_an_empty_window_still_hands_back_the_cursor(self):
+        """A poll loop's commonest answer is empty, and it must not lose its place.
+
+        Without the cursor the caller either re-reads with no `since` -- taking the
+        tail, which skips everything older than the last `limit` rows once the
+        target answers in a burst -- or reuses a stale position and re-reads rows it
+        has already seen.
+
+        Mutation guard: returning only the head line and "No messages" fails here.
+        """
+        with patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
+        ), patch(
+            "kiro_crew.mcp_dashboard._get",
+            return_value={"messages": [], "total": 7, "next_since": 7},
+        ):
+            out = _call_tool_inner("session_read_message", {"target": "peer"})
+        assert "since=7" in out, "an empty window must still carry next_since"
+
+    def test_a_trimmed_transcript_invents_no_cursor_on_an_empty_window(self):
+        """`next_since` is absent exactly when positions stopped being exact."""
+        with patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
+        ), patch(
+            "kiro_crew.mcp_dashboard._get", return_value={"messages": [], "total": 7}
+        ):
+            out = _call_tool_inner("session_read_message", {"target": "peer"})
+        assert "since=" not in out, "no cursor may be invented once rows are trimmed"
+
+    def test_an_unverifiable_caller_never_reaches_the_request(self):
+        """The refusal must precede the call, not merely alter its key."""
+        with patch(
+            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=""
+        ), patch("kiro_crew.mcp_dashboard._post") as post, patch(
+            "kiro_crew.mcp_dashboard._get"
+        ) as get:
+            for tool, args in (
+                ("session_create", {"title": "worker"}),
+                ("session_stop", {"target": "peer"}),
+                ("session_read_message", {"target": "peer"}),
+            ):
+                out = _call_tool_inner(tool, args)
+                assert "cannot be identified" in out
+        post.assert_not_called()
+        get.assert_not_called()
+
+
 class TestAdvertisedSet:
     """Reaching this server means an agent spec referenced it.
 
@@ -1274,4 +1474,7 @@ class TestAdvertisedSet:
             "chat_folder_create",
             "chat_folder_move",
             "chat_folder_move_session",
+            "session_create",
+            "session_stop",
+            "session_read_message",
         }

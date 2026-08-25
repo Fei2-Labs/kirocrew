@@ -78,6 +78,23 @@ def _slot_save(side_effect: BaseException | None = None):
     )
 
 
+def _durable_store_file(slot_key: str, name: str) -> list[dict[str, Any]]:
+    """Read ONE named store file, WITHOUT building a `CrewStore`.
+
+    The mechanism the named readers below share. `CrewStore.__init__` reads all
+    three store files, so building one to answer a single-file question also
+    opens the two files nothing awaited, and on Windows an open that lands in a
+    `Path.replace()` window fails with `PermissionError` — issue #4142. Missing
+    is empty here for the same reason it is in `CrewStore._load`: a file that
+    was never written means nothing has been recorded yet.
+    """
+    path = crew_mod.data_home() / "crew" / crew_mod._store_name(slot_key) / name
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+
+
 def _durable_queue(slot_key: str = "s1") -> list[dict[str, Any]]:
     """Read one slot's queue file, WITHOUT building a `CrewStore`.
 
@@ -90,11 +107,18 @@ def _durable_queue(slot_key: str = "s1") -> list[dict[str, Any]]:
     `PermissionError` — issue #4142. Reading the one file the product promises
     is durable keeps the assertion and drops the unpromised dependency.
     """
-    path = crew_mod.data_home() / "crew" / crew_mod._store_name(slot_key) / "queue.json"
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []                      # nothing enqueued yet, as `_load` reads it
+    return _durable_store_file(slot_key, "queue.json")
+
+
+def _durable_forwards(slot_key: str = "s1") -> list[dict[str, Any]]:
+    """Read one slot's forwards file — see :func:`_durable_queue` for the why.
+
+    The closed-slot completion path is the caller that promises this file is on
+    disk before it returns, so a "the forward is durable" assertion can be
+    answered from `forwards.json` alone and need not depend on the durability of
+    `topics.json` and `queue.json`, which no caller there promises.
+    """
+    return _durable_store_file(slot_key, "forwards.json")
 
 
 def _durable_entry(slot_key: str, msg_id: str) -> dict[str, Any] | None:
@@ -169,21 +193,24 @@ class TestWindowsReplaceWindow:
     """
 
     @staticmethod
-    def _emulate_windows_replace(monkeypatch, target: str) -> tuple[set[str], threading.Event]:
-        """Make `target` unopenable while its write is in flight, as Windows does.
+    def _emulate_windows_replace(monkeypatch, *targets: str) -> tuple[set[str], threading.Event]:
+        """Make each of `targets` unopenable while its write is in flight, as Windows does.
 
-        The write parks on the returned gate instead of sleeping, so the window
+        The writes park on the returned gate instead of sleeping, so the window
         is open for as long as the test needs rather than for a guessed number of
         milliseconds — a timing-based window would make this test itself flaky.
         The gate has a timeout so a regression cannot hang CI.
         """
+        assert targets, "arm at least one target, or the emulator is silently inert"
+        tmp_names = {f".{t}.tmp": t for t in targets}
         inflight: set[str] = set()
         gate = threading.Event()
-        real_write_text, real_replace, real_read_text = (
-            Path.write_text, Path.replace, Path.read_text)
+        real_write_text, real_replace, real_read_text, real_read_bytes = (
+            Path.write_text, Path.replace, Path.read_text, Path.read_bytes)
 
         def write_text(self, data, *a, **k):          # type: ignore[no-untyped-def]
-            if self.name == f".{target}.tmp":
+            target = tmp_names.get(self.name)
+            if target is not None:
                 inflight.add(str(self.parent / target))
                 gate.wait(timeout=10.0)
             return real_write_text(self, data, *a, **k)
@@ -199,9 +226,21 @@ class TestWindowsReplaceWindow:
                 raise PermissionError(errno.EACCES, "Permission denied", str(self))
             return real_read_text(self, *a, **k)
 
+        def read_bytes(self, *a, **k):                # type: ignore[no-untyped-def]
+            # Faulted alongside read_text so the emulator stays armed against
+            # the call the store actually makes: ``CrewStore._load`` reads bytes
+            # through ``read_bytes_with_retry`` (#4331). Patching only read_text
+            # would leave the positive control below passing vacuously — it
+            # would observe no failure because it never intercepted the read,
+            # not because the window closed.
+            if str(self) in inflight:
+                raise PermissionError(errno.EACCES, "Permission denied", str(self))
+            return real_read_bytes(self, *a, **k)
+
         monkeypatch.setattr(Path, "write_text", write_text)
         monkeypatch.setattr(Path, "replace", replace)
         monkeypatch.setattr(Path, "read_text", read_text)
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
         return inflight, gate
 
     @pytest.mark.asyncio
@@ -210,8 +249,9 @@ class TestWindowsReplaceWindow:
         # `ingest` awaits `queue.json` by name and nothing else: `_reconcile`
         # hands `topics.json` and `forwards.json` to the executor and never waits.
         # So a durability assertion may read the queue and must not read the
-        # other two, which may still be mid-replace.
-        inflight, gate = self._emulate_windows_replace(monkeypatch, "topics.json")
+        # other two, which may still be mid-replace — arm the window on both.
+        inflight, gate = self._emulate_windows_replace(
+            monkeypatch, "topics.json", "forwards.json")
         orch, slot = _orch(), _slot(key="winrace")
         shown: list[list[str]] = []
         control: list[str] = []
@@ -223,7 +263,7 @@ class TestWindowsReplaceWindow:
             # Positive control, in the same window: the three-file read this
             # assertion used to do DOES fail here, so a pass above is the fix
             # working and not an emulator that never armed.
-            assert inflight, "the topics.json write is not in flight — window missed"
+            assert inflight, "no unawaited write is in flight — window missed"
             try:
                 CrewStore("winrace")
             except RuntimeError as exc:
@@ -245,8 +285,54 @@ class TestWindowsReplaceWindow:
 
         assert shown == [["do the thing"]], \
             f"queue row was not readable while topics.json was mid-replace: {shown}"
-        assert control and "topics.json" in control[0], \
+        assert control and any(n in control[0] for n in ("topics.json", "forwards.json")), \
             "building a whole store did NOT fail in the window — the emulator is inert"
+
+    @pytest.mark.asyncio
+    async def test_the_durable_forwards_read_does_not_touch_unawaited_files(
+            self, monkeypatch) -> None:            # type: ignore[no-untyped-def]
+        # The closed-slot completion path awaits EVERY pending write before its
+        # assertion point (`await st.wait_writes()` in `on_subagent_done`), so
+        # today even a whole-store read there happens to be safe — no product
+        # path can open this window. But the only write that path PROMISES is
+        # its own forward: if the barrier ever narrows to name that write
+        # (the `CrewStore.wait_for` shape, already the majority in
+        # `crew_chat.py`), a reader widened back to `CrewStore(...)` is the
+        # #4142 race again, visible only as an intermittent red Windows shard.
+        # So the window is opened here in the harness instead: `forwards.json`
+        # durable and awaited — the same ordering the product path keeps — and
+        # the two files nothing there promises parked mid-replace.
+        inflight, gate = self._emulate_windows_replace(
+            monkeypatch, "topics.json", "queue.json")
+        st = CrewStore("winrace")
+        st.add_forward("the result body")
+        await st.wait_writes()      # the product's promise: the forward is on disk
+        try:
+            # One save touches all three files: the queue and topics writes
+            # park in their replace windows; the forwards write lands.
+            st.add_topic("t1", "r1", "the topic", "m1")
+            want = {str(st.dir / "queue.json"), str(st.dir / "topics.json")}
+            for _ in range(500):        # poll — a fixed sleep would flake
+                seen = set(inflight)    # snapshot: workers still mutate the set
+                if want <= seen:
+                    break
+                await asyncio.sleep(0.01)
+            assert want <= seen, f"window missed — in flight: {seen}"
+            # The property: a forwards assertion is answerable from
+            # `forwards.json` alone, whatever state the unpromised files are in.
+            assert any("the result body" in f["body"] for f in _durable_forwards("winrace"))
+            # Positive control, in the same window: the whole-store read this
+            # helper exists to avoid DOES fail here — on an UNPROMISED file, so
+            # the pass above is the single-file read working and not an
+            # emulator that never armed.
+            with pytest.raises(RuntimeError, match=r"queue\.json|topics\.json"):
+                CrewStore("winrace")
+        finally:
+            # Release the parked writes AND join them, for the same reason the
+            # queue test does: an executor thread left straddling this
+            # monkeypatch teardown surfaces its failure in whatever runs next.
+            gate.set()
+            await st.wait_writes()
 
 
 # ── ingest ──
@@ -431,6 +517,7 @@ class TestIngest:
         assert secret not in body and secret not in title
         # Same text, same treatment, on the two paths that persist it.
         assert secret not in (st.topic("r1") or {}).get("digest", "")
+        await orch._store("s1").wait_writes()      # reads below are ON-DISK
         assert not any(secret in f.get("body", "") for f in CrewStore("s1").forwards)
 
     @pytest.mark.asyncio
@@ -703,6 +790,23 @@ class TestAnswerMarking:
         cls = slot.append.call_args.args[2]
         assert ("crew-reply" in cls) is expect_marker
         assert cls.startswith("msg msg-a")
+
+    def test_the_durable_copy_carries_the_window_rows_id(self) -> None:
+        # `_post` appends the window copy — where ``meta.mid`` is minted — and
+        # then persists a durable transcript copy; both must carry ONE id or a
+        # bounded slot-detail read cannot reconcile them as the same message.
+        orch = _orch()
+        slot = _slot()
+        slot.append.return_value = {
+            "role": "assistant",
+            "content": "an answer",
+            "meta": {"mid": "m-feedfacefeedface"},
+        }
+        with patch.object(crew_mod, "append_if_absent_off_loop") as durable:
+            assert orch._post(slot, "an answer", kind="crew_result") is True
+        assert durable.call_args.kwargs["mid"] == "m-feedfacefeedface", (
+            "the durable copy did not carry the window row's id"
+        )
 
 
 class TestUnsettledEntriesAreNotStranded:
@@ -2098,8 +2202,9 @@ class TestGptRoundFive:
         orch._owned["r1"] = "s1"
         orch._state.get_slot = MagicMock(return_value=None)      # tab closed
         await orch.on_subagent_done(_spawn_info("r1", done=True, result="the result body"))
-        # Read from a FRESH store: the forward must already be on disk.
-        assert any("the result body" in f["body"] for f in CrewStore("s1").forwards)
+        # Read the FILE, not a store: awaiting here would prove nothing, since the
+        # property under test is that the PRODUCT awaited before returning.
+        assert any("the result body" in f["body"] for f in _durable_forwards("s1"))
 
 
 class TestLiveRunIsReOwned:
@@ -2502,10 +2607,19 @@ class TestReviewFixes:
         orch = _orch(state=state)
         with patch.object(orch, "_post", return_value=True) as post:
             orch._store("s1")     # _reconcile SCHEDULES the replay (it is sync)
-            await asyncio.sleep(0.05)          # let that task run
+            # Poll until the drain task completes (forwards cleared) instead of
+            # a fixed sleep that flakes on loaded CI runners (#4914).
+            # Catch RuntimeError on Windows where the drain task may hold a
+            # write lock on forwards.json while we try to read it.
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                try:
+                    if not CrewStore("s1").forwards:
+                        break
+                except (RuntimeError, OSError):
+                    pass  # file locked by drain task — retry
         post.assert_called_once()
         assert "orphaned result" in post.call_args.args[1]
-        await orch._store("s1").wait_writes()
         assert CrewStore("s1").forwards == []
 
 
@@ -2664,7 +2778,11 @@ class TestGatewayCrewInit:
         # GPT finding on 85f8fbe2: a failed durable write must surface, and
         # the generation must stay retryable (not recorded as landed).
         st = CrewStore("s1")
-        with patch("pathlib.Path.replace", side_effect=OSError("disk full")):
+        # Faulted at `os.replace`, the call the store's rename actually makes
+        # since it moved onto `replace_with_retry`. A bare `OSError` is not the
+        # Windows sharing violation that helper retries, so it still propagates
+        # on the first attempt — which is what this test is about.
+        with patch("os.replace", side_effect=OSError("disk full")):
             st.add_msg("doomed")
             with pytest.raises(OSError):
                 await st.wait_writes()
@@ -2936,3 +3054,74 @@ class TestUnknownCrewNameStaysFailClosed:
         with cfg_patch, bind_patch:
             resolved = await orch._dispatch_agent(_slot(agent="default"))
         assert resolved == "kirocrew"
+
+
+class TestDecisionJsonExtraction:
+    """The decision reply is parsed by the shared scanner, not a greedy regex."""
+
+    @pytest.mark.asyncio
+    async def test_stray_brace_in_prose_still_routes(self) -> None:
+        # The old greedy first-'{'-to-last-'}' regex spanned from the
+        # {placeholder} aside to the trailing "{}" echo, so a valid decision
+        # payload wrapped in prose never parsed and every entry was deferred.
+        orch = _orch()
+        slot = _slot()
+        st = orch._store("s1")
+        e = st.add_msg("do the thing")
+        reply = (
+            'Routing per the {msg_id, topic_id} schema: '
+            '{"actions": [{"do": "meta", "msg_id": "%s"}]} -- use {} if unsure.'
+            % e["msg_id"]
+        )
+
+        async def _reply(*a, **kw):
+            return reply
+
+        with patch.object(crew_mod, "run_bg_oneliner", side_effect=_reply), \
+                patch.object(orch, "_apply", new=AsyncMock()) as apply:
+            await orch._decide_once(slot)
+        apply.assert_awaited_once()
+        assert apply.await_args.args[2] == {"do": "meta", "msg_id": e["msg_id"]}
+
+    @pytest.mark.asyncio
+    async def test_two_different_payloads_defer_not_guess(self) -> None:
+        # Two DIFFERENT actions-shaped dicts (e.g. a worked example echoed
+        # before the real payload) are ambiguous: the shared contract refuses
+        # to guess, so the pass takes the retry-then-defer path instead of
+        # executing whichever dict a scanner happened to land on.
+        orch = _orch()
+        slot = _slot()
+        st = orch._store("s1")
+        st.add_msg("do the thing")
+
+        async def _reply(*a, **kw):
+            return ('{"actions": [{"do": "meta", "msg_id": "a"}]} or '
+                    '{"actions": [{"do": "meta", "msg_id": "b"}]}')
+
+        with patch.object(crew_mod, "run_bg_oneliner", side_effect=_reply) as llm, \
+                patch.object(orch, "_apply", new=AsyncMock()) as apply:
+            await orch._decide_once(slot)
+        apply.assert_not_awaited()
+        assert llm.call_count == 2  # retried once, then deferred
+
+    @pytest.mark.asyncio
+    async def test_braceless_reply_takes_the_retry_path(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        # The prompt demands a JSON-only reply, so a reply with no JSON object
+        # at all is a model failure: it gets the same retry-then-defer
+        # treatment as garbage braces (the old code silently treated it as
+        # "no actions" and never logged).
+        orch = _orch()
+        slot = _slot()
+        st = orch._store("s1")
+        st.add_msg("do the thing")
+
+        async def _reply(*a, **kw):
+            return "I cannot decide right now."
+
+        with caplog.at_level(logging.WARNING):
+            with patch.object(crew_mod, "run_bg_oneliner", side_effect=_reply) as llm, \
+                    patch.object(orch, "_apply", new=AsyncMock()) as apply:
+                await orch._decide_once(slot)
+        apply.assert_not_awaited()
+        assert llm.call_count == 2
+        assert "unparseable decision" in caplog.text

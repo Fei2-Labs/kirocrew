@@ -144,11 +144,11 @@ class TestLogout:
     @pytest.fixture
     def secret_home(self, monkeypatch, tmp_path):
         (tmp_path / ".local_secret").write_text("s3cr3t\n", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "s3cr3t")
         return tmp_path
 
     def test_missing_secret_reports_gateway_down(self, monkeypatch, tmp_path, capsys) -> None:
-        monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "")
         with pytest.raises(SystemExit) as exc:
             cli_server._logout(5476)
         assert exc.value.code == 1
@@ -924,6 +924,57 @@ class TestRunTask:
         assert vector.embed_fn_factory is None
         assert "Embedding model changed" in capsys.readouterr().err
 
+    def test_vector_init_is_offloaded_off_the_event_loop(
+        self, taskrunner_env, tmp_path, monkeypatch
+    ) -> None:
+        """``VectorMemoryStore.init()`` must honour its caller contract (#5389):
+        the Windows path shells out to icacls, so an async caller offloads it
+        via ``asyncio.to_thread`` instead of freezing the loop. Ordering is
+        asserted too: init must COMPLETE before ``_run_task`` wires the embed
+        hooks (a fire-and-forget offload would reorder them). The sibling
+        ``MemoryStore.init()`` (cheap mkdir+seed) carries no contract and is
+        deliberately not pinned to either thread here."""
+        import threading
+
+        events: list = []
+        init_threads: dict = {}
+
+        class _ThreadRecordingVector(_FakeVectorStore):
+            def init(self) -> None:
+                init_threads["vector"] = threading.current_thread()
+                events.append("init")
+                super().init()
+
+            @property
+            def embed_fn_factory(self):
+                return self.__dict__.get("_eff")
+
+            @embed_fn_factory.setter
+            def embed_fn_factory(self, value) -> None:
+                # First post-init wiring step in _run_task: recording it turns
+                # "init completed before first use" into an observed ordering.
+                events.append("wired")
+                self.__dict__["_eff"] = value
+
+        def _vector(**kw):
+            store = _ThreadRecordingVector(**kw)
+            taskrunner_env["vector"] = store
+            return store
+
+        monkeypatch.setattr(cli_server, "VectorMemoryStore", _vector)
+        taskrunner_env["install_runner"](_Result("completed"))
+        args = argparse.Namespace(
+            spec=str(_spec(tmp_path)), no_test=False, fresh=False, timeout=0, name=""
+        )
+        asyncio.run(cli_server._run_task(args))
+
+        # Offloaded: init ran in a worker thread, not on the loop thread.
+        assert init_threads["vector"] is not threading.current_thread()
+        assert taskrunner_env["vector"].inited is True
+        # Awaited, not fire-and-forget: init completed BEFORE the embed hooks
+        # were wired (the first use that follows it in _run_task).
+        assert events.index("init") < events.index("wired")
+
 
 # --------------------------------------------------------------------------
 # _update — git checkout path
@@ -937,6 +988,9 @@ class _GitStub:
         self.rc = rc
         self.calls: list[list[str]] = []
         self.status_out = ""
+        # Behind-only by default: these tests model a fast-forwardable
+        # checkout, which the divergence guard waves through.
+        self.rev_list_out = "0\t5\n"
 
     def __call__(self, argv, **kw):
         self.calls.append(list(argv))
@@ -946,6 +1000,10 @@ class _GitStub:
             return subprocess.CompletedProcess(argv, self.rc.get("fetch", 0), "", "no remote")
         if argv[:2] == ["git", "diff"]:
             return subprocess.CompletedProcess(argv, self.rc.get("diff", 1), "", "")
+        if argv[:2] == ["git", "rev-list"]:
+            return subprocess.CompletedProcess(
+                argv, self.rc.get("rev_list", 0), self.rev_list_out, ""
+            )
         if argv[:2] == ["git", "status"]:
             return subprocess.CompletedProcess(argv, 0, self.status_out, "")
         if argv[:2] == ["git", "reset"]:
@@ -953,7 +1011,11 @@ class _GitStub:
         if argv[0] == "kiro-cli":
             return subprocess.CompletedProcess(argv, 0, "", "")
         if "pip" in argv:
-            return subprocess.CompletedProcess(argv, self.rc.get("pip", 0), "", "wheel error")
+            # BYTES, like the real call: the install captures without text=True so
+            # a non-UTF-8 console cannot make pip's own error message undecodable.
+            return subprocess.CompletedProcess(
+                argv, self.rc.get("pip", 0), b"", b"wheel error"
+            )
         return subprocess.CompletedProcess(argv, self.rc.get("setup", 0), "", "")
 
 
@@ -962,7 +1024,18 @@ def git_checkout(monkeypatch, tmp_path):
     """A KIROCREW_PROJECT_DIR that looks like a git checkout, with git stubbed out."""
     proj = tmp_path / "proj"
     (proj / ".git").mkdir(parents=True)
+    # ``.git/HEAD``, not just ``.git/``: the install shape is derived by asking
+    # git and falling back to the on-disk markers of a working tree's own root,
+    # and a bare ``.git`` directory is refused by both on purpose.
+    (proj / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(proj))
+    # The git lane requires provenance as well as the path probe; this fixture
+    # exercises the git path with a fabricated tree the test process does not
+    # run from, so provenance is declared rather than derived.
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_capability.running_from_checkout",
+        lambda root, **kw: True,
+    )
     monkeypatch.setattr(
         "kiro_crew.platform.update_governance.resolve_remote_url",
         lambda p, remote="", branch="": "https://github.com/kirodotdev/KiroCrew.git",
@@ -973,6 +1046,17 @@ def git_checkout(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_server.shutil, "which", lambda name: None)
     monkeypatch.setattr(cli_server, "build_frontend_sync", lambda p: None)
     monkeypatch.setattr("kiro_crew.cli._ensure_node", lambda *a: None)
+    # Pin the install ROUTE. The real probe reads the test interpreter's own
+    # Scripts dir, so on a Windows dev box running from a checkout these tests
+    # would silently take the dependency-only branch instead of the reinstall
+    # they assert. `kirocrew update`'s own substitute behaviour is covered in
+    # test/test_dep_sync.py.
+    monkeypatch.setattr(cli_server.dep_sync, "locked_console_scripts", lambda target: [])
+    # And the foreign-venv guard, which now runs before either install branch.
+    # Its probe RUNS the target interpreter, which _GitStub intercepts into an
+    # empty answer — read as "cannot be shown to serve this checkout" and refused.
+    # dep_sync's own tests own that guard's behaviour.
+    monkeypatch.setattr(cli_server.dep_sync, "venv_not_mapped_to", lambda origin, repo: None)
     return proj
 
 
@@ -1026,6 +1110,59 @@ class TestUpdateGitPath:
         assert "Already up to date" in capsys.readouterr().out
         assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
 
+    def test_ahead_only_checkout_is_never_reset(self, monkeypatch, git_checkout, capsys) -> None:
+        """The CLI is the strictest surface: ahead-only has nothing to pull.
+
+        ``origin/<branch>`` is an ancestor of HEAD here, so a reset could only
+        REMOVE the local commits — refused even though the tree content
+        differs from the upstream.
+        """
+        stub = _GitStub()
+        stub.rev_list_out = "2\t0\n"  # 2 ahead, 0 behind
+        monkeypatch.setattr(subprocess, "run", stub)
+        cli_server._update()
+        out = capsys.readouterr().out
+        assert "Already up to date!" in out
+        assert "2 local commit(s) ahead" in out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_diverged_checkout_refuses_without_force(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        stub = _GitStub()
+        stub.rev_list_out = "3\t2\n"  # 3 ahead, 2 behind — diverged
+        monkeypatch.setattr(subprocess, "run", stub)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "diverged" in out
+        assert "kirocrew update --force" in out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_diverged_checkout_resets_under_force(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        stub = _GitStub()
+        stub.rev_list_out = "3\t2\n"  # 3 ahead, 2 behind — diverged
+        monkeypatch.setattr(subprocess, "run", stub)
+        cli_server._update(force=True)
+        out = capsys.readouterr().out
+        assert "--force: discarding 3 local commit(s)" in out
+        assert any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_unreadable_divergence_refuses_the_reset(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """Fail closed: a guard that cannot count must not wave the reset through."""
+        stub = _GitStub(rev_list=128)
+        monkeypatch.setattr(subprocess, "run", stub)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        assert "Could not compare HEAD against origin/main" in capsys.readouterr().out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
     def test_local_changes_prompt_and_abort_leaves_tree_alone(
         self, monkeypatch, git_checkout, capsys
     ) -> None:
@@ -1066,7 +1203,8 @@ class TestUpdateGitPath:
         with pytest.raises(SystemExit) as exc:
             cli_server._update()
         assert exc.value.code == 1
-        assert "Install failed" in capsys.readouterr().out
+        # pip's own reason reaches the console, not just the exit code.
+        assert "wheel error" in capsys.readouterr().out
 
     def test_success_updates_kiro_cli_and_refreshes_agent_config(
         self, monkeypatch, git_checkout, capsys
@@ -1099,7 +1237,10 @@ class TestUpdateWheelDispatch:
 
     def test_layout_is_built_from_the_distribution(self, monkeypatch, capsys) -> None:
         monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
-        monkeypatch.setattr("kiro_crew.beacon.distribution", lambda: "wheel")
+        # Both bindings: the capability derives WHO owns the update from the
+        # stamp, and cli_server names the layout kind from its own import.
+        monkeypatch.setattr("kiro_crew.platform.update_capability.distribution", lambda: "wheel")
+        monkeypatch.setattr("kiro_crew.cli_server.distribution", lambda: "wheel")
         seen: list[InstallLayout] = []
         monkeypatch.setattr(cli_server, "_update_wheel", lambda layout: seen.append(layout))
         cli_server._update()
@@ -1110,7 +1251,8 @@ class TestUpdateWheelDispatch:
 
     def test_unknown_distribution_defaults_to_wheel(self, monkeypatch) -> None:
         monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
-        monkeypatch.setattr("kiro_crew.beacon.distribution", lambda: "")
+        monkeypatch.setattr("kiro_crew.platform.update_capability.distribution", lambda: "")
+        monkeypatch.setattr("kiro_crew.cli_server.distribution", lambda: "")
         seen: list[InstallLayout] = []
         monkeypatch.setattr(cli_server, "_update_wheel", lambda layout: seen.append(layout))
         cli_server._update()

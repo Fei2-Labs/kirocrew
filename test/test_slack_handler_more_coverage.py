@@ -286,12 +286,15 @@ class _Cfg:
 
 
 class TestSetOrchCfgProviderValidation:
-    def test_unknown_provider_falls_back_to_polly(self, monkeypatch, caplog):
+    def test_unknown_provider_falls_back_to_local(self, monkeypatch, caplog):
+        # Flipped from a "polly" fallback: an unrecognised provider value must
+        # not land on a PAID cloud service. Local costs nothing and degrades
+        # visibly; a cloud fallback bills an account nobody chose.
         monkeypatch.setattr(h, "_vc", h._VoiceConfig())
         monkeypatch.setattr(h, "_orch_cfg", None, raising=False)
         with caplog.at_level("WARNING"):
             h.set_orch_cfg(_Cfg({"enabled": True, "provider": "ploly"}))
-        assert h._vc.provider == "polly"
+        assert h._vc.provider == "piper"
         assert "ploly" in caplog.text
 
     def test_valid_provider_is_kept_and_enabled_implies_auto_reply(self, monkeypatch):
@@ -603,6 +606,59 @@ class TestAutoTitleToolRejection:
         assert "slack:t2" not in h._titled_threads
         assert not [a for a in slack.actions if a[0] == "set_thread_title"]
 
+    def test_lock_is_rebound_when_the_event_loop_changes(self):
+        """Regression for #4789 (mechanism now shared via #4800's LoopBoundLock):
+        the module-global auto-title lock must keep working when the running
+        event loop changes.
+
+        ``pytest-asyncio`` gives every async test a fresh loop, and on
+        Python 3.10+ acquiring an ``asyncio.Lock`` from a loop other than the
+        one it was first used on raises ``RuntimeError`` — which the bare
+        ``except Exception:`` in ``_maybe_auto_title_slack`` then swallowed,
+        silently skipping the permission-rejection branch. Prove the contract
+        deterministically with two distinct loops instead of replaying the
+        order-dependent CI flake.
+        """
+
+        def _run_once(session_key: str):
+            provider = FakeProvider(
+                [
+                    AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id="rq1", title="Bash"),
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="Deploy plan review"),
+                    AcpEvent(kind=EVENT_COMPLETE),
+                ]
+            )
+            slack = MockSlackClient()
+
+            async def _go():
+                # Touch the lock on this loop first, then run the real path.
+                lock = h._get_auto_title_lock()
+                await lock.acquire()
+                lock.release()
+                inner = lock._bound()  # this loop's underlying asyncio.Lock
+                await h._maybe_auto_title_slack(
+                    slack, _TitleSessions(provider), "C1", session_key, None, "u", "a"
+                )
+                return lock, inner
+
+            lock, inner = asyncio.run(_go())
+            return lock, inner, provider, slack
+
+        lock1, inner1, provider1, _ = _run_once("slack:loop1")
+        lock2, inner2, provider2, slack2 = _run_once("slack:loop2")
+
+        # One shared chokepoint object, but each loop must get its OWN inner
+        # lock — this is the rebinding invariant that #4789's fix introduced
+        # and #4800's LoopBoundLock now carries.
+        assert lock2 is lock1
+        assert inner2 is not inner1
+        # …and the real path must still work there: the rejection is recorded
+        # (this was the exact assertion the flake broke) and the title lands.
+        assert provider1.rejected == ["rq1"]
+        assert provider2.rejected == ["rq1"]
+        titles = [a for a in slack2.actions if a[0] == "set_thread_title"]
+        assert titles and titles[0][1]["title"] == "Deploy plan review"
+
 
 # ──────────────────────────────────────────────────────────────────────
 # handle_interaction — defence-in-depth re-checks
@@ -633,7 +689,7 @@ class TestHandleInteractionAuthReChecks:
         )
         assert out is None
         assert calls["n"] == 2
-        assert h._trusted_sessions == set()
+        assert not h._trusted_sessions
         # Rejected before any Slack call is made.
         assert slack.actions == []
 
@@ -643,7 +699,7 @@ class TestHandleInteractionAuthReChecks:
             "C1", "m1", h._ACTION_TRUST, owner, thread_ts="t1", slack=None
         )
         assert out is None
-        assert h._trusted_sessions == set()
+        assert not h._trusted_sessions
 
     @pytest.mark.asyncio
     async def test_late_trust_click_denied_when_not_thread_owner(self, owner):
@@ -653,7 +709,7 @@ class TestHandleInteractionAuthReChecks:
             "C1", "m1", h._ACTION_TRUST, owner, thread_ts="t1", slack=slack
         )
         assert out is None
-        assert h._trusted_sessions == set()
+        assert not h._trusted_sessions
 
     @pytest.mark.asyncio
     async def test_late_trust_refused_when_session_map_lookup_fails(self, monkeypatch, owner):
@@ -671,7 +727,7 @@ class TestHandleInteractionAuthReChecks:
         )
         # Fail closed: no trust granted when the thread->session mapping is unknown.
         assert out is None
-        assert h._trusted_sessions == set()
+        assert not h._trusted_sessions
 
     @pytest.mark.asyncio
     async def test_late_trust_refused_when_ownership_fetch_raises(self, owner):
@@ -683,7 +739,7 @@ class TestHandleInteractionAuthReChecks:
             "C1", "m1", h._ACTION_TRUST, owner, thread_ts="t1", slack=_Boom()
         )
         assert out is None
-        assert h._trusted_sessions == set()
+        assert not h._trusted_sessions
 
     @pytest.mark.asyncio
     async def test_late_trust_binds_to_the_linked_dashboard_session(self, monkeypatch, owner):
@@ -703,7 +759,7 @@ class TestHandleInteractionAuthReChecks:
             "C1", "m1", h._ACTION_TRUST, owner, thread_ts="t1", slack=slack, sessions=sessions
         )
         assert out == h._ACTION_TRUST
-        assert h._trusted_sessions == {"dash:slot-1"}
+        assert h.is_session_trusted("dash:slot-1")
         assert sessions.policies == {"dash:slot-1": "auto"}
 
     @pytest.mark.asyncio
@@ -722,7 +778,7 @@ class TestHandleInteractionAuthReChecks:
         # The turn is unblocked with a rejection, trust is NOT granted, and the
         # entry is consumed so a retry cannot reuse it.
         assert pending.future.result() == h._OUTCOME_REJECTED
-        assert h._trusted_sessions == set()
+        assert not h._trusted_sessions
         assert sessions.policies == {}
         assert "C1:m1" not in h._pending_approvals
 
@@ -737,7 +793,7 @@ class TestHandleInteractionAuthReChecks:
         assert provider.approved == ["rq8"]
         assert pending.future.result() == h._OUTCOME_APPROVED
         # Nothing to trust — the set stays empty rather than gaining "".
-        assert h._trusted_sessions == set()
+        assert not h._trusted_sessions
 
     @pytest.mark.asyncio
     async def test_trust_with_session_key_propagates_policy_to_subagents(self, owner):
@@ -996,7 +1052,7 @@ class TestToolHookVerdicts:
     @pytest.mark.asyncio
     async def test_trusted_session_auto_approves_in_interactive_mode(self):
         slack = MockSlackClient()
-        h._trusted_sessions.add("m1")
+        h.add_trusted_session("m1")
         builder = _Builder(ToolHookResult(action=TOOL_ALLOW))
         provider = FakeProvider(
             [

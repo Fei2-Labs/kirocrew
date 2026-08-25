@@ -536,7 +536,7 @@ class TestLessonDedup:
         assert store.write_lesson(
             "Always pin the release tag before publishing a wheel to the CDN"
         )
-        assert store.write_lesson("pin the release tag") is False
+        assert store.write_lesson("pin the release tag").wrote is False
         assert len(store.get_lessons()) == 1
 
     def test_a_longer_rule_replaces_the_lesson_it_contains(self, tmp_path: Path) -> None:
@@ -1438,6 +1438,65 @@ class TestEpisodicBackfillSweep:
         assert store.search_episodic(query_embedding=_unit(0), limit=5) == []
         assert store.backfill_missing_embeddings() == 1
         assert len(store.search_episodic(query_embedding=_unit(0), limit=5)) == 1
+
+
+class TestPendingEmbeddingsProbe:
+    """``has_pending_embeddings()`` must answer for each sub-sweep, without a model.
+
+    The boot sweep skips the ~700MB embedding-model load when this returns False,
+    so a predicate that misses a row class would strand those rows unembedded
+    forever. One test per sub-sweep predicate.
+    """
+
+    def test_an_empty_store_has_nothing_pending(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        assert store.has_pending_embeddings() is False
+
+    def test_a_deferred_episodic_row_is_pending(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        assert store.write_episodic("A deferred fragment awaiting its vector", defer_embedding=True)
+        assert store.has_pending_embeddings() is True
+
+    def test_an_embedded_episodic_row_is_not_pending(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        assert store.write_episodic("A fragment that already carries a vector", embedding=_unit(0))
+        assert store.has_pending_embeddings() is False
+
+    def test_a_soft_deleted_row_is_not_pending(self, tmp_path: Path) -> None:
+        """``is_deleted = 0`` is in every sub-sweep predicate — mirror it here.
+
+        A tombstoned row is never embedded by the sweep, so counting it as work
+        would load the model on every boot for rows nothing will ever fill.
+        """
+        store = _store(tmp_path)
+        assert store.write_episodic("A fragment that is about to be deleted", defer_embedding=True)
+        mem_id = store.get_episodic_list()[0]["id"]
+        assert store.delete_episodic(mem_id)
+        assert store.has_pending_embeddings() is False
+
+    def test_a_lesson_with_no_vector_is_pending(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        assert store.write_lesson("Always name the branch explicitly when pushing", "tool")
+        # write_lesson embeds at write time only when embed_fn is bound; it is
+        # not here, so the row lands NULL — exactly the state after a model swap.
+        assert store.has_pending_embeddings() is True
+
+    def test_a_non_lesson_semantic_row_with_no_vector_is_pending(self, tmp_path: Path) -> None:
+        store = _store(tmp_path)
+        assert store.set_semantic("user.editor", "vim", 0.9, "user_explicit") is None
+        assert store.has_pending_embeddings() is True
+
+    def test_the_probe_agrees_with_the_sweep_after_it_runs(self, tmp_path: Path) -> None:
+        """The probe's contract: False means the sweep would embed nothing."""
+        store = _store(tmp_path)
+        assert store.write_episodic("A deferred fragment awaiting its vector", defer_embedding=True)
+        assert store.write_lesson("Never force-push a shared branch", "tool")
+        assert store.set_semantic("user.shell", "zsh", 0.9, "user_explicit") is None
+        store.embed_fn = _fixed_embed()
+        assert store.has_pending_embeddings() is True
+        store.backfill_missing_embeddings()
+        assert store.has_pending_embeddings() is False
+        assert store.backfill_missing_embeddings() == 0
 
 
 class TestEmbeddingSpaceReconciliation:

@@ -101,6 +101,8 @@ def test_save_persists_token_and_config(tmp_path: Path, monkeypatch) -> None:
             "enabled": True,
             "allowed_user_ids": ["123456789012345678", "987654321098765432"],
             "allowed_thread_ids": ["234567890123456789"],
+            "allowed_channel_ids": ["345678901234567890"],
+            "auto_thread": False,
             "soft_threshold_pct": 75,
         },
     )
@@ -117,9 +119,11 @@ def test_save_persists_token_and_config(tmp_path: Path, monkeypatch) -> None:
         "987654321098765432",
     ]
     assert cfg["discord"]["allowed_thread_ids"] == ["234567890123456789"]
-    assert loader.KiroCrewConfig.load().discord.allowed_thread_ids == [
-        "234567890123456789"
-    ]
+    assert cfg["discord"]["allowed_channel_ids"] == ["345678901234567890"]
+    loaded = loader.KiroCrewConfig.load().discord
+    assert loaded.allowed_thread_ids == ["234567890123456789"]
+    assert loaded.allowed_channel_ids == ["345678901234567890"]
+    assert loaded.auto_thread is False
     assert cfg["discord"]["soft_threshold_pct"] == 75
 
 
@@ -201,6 +205,26 @@ def test_save_rejects_non_numeric_thread_ids(tmp_path: Path, monkeypatch) -> Non
     assert "numeric" in body["error"]
 
 
+def test_save_rejects_non_numeric_channel_ids(tmp_path: Path, monkeypatch) -> None:
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    _accept_token(monkeypatch, mod)
+    (status_body, _) = _client_put(
+        mod, monkeypatch, tmp_path, {"allowed_channel_ids": ["general"]}
+    )
+    status, body = status_body
+    assert status == 400
+    assert "channel ID" in body["error"]
+
+
+def test_save_requires_boolean_auto_thread(tmp_path: Path, monkeypatch) -> None:
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    _accept_token(monkeypatch, mod)
+    (status_body, _) = _client_put(mod, monkeypatch, tmp_path, {"auto_thread": "true"})
+    assert status_body[0] == 400
+
+
 def test_clear_flag_must_be_strict_boolean(tmp_path: Path, monkeypatch) -> None:
     """Truthy non-bool clear flags (e.g. "false", 1) must not delete the token."""
     import kiro_crew.dashboard.handlers.messaging as mod
@@ -249,6 +273,9 @@ def test_soft_threshold_bounds(tmp_path: Path, monkeypatch) -> None:
     for bad in (0, 101, "80", True):
         (status_body, _) = _client_put(mod, monkeypatch, tmp_path, {"soft_threshold_pct": bad})
         assert status_body[0] == 400, f"soft_threshold_pct={bad!r} should be rejected"
+        # A machine-readable code, not prose only: the dashboard renders `error`
+        # verbatim into a localized UI, so prose alone is untranslatable.
+        assert status_body[1]["code"] == "soft_threshold_pct_invalid"
 
 
 def test_get_masks_token_and_reports_state(tmp_path: Path, monkeypatch) -> None:

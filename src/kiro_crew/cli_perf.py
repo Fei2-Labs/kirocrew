@@ -25,7 +25,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from kiro_crew import platform_compat
+from kiro_crew import cli_help, platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 from kiro_crew.gateway_lock import LOCK_FILENAME
@@ -63,9 +63,6 @@ def _read_gateway_pid() -> int | None:
     immediately and report None. If we cannot, a live holder exists and the
     recorded PID names it. Any error reads as "cannot confirm" and returns None —
     fail closed, since the failure mode is profiling the wrong process.
-
-    Mirrors ``home_migration._gateway_is_live``, which uses the same probe to
-    decide whether relocating a data home is safe.
     """
     lock_path = config_dir() / LOCK_FILENAME
     try:
@@ -345,7 +342,7 @@ def register_perf_parser(sub: argparse._SubParsersAction) -> None:
     exists, and "profile" is overloaded three ways in this codebase (governance
     profiles, AWS profiles, deploy profiles).
     """
-    perf_parser = sub.add_parser("perf", help="Debug-only performance sampling (off by default)")
+    perf_parser = cli_help.add_command(sub, "perf")
     perf_sub = perf_parser.add_subparsers(dest="perf_action")
     sample = perf_sub.add_parser(
         "sample",

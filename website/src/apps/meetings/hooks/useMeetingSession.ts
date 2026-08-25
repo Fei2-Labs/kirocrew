@@ -28,6 +28,16 @@ import { useMeetingTranscription } from './useMeetingTranscription'
 const DEDUP_WINDOW_MS = 5000
 
 /**
+ * Poll cadence while a start is in flight.
+ *
+ * Deliberately faster than `poll_interval_active`: this window is short and the
+ * whole point is to notice `active` promptly, so the Live badge and the meeting
+ * controls come alive instead of looking dead. Not configurable, because it is
+ * not a steady-state cost — at most a handful of requests, once per start.
+ */
+const START_POLL_MS = 1000
+
+/**
  * Transcription failure code -> catalog key.
  *
  * FILE SCOPE, not inline in the handler that indexes it: `check-i18n-keys.mjs`
@@ -143,8 +153,81 @@ export const ALLOWED_TRANSITIONS: Record<MeetingStatus, MeetingStatus[]> = {
   ended: ['active'],
 }
 
+/**
+ * Poll cadence for a meeting's metadata query, or `false` for "do not poll".
+ *
+ * The `startInFlight` rule is the load-bearing one. `POST /start` does not answer
+ * until EVERY agent has been initialized, and that is a sequence of awaited agent
+ * dispatches — tens of seconds with the default roster (measured: ~46s for three).
+ * The meeting is already `active` on the server for almost all of that, because the
+ * status is persisted up front, BEFORE the dispatches begin. So the wait gates
+ * nothing except this client's knowledge of it.
+ *
+ * Without the rule that was enough to look like a broken button: polling is off
+ * while `idle`, so with no poll and no resolved mutation the UI sat on a stale
+ * `idle` for the whole initialization — Start greyed out (it is disabled while the
+ * mutation is pending), no Live badge, and, because the microphone is bound to
+ * `status`, no permission prompt and no capture at all. The only way through was a
+ * manual reload, whose fresh fetch saw `active` and brought the meeting to life.
+ * Users reasonably concluded that recording does not start without a reload.
+ *
+ * Checked LAST so a known status always wins: once a poll lands and `status` is
+ * `active`, the caller's configured cadence takes over and this rule goes quiet on
+ * its own.
+ */
+export function metaPollInterval(opts: {
+  status: MeetingStatus | undefined
+  startInFlight: boolean
+  activeMs?: number
+  idleMs?: number
+}): number | false {
+  const { status, startInFlight, activeMs, idleMs } = opts
+  if (status === 'active') return activeMs ?? 5000
+  if (status === 'paused' || status === 'reviewing') return idleMs ?? 30_000
+  if (startInFlight) return START_POLL_MS
+  return false
+}
+
 export function canTransition(from: MeetingStatus, to: MeetingStatus): boolean {
   return ALLOWED_TRANSITIONS[from]?.includes(to) ?? false
+}
+
+/**
+ * Whether the microphone may open for an `active` meeting.
+ *
+ * `status === 'active'` alone is NOT dispatch readiness. `POST /start` persists
+ * `active` up front and then initializes agents with transcript ingress
+ * SUSPENDED — every dispatch in that window is rejected with a 409
+ * (`no_active_meeting`, see the backend's `get_for_dispatch`). The fast start
+ * poll exists to observe `active` early, so without a readiness gate it opened
+ * the microphone tens of seconds before ingress: early finals burned through
+ * the short dispatch retry schedule (~4.6s) against a ~46s initialization and
+ * were PERMANENTLY lost from the notes and tasks.
+ *
+ * `ingressReady` is the server's own admission flag, `accepting_dispatches`,
+ * reported on every meta poll — the same holder flag the dispatch endpoint
+ * itself checks. Gating on the POLLED value rather than on the start
+ * mutation's lifecycle makes every client-side inference hole unreachable at
+ * once, because the mutation's outcome is not evidence about ingress in either
+ * direction: an error settlement can hide a server-side success (the ~46s
+ * request is exactly the shape a proxy timeout kills), and a success response
+ * can be lost in transit. With the polled flag, the mic simply follows what
+ * the server reports: closed while initialization holds ingress shut, open on
+ * the first poll after `resume_dispatches` — whatever became of the start
+ * request itself. A reload or a second tab lands on the same rule, which also
+ * closes the pre-existing hole where a tab that never started the meeting
+ * opened its mic mid-initialization.
+ *
+ * The Live badge and controls still key off `status` and appear within ~1s of
+ * Start; only capture waits for the server to report ingress open.
+ */
+export function canOpenTranscription(opts: {
+  status: MeetingStatus
+  ingressReady: boolean
+  transcriptFull: boolean
+}): boolean {
+  const { status, ingressReady, transcriptFull } = opts
+  return status === 'active' && ingressReady && !transcriptFull
 }
 
 interface Options {
@@ -190,21 +273,36 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
     retry: 1,
   })
 
+  // Whether a start is waiting on the server. Drives the poll that lets the UI see
+  // `active` while `POST /start` is still initializing agents — see
+  // `metaPollInterval`, which explains why that wait is long and why it matters.
+  // The MICROPHONE deliberately does not key off this flag: it follows the polled
+  // `live.accepting_dispatches` instead (see `canOpenTranscription`), so the
+  // mutation's fate — settled, failed, or its response lost in transit — cannot
+  // wedge capture in either direction.
+  const [startInFlight, setStartInFlight] = useState(false)
+
   const metaQuery = useQuery({
     queryKey: [...scope, 'meta'],
     queryFn: () => meetingsApi.meeting(meetingId),
     enabled: initQuery.isSuccess,
-    refetchInterval: query => {
-      const status = query.state.data?.meta?.status
-      if (status === 'active') return config?.poll_interval_active ?? 5000
-      if (status === 'paused' || status === 'reviewing') return config?.poll_interval_idle ?? 30_000
-      return false
-    },
+    refetchInterval: query =>
+      metaPollInterval({
+        status: query.state.data?.meta?.status,
+        startInFlight,
+        activeMs: config?.poll_interval_active,
+        idleMs: config?.poll_interval_idle,
+      }),
   })
 
   const meta: MeetingMeta | undefined = metaQuery.data?.meta
   const status: MeetingStatus = meta?.status ?? 'idle'
   const live = metaQuery.data?.live ?? null
+  // The server's own dispatch-admission flag, straight off the poll. `=== true`
+  // rather than truthy-or-default: a missing `live` (no session installed — a
+  // gateway restart left the meeting `active` on disk with nothing live) means a
+  // dispatch CANNOT land, so unknown must read as not-ready.
+  const ingressReady = live?.accepting_dispatches === true
 
   const outputsQuery = useQuery({
     queryKey: [...scope, 'outputs'],
@@ -345,7 +443,9 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
     onError: onTranscriptionError,
   })
 
-  // Bind the microphone to the meeting's status: recording exactly while active.
+  // Bind the microphone to the meeting's status: recording exactly while active
+  // AND dispatch-ready — see `canOpenTranscription` for why `active` alone is not
+  // enough while a start is still initializing agents.
   //
   // Keyed on `transcription.active` as WELL as `status`. Keying on `status` alone
   // made the binding one-directional: if the socket dropped while the meeting was
@@ -363,13 +463,14 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
   transcriptionRef.current = transcription
   const transcriptionActive = transcription.active
   useEffect(() => {
-    if (status === 'active' && !transcriptFull && !transcriptionRef.current.active) {
+    const mayOpen = canOpenTranscription({ status, ingressReady, transcriptFull })
+    if (mayOpen && !transcriptionRef.current.active) {
       void transcriptionRef.current.start()
     }
-    if ((status !== 'active' || transcriptFull) && transcriptionRef.current.active) {
+    if (!mayOpen && transcriptionRef.current.active) {
       transcriptionRef.current.stop()
     }
-  }, [status, transcriptFull, transcriptionActive])
+  }, [status, ingressReady, transcriptFull, transcriptionActive])
 
   // ── mutations ─────────────────────────────────────────────────────────────
 
@@ -406,6 +507,15 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
         muted_agents: mutedAgents,
         restart: opts.restart,
       }),
+    // Opens the polling window BEFORE the request goes out, so the status is
+    // observable for the entire time the server spends initializing agents.
+    onMutate: () => setStartInFlight(true),
+    // `onSettled`, not `onSuccess`: a start that 409s or fails must close the window
+    // too, or a meeting that never started would be polled forever. This flag only
+    // drives poll cadence — the microphone follows the polled
+    // `live.accepting_dispatches`, so nothing here needs to reason about whether an
+    // outcome reflects the server's true state.
+    onSettled: () => setStartInFlight(false),
     onSuccess: () => {
       notify(i18nT('apps.meetings.session.started'), { type: 'success' })
       invalidate()

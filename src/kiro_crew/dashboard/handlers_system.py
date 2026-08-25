@@ -30,6 +30,7 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.embeddings import get_shared_embedder, model_file_present
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform import current_context
 from kiro_crew.safety_override import safety_override, until_shutdown_permitted
 from kiro_crew.stats import Stats
@@ -157,7 +158,6 @@ async def api_status(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers import (
         _UPDATE_CHECK_INTERVAL,
         _do_update_check,
-        _update_info,
     )
     from kiro_crew.dashboard.handlers import updates as _updates_mod
 
@@ -172,13 +172,7 @@ async def api_status(request: web.Request) -> web.Response:
         state._background_tasks.add(_bg)
         _bg.add_done_callback(state._background_tasks.discard)
 
-    data = state.status_snapshot(
-        update_available=bool(_update_info.get("available")),
-        update_self_updatable=bool(_update_info.get("self_updatable")),
-        update_checked=bool(_update_info.get("checked")),
-        update_command=str(_update_info.get("update_command") or ""),
-        update_channel=str(_update_info.get("channel") or ""),
-    )
+    data = state.status_snapshot(**_updates_mod.status_update_fields())  # type: ignore[arg-type]
     static_info = _get_static_system_info()
     if state._owner_hash is not None:
         owner_hash = state._owner_hash
@@ -478,11 +472,18 @@ def _collect_system_metrics() -> dict[str, object]:
     """
     data: dict[str, object] = dict(_get_static_system_info())
 
-    # Process memory (RSS)
+    # Process memory. `proc_mem_mb` is the LIVE resident set (falls when memory
+    # is released); `proc_mem_peak_mb` is the high-water mark since start, kept
+    # as a separate reading so a transient spike stays diagnosable without the
+    # live figure inheriting it.
     try:
         data["proc_mem_mb"] = round(platform_compat.proc_rss_bytes() / (1024 * 1024), 1)
     except Exception:
         data["proc_mem_mb"] = 0
+    try:
+        data["proc_mem_peak_mb"] = round(platform_compat.proc_peak_rss_bytes() / (1024 * 1024), 1)
+    except Exception:
+        data["proc_mem_peak_mb"] = 0
 
     # System-wide memory — cross-platform
     try:
@@ -716,7 +717,7 @@ _METRICS_CACHE_TTL = 2.0  # seconds
 #: because the dashboard polls this endpoint at exactly the TTL. Coalescing makes
 #: concurrent pollers await the SAME collection, so N tabs and a slow host cost
 #: one collection, not N.
-_metrics_lock: asyncio.Lock | None = None
+_metrics_lock = LoopBoundLock()
 
 
 async def api_system(request: web.Request) -> web.Response:
@@ -725,12 +726,10 @@ async def api_system(request: web.Request) -> web.Response:
     Caches results briefly and coalesces concurrent collections, so several
     dashboard tabs polling at once cost one collection rather than one each.
     """
-    global _metrics_cache, _metrics_cache_ts, _metrics_lock
+    global _metrics_cache, _metrics_cache_ts
     now = time.monotonic()
     if now - _metrics_cache_ts < _METRICS_CACHE_TTL and _metrics_cache:
         return web.json_response(_metrics_cache)
-    if _metrics_lock is None:
-        _metrics_lock = asyncio.Lock()
     async with _metrics_lock:
         # Re-check under the lock: whoever held it may have just refreshed, and
         # this waiter wants that result rather than a second collection of its own.

@@ -4,7 +4,7 @@ import { Check, Plus, RefreshCw, Wand2 } from 'lucide-react'
 import {
   issueRadarApi, type LabelRecommendation, type RepoLabel, type RepoSettings, type RepoRef,
 } from '../../api'
-import { issueUrlFor, repoScopeKey } from '../../lib/links'
+import { issueUrlFor, providerTerms, readOnlyHint, repoScopeKey } from '../../lib/links'
 import { asArray, readableText, hexToRgba } from '../../lib/format'
 import ReadOnlyTag from '../../components/ReadOnlyTag'
 import ShimmerLine from '../../components/ShimmerLine'
@@ -47,6 +47,9 @@ export default function LabelsPanel({
   const qc = useQueryClient()
   const { owner, repo } = repoRef
   const scopeKey = repoScopeKey(repoRef)
+  // The refresh control names where the labels come from, and that is not always
+  // GitHub.
+  const terms = providerTerms(repoRef)
   const key = ['issue-radar', 'recommendations', scopeKey]
 
   const ranked = useMemo(
@@ -109,14 +112,14 @@ export default function LabelsPanel({
         <div className="ml-auto flex items-center gap-2.5 flex-wrap">
           {!canWrite && (
             <span className="text-[12px] text-muted inline-flex items-center gap-1">
-              <ReadOnlyTag /> {i18nT('apps.issueRadar.views.tagging.labelsPanel.creating_needs_write_access')}
+              <ReadOnlyTag repoRef={repoRef} /> {i18nT('apps.issueRadar.views.tagging.labelsPanel.creating_needs_write_access')}
             </span>
           )}
           <button
             onClick={() => refreshLabels.mutate()}
             disabled={refreshLabels.isPending}
-            aria-label={i18nT('apps.issueRadar.views.tagging.labelsPanel.re_fetch_this_repo_s_labels_from_github')}
-            title={i18nT('apps.issueRadar.views.tagging.labelsPanel.re_fetch_this_repo_s_labels_from_github')}
+            aria-label={i18nT('apps.issueRadar.views.tagging.labelsPanel.re_fetch_this_repo_s_labels_from', { provider: terms.providerName })}
+            title={i18nT('apps.issueRadar.views.tagging.labelsPanel.re_fetch_this_repo_s_labels_from', { provider: terms.providerName })}
             className="inline-flex items-center justify-center h-7 w-7 rounded-md border border-border text-muted hover:text-text hover:border-border-strong disabled:opacity-40 cursor-pointer"
           >
             <RefreshCw size={12} className={refreshLabels.isPending ? 'animate-spin' : ''} />
@@ -272,7 +275,9 @@ export default function LabelsPanel({
                         // two overlapping patches lose one of the new labels.
                         disabled={!canWrite || createLabel.isPending}
                         aria-label={i18nT('apps.issueRadar.views.tagging.labelsPanel.create_the_label_on_github', { name: rec.name })}
-                        title={canWrite ? i18nT('apps.issueRadar.views.tagging.labelsPanel.create_this_label_on_github') : i18nT('apps.issueRadar.views.tagging.labelsPanel.read_only_repo_needs_triage_push_access')}
+                        title={canWrite
+                          ? i18nT('apps.issueRadar.views.tagging.labelsPanel.create_this_label_on', { provider: terms.providerName })
+                          : readOnlyHint(repoRef, i18nT('apps.issueRadar.views.tagging.labelsPanel.read_only_repo_needs_triage_push_access'))}
                         // Same accent treatment as the queue's Add button: both are
                         // the row's one write action, so they should read alike.
                         className="inline-flex items-center gap-1 text-[12px] px-2 py-0.5 rounded border border-accent/40 text-accent hover:bg-accent-subtle disabled:opacity-30 disabled:hover:bg-transparent cursor-pointer bg-transparent"

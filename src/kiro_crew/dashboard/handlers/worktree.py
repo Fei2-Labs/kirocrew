@@ -74,9 +74,11 @@ import subprocess
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_handlers import deny_non_dashboard_caller
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.validation import MAX_FOLLOWUP_BRANCH, is_valid_followup_branch
 
 logger = logging.getLogger(__name__)
@@ -171,11 +173,11 @@ class SandboxUnavailable(RuntimeError):
 # but it removes the same-destination window between the "does dest exist" probe
 # and `worktree add`, which is what lets `_cleanup_partial` treat an unregistered
 # leftover directory as its own.
-_REPO_LOCKS: dict[str, asyncio.Lock] = {}
+_REPO_LOCKS: dict[str, LoopBoundLock] = {}
 _MAX_REPO_LOCKS = 64
 
 
-def _repo_lock(root: str) -> asyncio.Lock:
+def _repo_lock(root: str) -> LoopBoundLock:
     """Return (creating if needed) the serialization lock for ``root``."""
     lock = _REPO_LOCKS.get(root)
     if lock is None:
@@ -184,7 +186,7 @@ def _repo_lock(root: str) -> asyncio.Lock:
             # does not accumulate locks forever. Held locks are kept.
             for key in [k for k, v in _REPO_LOCKS.items() if not v.locked()]:
                 del _REPO_LOCKS[key]
-        lock = _REPO_LOCKS[root] = asyncio.Lock()
+        lock = _REPO_LOCKS[root] = LoopBoundLock()
     return lock
 
 
@@ -228,9 +230,9 @@ def _run_git(args: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
             cwd=cwd,
             env=env,
             capture_output=True,
-            text=True,
             timeout=_GIT_TIMEOUT,
             check=False,
+            **UTF8_TEXT,
         )
     finally:
         if cleanup:
@@ -631,7 +633,10 @@ def _create_worktree_sync(root: str, branch: str) -> tuple[dict, int]:
         return ({"error": f"Directory already exists: {dest}"}, 409)
     except OSError as exc:
         _cleanup_partial(root, dest, branch, claimed=True, created=False, base_sha=base_sha)
-        return ({"error": f"Cannot create {dest}: {exc.strerror or exc}"}, 500)
+        # The OSError detail and destination path stay server-side; the client
+        # body (rendered verbatim in the UI) gets a generic message + code.
+        logger.warning("worktree create failed: %s", exc)
+        return ({"error": "cannot create worktree directory", "code": "worktree_mkdir_failed"}, 500)
 
     try:
         proc = _run_git(["worktree", "add", dest, branch], root)

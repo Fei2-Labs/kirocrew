@@ -17,8 +17,9 @@ sessions. It drives an LLM through the KiroACP provider (the ACP adapter running
 - **Backend:** Python package `kiro_crew` in `src/kiro_crew/`.
 - **Frontend:** React + TS + Vite SPA in `website/`; the built `dist/` is staged
   into `src/kiro_crew/static/dist/` and served by the backend.
-- **Data home:** `~/.kiro/crew` (the legacy `~/.kirocrew` auto-migrates).
-  Override with `KIROCREW_HOME`.
+- **Data home:** `~/.kiro/crew`, overridden with `KIROCREW_HOME`. The legacy
+  `~/.kirocrew` is fully deprecated and no longer auto-migrates; it survives only
+  in sensitive-path deny lists, which must keep covering it.
 - **Distribution:** public GitHub, plain setuptools, public PyPI / public npm.
 
 Full map: [`docs/architecture/overview.md`](docs/architecture/overview.md).
@@ -109,7 +110,7 @@ destructive-command deny rules, `~/.aws` / `~/.ssh` path blocking, the SEL audit
   agent config granted it. The evaluator is scope-name-agnostic, so adding a scope
   is a `SCOPE_CATALOG` data change, never an evaluator edit.
 - **`CONTRACT_VERSION` stays pinned at 1 pre-launch.**
-- **Denied commands** are `DeniedCommandRule` records (`BUILTIN_DENIED_RULES`, 139 rules)
+- **Denied commands** are `DeniedCommandRule` records (`BUILTIN_DENIED_RULES`)
   enforced only at the `hooks.py` PreToolUse gate. Never restate the rule count in
   prose: `test/test_denied_commands_security.py` pins it, and a restated count goes
   stale silently.
@@ -229,21 +230,38 @@ One logical change per commit.
 
 ## Release Changelog
 
+> **Releasing or promoting a version? Read `docs/build/release.md` first.** It is
+> the authority on the channel model, version stamping, and the **RC → stable
+> promotion runbook** — including why anything a stable user will see (a clean
+> version number, a finalized changelog) must be baked into the RC bytes *before
+> the RC is cut*, since promotion never rebuilds. This section covers only the
+> changelog rules.
+
 `CHANGELOG.md` is written **only when a version is bumped**, and everything
-already in it is immutable. Enforced by the `changelog-is-written-at-version-bump-only`
-rule in `AUTOSDE.yaml`; the parser that renders it is `src/kiro_crew/changelog.py`.
+already in it is immutable. Two halves enforce that: the
+`changelog-is-written-at-version-bump-only` rule in `AUTOSDE.yaml` applies the
+judgment a reviewer has to make (is this a commit dump? should this PR be touching
+the file at all?), and `scripts/check_changelog_history.py` enforces what needs no
+reading — every section the base documents as shipped survives byte-identical, and
+the file contains **only** shipped sections. The parser that renders it is
+`src/kiro_crew/changelog.py`.
 
 - **Your feature PR does not touch `CHANGELOG.md`.** The release PR writes the
   section covering everything that shipped. A per-PR changelog line is how the
   file grows into something nobody reads, and how it acquires an `## [Unreleased]`
   section that then has to be untangled at release time. The commit subject is
   the record until a bump names it.
-- **There is no `## [Unreleased]` section.** To see what is pending, read
-  `git log --oneline <last-tag>..HEAD`.
+- **There is no `## [Unreleased]` section, and the gate refuses one.** To see what
+  is pending, read `git log --oneline <last-tag>..HEAD`. With shipped sections
+  frozen, that leaves exactly one legal shape for a changelog diff — prepend one new
+  section — because there is nowhere to append a per-PR line to.
 - **One section per release, newest first**, headed exactly
   `## [X.Y.Z] — YYYY-MM-DD`. Never a prerelease spelling: `0.3.0-insider.9` and
   `0.3.0-rc.2` are drafts of `0.3.0`, are folded onto it by the parser, and must
-  not get their own heading.
+  not get their own heading. The gate refuses those too, so a release branch writes
+  its section once, under the release's final heading, rather than carrying a draft
+  it renames later.
+
 - **Never delete or edit a shipped section.** A release PR prepends one section
   and leaves every earlier one byte-identical. This has already gone wrong once:
   a section was *replaced* rather than prepended and 322 lines of released
@@ -290,15 +308,35 @@ Format, which the `[0.2.0]` section is the reference for:
   Partition `git log <last-tag>..HEAD` and account for every commit, because the
   omissions are systematic rather than random: a change whose subject names one
   subsystem while touching a shared surface is exactly what a keyword or path
-  scan misses, and nothing downstream ever reports it.
+  scan misses, and nothing downstream ever reports it. It is also systematically
+  biased *against* the release's headline: the PR that lands a large surface is
+  the least likely to have spent effort on a changelog line, so an accumulated
+  file over-represents small fixes and omits the features people upgraded for.
+- **The section ends with `### Contributors`**, crediting everyone whose code
+  shipped in it — `@handle`, alphabetical by username case-insensitively, bots
+  left out. Derive it from the release's own range rather than by hand:
+  `gh api repos/kirodotdev/KiroCrew/releases/generate-notes -f tag_name=<tag>
+  -f previous_tag_name=<last-tag>` names the author of every merged PR, so nobody
+  is dropped for having a quiet commit subject. **This belongs to the changelog
+  only.** A GitHub Release page renders its own contributor block from the tag
+  range, natively, whatever its body says — so putting a list in the release notes
+  duplicates it on the page, immediately above GitHub's own. The changelog needs
+  its own because that copy is what ships inside the wheel and what the
+  dashboard's Releases page reads, where no such block exists.
 
 ## The gate before you commit
 
 ```bash
-python3 scripts/check_black_formatting.py && isort src/kiro_crew test
+python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py && isort src/kiro_crew test
 flake8 src/kiro_crew test && mypy src/kiro_crew
 python -m pytest
 ```
+
+**On macOS, add `--platform linux` to mypy.** CI type-checks on Linux, and
+typeshed guards `os.listxattr` / `getxattr` / `setxattr` behind
+`sys.platform == "linux"` even though macOS has them — so a local run reports 4
+errors in files you did not touch, and it MISSES Linux-only errors CI fails on.
+`mypy --platform linux src/kiro_crew` is the parity invocation.
 
 **Do not run bare `black src/kiro_crew test`.** 1,420 files are not black-clean
 yet, so it reformats ~95,800 lines on top of whatever you changed and buries your
@@ -336,7 +374,7 @@ doubling ratio only where it does not: absolute ceilings split by Python version
 enables coverage on 3.12 only), and tight timed ratios false-red on shared runners.
 
 **A test must not touch the operator's machine, and the floor you stand on is not the
-same in every testpath.** `testpaths` collects three trees, and only `test/` gets
+same in every testpath.** `testpaths` collects two trees, and only `test/` gets
 `test/conftest.py`; the ~108 test modules under `src/kiro_crew/apps/builtins/*/tests/`
 see the **rootdir** `conftest.py`, plus that app's own `tests/conftest.py` where one
 exists (three of the eight apps ship one). So the rootdir conftest carries the
@@ -392,17 +430,21 @@ Kiro Crew runs on macOS, Linux (x86_64 and ARM), and Windows (native). `fcntl`,
 | Kill a tree | `kill_process_tree(pid, sig)` | `os.killpg(os.getpgid(pid), sig)` |
 | Parent PID | `get_ppid(pid)` | `/proc` read / libproc |
 | Match process cmdline | `process_matches(pid, needles)` | `/proc/<pid>/cmdline` / `ps` |
+| Process start time (PID-reuse guard) | `process_start_time(pid)` | `/proc/<pid>/stat` / `ps -o lstart=` (both answer `None` on Windows, so the guard silently never confirms) |
 | Signals | `platform_compat.SIGKILL` / `SIGTERM` | `signal.SIGKILL` (undefined on Windows) |
 | Spawn isolation | `start_new_session=IS_POSIX` + `creationflags=CREATE_NEW_PROCESS_GROUP` | bare `start_new_session=True` |
+| Re-exec the current Python module | `reexec_python_module(module, args)` | `os.execv(sys.executable, [sys.executable, ...])` (breaks when the Windows interpreter path contains spaces) |
 | Race-free Job object assignment | `creationflags \|= CREATE_SUSPENDED`, then `apply_job_limits`, then `resume_process_main_thread` | assigning a job to an already-running child (descendants it already spawned escape) |
 | Fork-bomb / memory ceiling on a spawned tree | `sandbox.apply_windows_resource_ceiling(pid)` after the spawn, alongside `cgroup_scope_argv` | `cgroup_scope_argv` alone (a no-op on Windows, so no ceiling at all) |
 | File mode | `chmod_safe(path, mode)` / `fchmod_safe(fd, mode)` | `os.chmod` / `os.fchmod` (no `os.fchmod` on Windows) |
 | Owner-only secret (fail-loud) | `restrict_to_owner(path)` | `os.chmod(path, 0o600)` under `if IS_POSIX` (silent no-op leaves secrets world-readable) |
+| Owner-only secret directory (fail-loud, inheritable) | `restrict_dir_to_owner(path)`; `make_owner_only_dir(path)` to also create it (its tighten step is best-effort) | `restrict_to_owner(path)` on a directory (its Windows grants carry no `(OI)(CI)`, so files created inside land on the default DACL, not owner-only; its `0o600` also drops the execute bit a directory needs) |
 | Directory link | `symlink_or_junction(target, link)` | `os.symlink` (`WinError 1314` without elevation) |
 | Detect/remove a dir link | `is_link_or_junction(path)` / `unlink_link_or_junction(path)` | `path.is_symlink()` (misses a Windows junction) |
-| Process RSS / CPU | `proc_rss_bytes()` / `proc_cpu_seconds()` | `resource.getrusage` |
+| Process RSS (live) / peak RSS / CPU | `proc_rss_bytes()` / `proc_peak_rss_bytes()` / `proc_cpu_seconds()` | `resource.getrusage` (`ru_maxrss` is a high-water mark, never a live reading, and its unit is KiB on Linux but bytes on macOS) |
+| Available host memory | `host_available_mib()` (0 = unknown, never 0 = no memory) | `/proc/meminfo` directly (Linux-only, so the bound built on it silently vanishes on macOS and Windows) |
 | FD soft limit | `raise_nofile_soft_limit(n)` | `resource.setrlimit` |
-| Port to PID | `find_listening_pids(port)` / `listening_pid_tool_available()` | `lsof` directly |
+| Port to PID | `find_listening_pids(port)` / `listening_pid_tool_available()`; `find_port_listeners(port)` when ownership must be scoped to the local address actually probed | `lsof` directly |
 | Spawn a system tool (`ps`, `lsof`, `netstat`, `taskkill`) | `trusted_system_bin(name)`, treating `None` as "unavailable" | a bare argv name (resolved through a `PATH` that can lead with same-uid-writable dirs) |
 | strftime no-pad | `strftime(dt, "%-I")` | bare `dt.strftime("%-I")` (`ValueError` on Windows) |
 

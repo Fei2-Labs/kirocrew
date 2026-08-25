@@ -30,9 +30,11 @@ from aiohttp.multipart import BodyPartReader
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import KiroCrewConfig, WorkspaceConfig, config_dir, data_home
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.hooks import safe_read_prefix
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
 from kiro_crew.security import (
@@ -81,7 +83,7 @@ async def api_reveal_path(request: web.Request) -> web.Response:
     """POST /api/reveal — reveal a file/folder in Finder or open with default app."""
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return web.json_response({"error": "invalid JSON body"}, status=400)
     path = body.get("path", "")
     action = body.get("action", "reveal")  # "reveal" or "open"
@@ -122,7 +124,7 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
 
         _sel().log_tool_invocation(
             session_key="api",
@@ -429,7 +431,7 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "skipped": "no_slack"})
     try:
         body = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         _sel().log_tool_invocation(
             session_key="api",
             source="api",
@@ -856,19 +858,35 @@ def _open_rb_nofollow(path: str) -> int:
 
 # Magic-byte signatures for content-type validation at the upload boundary
 # (CWE-434). The extension is attacker-controlled, so binary types are verified
-# against their file signature BEFORE the bytes are written. Text formats (and
+# against their file signature BEFORE the bytes are written. Raster types are
+# verified by the shared sniffer (:mod:`kiro_crew.messaging.raster`), so all
+# consumers agree on what counts as each image type (including WebP's form tag
+# at offset 8, which a bare ``RIFF`` prefix would not check). Text formats (and
 # SVG, which is XML) have no reliable magic and remain gated by the extension
 # allowlist only.
 _ZIP_CONTAINER_EXTS = {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".zip"}
+#: Raster extensions and the mime :func:`sniff_raster_mime` must report for
+#: the claimed extension to be accepted.
+_RASTER_EXT_MIME: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+}
+#: Non-raster binary types that still carry a reliable leading signature.
 _MAGIC_PREFIXES: dict[str, tuple[bytes, ...]] = {
-    ".png": (b"\x89PNG\r\n\x1a\n",),
-    ".jpg": (b"\xff\xd8\xff",),
-    ".jpeg": (b"\xff\xd8\xff",),
-    ".gif": (b"GIF87a", b"GIF89a"),
-    ".bmp": (b"BM",),
     ".pdf": (b"%PDF-",),
     ".gz": (b"\x1f\x8b",),
 }
+#: Read-path extras the shared raster table does not cover (served by
+#: ``api_file_raw`` but never accepted at the upload boundary).
+_READ_PATH_EXTRA_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"II\x2a\x00", "image/tiff"),
+    (b"MM\x00\x2a", "image/tiff"),
+    (b"\x00\x00\x01\x00", "image/x-icon"),
+)
 
 
 def _content_matches_ext(ext: str, data: bytes) -> bool:
@@ -884,8 +902,9 @@ def _content_matches_ext(ext: str, data: bytes) -> bool:
         # OOXML / ODF / zip all begin with a local-file-header, empty-archive,
         # or spanned-archive PK signature.
         return data[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-    if ext == ".webp":
-        return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+    expected = _RASTER_EXT_MIME.get(ext)
+    if expected is not None:
+        return sniff_raster_mime(data[:SNIFF_BYTES]) == expected
     prefixes = _MAGIC_PREFIXES.get(ext)
     if prefixes is None:
         return True  # text / svg / unknown — nothing to enforce
@@ -1763,7 +1782,7 @@ async def api_file_raw(request: web.Request) -> web.Response:
             if st.st_size > _MAX_UPLOAD_BYTES:
                 _log("denied", path)
                 return web.json_response({"error": "file too large"}, status=413)
-            header = f.read(12)
+            header = f.read(SNIFF_BYTES)
             f.seek(0)
             data = f.read()
     except OSError as exc:
@@ -1772,22 +1791,13 @@ async def api_file_raw(request: web.Request) -> web.Response:
             return web.json_response({"error": "symlinks not allowed"}, status=403)
         _log("failure", path)
         return web.json_response({"error": "cannot read file"}, status=500)
-    _image_magic = (
-        (b"\x89PNG", "image/png"),
-        (b"\xff\xd8\xff", "image/jpeg"),
-        (b"GIF87a", "image/gif"),
-        (b"GIF89a", "image/gif"),
-        (b"BM", "image/bmp"),
-        (b"II\x2a\x00", "image/tiff"),
-        (b"MM\x00\x2a", "image/tiff"),
-        (b"\x00\x00\x01\x00", "image/x-icon"),
-    )
-    content_type = None
-    # WebP: RIFF....WEBP compound signature
-    if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
-        content_type = "image/webp"
-    else:
-        for magic, mime in _image_magic:
+    # Raster types are detected by the shared sniffer
+    # (kiro_crew.messaging.raster), which requires the full PNG signature and
+    # WebP's form tag at offset 8 — so a RIFF/WAVE audio file is not served as
+    # an image. TIFF and ICO keep local rows (_READ_PATH_EXTRA_MAGIC).
+    content_type = sniff_raster_mime(header)
+    if content_type is None:
+        for magic, mime in _READ_PATH_EXTRA_MAGIC:
             if header.startswith(magic):
                 content_type = mime
                 break
@@ -2344,11 +2354,13 @@ async def api_file_search(request: web.Request) -> web.Response:
             return web.json_response({"results": trimmed, "root": safe_roots[0]})
 
     # Fallback: walk filesystem per request
-    # Dot-prefixed dirs (.kirocrew, .kiro, .aim) excluded by startswith(".") guard below.
-    skip_dirs = {
-        ".git", "node_modules", "__pycache__", ".cache", ".venv", "venv",
-        "dist", "build", "env", "out", "target",
-    }
+    # Dot-prefixed FILES stay excluded (startswith(".") guard in _collect).
+    # Dot-prefixed DIRECTORIES (.github, .kiro, .claude) ARE offered as
+    # candidates; only skip_dirs below are dropped from both descent and results.
+    # skip_dirs is the SAME shared set the indexed fast path uses (imported from
+    # file_index), so the two paths of this endpoint cannot diverge on which
+    # directories are suppressed -- see #5677.
+    skip_dirs = _WALK_SKIP_DIRS
 
     max_scan = _WALK_MAX_SCAN_SCOPED if scoped else _WALK_MAX_SCAN_UNSCOPED
     max_collect = max_results * 10  # collect enough candidates for good scoring, then stop
@@ -2423,17 +2435,32 @@ async def api_file_search(request: web.Request) -> web.Response:
                 # Bounds the traversal; the per-kind counters stop advancing once
                 # their kind is done.
                 dirs_visited += 1
-                pruned = [
-                    d for d in dirnames
-                    if not d.startswith(".") and d not in skip_dirs
-                ]
-                dirnames[:] = pruned if scoped else platform_compat.tcc_prune_walk_dirs(
-                    root_dir, dirpath, pruned
-                )
+                # A dot-prefixed directory (.github, .kiro, .claude) should be
+                # OFFERED as a candidate even though we must not DESCEND into it.
+                # These were previously conflated: ``dirnames`` was pruned in
+                # place (dropping dot-dirs) before _collect saw it.
+                #
+                # Build the candidate list (offered AND stat'd) first, then
+                # derive the narrower descent list from it. Both drop skip_dirs
+                # (.git, node_modules, ...). On an UNSCOPED root the TCC-gated
+                # folders (Downloads, Desktop, Library, ... from a $HOME root on
+                # macOS) must also be dropped from candidates -- merely offering
+                # one means os.stat-ing it, which pops a consent modal; a scoped
+                # root is deliberate and is never TCC-pruned, matching the
+                # descent rule below. Only the leading-dot rule differs: a dot-
+                # dir is a valid candidate but is removed from the descent list.
+                base_dirs = [d for d in dirnames if d not in skip_dirs]
+                if scoped:
+                    candidate_dirs = base_dirs
+                else:
+                    candidate_dirs = platform_compat.tcc_prune_walk_dirs(
+                        root_dir, dirpath, base_dirs
+                    )
+                dirnames[:] = [d for d in candidate_dirs if not d.startswith(".")]
                 # Files first: under a tight scan budget the file candidates are
                 # the ones that survive.
                 _collect("file", dirpath, filenames, root_dir)
-                _collect("dir", dirpath, dirnames, root_dir)
+                _collect("dir", dirpath, candidate_dirs, root_dir)
                 if _full():
                     break
         return found["file"] + found["dir"]
@@ -2480,35 +2507,41 @@ async def api_file_diff(request: web.Request) -> web.Response:
         try:
             subprocess.run(
                 [*_git, "rev-parse", "--git-dir"],
-                cwd=dirpath, capture_output=True, timeout=5, check=True, env=_env,
+                cwd=dirpath, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=5, check=True, env=_env,
             )
             # Get HEAD content
             root = subprocess.run(
                 [*_git, "rev-parse", "--show-toplevel"],
-                cwd=dirpath, capture_output=True, text=True, timeout=5, env=_env,
+                cwd=dirpath, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=5, env=_env,
             ).stdout.strip()
             rel = os.path.relpath(raw_path, root)
             head = subprocess.run(
                 [*_git, "show", "--no-textconv", f"HEAD:{rel}"],
-                cwd=dirpath, capture_output=True, text=True, timeout=10, env=_env,
+                cwd=dirpath, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=10, env=_env,
             )
             original = head.stdout if head.returncode == 0 else ""
             # Get diff
             r = subprocess.run(
                 [*_git, "diff", "--no-textconv", "--no-ext-diff", "HEAD", "--", raw_path],
-                cwd=dirpath, capture_output=True, text=True, timeout=10, env=_env,
+                cwd=dirpath, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=10, env=_env,
             )
             diff = r.stdout.strip() if r.returncode == 0 else ""
             if not diff:
                 # Check for untracked file
                 r2 = subprocess.run(
                     [*_git, "status", "--porcelain", "--", raw_path],
-                    cwd=dirpath, capture_output=True, text=True, timeout=5, env=_env,
+                    cwd=dirpath, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=5, env=_env,
                 )
                 if r2.returncode == 0 and r2.stdout.strip().startswith("??"):
                     r3 = subprocess.run(
                         [*_git, "diff", "--no-textconv", "--no-ext-diff", "--no-index", "/dev/null", raw_path],
-                        cwd=dirpath, capture_output=True, text=True, timeout=10, env=_env,
+                        cwd=dirpath, capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=10, env=_env,
                     )
                     diff = r3.stdout if r3.stdout else ""
                     return {"diff": diff, "original": "", "status": "untracked"}
@@ -2674,7 +2707,7 @@ def _known_project_dirs(slot_projects: list[str]) -> list[str]:
     fp = config_dir() / "recent_projects.json"
     try:
         recent = json.loads(fp.read_text(encoding="utf-8")) if fp.is_file() else []
-    except (json.JSONDecodeError, OSError, ValueError):
+    except (OSError, ValueError):
         recent = []
     if isinstance(recent, list):
         dirs.extend(d for d in recent if isinstance(d, str) and d)

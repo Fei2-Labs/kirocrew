@@ -105,7 +105,21 @@ async def test_relay_rejects_valid_non_object_json(body):
 
 
 @pytest.mark.asyncio
-async def test_relay_rejects_unknown_provider_before_network(monkeypatch):
+@pytest.mark.parametrize(
+    "slug",
+    ["Not A Slug", ".leading-dot", "has..traversal", "a" * 129, ""],
+)
+async def test_relay_rejects_malformed_slug_before_network(monkeypatch, slug):
+    """The server name is still shape/length-bounded so it stays a safe SEL audit label.
+
+    The Connections-registry membership gate is gone (issue #4491: user-added and
+    self-hosted MCP servers must relay too), and the accepted shape is now the SAME
+    one user-added servers pass at add time (_is_valid_mcp_name: uppercase, ``_``,
+    ``.``, ``:``, ``@`` allowed, ≤128 chars) so a name the add path accepted can
+    also relay. A name outside even that shape — spaces, a leading dot, ``..``
+    traversal, over-long — is still refused before any network dial, since it
+    would otherwise become attacker-controlled audit-log content.
+    """
     relay_app = web.Application()
     relay_app.router.add_post("/api/mcp/oauth/relay", connections.api_mcp_oauth_relay)
     relay_client = TestClient(TestServer(relay_app))
@@ -116,13 +130,98 @@ async def test_relay_rejects_unknown_provider_before_network(monkeypatch):
     try:
         response = await relay_client.post(
             "/api/mcp/oauth/relay",
-            json={"server": "unknown", "redirect_url": "http://127.0.0.1:43123/?code=x"},
+            json={"server": slug, "redirect_url": "http://127.0.0.1:43123/?code=x"},
         )
         assert response.status == 400
         assert (await response.json())["code"] == "invalid_server"
         audit.log_api_access.assert_not_called()
     finally:
         await relay_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["myServer", "@org/tools", "svc_v2.beta:eu"])
+async def test_relay_accepts_user_added_name_shapes(monkeypatch, name):
+    """Names the add path accepts (_is_valid_mcp_name) get past relay validation.
+
+    The Design review on this PR found the relay kept the registry's
+    lowercase-hyphen slug regex, so ``myServer`` / ``@org/tools`` — valid
+    user-added server names, the exact population issue #4491 targets — 400ed as
+    ``invalid_server`` before the relay could run. These names must now clear
+    the name check; the request then proceeds to return-address validation.
+    The address deliberately uses a sub-1024 port, which the validator rejects
+    BEFORE any socket dial — so this test can never contact a real local
+    service, and reaching ``invalid_loopback_return_address`` proves the
+    failure is no longer the name.
+    """
+    relay_app = web.Application()
+    relay_app.router.add_post("/api/mcp/oauth/relay", connections.api_mcp_oauth_relay)
+    relay_client = TestClient(TestServer(relay_app))
+    await relay_client.start_server()
+    audit = MagicMock()
+    monkeypatch.setattr(connections, "sel", lambda: audit)
+
+    try:
+        response = await relay_client.post(
+            "/api/mcp/oauth/relay",
+            json={"server": name, "redirect_url": "http://127.0.0.1:80/?code=x"},
+        )
+        body = await response.json()
+        # The name check passed: the request got as far as return-address
+        # validation (which rejects the privileged port with no dial). A name
+        # failure would have answered ``invalid_server`` before reaching it.
+        assert body.get("code") == "invalid_loopback_return_address"
+    finally:
+        await relay_client.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_delivers_for_a_user_added_non_registry_server(monkeypatch):
+    """A user-added / self-hosted server (not in the Connections registry) relays.
+
+    This is the fix for issue #4491: the relay is no longer gated on get_provider,
+    so a well-formed slug the registry has never heard of reaches the loopback
+    listener and its code is delivered, exactly as a curated provider's would be.
+    """
+    received: list[dict[str, str]] = []
+
+    async def callback(request: web.Request) -> web.Response:
+        received.append(dict(request.query))
+        return web.Response(status=200)
+
+    callback_app = web.Application()
+    callback_app.router.add_get("/callback", callback)
+    callback_server = TestServer(callback_app, host="127.0.0.1")
+    await callback_server.start_server()
+
+    relay_app = web.Application()
+    relay_app.router.add_post("/api/mcp/oauth/relay", connections.api_mcp_oauth_relay)
+    relay_client = TestClient(TestServer(relay_app))
+    await relay_client.start_server()
+    audit = MagicMock()
+    monkeypatch.setattr(connections, "sel", lambda: audit)
+    # Prove the registry genuinely does not know this slug, so the success below
+    # cannot be a registry hit in disguise.
+    assert connections.get_provider("my-self-hosted-mcp") is None
+
+    try:
+        return_address = str(callback_server.make_url("/callback?code=one-time&state=opaque"))
+        response = await relay_client.post(
+            "/api/mcp/oauth/relay",
+            json={"server": "my-self-hosted-mcp", "redirect_url": return_address},
+        )
+        assert response.status == 200
+        assert await response.json() == {"ok": True}
+        assert received == [{"code": "one-time", "state": "opaque"}]
+        audit.log_api_access.assert_called_once_with(
+            caller="dashboard",
+            operation="mcp_oauth_callback_relay",
+            outcome="completed",
+            resources="my-self-hosted-mcp",
+        )
+    finally:
+        await relay_client.close()
+        await callback_server.close()
 
 
 @pytest.mark.asyncio

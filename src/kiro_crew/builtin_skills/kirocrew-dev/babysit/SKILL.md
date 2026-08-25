@@ -42,10 +42,117 @@ stretch this: a due fire waits for the user's turn to end, then delivers.
 
 `max_cycles` (default 24) is a **runaway backstop, not a finish line**. A loop
 that coasts into its cap did not complete — it ran out of rope, and whatever
-it was watching is still unresolved. Real loop stores show this is the common
-failure: two live babysit loops ended at exactly 24/24 and 20/20 delivered
-cycles, neither having called `autonudge_stop`. Evaluate the exit condition
-every single cycle and stop deliberately.
+it was watching is still unresolved. Evaluate the exit condition every single
+cycle and stop deliberately.
+
+**This is the dominant failure, not a rare one.** Measured on a real loop store
+(4 loops, 84 delivered cycles, 14.9h wall clock, 7.5h of model turn time):
+**4 of 4 ended at exactly their cap** — 24/24, 20/20, 28/28, 12/12 — with
+`stopped_reason` either empty or `cycle_cap`, and **0 of 4 carried an
+agent-supplied stop reason**. None set `max_runtime_secs`, so cycle count was
+the only bound on spend.
+
+The reason this is expensive rather than merely untidy: the cap is reached the
+same way whether the loop **converged early** and then re-polled for nothing, or
+**never converged** and stopped with the work still unresolved. The two are
+indistinguishable from outside — the loop simply goes inactive — so a loop that
+stops only at its cap tells you nothing about which happened, and bills you for
+the difference.
+
+### Stall tripwire — stop on no-progress, not just on success
+
+An exit condition keyed only on *success* cannot end a loop that is stuck, and
+stuck is the common case: a blocker needing a human decision, an upstream
+outage, a flake nobody owns. So carry a second exit condition.
+
+Each cycle, record the **progress key** — `pr_status.py --json` emits every
+field of it:
+
+| field | why it is in the key |
+|---|---|
+| `head_sha` | a new head means you pushed; work happened |
+| `failing_checks` (sorted, workflow-qualified) | *which* checks are red, not how many — qualified by workflow because two workflows can publish the same check name, and a name-only list stays identical when one starts failing as the other stops |
+| `checks_failing` | the count, as a cheap scalar |
+| `readiness_kind` | distinguishes running from failing from unpublished |
+| `exit_code` | collapses the whole verdict |
+| `status` | the verdict *reason* — a conflict and a failing check are both exit `20` and can carry an identical check set, so without this a changed blocker extends a stall streak instead of resetting it |
+
+If the key is byte-identical for **3 consecutive counting cycles** and you pushed
+nothing in that span, the loop is not making progress. **Stop it**: report what is
+blocking, why you could not move it, and what decision you need, then call
+`autonudge_stop` with that as the reason.
+
+**Only a settled cycle counts.** A cycle whose poll exits `10` is reporting work
+still in flight, and waiting is exactly what the loop is for — so an exit-`10`
+cycle neither counts toward the tripwire nor resets it; skip it and move on.
+**Both exit `0` and exit `20` are settled, and both count.** A PR can sit at exit
+`0` indefinitely — green checks, but not review-ready because a human-owned thread
+or an unanswered advisory concern is outstanding — and a tripwire that counted only
+`20` would never notice that kind of stall. Exit `2` is an environment fault:
+escalate it rather than counting it.
+
+This matters because a running PR yields a byte-identical key every cycle by
+construction (`failing_checks` empty, `readiness_kind` `running`, `exit_code` 10),
+so counting those would fire the tripwire after ~15 minutes of ordinary CI on a
+repo where a single gate can legitimately run an hour. Skipping rather than
+resetting is deliberate too: a PR that flickers between running and blocked would
+otherwise reset forever and never be recognised as stuck. What bounds a genuinely
+endless wait is not this tripwire but `max_runtime_secs`.
+
+**Persist the key AND the streak count — session memory is not durable enough.**
+A stalled loop is precisely the long-running case that walks into compaction (see
+above), which can summarise away the counter at the moment it matters; the loop
+then coasts to its cap exactly as before, which is the failure this tripwire
+exists to prevent. Storing only the last key is not enough: that tells the next
+cycle what the previous key was but not whether this is match one, two or three,
+so the streak itself would still live in memory and still be lost. Write BOTH to
+one file — the key plus an integer count — and read it first on every settled
+cycle, then:
+
+- key matches the stored key → increment the count, write it back, trip at 3;
+- key differs → overwrite with the new key and a count of 1.
+
+**Put that file where the loop's own state lives, not in temp.** A babysit runs
+for hours and `TMPDIR` is periodically reaped by the OS, which would silently
+reset the streak — the same erasure as compaction, just a different eraser. Use
+the data home beside the loop's stop sentinel, i.e.
+`${KIROCREW_HOME:-$HOME/.kiro/crew}/workspace/.babysit-key-<loop-id>`, which is the
+convention `stop_sentinel_path` already follows and is not machine-cleaned. Write
+`$HOME`, not `~`: a tilde inside a parameter-expansion default is not expanded, so
+the literal `~` would survive and the state would land in a `~/` directory
+relative to the current working directory — lost the moment that directory
+changes.
+
+Nothing in the monitor engine observes the key today, so that file is the only
+durable record; moving the counter into the loop store, so the engine itself could
+stop on it, is the follow-up that would make this enforceable rather than
+advisory.
+
+**The key is GitHub-only today.** `pr_status.py --json` is its only emitter, so on
+GitLab or Bitbucket you must first derive an equivalent key from that host's own
+verdict fields (the table above). The 3-cycle rule means nothing until something
+emits a comparable value.
+
+Two things deliberately stay OUT of the key:
+
+- **Finding counts.** A finding you rebutted or deferred keeps being re-raised,
+  so a key including it never stabilises and the tripwire never fires. Worse,
+  the count moves when a bot merely re-words a comment. Read findings to decide
+  *what to do*; do not let them decide *whether you are stuck*.
+- **Unresolved-thread counts.** `?` means "could not establish", and a transient
+  API blip would read as progress.
+
+Escalating early is correct — a stalled loop does not become unstuck by being
+re-run 18 more times; it becomes unstuck when a human answers the question. This
+is **not** licence to park on a *fixable* blocker: the tripwire fires only when
+nothing changed **because there was nothing you could change unilaterally**. A
+diagnosed, verified fix gets applied and pushed, which moves `head_sha` and
+resets the count by construction.
+
+Deliberate stops are the goal. `autonudge_stop` should carry a real sentence
+naming the exit condition, the tripwire, or a terminal PR state. A loop whose
+store row later reads `cycle_cap` is a defect in that loop's instructions, not
+a completed job.
 
 ### Context grows every cycle
 
@@ -74,16 +181,81 @@ not write it off as flakiness.
 ## Decision table
 
 - User is waiting and total time < 30 min → `wait` + poll, no loop.
-- "Babysit / monitor / keep checking" in THIS conversation → `monitor_start`.
+- "Babysit / monitor / keep checking" in THIS conversation, in a phase where
+  you ACT most cycles (fixing findings, pushing revisions) → `monitor_start`.
+- **Pure-watch phase of a PR babysit** — waiting on CI or reviewers, nothing
+  to do until a signal → arm the **`pr_watch` script cron** (below). Zero
+  tokens per quiet cycle; it wakes THIS session with one agent turn only when
+  something unexpected happens.
 - Reacting to review feedback or CI on a PR → `monitor_start` or in-turn
-  `wait`+poll. **Never `cron_add`, never HEARTBEAT.md** (see below).
+  `wait`+poll for the active-fix phase. **Never an agent (LLM) cron, never
+  HEARTBEAT.md** (see below). The `pr_watch` script cron is fine: it is the
+  detector, not the reactor — the woken agent turn does the reacting with
+  this session's own trust.
 - Work belongs in a fresh isolated session each cycle, and needs no tools that
   require approval → `cron_add`.
 - Cleaning up after a merge you have already verified → `cron_add`, as a
   `script` cron at roughly a 5-minute interval.
 - External system will call back → `register_hook`.
 
-### Never use cron or heartbeat to react to reviewer feedback
+### Watch mode — zero-token PR polling with `pr_watch.py`
+
+A babysit spends most of its life waiting: CI runs for ten minutes, reviewers
+take longer, and every `monitor_start` cycle that discovers "nothing changed"
+still pays a full agent turn on the session's whole context. Watch mode moves
+the *detection* to a script cron and keeps the *judgment* in this session:
+
+```
+script cron (zero tokens, every ~5 min)
+  ├─ nothing changed / checks still running     → silent, no delivery
+  ├─ merged / closed                            → final message, cron removes itself
+  └─ unexpected state                           → ONE agent turn in THIS session
+       (CONFLICTING · new failing check not in known_reds · all green)
+```
+
+Arm it **from the session that owns the babysit** — the cron captures that
+session as its wake target; armed anywhere else, the wake lands in the wrong
+chat. Cron scripts must live under `~/.kiro/crew/crons/`, so copy the synced
+skill asset there first (re-copy on every arm — it keeps the copy current
+with skill updates):
+
+```
+cp ~/.kiro/crew/skills/kirocrew-dev/babysit/scripts/pr_watch.py \
+   ~/.kiro/crew/crons/pr_watch.py
+
+cron_add(
+  name="pr-watch #1234",
+  script="~/.kiro/crew/crons/pr_watch.py:watch",
+  every=300,
+  timeout=120,
+  message='{"repo": "owner/name", "pr": 1234,
+            "known_reds": ["Frontend Tests (4)"],
+            "note": "worktree ~/oss/wt-foo, branch fix/foo"}'
+)
+```
+
+- `known_reds` — check names that are red on the BASE branch (inherited
+  breakage). The watch never wakes for them and treats "everything else
+  green" as review-ready. Populate it from what you verified against main's
+  own CI, and update the cron message if main's condition changes.
+- `note` — one line of context echoed into the wake brief. Put the worktree
+  and branch here so the woken turn starts oriented; if this session keeps a
+  work ledger, the brief also tells the woken turn to read it.
+- Wakes are deduplicated **per head SHA**: one wake per conflict, per new red
+  check name, per all-green. A force-push resets the memory, so the next
+  anomaly on the new head wakes again. Quiet ticks deliver nothing at all.
+- The watch reads only PR state and the check rollup. It does NOT read
+  reviewer comment bodies — verdict text, marker freshness, and rebuttals are
+  the woken agent's job, exactly as in a manual cycle.
+- Merged or closed → the cron delivers a final message and removes itself.
+  If you finish the babysit early, remove it yourself (`cron_remove`).
+- Typical composition: drive the active-fix phase with `monitor_start`; when
+  the PR goes quiet (checks running, awaiting review), stop the loop
+  (`autonudge_stop`) and arm the watch. When a wake arrives, act on it; if
+  heavy fixing resumes, re-arm `monitor_start` and remove the watch until
+  things go quiet again.
+
+### Never use an agent cron or heartbeat to react to reviewer feedback
 
 Both are structurally incapable of it, and both fail in ways that look like
 success:
@@ -192,8 +364,22 @@ talking about from your cwd):
 ```bash
 SKILL_DIR="${KIROCREW_HOME:-$HOME/.kiro/crew}/skills/kirocrew-dev/prepare-pr"
 python3 "$SKILL_DIR/scripts/pr_status.py" <pr#>     # exit 0 clean / 10 running / 20 blocked / 2 env
+python3 "$SKILL_DIR/scripts/pr_status.py" <pr#> --json   # same exit code, plus the progress key on stdout
 python3 "$SKILL_DIR/scripts/pr_findings.py" <pr#>   # only after 20: failed steps, log tails, threads
 ```
+
+`--json` adds one machine-readable object to stdout and changes nothing else —
+same exit codes, same prose above it. Use it for the stall tripwire: the object
+carries the full 40-char `head_sha` (the prose only ever prints 12), the sorted
+`failing_checks` list, and `readiness_kind`, so two cycles can be compared
+byte-for-byte instead of by eyeballing a diff of human text.
+
+Its `advisory` half is what you read when checking the exit conditions below:
+`unresolved_threads` (`null` there is the same "could not establish" as a `?`),
+`findings` per reviewer, and `stale_reviewers` / `blocking_reviewers`. Nothing
+else is emitted — ambient PR state (mergeable, merge state, review decision,
+check totals) stays in the prose above, which is where those conditions already
+read it, so there is no second copy to keep in sync.
 
 Drive the cycle off the **exit code**, not off prose: `10` → report nothing and
 wait for the next cycle; `20` → drill in with `pr_findings.py` and act; `2` →
@@ -332,10 +518,15 @@ Two limits worth knowing before you trust it on an arbitrary PR:
    - what to do with findings (fix + push, summarize, escalate),
    - the exit condition, ending with: "when met, tell the user and call
      `autonudge_stop`".
-2. **Call `monitor_start`.** `interval_secs` default 300 suits CI/review
-   polling. `max_cycles` defaults to 24 (≈2h of idle gaps at 300s); raise it
-   for longer work, and pass `0` for unlimited only when the user explicitly
-   asks for an unbounded loop.
+2. **Call `monitor_start`, and always pass a wall-clock budget.**
+   `interval_secs` default 300 suits CI/review polling. `max_cycles` defaults to
+   24 (≈2h of idle gaps at 300s); raise it for longer work, and pass `0` for
+   unlimited only when the user explicitly asks for an unbounded loop.
+   **Set `max_runtime_secs` too.** It is the only bound that holds when
+   per-cycle work grows: measured cycles ran 124s–823s of model time *on top of*
+   the idle gap, so a 12-cycle cap took 4.1 hours. Cycle count does not bound
+   spend. Budget the wall clock you would actually accept (e.g. `14400` for four
+   hours) so a stalled loop dies on time rather than on arithmetic.
 3. **Confirm it armed.** Read `~/.kiro/crew/autonudge.json` and check your
    loop is there. The tool's reply is not evidence — see above.
 4. **Tell the user monitoring is active and END YOUR TURN.** The loop wakes
@@ -343,7 +534,17 @@ Two limits worth knowing before you trust it on an arbitrary PR:
 5. **Each cycle:** do the check, act, and report only real signals. Don't
    post "nothing new" every cycle. If the instruction no longer matches
    reality, `monitor_update` it rather than working around it.
-6. **On the exit condition** (or the user saying stop): report, then call
+   **Keep a no-signal cycle cheap.** On exit `10` the correct cycle is: read the
+   exit code, write nothing, end the turn. Do not re-read review-bot bodies, job
+   logs, or diffs on a cycle whose own status call already said nothing changed —
+   that is where a watch loop turns into a spend loop. One `pr_status.py` run is
+   6–8 `gh` invocations; the expensive reads belong to exit `20`.
+6. **Persist the progress key and its streak count to a file** (not session
+   memory — compaction eats both) and apply the stall tripwire above: 3
+   byte-identical keys on *settled* cycles (exit `0` or `20`) with no push means
+   stop and escalate. Exit-`10` cycles are skipped, not counted and not reset;
+   exit `2` escalates.
+7. **On the exit condition** (or the user saying stop): report, then call
    `autonudge_stop` with a reason. Do not let the cap do this for you.
 
 ## Example
@@ -357,9 +558,15 @@ monitor_start(
            rules 6 and 7 of the babysit skill govern what each value means.
            Then run
            python3 \"${KIROCREW_HOME:-$HOME/.kiro/crew}/skills/kirocrew-dev/prepare-pr/scripts/pr_status.py\" 247
-           and act on its exit code (10 = still running, report nothing;
+           and act on its exit code, passing --json so the progress key is
+           machine-comparable (10 = still running, report nothing and do not
+           read bot bodies or job logs;
            20 = drill in with pr_findings.py, or stop if the reason is a
-           terminal PR state). If this repo's reviewer conclusions are on the
+           terminal PR state). Keep the progress_key AND a consecutive-match
+           count in the data home beside the loop's stop sentinel, reading that
+           file rather than trusting memory: 3 byte-identical keys on settled
+           cycles (exit 0 or 20) with no push in that span means stop and
+           escalate. If this repo's reviewer conclusions are on the
            unreliable list you established for it, resolve the AI review lane
            from the job log plus the comment body for the current head SHA
            rather than the conclusion; where the conclusion is trustworthy, use
@@ -375,6 +582,7 @@ monitor_start(
            user the PR is review-ready and call autonudge_stop.",
   interval_secs=300,
   max_cycles=20,
+  max_runtime_secs=14400,
 )
 ```
 

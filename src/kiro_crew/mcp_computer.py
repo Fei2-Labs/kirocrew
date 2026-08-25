@@ -28,11 +28,15 @@ auditing happen IN THE GATEWAY (``computer_use/tools.py`` →
   down the process kiro-cli is talking to, and this file is byte-identical in
   behavior on macOS, Linux and Windows.
 
-Identity is resolved with :func:`mcp_core._resolve_session_key_strict` — the env
-var, or ``KIROCREW_HOST_PID`` plus the HMAC sidecar signed with the
-keystone-protected ``sel_hmac.key``. The lenient resolver is deliberately NOT
-used: it walks ``/proc`` ancestors over ``session_pid_<pid>.txt``, which
-``mcp_core`` itself documents as "agent-writable and therefore forgeable".
+Identity is resolved with :func:`mcp_core._resolve_session_key_strict` — the
+gateway-injected per-call caller block first (this server advertises
+``kirocrew.caller-identity``, so gatewayd injects one whenever it can name the
+caller — the only identity source that works on a pooled backend serving many
+sessions), then the env var, then ``KIROCREW_HOST_PID`` plus the HMAC sidecar
+signed with the keystone-protected ``sel_hmac.key``. The lenient resolver is
+deliberately NOT used: it walks ``/proc`` ancestors over
+``session_pid_<pid>.txt``, which ``mcp_core`` itself documents as
+"agent-writable and therefore forgeable".
 
 **An unresolved key is NOT a refusal.** It is forwarded empty and the call proceeds.
 Neither accepted source exists for a GUI-launched kiro-cli on macOS —
@@ -66,11 +70,16 @@ from kiro_crew.computer_use.types import (
     CLICK_METHOD_AUTO,
     CLICK_METHOD_GLOBAL,
     CLICK_METHODS,
+    DRAG_PATH_CURVED,
+    DRAG_PATH_STRAIGHT,
+    DRAG_PATHS,
     ERROR_PREFIX,
     MAX_ACTION_LEN,
     MAX_CLICK_COUNT,
+    MAX_DRAG_STEPS,
     MAX_ELEMENT_INDEX,
     MAX_KEY_LEN,
+    MAX_LAUNCH_QUERY_LEN,
     MAX_SCREEN_COORD,
     MAX_SCROLL_PAGES,
     MAX_TEXT_LIMIT,
@@ -78,6 +87,7 @@ from kiro_crew.computer_use.types import (
     MAX_TREE_NODES_LIMIT,
     MAX_TYPE_TEXT_LEN,
     MIN_CLICK_COUNT,
+    MIN_DRAG_STEPS,
     MIN_SCREEN_COORD,
     MIN_SCROLL_PAGES,
     MOUSE_BUTTONS,
@@ -87,6 +97,7 @@ from kiro_crew.computer_use.types import (
     TOOL_DRAG,
     TOOL_END_TURN,
     TOOL_GET_STATE,
+    TOOL_LAUNCH_APP,
     TOOL_LIST_APPS,
     TOOL_PERFORM_ACTION,
     TOOL_PRESS_KEY,
@@ -148,9 +159,13 @@ ERR_GATEWAY_UNREACHABLE = (
 # class this feature can produce.
 #
 # The fix is a per-PROCESS identity, not a refusal. kiro-cli spawns one shim process
-# per session, so the shim's own pid separates the namespaces exactly as far as the
-# sessions are actually separate — and it does so without reinstating the
-# unattended-surface refusal that was removed by product decision. It is
+# per session, so in the 1:1 shim topology the pid separates the namespaces exactly
+# as far as the sessions are actually separate — and it does so without reinstating
+# the unattended-surface refusal that was removed by product decision. On a POOLED
+# backend one process serves many sessions, so the pid separates only what the
+# injected caller block does not already name: co-tenants gatewayd can name get real
+# per-session keys, and the residual — unnamed co-tenants sharing one
+# ``unresolved:<pid>`` namespace — is tracked as #5322. It is
 # deliberately NOT presented as trustworthy attribution: the prefix names it as
 # unresolved so an audit reader cannot mistake a pid for a session identity.
 UNRESOLVED_SESSION_PREFIX = "unresolved:"
@@ -212,7 +227,7 @@ def _coord_prop(description: str) -> dict[str, Any]:
 
 
 def _tool_definitions() -> list[dict[str, Any]]:
-    """The ten tool definitions.
+    """The eleven tool definitions.
 
     Bounds mirror ``validation.MCP_COMPUTER_SCHEMAS`` (which is the enforcement
     point — this is advertisement, so a mismatch would only produce a confusing
@@ -253,6 +268,35 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "you do not already know how the user names the app."
             ),
             "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": TOOL_LAUNCH_APP,
+            "description": (
+                "Open an installed application that is not running yet, so the "
+                "other tools have a window to drive. Give the app's NAME as the "
+                "operating system knows it ('Paint', 'Notepad', 'Preview') — a "
+                "filesystem path, a command line and a document are all refused, "
+                "because this opens an application and nothing else. Returns the "
+                "new window's element tree, so you can act on it without a "
+                f"separate {TOOL_GET_STATE} call. If the app already has a window "
+                f"this is refused: call {TOOL_GET_STATE} instead of opening a "
+                "second copy. A cold start can take ten seconds; the result says "
+                "how long it took, so do NOT call this twice for one app."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": {
+                        "type": "string",
+                        "maxLength": MAX_LAUNCH_QUERY_LEN,
+                        "description": (
+                            "The application's name, as it appears in the Start "
+                            "menu or Applications folder. Not a path."
+                        ),
+                    },
+                },
+                "required": ["app"],
+            },
         },
         {
             "name": TOOL_GET_STATE,
@@ -348,11 +392,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "presses the control and requires element_index. "
                             f"'{CLICK_METHOD_APP_POST}' sends a click at x/y to the "
                             "target app WITHOUT moving the pointer — correct for a "
-                            f"background window. '{CLICK_METHOD_GLOBAL}' MOVES THE "
-                            "USER'S REAL MOUSE POINTER and clicks there; it is off "
-                            "by default and refused unless the user enabled it and "
-                            "policy permits it, so only ask for it when a click "
-                            "must be physically real."
+                            "background window, and macOS-only: WINDOWS HAS NO "
+                            "PER-PROCESS MOUSE ROUTE, so it is refused there (as is "
+                            f"'{CLICK_METHOD_AUTO}' with x/y). On Windows, pass an "
+                            "element_index for a pointer-free click, or name "
+                            f"'{CLICK_METHOD_GLOBAL}' to accept the cursor move. "
+                            f"'{CLICK_METHOD_GLOBAL}' MOVES THE USER'S REAL MOUSE "
+                            "POINTER and clicks there, so only ask for it when a "
+                            "click must be physically real."
                         ),
                     },
                 },
@@ -365,8 +412,12 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "Drag from one screen point to another inside an application — for "
                 "canvas strokes, sliders, range selections and reordering. "
                 "Coordinate-only: there is no element form, because a drag's "
-                "meaning is the path between the two points. The pointer is not "
-                f"moved unless you ask for click_method '{CLICK_METHOD_GLOBAL}'."
+                "meaning is the path between the two points. On macOS the pointer "
+                "is not moved unless you ask for click_method "
+                f"'{CLICK_METHOD_GLOBAL}'. ON WINDOWS EVERY DRAG MOVES THE USER'S "
+                f"REAL CURSOR, so click_method '{CLICK_METHOD_GLOBAL}' must be "
+                "passed EXPLICITLY there and the default is refused — the refusal "
+                "is what keeps 'the pointer was not moved' a true statement."
             ),
             "inputSchema": {
                 "type": "object",
@@ -377,17 +428,44 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "to_x": _coord_prop("End X screen coordinate."),
                     "to_y": _coord_prop("End Y screen coordinate."),
                     "mouse_button": button_prop,
+                    "steps": {
+                        "type": "integer",
+                        "minimum": MIN_DRAG_STEPS,
+                        "maximum": MAX_DRAG_STEPS,
+                        "description": (
+                            "How many segments the path is divided into. 1 (the "
+                            "default) is a plain two-point sweep — correct for a "
+                            "slider, a range selection or a reorder. TO DRAW a "
+                            "stroke you need many: an app samples the pointer as "
+                            "it moves, so a 1-step drag can only ever produce a "
+                            "straight line. 32-64 draws a smooth curve."
+                        ),
+                    },
+                    "path": {
+                        "type": "string",
+                        "enum": list(DRAG_PATHS),
+                        "description": (
+                            f"The shape between the two points. "
+                            f"'{DRAG_PATH_STRAIGHT}' (default) interpolates the "
+                            f"straight line; '{DRAG_PATH_CURVED}' bows it sideways, "
+                            "which is what a hand-drawn stroke looks like. Only "
+                            "meaningful with steps > 1."
+                        ),
+                    },
                     "click_method": {
                         "type": "string",
                         "enum": list(CLICK_METHODS),
                         "description": (
                             f"'{CLICK_METHOD_AUTO}' (default) and "
                             f"'{CLICK_METHOD_APP_POST}' send the drag to the target "
-                            "app without moving the pointer. "
-                            f"'{CLICK_METHOD_GLOBAL}' MOVES THE USER'S REAL MOUSE "
-                            "POINTER along the path and needs their opt-in. "
+                            "app without moving the pointer — macOS only. On "
+                            f"WINDOWS both are refused and '{CLICK_METHOD_GLOBAL}' "
+                            "is the only method, because there is no per-process "
+                            "mouse route: name it explicitly to accept the cursor "
+                            f"move. '{CLICK_METHOD_GLOBAL}' MOVES THE USER'S REAL "
+                            "MOUSE POINTER along the path. "
                             f"'{CLICK_METHOD_ACCESSIBILITY}' cannot express a drag "
-                            "and is refused."
+                            "and is refused everywhere."
                         ),
                     },
                 },
@@ -698,6 +776,37 @@ def _invoke(session_key: str, name: str, args: dict[str, Any]) -> dict[str, Any]
     return decoded
 
 
+#: Whether this server advertises ``kirocrew.caller-identity`` — i.e. whether it
+#: consumes the per-call caller block gatewayd injects instead of reading identity
+#: from its own process. True here because it does: the session key forwarded to
+#: the gateway comes from :func:`mcp_core._resolve_session_key_strict`, whose
+#: first source is that block.
+#:
+#: Advertising is not cosmetic. ``mcp_gateway/backend.py`` strips any client-forged
+#: caller block from EVERY forwarded request and re-injects its own only when the
+#: backend advertised this capability — so without the advertisement the block
+#: never arrives, and this server's resolver reads an empty identity no matter how
+#: correctly it is written. Nothing declines to POOL an unadvertised backend
+#: (``rewriter.UNPOOLABLE_SERVERS`` is empty and documents that the capability is
+#: read only to decide injection), so the unadvertised state was not "per-session
+#: spawn" — it was pooled AND identity-blind. For this server that silently
+#: degraded every pooled call to the unresolved-identity path: the call still
+#: proceeds (by product decision), but the audit trail loses attribution it was
+#: built to carry.
+#:
+#: A module-level constant rather than a bare argument below so the value is
+#: readable without executing :func:`run_mcp_server`, and so
+#: ``test/test_mcp_managed_caller_identity.py`` can assert it against the argument
+#: actually handed to the shim.
+ADVERTISE_CALLER_IDENTITY = True
+
+
 def run_mcp_server() -> None:
     """Run the MCP stdio server — reads JSON-RPC from stdin, writes to stdout."""
-    run_mcp_stdio_loop(SERVER_NAME, SERVER_VERSION, _list_tools, _call_tool)
+    run_mcp_stdio_loop(
+        SERVER_NAME,
+        SERVER_VERSION,
+        _list_tools,
+        _call_tool,
+        advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
+    )

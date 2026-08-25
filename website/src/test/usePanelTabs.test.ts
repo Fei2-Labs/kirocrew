@@ -74,6 +74,79 @@ describe('usePanelTabs', () => {
     expect(result.current.activeTab?.content).toBe('body-2')
   })
 
+  it('re-opening a file with unsaved edits focuses it and keeps the edited buffer', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'on-disk', 'slot-a'))
+    // The user types into the editor (MarkdownPanel patches content per edit).
+    act(() => result.current.patchTab('file:/notes.md', { content: 'user edits' }))
+    // Something re-opens the same path — another chip, the Files tab row.
+    act(() => result.current.openFile('/notes.md', 'on-disk'))
+    expect(result.current.tabs).toHaveLength(1)
+    expect(result.current.activeId).toBe('file:/notes.md')
+    // The buffer survives; the on-disk bytes do not revert it silently.
+    expect(result.current.activeTab?.content).toBe('user edits')
+    expect(result.current.activeTab?.savedContent).toBe('on-disk')
+  })
+
+  it('re-opening a clean file refreshes it from disk', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'version-1'))
+    act(() => result.current.openFile('/notes.md', 'version-2'))
+    expect(result.current.activeTab?.content).toBe('version-2')
+    expect(result.current.activeTab?.savedContent).toBe('version-2')
+  })
+
+  it('a completed save re-arms the baseline so later opens refresh again', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'v1'))
+    act(() => result.current.patchTab('file:/notes.md', { content: 'typed' }))
+    // The save handler stamps the written bytes as the new baseline.
+    act(() => result.current.patchTab('file:/notes.md', { savedContent: 'typed' }))
+    // Buffer matches baseline now: an external change may flow in.
+    act(() => result.current.openFile('/notes.md', 'external-edit'))
+    expect(result.current.activeTab?.content).toBe('external-edit')
+  })
+
+  it('a buffered tab with no baseline yet is treated as dirty, not reverted', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'v1'))
+    // Simulate a legacy/restored tab whose baseline was never established.
+    act(() => result.current.patchTab('file:/notes.md', { savedContent: undefined }))
+    act(() => result.current.openFile('/notes.md', 'v2'))
+    expect(result.current.activeTab?.content).toBe('v1')
+  })
+
+  it('a disk-originated refresh restamps the baseline so later opens refresh', () => {
+    const { result } = renderHook(() => usePanelTabs())
+    act(() => result.current.openFile('/notes.md', 'v1'))
+    // What SidePanel's onDiskContent wiring does when the file watch or the
+    // panel's Refresh lands new disk bytes in the buffer.
+    act(() => result.current.patchTab('file:/notes.md', { content: 'disk-new', savedContent: 'disk-new' }))
+    act(() => result.current.openFile('/notes.md', 'disk-newer'))
+    expect(result.current.activeTab?.content).toBe('disk-newer')
+  })
+
+  it('persists metadata only: the saved baseline never reaches localStorage', () => {
+    // savedContent mirrors a file body ("can be MBs"), so persisting it would
+    // defeat the same quota protection that strips content itself.
+    vi.useFakeTimers()
+    try {
+      const { result } = renderHook(() => usePanelTabs())
+      act(() => result.current.openFile('/big.md', 'body'))
+      act(() => result.current.patchTab('file:/big.md', { content: 'edited' }))
+      act(() => { vi.advanceTimersByTime(500) })
+      const raw = localStorage.getItem('mc-panel-tabs:__no_slot__')
+      expect(raw).toBeTruthy()
+      const bucket = JSON.parse(raw!)
+      const tab = bucket.tabs.find((t: { id: string }) => t.id === 'file:/big.md')
+      expect(tab.content).toBeUndefined()
+      expect(tab.savedContent).toBeUndefined()
+      expect(tab.path).toBe('/big.md')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('openFile with replaceId swaps the new tab into the replaced tab\'s strip position', () => {
     const { result } = renderHook(() => usePanelTabs())
     act(() => result.current.openView('files'))

@@ -34,6 +34,11 @@ import {
 import { registerTheme, getRegisteredThemes } from '../hooks/useTheme'
 import { registerCapsuleSegment, getCapsuleSegments } from '../apps/capsuleSegments'
 import { registerOverviewStatCards, getOverviewStatCards } from '../pages/overviewStatCards'
+import { registerOverviewPanel, getOverviewPanel } from '../pages/overviewPanel'
+import {
+  suppressOverviewBuiltin,
+  isOverviewBuiltinSuppressed,
+} from '../pages/overviewBuiltins'
 import { apiTransport } from '../api/apiTransport'
 // Importing the client installs the blessed transport (installApiTransport runs
 // at client module load), so `apiTransport` is populated for the test below.
@@ -238,16 +243,45 @@ describe('apiTransport — exported blessed transport (not a registry)', () => {
     }
   })
 
-  it('methods are stable wrappers — destructuring at module-init must not throw', () => {
-    // extensions.ts is imported before client.ts in main.tsx, so an edition
-    // that destructures the transport at its own module-init could reach it
-    // before install. The wrappers resolve at CALL time, so destructuring is
-    // always safe (no import-ordering hazard); only calling before install
-    // would error, which never happens after startup.
-    expect(() => {
-      const { get, post, put } = apiTransport
-      return [get, post, put]
-    }).not.toThrow()
+  it('a reference destructured BEFORE install still forwards after it', async () => {
+    // The previous body only asserted that destructuring does not throw — a plain
+    // property read on an object literal, which cannot throw whatever the seam
+    // does, so the test held no matter how the wrappers were written.
+    //
+    // The invariant that actually matters for import order: `extensions.ts` is
+    // imported before `client.ts` in `main.tsx`, so an edition may capture
+    // `apiTransport.get` at its own module-init, BEFORE any transport is
+    // installed, and that captured reference must still reach the transport
+    // installed later. That is what "resolves at CALL time" buys, and it fails
+    // the moment a wrapper is replaced by a direct bind to `_installed`.
+    //
+    // Run it against a FRESH, uninstalled copy of the module rather than swapping
+    // the process-wide singleton the rest of this file's tests share: `_installed`
+    // has no getter, so the real transport cannot be read back to restore it, and
+    // installing `apiTransport` itself (the wrapper object) would make
+    // `_resolve().get()` call itself — unbounded recursion. `vi.resetModules()`
+    // gives an isolated instance whose `_installed` starts null, exactly the
+    // edition's module-init state.
+    vi.resetModules()
+    const fresh = await import('../api/apiTransport')
+
+    // Captured from the fresh module BEFORE anything is installed into it.
+    const { get } = fresh.apiTransport
+
+    const calls: string[] = []
+    fresh.installApiTransport({
+      ...fresh.apiTransport,
+      get: (async (url: string) => { calls.push(url); return 'from-stub' }) as typeof fresh.apiTransport.get,
+    })
+
+    // The pre-captured reference reaches the LATER-installed transport, which is
+    // exactly what an edition destructuring at module-init depends on.
+    await expect((get as (u: string) => Promise<unknown>)('/probe')).resolves.toBe('from-stub')
+    expect(calls).toEqual(['/probe'])
+
+    // Drop the isolated registry so the file's shared `apiTransport` import is
+    // untouched; the next importer gets the normal singleton again.
+    vi.resetModules()
   })
 })
 
@@ -282,6 +316,48 @@ describe('overviewStatCards — settings status-card seam', () => {
       registerOverviewStatCards([{ id: 'testcard:dup', component: () => null }]),
     ).toThrow(/already registered/)
     expect(getOverviewStatCards().filter(c => c.id === 'testcard:dup').length).toBe(1)
+  })
+})
+
+describe('overviewPanel — lower-region single-owner slot', () => {
+  it('is empty in the stock build until something claims it', () => {
+    expect(getOverviewPanel()).toBeNull()
+  })
+
+  it('registers a panel and returns it', () => {
+    const Comp = () => null
+    registerOverviewPanel({ id: 'testpanel:a', component: Comp })
+    expect(getOverviewPanel()).toEqual({ id: 'testpanel:a', component: Comp })
+  })
+
+  it('throws on a second claim in dev/test; the first owner keeps the slot', () => {
+    // The slot is deliberately singular: a second registrant is a collision,
+    // not an append, so the region never has two owners negotiating layout.
+    expect(() =>
+      registerOverviewPanel({ id: 'testpanel:b', component: () => null }),
+    ).toThrow(/already owns the overview panel slot/)
+    expect(getOverviewPanel()?.id).toBe('testpanel:a')
+  })
+})
+
+describe('overviewBuiltins — built-in suppression seam', () => {
+  it('suppresses nothing in the stock build', () => {
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(false)
+  })
+
+  it('suppresses a built-in surface once asked', () => {
+    suppressOverviewBuiltin('tailnet-mobile')
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(true)
+  })
+
+  it('is idempotent — a repeat is agreement, not a collision', () => {
+    // Deliberately unlike `overviewPanel` above, which throws on a second claim
+    // because two owners cannot share one slot. Two parties that both want a
+    // surface GONE do not conflict, so a repeat must not fail-loud the way a
+    // duplicate contribution does — HMR and a twice-imported module both hit
+    // this path.
+    expect(() => suppressOverviewBuiltin('tailnet-mobile')).not.toThrow()
+    expect(isOverviewBuiltinSuppressed('tailnet-mobile')).toBe(true)
   })
 })
 
@@ -373,6 +449,7 @@ describe('composition root — stock extensions.ts is empty', () => {
   it('capsule-segment + overview-stat-card seams are empty in the stock build', () => {
     expect(getCapsuleSegments().every(s => !s.id.startsWith('edition:'))).toBe(true)
     expect(getOverviewStatCards().every(c => !c.id.startsWith('edition:'))).toBe(true)
+    expect(getOverviewPanel()?.id.startsWith('edition:') ?? false).toBe(false)
   })
 
   it('importing it adds no registrations beyond the seeded core state', async () => {

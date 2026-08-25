@@ -53,6 +53,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
+    JSONRPC_METHOD_NOT_FOUND,
     METHOD_COMMANDS_EXECUTE,
     UPDATE_AGENT_THOUGHT_CHUNK,
     UPDATE_TOOL_CALL,
@@ -263,16 +264,20 @@ class TestDrainOversizeLine:
 
 @_POSIX_ONLY
 class TestResolveSshAuthSock:
-    def test_live_socket_is_kept(self, tmp_path):
-        sock_path = tmp_path / "live.sock"
+    def test_live_socket_is_kept(self, short_sock_dir):
+        sock_path = short_sock_dir / "live.sock"
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
             srv.bind(str(sock_path))
             env = {"SSH_AUTH_SOCK": str(sock_path)}
             _resolve_ssh_auth_sock(env)
         assert env["SSH_AUTH_SOCK"] == str(sock_path)
 
-    def test_stale_pointer_is_repaired_to_newest_socket(self, tmp_path, monkeypatch):
-        old, new = tmp_path / "agent.1", tmp_path / "agent.2"
+    def test_stale_pointer_is_repaired_to_newest_socket(
+        self, tmp_path, short_sock_dir, monkeypatch
+    ):
+        # Bound endpoints must live under a short root (sun_path cap); the
+        # "gone.sock" pointer below never binds, so it can stay on tmp_path.
+        old, new = short_sock_dir / "agent.1", short_sock_dir / "agent.2"
         socks = []
         for path in (old, new):
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -968,7 +973,7 @@ class TestReadPromptResponse:
         assert await client._read_prompt_response(1, 5.0) == ""
         # An unhandled inbound request is answered so the agent fails fast.
         client._send_error.assert_awaited_once_with(
-            "s-1", acp_client._JSONRPC_METHOD_NOT_FOUND, "Method not found: fs/read_text_file"
+            "s-1", JSONRPC_METHOD_NOT_FOUND, "Method not found: fs/read_text_file"
         )
         assert client.last_prompt_stats.context_pct == 42.5
         assert client._last_stop_reason == "end_turn"

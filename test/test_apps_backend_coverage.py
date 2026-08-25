@@ -167,9 +167,9 @@ def _record_runs(
     """Record every run argv, optionally failing the call.
 
     Both entry points, because this module has two: the dependency installers go
-    through ``run_limited`` (resource limits applied post-exec), while the nvm and
-    lsof probes are plain ``subprocess.run`` -- they carry no resource policy, so
-    there was nothing for the limiter to deliver for them.
+    through ``run_limited`` (resource limits applied post-exec), while the nvm
+    probe is a plain ``subprocess.run`` -- it carries no resource policy, so
+    there was nothing for the limiter to deliver for it.
     """
 
     calls: list[list[str]] = []
@@ -185,6 +185,16 @@ def _record_runs(
     monkeypatch.setattr(bmod, "run_limited", _run)
     monkeypatch.setattr(bmod.subprocess, "run", _run)
     return calls
+
+
+def _stub_listeners(monkeypatch: pytest.MonkeyPatch, listeners: list[Any]) -> None:
+    """Pin the port->PID lookup the adoption path reads its owners from.
+
+    ``find_port_listeners`` never raises and folds every failure (tool absent,
+    wedged probe) into ``[]``, so an empty stub covers the unavailable case too.
+    """
+
+    monkeypatch.setattr(bmod.platform_compat, "find_port_listeners", lambda _port: listeners)
 
 
 # ---------------------------------------------------------------------------
@@ -654,18 +664,69 @@ class TestAdoptExistingInstance:
     ) -> None:
         port = bmod._MIN_PORT + 6
         monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
-        _record_runs(
+        _stub_listeners(
             monkeypatch,
-            # A non-numeric line must be skipped, not abort the adoption.
-            result=SimpleNamespace(returncode=0, stdout="111\nbogus\n222\n"),
+            [
+                # Pre-fork workers legitimately share the listening socket.
+                bmod.platform_compat.PortListener(111, "127.0.0.1", "4"),
+                bmod.platform_compat.PortListener(222, "127.0.0.1", "4"),
+            ],
         )
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
         ap = self._run(port)
         assert ap is not None
         assert ap.proc is None
         assert ap.healthy is True
         assert ap.adopted_pids == [111, 222]
+        # Start-time identity is captured per owner so stop can refuse a
+        # recycled PID later.
+        assert ap.adopted_start_times == {111: "st-111", 222: "st-222"}
         assert bmod._processes["adoptee"] is ap
         assert bmod._allocated_ports["adoptee"] == port
+
+    def test_adoption_records_only_the_probed_address_owner(
+        self, occupied: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ownership is claimed per address, not per port.
+
+        Two processes legally share a port on different local addresses; only
+        the one covering the health-checked 127.0.0.1 was ever validated, so
+        recording the other would hand stop_app_backend an unrelated process
+        to signal.
+        """
+
+        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
+        _stub_listeners(
+            monkeypatch,
+            [
+                bmod.platform_compat.PortListener(111, "127.0.0.1", "4"),
+                bmod.platform_compat.PortListener(999, "192.168.1.5", "4"),
+            ],
+        )
+        ap = self._run(bmod._MIN_PORT + 16)
+        assert ap is not None
+        assert ap.adopted_pids == [111]
+
+    def test_adoption_excludes_a_v6only_wildcard_beside_the_v4_owner(
+        self, occupied: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lsof spells both wildcard binds ``*`` — only the family separates a
+        v4 owner from an unrelated IPV6_V6ONLY listener sharing its port, and
+        the latter never saw the 127.0.0.1 health probe."""
+
+        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
+        _stub_listeners(
+            monkeypatch,
+            [
+                bmod.platform_compat.PortListener(111, "*", "4"),
+                bmod.platform_compat.PortListener(999, "*", "6"),
+            ],
+        )
+        ap = self._run(bmod._MIN_PORT + 17)
+        assert ap is not None
+        assert ap.adopted_pids == [111]
 
     def test_adoption_survives_an_audit_sink_failure(
         self, occupied: Any, monkeypatch: pytest.MonkeyPatch
@@ -677,7 +738,8 @@ class TestAdoptExistingInstance:
 
         monkeypatch.setattr(bmod, "sel", _boom)
         monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
-        _record_runs(monkeypatch, result=SimpleNamespace(returncode=0, stdout="333\n"))
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
+        _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(333, "127.0.0.1", "4")])
         ap = self._run(bmod._MIN_PORT + 7)
         assert ap is not None
         assert ap.adopted_pids == [333]
@@ -688,18 +750,84 @@ class TestAdoptExistingInstance:
         """Adopting without PIDs would leave a backend we can never stop."""
 
         monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
-        _record_runs(monkeypatch, result=SimpleNamespace(returncode=1, stdout=""))
+        _stub_listeners(monkeypatch, [])
         with caplog.at_level(logging.WARNING):
             assert self._run(bmod._MIN_PORT + 8) is None
-        assert any("cannot record PIDs" in r.message for r in caplog.records)
+        assert any("cannot record owning PIDs" in r.message for r in caplog.records)
         assert "adoptee" not in bmod._processes
 
-    def test_adoption_is_refused_when_the_pid_probe_is_unavailable(
+    def test_adoption_is_refused_when_only_other_addresses_listen(
         self, occupied: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """No loopback-covering owner means the probed backend cannot be
+        attributed — adopting the other-address listener would be adopting a
+        process that never answered the health check."""
+
         monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
-        _record_runs(monkeypatch, exc=OSError("no lsof"))
+        _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(999, "192.168.1.5", "4")])
         assert self._run(bmod._MIN_PORT + 9) is None
+        assert "adoptee" not in bmod._processes
+
+    def test_adoption_is_refused_when_an_owner_identity_is_unreadable(
+        self, occupied: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An owner that cannot be positively named can never be signalled
+        later: stop and uninstall would skip it, leaving a third-party backend
+        running after its trust was revoked. Refuse the adoption instead."""
+
+        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: None)
+        _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(111, "127.0.0.1", "4")])
+        with caplog.at_level(logging.WARNING):
+            assert self._run(bmod._MIN_PORT + 20) is None
+        assert any("refusing adoption" in r.message for r in caplog.records)
+        assert "adoptee" not in bmod._processes
+
+    def test_adoption_is_refused_when_owners_change_mid_capture(
+        self, occupied: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The consistency sandwich: if the responder exits between the health
+        probe and the owner capture, the lookup would attribute ownership to a
+        bystander (e.g. a coexisting v6-only wildcard) — the re-read owner set
+        differs, so adoption is refused instead of recording the bystander."""
+
+        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
+        seqs = [
+            [bmod.platform_compat.PortListener(111, "127.0.0.1", "4")],
+            [bmod.platform_compat.PortListener(999, "*", "6")],
+        ]
+        monkeypatch.setattr(
+            bmod.platform_compat, "find_port_listeners", lambda _port: seqs.pop(0)
+        )
+        with caplog.at_level(logging.WARNING):
+            assert self._run(bmod._MIN_PORT + 18) is None
+        assert any("owners changed" in r.message for r in caplog.records)
+        assert "adoptee" not in bmod._processes
+
+    def test_adoption_is_refused_when_health_lapses_mid_capture(
+        self, occupied: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The re-probe half of the sandwich: a backend that stops answering
+        its health check while ownership is being recorded is not a stable
+        adoptee — whatever the owner lookup returned may describe a corpse or
+        a bystander."""
+
+        calls = {"n": 0}
+
+        def _urlopen(*_a: Any, **_k: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _FakeResp(200)
+            raise urllib.error.URLError("gone mid-capture")
+
+        monkeypatch.setattr(bmod.urllib.request, "urlopen", _urlopen)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
+        _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(111, "127.0.0.1", "4")])
+        with caplog.at_level(logging.WARNING):
+            assert self._run(bmod._MIN_PORT + 19) is None
+        assert any("stopped answering" in r.message for r in caplog.records)
+        assert "adoptee" not in bmod._processes
 
     def test_an_unhealthy_occupant_blocks_the_spawn_instead_of_colliding(
         self, occupied: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -1084,9 +1212,12 @@ class TestStopAdoptedBackend:
     @pytest.fixture()
     def kills(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
         recorded: list[tuple[int, int]] = []
-        monkeypatch.setattr(
-            bmod.platform_compat, "kill_pid", lambda pid, sig: recorded.append((pid, sig))
-        )
+
+        def _pinned_kill(pid: int, _start_time: str, sig: int) -> bool:
+            recorded.append((pid, sig))
+            return True
+
+        monkeypatch.setattr(bmod.platform_compat, "kill_pid_pinned", _pinned_kill)
         monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: False)
         return recorded
 
@@ -1110,29 +1241,117 @@ class TestStopAdoptedBackend:
         assert bmod._processes["ext"] is ap
         assert bmod._allocated_ports["ext"] == ap.port
 
-    def test_only_pids_still_listening_on_the_port_are_signalled(
+    def test_only_identity_verified_pids_are_signalled(
         self, kills: list[tuple[int, int]], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Revalidation guards against a PID recycled since adoption."""
+        """Revalidation is process identity, not a port heuristic: a PID whose
+        live start time no longer matches the adoption record was recycled and
+        must not be signalled, whatever it listens on now."""
 
-        self._track(adopted_pids=[111, 222], healthy=True)
-        _record_runs(monkeypatch, result=SimpleNamespace(returncode=0, stdout="111\n999\n"))
+        self._track(
+            adopted_pids=[111, 222],
+            adopted_start_times={111: "st-111", 222: "st-222"},
+            healthy=True,
+        )
+        monkeypatch.setattr(
+            bmod, "_proc_start_time", lambda pid: {111: "st-111", 222: "st-999"}.get(pid)
+        )
+        # 222 stays alive (it is the recycled process we must not touch);
+        # 111 dies on SIGTERM so no SIGKILL escalation muddies the record.
+        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda pid: pid == 222)
         assert bmod.stop_app_backend("ext") is True
         assert kills == [(111, bmod.platform_compat.SIGTERM)]
 
-    def test_an_unavailable_pid_probe_falls_back_to_the_adopted_set(
+    def test_a_recycled_pid_is_not_signalled_even_when_it_listens(
+        self, kills: list[tuple[int, int]], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The exact residual the identity guard closes: the adopted backend
+        exits, the OS recycles its PID onto ANOTHER listener of the same port
+        (any local address, including a v6-only wildcard) — the start-time
+        mismatch keeps it from being signalled."""
+
+        self._track(adopted_pids=[111], adopted_start_times={111: "st-old"}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st-recycled")
+        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: True)
+        with caplog.at_level(logging.WARNING):
+            assert bmod.stop_app_backend("ext") is True
+        assert kills == []
+        assert any("identity does not match" in r.message for r in caplog.records)
+
+    def test_an_exited_backend_signals_nothing(
         self, kills: list[tuple[int, int]], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        self._track(adopted_pids=[111], healthy=True)
-        _record_runs(monkeypatch, exc=OSError("no lsof"))
+        """A dead PID reads back no start time: nothing to signal, no warning
+        spam for a process that simply finished."""
+
+        self._track(adopted_pids=[111], adopted_start_times={111: "st-111"}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: None)
+        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: False)
         assert bmod.stop_app_backend("ext") is True
-        assert kills == [(111, bmod.platform_compat.SIGTERM)]
+        assert kills == []
+
+    def test_a_pid_recycled_during_the_graceful_wait_is_not_sigkilled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The escalation re-reads identity: a PID whose start time changed
+        during the 2s graceful wait was recycled and must not receive the
+        destructive SIGKILL, on any platform."""
+
+        recorded: list[tuple[int, int]] = []
+
+        def _pinned_kill(pid: int, _start_time: str, sig: int) -> bool:
+            recorded.append((pid, sig))
+            return True
+
+        monkeypatch.setattr(bmod.platform_compat, "kill_pid_pinned", _pinned_kill)
+        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: True)
+        self._track(adopted_pids=[111], adopted_start_times={111: "st"}, healthy=True)
+        # Identity matches for the SIGTERM selection, then flips before the
+        # escalation re-read (the PID was recycled during the graceful wait).
+        reads = iter(["st", "st-recycled"])
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: next(reads))
+        assert bmod.stop_app_backend("ext") is True
+        assert recorded == [(111, bmod.platform_compat.SIGTERM)]
+
+    def test_a_pin_refusal_signals_nothing_and_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """kill_pid_pinned returning False means the process exited between the
+        identity check and the pin — there is nothing left to stop, and no
+        signal may be sent to whatever holds the PID now."""
+
+        self._track(adopted_pids=[111], adopted_start_times={111: "st"}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st")
+        monkeypatch.setattr(
+            bmod.platform_compat, "kill_pid_pinned", lambda _pid, _st, _sig: False
+        )
+        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: True)
+        with caplog.at_level(logging.INFO):
+            assert bmod.stop_app_backend("ext") is True
+        assert any("pinned SIGTERM" in r.message for r in caplog.records)
+
+    def test_an_unreadable_identity_is_never_signalled(
+        self, kills: list[tuple[int, int]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No token was recorded at adoption (identity unreadable): the PID can
+        no longer be positively named, so it is skipped — fail toward not
+        killing, per the process_start_time contract."""
+
+        self._track(adopted_pids=[111], adopted_start_times={}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st-live")
+        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: True)
+        assert bmod.stop_app_backend("ext") is True
+        assert kills == []
 
     def test_nonpositive_recorded_pids_are_never_signalled(
         self, kills: list[tuple[int, int]], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        self._track(adopted_pids=[0, -1], healthy=True)
-        _record_runs(monkeypatch, exc=OSError("no lsof"))
+        self._track(
+            adopted_pids=[0, -1],
+            adopted_start_times={0: "st-0", -1: "st-1"},
+            healthy=True,
+        )
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: {0: "st-0", -1: "st-1"}.get(pid))
         assert bmod.stop_app_backend("ext") is True
         assert kills == []
 
@@ -1140,12 +1359,15 @@ class TestStopAdoptedBackend:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         recorded: list[tuple[int, int]] = []
-        monkeypatch.setattr(
-            bmod.platform_compat, "kill_pid", lambda pid, sig: recorded.append((pid, sig))
-        )
+
+        def _pinned_kill(pid: int, _start_time: str, sig: int) -> bool:
+            recorded.append((pid, sig))
+            return True
+
+        monkeypatch.setattr(bmod.platform_compat, "kill_pid_pinned", _pinned_kill)
         monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: True)
-        self._track(adopted_pids=[111], healthy=True)
-        _record_runs(monkeypatch, exc=OSError("no lsof"))
+        self._track(adopted_pids=[111], adopted_start_times={111: "st"}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st")
         assert bmod.stop_app_backend("ext") is True
         assert recorded == [
             (111, bmod.platform_compat.SIGTERM),
@@ -1155,13 +1377,13 @@ class TestStopAdoptedBackend:
     def test_an_unsignalable_pid_is_skipped_not_fatal(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _denied(_pid: int, _sig: int) -> None:
+        def _denied(_pid: int, _start_time: str, _sig: int) -> bool:
             raise ProcessLookupError
 
-        monkeypatch.setattr(bmod.platform_compat, "kill_pid", _denied)
+        monkeypatch.setattr(bmod.platform_compat, "kill_pid_pinned", _denied)
         monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: False)
-        self._track(adopted_pids=[111], healthy=True)
-        _record_runs(monkeypatch, exc=OSError("no lsof"))
+        self._track(adopted_pids=[111], adopted_start_times={111: "st"}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st")
         assert bmod.stop_app_backend("ext") is True
 
     def test_an_unexpected_stop_failure_restores_tracking(
@@ -1169,12 +1391,12 @@ class TestStopAdoptedBackend:
     ) -> None:
         """Losing the record would orphan the backend with no way to retry."""
 
-        def _bad(_pid: int, _sig: int) -> None:
+        def _bad(_pid: int, _start_time: str, _sig: int) -> bool:
             raise ValueError("bad signal")
 
-        monkeypatch.setattr(bmod.platform_compat, "kill_pid", _bad)
-        ap = self._track(adopted_pids=[111], healthy=True)
-        _record_runs(monkeypatch, exc=OSError("no lsof"))
+        monkeypatch.setattr(bmod.platform_compat, "kill_pid_pinned", _bad)
+        ap = self._track(adopted_pids=[111], adopted_start_times={111: "st"}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st")
         with caplog.at_level(logging.WARNING):
             assert bmod.stop_app_backend("ext") is False
         assert any("Failed to stop adopted backend" in r.message for r in caplog.records)
@@ -1287,73 +1509,26 @@ class TestPidfileHelpers:
 
 
 class TestProcStartTime:
-    def test_linux_reads_the_starttime_field_past_a_parenthesised_comm(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Splitting on the FIRST ')' would mis-index any comm containing one."""
+    """The wrapper must not re-implement the per-platform probe.
 
-        tail = " ".join(str(i) for i in range(4, 24))
-        stat = f"4242 (my (odd) proc) S 1 {tail}"
+    Every platform source (Linux /proc field 22, the Windows creation
+    FILETIME, the BSD ``ps`` leg) and its fail-safe behaviour is pinned in
+    test_platform_compat::TestProcessStartTime. What matters here is that this
+    module reads identity from that shim, because a /proc-or-ps probe answers
+    None for every pid on Windows and a recorded None makes the stale-reap
+    decline to confirm any backend at all.
+    """
 
-        class _FakeStatPath:
-            def __init__(self, _p: str) -> None:
-                pass
+    def test_it_delegates_to_the_platform_shim(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[int] = []
 
-            def read_text(self) -> str:
-                return stat
+        def _probe(pid: int) -> str:
+            seen.append(pid)
+            return "ST-FROM-SHIM"
 
-        monkeypatch.setattr(bmod.sys, "platform", "linux")
-        monkeypatch.setattr(bmod, "Path", _FakeStatPath)
-        assert bmod._proc_start_time(4242) == "21"
-
-    def test_a_malformed_stat_line_yields_no_identity(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        class _FakeStatPath:
-            def __init__(self, _p: str) -> None:
-                pass
-
-            def read_text(self) -> str:
-                return "no closing paren here"
-
-        monkeypatch.setattr(bmod.sys, "platform", "linux")
-        monkeypatch.setattr(bmod, "Path", _FakeStatPath)
-        assert bmod._proc_start_time(4242) is None
-
-    def test_non_linux_shells_out_to_ps(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(bmod.sys, "platform", "darwin")
-        monkeypatch.setattr(
-            bmod.subprocess, "check_output", lambda *_a, **_k: b" Mon Jan  1 00:00:00 2024\n"
-        )
-        assert bmod._proc_start_time(4242) == "Mon Jan  1 00:00:00 2024"
-
-    def test_empty_ps_output_yields_no_identity(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(bmod.sys, "platform", "darwin")
-        monkeypatch.setattr(bmod.subprocess, "check_output", lambda *_a, **_k: b"\n")
-        assert bmod._proc_start_time(4242) is None
-
-    def test_a_failed_ps_probe_yields_no_identity(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def _boom(*_a: Any, **_k: Any) -> bytes:
-            raise OSError("no ps")
-
-        monkeypatch.setattr(bmod.sys, "platform", "darwin")
-        monkeypatch.setattr(bmod.subprocess, "check_output", _boom)
-        assert bmod._proc_start_time(4242) is None
-
-    def test_pid_alive_delegates_to_the_platform_shim(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: True)
-        assert bmod._pid_alive(4242) is True
-
-
-# ---------------------------------------------------------------------------
-# Health-gated MCP registration
-# ---------------------------------------------------------------------------
+        monkeypatch.setattr(bmod.platform_compat, "process_start_time", _probe)
+        assert bmod._proc_start_time(4242) == "ST-FROM-SHIM"
+        assert seen == [4242]
 
 
 class TestGateMcpRegistration:
@@ -1793,7 +1968,7 @@ class TestDefensiveBranches:
         assert bmod.stop_app_backend("ext") is False
         assert "ext" in bmod._processes
 
-    def test_a_garbled_pid_probe_line_is_skipped_during_an_adopted_stop(
+    def test_an_adopted_stop_kill_path_survives_an_audit_sink_failure(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         def _no_sel() -> Any:
@@ -1802,14 +1977,18 @@ class TestDefensiveBranches:
         killed: list[tuple[int, int]] = []
         monkeypatch.setattr(bmod, "sel", _no_sel)
         monkeypatch.setattr(bmod, "_wait_for_pids", lambda _pids, timeout=2.0: None)
-        monkeypatch.setattr(
-            bmod.platform_compat, "kill_pid", lambda pid, sig: killed.append((pid, sig))
-        )
+
+        def _pinned_kill(pid: int, _start_time: str, sig: int) -> bool:
+            killed.append((pid, sig))
+            return True
+
+        monkeypatch.setattr(bmod.platform_compat, "kill_pid_pinned", _pinned_kill)
         monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: True)
-        _record_runs(monkeypatch, result=SimpleNamespace(returncode=0, stdout="111\nnope\n"))
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st")
         with bmod._lock:
             bmod._processes["ext"] = AppProcess(
-                app_name="ext", port=9100, pid=0, proc=None, adopted_pids=[111], healthy=True
+                app_name="ext", port=9100, pid=0, proc=None, adopted_pids=[111],
+                adopted_start_times={111: "st"}, healthy=True
             )
         assert bmod.stop_app_backend("ext") is True
         assert killed == [
@@ -1853,21 +2032,25 @@ class TestReapDefensiveBranches:
                 "zero": {"pid": 0, "start_time": "ST", "port": 9101},
             }
         )
-        monkeypatch.setattr(
-            bmod.platform_compat,
-            "kill_process_tree",
-            lambda *_a: pytest.fail("signalled an unusable pidfile entry"),
-        )
+        for _name in ("kill_process_tree", "kill_process_tree_pinned"):
+            monkeypatch.setattr(
+                bmod.platform_compat,
+                _name,
+                lambda *_a: pytest.fail("signalled an unusable pidfile entry"),
+            )
         assert bmod._reap_stale_app_backends() == 0
         assert bmod._read_pidfile() == {}
 
     def test_a_pid_that_exits_before_the_signal_is_dropped(
         self, matched_orphan: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _gone(_pid: int, _sig: int) -> None:
+        def _gone(_pid: int, _expected: str, _sig: int) -> bool:
             raise ProcessLookupError
 
-        monkeypatch.setattr(bmod.platform_compat, "kill_process_tree", _gone)
+        # Patched at the PINNED entry point, which is what the reap calls now.
+        # Patching the inner ``kill_process_tree`` would leave the real handle
+        # work in front of it and make the case host-dependent.
+        monkeypatch.setattr(bmod.platform_compat, "kill_process_tree_pinned", _gone)
         assert bmod._reap_stale_app_backends() == 0
         assert bmod._read_pidfile() == {}
 
@@ -1880,7 +2063,9 @@ class TestReapDefensiveBranches:
         signals: list[int] = []
         monkeypatch.setattr(bmod, "sel", _no_sel)
         monkeypatch.setattr(
-            bmod.platform_compat, "kill_process_tree", lambda _pid, sig: signals.append(sig)
+            bmod.platform_compat,
+            "kill_process_tree_pinned",
+            lambda _pid, _expected, sig: bool(signals.append(sig)) or True,
         )
         assert bmod._reap_stale_app_backends() == 1
         assert signals == [
@@ -1891,10 +2076,11 @@ class TestReapDefensiveBranches:
     def test_a_pid_that_exits_before_the_escalation_is_not_an_error(
         self, matched_orphan: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _kill(_pid: int, sig: int) -> None:
+        def _kill(_pid: int, _expected: str, sig: int) -> bool:
             if sig == bmod.platform_compat.SIGKILL:
                 raise ProcessLookupError
+            return True
 
-        monkeypatch.setattr(bmod.platform_compat, "kill_process_tree", _kill)
+        monkeypatch.setattr(bmod.platform_compat, "kill_process_tree_pinned", _kill)
         assert bmod._reap_stale_app_backends() == 1
         assert bmod._read_pidfile() == {}

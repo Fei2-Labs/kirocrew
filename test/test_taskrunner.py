@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -141,6 +142,126 @@ class TestParseSteps:
         steps = runner._parse_tasks(text)
         assert len(steps) == 1
         assert steps[0].title == "has title"
+
+    def test_prose_preamble_before_json_object(self) -> None:
+        # Reporter's real shape: a one-line preamble before a complete
+        # {"steps": [...]} object, despite the prompt demanding bare JSON.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        body = json.dumps(
+            {
+                "steps": [
+                    {"title": "Set up scaffolding", "description": "Init the repo"},
+                    {"title": "Implement feature", "description": "Write the code"},
+                ]
+            }
+        )
+        text = "Here is the decomposed task plan you asked for:\n" + body
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 2
+        assert steps[0].title == "Set up scaffolding"
+        assert steps[1].index == 2
+
+    def test_prose_preamble_and_suffix_around_json_array(self) -> None:
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = 'Sure! Plan below.\n[{"title": "A"}, {"title": "B"}]\nLet me know if you need more.'
+        steps = runner._parse_tasks(text)
+        assert [s.title for s in steps] == ["A", "B"]
+
+    def test_preamble_with_stray_brace_still_finds_body(self) -> None:
+        # A brace in the preamble prose must not mask the real JSON body.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = 'Note: use {placeholder} syntax.\n{"steps": [{"title": "A"}]}'
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 1
+        assert steps[0].title == "A"
+
+    def test_preamble_json_with_braces_inside_strings(self) -> None:
+        # Braces/brackets inside string values must not end the span early.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        body = json.dumps({"steps": [{"title": 'Fix "{}" rendering', "description": "x]}"}]})
+        steps = runner._parse_tasks("Plan:\n" + body)
+        assert len(steps) == 1
+        assert steps[0].title == 'Fix "{}" rendering'
+
+    def test_genuinely_unparseable_returns_empty(self) -> None:
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        assert runner._parse_tasks("no json here at all") == []
+        assert runner._parse_tasks("broken { not json [ anywhere") == []
+
+    def test_json_like_token_in_preamble_does_not_mask_body(self) -> None:
+        # A trivial parseable span in the preamble (here "[1]") must not win
+        # over the plan-shaped body that follows it.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = 'Steps use depends_on: [1] for ordering.\n{"steps": [{"title": "Real task"}]}'
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 1
+        assert steps[0].title == "Real task"
+
+    def test_empty_plan_snippet_in_preamble_does_not_mask_body(self) -> None:
+        # An empty-plan example in the preamble (e.g. '{"steps": []}') must not
+        # be selected over the real title-bearing plan that follows it.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = 'The shape is {"steps": []} with items like:\n{"steps": [{"title": "Real task"}]}'
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 1
+        assert steps[0].title == "Real task"
+
+    def test_nested_example_snippet_in_preamble_does_not_starve_scan(self) -> None:
+        # A deeply nested example plus stray prose braces before the body must
+        # not exhaust the extractor (raw_decode skips past each parsed value).
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = (
+            'Example: {"a": {"b": {"c": [1, 2, {"d": []}]}}} and tokens {x} {y} {z}.\n'
+            '{"steps": [{"title": "Real task"}]}'
+        )
+        steps = runner._parse_tasks(text)
+        assert len(steps) == 1
+        assert steps[0].title == "Real task"
+
+    def test_two_different_plans_is_ambiguous_and_fails_safe(self) -> None:
+        # A title-bearing worked EXAMPLE before the real plan is ambiguous: the
+        # parser cannot know which plan is real, and executing a guess is worse
+        # than failing. Two different plan-shaped values -> [] (logged).
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        text = (
+            'For example {"steps": [{"title": "Example task"}]} — here is the plan:\n'
+            '{"steps": [{"title": "Real task"}]}'
+        )
+        assert runner._parse_tasks(text) == []
+
+    def test_identical_restated_plan_is_not_ambiguous(self) -> None:
+        # A model restating the SAME payload twice is not ambiguity.
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        body = '{"steps": [{"title": "Real task"}]}'
+        steps = runner._parse_tasks(f"Plan:\n{body}\nAgain, the plan is:\n{body}")
+        assert len(steps) == 1
+        assert steps[0].title == "Real task"
+
+    def test_unparseable_error_log_is_bounded_and_redacted(self, caplog) -> None:
+        import logging
+
+        sessions = _make_mock_sessions()
+        runner = TaskRunner(sessions=sessions, auto_test=False)
+        secret = "ghp_" + "a" * 36
+        text = "totally not json " + secret + " " + "x" * 5000
+        with caplog.at_level(logging.ERROR, logger="kiro_crew.task_planner"):
+            assert runner._parse_tasks(text) == []
+        record = next(r for r in caplog.records if "Failed to parse tasks JSON" in r.getMessage())
+        message = record.getMessage()
+        assert secret not in message
+        assert str(len(text)) in message
+        # Payload slice is bounded so one record cannot evict the log window.
+        assert len(message) < 700
 
 
 # ── Build step prompt ──
@@ -808,6 +929,15 @@ class TestSaveProgress:
         assert "❌" in content
         assert "boom" in content
         assert "(attempts: 2)" in content
+
+    def test_save_progress_without_spec_does_not_write_to_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        runner = TaskRunner(sessions=_make_mock_sessions(), auto_test=False)
+        run = TaskRun(spec_path="", spec_content="ad-hoc", started_at=1000.0)
+        runner._save_progress(run)
+        assert not (tmp_path / PROGRESS_FILE).exists()
 
 
 # ── 12.1a: Checkpoint Resume ──
@@ -3243,3 +3373,101 @@ class TestSemaphoreParallelScheduling:
             f"task 3 started at index {start3_idx} but task 1 ended at {end1_idx}; "
             "expected task 3 to start BEFORE task 1 finishes (slot refill)"
         )
+
+
+class TestNotifySessionKey:
+    """``start_background(session_key=)`` reaches the notify sink as a keyword.
+
+    The sink is what routes a stall-worthy notice (an approval request, a denial)
+    back to the surface the run was started from. ``notify`` swallows sink
+    failures at debug level, so "the keyword broke the sink" and "there was no
+    notification" look identical from the outside — which is why each of these
+    asserts the notification ARRIVED, not merely that the call was shaped right.
+    """
+
+    @staticmethod
+    def _spec(tmp_path: Path) -> Path:
+        spec = tmp_path / "spec.md"
+        spec.write_text("# Bg Task\n## Steps\n1. Do thing\n   - run: echo hi")
+        return spec
+
+    async def _start(self, tmp_path: Path, sink, session_key: str) -> tuple[TaskRunner, TaskRun]:
+        runner = TaskRunner(
+            sessions=_make_mock_sessions(), work_dir=tmp_path, on_notify=sink
+        )
+        with patch.object(runner, "run", new_callable=AsyncMock):
+            task_id = await runner.start_background(
+                self._spec(tmp_path), session_key=session_key
+            )
+            # Drain the background wrapper here rather than leaving it to be
+            # garbage-collected: a task still pending at teardown escapes into
+            # the next test and prints "Task was destroyed but it is pending".
+            background = runner._tasks.get(task_id)
+            if background is not None:
+                await background
+        return runner, runner._runs[task_id]
+
+    @pytest.mark.asyncio
+    async def test_session_aware_sink_receives_the_originating_key(self, tmp_path: Path) -> None:
+        seen: list[tuple[str, str]] = []
+
+        async def _sink(title: str, body: str, task_id: str = "", *, session_key: str = "") -> None:
+            seen.append((title, session_key))
+
+        runner, run = await self._start(tmp_path, _sink, "telegram:kirocrew:direct:U9")
+        await runner._notify("Task 1 requires approval", "run the deploy?", run=run)
+
+        assert seen == [("[spec] Task 1 requires approval", "telegram:kirocrew:direct:U9")]
+
+    @pytest.mark.asyncio
+    async def test_omitted_session_key_leaves_the_call_shape_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """No originating conversation ⇒ the sink sees the call it always saw.
+
+        Asserted on the call SHAPE, not merely on an empty value: a sink is only
+        obliged to accept ``session_key`` once something hands it one, so a
+        notification with no origin has to arrive as the three-argument call every
+        pre-existing sink was written against.
+        """
+        calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        async def _sink(*args: Any, **kwargs: Any) -> None:
+            calls.append((args, kwargs))
+
+        runner, run = await self._start(tmp_path, _sink, "")
+        await runner._notify("Task 1 requires approval", "run the deploy?", run=run)
+
+        assert calls == [
+            (("[spec] Task 1 requires approval", "run the deploy?", run.task_id), {})
+        ]
+
+    @pytest.mark.asyncio
+    async def test_legacy_three_arg_sink_is_still_notified(self, tmp_path: Path) -> None:
+        """A sink that predates the keyword keeps working, present key or not.
+
+        The keyword is keyword-only WITH a default so a sink can adopt it at its
+        own pace; handing it to one that cannot take it would raise a
+        ``TypeError`` into ``notify``'s best-effort ``except``, and that sink's
+        notifications would simply stop arriving with nothing logged above debug.
+        """
+        seen: list[str] = []
+
+        async def _legacy(title: str, body: str, task_id: str = "") -> None:
+            seen.append(title)
+
+        runner, run = await self._start(tmp_path, _legacy, "telegram:kirocrew:direct:U9")
+        await runner._notify("Task 1 requires approval", "run the deploy?", run=run)
+
+        assert seen == ["[spec] Task 1 requires approval"]
+
+    @pytest.mark.asyncio
+    async def test_delete_forgets_the_originating_key(self, tmp_path: Path) -> None:
+        """The mapping is per-run bookkeeping, so deleting a run releases it."""
+        runner, run = await self._start(
+            tmp_path, AsyncMock(), "telegram:kirocrew:direct:U9"
+        )
+        assert runner._run_session_keys.get(run.task_id)
+
+        assert await runner.delete_run(run.task_id) is True
+        assert run.task_id not in runner._run_session_keys

@@ -19,6 +19,7 @@ import threading
 import time as _time
 from collections import OrderedDict
 from collections.abc import Callable, Container, Iterator
+from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar
@@ -28,12 +29,16 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
-from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect, stream_and_collect_json
+from kiro_crew.llm_helpers import (
+    ToolApprovalPolicy,
+    background_turn,
+    stream_and_collect,
+    stream_and_collect_json,
+)
 from kiro_crew.messaging.link import canonical_key, legacy_key
 from kiro_crew.preview_text import strip_markdown_preview
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
-from kiro_crew.session import BACKGROUND_KEY
 from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance
 from kiro_crew.skills_dedupe import (
     VERDICT_DUP,
@@ -566,6 +571,7 @@ def append_if_absent_off_loop(
     *,
     agent: str | None = None,
     cls: str = "",
+    mid: str | None = None,
 ) -> Any:
     """Idempotent, loop-safe variant of :func:`append_off_loop`.
 
@@ -586,7 +592,7 @@ def append_if_absent_off_loop(
     """
 
     def _do() -> None:
-        conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls)
+        conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls, mid=mid)
 
     try:
         loop = asyncio.get_running_loop()
@@ -703,6 +709,25 @@ _RECENCY_HALF_WEIGHT_DAYS = 30.0
 # ranks CJK results. They still gate the AND match at full strength — the weight
 # only dampens their contribution to the relevance score.
 _CJK_CHAR_WEIGHT = 0.25
+# Weight of one forge-reference spelling hit contributed for RANKING a bare
+# number query ("4411"). Such a query keeps its plain substring needle, so
+# recall is untouched — the spellings only move the session that actually
+# references pull request 4411 above one that happens to contain those digits
+# inside a run id. Sized like _PHRASE_BOOST: strong enough that a single real
+# reference outranks incidental digit noise, not so strong that a session
+# repeating the digits many times can never win.
+_FORGE_REF_WEIGHT = 4.0
+# Forge expansions per query. Each one costs one substring scan of every scanned
+# session PER SPELLING it carries — up to eight for a reference the query named,
+# and up to thirteen for a bare number's ranking needle, which carries both
+# families. Three expansions therefore top out around 39 substring scans per
+# field over the scan window, each a single C-level ``str.count`` against
+# already-folded, memoized text — which is why the cap stays at three rather
+# than shrinking as the spelling sets grew: a query naming three references
+# ("compare #1 #2 #3") is legitimate, and the scans it costs are not the
+# expensive part of a search. A fourth forge-shaped token degrades to a plain
+# needle.
+_SEARCH_MAX_FORGE_REFS = 3
 
 
 def _is_cjk_char(ch: str) -> bool:
@@ -736,11 +761,78 @@ class SearchNeedle(NamedTuple):
     both title and content) is disqualified. ``required=False`` needles only
     contribute to the relevance score. ``weight`` scales each occurrence's
     contribution to that score.
+
+    ``alts`` are ALTERNATIVE SPELLINGS of the same reference: the needle is
+    satisfied by ``text`` or by any alt, and occurrences of every spelling
+    count toward the score. That is a bounded OR *inside* one needle, not an OR
+    over the query — it exists because one forge reference has several written
+    forms (``#4411`` and ``…/pull/4411`` name the same pull request), and a
+    transcript may carry any of them.
+
+    ``digit_bounded`` rejects a match that sits inside a LONGER number, on
+    either side — so ``4411`` matches ``PR 4411.`` but not ``#44110`` and not
+    the run id ``1544110293``. Only meaningful for a spelling made of digits or
+    ending in one.
+
+    ``adjacency`` marks a needle as ADJACENCY EVIDENCE (a CJK bigram) — the only
+    kind the adjacency floor in :meth:`ConversationLog.search_sessions` counts.
+    Scoring-only needles that are not adjacency evidence (the forge spellings
+    added for ranking a bare number) therefore cannot arm that floor, which
+    would otherwise turn a ranking hint into a hidden gate.
     """
 
     text: str
     weight: float
     required: bool
+    alts: tuple[str, ...] = ()
+    digit_bounded: bool = False
+    adjacency: bool = False
+
+
+def count_needle(needle: SearchNeedle, folded_text: str) -> int:
+    """Occurrences of any of *needle*'s spellings in *folded_text*.
+
+    The single counter every matcher and ranker shares, so the alternation and
+    the digit boundary cannot be honored by one caller and dropped by another.
+    *folded_text* must already be casefolded (needle spellings are).
+
+    An ordinary needle (no alts, unbounded) costs exactly one :meth:`str.count`,
+    the same as before spellings existed — the scan cost that
+    :func:`parse_search_query`'s needle caps are sized against. A needle with
+    alts costs one scan per spelling, which is why forge expansions carry their
+    own cap.
+    """
+    if not folded_text:
+        return 0
+    total = 0
+    for text in (needle.text, *needle.alts):
+        if not text:
+            continue
+        if not needle.digit_bounded:
+            total += folded_text.count(text)
+            continue
+        # Non-overlapping scan, matching str.count, skipping a hit that sits
+        # inside a longer number (``4411`` in ``1544110293``, ``#4411`` in
+        # ``#44110``). The LEFT guard applies only to a spelling that starts with
+        # a digit: for a delimited spelling the character before it says nothing
+        # about the number's length, and demanding a non-digit there would refuse
+        # ``#4411`` inside ``owner/repo2#4411`` — a repository whose name ends in
+        # a digit, matched against the very reference the query named.
+        left_bounded = text[0].isdigit()
+        start = 0
+        while True:
+            found = folded_text.find(text, start)
+            if found < 0:
+                break
+            end = found + len(text)
+            before_ok = (
+                not left_bounded or found == 0 or not folded_text[found - 1].isdigit()
+            )
+            after_ok = end >= len(folded_text) or not folded_text[end].isdigit()
+            if before_ok and after_ok:
+                total += 1
+            start = end
+    return total
 
 
 def _script_runs(token: str) -> Iterator[tuple[str, bool]]:
@@ -753,6 +845,266 @@ def _script_runs(token: str) -> Iterator[tuple[str, bool]]:
             yield token[start:i], cur
             start, cur = i, nxt
     yield token[start:], cur
+
+
+# Words that only NAME a reference type in front of its number ("PR 4411",
+# "merge request !12"). They are dropped from the gate when they introduce a
+# number, because they are not part of the reference: requiring the literal
+# "pr" would disqualify the very transcripts this expansion exists to find —
+# one that names the pull request only by URL never contains those letters.
+_FORGE_MR_WORDS = frozenset({"mr", "merge-request", "merge_request", "mergerequest"})
+# "merge" and "request" name no type on their own: "merge 1234" and "requests 12"
+# are ordinary prose, and treating either as a reference would drop the word from
+# the gate and pull in every session mentioning that number. They qualify only
+# TOGETHER ("merge request 12"), which does name GitLab's type.
+_FORGE_REQUEST_WORDS = frozenset({"request", "requests"})
+_FORGE_CHAIN_ONLY_WORDS = _FORGE_REQUEST_WORDS | frozenset({"merge"})
+# Words that DO name a type by themselves, so one of them in the lead-in run is
+# what makes a following number a reference.
+_FORGE_TYPE_WORDS = (
+    frozenset({"pr", "prs", "pull", "pulls", "pull-request", "pull_request", "pullrequest"})
+    | frozenset({"issue", "issues"})
+    | _FORGE_MR_WORDS
+)
+# The full lead-in vocabulary: type words plus the chain-only members, which must
+# be droppable and visible to the family test even though neither names a type.
+_FORGE_REF_WORDS = _FORGE_TYPE_WORDS | _FORGE_CHAIN_ONLY_WORDS
+
+
+def _lead_names_merge_request(lead: tuple[str, ...]) -> bool:
+    """True when the words introducing a number name a GitLab merge request.
+
+    Either an unambiguous word ("MR 12", "merge_request 12") or the two-word
+    form "merge request 12".
+    """
+    if any(word in _FORGE_MR_WORDS for word in lead):
+        return True
+    return "merge" in lead and any(word in _FORGE_REQUEST_WORDS for word in lead)
+
+
+def _lead_names_a_type(lead: tuple[str, ...]) -> bool:
+    """True when the lead-in run actually names a forge type.
+
+    A run of chain-only words does not: "requests 12" is prose about requests,
+    not a reference to item 12, and reading it as one would drop "requests" from
+    the gate and admit every session mentioning ``#12``.
+    """
+    return any(word in _FORGE_TYPE_WORDS for word in lead) or _lead_names_merge_request(lead)
+
+
+# Punctuation a reference collects from surrounding prose ("(#4411)," / "PR
+# #4411."). Stripped before the shapes below are tried, and only from the edges,
+# so the token's own delimiters survive. '!' is NOT in the leading set: it is
+# GitLab's merge-request sigil, not decoration.
+_FORGE_LEAD_PUNCT = "([{<\"'“‘"
+_FORGE_TRAIL_PUNCT = ")]}>,.;:?\"'”’"
+# A path-shaped reference, with or without a scheme/host: ``pull/4411``,
+# ``https://github.com/o/r/pull/4411/files``, ``…/-/merge_requests/12``.
+_FORGE_URL_RE = re.compile(
+    r"^(?:\S*/)?(?P<kind>pull|pulls|merge_requests|merge-requests|issues)"
+    r"/(?P<number>\d{1,9})(?:/\S*)?$"
+)
+# The owner/repo slug inside such a URL, used only for ranking.
+_FORGE_URL_REPO_RE = re.compile(
+    r"^(?:https?://)?[^/\s]+\.[^/\s]+"
+    r"/(?P<repo>[a-z0-9._-]+(?:/[a-z0-9._-]+)+?)"
+    r"(?:/-)?/(?:pull|pulls|merge_requests|merge-requests|issues)/\d"
+)
+# A sigil reference: ``#4411``, ``!12``, ``owner/repo#4411``, ``pr#4411``.
+_FORGE_SIGIL_RE = re.compile(
+    r"^(?:(?P<repo>[a-z0-9._-]+(?:/[a-z0-9._-]+)+)|(?P<word>pr|mr|pull|issue))?"
+    r"(?P<sigil>[#!])(?P<number>\d{1,9})$"
+)
+# A glued word+number reference: ``pr4411``, ``pr-4411``, ``mr-12``.
+_FORGE_WORD_NUM_RE = re.compile(r"^(?P<word>pr|mr|pull|issue)-?(?P<number>\d{1,9})$")
+
+
+class _ForgeRef(NamedTuple):
+    """A forge item (pull request / merge request / issue) named by a query.
+
+    ``bare`` records that the QUERY spelled the number with no sigil ("PR 4411",
+    "issue 42", "pr4411"). That decides whether plain digits are one of the
+    item's spellings — see :func:`_forge_spellings`.
+
+    """
+
+    number: str
+    merge_request: bool
+    repo: str | None
+    bare: bool = False
+
+
+def _forge_spellings(ref: _ForgeRef) -> tuple[str, tuple[str, ...]]:
+    """Return ``(canonical, alts)`` — how *ref* can be written in a transcript.
+
+    The families are kept apart because the sigils are not interchangeable:
+    GitHub draws pull requests and issues from ONE number sequence (``#4411``,
+    ``/pull/4411`` and ``/issues/4411`` are the same item), while GitLab numbers
+    merge requests separately from issues, which is why it spells them ``!12``
+    and ``#12``. For a SIGIL query that separation is a guarantee — ``!12`` never
+    matches ``#12``, a different object. A sigil-free query ("merge request 12")
+    also carries the bare digits, which a ``#12`` mention satisfies, so there the
+    separation governs ranking rather than exclusion.
+
+    Path spellings carry no leading slash so they match both ``/pull/4411`` in a
+    URL and a bare ``pull/4411`` written on its own.
+
+    The prose spellings ("pr 4411", "pull request 4411", "pr4411") are included
+    because a transcript often names the item in words rather than with a sigil,
+    and a query that typed the sigil should still find it. They match as plain
+    substrings, so a glued form can hit inside a longer word (``expr4411``
+    satisfies ``pr4411``). That is deliberate: this module matches every other
+    needle as a substring — ``cont`` hits ``contention`` — and adding word
+    boundaries for some spellings and not others would make the rule harder to
+    predict than the false positive it avoids, which ranks last anyway on a
+    single hit. The digit boundary still bounds the numeric side.
+
+    A bare digit spelling is a substring of its own sigil and glued spellings, so
+    one mention of ``#4411`` counts twice inside a bare reference's needle. That
+    only lifts the relevance score of a session that really does reference the
+    item, and never gates.
+
+    Plain digits are a spelling only for a ``bare`` reference, and that
+    asymmetry is deliberate. A query that typed no sigil ("issue 42") is looking
+    for the number as written, so the digits belong; a query that typed one
+    ("#4411", a PR URL) was explicit, and admitting bare digits there would make
+    ``!12`` match every session that mentions a standalone 12 — ordinary prose
+    (a count, a date, a version).
+
+    Recall relative to the plain substring gate this replaces does not rest on
+    the list being exhaustive by inspection — three shapes slipped past that
+    reasoning — but on a property test that drives every shape the parser
+    accepts against a transcript quoting it verbatim. Concretely: a sigil shape
+    contains its own canonical spelling (``owner/repo2#4411`` contains
+    ``#4411``), a path or URL shape contains a path spelling, and a glued or
+    two-token shape contains the bare digits. The one session the expansion can
+    still drop is one whose only claim to the old match was the digits sitting
+    INSIDE a longer number ("4411" within run id 1544110293) — and excluding that
+    is the point of the digit boundary, since such a session never referenced
+    the item.
+    """
+    number = ref.number
+    bare = (number,) if ref.bare else ()
+    if ref.merge_request:
+        return (
+            f"!{number}",
+            (
+                f"merge_requests/{number}",
+                f"merge-requests/{number}",
+                f"mr {number}",
+                f"merge request {number}",
+                f"mr{number}",
+                *bare,
+            ),
+        )
+    return (
+        f"#{number}",
+        (
+            f"pull/{number}",
+            f"pulls/{number}",
+            f"issues/{number}",
+            f"pr {number}",
+            f"pull request {number}",
+            f"pr{number}",
+            *bare,
+        ),
+    )
+
+
+def _forge_lead_in(parts: list[str], index: int) -> tuple[str, ...]:
+    """The contiguous run of reference-vocabulary words before ``parts[index]``.
+
+    Raw material for :func:`_forge_type_suffix`, which decides how much of the
+    run is actually part of the reference.
+    """
+    back = index - 1
+    while back >= 0 and parts[back] in _FORGE_REF_WORDS:
+        back -= 1
+    return tuple(parts[back + 1 : index])
+
+
+def _forge_type_suffix(lead: tuple[str, ...]) -> tuple[str, ...]:
+    """The part of *lead* that names the reference's type — its SHORTEST naming suffix.
+
+    Only the words adjacent to the number belong to the reference; anything
+    before them is the user's own search term. "merge issue 42" is a query about
+    ``merge`` AND issue 42, so the reference is ``issue 42`` and ``merge`` stays
+    in the gate — taking the whole run would drop it and return every session
+    mentioning #42.
+
+    SHORTEST, not longest: a longer suffix can still contain a type word without
+    that word being the head of the phrase ("merge issue" would qualify on
+    ``issue`` alone and swallow ``merge``). The shortest naming suffix is the
+    complete type phrase and no more — which still admits the two-word forms,
+    since neither "request" nor "merge" names a type by itself and only
+    ("merge", "request") together qualify.
+
+    Returns ``()`` when no suffix names a type, i.e. the number is not a
+    reference at all.
+
+    Two known limitations, accepted rather than special-cased. A chain-only word
+    wedged BETWEEN the type word and the number ("issue merge 42") is swallowed,
+    because the shortest naming suffix is ``("issue", "merge")``; the mirror case
+    ("merge issue 42") is handled. And because the gate is keyed by term text, a
+    query repeating a suffix word as its own search term ("pull the pull request
+    12") loses that term when the suffix is dropped. Both need a query nobody
+    writes, both only widen the result set, and closing them means keying the
+    gate by token position rather than by text — a redesign of the needle map,
+    not a fix here.
+    """
+    for size in range(1, len(lead) + 1):
+        suffix = lead[len(lead) - size :]
+        if _lead_names_a_type(suffix):
+            return suffix
+    return ()
+
+
+def _parse_forge_ref(token: str, lead: tuple[str, ...]) -> _ForgeRef | None:
+    """Parse *token* as a forge reference, or return ``None``.
+
+    *token* is one casefolded whitespace-separated term; *lead* is the run of
+    type-naming words before it (:func:`_forge_lead_in`), which is what makes
+    the two-token form ("PR 4411", "merge request 12") a reference rather than a
+    bare number, and which names the family when the token itself does not. A
+    bare number with no such lead-in is NOT a reference — treating every number
+    in a query as one would rewrite ordinary numeric content search (ports,
+    error codes, dates).
+    """
+    token = token.lstrip(_FORGE_LEAD_PUNCT).rstrip(_FORGE_TRAIL_PUNCT)
+    if not token:
+        return None
+    url = _FORGE_URL_RE.match(token)
+    if url:
+        repo_match = _FORGE_URL_REPO_RE.match(token)
+        return _ForgeRef(
+            url.group("number"),
+            url.group("kind").startswith("merge"),
+            repo_match.group("repo") if repo_match else None,
+        )
+    sigil = _FORGE_SIGIL_RE.match(token)
+    if sigil:
+        # The TYPED sigil decides the family, not the word before it: "#" names
+        # the shared pull/issue sequence and "!" names GitLab's merge requests,
+        # so letting a word override the sigil produced a reference ("mr#12")
+        # none of whose spellings was the string the user typed.
+        return _ForgeRef(
+            sigil.group("number"),
+            sigil.group("sigil") == "!",
+            sigil.group("repo"),
+        )
+    glued = _FORGE_WORD_NUM_RE.match(token)
+    if glued:
+        return _ForgeRef(
+            glued.group("number"),
+            glued.group("word") in _FORGE_MR_WORDS,
+            None,
+            bare=True,
+        )
+    if token.isdigit() and len(token) <= 9:
+        suffix = _forge_type_suffix(lead)
+        if suffix:
+            return _ForgeRef(token, _lead_names_merge_request(suffix), None, bare=True)
+    return None
 
 
 def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
@@ -789,6 +1141,28 @@ def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
     Precision moves from the gate into the ranking, which is the module's
     existing philosophy for the substring-prefix looseness on ASCII terms.
 
+    A term that names a FORGE ITEM — a pull request, merge request or issue —
+    becomes ONE required needle carrying every spelling of that item instead of
+    the literal term (see :func:`_parse_forge_ref`). ``#4411``, ``pr 4411``,
+    ``pull/4411``, a full PR URL and ``owner/repo#4411`` therefore all find the
+    same sessions, whichever form each transcript happens to use, and the
+    spellings are digit-bounded so ``#4411`` never matches ``#44110``. A naming
+    word that introduces a number ("PR 4411") is dropped from the gate: it is
+    not part of the reference, and requiring the letters "pr" would disqualify a
+    transcript that names the pull request only by URL. When the query spelled
+    the number with no sigil, plain digits stay one of the spellings, so the
+    expansion keeps the recall of the literal AND it replaces — the one session
+    it can drop is a session whose digits merely sat inside a longer number,
+    which is what the digit boundary is for. Only a run of words that actually
+    NAMES a type makes a following number a reference: "requests 12" and
+    "merge 1234" stay literal terms, since dropping such a word from the gate
+    would trade a real term for every session mentioning that number. A BARE
+    number with no naming word at all is not a reference either: it keeps its
+    plain substring needle, so numeric content search is unchanged, and gains
+    the spellings as scoring-only needles, so the session that actually
+    references pull request 4411 outranks one that merely contains those digits
+    inside a run id.
+
     Bounds (both exist because **every needle costs one full scan** of a
     session's text): required needles cap at :data:`SEARCH_MAX_TOKENS` and
     scoring extras at :data:`_SEARCH_MAX_SCORING_EXTRAS`. Deduplication is free
@@ -810,25 +1184,98 @@ def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
     if not parts:
         return ([], "", False)
     phrase = " ".join(parts)
-    required: dict[str, float] = {}
-    extras: dict[str, float] = {}
-    for part in dict.fromkeys(parts):
+    required: dict[str, SearchNeedle] = {}
+    extras: dict[str, SearchNeedle] = {}
+    ranking: dict[str, SearchNeedle] = {}
+    forge_budget = _SEARCH_MAX_FORGE_REFS
+    # One ledger keyed by the item's canonical spelling, so a slot is charged per
+    # ITEM rather than per needle. "#4411 4411" names one pull request twice — as
+    # a required reference and as a bare number's ranking hint — and charging
+    # both spent a phantom slot that could push a later distinct reference past
+    # the cap. Keyed rather than counted so the order the two forms appear in
+    # cannot change the outcome.
+    charged: set[str] = set()
+    for index, part in enumerate(parts):
+        lead = _forge_lead_in(parts, index)
+        ref = _parse_forge_ref(part, lead)
+        if ref is not None:
+            canonical, alts = _forge_spellings(ref)
+            if canonical in required:
+                # The item is already gated, but this occurrence still carries
+                # information: its own naming words must leave the gate, and a
+                # sigil-free spelling contributes the bare digits the first
+                # occurrence may not have had. Skipping outright let
+                # "#42 issue 42" keep `issue` required AND lose the bare-digit
+                # spelling — narrowing a query that named the item twice, which
+                # the loosen-only contract forbids.
+                for word in _forge_type_suffix(lead):
+                    required.pop(word, None)
+                if ref.bare:
+                    seen = required[canonical]
+                    if ref.number not in seen.alts:
+                        required[canonical] = seen._replace(alts=(*seen.alts, ref.number))
+                continue
+            if canonical not in charged and not forge_budget:
+                ref = None
+        if ref is not None:
+            if canonical not in charged:
+                charged.add(canonical)
+                forge_budget -= 1
+            # The words that NAME the reference's type are not part of the search
+            # text, and requiring them would disqualify a transcript that names
+            # the item only by URL — one that never spells the letters "pr". Only
+            # that naming suffix is dropped: in "merge issue 42" the reference is
+            # "issue 42" and `merge` is the user's own term, so popping the whole
+            # run would return every session mentioning #42.
+            for word in _forge_type_suffix(lead):
+                required.pop(word, None)
+            required.setdefault(canonical, SearchNeedle(canonical, 1.0, True, alts, True))
+            if ref.repo:
+                # Ranking only: the repo slug appears in a URL mention but not in
+                # a prose "#4411" one, so requiring it would hide real hits. It
+                # breaks the tie between the same number in two repos.
+                ranking.setdefault(ref.repo, SearchNeedle(ref.repo, 1.0, False))
+            continue
+        if part.isdigit() and len(part) <= 9:
+            gh_text, gh_alts = _forge_spellings(_ForgeRef(part, False, None))
+            # Charged against the shared ledger, so a number already gated as a
+            # reference does not spend a second slot on a hint the dedup below
+            # will discard anyway. This branch deliberately does NOT `continue` —
+            # the plain digit needle added below is what keeps numeric content
+            # search working, and it belongs in the gate whether or not the hint
+            # fits in the budget.
+            if gh_text not in charged and forge_budget:
+                charged.add(gh_text)
+                forge_budget -= 1
+                mr_text, mr_alts = _forge_spellings(_ForgeRef(part, True, None))
+                # Every sigil spelling of the number, both families: these only
+                # score, so a wrong-family hit costs a little rank rather than
+                # admitting a wrong object into the results.
+                spellings = tuple(
+                    dict.fromkeys(
+                        s for s in (gh_text, *gh_alts, mr_text, *mr_alts) if s != part
+                    )
+                )
+                ranking[gh_text] = SearchNeedle(
+                    spellings[0], _FORGE_REF_WEIGHT, False, spellings[1:], True
+                )
         for run, is_cjk in _script_runs(part):
             if not is_cjk or len(run) == 1:
-                required.setdefault(run, 1.0)
+                required.setdefault(run, SearchNeedle(run, 1.0, True))
                 continue
             for ch in run:
-                required.setdefault(ch, _CJK_CHAR_WEIGHT)
+                required.setdefault(ch, SearchNeedle(ch, _CJK_CHAR_WEIGHT, True))
             for i in range(len(run) - 1):
-                extras.setdefault(run[i : i + 2], 1.0)
-    needles = [
-        SearchNeedle(text, weight, True)
-        for text, weight in list(required.items())[:SEARCH_MAX_TOKENS]
-    ]
-    needles.extend(
-        SearchNeedle(text, weight, False)
-        for text, weight in list(extras.items())[:_SEARCH_MAX_SCORING_EXTRAS]
-    )
+                bigram = run[i : i + 2]
+                extras.setdefault(bigram, SearchNeedle(bigram, 1.0, False, adjacency=True))
+    # A spelling that is already REQUIRED must not also score as a ranking hint:
+    # a query naming the same item twice ("#4411 4411") would count its hits
+    # twice over.
+    for text in [t for t in ranking if t in required]:
+        del ranking[text]
+    needles = list(required.values())[:SEARCH_MAX_TOKENS]
+    needles.extend(list(extras.values())[:_SEARCH_MAX_SCORING_EXTRAS])
+    needles.extend(ranking.values())
     adjacency_floor = 0 < len(extras) <= _SEARCH_MAX_SCORING_EXTRAS
     return (needles, phrase, adjacency_floor)
 
@@ -843,6 +1290,10 @@ def snippet_needles(query: str) -> list[str]:
     queries, where a predictable first-typed-term fallback is part of the
     contract — and down-weighted lone CJK characters last, the anchor of last
     resort. Returns ``[]`` for a whitespace-only query.
+
+    A forge-reference needle contributes every spelling it carries, right after
+    its canonical form: the transcript that matched may name the item any of
+    those ways, and centering the snippet on the mention is the whole point.
     """
     needles, phrase, _ = parse_search_query(query)
     if not needles:
@@ -851,7 +1302,7 @@ def snippet_needles(query: str) -> list[str]:
     # order (required terms first-seen, then bigrams) is the display order.
     ordered = sorted(needles, key=lambda n: -n.weight)
     out: list[str] = []
-    for text in (phrase, *(n.text for n in ordered)):
+    for text in (phrase, *(t for n in ordered for t in (n.text, *n.alts))):
         if text not in out:
             out.append(text)
     return out
@@ -873,6 +1324,10 @@ def needles_match_text(
     exactly as in ``search_sessions`` (a partial bigram set cannot prove
     "no adjacency anywhere"). *folded_text* must already be casefolded
     (needle texts are).
+
+    Satisfaction is per NEEDLE, not per literal: a needle carrying alternative
+    spellings (a forge reference) is satisfied by any one of them, via the
+    shared :func:`count_needle`.
     """
     if not needles:
         return False
@@ -880,11 +1335,11 @@ def needles_match_text(
     has_adjacency = False
     for needle in needles:
         if needle.required:
-            if needle.text not in folded_text:
+            if not count_needle(needle, folded_text):
                 return False
-        else:
+        elif needle.adjacency:
             has_adjacency = True
-            if needle.text in folded_text:
+            if count_needle(needle, folded_text):
                 adjacency_hit = True
     return adjacency_hit or not has_adjacency or not adjacency_floor
 
@@ -1240,6 +1695,35 @@ def transcript_stem(key: str) -> str:
     alone would not find it.
     """
     return _safe_key(key)
+
+
+_TAB_ID_INDEX_STEM_PREFIX = "dashboard_chat-"
+_TAB_ID_INDEX_GLOB = f"{_TAB_ID_INDEX_STEM_PREFIX}*.jsonl"
+
+
+def _index_key_for_stem(stem: str) -> str:
+    """The key form :attr:`ConversationLog._tab_id_index` stores for *stem*.
+
+    One derivation shared by the index builder (which starts from a filename)
+    and the in-place updater (which starts from a session key), because a second
+    copy would drift the moment either side changed and the failure is silent:
+    the two spellings stop matching, so an updater's lookup misses an entry that
+    is really there.
+    """
+    return stem.replace("_", ":", 1)
+
+
+def can_hold_tab_id_index_entry(key: str) -> bool:
+    """True when *key*'s transcript is one :meth:`_rebuild_tab_id_index` scans.
+
+    The index is built by globbing :data:`_TAB_ID_INDEX_GLOB`, so a transcript
+    whose stem does not match can never appear in it -- a channel-keyed session
+    (``slack:<ts>`` and friends) writes ``slack_<ts>.jsonl``, which the glob
+    never returns. Saving such a transcript therefore cannot add, remove or
+    change any index entry, which is what makes a no-op the correct response to
+    one rather than an invalidation.
+    """
+    return transcript_stem(key).startswith(_TAB_ID_INDEX_STEM_PREFIX)
 
 
 def transcript_stems(key: str) -> tuple[str, ...]:
@@ -1746,6 +2230,32 @@ class ConversationLog:
         #: event loop may mark it stale — an unsynchronized rebuild/read/clear
         #: produced a transient empty index or ``AttributeError``.
         self._tab_id_index: dict[str, list[str]] | None = None
+        #: session key → (mtime, tab_id) memo feeding the rebuild above.
+        #: Deliberately an unbounded plain dict, NOT an _LRUCache: the rebuild is
+        #: a cyclic scan over every dashboard file, and a bounded cache under a
+        #: cyclic scan larger than the bound has a 0% hit rate (see
+        #: _SearchTextCache's docstring). Values are 12-char ids, so 1k sessions
+        #: is tens of KB.
+        #:
+        #: TWO guards, and neither is sufficient alone. The explicit pop in
+        #: _invalidate_cache covers writes THROUGH this class from THIS instance:
+        #: those restore the pre-write mtime (_restore_mtime), so a stamp alone
+        #: would not see them. The stamp covers rewrites that never reach that
+        #: pop -- a hand-edited tab_id, or a write through ANOTHER instance,
+        #: whose pop lands on its own memo and leaves ours intact.
+        #:
+        #: The stamp is (st_mtime_ns, st_size, st_ino), all from one stat. Size
+        #: rides along because timestamp granularity is coarse (worse on
+        #: Windows). ns rather than float seconds, and st_ino as well, because
+        #: another instance's equal-length tab_id rewrite preserves mtime and
+        #: size both -- see the cross-instance test.
+        self._tab_id_by_key: dict[str, tuple[tuple[int, int, int], str]] = {}
+        #: Bumped by _invalidate_cache. The rebuild samples it before reading a
+        #: file's metadata and declines to memoize if it moved, so a store cannot
+        #: land after a concurrent writer's pop and resurrect a stale id.
+        #: _invalidate_cache deliberately does not take self._lock, so the
+        #: rebuild cannot exclude it.
+        self._tab_id_generation = 0
         #: Coarse instance lock protecting the lazily-built ``_tab_id_index``
         #: rebuild/read/clear. The message/metadata/recent LRUs are each
         #: internally locked; this guards the shared mutable state that lives
@@ -2065,21 +2575,47 @@ class ConversationLog:
             return None
         summary = data.get("summary")
         sig = self.session_mtime(key)
-        if sig is not None and data.get("sig") == sig and isinstance(summary, str):
+        if (
+            sig is not None
+            and data.get("sig") == sig
+            and data.get("gen", 0) == self.rotation_generation(key)
+            and isinstance(summary, str)
+        ):
             return summary
         return None
 
-    def set_cached_summary(self, key: str, summary: str, sig: float) -> None:
+    def set_cached_summary(
+        self, key: str, summary: str, sig: float, generation: int | None = None
+    ) -> None:
         """Persist a derived one-line *summary* to the sidecar cache.
 
         Keyed by the session file's mtime *sig* so a later append invalidates
         it. Atomic and side-effect-free with respect to the session JSONL —
         no read-modify-write, hence no data-loss race with a concurrent
         :meth:`append`.
+
+        *generation* is :meth:`rotation_generation` captured at the same moment
+        as *sig*, and must come from the caller for the same reason *sig* does:
+        summary generation holds no lock while the model call is in flight, and
+        a rewrite landing in that window preserves the mtime while advancing the
+        generation. Reading the generation HERE would stamp the new content's
+        identity onto the old summary and bless it as fresh — the exact
+        staleness the generation was added to catch. ``None`` reads it at write
+        time, which is only safe when no snapshot preceded the call.
         """
         atomic_write(
             self._summary_cache_path(key),
-            json.dumps({"sig": sig, "summary": summary}),
+            json.dumps(
+                {
+                    "sig": sig,
+                    "gen": (
+                        self.rotation_generation(key)
+                        if generation is None
+                        else generation
+                    ),
+                    "summary": summary,
+                }
+            ),
         )
 
     def _intent_summary_cache_path(self, key: str) -> Path:
@@ -2110,6 +2646,8 @@ class ConversationLog:
         sig = self.session_mtime(key)
         if sig is None or data.get("sig") != sig:
             return None
+        if data.get("gen", 0) != self.rotation_generation(key):
+            return None
         return data
 
     def read_intent_summary(self, key: str) -> tuple[dict | None, bool]:
@@ -2130,9 +2668,16 @@ class ConversationLog:
         if not isinstance(data, dict) or not isinstance(data.get("intents"), list):
             return None, False
         sig = self.session_mtime(key)
-        return data, not (sig is not None and data.get("sig") == sig)
+        fresh = (
+            sig is not None
+            and data.get("sig") == sig
+            and data.get("gen", 0) == self.rotation_generation(key)
+        )
+        return data, not fresh
 
-    def set_cached_intent_summary(self, key: str, payload: dict, sig: float) -> bool:
+    def set_cached_intent_summary(
+        self, key: str, payload: dict, sig: float, generation: int | None = None
+    ) -> bool:
         """Persist a derived intent summary *payload* to its sidecar cache.
 
         Writes only the sidecar, never the session JSONL, so generating a
@@ -2158,9 +2703,28 @@ class ConversationLog:
             with self._locked(key):
                 if _safe_mtime(self._path(key)) != sig:
                     return False
+                current_generation = self.rotation_generation(key)
+                if generation is not None and current_generation != generation:
+                    # A rewrite landed while the model call was in flight. It
+                    # PRESERVED the mtime, so the check above cannot see it —
+                    # the generation is the only signal that the summary now
+                    # describes replaced content. Refuse for the same reason a
+                    # changed mtime is refused: storing it would record a known
+                    # stale payload as the latest word.
+                    return False
                 atomic_write(
                     self._intent_summary_cache_path(key),
-                    json.dumps({**payload, "sig": sig}),
+                    json.dumps(
+                        {
+                            **payload,
+                            "sig": sig,
+                            "gen": (
+                                current_generation
+                                if generation is None
+                                else generation
+                            ),
+                        }
+                    ),
                 )
                 return True
         except HistoryLockTimeout:
@@ -2180,6 +2744,7 @@ class ConversationLog:
         agent: str | None = None,
         tab_id: str | None = None,
         cls: str = "",
+        mid: str | None = None,
     ) -> None:
         """Append a message with optional provenance to the session log.
 
@@ -2187,6 +2752,18 @@ class ConversationLog:
         carries one (``_ChatSlot.append``) but this durable copy had nowhere to
         put it, so any class-borne distinction silently vanished the moment a
         session's rows had to be replayed from disk after a restart.
+
+        *mid* persists the row's delivery identity as ``meta.mid`` — the SAME
+        field shape the dashboard slot save writes
+        (``chat_persistence._build_message_entry`` copies the window row's
+        ``meta`` dict to disk). A dual-writer that reflects a message in the
+        in-memory slot (``_ChatSlot.append``, which mints the id) AND persists
+        it here must pass that minted id, so both copies carry one identity and
+        the bounded-read reconciliation (``_append_unflushed_tail``'s
+        ``meta.mid`` walk) recognises the durable copy instead of treating the
+        window copy as still owed. Optional: a row appended without one carries
+        no ``meta`` at all, which is what pre-id transcripts hold — readers keep
+        their id-less fallback for exactly those rows.
 
         If the session file does not yet exist, it will be created with an
         initial metadata line.  When *agent* is supplied, the agent name is
@@ -2246,6 +2823,14 @@ class ConversationLog:
                 msg["source_thread"] = source_thread
             if source_user:
                 msg["source_user"] = source_user
+            if isinstance(mid, str) and mid:
+                # ``meta`` holding ``mid`` is the identity shape every reader of
+                # this file already matches on (the slot save writes it, the
+                # bounded-read walk consumes it); a second spelling would be
+                # invisible to both. Only a non-empty ``str`` counts, matching
+                # the read side — persisting any other shape would store an id
+                # the reader is structurally unable to honour.
+                msg["meta"] = {"mid": mid}
 
             # Session transcripts are intentionally local plaintext JSONL (the
             # documented storage format), not a credential/secret store.
@@ -2276,11 +2861,14 @@ class ConversationLog:
         agent: str | None = None,
         tab_id: str | None = None,
         cls: str = "",
+        mid: str | None = None,
     ) -> bool:
         """Append a message only if an identical one is not already persisted.
 
-        Returns ``True`` if the message was written, ``False`` if a message
-        with the same ``(role, content)`` already exists on disk.
+        Returns ``True`` if the message was written, ``False`` if it is already
+        on disk — judged by ``(role, content)`` when the caller supplies no
+        *mid*, and by ``(role, content)`` plus the SAME ``meta.mid`` when it
+        does (see below).
 
         The disk check and the append run together under ``_locked`` so they
         are ATOMIC against a concurrent writer of the same session file — in
@@ -2294,7 +2882,19 @@ class ConversationLog:
         agent turns. This is the workflow-result / cron-result double-append
         race: the read-modify-write must be one locked critical section, not a
         separate unlocked existence check followed by a later append.
+
+        What counts as "already persisted" depends on whether the caller holds
+        an identity. Without *mid*, any row with the same ``(role, content)``
+        does — body equality is all an id-less writer can check. WITH *mid*,
+        only a body-equal row carrying the SAME ``meta.mid`` does: that row is
+        this very message, landed by the slot save or an earlier attempt of
+        this write. A body-equal row under another id (or none) is a DIFFERENT
+        occurrence that happens to repeat the text — an id-carrying twin of an
+        earlier injection, or a pre-id legacy row — and skipping on it would
+        drop THIS occurrence's only durable copy: the in-memory window is lost
+        on restart, so nothing would replay the newer message.
         """
+        supplied_mid = mid if isinstance(mid, str) and mid else None
         with self._locked(key):
             if self._path(key).exists():
                 # Compare against the form ``append`` actually stores: the
@@ -2303,19 +2903,26 @@ class ConversationLog:
                 # that contained a credential and would append it twice.
                 persisted = _redact_at_write_boundary(role, content)
                 for m in self._read_messages(key):
-                    if m.get("role") == role and m.get("content") == persisted:
+                    if m.get("role") != role or m.get("content") != persisted:
+                        continue
+                    if supplied_mid is None:
+                        return False
+                    m_meta = m.get("meta")
+                    if isinstance(m_meta, dict) and m_meta.get("mid") == supplied_mid:
                         return False
             # Reentrant: ``append`` re-enters ``_locked`` for the same key on
             # this thread (RLock + refcounted flock), so the write stays inside
-            # the critical section we already hold.
-            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls)
+            # the critical section we already hold. The skip paths above leave
+            # the persisted rows untouched — an id is never retrofitted onto a
+            # row already on disk.
+            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls, mid=mid)
             return True
 
     def recent(
         self,
         key: str,
         max_messages: int = 20,
-        roles: set[str] | None = None,
+        roles: AbstractSet[str] | None = None,
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
@@ -2352,7 +2959,7 @@ class ConversationLog:
         self,
         key: str,
         max_messages: int = 20,
-        roles: set[str] | None = None,
+        roles: AbstractSet[str] | None = None,
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
@@ -3069,6 +3676,12 @@ class ConversationLog:
         bigram hit (the adjacency floor) — see :func:`parse_search_query` for
         the recall/precision split.
 
+        A term naming a forge item (``#4411``, ``pr 4411``, ``pull/4411``, a PR
+        URL, ``owner/repo#4411``) gates on ANY spelling of that item rather than
+        on the literal term, so the session that discussed the pull request is
+        found whichever form its transcript used. A bare number additionally
+        RANKS on those spellings while still gating on the plain digits.
+
         Each needle is matched case-insensitively as a SUBSTRING (so ``"cont"``
         hits ``"contention"``, which keeps search-as-you-type responsive) using
         full Unicode case folding via :meth:`str.casefold` (so e.g. German ``ß``
@@ -3137,14 +3750,14 @@ class ConversationLog:
             adjacency_hits = 0
             disqualified = False
             for needle in needles:
-                in_content = folded.count(needle.text) if folded else 0
-                in_title = title_folded.count(needle.text)
+                in_content = count_needle(needle, folded)
+                in_title = count_needle(needle, title_folded)
                 if needle.required and not in_content and not in_title:
                     # AND semantics: one absent required needle disqualifies the
                     # session, so stop counting the rest.
                     disqualified = True
                     break
-                if not needle.required:
+                if needle.adjacency:
                     adjacency_hits += in_content + in_title
                 content_hits += in_content * needle.weight
                 title_hits += in_title * needle.weight
@@ -3380,7 +3993,7 @@ class ConversationLog:
                     continue
                 try:
                     data = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
+                except ValueError:
                     continue
                 if not isinstance(data, dict) or data.get("_type") == "metadata":
                     continue
@@ -3521,7 +4134,7 @@ class ConversationLog:
                     for _, line in zip(range(5), f):
                         try:
                             d = json.loads(line.strip())
-                        except (json.JSONDecodeError, ValueError):
+                        except ValueError:
                             continue
                         if d.get("_type") == "metadata" and is_incognito_transcript(
                             d.get("memory_mode")
@@ -3590,18 +4203,102 @@ class ConversationLog:
 
         Caller MUST hold ``self._lock`` — this replaces the shared
         ``_tab_id_index`` mapping.
+
+        Each file's tab_id is memoized in ``_tab_id_by_key`` under a
+        ``(st_mtime_ns, st_size, st_ino)`` stamp, so a file unchanged since the last rebuild
+        costs a ``stat`` instead of an ``open`` + ``readline`` + ``json.loads``.
+        A rebuild still runs on the first chained read, and whenever
+        ``note_tab_id`` falls back to invalidating instead of updating one entry
+        in place (no tab_id, an already-stale index, or a tab_id whose first
+        file this save just created), so the memo pays for itself on those.
+        Before that in-place update landed, ``append`` invalidated the index
+        unconditionally and one sent message re-read every session file on the
+        event loop.
+
+        TWO guards, because neither is sufficient alone. A write THROUGH this
+        class from THIS instance restores the pre-write mtime (see
+        :func:`_restore_mtime`, which exists so housekeeping does not reorder
+        ``list_sessions``), so the stamp cannot see it — ``_invalidate_cache``
+        pops the memo instead, on the line after the restore. Anything that
+        never reaches that pop is the stamp's job: a write AROUND the class, and
+        a write through ANOTHER instance of this class, whose pop lands on its
+        own memo and leaves ours untouched. That last case is why the stamp
+        carries ``st_mtime_ns`` and ``st_ino`` and not just ``(mtime, size)`` —
+        an equal-length ``tab_id`` rewrite preserves both mtime and size. Either
+        guard alone would keep serving a stale tab_id and silently drop that
+        session from its chain — the same vanished-history failure the removed
+        ``[]`` sentinel used to cause.
         """
         index: dict[str, list[str]] = {}
-        for path in sorted(self._dir.glob("dashboard_chat-*.jsonl")):
+        for path in sorted(self._dir.glob(_TAB_ID_INDEX_GLOB)):
+            # Both derivations come from main's shared helpers rather than being
+            # respelled here: ``key`` feeds the memo AND the index append below,
+            # and ``note_tab_id`` looks entries up through the same helper, so a
+            # second copy would drift and its lookup would silently miss an
+            # entry that is really present.
+            key = _index_key_for_stem(path.stem)
             try:
-                with path.open(encoding="utf-8") as f:
-                    first_line = f.readline()
-                m = json.loads(first_line)
-                tid = m.get("tab_id")
-                if tid:
-                    index.setdefault(tid, []).append(path.stem.replace("_", ":", 1))
-            except Exception:
+                st = path.stat()
+            except OSError:
                 continue
+            # Three terms, all off the one stat above, because the pop below
+            # only ever reaches the memo of the instance that did the writing:
+            # another instance's write restores the mtime AND leaves the size
+            # identical (a tab_id is fixed-length), so mtime+size alone serve a
+            # stale id. mtime_ns rather than mtime because _restore_mtime puts
+            # the time back through a float, which cannot carry ns; st_ino moves
+            # too, since a metadata rewrite is atomic_write (temp + os.replace),
+            # and it holds even if _restore_mtime later becomes ns-exact.
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+            cached = self._tab_id_by_key.get(key)
+            if cached is not None and cached[0] == stamp:
+                tid = cached[1]
+            else:
+                # Sample the generation BEFORE the read: if a writer pops this key
+                # while we are reading, the value we got is already stale and must
+                # not be memoized. stamp is also the pre-read one, so a write that
+                # lands mid-read leaves a value that fails the guard next time.
+                generation = self._tab_id_generation
+                # We are on the MISS path, so this file changed since we
+                # memoized it -- or we never memoized it at all. _meta_cache is
+                # keyed on float mtime ALONE, which is strictly weaker than our
+                # stamp: a rewrite that restores the mtime and keeps the size
+                # compares EQUAL there and hands back the pre-write line, so
+                # widening the stamp alone would still serve a stale tab_id from
+                # this second layer. Pop UNCONDITIONALLY, because the cold-memo
+                # case is the dangerous one: get_metadata and the consolidation
+                # counters warm _meta_cache without ever touching this memo, and
+                # a stale line served there gets memoized below under the NEW,
+                # correct-looking stamp -- after which the warm path never
+                # re-reads it and the session stays off its chain for good.
+                # Costs one reread for a file warm here but cold in the memo; the
+                # warm path (stamp hit) returns above, so the win is unaffected.
+                self._meta_cache.pop(key, None)
+                try:
+                    meta, readable = self._read_metadata_status(key)
+                except Exception:
+                    continue
+                # _read_metadata_status, NOT _read_metadata: the latter drops the
+                # readability flag, so a transient failure (an AV scanner holding
+                # a freshly appended file, where stat succeeds but open does not)
+                # arrives as {} and would be memoized below as a definitive "no
+                # tab_id" against an unchanged stamp -- dropping the session from
+                # its chain until its next write. Retry on the next rebuild.
+                if not readable:
+                    continue
+                raw = meta.get("tab_id")
+                # "" memoizes "no tab_id at this stamp". Without it a session
+                # lacking one is re-read every rebuild and re-enters _meta_cache,
+                # evicting what other code paths in this process warmed (it is
+                # per-instance, not process-shared). A non-str tab_id reaches
+                # here only from corrupt metadata (and unhashable would abort the
+                # rebuild), so it folds into the same sentinel.
+                tid = raw if isinstance(raw, str) else ""
+                if self._tab_id_generation == generation:
+                    self._tab_id_by_key[key] = (stamp, tid)
+            if not tid:
+                continue
+            index.setdefault(tid, []).append(key)
         self._tab_id_index = index
 
     def invalidate_tab_id_cache(self) -> None:
@@ -3616,6 +4313,59 @@ class ConversationLog:
         """
         with self._lock:
             self._tab_id_index = None
+
+    def note_tab_id(self, key: str, tab_id: str | None) -> None:
+        """Register *key* under *tab_id* in place, keeping the chain index warm.
+
+        A content-only save never changes the tab_id -> keys mapping, so the
+        blanket :meth:`invalidate_tab_id_cache` the slot-save path used to call
+        threw the whole index away, and the next chained read then re-globbed
+        the session directory and re-opened every ``dashboard_chat-*.jsonl`` in
+        it to rebuild a mapping that had not changed. Updating the single
+        affected entry keeps that rescan off the read path.
+
+        A key whose transcript the rebuild never scans returns immediately
+        without invalidating -- see :func:`can_hold_tab_id_index_entry`. Such a
+        save cannot change the mapping at all, so invalidating on one would
+        throw the warm index away for nothing, and a channel-keyed session
+        flushes often enough that it would restore the very per-save rescan
+        this method exists to remove.
+
+        Three further cases deliberately fall back to the slow-but-correct path
+        instead of appending:
+
+        * no *tab_id* -- there is nothing to index against, so invalidate and
+          keep the previous unconditional behaviour for that case;
+        * a stale index (``None``) -- leave it stale, because the next chained
+          read rebuilds it authoritatively and a rebuild is what makes it
+          trustworthy;
+        * a *tab_id* carrying no keys -- this save may have just created that
+          tab_id's FIRST file, which a previously-built index predates.
+          Appending here would forge a one-key entry that reads as
+          authoritative and hides every sibling key. The test is ``not keys``
+          rather than ``keys is None`` so an empty-list value can never slip
+          through into that append.
+
+        Caller must not hold ``self._lock``; this takes it. The slot-save path
+        already calls ``invalidate_tab_id_cache`` (which takes the same lock)
+        from inside ``_locked(history_key)``, so this adds no new lock ordering.
+        """
+        if not can_hold_tab_id_index_entry(key):
+            return
+        if not tab_id:
+            self.invalidate_tab_id_cache()
+            return
+        with self._lock:
+            index = self._tab_id_index
+            if index is None:
+                return
+            keys = index.get(tab_id)
+            if not keys:
+                self.invalidate_tab_id_cache()
+                return
+            chained = _index_key_for_stem(transcript_stem(key))
+            if chained not in keys:
+                keys.append(chained)
 
     def delete_session(self, key: str) -> bool:
         """Delete a session file. Returns True if a file was removed.
@@ -4152,7 +4902,7 @@ class ConversationLog:
     _TAIL_MAX_GROWTHS = 6
 
     def _recent_via_tail(
-        self, key: str, max_messages: int, roles: set[str] | None
+        self, key: str, max_messages: int, roles: AbstractSet[str] | None
     ) -> list[dict] | None:
         """Return the formatted recent window via a tail read, or None to defer.
 
@@ -4206,7 +4956,7 @@ class ConversationLog:
         return [dict(m) for m in formatted]
 
     @staticmethod
-    def _recent_cache_key(key: str, max_messages: int, roles: set[str] | None) -> str:
+    def _recent_cache_key(key: str, max_messages: int, roles: AbstractSet[str] | None) -> str:
         """Build a stable ``_recent_cache`` key from the recent() parameters.
 
         ``\\x00`` cannot appear in a session key, so it is an unambiguous field
@@ -4217,7 +4967,7 @@ class ConversationLog:
         return f"{key}\x00{max_messages}\x00{roles_part}"
 
     def _read_tail_messages(
-        self, path: Path, max_messages: int, roles: set[str] | None
+        self, path: Path, max_messages: int, roles: AbstractSet[str] | None
     ) -> list[dict]:
         """Read the last *max_messages* messages by seeking to the file tail.
 
@@ -4456,6 +5206,13 @@ class ConversationLog:
         for ident in idents:
             self._msg_cache.pop(ident, None)
             self._meta_cache.pop(ident, None)
+            # The tab_id memo's mtime guard cannot see a write that goes through
+            # this class, because those restore the pre-write mtime. This pop is
+            # what does -- under every spelling, for the same reason as the rest:
+            # the rebuild keys its memo off the sanitized filename stem, so a
+            # single-spelling pop would leave an alias-keyed memo serving a stale
+            # tab_id under the restored mtime.
+            self._tab_id_by_key.pop(ident, None)
             # The folded search blob is derived from the messages, so it goes
             # stale exactly when they do. Its own mtime guard is not enough
             # here: the housekeeping rewrites below restore the pre-write
@@ -4473,6 +5230,10 @@ class ConversationLog:
             # _restore_mtime, so the recent cache's mtime guard alone would let
             # a stale window survive a content change.
             self._recent_cache.pop_prefix(f"{ident}\x00")
+        # Sampled by the rebuild before it reads a file's metadata, so a store
+        # cannot land after the pops above and resurrect a stale id. Bumped once
+        # per invalidation: it is a single counter, not per-identity.
+        self._tab_id_generation += 1
 
     #: Bytes read from the end of a session file for the last-message preview.
     #: One tail block comfortably covers several trailing JSONL lines without
@@ -4724,7 +5485,7 @@ class ConversationLog:
                     continue
                 try:
                     normalized = json.dumps(json.loads(ln), sort_keys=True)
-                except (json.JSONDecodeError, ValueError):
+                except ValueError:
                     dropped.append(ln)  # corrupted line → archive it
                     continue
                 if normalized not in kept_serialized:
@@ -5648,7 +6409,24 @@ class HistoryConsolidator:
                             len(prefs),
                         )
                     elif prefs.strip() != current_prefs.strip():
-                        memory.write_preferences(prefs)
+                        # Offloaded like append_history above (blocking file
+                        # I/O on the event loop thread). expected_baseline is
+                        # the compare-and-swap guard: this whole-file result
+                        # was merged from current_prefs, read BEFORE the
+                        # minutes-long LLM call — if a dashboard Save landed
+                        # in that window, writing would silently revert it,
+                        # so the store skips the stale write instead.
+                        wrote = await run_in_embed_pool(
+                            lambda: memory.write_preferences(
+                                prefs, expected_baseline=current_prefs
+                            )
+                        )
+                        if not wrote:
+                            logger.info(
+                                "Consolidated preferences for %s discarded: file "
+                                "changed during consolidation",
+                                key,
+                            )
 
                 if projects := result.get("projects_update"):
                     if not _is_plausible_memory_file(projects, "# Active Projects"):
@@ -5659,7 +6437,17 @@ class HistoryConsolidator:
                             len(projects),
                         )
                     elif projects.strip() != current_projects.strip():
-                        memory.write_projects(projects)
+                        wrote = await run_in_embed_pool(
+                            lambda: memory.write_projects(
+                                projects, expected_baseline=current_projects
+                            )
+                        )
+                        if not wrote:
+                            logger.info(
+                                "Consolidated projects for %s discarded: file "
+                                "changed during consolidation",
+                                key,
+                            )
 
             # Lesson extraction: _save_lessons calls write_lesson which embeds
             # each rule (+ up to 5 lazy backfills) via blocking urllib to Ollama.
@@ -6088,34 +6876,24 @@ class HistoryConsolidator:
         if not self._sessions:
             return ""
         try:
-            client, _new, _resumed = await self._sessions.get_or_create(
-                BACKGROUND_KEY, agent="kirocrew-lite"
-            )
-            text = await stream_and_collect(
-                client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
-            )
+            async with background_turn(
+                self._sessions, task="skill_dedupe", agent="kirocrew-lite"
+            ) as client:
+                text = await stream_and_collect(
+                    client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+                )
             return text or ""
         except Exception:
             logger.debug("Skill dedupe judge failed", exc_info=True)
             return ""
-        finally:
-            # get_or_create ACQUIRES the per-session semaphore — the caller MUST
-            # release it (mirror _call_llm), else the shared _bg session is held
-            # forever and the next consolidation turn deadlocks waiting for it.
-            try:
-                self._sessions.release(BACKGROUND_KEY)
-                await self._sessions.recycle_background()
-            except Exception:
-                logger.debug("Skill dedupe judge session release failed", exc_info=True)
 
     async def _merge_skill_update(
         self, live_body: str, description: str, triggers: str, procedure_md: str
     ) -> "str | None":
         """Merge an existing live skill body with a new candidate into ONE
         updated markdown body — a single text turn on the shared background
-        session. Mirrors ``_dedupe_judge`` exactly (get_or_create / REJECT_ALL /
-        finally-release + recycle). Fail-open (returns ``None`` on any error) so
-        the caller can fall back to a plain replacement proposal."""
+        session. Mirrors ``_dedupe_judge`` exactly. Fail-open (returns ``None`` on
+        any error) so the caller can fall back to a plain replacement proposal."""
         if not self._sessions:
             return None
         prompt = (
@@ -6132,25 +6910,16 @@ class HistoryConsolidator:
             f"NEW requirement — procedure:\n{procedure_md}\n"
         )
         try:
-            client, _new, _resumed = await self._sessions.get_or_create(
-                BACKGROUND_KEY, agent="kirocrew-lite"
-            )
-            text = await stream_and_collect(
-                client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
-            )
+            async with background_turn(
+                self._sessions, task="skill_merge", agent="kirocrew-lite"
+            ) as client:
+                text = await stream_and_collect(
+                    client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+                )
             return text or None
         except Exception:
             logger.debug("Skill update merge failed", exc_info=True)
             return None
-        finally:
-            # get_or_create ACQUIRES the per-session semaphore — the caller MUST
-            # release it (mirror _dedupe_judge), else the shared _bg session is
-            # held forever and the next consolidation turn deadlocks.
-            try:
-                self._sessions.release(BACKGROUND_KEY)
-                await self._sessions.recycle_background()
-            except Exception:
-                logger.debug("Skill update merge session release failed", exc_info=True)
 
     def _stage_skill_update(
         self,
@@ -6623,18 +7392,18 @@ class HistoryConsolidator:
             logger.warning("LLM consolidation skipped — no session manager")
             raise _ConsolidationNotDispatched("no session manager")
 
-        session_key = BACKGROUND_KEY
-        # Timing instrumentation (_bg stall investigation): measure both the
-        # wait to acquire the shared `_bg` session (queue contention behind
-        # other `_bg` consumers like chat_nav link-preview) and the LLM turn
-        # itself. No behavior change. Logged at DEBUG: silent in normal
-        # operation, surfaced only when log_level is raised to investigate a
-        # consolidation stall.
+        # Timing instrumentation: measure both the wait to acquire the shared
+        # `_bg` session (queue contention behind other `_bg` consumers like
+        # chat_nav link-preview) and the LLM turn itself. Logged at DEBUG:
+        # silent in normal operation, surfaced only when log_level is raised
+        # to investigate a consolidation stall.
         t_start = _time.monotonic()
-        try:
+        async with contextlib.AsyncExitStack() as stack:
             try:
-                client, _is_new, _resumed = await self._sessions.get_or_create(
-                    session_key, agent="kirocrew-lite"
+                client = await stack.enter_async_context(
+                    background_turn(
+                        self._sessions, task="consolidation", agent="kirocrew-lite"
+                    )
                 )
             except Exception as exc:
                 logger.warning(
@@ -6656,7 +7425,10 @@ class HistoryConsolidator:
             # learn_add, spawn_run). REJECT_ALL keeps both providers tool-free.
             try:
                 result = await stream_and_collect_json(
-                    client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
+                    client,
+                    prompt,
+                    approval_policy=ToolApprovalPolicy.REJECT_ALL,
+                    model_fallback=True,
                 )
             except Exception:
                 logger.warning(
@@ -6674,6 +7446,8 @@ class HistoryConsolidator:
                 result is not None,
             )
             return result
-        finally:
-            self._sessions.release(session_key)
-            await self._sessions.recycle_background()
+        # Reached only if the exit stack suppresses an exception. The prompt was
+        # already sent by then, so the turn may have been billed: report it as a
+        # spent-but-unusable result rather than a non-dispatch, which would hand
+        # the caller a free retry it has not earned.
+        return None

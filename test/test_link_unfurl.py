@@ -160,6 +160,72 @@ def test_vet_rejects_multicast_despite_is_global(host: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "embedded", ["10.0.0.1", "127.0.0.1", "192.168.1.1", "169.254.169.254"]
+)
+def test_6to4_is_refused_by_unwrapping_not_by_cpythons_table(
+    embedded: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 6to4 address is judged by the IPv4 address it carries, on every 3.x.
+
+    ``2002::/16`` entered CPython's IPv6 private table only with gh-113171
+    (3.10.14, 3.11.9, 3.12.4). On an older patch release of a version this project
+    supports, ``2002:0a00:0001::1`` reports ``is_global`` and every category flag
+    clean, while the packet is routed to ``10.0.0.1``.
+
+    The table-driven pin above lists ``2002::/16``, but on a fixed interpreter it
+    passes through ``is_private`` alone and so cannot detect a missing unwrap. This
+    drops that entry for the test's duration to reproduce the older behavior: what
+    is asserted is that the refusal comes from unwrapping the embedded address, not
+    from the interpreter agreeing with us.
+    """
+    v4 = ipaddress.ip_address(embedded)
+    sixtofour = ipaddress.ip_address(f"2002:{int(v4) >> 16:04x}:{int(v4) & 0xFFFF:04x}::1")
+    assert sixtofour.sixtofour == v4
+
+    without_6to4 = tuple(
+        net
+        for net in ipaddress._IPv6Constants._private_networks
+        if str(net) != "2002::/16"
+    )
+    monkeypatch.setattr(
+        ipaddress._IPv6Constants, "_private_networks", without_6to4, raising=True
+    )
+    # The premise: with that entry gone the interpreter now calls it public, so a
+    # check that consulted only the flags would let it through.
+    assert ipaddress.ip_address(str(sixtofour)).is_global
+
+    with pytest.raises(lu.UnfurlRejected) as exc:
+        lu.vet_unfurl_url(f"https://[{sixtofour}]/x")
+    assert exc.value.code == "blocked_url"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://\ud800.example/",
+        "https://ex\udcffample.test/",
+        "https://\udfff/",
+    ],
+)
+def test_a_host_the_resolver_cannot_encode_is_refused_not_raised(url: str) -> None:
+    """A lone surrogate in the host is a refusal, not an uncaught ``UnicodeError``.
+
+    ``getaddrinfo`` raises ``UnicodeError`` for these — a ``ValueError``, not an
+    ``OSError`` — so the fail-closed catch around the resolver missed it and the
+    exception escaped the vet. It reaches here intact because a JSON string can
+    carry an unpaired surrogate, so this is an ordinary bad input rather than a
+    contrived one: `link_meta` takes the URL from a request body, and the meetings
+    calendar takes it from a config value.
+
+    Refused rather than merely "not crashing": a host whose addresses were never
+    checked cannot be declared safe to connect to.
+    """
+    with pytest.raises(lu.UnfurlRejected) as exc:
+        lu.vet_unfurl_url(url)
+    assert exc.value.code in {"blocked_url", "invalid_url"}
+
+
+@pytest.mark.parametrize(
     "prefix",
     [
         # IPv4 special-purpose (RFC 6890 + the ones CPython classifies unevenly)
@@ -1214,20 +1280,21 @@ def test_fat_head_with_a_decoy_marker_is_a_502(monkeypatch, shape: str) -> None:
     assert (status, body) == (502, {"code": "fetch_failed"})
 
 
-#: Truncated pages that DO carry their metadata before the cut. Each names the
-#: shape that could be mis-rejected by a stricter guard.
+#: Truncated pages that DO carry their metadata before the cut, as
+#: ``(head_prefix, filler_byte, expected_title)``. Each names the shape that
+#: could be mis-rejected by a stricter guard. Only the prefix is held here: the
+#: filler past the cap is appended in the test body, because a payload built at
+#: module scope is allocated during collection and then held for the whole
+#: session by every xdist worker, including those that never run this file.
 _TRUNCATED_BUT_TITLED = {
     # `<body/>` as the sole head terminator — a byte pattern keyed on `<body[\s>]`
     # misses the self-closing form and would reject this.
-    "self_closing_body": (
-        b"<html><head><title>Ok</title><body/>" + b"A" * (lu.MAX_BODY_BYTES + 4096),
-        "Ok",
-    ),
+    "self_closing_body": (b"<html><head><title>Ok</title><body/>", b"A", "Ok"),
     # No `<title>` at all, but an `og:title` — `extract_meta` prefers og, so the
     # preview is complete and the cut is harmless.
     "og_title_only": (
-        b'<html><head><meta property="og:title" content="Via OG"><style>'
-        + b"z" * (lu.MAX_BODY_BYTES + 4096),
+        b'<html><head><meta property="og:title" content="Via OG"><style>',
+        b"z",
         "Via OG",
     ),
 }
@@ -1237,7 +1304,8 @@ _TRUNCATED_BUT_TITLED = {
 def test_truncated_page_keeps_its_preview_when_the_title_arrived(
     monkeypatch, shape: str
 ) -> None:
-    page, expected = _TRUNCATED_BUT_TITLED[shape]
+    prefix, filler, expected = _TRUNCATED_BUT_TITLED[shape]
+    page = prefix + filler * (lu.MAX_BODY_BYTES + 4096)
     _install(
         monkeypatch,
         {

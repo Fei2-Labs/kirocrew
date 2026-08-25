@@ -175,4 +175,24 @@ describe('create-button caret menu', () => {
     await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalled())
     expect(mocks.createChatSlot.mock.calls.some(c => c.includes('orchestrator'))).toBe(true)
   })
+
+  it('tags Crew Mode experimental where the mode is chosen, and only there', async () => {
+    // Crew Mode dispatches every message to a sub-session and relays a summary
+    // rather than the reply, so it does not yet read like a conversation. Until
+    // that is fixed the mode has to announce itself, and the only moment that
+    // helps is BEFORE the click — a warning on the resulting session's badge is
+    // read once the session already exists.
+    renderSidebar()
+    openCreateMenu()
+    const crewItem = (await screen.findByText('New Crew Mode chat')).closest('[role="menuitem"]')
+    expect(crewItem).not.toBeNull()
+    // Scoped to the crew item, not the menu: asserting the word merely appears
+    // somewhere would still pass if the tag drifted onto a sibling entry.
+    const tag = crewItem?.querySelector('[data-testid="crew-experimental-tag"]')
+    expect(tag?.textContent).toBe('Experimental')
+    // The neighbouring mode is NOT experimental; a tag that leaks onto it turns
+    // a targeted caution into noise on a shipped feature.
+    const autopilotItem = screen.getByText('New autopilot chat').closest('[role="menuitem"]')
+    expect(autopilotItem?.querySelector('[data-testid="crew-experimental-tag"]')).toBeNull()
+  })
 })

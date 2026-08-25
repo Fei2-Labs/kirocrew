@@ -16,7 +16,6 @@ Permission flow:
 from __future__ import annotations
 
 import asyncio
-import difflib
 import functools
 import glob
 import json
@@ -34,11 +33,13 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Sequence, TypeVar
 
-from kiro_crew import model_registry, platform_compat
+from kiro_crew import agent_scratch, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
     _kiro_mcp_server_name,
     _kiro_tool_name,
+    derive_edit_diff,
     extract_tool_purpose,
+    make_unified_diff,
     parse_session_modes,
     parse_usage_update,
 )
@@ -53,6 +54,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_COPILOT,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_BYOK,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
@@ -71,6 +73,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
+    JSONRPC_METHOD_NOT_FOUND,
     KNOWN_SESSION_UPDATES,
     METHOD_AGENT_SWITCHED,
     METHOD_CANCEL,
@@ -130,7 +133,7 @@ from kiro_crew.sandbox import (
     apply_windows_resource_ceiling,
     cgroup_scope_argv,
     create_subprocess_limited,
-    scrub_agent_denied_env,
+    scrub_agent_subprocess_env,
     wrap_argv,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -613,7 +616,9 @@ def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
             return
 
 
-def _resolve_spawn_env(env: dict[str, str], *, kiro_api_key: bool = False) -> dict[str, str]:
+def _resolve_spawn_env(
+    env: dict[str, str], *, kiro_api_key: bool = False, byok: bool = False
+) -> dict[str, str]:
     """Repair stale credential pointers in *env* before an agent spawn.
 
     Bundles :func:`_resolve_ssh_auth_sock` (glob + stat over ``/tmp``) and
@@ -633,6 +638,13 @@ def _resolve_spawn_env(env: dict[str, str], *, kiro_api_key: bool = False) -> di
     deliberately exempts it, so an inherited copy would otherwise ride into a
     foreign agent process. The file read is IO, which is why both branches
     ride this same off-loop hop.
+
+    With ``byok=True`` (a backend in :data:`ACP_BACKENDS_BYOK`, e.g. GitHub
+    Copilot CLI), the operator's own provider keys are read from the owner-only
+    BYOK store (:mod:`kiro_crew.acp.byok`) and injected into *env* so the child
+    authenticates with them — the store value wins over any inherited variable.
+    Another file read, folded into this same hop. Never combined with
+    ``kiro_api_key=True``: kiro-cli is not a BYOK backend.
     """
     _resolve_ssh_auth_sock(env)
     resolve_krb5_ccname(env)
@@ -644,6 +656,10 @@ def _resolve_spawn_env(env: dict[str, str], *, kiro_api_key: bool = False) -> di
         inject_kiro_cli_api_key(env)
     else:
         strip_kiro_cli_api_key(env)
+    if byok:
+        from kiro_crew.acp.byok import inject_byok_env
+
+        inject_byok_env(env)
     return env
 
 
@@ -765,6 +781,55 @@ def _is_tool_interrupted_marker(chunk: str) -> bool:
     return chunk.strip() == _TOOL_INTERRUPTED_MARKER
 
 
+def format_command_result(result: dict) -> str:
+    """Extract displayable text from a commands/execute response.
+
+    Module-level (not a method) because both native slash-command paths need
+    it: AcpClient.stream_command (direct-spawn sessions) and
+    AcpSessionHandle.stream_command (shared-runtime sessions).
+
+    The output is two-pass redacted (URLs + credentials) HERE, in the shared
+    helper, so every present and future caller inherits the security control
+    (command output is backend-echoed text that reaches the dashboard) instead
+    of each call site re-discovering it. Call-site re-redaction stays
+    harmless — both passes are idempotent.
+    """
+    data = result.get("data")
+    message = result.get("message", "")
+    text = ""
+    # Structured data — format as readable JSON block
+    if isinstance(data, dict) and data:
+        # Filter out agent/model metadata (handled separately)
+        display = {k: v for k, v in data.items() if k not in ("agent", "model")}
+        if display:
+            block = json.dumps(display, indent=2)
+            text = (
+                f"{message}\n```json\n{block}\n```"
+                if message
+                else f"```json\n{block}\n```"
+            )
+    if not text:
+        text = message or ""
+    if text:
+        text, _ = redact_exfiltration_urls(text)
+        text, _ = redact_credentials(text)
+    return text
+
+
+def parse_slash_command(command: str) -> tuple[str, dict]:
+    """Parse ``/foo bar baz`` into TuiCommand ``(name, args)``.
+
+    Shared by AcpClient.stream_command and AcpSessionHandle.stream_command —
+    both send the OBJECT form (``{command, args}``) because kiro-cli 2.14.0
+    returns no response on the string form of ``_kiro.dev/commands/execute``.
+    """
+    parts = command.strip().split(None, 1)
+    name = parts[0].lstrip("/") if parts else command.lstrip("/")
+    value = parts[1] if len(parts) > 1 else None
+    args: dict = {"value": value} if value else {}
+    return name, args
+
+
 # Timeouts for session initialization steps
 _INIT_TIMEOUT = 240.0  # 4 min — MCP servers can be slow to initialize
 # set_mode/set_model: fire-and-forget.  kiro-cli accepts these commands
@@ -883,11 +948,6 @@ _WAIT_RESPONSE_MAX_TIMEOUT = 600.0  # 10 min absolute ceiling
 # and must never gate tool dispatch, so a wedged SEL backend is abandoned (the
 # worker thread may leak, which is survivable) after this timeout.
 _SEL_AUDIT_TIMEOUT_SECONDS = 5.0
-# JSON-RPC 2.0 reserved error code for an unrecognized method — used to answer
-# unknown server→client requests so the agent fails fast instead of hanging.
-_JSONRPC_METHOD_NOT_FOUND = -32601
-
-
 # Legacy kiro permission options omit the spec-mandated `kind` field. Only
 # synthesize a kind for these well-known literals — unknown ids stay empty
 # so we don't fabricate intent the agent didn't express.
@@ -2000,12 +2060,14 @@ def _kill_escaped_children(child_pids: dict[int, int | None] | dict[int, ChildRe
             pass
 
 
-def _make_unified_diff(old: str, new: str, path: str, max_len: int = 6000) -> str:
-    """Generate a unified diff string from old/new text, handling empty inputs."""
-    old_lines = (old if old.endswith("\n") else old + "\n").splitlines(keepends=True) if old else []
-    new_lines = (new if new.endswith("\n") else new + "\n").splitlines(keepends=True) if new else []
-    udiff = difflib.unified_diff(old_lines, new_lines, fromfile=path, tofile=path, n=3)
-    return "".join(udiff).rstrip()[:max_len]
+def _make_unified_diff(old: str, new: str, path: str, max_len: int = 65536) -> str:
+    """Generate a unified diff string from old/new text, handling empty inputs.
+
+    Thin delegate to :func:`kiro_crew.acp._dispatch.make_unified_diff`, kept as
+    a module-level name for this file's call sites and tests; the truncation
+    semantics (line-boundary cut + ``DIFF_TRUNCATION_MARK``) live in one place.
+    """
+    return make_unified_diff(old, new, path, max_len=max_len)
 
 
 def _select_tool_title(
@@ -2769,9 +2831,9 @@ class AcpClient:
         # foreign MCP subprocesses (which bundle their own interpreter + deps).
         # is_kiro_cli is membership in ACP_BACKENDS_INTERNAL_SANDBOX
         # (harness-parity H7), not "not claude": the flag makes wrap_argv SKIP
-        # Crew's seatbelt on macOS in favour of the harness's own internal
-        # sandbox, so a harness without one must never be granted it by the
-        # absence of another harness.
+        # Crew's seatbelt on macOS and grants Windows's Kiro-only delegation in
+        # favour of the harness's own internal sandbox, so a harness without one
+        # must never be granted it by the absence of another harness.
         argv, self._sandbox_cleanup = wrap_argv(
             argv,
             mode=self._sandbox_mode,
@@ -2793,14 +2855,6 @@ class AcpClient:
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
-        # Parent-level scrub of gateway-owned channel credentials. The default
-        # auto/standard sandbox launcher strips _AGENT_DENIED_ENV_KEYS only for
-        # cc/strict, and this path copies a raw os.environ + wrap_argv (not
-        # sandboxed_spawn_argv), so without this the Slack/WeCom/Telegram tokens
-        # seeded into os.environ by load_credentials() would be inherited by the
-        # agent subprocess on the default tier. Leaves the AWS/SSH env the
-        # standard sandbox intentionally exposes untouched.
-        env = scrub_agent_denied_env(env)
         env["PATH"] = augmented_path(env.get("PATH", ""))
         if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"):
             # Dormant seam (see _spawn docstring): the adapter's SDK needs a
@@ -2839,12 +2893,37 @@ class AcpClient:
         # ONE thread hop. Guarded: the sandbox temp file is live, so a
         # cancellation here must not orphan it.
         env = await self._to_thread_guarding_sandbox(
-            functools.partial(_resolve_spawn_env, kiro_api_key=self._is_kiro), env
+            functools.partial(
+                _resolve_spawn_env,
+                kiro_api_key=self._is_kiro,
+                byok=self.backend in ACP_BACKENDS_BYOK,
+            ),
+            env,
         )
+        # Match the OS launchers' sensitive + Python env scrub in the parent.
+        # Windows Kiro delegation has no POSIX `env -u` wrapper, so this is the
+        # enforcement point there. Keep it after _resolve_spawn_env so SSH repair
+        # cannot reintroduce a denied pointer; KIRO_API_KEY remains available only
+        # to the positively identified Kiro backend.
+        env = scrub_agent_subprocess_env(env)
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
         env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
+        # Per-process scratch containment (#5063) -- see acp/runtime.py's
+        # twin block. Allocated off-loop, fail-open; owner recorded after
+        # spawn; reclamation is liveness-keyed, never age-keyed.
+        self._scratch_dir = None
+        try:
+            self._scratch_dir = await asyncio.to_thread(
+                agent_scratch.allocate_scratch, self._session_key or "session"
+            )
+            env.update(agent_scratch.scratch_env(self._scratch_dir))
+        except OSError:
+            logger.warning(
+                "agent-scratch: could not allocate; spawning with inherited temp",
+                exc_info=True,
+            )
         # Memory-aware cap for pytest-xdist's ``-n auto``: xdist sizes auto to
         # the CPU count, ignoring memory, so a full-suite run in an agent turn
         # can spawn cpu_count workers x ~1 GB each and exhaust the host. xdist
@@ -2906,6 +2985,13 @@ class AcpClient:
         self._start_time = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), _get_start_time, self._pid
         )
+        if self._scratch_dir is not None:
+            # Liveness anchor for the scratch sweeps -- see acp/runtime.py's
+            # twin block. Off-loop, fail-open.
+            await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(),
+                functools.partial(agent_scratch.record_owner, self._scratch_dir, self._pid),
+            )
         logger.info("Spawned %s (PID %d)", _spawn_label, self._pid)
         # Track root PID and do an early descendant scan.  kiro-cli forks
         # child processes quickly after launch.  Recording them here means
@@ -3545,8 +3631,28 @@ class AcpClient:
 
     async def shutdown(self) -> None:
         """Gracefully stop the ACP process."""
-        await self._kill_process(force=True)
-        self._reset_state()  # untracks all PIDs (root + children)
+        # `_reset_state` in a `finally`, because `_kill_process` can leave
+        # through several doors: it awaits four `run_in_executor` calls (child
+        # scan, record capture, escaped-child sweep) that are not individually
+        # guarded, `subprocess_executor()` refuses new work once the loop is
+        # tearing down, and `asyncio.CancelledError` is a `BaseException` --
+        # shutdown being exactly when cancellation arrives.
+        #
+        # Nothing retries. Every caller treats this as terminal and drops the
+        # client immediately afterwards (`AcpWorker` and `_shutdown_quietly`
+        # both `except Exception: log` and then set their reference to None), so
+        # a skipped reset is permanent: the pipes stay open, the sandbox temp
+        # files stay on disk, and for the claude backend
+        # `.claude/settings.local.json` -- written to hold `bypassPermissions`
+        # for the session -- survives the process it belonged to.
+        #
+        # Running it after a failed kill is safe by construction: `_reset_state`
+        # untracks only PIDs it confirms dead and deliberately RETAINS tracking
+        # for survivors so the orphan sweep still reaps them.
+        try:
+            await self._kill_process(force=True)
+        finally:
+            self._reset_state()  # untracks all PIDs (root + children)
 
     # ── JSON-RPC Transport ──
 
@@ -4301,7 +4407,7 @@ class AcpClient:
                 if extract_agent_from_result and isinstance(result, dict):
                     # commands/execute returns output in result fields,
                     # not via session/update chunks — yield as text.
-                    text = self._format_command_result(result)
+                    text = format_command_result(result)
                     if text:
                         yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=text)
                     if not saw_agent_switch:
@@ -4436,6 +4542,9 @@ class AcpClient:
                     len(_subs) if isinstance(_subs, list) else "n/a",
                 )
                 if isinstance(_subs, list):
+                    # No runtime_global marking here: AcpClient owns a dedicated
+                    # process with a single session, so an ownerless frame from
+                    # it is this session's own roster, never a co-tenant's.
                     yield AcpEvent(kind=EVENT_SUBAGENT_LIST, subagents=_subs)
             elif action == "subagent_activity":
                 # _kiro.dev/session/update: a sub-agent session's own update,
@@ -4662,7 +4771,7 @@ class AcpClient:
         self._cancelled = False
         await self.ensure_ready()
 
-        cmd_name, cmd_args = self._parse_slash_command(command)
+        cmd_name, cmd_args = parse_slash_command(command)
         req_id = await self._send_request(
             METHOD_COMMANDS_EXECUTE,
             {
@@ -4672,34 +4781,6 @@ class AcpClient:
         )
         async for event in self._dispatch_events(req_id, timeout, extract_agent_from_result=True):
             yield event
-
-    @staticmethod
-    def _format_command_result(result: dict) -> str:
-        """Extract displayable text from a commands/execute response."""
-        import json as _json
-
-        data = result.get("data")
-        message = result.get("message", "")
-        # Structured data — format as readable JSON block
-        if isinstance(data, dict) and data:
-            # Filter out agent/model metadata (handled separately)
-            display = {k: v for k, v in data.items() if k not in ("agent", "model")}
-            if display:
-                return (
-                    f"{message}\n```json\n{_json.dumps(display, indent=2)}\n```"
-                    if message
-                    else f"```json\n{_json.dumps(display, indent=2)}\n```"
-                )
-        return message or ""
-
-    @staticmethod
-    def _parse_slash_command(command: str) -> tuple[str, dict]:
-        """Parse ``/foo bar baz`` into TuiCommand ``(name, args)``."""
-        parts = command.strip().split(None, 1)
-        name = parts[0].lstrip("/") if parts else command.lstrip("/")
-        value = parts[1] if len(parts) > 1 else None
-        args: dict = {"value": value} if value else {}
-        return name, args
 
     async def cancel_session(self, grace_secs: float = 0.0) -> None:
         """Cancel the current in-flight operation via ACP session/cancel.
@@ -4761,7 +4842,19 @@ class AcpClient:
         await self._send_request(
             "_session/steer", {"sessionId": self._session_id, "message": wrapped}
         )
+        # See AcpSessionHandle.steer for why the stamp is taken at the write.
+        self._last_steer_monotonic = time.monotonic()
         return True
+
+    # Monotonic stamp of the last steer handed to the backend, 0.0 when never
+    # steered. Mirrors AcpSessionHandle.last_steer_monotonic — the dashboard's
+    # keepalive route reads whichever of the two backs the live session.
+    _last_steer_monotonic: float = 0.0
+
+    @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the last steer written to the backend (0.0 if none)."""
+        return self._last_steer_monotonic
 
     @property
     def supports_steer(self) -> bool:
@@ -4896,7 +4989,7 @@ class AcpClient:
         if msg.id is None:
             return
         logger.warning("ACP: rejecting unknown server request: method=%s id=%s", msg.method, msg.id)
-        await self._send_error(msg.id, _JSONRPC_METHOD_NOT_FOUND, f"Method not found: {msg.method}")
+        await self._send_error(msg.id, JSONRPC_METHOD_NOT_FOUND, f"Method not found: {msg.method}")
 
     def _extract_text_chunk(self, msg: JsonRpcMessage) -> tuple[str | None, bool]:
         """Extract text from an agent_message_chunk or agent_thought_chunk update.
@@ -5276,19 +5369,16 @@ class AcpClient:
                             input_str = diff_str
                             found_diff = True
                         break
-            # Fallback for strReplace when no diff content block was found
-            if (
-                not found_diff
-                and isinstance(raw_input, dict)
-                and raw_input.get("command") == "strReplace"
+            # Fallback when no diff content block was found: derive from the
+            # edit args (strReplace pair, create/insert content). Gated on
+            # the EDIT kind — "content"-shaped args exist on non-edit tools.
+            if not found_diff and (
+                kind == "edit"
+                or (isinstance(raw_input, dict) and raw_input.get("command") == "strReplace")
             ):
-                old = raw_input.get("oldStr") or ""
-                new = raw_input.get("newStr") or ""
-                path = raw_input.get("path") or ""
-                if old or new:
-                    diff_str = _make_unified_diff(old, new, path)
-                    if diff_str:
-                        input_str = diff_str
+                diff_str = derive_edit_diff(raw_input)
+                if diff_str:
+                    input_str = diff_str
             # Redact sensitive content before caching/displaying
             if input_str:
                 input_str, _ = redact_exfiltration_urls(input_str)
@@ -5649,12 +5739,15 @@ class AcpClient:
         # Record optionIds the agent advertised so approve_tool / reject_tool
         # can echo the exact ids. We record when EITHER an allow option (for
         # approve) OR a reject option (for a clean reject) was advertised.
-        # claude-agent-acp advertises a {kind:"reject_once", optionId:"reject"}
-        # option whose selection yields behavior:"deny" — sending that is far
-        # better than a "cancelled" outcome, which the adapter turns into the
-        # cryptic "Tool use aborted". kiro-cli advertises no reject option, so
-        # reject_tool falls back to "cancelled" there (handled as a clean
-        # rejection by kiro).
+        # Both backends advertise a reject option — claude-agent-acp as
+        # {kind:"reject_once", optionId:"reject"}, kiro-cli as
+        # {kind:"reject_once", optionId:"reject_once"} — and sending it is far
+        # better than a "cancelled" outcome: kiro-cli resolves a clean reject to
+        # a FAILED tool call and lets the turn continue to a model-inference
+        # boundary, whereas "cancelled" ends the turn outright with
+        # stopReason:"refusal" (and the claude adapter turns it into the cryptic
+        # "Tool use aborted"). reject_tool falls back to "cancelled" only for a
+        # backend that advertised no reject option at all.
         any_allow = kind_to_id.get("allow_once") or kind_to_id.get("allow_always")
         any_reject = kind_to_id.get("reject_once") or kind_to_id.get("reject_always")
         if request_id != "" and (any_allow is not None or any_reject is not None):

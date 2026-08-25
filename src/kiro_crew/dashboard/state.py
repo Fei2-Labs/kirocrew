@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import fnmatch
+import hashlib
 import json
 import logging
 import math
@@ -31,10 +33,12 @@ from kiro_crew.constants import (
     SUBAGENT_COMPLETION_PREFIX,
 )
 from kiro_crew.dashboard.chat_compaction_notice import deliver_channel_compaction_notice
+from kiro_crew.dashboard.session_pulse_counter import increment_user_session_count_off_loop
 from kiro_crew.dashboard.side_state import SideState
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
     UNBIND_REASON_DASHBOARD_UNLINK,
@@ -81,6 +85,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: The single ceiling on live slots, owned by the module that owns the slot
+#: table (see :meth:`DashboardState.live_slot_count`). Every path that allocates
+#: a slot -- session create, chat fork, session import -- tests ``live_slot_count()``
+#: against this one number, so raising the ceiling is a single edit and no entry
+#: point can silently drift to a different limit.
+MAX_LIVE_SLOTS = 500
+
 #: Return type of a mutate_folders callback.
 _T = TypeVar("_T")
 
@@ -93,6 +104,9 @@ _CHANNEL_LABELS = {
     "webex": "Webex",
     "wecom": "WeCom",
     "weixin": "WeChat",
+    "imessage": "iMessage",
+    "whatsapp": "WhatsApp",
+    "feishu": "Feishu",
 }
 
 
@@ -156,6 +170,25 @@ NATIVE_SUBAGENT_DONE_RESULT_CAP = 8_000
 NATIVE_SUBAGENT_DONE_TRUNC_MARKER = "…(earlier output truncated)\n"
 NATIVE_SUBAGENT_TERMINAL_KEEP = 50
 NATIVE_SUBAGENT_TERMINAL_TTL_SECS = 3600.0
+
+# Cap on a slot's queued-completion delivery ledger (see
+# ``_ChatSlot.note_pending_subagent_delivery``). Well above any legitimate
+# in-flight set — the slot queue itself is capped at 50 rows — so it only ever
+# evicts entries left behind by rows that vanished from the queue without being
+# consumed, and eviction merely defers those agents' cleanup to the next start.
+_MAX_PENDING_SUBAGENT_DELIVERIES = 128
+
+
+def _delivery_key(content: str) -> str:
+    """Identity of a queued completion for delivery bookkeeping.
+
+    A digest of the announce rather than the text itself: a wave digest runs to
+    tens of kilobytes, and the ledger only needs to recognise the same announce
+    again after a pre-consumption failure re-queues it verbatim under a new
+    queue-entry id. Not a security boundary — nothing is authenticated by it.
+    """
+    return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:32]
+
 
 # Slot-list broadcast coalescing window. The sub-agent slots debouncer in
 # slack/gateway.py hardcodes the same value independently; the two are not shared.
@@ -563,6 +596,991 @@ def _is_help_probe(segment: str) -> bool:
     return True
 
 
+# ── Side effects reached through an allowlisted read-only verb ──
+#
+# The allowlist above names a verb and is matched as a prefix, so it vouches
+# for every flag, subcommand and operand that verb accepts. Some of those
+# write a file, change a ref or launch another program — and none of it goes
+# through a shell redirect, so `_UNSAFE_SHELL_RE` never sees it.
+#
+# The tables are keyed by verb because the same spelling is harmless
+# elsewhere: `ls -o` is a long listing format and `grep -o` prints only the
+# match, while `sort -o FILE` truncates and writes FILE.
+
+# Flags that make the program write a file named on its own command line.
+_WRITE_FLAGS: dict[str, tuple[str, ...]] = {
+    # `-T` does not name the output, it names a DIRECTORY sort writes its
+    # temporaries into — a write to a path the caller chose, one step removed,
+    # exactly like `tree -R` below. Reported by #5038.
+    "sort": ("-o", "--output", "-T", "--temporary-directory"),
+    # `-R` writes without being handed a filename: tree re-runs itself in every
+    # directory it descends into, adding `-o 00Tree.html` each time, so the file
+    # is named by tree rather than by the command line. Same outcome as `-o`, one
+    # step removed, which is why looking only for a filename-bearing flag missed
+    # it.
+    "tree": ("-o", "--output", "-R"),
+    "file": ("-C", "--compile"),
+    "uniq": ("-o",),
+    "git diff": ("--output",),
+    "git show": ("--output",),
+    "git log": ("--output",),
+    # A pager, and not on the prefix allowlist — but the PIPE-TARGET check runs
+    # this table too, and `cat f | less -O FILE` writes FILE from a segment whose
+    # leading verb is a read.
+    "less": ("-o", "-O", "--log-file", "--LOG-FILE"),
+}
+
+# Flags that hand control to a program the repository names, not the caller:
+# an external diff driver comes from the repo's config or .gitattributes.
+_EXEC_FLAGS: dict[str, tuple[str, ...]] = {
+    # `--textconv` is the same hand-off as `--ext-diff` through a different config
+    # key, and it was missing here while `git cat-file` below already listed it —
+    # the table gap, not the design, is what let `git diff --textconv` through.
+    #
+    # Scope, stated plainly: this stops the COMMAND LINE from selecting the
+    # program. It does not stop a textconv driver the user configured from being
+    # applied by default, because that name comes from git config, which is not
+    # part of a repository and is not something a checkout can add. Requiring
+    # `--no-textconv` would be the only way to cover that, and it would take plain
+    # `git diff` off the read-only path — the most common read there is.
+    "git diff": ("--ext-diff", "--textconv"),
+    "git show": ("--ext-diff", "--textconv"),
+    "git log": ("--ext-diff", "--textconv"),
+    # `--filters` runs the repository's clean/smudge filter — a command from
+    # `.gitattributes`, i.e. chosen by the checkout rather than by the caller.
+    # `--textconv` is the same hand-off through a different config key.
+    "git cat-file": ("--filters", "--textconv"),
+    # `sort` compresses its temporary files by running this program.
+    "sort": ("--compress-program",),
+    # A pager that runs a filter over its input, reachable as a pipe target.
+    # `-k` is the sharper one and it is INDIRECT: it loads a lesskey file, and a
+    # lesskey file can set environment variables — including `LESSOPEN`, which less
+    # treats as an input PREPROCESSOR and runs. So a checkout-supplied lesskey is
+    # arbitrary command execution, two steps removed from anything on the command
+    # line. Verified against `less --help` on less 608: `-k [file]` /
+    # `--lesskey-file=[file]`, plus `--lesskey-src` on newer builds.
+    #
+    # Case is load-bearing here, as it is for `file -C`: lowercase `-k` loads the
+    # keyfile, while uppercase `-K` is `--quit-on-intr` and an ordinary read.
+    "less": ("--filter", "-k", "--lesskey-file", "--lesskey-src"),
+}
+
+# `git branch` and `git tag` each carry a read mode and a write mode under one
+# subcommand, so the prefix match admits the destructive spellings. Some of
+# these also open `$EDITOR`, which runs a program of the environment's
+# choosing: `git branch --edit-description` always does, and `git tag <name>`
+# does whenever `tag.gpgSign` or `tag.forceSignAnnotated` is set.
+_GIT_REF_WRITE_FLAGS: dict[str, tuple[str, ...]] = {
+    "branch": (
+        "-d",
+        "-D",
+        "--delete",
+        "-m",
+        "-M",
+        "--move",
+        "-c",
+        "-C",
+        "--copy",
+        "-f",
+        "--force",
+        "-u",
+        "--set-upstream",
+        "--set-upstream-to",
+        "--unset-upstream",
+        "--edit-description",
+    ),
+    "tag": (
+        "-d",
+        "--delete",
+        "-a",
+        "--annotate",
+        "-s",
+        "--sign",
+        "-m",
+        "--message",
+        "-F",
+        "--file",
+        "-f",
+        "--force",
+        "--cleanup",
+        # `-u <keyid>` is `--local-user`: it makes the tag ANNOTATED and signed,
+        # so it creates a ref exactly as `-a` does. `-u` was in the `branch` list
+        # (set-upstream) and missing here, and the omission was reachable —
+        # `git tag -ulin@kiro.co release` created a signed tag.
+        "-u",
+        "--local-user",
+    ),
+}
+
+# Why a bare operand needs TWO tables rather than one.
+#
+# `git branch <name>` creates a ref, so a bare operand is the signal. Deciding
+# when an operand is NOT that name was collapsed into a single "this flag eats
+# the next token" set, and that conflated two different things git keeps apart:
+#
+#   * whether the flag CONSUMES the following word, which git's own option
+#     parser decides by whether the argument is required or optional. A required
+#     argument is taken from the next word; an OPTIONAL one must be attached with
+#     `=`, and a separate word is left as an operand. `--color` is optional, so
+#     `git branch --color newbranch` still creates `newbranch` — while the guard
+#     read `newbranch` as the colour and passed the segment.
+#   * whether the command is in LIST mode, where an operand is a pattern to match
+#     rather than a ref to create. `git branch --list newbranch` lists, it does
+#     not create, so treating that operand as a creation would be a false denial.
+#
+# Splitting them keeps both answers right: `--color` is in neither set, and
+# `--list` is in the list-mode set only.
+
+# Flags whose argument is REQUIRED, so git takes it from the following word.
+_GIT_REF_VALUE_FLAGS: frozenset[str] = frozenset(("--points-at", "--format", "--sort"))
+
+
+def _consumes_next_word(token: str) -> bool:
+    """Whether *token* is a required-argument flag that takes the FOLLOWING word.
+
+    Abbreviations count, because git's parser resolves them: `git branch --form`
+    reaches `--format` and eats the next word, so reading `--form` as an ordinary
+    option left `-l` in `git branch --form -l newbranch` looking like a list flag
+    and licensed the bare operand that created the branch.
+
+    This is the fourth site on this guard to need the abbreviation axis — after
+    `_matched_flag`, `_system_set_flag` and `_glob_reaches` — which is why it is a
+    named helper rather than a fourth inline prefix test.
+
+    An ATTACHED value (`--format=x`) takes nothing from the next word, so it is
+    not one of these. Over-matching an ambiguous abbreviation is safe: git rejects
+    it rather than running it.
+    """
+    if "=" in token or not token.startswith("--") or len(token) <= 2:
+        return False
+    return any(flag == token or flag.startswith(token) for flag in _GIT_REF_VALUE_FLAGS)
+
+
+# Flags that put `git branch` / `git tag` in list mode, where a bare operand is a
+# pattern. `--points-at` appears in both: it consumes its value AND selects.
+_GIT_REF_LIST_FLAGS: frozenset[str] = frozenset(
+    (
+        "-l",
+        "--list",
+        "--contains",
+        "--no-contains",
+        "--merged",
+        "--no-merged",
+        "--points-at",
+    )
+)
+
+
+def _glob_shifts_arguments(token: str) -> bool:
+    """Whether a glob in *token* can change how many arguments the program gets.
+
+    A separate question from `_glob_hides_word`, which asks what a pattern can
+    expand INTO. This one is about the COUNT, and it cuts both ways:
+
+    * several matches become several WORDS — with `in1` and `in2` present,
+      `uniq in*` runs `uniq in1 in2`, whose second operand is an OUTPUT file;
+    * no match under `nullglob` makes the word VANISH — `git branch --format
+      nomatch* --list newbranch` loses the format's value, so `--format` eats
+      `--list` instead and `newbranch` stops being a pattern.
+
+    Neither outcome needs the pattern to resemble anything this module decides on,
+    so it is only asked where the argument COUNT or POSITION carries the verdict:
+    a `uniq` operand, and a required git option's value. An operand whose meaning
+    does not depend on its position — `ls *.py`, `git branch --list 'feat/*'` —
+    is not affected, which is what keeps ordinary globbing on the read path.
+    """
+    return bool(_GLOB_META_RE.search(token) or _EXTGLOB_RE.search(token))
+
+
+# The SHORT list-mode flags, per subcommand, because they do not agree. `-l` is
+# a listing for both, but `git tag -n[<num>]` prints annotation lines — a listing
+# form `git branch` has no counterpart for, and reading it as anything else
+# denied a common inspection (`git tag -n 'v1.*'`) its auto-approval. Kept as
+# LETTERS, not flags, because they arrive bundled: `git tag -n2` and `git tag -ln`
+# both select, and only a per-letter test sees that. A letter here must never be
+# a write flag for the same subcommand — `-n` is not in `_GIT_REF_WRITE_FLAGS`
+# ("tag"), which is what makes reading it as a listing safe.
+_GIT_REF_LIST_SHORTS: dict[str, str] = {"branch": "l", "tag": "ln"}
+
+# Flags that CANCEL list mode, per subcommand. git's parse-options auto-generates
+# a `--no-<opt>` negation for a boolean, so `--list` has one and it undoes the
+# listing — `git branch --list --no-list newbranch` CREATES the branch. Verified
+# against git rather than inferred, which matters because the neighbouring
+# `--no-` spellings do NOT behave this way:
+#
+#     git branch --list --no-list nl1                -> branch nl1 CREATED
+#     git branch --list --no-lis nl2                 -> branch nl2 CREATED
+#     git branch -l --no-list nl3                    -> branch nl3 CREATED
+#     git branch --contains HEAD --no-contains nc1   -> no ref (git errors)
+#     git branch --merged --no-merged nm1            -> no ref (git errors)
+#     git tag -l --no-list t1                        -> no ref (unknown option)
+#
+# So `--no-contains` and `--no-merged` are real list FILTERS rather than
+# negations, and treating them as cancelling would deny two ordinary reads;
+# `git tag` has no `--no-list` at all. The table says only what was measured.
+_GIT_REF_LIST_CANCEL_FLAGS: dict[str, tuple[str, ...]] = {"branch": ("--no-list",)}
+
+
+def _cancels_list_mode(token: str, subcommand: str) -> bool:
+    """Whether *token* turns list mode off for *subcommand*.
+
+    Abbreviations count, as everywhere else on this guard: `--no-lis` reaches
+    `--no-list`. Cancelling can only move a bare operand from "pattern" to
+    "creates a ref", i.e. toward the prompt, so over-matching here is safe.
+    """
+    head = token.split("=", 1)[0]
+    if not head.startswith("--") or len(head) <= 2:
+        return False
+    cancels = _GIT_REF_LIST_CANCEL_FLAGS.get(subcommand, ())
+    return any(flag.startswith(head) for flag in cancels)
+
+
+# `git remote` subcommands that rewrite remote configuration. `set-url` is the
+# sharpest: it repoints the remote, so later fetches and pushes go elsewhere.
+_GIT_REMOTE_WRITE_SUBCOMMANDS: frozenset[str] = frozenset(
+    ("add", "remove", "rm", "rename", "set-url", "set-head", "set-branches", "prune", "update")
+)
+
+# Allowlist entries that name a VERSION PROBE, matched as a prefix like every
+# other entry — so a trailing operand was vouched for too. That is not academic:
+# `javac` does not act on `-version` and exit, it prints the version and then
+# compiles whatever else it was handed, so
+#
+#     javac -version -processorpath evil.jar -processor Evil Payload.java
+#
+# auto-approved and ran an annotation processor — ordinary compiled Java on a
+# path the caller supplies, i.e. arbitrary code execution. Reported by #5038,
+# and the highest-severity shape in this family.
+#
+# All five probes are listed, not only `javac`. Whether an interpreter ignores a
+# trailing operand is a property of the installed release rather than of the
+# flag, and JDK single-file source mode (`java Foo.java`) already moved that
+# answer once. A version probe has no legitimate operand, so requiring the exact
+# spelling costs nothing and does not depend on being right about each tool.
+_EXACT_ONLY_BASH_PREFIXES: frozenset[str] = frozenset(
+    (
+        "python --version",
+        "python3 --version",
+        "node --version",
+        "java -version",
+        "javac -version",
+    )
+)
+
+# Flags that change SYSTEM state rather than writing a file: `hostname` renames
+# the host, `date` sets the clock. Both entries are on the read-only allowlist
+# for their bare listing form, and both carry a setter under the same verb.
+#
+# Kept out of `_WRITE_FLAGS` because they must NOT go through `_matched_flag`'s
+# short-option CLUSTER scan, and `date` is the worked example of why: `-s` sets
+# the clock, while `date -Iseconds` is an ordinary read whose attached VALUE
+# contains an `s`. A cluster scan reads that `s` as `-s` and denies the read.
+# `_system_set_flag` prefix-matches the token instead, which `-Iseconds` (a
+# token starting `-I`) cannot satisfy. Reported by #5038, whose comment names
+# the same trap.
+_SYSTEM_SET_FLAGS: dict[str, tuple[str, ...]] = {
+    # `-b`/`--boot` and `-F`/`--file` set the name with no operand at all.
+    # Case is load-bearing: `-F` sets from a file, `-f` prints the FQDN.
+    "hostname": ("-b", "--boot", "-F", "--file"),
+    "date": ("-s", "--set"),
+}
+
+# Verbs whose bare OPERAND changes system state, with no flag involved:
+# `hostname evil-host` renames the host and `date 08221200` sets the clock.
+# `date`'s one legitimate operand is a `+FORMAT` string, which is why the two
+# need different predicates rather than one shared "no operands" rule.
+#
+# The flags here take their value from the FOLLOWING word, so that word is not
+# an operand — without them `date -d yesterday` and `date -r FILE`, both reads,
+# would be denied.
+_SYSTEM_OPERAND_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "hostname": frozenset(),
+    "date": frozenset(("-d", "--date", "-r", "--reference", "-f", "--file")),
+}
+
+# The SHORT setters as LETTERS, and the letters that consume the rest of their
+# token, because a cluster has to be walked rather than prefix-tested. `-s` sets
+# the clock, and it can arrive anywhere in a cluster: GNU resolves
+# `date -us2026-08-23` to `-u` plus `-s 2026-08-23`, which a test anchored at the
+# token's first character never saw.
+#
+# The value-taking letters are what keeps the walk from reading a VALUE as a flag —
+# the `date -Iseconds` case: `I` takes an optional attached value, so the `s` in
+# `seconds` belongs to that value and the walk stops before it. This is the same
+# distinction, stated per letter, that the note above states per token.
+_SYSTEM_SHORT_SETTERS: dict[str, str] = {"hostname": "bF", "date": "s"}
+_SYSTEM_SHORT_VALUE_TAKING: dict[str, str] = {"hostname": "F", "date": "dfrsI"}
+
+
+def _system_set_flag(verb: str, args: list[str]) -> str:
+    """Return the setter flag *args* supplies for *verb*, or "".
+
+    Prefix-matches the token, so the attached spelling (`--set=…`, `-s2020`) is
+    caught while an unrelated flag whose attached value merely CONTAINS the
+    letter is not. See the note on `_SYSTEM_SET_FLAGS` for why the cluster scan
+    in :func:`_matched_flag` is the wrong tool here.
+
+    A long option is ALSO matched by any unambiguous abbreviation of it, because
+    GNU's own parser resolves one: `date --se=2026-08-23` reaches `--set` and the
+    clock moves, while a plain prefix test on the flag saw nothing. Avoiding the
+    cluster scan is what this function is for — abbreviation is a separate axis,
+    and `_matched_flag` already accepts it for every other table.
+
+    A SHORT setter is found by walking the cluster, because it can sit anywhere in
+    one: GNU resolves `date -us2026-08-23` to `-u` plus `-s 2026-08-23`. The walk
+    stops at the first letter that consumes the rest of the token, which is what
+    keeps `date -Iseconds` a read — the `s` there is part of `I`'s value, not a
+    flag. Avoiding `_matched_flag`'s *undifferentiated* cluster scan is still the
+    point; this one knows which letters take a value.
+    """
+    for tok in args:
+        head = tok.split("=", 1)[0]
+        if len(tok) > 1 and tok[0] == "-" and tok[1] != "-":
+            setters = _SYSTEM_SHORT_SETTERS.get(verb, "")
+            consumes = _SYSTEM_SHORT_VALUE_TAKING.get(verb, "")
+            for ch in tok[1:]:
+                if ch in setters:
+                    return "-" + ch
+                if ch in consumes:
+                    break
+        for flag in _SYSTEM_SET_FLAGS.get(verb, ()):
+            if len(flag) == 2 and flag[0] == "-" and flag[1] != "-":
+                # Short setters are handled by the cluster walk above; matching
+                # them again by prefix here would re-introduce the `-Iseconds`
+                # false positive this function exists to avoid.
+                continue
+            if tok.startswith(flag):
+                return flag
+            # `--` plus at least one character, and a prefix of this flag. Over-
+            # matching can only add a prompt: an abbreviation that is ambiguous
+            # against the tool's OTHER long options is rejected by the tool itself,
+            # so refusing it here costs a command that was never going to run.
+            if (
+                flag.startswith("--")
+                and head.startswith("--")
+                and len(head) > 2
+                and flag.startswith(head)
+            ):
+                return flag
+    return ""
+
+
+def _operands(args: list[str]) -> list[str]:
+    """Operand tokens in *args*, honouring the `--` terminator.
+
+    Before the terminator a leading-dash word is an option; after it EVERY word
+    is an operand however it is spelled. That second half is what
+    `uniq -- input -pwned` turned on: counting only the non-dash words saw one
+    operand and passed a segment that writes `-pwned`.
+    """
+    if "--" in args:
+        cut = args.index("--")
+        return [tok for tok in args[:cut] if not tok.startswith("-")] + args[cut + 1 :]
+    return [tok for tok in args if not tok.startswith("-")]
+
+
+#: Shell expansions whose RESULT is the argument, while ``shlex`` hands this
+#: module the unexpanded text. Every check here is keyed on the token, so where
+#: the two disagree the guard inspects one string and the program receives
+#: another:
+#:
+#:     git diff $'--output=/tmp/pwned'       shlex: `$--output=…`     bash: `--output=…`
+#:     git diff $"--output=/tmp/pwned"       shlex: `$--output=…`     bash: `--output=…`
+#:     git diff ${HOME:+--output=/tmp/pwned} shlex: literal           bash: `--output=…`
+#:     git remote se${x}t-url …              shlex: `se${x}t-url`     bash: `set-url`
+#:     git diff --{out,out}put=/tmp/pwned    shlex: `--{out,out}put=` bash: `--output=…`
+#:
+#: Matched as ONE class rather than one spelling at a time. Closing ``$'`` alone
+#: left ``$"`` (locale translation) and ``${…}`` (parameter expansion) open on the
+#: identical path, and the remaining forms are bounded only by bash's grammar.
+#: Un-expanding them here would mean reimplementing that grammar, so a segment
+#: carrying one is refused instead: a read-only command has no need of any of
+#: them, and a rejected segment falls through to the human approval prompt.
+#:
+#: Brace expansion belongs to the same class even though it carries no ``$``: it
+#: is performed FIRST, before any other expansion, and it can assemble a flag out
+#: of fragments that match nothing here. Only the forms bash actually expands are
+#: matched — a comma list or a ``..`` range — so a lone ``{`` (a JSON argument, a
+#: Go template) is left alone.
+#:
+#: ``$(…)`` and backticks are already refused upstream by ``_UNSAFE_SHELL_RE``;
+#: this covers what that pattern does not reach.
+#:
+#: Positional and special parameters (``$1``, ``$@``, ``$*``, ``$?``, ``$$``,
+#: ``$!``, ``$#``, ``$-``) belong to the same class and are matched by their own
+#: alternative. Their NAME is not an identifier, so the ``$[A-Za-z_]`` branch
+#: above never saw them, and in a `bash -c` string with no positional arguments
+#: ``$@`` and ``$*`` expand to NOTHING — which is what makes them the sharpest
+#: spelling here rather than a curiosity:
+#:
+#:     git remote $@set-url origin …   shlex: `$@set-url`      bash: `set-url`
+#:     git diff $1--output=/tmp/pwned  shlex: `$1--output=…`   bash: `--output=…`
+#:
+#: Matched on the raw segment, so a QUOTED occurrence is refused too even though
+#: bash would not expand it (``grep '*.{js,ts}' f``). That is the same trade the
+#: ``$`` forms already make, and it errs toward the prompt.
+#:
+#: Applied only to a GUARDED verb (see ``_side_effect_reason``). A verb this
+#: module has no table for cannot have a decision subverted by a hidden word,
+#: so ``cat $HOME/.bashrc`` and ``head -20 $LOG`` — the ordinary reads — stay on
+#: the auto-approve path.
+_SHELL_EXPANSION_RE = re.compile(
+    r"\$['\"{]"
+    r"|\$[A-Za-z_][A-Za-z0-9_]*"
+    r"|\$[0-9@*#?$!\-]"
+    r"|\{[^{}\s]*,[^{}\s]*\}"
+    r"|\{[^{}\s]*\.\.[^{}\s]*\}"
+)
+#: Pathname-expansion metacharacters. NOT part of the class above, because a glob
+#: is usually the argument itself in a read-only command (`ls *.py`) — it is
+#: refused only in the positions where the spelling is what gets classified. See
+#: the note in `_side_effect_reason`.
+#:
+#: A leading `~` is deliberately NOT here: tilde expansion yields a path starting
+#: with `/`, so it cannot synthesize a flag or a subcommand.
+_GLOB_META_RE = re.compile(r"[*?\[]")
+
+#: Bash EXTGLOB operators, which synthesize a token the same way an ordinary glob
+#: does — `git diff @(--output=pwned)` matches a file of that name and git writes
+#: it. Reported by #5038, which measured it.
+#:
+#: These get their own regex and their own verdict because `fnmatch` — the test
+#: that makes the plain-glob case precise — does not implement extglob: it reads
+#: `@(` as two literal characters, so `fnmatch("--output", "@(--output")` is False
+#: and the pattern that reaches the flag looks inert. Nothing can be proven about
+#: an extglob token here, so a guarded verb refuses it outright. That is the same
+#: trade the `$`-led forms make, and it costs nothing: unlike a plain glob, an
+#: extglob has no ordinary use in a read-only command.
+#:
+#: Extglob is off by default in a non-interactive `bash -c`, so reaching this needs
+#: `shopt -s extglob` (or a `BASHOPTS` carrying it) AND a matching file — narrower
+#: than the plain-glob case, closed here because it is the same cause.
+_EXTGLOB_RE = re.compile(r"[?*+@!]\(")
+
+#: Every word this module decides on: the flags of all four tables, the
+#: ``git remote`` write subcommands, and the option terminator. A glob is
+#: dangerous exactly when the filesystem can hand the program one of THESE in
+#: place of the pattern, so the test is ``fnmatch`` against this set rather than
+#: "the token contains a metacharacter" — which would have taken `ls *.py` and
+#: `git diff *.py` off the read-only path for no gain.
+_GLOB_SENSITIVE_WORDS: frozenset[str] = (
+    frozenset(
+        flag
+        for table in (_WRITE_FLAGS, _EXEC_FLAGS, _GIT_REF_WRITE_FLAGS)
+        for flags in table.values()
+        for flag in flags
+    )
+    | _GIT_REMOTE_WRITE_SUBCOMMANDS
+    # A glob that expands to `--` shifts every following word into operand
+    # position, which is how the terminator changes what the walk below decides.
+    | frozenset(("--",))
+)
+
+#: Verbs whose OWN tables carry a short flag, so a glob can expand into a bundled
+#: cluster for them (``?uo`` -> ``-uo``, which supplies ``-o``). A cluster is not
+#: a word in the set above, so it takes the extra test in `_glob_hides_word` —
+#: and only here, which is what keeps `git diff *.py` (long flags only) passing.
+#: Derived from the tables so the two cannot drift apart.
+_SHORT_FLAG_VERBS: frozenset[str] = frozenset(
+    key
+    for table in (_WRITE_FLAGS, _EXEC_FLAGS)
+    for key, flags in table.items()
+    if any(len(flag) == 2 and flag[0] == "-" for flag in flags)
+)
+
+
+def _glob_hides_word(token: str, has_short_flags: bool) -> bool:
+    """Whether *token*'s glob can expand into a word this module decides on.
+
+    Two shapes, because a pattern reaches a flag two different ways:
+
+    * it matches a decided word outright — ``s?t-url`` matches ``set-url``,
+      ``--outp?t`` matches ``--output``, ``?o`` matches ``-o``, and a bare ``*``
+      matches every one of them. ``fnmatchcase`` answers this exactly, so a
+      pattern that CANNOT reach one (``*.py``) is left alone;
+    * its metacharacter is the FIRST character, so the filesystem chooses the
+      leading character too and the expansion can be a short-option CLUSTER
+      (``?uo`` -> ``-uo``, which :func:`_matched_flag` reads as supplying ``-o``).
+      A cluster is not a word in the set above, so it needs its own test — but
+      only where the verb HAS a short flag to be bundled into, which keeps
+      ``git diff *.py`` (long flags only) passing.
+
+    An EXTGLOB token short-circuits to True: ``fnmatch`` cannot model extglob, so
+    neither shape below can rule on one. See `_EXTGLOB_RE`.
+    """
+    if _EXTGLOB_RE.search(token):
+        return True
+    if not _GLOB_META_RE.search(token):
+        return False
+    head = token.split("=", 1)[0]
+    # A token that already LOOKS like an option is refused on the metacharacter
+    # alone, without asking what it can match. `fnmatch` answers "can this reach a
+    # decided word", and a short-option CLUSTER is not one of those words, so
+    # `sort -u? victim` slipped: no candidate is three characters long, the
+    # metacharacter is not first so the cluster test below does not fire, and bash
+    # resolves `-u?` against a file named `-uo` — which `_matched_flag` would have
+    # rejected had it ever seen it. Nothing legitimate is lost, because the head is
+    # the flag NAME: a glob in a flag's VALUE is split off above, which is what
+    # keeps `git log --grep=[abc]` a read.
+    if token.startswith("-") and _GLOB_META_RE.search(head):
+        return True
+    # Every word this module decides on, PLUS every abbreviation of a long one,
+    # because `_matched_flag` resolves an abbreviation and so does the parser it
+    # guards. Testing only the full spellings left `git diff ??out=victim`
+    # auto-approved: `fnmatch("--output", "??out")` is False on the length alone,
+    # `git diff`'s table is long-only so the cluster arm below does not fire, and
+    # bash resolves `??out` against a file named `--out` that git then reads as
+    # `--output`. The full spelling `??output` was already refused, which is what
+    # made the gap look closed.
+    if any(_glob_reaches(head, word) for word in _GLOB_SENSITIVE_WORDS):
+        return True
+    return has_short_flags and _GLOB_META_RE.match(token) is not None
+
+
+def _glob_reaches(head: str, word: str) -> bool:
+    """Whether glob *head* can expand to *word* or to an abbreviation of it.
+
+    A long option is abbreviable to any unambiguous prefix, and an ambiguous one
+    is rejected by the tool rather than run — so every prefix of `--` plus one
+    character is tested, and over-matching can only add a prompt.
+
+    Compared CASE-INSENSITIVELY, because `nocaseglob` decouples the pattern's case
+    from the filename's: with it set, `git diff ??OUT=victim` expands to
+    `--out=victim` and git writes the file, while a case-sensitive test saw a
+    pattern matching nothing. Measured — `bash -O nocaseglob -c 'echo git diff
+    ??OUT=victim'` prints `git diff --out=victim`, and plain `bash -c` does not.
+
+    The case sensitivity this module DOES rely on is elsewhere and unaffected:
+    `_matched_flag` still distinguishes `file -C` (compiles a magic file) from
+    `file -c` (prints one), because that reads a literal token rather than asking
+    what a pattern could become.
+    """
+    folded = head.lower()
+    lowered = word.lower()
+    if fnmatch.fnmatchcase(lowered, folded):
+        return True
+    if not word.startswith("--") or len(word) <= 3:
+        return False
+    return any(fnmatch.fnmatchcase(lowered[:cut], folded) for cut in range(3, len(word)))
+
+
+def _matched_flag(tokens: list[str], flags: tuple[str, ...]) -> str:
+    """Return the first token in *tokens* that supplies one of *flags*.
+
+    Matches the flag on its own (``-o``), joined to its value (``--output=x``)
+    and bundled into a short-option cluster (``-uo`` supplies ``-o``), so the
+    check cannot be stepped around by respelling the same flag.
+    """
+    shorts = {f[1] for f in flags if len(f) == 2 and f[0] == "-"}
+    longs = [f for f in flags if f.startswith("--") and len(f) > 2]
+    for tok in tokens:
+        if tok in flags:
+            return tok
+        for flag in flags:
+            if tok.startswith(flag + "="):
+                return flag
+        # A GNU long option may be ABBREVIATED to any unambiguous prefix, so
+        # `--out=FILE` and `--outp=FILE` reach the same `--output` that exact
+        # matching missed. Accept any prefix of a known flag that is at least
+        # `--` plus one character: the parser this guards resolves it, so the
+        # guard has to as well. Over-matching here can only add a prompt.
+        head = tok.split("=", 1)[0]
+        if head.startswith("--") and len(head) > 2:
+            for flag in longs:
+                if flag.startswith(head):
+                    return flag
+        if shorts and len(tok) > 1 and tok[0] == "-" and tok[1] != "-":
+            for ch in tok[1:]:
+                if ch in shorts:
+                    return "-" + ch
+    return ""
+
+
+def _side_effect_reason(segment: str) -> str:
+    """Reason *segment* has a side effect, despite naming a read-only verb.
+
+    Returns "" when the segment is genuinely read-only. Called after the verb
+    has cleared the allowlist, because the allowlist only decides *which
+    program* runs — not what the rest of the command line asks it to do.
+    """
+    try:
+        # Discard-only redirects are scrubbed first, mirroring the unsafe-shell
+        # check upstream, because the exact-match rule below would otherwise read
+        # one as a trailing operand. `java -version 2>&1` is the canonical probe —
+        # java prints its version to stderr — so counting `2>&1` as an operand
+        # would deny the single most common read on this path.
+        tokens = shlex.split(_DEVNULL_REDIR_RE.sub(" ", segment))
+    except ValueError:
+        # Cannot recover argv, so cannot vouch for the operands.
+        return "quoting cannot be resolved"
+    if not tokens:
+        return ""
+    # A version probe acts on an operand, so its entry matches EXACTLY: the
+    # allowlist named `javac -version`, the prefix match vouched for everything
+    # after it, and javac compiled it. See `_EXACT_ONLY_BASH_PREFIXES`.
+    spelled = " ".join(tokens).lower()
+    for probe in _EXACT_ONLY_BASH_PREFIXES:
+        if spelled.startswith(probe + " "):
+            return f"'{probe}' takes no operand, and acts on one when given it"
+    # The verb is matched case-insensitively, like the allowlist does, so an
+    # unusual spelling cannot step past the table. Flags keep their case,
+    # because for these programs the case carries the meaning.
+    verb = tokens[0].rsplit("/", 1)[-1].lower()
+    args = tokens[1:]
+
+    # Whether an unexpanded word can subvert THIS segment's classification.
+    #
+    # Every check below is keyed on a table, so a verb with no table has no
+    # decision to subvert: whatever `cat $HOME/.bashrc` expands to, this
+    # function was always going to return "". Refusing an expansion there buys
+    # nothing and costs the most ordinary read on the auto-approve path, so the
+    # refusal is scoped to the verbs whose arguments this module reads.
+    #
+    # `git` is guarded whatever the subcommand, because the subcommand itself is
+    # a decided word: `git $x` reaches bash as `git branch -D release`.
+    #
+    # `hostname` and `date` are guarded through `_SYSTEM_OPERAND_VALUE_FLAGS`
+    # rather than a flag table, because their rule is an OPERAND rule: an
+    # unexpanded word IS the decision there, so `hostname $EVIL` renames the host
+    # under a spelling this module read as harmless.
+    guarded = (
+        verb in ("git", "uniq")
+        or verb in _WRITE_FLAGS
+        or verb in _EXEC_FLAGS
+        or verb in _SYSTEM_OPERAND_VALUE_FLAGS
+    )
+
+    # ANSI-C quoting is stripped by `shlex` but honoured by bash, so the token
+    # this check inspects is not the token the shell runs: `git diff $'-o'` reaches
+    # `shlex` as `$-o` — matching no flag — while bash passes `-o`. The same trick
+    # hides a subcommand (`git remote $'set-url'`), and a positional or special
+    # parameter does it with no quoting at all — `git remote $@set-url …`, where
+    # `$@` expands to nothing in a `bash -c` string. It is a spelling with no
+    # legitimate use in a read-only command, so the segment is refused outright
+    # rather than un-quoted here, which would mean reimplementing bash's rules.
+    if guarded and _SHELL_EXPANSION_RE.search(segment):
+        return "a shell expansion hides the real argument"
+
+    # Pathname expansion cannot be refused wholesale: a glob usually IS the
+    # argument — `ls *.py`, `grep -rn TODO src/*` — so the question is whether
+    # THIS pattern can reach a word this module decides on. `_glob_hides_word`
+    # answers it with `fnmatch`, which is what keeps the ordinary forms passing:
+    #
+    #     git remote s?t-url origin https://evil   (a file named `set-url` nearby)
+    #     git diff --outp?t=/tmp/pwned
+    #     cat f | sort ?o victim                   (a file named `-o` nearby)
+    #
+    # The last one is why a leading-dash test is not enough. `?o` does not start
+    # with `-`, so a test keyed on the spelling skipped it, bash resolved it to
+    # `-o`, and `sort` truncated `victim` under an auto-approval.
+    if guarded:
+        has_short_flags = verb in _SHORT_FLAG_VERBS or (
+            verb == "git" and bool(args) and args[0].lower() in _GIT_REF_WRITE_FLAGS
+        )
+        for token in args:
+            if _glob_hides_word(token, has_short_flags):
+                return "a glob could expand into a flag or subcommand"
+
+    # The allowlist names `git <subcommand>`, so that is the unit to key on.
+    key = verb
+    if verb == "git" and args:
+        subcommand = args[0].lower()
+        key = f"git {subcommand}"
+        args = args[1:]
+
+        if subcommand in _GIT_REF_WRITE_FLAGS:
+            hit = _matched_flag(args, _GIT_REF_WRITE_FLAGS[subcommand])
+            if hit:
+                return f"'git {subcommand} {hit}' changes a ref"
+            # A bare operand names a ref to create, unless the command is in list
+            # mode (where it is a pattern) or the operand is a required flag value.
+            #
+            # List mode is decided over the whole argument list, because the
+            # selecting flag can come after the operand it makes into a pattern:
+            # `git branch newbranch --list` is still a list. It must stop at `--`,
+            # though: after the terminator a word spelled like a flag is an
+            # operand, so `git tag -- --list` CREATES the ref `--list` while
+            # reading that `--list` as list mode passed it off as a read.
+            options = args[: args.index("--")] if "--" in args else args
+            list_shorts = _GIT_REF_LIST_SHORTS.get(subcommand, "")
+            # A required flag's VALUE is not an option, however it is spelled. git
+            # takes it from the following word, so `git branch --format -l newbranch`
+            # hands `-l` to `--format` and never sees a list flag — while scanning
+            # every token read that `-l` as one, and the bare operand it then
+            # licensed created the branch. The walk below already tracks this for
+            # operands; list mode has to track it too, over the same tokens.
+            selectors: list[str] = []
+            consumed = ""
+            for tok in options:
+                if _consumes_next_word(consumed):
+                    # A glob HERE decides by COUNT, not by what it becomes: under
+                    # `nullglob` an unmatched pattern vanishes, so the flag eats the
+                    # NEXT word instead and every later position shifts by one.
+                    # `git branch --format nomatch* --list newbranch` loses the
+                    # format's value, `--format` takes `--list`, and `newbranch`
+                    # stops being a pattern. See `_glob_shifts_arguments`.
+                    if _glob_shifts_arguments(tok):
+                        return "a glob in a required option's value shifts the arguments"
+                    consumed = ""
+                    continue
+                if tok.startswith("-"):
+                    # An ATTACHED value takes nothing from the next word.
+                    consumed = "" if "=" in tok else tok
+                    selectors.append(tok)
+                    continue
+                consumed = ""
+            list_mode = any(
+                tok.split("=", 1)[0] in _GIT_REF_LIST_FLAGS
+                or (
+                    len(tok) > 1
+                    and tok[0] == "-"
+                    and tok[1] != "-"
+                    # EVERY character of the cluster must be a list letter or a
+                    # digit, not merely one of them. `any` read an attached VALUE
+                    # as part of the cluster, which is the same trap the note on
+                    # `_SYSTEM_SET_FLAGS` records for `date -Iseconds`: the `l` in
+                    # `git tag -ulin@kiro.co` selected list mode and the bare
+                    # operand it then licensed created a signed tag. A digit is
+                    # allowed because `-n` carries an optional count (`-n5`).
+                    #
+                    # A MIXED cluster (`-lv`) is no longer a listing here and falls
+                    # through to the prompt. That is the intended trade: the letter
+                    # this cannot distinguish from a value is exactly the letter a
+                    # write flag arrives on, and the ordinary spellings — a separate
+                    # `-l`, `--list`, or `-n5` — are unaffected.
+                    and all(ch in list_shorts or ch.isdigit() for ch in tok[1:])
+                )
+                for tok in selectors
+            )
+            # A `--no-list` anywhere in the span undoes it, and the operand it was
+            # protecting becomes a ref to create. Applied AFTER the scan and
+            # unconditionally, rather than as git's last-wins: cancelling can only
+            # move an operand toward the prompt, so being coarse here is the safe
+            # direction. See `_GIT_REF_LIST_CANCEL_FLAGS` for what was measured.
+            if list_mode and any(_cancels_list_mode(tok, subcommand) for tok in selectors):
+                list_mode = False
+            previous = ""
+            operand_only = False
+            for tok in args:
+                # `--` ends the options. Everything after it is an operand, however
+                # it is spelled: `git tag -- -z` creates the tag `-z`, while a
+                # leading-dash test read it as one more option and passed. A SECOND
+                # `--` is itself an operand, so the terminator is consumed once.
+                if tok == "--" and not operand_only:
+                    operand_only = True
+                    previous = ""
+                    continue
+                if not operand_only and tok.startswith("-"):
+                    # An ATTACHED value (`--sort=x`) takes nothing from the next
+                    # word, so it must not mark the following operand as consumed.
+                    previous = "" if "=" in tok else tok
+                    continue
+                if _consumes_next_word(previous):
+                    previous = ""
+                    continue
+                if list_mode:
+                    continue
+                return f"'git {subcommand} {tok}' creates a ref"
+
+        if subcommand == "remote":
+            # `git remote -v set-url …` puts an option BEFORE the subcommand, and
+            # git accepts it there. Keying on `args[0]` therefore saw `-v` and let
+            # the mutation through, so the leading options are skipped and the
+            # first non-option word is the subcommand — the same token git uses.
+            for tok in args:
+                if tok.startswith("-"):
+                    continue
+                if tok in _GIT_REMOTE_WRITE_SUBCOMMANDS:
+                    return f"'git remote {tok}' rewrites remote configuration"
+                # A glob HERE, even one that reaches no decided word, because this
+                # loop stops at the first non-option token and `nullglob` can make
+                # a token VANISH: with it exported, `git remote nomatch* set-url
+                # origin …` loses `nomatch*` entirely and git receives `set-url` —
+                # while this loop broke on the pattern and never looked further.
+                #
+                # `_glob_hides_word` above cannot cover it: that test asks whether
+                # the pattern can EXPAND INTO a decided word, and `nomatch*` cannot
+                # — the mutation comes from the token disappearing, not from what it
+                # becomes. Removing this check on the grounds that the general test
+                # subsumed it is what opened the hole.
+                if _GLOB_META_RE.search(tok) or _EXTGLOB_RE.search(tok):
+                    return "a glob in the subcommand hides the real argument"
+                # Likewise an expansion: `guarded` refuses those for `git` before
+                # this point, so reaching here with one is impossible — but the
+                # subcommand position is load-bearing enough to state rather than
+                # infer.
+                if _SHELL_EXPANSION_RE.search(tok):
+                    return "a shell expansion hides the real argument"
+                break
+
+    hit = _matched_flag(args, _WRITE_FLAGS.get(key, ()))
+    if hit:
+        return f"'{key} {hit}' writes a file"
+    hit = _matched_flag(args, _EXEC_FLAGS.get(key, ()))
+    if hit:
+        return f"'{key} {hit}' runs a program named by the repository"
+
+    # `uniq INPUT OUTPUT` writes its second operand. `--` ends the options here
+    # too, so a word after it is an operand however it is spelled:
+    # `uniq -- input -pwned` writes `-pwned`, while a leading-dash test counted
+    # one operand and passed the segment as a read.
+    if verb == "uniq":
+        operands = _operands(args)
+        # Counting the tokens is only sound if each one stays ONE word. A glob
+        # here decides by count: with `in1` and `in2` present, `uniq in*` runs
+        # `uniq in1 in2`, and the second operand is the OUTPUT file — so a single
+        # pattern passed a segment that truncates a file. `uniq`'s operands are
+        # positional, which is what makes this different from `ls *.py`.
+        if any(_glob_shifts_arguments(tok) for tok in operands):
+            return "a glob in a 'uniq' operand can expand into a second operand, which it writes"
+        if len(operands) > 1:
+            return "'uniq INPUT OUTPUT' writes its second operand"
+
+    # `hostname` and `date` each carry a SYSTEM-state setter under a verb whose
+    # bare form is a listing, so the prefix match vouched for the setter too.
+    hit = _system_set_flag(verb, args)
+    if hit:
+        changes = "renames the host" if verb == "hostname" else "sets the system clock"
+        return f"'{verb} {hit}' {changes}"
+
+    # Both also change state through a BARE OPERAND, with no flag at all —
+    # `hostname evil-host` and `date 08221200` (which fails only on privilege,
+    # not on parsing). Their legitimate operands differ, so the predicate does
+    # too: every `hostname` read form is flag-only, while `date`'s one operand
+    # is a `+FORMAT` string.
+    if verb in _SYSTEM_OPERAND_VALUE_FLAGS:
+        value_flags = _SYSTEM_OPERAND_VALUE_FLAGS[verb]
+        previous = ""
+        operand_only = False
+        for tok in args:
+            # `--` ends the options here for the same reason it does for a ref:
+            # after it, `hostname -- -evil` names the host `-evil`, and a
+            # leading-dash test read that as one more option and passed it.
+            if tok == "--" and not operand_only:
+                operand_only = True
+                previous = ""
+                continue
+            if not operand_only and tok.startswith("-"):
+                # Whether a flag takes the FOLLOWING word depends on its form,
+                # and long and short disagree. A long option consumes the next
+                # word unless the value is attached with `=`, so
+                # `date --date yesterday` is a read. A short option consumes it
+                # only when the token is the bare flag: `-Iseconds` carries its
+                # own value, so reading it as `-I` + a separate operand would
+                # deny that read.
+                if tok.startswith("--"):
+                    previous = "" if "=" in tok else tok
+                else:
+                    previous = tok if len(tok) == 2 else ""
+                continue
+            if previous in value_flags:
+                previous = ""
+                continue
+            previous = ""
+            if verb == "date":
+                if tok.startswith("+"):
+                    continue
+                return "'date <operand>' sets the system clock unless it is a +FORMAT string"
+            return f"'{verb} <operand>' sets the hostname; every read form is flag-only"
+
+    return ""
+
+
+def _elided_shell_construct(cmd: str) -> str:
+    """Reason *cmd* carries a construct bash REMOVES but ``shlex`` keeps.
+
+    Every operand rule in this module reads `shlex.split`'s token list and
+    assumes it is the argv the program receives. Two shell constructs break that
+    assumption by DELETING words rather than rewriting them, and `shlex` has no
+    concept of either — it hands them back as ordinary tokens:
+
+        git branch injected # --list      shlex: [… 'injected', '#', '--list']
+                                          bash:  git branch injected
+        git branch injected <<< --list    shlex: [… 'injected', '<<<', '--list']
+                                          bash:  git branch injected
+
+    In both, the `--list` this module reads never reaches git. It flips
+    `_GIT_REF_LIST_FLAGS` on, the bare `injected` is reclassified from "creates a
+    ref" to "a pattern", and the segment auto-approves — while bash creates the
+    ref. Measured against real git: `git branch injected # --list`,
+    `git tag forged # --list` and `git branch injected <<< --list` each created
+    the ref, so this is a live auto-approval bypass rather than a parse curiosity.
+
+    Refused as a CLASS rather than repaired. Repairing it means deciding what
+    bash would have deleted — i.e. reimplementing shell word removal on top of
+    the quoting rules `shlex` already models differently — and an earlier
+    revision of this fix tried exactly that and reopened the bypass it closed:
+    reproducing the comment made this scanner keep going after the `#`, and a
+    lone `'` inside comment TEXT (`echo x # don't`) then leaked quote state
+    across the newline, so the next line's forged `# --list` was never removed
+    and `git branch evil # --list` auto-approved again. Refusing on the FIRST
+    hit has no "afterwards" to get wrong. A read-only command needs neither
+    construct, and a refused command falls through to the human approval prompt.
+
+    Every way this scanner can disagree with bash therefore costs a prompt
+    rather than an approval. It is deliberately wider than bash in places —
+    `str.isspace()` accepts separators bash does not (U+00A0), and ANSI-C
+    `$'…\''` quoting is not modelled — and in this direction that is a false
+    refusal, never a false approval.
+
+    Quote-aware on purpose, so it costs no ordinary read. Both constructs are
+    shell syntax only when unquoted, and the common false positives are exactly
+    the quoted and non-word-initial spellings:
+
+        grep '#include' file        `#` inside quotes is data
+        git log --grep=#123         `#` mid-word is not a comment to bash
+        grep "<div>" file           `<` inside quotes is data
+
+    A backslash escape is honoured for the same reason (`grep \\# file`).
+
+    Two costs, stated rather than hidden, and asserted in the tests:
+
+    * An ordinary trailing comment is refused (`git status # note`,
+      `ls -la # list files`). Agent-emitted bash carries one often, so this is
+      the larger everyday cost of the two — a real auto-approve-rate loss, taken
+      knowingly because the alternative above is a live bypass.
+    * An unquoted input redirect is refused even where it is genuinely harmless
+      (`wc -l < file`, `grep pattern < file`), since what makes it dangerous is
+      the token-list divergence, not the direction of the data.
+    """
+    quote: str | None = None
+    # Start-of-string counts as a word boundary: bash reads a leading `#` as a
+    # comment, so `# git status` is an empty command rather than a read.
+    at_word_start = True
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if quote is not None:
+            # Inside double quotes a backslash still escapes; inside single
+            # quotes it is literal, exactly as a shell reads it.
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            at_word_start = False
+            continue
+        if ch == "\\" and i + 1 < n:
+            # An escaped character is data, including an escaped `#` or `<`.
+            i += 2
+            at_word_start = False
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            at_word_start = False
+            continue
+        if ch == "#" and at_word_start:
+            return "a comment deletes the rest of the line, which `shlex` keeps"
+        if ch == "<":
+            return "an input redirect removes words that `shlex` keeps"
+        at_word_start = ch.isspace()
+        i += 1
+    return ""
+
+
 def _classify_bash(cmd: str) -> str:
     """Single source of truth for read-only bash classification.
 
@@ -574,6 +1592,13 @@ def _classify_bash(cmd: str) -> str:
     """
     if not cmd.strip():
         return "empty command"
+    # Runs on the RAW command, before any splitting: a comment elides to the end
+    # of the line regardless of the `&&` / `;` boundaries the regex split below
+    # believes in, so `git status && git branch injected # --list` has to be
+    # caught here rather than per-segment.
+    elided = _elided_shell_construct(cmd)
+    if elided:
+        return f"unsafe shell pattern: {elided}"
     # Strip discard-only redirects (output sinks / stderr-merge) before the
     # unsafe-shell check; they are read-only but contain '>' / '&'.
     scrubbed = _DEVNULL_REDIR_RE.sub(" ", cmd)
@@ -586,17 +1611,55 @@ def _classify_bash(cmd: str) -> str:
         pipe_parts = [p.strip() for p in part.split("|") if p.strip()]
         if not pipe_parts:
             return "unsafe shell pattern"
-        first = pipe_parts[0].strip().lower()
+        # The verb is compared case-insensitively, but the side-effect check
+        # below needs the original spelling: flags are case-sensitive, and the
+        # two cases can mean opposite things (`file -C` compiles a magic file,
+        # `file -c` only prints one).
+        head = pipe_parts[0].strip()
+        first = head.lower()
         if not (
             _is_help_probe(first)
             or any(first == p or first.startswith(p + " ") for p in _READ_ONLY_BASH_PREFIXES)
         ):
             base = first.split()[0] if first.split() else first
             return f"command '{base}' is not on the read-only allowlist"
+        # Clearing the allowlist only settles which program runs. The rest of
+        # the command line can still write a file, change a ref or start
+        # another program.
+        side_effect = _side_effect_reason(head)
+        if side_effect:
+            return f"not read-only: {side_effect}"
         for target in pipe_parts[1:]:
-            if not _READ_ONLY_PIPE_RE.match(target):
+            matched = _READ_ONLY_PIPE_RE.match(target)
+            if not matched:
                 tgt = target.split()[0] if target.split() else target
                 return f"pipe target '{tgt}' is not a read-only filter"
+            # The name the allowlist matched must be the program bash actually
+            # runs. `_READ_ONLY_PIPE_RE` ends its filter name at a `\b`, and `$`
+            # satisfies that, so `sort$IFS-o victim` matched the entry `sort` while
+            # bash split `$IFS` into whitespace and ran `sort -o victim`. Nothing
+            # downstream recovered: `_side_effect_reason` reads the verb as
+            # `sort$ifs-o`, finds no table for it, and returns "".
+            #
+            # The leading segment of a pipeline was never exposed to this, because
+            # its allowlist test pins the boundary to a literal space
+            # (`first == p or first.startswith(p + " ")`). This makes the pipe
+            # allowlist say the same thing: the first argv word, exactly.
+            try:
+                target_tokens = shlex.split(target)
+            except ValueError:
+                return "pipe target quoting cannot be resolved"
+            if not target_tokens or target_tokens[0] != matched.group(1):
+                tgt = target_tokens[0] if target_tokens else target
+                return (
+                    f"pipe target '{tgt}' is not the read-only filter "
+                    f"'{matched.group(1)}' it matched"
+                )
+            # The pipe allowlist matches only the leading verb, so a filter's
+            # own output flag (`sort -o FILE`) needs the same check.
+            side_effect = _side_effect_reason(target)
+            if side_effect:
+                return f"pipe target is not read-only: {side_effect}"
     return ""
 
 
@@ -846,6 +1909,26 @@ _MAX_SLOT_MESSAGES = 10000  # Keep all messages — virtual scrolling handles pe
 #: ``chat_persistence._TRANSIENT_ROLES`` minus the rows that ARE broadcast).
 #: They get no ``meta.mid`` — see ``_ChatSlot.append``.
 _WIRE_ONLY_ROLES = frozenset({"chunk", "done", "streaming"})
+
+
+def row_mid(row: Any) -> str | None:
+    """The delivery identity stamped on an appended window row, or ``None``.
+
+    The ONE extraction of ``meta.mid`` shared by every dual-writer that reads
+    the id off a ``_ChatSlot.append`` return to stamp its durable transcript
+    copy. Mirrors the read side (``_append_unflushed_tail`` matches only a
+    non-empty ``str``): any other shape reads as "no identity" here rather than
+    being persisted as an id the reader is structurally unable to match.
+    Tolerates a non-dict *row* so a caller handed a test double degrades to
+    ``None`` (an id-less durable copy) instead of raising.
+    """
+    if not isinstance(row, dict):
+        return None
+    meta = row.get("meta")
+    mid = meta.get("mid") if isinstance(meta, dict) else None
+    return mid if isinstance(mid, str) and mid else None
+
+
 #: Roles whose LIVE append starts the slot's next turn, and so consumes the answer
 #: channel an unanswered stateless question card was waiting on. Mirrors the
 #: frontend's ``QUESTION_RETIRING_ROLES``: the two must agree, or a session reports
@@ -921,6 +2004,33 @@ _NON_DURABLE_SOURCE_LINK_ROLES = frozenset({"chunk", "done", "streaming", "queue
 # FIFO ceiling on a slot's pending-context queue (app-kit context inject +
 # Slack thread backfill). Shared so the two eviction sites cannot drift.
 _MAX_PENDING_CONTEXT = 50
+
+
+def context_entry_expired(entry: dict, now: float) -> bool:
+    """True if a pending-context entry's TTL has elapsed.
+
+    Shared by the drain, the per-source cap count, and the deferred-note
+    promotion so they cannot disagree about which entries are still live. It
+    lives here rather than in chat_runner because ``_ChatSlot`` itself needs it.
+    """
+    max_age = entry.get("maxAge")
+    if max_age is None:
+        return False
+    return entry.get("injectedAt", 0) + max_age < now
+
+
+def _note_authorized_elsewhere(stamped: object, live_session: str) -> bool:
+    """True when note content records a session other than *live_session*.
+
+    Reads the same ``session`` stamp off a pending-context entry or off a
+    transcript row's ``meta``. Absent stamp means not note content that carries
+    an authorizing session, so it is never dropped.
+    """
+    if not isinstance(stamped, dict):
+        return False
+    authorized = stamped.get("noteSession")
+    return authorized is not None and authorized != live_session
+
 
 # Bare chat-N label matcher used by DashboardState.resolve_slot() for prefix fallback.
 # Gates the prefix lookup to prevent broad matches (e.g. bare "chat" binding to any slot).
@@ -1005,6 +2115,12 @@ POSTTOKEN_RECOVERY_PREFIX = "[Interrupted turn — automatic recovery]"
 # Prefix on the runner-injected nudge that breaks a repeated empty-generation
 # pattern (the model returned no output twice). Body: _EMPTY_AUTO_CONTINUE_MSG.
 EMPTY_RESPONSE_RECOVERY_PREFIX = "[Empty response — automatic recovery]"
+# Prefix on the runner-injected continuation sent when a turn ended on a
+# PROMISE-ONLY final message: the model announced an immediate action ("I'll do
+# that now") and then yielded without making the tool call, so the work never
+# happened and the turn still billed. Body: _PROMISE_ONLY_CONTINUE_MSG in
+# chat_utils. One bounded attempt (slot._promise_only_retries), never a loop.
+PROMISE_ONLY_RECOVERY_PREFIX = "[Unfinished action — automatic recovery]"
 # Prefix on the continuation injected when the USER pressed Continue on an
 # interrupted turn. Body: _MANUAL_RESUME_MSG in chat_utils. Named into the
 # *_RECOVERY_PREFIX family because test_recovery_card_prefixes.py keys the
@@ -1032,10 +2148,30 @@ HOOK_CONTINUATION_RECOVERY_PREFIX = "[Hook continuation — automatic]"
 # The VALUE does not say "recovery": nothing failed or recovered, a safety cap
 # fired.
 HOOK_HALTED_RECOVERY_PREFIX = "[Stop-hook nudge cap reached]"
+# Prefix on the DISPLAY-ONLY row appended when a tool deny's reason was steered
+# into the running turn (see chat_runner._steer_policy_notice). Nothing is
+# queued and no turn is dispatched — the agent already has the reason — so this
+# row exists purely so the person sees the same blocked-tool card they used to
+# get from the recovery continuation, instead of only a generic "Steered" chip
+# that reads as though they had steered the turn themselves.
+#
+# Named into the *_RECOVERY_PREFIX family because test_recovery_card_prefixes.py
+# keys its cross-language drift guard on that suffix — a marker outside the
+# family is invisible to it and the row would render as a full-width bubble of
+# machine prose. The VALUE deliberately does not say "recovery": nothing was
+# recovered and no continuation was sent, which is the whole point. Same
+# reasoning as HOOK_HALTED_RECOVERY_PREFIX, whose row is also display-only.
+REFUSAL_INBAND_RECOVERY_PREFIX = "[Tool blocked — reason sent to the agent]"
 
 
 def should_queue_refusal_recovery(
-    refusal_reasons: list, stopping: bool, needs_reset: bool, stop_reason: str
+    refusal_reasons: list,
+    stopping: bool,
+    needs_reset: bool,
+    stop_reason: str,
+    *,
+    notices_sent: int = 0,
+    notices_pending: int = 0,
 ) -> bool:
     """Decide whether to auto-queue a refusal-recovery prompt after a turn.
 
@@ -1044,7 +2180,24 @@ def should_queue_refusal_recovery(
     - A stop is still in progress
     - A session reset is already re-queuing
     - The turn was cancelled by the user (not a policy block)
+    - Every refusal was already explained IN-BAND and the backend confirmed it
+
+    ``notices_sent`` is how many :func:`build_refusal_steer_notice` bodies were
+    steered into the turn, and ``notices_pending`` how many of those the
+    ``steering_consumed`` echo did NOT account for. The extra turn is skipped only
+    when every refusal got a notice AND none is still pending — an unconfirmed
+    steer is treated as undelivered, so the fallback continuation still runs. The
+    check is deliberately coarse (counts, not a per-refusal pairing): its two
+    failure directions are not symmetric. Skipping wrongly leaves the model with
+    kiro-cli's "User denied tool execution" and no correction, while queueing
+    wrongly costs one turn the model would otherwise have been told twice — which
+    is exactly what this path already cost before in-band delivery existed.
+
+    Both are keyword-only with defaults so a caller on a harness without mid-turn
+    steer keeps the original three-condition behaviour unchanged.
     """
+    if refusal_reasons and notices_sent >= len(refusal_reasons) and notices_pending == 0:
+        return False
     return bool(
         refusal_reasons
         and not stopping
@@ -1095,10 +2248,17 @@ def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
 
     When a tool call is refused for a recoverable, system-side reason — a
     host-gate policy deny, the read-only bash safety gate, or a PreToolUse policy
-    hook block — kiro-cli ends the turn early with an attribution-free
-    "tool uses were interrupted" marker. The refusal reason is otherwise surfaced
-    only to the dashboard pill and the SEL audit log, never to the model, so the
-    agent stalls and waits for the user.
+    hook block — the reason reaches the dashboard pill and the SEL audit log but
+    never the model: kiro-cli's own tool result for a rejected permission is the
+    fixed string "User denied tool execution", which is indistinguishable from a
+    human having clicked No. So the agent apologises for a cancellation that
+    never happened and yields.
+
+    This continuation is the FALLBACK path. The primary path is
+    :func:`build_refusal_steer_notice`, which delivers the same reason in-band on
+    a harness that supports mid-turn steer, costing no extra turn. This one runs
+    when that was impossible (harness without steer) or when the steer was never
+    folded in (no ``steering_consumed`` echo covered it).
 
     ``refusals`` is a list of ``(tool_title, reason)`` tuples recorded during the
     turn (already redacted by the caller). The returned text hands those reasons
@@ -1131,6 +2291,91 @@ def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
         "task where you left off.",
     ]
     return "\n".join(lines)
+
+
+#: Why a tool call was denied, for the in-band notice's cause-specific wording.
+#: The notice's INVARIANT half — that this was not a user action, the generic
+#: string it is correcting, and the instruction to decide inside this turn — is
+#: identical for every cause; only the clause naming the cause and the guidance
+#: about what to do next differ. Kept as data rather than three near-copies of
+#: the notice so the invariant half cannot drift between them, which is the half
+#: doing the actual work of overwriting the model's wrong conclusion.
+DENY_CAUSE_POLICY = "policy"
+DENY_CAUSE_INVALID_NAME = "invalid_name"
+DENY_CAUSE_HOOK_ERROR = "hook_error"
+
+#: cause → (clause completing "The tool call you just made …", what to do next).
+_DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
+    DENY_CAUSE_POLICY: (
+        "was blocked by a Kiro Crew safety policy",
+        "use an allowed alternative (for a shell command, a read-only variant), use "
+        "a different tool, or — if the block is correct and you genuinely cannot "
+        "proceed — say so and stop with the reason.",
+    ),
+    DENY_CAUSE_INVALID_NAME: (
+        "was refused because its tool name failed validation",
+        "reissue the call with a name that passes validation. The action itself was "
+        "never judged, so do not abandon it or look for a different approach on this "
+        "evidence — and do not repeat the same malformed name.",
+    ),
+    DENY_CAUSE_HOOK_ERROR: (
+        "could not be authorized because a PreToolUse hook raised while deciding it",
+        "treat this as a host fault, not a verdict on the action: nothing judged the "
+        "call itself. Retrying the identical call is reasonable once; if it faults "
+        "again, say what happened rather than working around it silently.",
+    ),
+}
+
+
+def build_refusal_steer_notice(title: str, reason: str, *, cause: str = DENY_CAUSE_POLICY) -> str:
+    """Body of the in-band deny notice steered into the RUNNING turn.
+
+    Sent BEFORE the permission rejection goes back on the wire, which is what
+    makes it race-free: while the ``session/request_permission`` is still
+    unanswered the turn is provably in flight, so the steer is queued rather than
+    dropped, and kiro-cli folds it in at the next model-inference boundary — the
+    one immediately after the rejected tool resolves. The model therefore learns
+    why inside the SAME turn and no recovery continuation is needed.
+
+    The notice must correct an attribution the model has already been handed:
+    a rejected permission is reported to the model as a generic tool failure with
+    no channel for the host to say more (ACP's permission response carries only
+    ``outcome``/``optionId``). Naming kiro-cli's exact wording — measured against
+    kiro-cli 2.19.1 — is what lets the model overwrite the wrong conclusion rather
+    than hold both, and attributing the quote to that backend keeps the sentence
+    true on another steer-capable harness whose wording has not been measured.
+    ``title``/``reason`` must already be redacted by the caller.
+
+    *cause* selects the wording. The distinction is not cosmetic: a policy block
+    is a verdict the model must route around, an invalid tool name is the model's
+    own malformed output and is the one case it can simply fix, and a hook fault
+    judged nothing at all. Telling the model "safety policy" for the latter two
+    would send it looking for an allowed alternative to an action nobody refused.
+    An unknown cause degrades to the policy wording rather than raising: a wrong
+    noun is recoverable, and losing the notice would hand the model back
+    kiro-cli's "user denied" with nothing to correct it.
+
+    Returns "" when there is nothing to say, so a caller can treat the empty
+    string as "no notice was sent" and fall back to the recovery continuation.
+    """
+    if not (title or "").strip() and not (reason or "").strip():
+        return ""
+    clause, guidance = _DENY_CAUSE_TEXT.get(cause, _DENY_CAUSE_TEXT[DENY_CAUSE_POLICY])
+    what = f"{title}: {reason}" if reason else title
+    # "host notice", not "policy notice": the tag has to be true for all three
+    # causes, and only one of them IS a policy. Naming the ACTOR is also what the
+    # notice exists to do — the model has just been told the user denied this, and
+    # every sentence after this one is spent correcting that.
+    return (
+        f"[Kiro Crew host notice] The tool call you just made {clause}. "
+        "This was NOT a user action — the user did not "
+        "cancel, reject, or interrupt anything. The tool result you were handed for "
+        "it is generic and wrong about who denied it — on kiro-cli it reads "
+        '"User denied tool execution".\n\n'
+        f"Blocked: {what}\n\n"
+        "Do not apologise for a cancellation and do not ask the user whether to "
+        f"retry. Decide and continue in this same turn: {guidance}"
+    )
 
 
 def build_stale_recovery_prompt() -> str:
@@ -1316,10 +2561,10 @@ class SlotOrigin:
     regardless of their ``_app`` owner).
     """
 
-    USER = "user"       # initiated from the dashboard UI (no app token)
-    APP = "app"         # initiated by an app SDK call (carries owner _app)
-    CRON = "cron"       # initiated by a cron job
-    SYSTEM = "system"   # gateway-internal (startup, migration, etc.)
+    USER = "user"  # initiated from the dashboard UI (no app token)
+    APP = "app"  # initiated by an app SDK call (carries owner _app)
+    CRON = "cron"  # initiated by a cron job
+    SYSTEM = "system"  # gateway-internal (startup, migration, etc.)
 
 
 def request_slot_origin(app: str) -> str:
@@ -1358,6 +2603,8 @@ class _ChatSlot:
         "task",
         "event",
         "_pending",
+        "_pending_consumers",
+        "_pending_release_deferred",
         "_queue",
         "_last_enqueue_ts",
         "_approval_futures",
@@ -1383,7 +2630,7 @@ class _ChatSlot:
         "_todo",
         "_on_message",
         "_on_question_retired",
-        "_has_reader",
+        "_has_reader_flag",
         "_stop_state_raw",
         "_stop_generation",
         "_stop_event_id",
@@ -1415,6 +2662,7 @@ class _ChatSlot:
         "_synthesis_inflight",
         "_subagent_deliveries_inflight",
         "_subagents_inline_collected",
+        "_subagent_delivery_pending",
         "_recovery_retrigger_count",
         "_prompt_busy_retries",
         "_acp_pipe_death_retries",
@@ -1423,10 +2671,19 @@ class _ChatSlot:
         "_tool_stall_retries",
         "_tool_stall_exhausted_emitted",
         "_transient_5xx_retries",
+        "_fallback_candidate_idx",
+        "_fallback_walked",
+        "_active_fallback_model",
+        "_fallback_primary_model",
+        "_fallback_slot_model",
+        "_model_pick_gen",
+        "_fallback_pick_gen",
         "_posttoken_retry_used",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
         "_empty_response_retries",
+        "_promise_only_retries",
+        "_promise_only_stop_gen",
         "_batch_rejected",
         "_compaction_fail_streak",
         "_compaction_fail_cooldown_until",
@@ -1438,6 +2695,7 @@ class _ChatSlot:
         "memory_mode",
         "_ephemeral",
         "_pending_context",
+        "_deferred_notes",
         "_app",
         "_human_seen",
         "_origin",
@@ -1445,6 +2703,7 @@ class _ChatSlot:
         "_lock",
         "forked_from",
         "_fork_lock",
+        "_model_pick_lock",
         "_tab_id",
         "_channel_window_mtime",
         "_disk_older_count",
@@ -1457,13 +2716,17 @@ class _ChatSlot:
         "_active_turn_session_key",
         "_side",
         "_acp_client",
+        "_last_turn_awaiting_permission",
+        "_last_turn_children_announced",
         "_steer_segment_cut",
         "_native_subagent_tracker",
         "_native_subagent_output",
         "_pending_steers",
+        "_steer_delivery_ids",
         "_wait_state",
         "_end_wait_request",
         "_wait_last_ping",
+        "_wait_steer_baseline",
         "_wait_contested",
         "_question_pending",
     )
@@ -1499,6 +2762,15 @@ class _ChatSlot:
         self.task: asyncio.Task | None = None  # type: ignore[type-arg]
         self.event = asyncio.Event()
         self._pending: list[dict[str, str]] = []
+        # Number of readers currently treating ``_pending`` as their delivery
+        # queue -- see ``pending_consumer``. Zero means a row left in the queue
+        # can never reach a client, which is what makes releasing it safe.
+        self._pending_consumers: int = 0
+        # Set when a release was ASKED FOR and refused because a consumer held
+        # the queue. Without it the refusal is silent and final: the turn-end
+        # purge never runs again for that slot, so the rows it declined to drop
+        # outlive every consumer and the leak survives its own fix.
+        self._pending_release_deferred: bool = False
         self._queue: list[dict[str, str]] = []  # [{"id": uuid, "content": str}, ...]
         # Newest enqueue instant, read only while ``_queue`` is non-empty — see
         # ``_note_enqueue``.
@@ -1597,7 +2869,7 @@ class _ChatSlot:
         # is invisible to a second window, and to a /pending response already in
         # flight — either would re-render a card whose answer has been sent.
         self._on_question_retired: object | None = None
-        self._has_reader: bool = False  # True when HTTP SSE stream is draining
+        self._has_reader_flag: bool = False  # True when HTTP SSE stream is draining
         self._stop_state_raw: str = "idle"  # 'idle' | 'soft_pending' | 'killing'
         # Monotonic count of stop INITIATIONS (idle → active edges of
         # _stop_state). Teardown resets _stop_state back to "idle" but never
@@ -1686,6 +2958,14 @@ class _ChatSlot:
         # blocking spawn_sub_agents MCP tool.  _subagent_done skips injection
         # for these to prevent a duplicate turn that clobbers [OPTIONS:] buttons.
         self._subagents_inline_collected: set[str] = set()
+        # Queued sub-agent completions whose delivery tombstone is still owed:
+        # queue-id -> the agent ids whose ``result.txt`` that row promises. A
+        # completion routed into a BUSY slot is queued, so the parent's context
+        # does not contain it until the row drains; the run loop therefore skips
+        # its own ``mark_delivered`` and the drain settles these instead, so the
+        # retention TTL is measured from consumption rather than from run
+        # completion (issue #4839). See ``take_pending_subagent_deliveries``.
+        self._subagent_delivery_pending: dict[str, list[str]] = {}
         self._recovery_retrigger_count: int = 0
         self._prompt_busy_retries: int = 0
         self._acp_pipe_death_retries: int = 0
@@ -1714,6 +2994,33 @@ class _ChatSlot:
         # ConnectionReset) retries on the interactive stream path. Distinct
         # budget from prompt-busy / pipe-death; reset on a completed turn.
         self._transient_5xx_retries: int = 0
+        # Throttle-exhaustion model-fallback walk state (agent.fallback_model).
+        # _fallback_candidate_idx / _fallback_walked are PER-CYCLE (next chain
+        # position to try + candidates already tried this logical turn, for the
+        # chain-exhausted error story); both reset with the other retry budgets
+        # on a landed turn. _active_fallback_model / _fallback_primary_model are
+        # STICKY session state: set when a fallback swap lands, kept across
+        # turns until the start-of-turn restore probe moves the session back to
+        # the primary (deliberately NOT reset on turn completion).
+        self._fallback_candidate_idx: int = 0
+        self._fallback_walked: list[str] = []
+        self._active_fallback_model: str = ""
+        self._fallback_primary_model: str = ""
+        # Snapshot of slot.model taken when the fallback activated, used to heal
+        # slot.model if the automatic provider backfill wrote the fallback id
+        # into an empty slot while the fallback was active (slot.model is
+        # re-sent as a set_model override on resume, so leaving the fallback
+        # there would re-pin it after the primary recovered).
+        self._fallback_slot_model: str = ""
+        # Explicit model-pick generation. Bumped ONLY by the explicit set-model
+        # surfaces (single-slot pick, bulk switch, provider-switch clear) —
+        # never by the automatic provider backfill — so the fallback restore
+        # probe can tell a genuine user pick (drop sticky state, never
+        # override) from the backfill writing the served fallback into an
+        # unpinned slot (heal and restore). _fallback_pick_gen is the value
+        # snapshotted when the fallback activated.
+        self._model_pick_gen: int = 0
+        self._fallback_pick_gen: int = 0
         # One-shot guard for the post-token (text-only) transient retry: a turn
         # that has already streamed answer tokens may be re-prompted at most
         # ONCE on a transient 5xx (and only when no tool call fired). Reset on a
@@ -1735,6 +3042,14 @@ class _ChatSlot:
         # discard loop.
         self._poisoned_reset_used: bool = False
         self._empty_response_retries: int = 0
+        # One bounded synthetic continuation when a turn ended on a promise-only
+        # final message (announced an immediate action, then yielded with no tool
+        # call). Reset like the other per-turn retry budgets on a landed turn.
+        self._promise_only_retries: int = 0
+        # Monotonic _stop_generation snapshot taken when a promise-only continuation
+        # is enqueued; the dispatch-point purge compares against it to catch a Stop
+        # that pressed AND resolved to idle while the continuation waited (#2696).
+        self._promise_only_stop_gen: int = 0
         self._batch_rejected: bool = False
         # Per-turn compaction-status failure tracking (Mesh compaction-spam
         # fix). Distinct from SessionManager._compact_cooldown_until, which
@@ -1768,6 +3083,7 @@ class _ChatSlot:
         self.memory_mode: str = memory_mode
         self._ephemeral: bool = ephemeral  # Incognito mode: no memory writes
         self._pending_context: list[dict[str, Any]] = []
+        self._deferred_notes: list[dict[str, Any]] = []
         self._app: str = ""  # App identity tag (App Kit §5.2)
         # FIX 1 (unattended approval park). Evidence that a HUMAN has driven
         # this slot through a dashboard-user route (typed a message, answered an
@@ -1797,6 +3113,12 @@ class _ChatSlot:
         self._lock = asyncio.Lock()
         self.forked_from: str | None = None  # parent slot key if this is a fork
         self._fork_lock: asyncio.Lock = asyncio.Lock()  # serialises concurrent forks on this slot
+        # Serialises explicit model-pick transactions (check → mutate → live
+        # switch → rollback) on this slot: picks interleaving at the set_model
+        # await could otherwise roll back each other's state. Deliberately NOT
+        # slot._lock, which guards message-window edits and must not be held
+        # across a multi-second network await.
+        self._model_pick_lock: asyncio.Lock = asyncio.Lock()
         self._tab_id: str = ""  # permanent tab identity for cross-restart session chaining
         # Transcript mtime the in-memory window was last brought up to date
         # against. Only meaningful for a slot bound to a channel session, whose
@@ -1869,6 +3191,11 @@ class _ChatSlot:
         # dashboard steer handler) reach the running session's client to inject
         # a mid-turn steer. None when idle.
         self._acp_client = None
+        # Hang-attribution snapshot stashed by _run_chat's finally just before
+        # _acp_client is dropped; read by finish_turn_task when the dashboard
+        # ceiling cut the turn (kirocrew.turn.timeout.cause).
+        self._last_turn_awaiting_permission = False
+        self._last_turn_children_announced = False
         # Sync callable published by _run_chat alongside _acp_client (cleared in
         # the same finally): flushes the turn's accumulated text as a finalized
         # assistant segment NOW. The steer handler calls it right BEFORE
@@ -1893,6 +3220,13 @@ class _ChatSlot:
         # STOP, error). Without this, a steer swallowed by a dying turn
         # vanished with no trace (see the requeue site).
         self._pending_steers: list[str] = []
+        # Opaque id per in-flight steer, keyed by its text (the one-per-text
+        # rule in chat_delivery makes that key unique). The requeue moves the id
+        # onto the queue entry and the drain unions entry meta onto the row it
+        # writes, which is how a caller can tell a delivery the drain already
+        # persisted from one the running turn consumed — a distinction the bare
+        # text cannot make.
+        self._steer_delivery_ids: dict[str, str] = {}
         # In-flight `wait` tool sleep, as reported by the tool's own keepalive
         # ping: {"wait_id": str, "seconds": int, "deadline_ts": float}. The
         # deadline is on the dashboard's clock (see api_session_keepalive) so
@@ -1908,6 +3242,12 @@ class _ChatSlot:
         # _service_wait_ping tells a legitimate hand-over from two concurrent
         # waits colliding on one session key.
         self._wait_last_ping: float = 0.0
+        # The session's steer stamp as it read when the tracked wait was minted.
+        # Server-side only (deliberately NOT in to_dict). A steer newer than
+        # this baseline is what ends the sleep early; re-reading it per sleep is
+        # what stops ONE unconsumed steer from ending every subsequent sleep in
+        # the turn and handing the model a `wait` that returns instantly.
+        self._wait_steer_baseline: float = 0.0
         # True once two sleeps have been seen sharing this slot: neither may be
         # tracked or ended, because there is no way to know which one the user is
         # looking at. Latched for the rest of the turn and cleared by the same
@@ -2060,7 +3400,7 @@ class _ChatSlot:
         broadcast: bool = True,
         broadcast_user: bool = False,
         meta: dict | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         # A LIVE turn-consuming row retires every unanswered STATELESS question:
         # the card's own submit path sends one, and anything else that starts the
         # slot's next turn consumes the answer channel the card was waiting on.
@@ -2208,6 +3548,13 @@ class _ChatSlot:
                 )
             # The frozen prefix grew → its cached bytes are stale.
             self._frozen_prefix_cache = None
+        # Hand back the row as appended (id included): a dual-writer that also
+        # persists this message through ``ConversationLog.append`` needs the
+        # ``meta.mid`` minted above so BOTH copies carry the same identity —
+        # re-minting at the durable copy would give the reconciliation walk two
+        # ids for one logical message. Read the id off the return with
+        # :func:`row_mid`, never an inline ``meta`` poke.
+        return msg
 
     def push_wire_frame(self, cls: str, content: str) -> None:
         """Queue an ephemeral wire-only frame for live SSE readers.
@@ -2221,9 +3568,7 @@ class _ChatSlot:
         The queue/ordering contract lives here so callers never hand-roll a
         raw ``_pending`` append at a distance.
         """
-        self._pending.append(
-            {"role": cls, "content": content, "cls": cls, "ts": ""}
-        )
+        self._pending.append({"role": cls, "content": content, "cls": cls, "ts": ""})
         self.event.set()
 
     def drain(self) -> list[dict[str, str]]:
@@ -2232,6 +3577,285 @@ class _ChatSlot:
         self._pending.clear()
         self.event.clear()
         return out
+
+    @property
+    def pending_has_consumer(self) -> bool:
+        """True while something can still deliver rows out of ``_pending``.
+
+        The queue serves two unrelated roles. For a WebSocket client it is dead
+        weight: every row it holds was already broadcast, and nothing reads the
+        queue again until the slot's next turn discards it. For an HTTP SSE
+        reader (``/api/chat``) or an OpenAI-compatible reader
+        (``/v1/chat/completions``) it IS the delivery queue -- a row still in it
+        has NOT reached the client, so dropping one truncates the answer.
+
+        So a release may only drop rows while no consumer is attached, and the
+        answer needs two signals because they arm at different moments:
+        ``_has_reader`` is set before the SSE turn is dispatched (covering the
+        window before the reader loop runs its first iteration), and
+        ``_pending_consumers`` is held for the span of each reader loop. The
+        OpenAI-compatible paths deliberately do not set ``_has_reader`` -- that
+        flag also suppresses the global message broadcast, which those slots
+        still want -- so the counter is the only thing that sees them.
+        """
+        return self._pending_consumers > 0 or self._has_reader
+
+    @property
+    def _has_reader(self) -> bool:
+        """True while an HTTP SSE stream is draining this slot.
+
+        A property, not a plain field, because clearing it LIFTS the release
+        guard: the SSE reader sets it before the turn is dispatched and clears
+        it on ``done`` or on the way out, and a deferred release has to be
+        retried at that moment or never. Routing every write through the setter
+        means a future assignment site inherits the retry instead of silently
+        reopening the leak -- the same reason ``pending_consumer`` retries in its
+        ``finally`` rather than trusting its callers to remember.
+        """
+        return self._has_reader_flag
+
+    @_has_reader.setter
+    def _has_reader(self, value: bool) -> None:
+        was = self._has_reader_flag
+        self._has_reader_flag = bool(value)
+        if was and not self._has_reader_flag:
+            self._retry_deferred_release()
+
+    def _retry_deferred_release(self) -> int:
+        """Re-attempt a release that a consumer previously refused. Returns rows freed.
+
+        Called at each point the guard can lift -- the last consumer detaching
+        and ``_has_reader`` clearing. A no-op unless a release was actually
+        deferred, so an ordinary reader that drained its queue cleanly costs one
+        boolean test and changes nothing.
+        """
+        if not self._pending_release_deferred:
+            return 0
+        return self.release_pending_chunks()
+
+    @contextlib.contextmanager
+    def pending_consumer(self) -> Iterator[None]:
+        """Hold ``_pending`` as an attached delivery queue for the block.
+
+        Counted rather than boolean: nothing forbids two readers on one slot,
+        and a boolean would let the first to finish declare the queue unowned
+        while the second is still mid-stream.
+        """
+        self._pending_consumers += 1
+        try:
+            yield
+        finally:
+            self._pending_consumers = max(0, self._pending_consumers - 1)
+            # The detaching consumer may have been the only thing holding the
+            # queue. A consumer that drained cleanly leaves nothing to free; one
+            # that went away mid-stream (client hung up, exception) leaves the
+            # rows the turn-end purge already tried to drop, and this is the only
+            # moment anything looks at them again.
+            self._retry_deferred_release()
+
+    def release_pending_chunks(self) -> int:
+        """Drop undelivered ``chunk`` rows from ``_pending``; return how many.
+
+        ``append`` puts each streamed token row in BOTH ``messages`` and
+        ``_pending`` -- the same dict object in two lists -- so rewriting
+        ``messages`` alone frees nothing: the queue still holds a reference to
+        every chunk dict. On the WebSocket transport no reader ever drains, so
+        those references live until the slot takes another turn, and a slot
+        abandoned after a long streamed turn holds its whole token stream for
+        the process lifetime. Releasing here is what makes a window rewrite
+        actually reclaim the stream.
+
+        A no-op while a consumer is attached (see ``pending_has_consumer``):
+        there those rows are undelivered output, not garbage. The refusal is
+        RECORDED rather than forgotten, and retried when the guard lifts -- a
+        refusal that is silent and final would leave the OpenAI-compatible and
+        SSE transports leaking exactly as before, since their turn-end purge
+        lands while their reader is still attached and never runs again.
+        """
+        if self.pending_has_consumer:
+            self._pending_release_deferred = True
+            return 0
+        self._pending_release_deferred = False
+        before = len(self._pending)
+        if not before:
+            return 0
+        self._pending = [m for m in self._pending if m.get("role") != "chunk"]
+        return before - len(self._pending)
+
+    def purge_chunks(self) -> int:
+        """Drop every ``chunk`` row from the window and release the queue.
+
+        The single owner of "this turn's streamed tokens are now represented by
+        a finalized assistant message, so the raw chunk rows are dead". Callers
+        that rewrite ``messages`` themselves must still call
+        ``release_pending_chunks`` -- a window rewrite on its own leaves the
+        queue as the sole owner of every chunk dict.
+        """
+        self.messages = [m for m in self.messages if m.get("role") != "chunk"]
+        return self.release_pending_chunks()
+
+    def append_pending_context(self, entry: dict[str, Any]) -> None:
+        """Append one built context entry, pruning and FIFO-evicting first.
+
+        Shared by /context, /note, and the deferred-note promotion so the three
+        cannot drift on the ceiling. Expired entries are pruned BEFORE the
+        eviction because FIFO evicts by POSITION: without the prune a live entry
+        at index 0 is dropped while newer already-dead ones survive. An entry
+        that arrives already expired is dropped outright rather than seated.
+        """
+        now = time.time()
+        # A held note's maxAge can elapse while its turn runs, so an entry can
+        # arrive dead; seating it would evict a live one the drain would keep.
+        if context_entry_expired(entry, now):
+            return
+        self._pending_context[:] = [
+            e for e in self._pending_context if not context_entry_expired(e, now)
+        ]
+        while len(self._pending_context) >= _MAX_PENDING_CONTEXT:
+            self._pending_context.pop(0)
+        self._pending_context.append(entry)
+
+    def drop_foreign_authorized_notes(self) -> int:
+        """Discard note content authorized against a session this slot has left.
+
+        An immediate note is written while the slot routes to one session, but
+        BOTH halves resolve their destination late -- the queued half at the
+        next turn's drain, the visible row at the next save. An unbound slot can
+        acquire a foreign binding in between (a cron result or workflow
+        injection claims an empty ``linked_session_key`` with no running gate),
+        so content authorized for one conversation would otherwise be read as
+        belonging to another. Same rule the deferred flush applies, moved to the
+        seams the immediate writes actually resolve at. Returns the count
+        dropped. Unstamped entries are left alone: ``/context`` and the Slack
+        backfill share this queue and record no session.
+        """
+        # circular import: chat_utils imports state at module scope
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        live = effective_session_key(self)
+        dropped = 0
+        keep_ctx = [e for e in self._pending_context if not _note_authorized_elsewhere(e, live)]
+        if len(keep_ctx) != len(self._pending_context):
+            dropped += len(self._pending_context) - len(keep_ctx)
+            self._pending_context[:] = keep_ctx
+        keep_msgs = [
+            m for m in self.messages if not _note_authorized_elsewhere(m.get("meta"), live)
+        ]
+        if len(keep_msgs) != len(self.messages):
+            dropped += len(self.messages) - len(keep_msgs)
+            self.messages[:] = keep_msgs
+        if dropped:
+            sel().log_api_access(
+                caller="dashboard",
+                operation="note_rebind_drop",
+                outcome="denied",
+                source="app_isolation",
+                resources=f"slot={self.key} dropped={dropped}",
+                error="slot was rebound to another session after the note was written",
+            )
+            logger.warning(
+                "Slot %s dropped %d note item(s): authorized elsewhere, slot now routes to %s",
+                self.key,
+                dropped,
+                live,
+            )
+        return dropped
+
+    def deferred_context_count(self) -> int:
+        """Held notes whose context half has not reached the queue yet."""
+        return sum(1 for n in self._deferred_notes if n.get("context") is not None)
+
+    def flush_deferred_notes(self) -> int:
+        """Append notes that were held while a turn ran. Returns the count written.
+
+        A ``/note`` visible line must not land while a turn is in flight. The
+        replay path drops ``exclude_last_n=1`` to skip the current-turn user
+        message, and that count assumes exactly one recall-eligible row was
+        appended before the turn started. ``inject`` IS recall-eligible, so a
+        mid-turn note becomes the last such row and the exclusion falls on the
+        note instead -- replaying the user's request and sending it twice.
+
+        A note is owed to the next USER turn, so an AUTOMATIC successor is
+        withheld from rather than fed: synthesis (``_finish_queue_cycle``), a
+        queued item carrying a structural origin tag such as a cron
+        notification (``_start_next_queued_turn``), and every stage of a plan
+        (the stage loop, which does not flush at all). Each of those is followed
+        by a seam that DOES flush, so withholding delays delivery rather than
+        losing it -- ``_finish_queue_cycle`` for the queued and synthesis cases,
+        the stage loop's own exit for a plan, and the bulk-cleanup archive for a
+        slot torn down before any of them run.
+
+        Where it IS called above a turn's own user row, ordering is why: the
+        note's context half drains inside ``_run_chat``, so flushing after the
+        successor began would let the note shape a turn its visible line appears
+        below. The stage loop's exit also covers the paused and cancelled paths.
+        Idempotent -- a no-op when nothing is held.
+        """
+        if not self._deferred_notes:
+            return 0
+        # circular import: chat_utils imports state at module scope
+        from kiro_crew.dashboard.chat_utils import effective_session_key
+
+        held = self._deferred_notes[:]
+        self._deferred_notes.clear()
+        live_session = effective_session_key(self)
+        written = 0
+        for _idx, note in enumerate(held):
+            # A held note carries the session it was authorized against. An
+            # unbound slot can acquire a foreign binding while the note waits
+            # (a cron result or workflow injection claims an empty
+            # linked_session_key with no running gate), and both the transcript
+            # path and the next turn's session resolve that binding HERE, not at
+            # the POST. Writing anyway would surface content authorized for one
+            # conversation inside another, so a rebound slot drops the note and
+            # its context together rather than retargeting them.
+            authorized = note.get("session")
+            if authorized is not None and authorized != live_session:
+                sel().log_api_access(
+                    caller="dashboard",
+                    operation="note_flush",
+                    outcome="denied",
+                    source="app_isolation",
+                    resources=f"slot={self.key}",
+                    error="slot was rebound to another session while the note was held",
+                )
+                logger.warning(
+                    "Slot %s dropped a held note: authorized for %s, slot now routes to %s",
+                    self.key,
+                    authorized,
+                    live_session,
+                )
+                continue
+            # The context half is promoted HERE, not at the POST, because the
+            # drain runs inside the turn: an entry queued while that turn was
+            # starting is consumed by it, so the note shapes the request it was
+            # written after and the next turn never sees it at all.
+            # Popped rather than read: the two halves are written in sequence, so
+            # if the visible line below raises after this succeeded, the retry
+            # this note is restored for must not queue the context a second time.
+            ctx = note.pop("context", None)
+            try:
+                if ctx is not None:
+                    ctx["noteSession"] = live_session
+                    self.append_pending_context(ctx)
+                self.append(
+                    role="inject",
+                    content=note["content"],
+                    cls=note["cls"],
+                    broadcast=True,
+                    meta={"noteSession": live_session},
+                )
+            except Exception:
+                # The list was cleared above, and ``held`` is a local -- so an
+                # unwritten note dies with this frame unless it is put back.
+                # Restore this note and everything after it, AHEAD of anything
+                # queued since (they are older), then let the raise reach the
+                # caller's guard: every seam logs it and carries on, and the next
+                # seam retries these. Delivery is delayed, never lost.
+                self._deferred_notes[:0] = held[_idx:]
+                raise
+            written += 1
+        return written
 
     def mark_permission_resolved(self, approval_id: str, decision: str = "approved") -> None:
         """Update stored permission message cls JSON with resolved flag."""
@@ -2312,7 +3936,14 @@ class _ChatSlot:
         """
         self._last_enqueue_ts = datetime.now(timezone.utc).isoformat()
 
-    def queue_insert(self, index: int, content: str, kind: str = "", payload: str = "") -> str:
+    def queue_insert(
+        self,
+        index: int,
+        content: str,
+        kind: str = "",
+        payload: str = "",
+        meta: dict | None = None,
+    ) -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
         See :meth:`queue_append` for the ``kind`` structural origin tag. ``payload``
@@ -2321,13 +3952,75 @@ class _ChatSlot:
         message shares the recovery kind but is not machine speech.
         """
         qid = uuid.uuid4().hex[:12]
-        self._queue.insert(index, {"id": qid, "content": content, "kind": kind, "payload": payload})
+        entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind, "payload": payload}
+        if meta:
+            entry["meta"] = dict(meta)
+        self._queue.insert(index, entry)
         self._note_enqueue()
         return qid
 
     def queue_pop(self, index: int = 0) -> dict[str, str]:
         """Pop a queue item by index. Returns {"id": ..., "content": ...}."""
         return self._queue.pop(index)
+
+    def note_pending_subagent_delivery(self, content: str, agent_ids: list[str]) -> None:
+        """Record that a queued completion still owes *agent_ids* a delivery mark.
+
+        Called by the gateway when a sub-agent completion could not be injected
+        because the slot was busy. Until the row drains AND its turn consumes the
+        prompt, the result is not in the parent's context, so no ``delivered``
+        tombstone is written for those agents -- which is also what keeps their
+        ``result.txt`` alive across an arbitrarily long queue wait (issue #4839).
+
+        Keyed on the ANNOUNCE CONTENT, not the queue-entry id: a turn that fails
+        before the model consumed the prompt re-queues that same announce under a
+        freshly minted id (``build_recovery_requeue`` replays the message verbatim
+        while nothing has been emitted), and a debt keyed on the old id could never
+        be claimed by the retry that actually delivers it. The content embeds the
+        agent ids and their result paths, so it is the identity that survives.
+
+        An empty *agent_ids* records nothing: a stopped or failed member keeps the
+        tombstone its own terminal path wrote, and there is nothing to settle.
+
+        Entries are only ever removed by the row that settles them, because
+        anything cleverer races the drain: a turn's tail-drain pops the NEXT row
+        before the current turn's settlement callback runs, so "no longer queued"
+        does not mean "abandoned". A row that leaves the queue unconsumed therefore
+        leaves its entry behind, so the ledger is capped and evicts oldest-first --
+        in the fail-safe direction, since an unsettled agent keeps its folder and
+        is recovered by the next start's reconciliation.
+        """
+        if not content or not agent_ids:
+            return
+        key = _delivery_key(content)
+        owed = self._subagent_delivery_pending.setdefault(key, [])
+        owed.extend(a for a in agent_ids if a not in owed)
+        while len(self._subagent_delivery_pending) > _MAX_PENDING_SUBAGENT_DELIVERIES:
+            self._subagent_delivery_pending.pop(next(iter(self._subagent_delivery_pending)))
+
+    def owes_subagent_delivery(self, contents: list[str]) -> bool:
+        """Whether any of *contents* still owes a delivery mark. Read-only.
+
+        Lets the drain leave a row's dispatch completely untouched when it owes
+        nothing -- the overwhelmingly common case, including every ordinary
+        recovery replay -- instead of arming settlement machinery for it.
+        """
+        return any(_delivery_key(c) in self._subagent_delivery_pending for c in contents)
+
+    def take_pending_subagent_deliveries(self, contents: list[str]) -> list[str]:
+        """Claim the delivery marks owed by the given consumed completion rows.
+
+        Returns the agent ids whose result is now in the parent's context, in
+        drain order, and forgets them. Only the named rows are touched: sweeping
+        entries whose row is "no longer queued" would delete a SUCCESSOR's debt,
+        because the tail-drain at the end of a turn pops the next row while this
+        turn's settlement callback has not run yet -- and a consumed result left
+        unsettled is re-announced as an orphan by the next start.
+        """
+        claimed: list[str] = []
+        for content in contents:
+            claimed.extend(self._subagent_delivery_pending.pop(_delivery_key(content), []))
+        return claimed
 
     def queue_remove_by_id(self, queue_id: str) -> str | None:
         """Remove a queue item by ID. Returns the content or None if not found."""
@@ -2933,7 +4626,9 @@ class DashboardState:
         # Cloud provisioning launch jobs (lazy-init in handlers_cloud).
         self.cloud_launch_store: Any = None  # LaunchJobStore
         self.cloud_launch_cancels: Any = None  # dict[str, threading.Event]
-        self.cloud_launch_engine: Any = None  # test-injected LaunchEngine (None -> RealLaunchEngine)
+        self.cloud_launch_engine: Any = (
+            None  # test-injected LaunchEngine (None -> RealLaunchEngine)
+        )
         self.cloud_launch_sync: bool = False  # tests set True to run launches inline
         self.cloud_launch_reaped: bool = False  # orphan reap is once per process
         self.cloud_launch_lock: Any = None  # asyncio.Lock serializing launch creation
@@ -2943,6 +4638,7 @@ class DashboardState:
         self._mcp_gateway_manager: Any = None  # GatewayManager | None
         self._mcp_gateway_apply: Any = None  # async (enabled: bool) -> dict
         self._mcp_gateway_apply_stub: Any = None  # async () -> dict
+        self._mcp_resolve_refresh: Any = None  # async () -> dict
         # Secretary subsystem removed; kept as permanent None for apps/routes.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)
@@ -2981,6 +4677,14 @@ class DashboardState:
         # Short reason from the most recent Webex connection failure, empty
         # when connected or never attempted. Read by the settings badge.
         self.webex_connect_error: str = ""
+        # True only while the iMessage watch is live on the local bridge (kept
+        # truthful by IMessageClient.on_state_change). Read by the iMessage
+        # settings status badge.
+        self.imessage_connected: bool = False
+        # Short reason the iMessage channel is not running — a missing imsg
+        # binary, a Messages database the process cannot read (Full Disk
+        # Access), or a non-macOS host. Empty when connected or never attempted.
+        self.imessage_connect_error: str = ""
         # True only while the WeCom (企业微信) channel's WebSocket is connected
         # + subscribed (kept live by WeComClient.on_status, wired in
         # maybe_start_wecom). Read by the WeCom settings status badge.
@@ -3009,6 +4713,14 @@ class DashboardState:
         # Short reason from the most recent Weixin start failure, empty when
         # connected or never attempted. Read by the settings badge.
         self.weixin_connect_error: str = ""
+        # True only while the WhatsApp (QR-linked personal account) client's
+        # event loop is running (set in maybe_start_whatsapp). Read by the
+        # WhatsApp settings status badge — a paired session DB on disk is NOT
+        # enough to report "connected".
+        self.whatsapp_connected: bool = False
+        # Short reason from the most recent WhatsApp start failure, empty when
+        # connected or never attempted. Read by the settings badge.
+        self.whatsapp_connect_error: str = ""
         # Live channel transports (Telegram/WeCom/...) for channel-neutral
         # cross-surface mirror delivery — registered at boot by each channel's
         # gateway via ``register_channel_transport``. Slack keeps its dedicated
@@ -3106,16 +4818,23 @@ class DashboardState:
         self._context_snapshots_flush_lock = threading.Lock()
         self._folders: list[dict[str, Any]] = []  # project folder definitions
         self._cron_folders: list[dict[str, Any]] = []  # cron job folder groupings
+        # Malformed cron_folders.json entries dropped at load time, kept verbatim
+        # so save_cron_folders round-trips them back instead of erasing bytes it
+        # could not parse (mirrors the hooks store's unparsed-entry preservation).
+        self._unparsed_cron_folder_entries: list[Any] = []
         self._chat_pins: list[dict[str, Any]] = []  # pinned chat messages
         # Serializes pin mutation + persistence so concurrent requests cannot
         # interleave snapshots and replace chat_pins.json out of order.
-        self._chat_pins_lock = asyncio.Lock()
+        # LoopBoundLock, not asyncio.Lock (#4800): DashboardState outlives any
+        # single event loop (in-process gateway restart, test loops).
+        self._chat_pins_lock = LoopBoundLock()
         # Serializes read-modify-write of the folder store; see
         # mutate_folders(). Constructed here rather than lazily so two
         # concurrent first-callers cannot each make their own lock and
-        # serialize against nothing. asyncio.Lock binds no loop at
-        # construction (3.10+), so building it off-loop is safe.
-        self._folders_lock = asyncio.Lock()
+        # serialize against nothing. LoopBoundLock binds no loop at
+        # construction, so building it off-loop is safe — and it stays valid
+        # across the loop changes this long-lived state survives (#4800).
+        self._folders_lock = LoopBoundLock()
         # Tag vocabulary: list of {id, name, color, order}. User-managed.
         self._tags: list[dict[str, Any]] = []
         # True once load_tags() parsed tags.json successfully (or seeded a
@@ -3214,6 +4933,40 @@ class DashboardState:
     def get_channel_transport(self, channel_type: str) -> "MessagingTransport | None":
         """Return the registered transport for *channel_type*, or None."""
         return self.channel_transports.get(channel_type)
+
+    def channel_status(self) -> dict[str, dict[str, Any]]:
+        """Per-channel ``{connected, error}``, keyed by ``channel_type``.
+
+        Read off the same ``<channel>_connected`` / ``<channel>_connect_error``
+        attributes each channel's own settings endpoint reports, so one page cannot
+        disagree with another about whether a channel came up. A channel with no
+        attributes yet reads as not connected with no reason, which is the honest
+        answer for one that never started.
+
+        The error string is bounded here as well as at each settings endpoint: this
+        payload is polled, and a channel that reconnects in a loop would otherwise
+        publish an unbounded reason on every tick.
+        """
+        # Imported here rather than at module scope: `channels` imports every
+        # channel package, and those import this module through the gateway.
+        try:
+            from kiro_crew.channels import builtin_channel_descriptors
+
+            names = [d.channel_type for d in builtin_channel_descriptors()]
+        except Exception:
+            logger.debug("channel status: roster unavailable", exc_info=True)
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for name in names:
+            if name == "slack":
+                connected = self.slack_client is not None and self.slack_socket_connected
+            else:
+                connected = bool(getattr(self, f"{name}_connected", False))
+            out[name] = {
+                "connected": connected,
+                "error": str(getattr(self, f"{name}_connect_error", ""))[:120],
+            }
+        return out
 
     def wire_session_compact_callback(self) -> None:
         """Register the dashboard's compaction callback on the session manager."""
@@ -3477,11 +5230,15 @@ class DashboardState:
         *,
         cron_jobs: int | None = None,
         lessons: int | None = None,
-        update_available: bool = False,
-        update_self_updatable: bool = False,
-        update_checked: bool = False,
+        update_available: bool | None = None,
+        update_can_apply: bool = False,
+        update_check_status: str = "unchecked",
         update_command: str = "",
+        update_latest_version: str = "",
         update_channel: str = "",
+        update_managed_by: str = "",
+        update_commits_ahead: int = 0,
+        update_commits_behind: int = 0,
     ) -> dict[str, Any]:
         """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
         uptime = int(time.time() - self.start_time)
@@ -3495,22 +5252,30 @@ class DashboardState:
             "lessons": lessons if lessons is not None else self._count_lessons(),
             "subagents": self.subagents.count if self.subagents else 0,
             "update_available": update_available,
-            # Can THIS install replace its own code? Only a git checkout can
-            # (``POST /api/update`` is git fetch + reset). Shipped alongside the
-            # availability flag so the dashboard can offer an Update button that
-            # will actually work, instead of one that 409s on a wheel install —
-            # it must not have to run a fresh check just to learn the layout.
-            "update_self_updatable": update_self_updatable,
-            # Did a check ever reach a verdict? Without this the UI cannot tell
-            # "checked and current" from "never checked", and painting a green
+            # Can THIS install replace its own code without the user leaving the
+            # app? Only a git checkout can (``POST /api/update`` is git fetch +
+            # reset). Shipped alongside the availability flag so the dashboard can
+            # offer an Update button that will actually work, instead of one that
+            # 409s on a wheel install — it must not have to run a fresh check just
+            # to learn the layout.
+            "update_can_apply": update_can_apply,
+            # Where the check itself got to: "unchecked", "checking", "succeeded",
+            # "failed" or "deferred". ``update_available`` is only authoritative on
+            # "succeeded", and is null otherwise — without this pair the UI cannot
+            # tell "checked and current" from "never checked", and painting a green
             # "Up to date" pill next to a red "couldn't check" line is the exact
-            # half-truth the update-check contract exists to prevent.
-            "update_checked": update_checked,
+            # half-truth the update contract exists to prevent.
+            "update_check_status": update_check_status,
             # The upgrade command for an install that cannot replace itself, so the
             # 12-hourly BACKGROUND check can light the nav badge and still land the
             # user on something actionable. Deriving it only from a manual check
             # left the badge pointing at an Update button that 409s.
             "update_command": update_command,
+            # The candidate release's version string ("" until a check finds a
+            # newer build). The proactive update popup keys its per-version
+            # snooze/skip on this, so it rides the hot-path subset; the
+            # changelog text deliberately does not.
+            "update_latest_version": update_latest_version,
             # The release channel this INSTALL follows (the ``channel`` file
             # cli.sh wrote), empty when the layout has no channel at all (a git
             # checkout tracks a remote; a desktop bundle or container is updated
@@ -3520,6 +5285,19 @@ class DashboardState:
             # between switching channels and the new lane's build landing, so the
             # switcher must key on this one or it would snap back on every poll.
             "update_channel": update_channel,
+            # Who manages updates on this host: "" (self-managed), or the
+            # mechanism that owns them (e.g. "command" for a policy-pinned
+            # provider). The panel keys its update copy on this — a
+            # command-managed host must not render self-managed installer
+            # instructions its policy exists to bypass.
+            "update_managed_by": update_managed_by,
+            # Commit distance from a git checkout's upstream, both directions.
+            # DIVERGED (both > 0) reports ``update_available: False`` exactly
+            # like a current checkout — the destructive apply paths must never
+            # be offered local commits — so without the counts the badge cannot
+            # tell the two apart. 0/0 on non-git layouts and before any check.
+            "update_commits_ahead": update_commits_ahead,
+            "update_commits_behind": update_commits_behind,
             "no_crons": self.no_crons,
             "branch": branch,
             "commit": commit,
@@ -3540,9 +5318,14 @@ class DashboardState:
             # Require BOTH a wired client and the real connect outcome the
             # gateway records after _connect_slack. This is the same field
             # /api/slack/config already reports to the settings badge.
-            "slack_connected": (
-                self.slack_client is not None and self.slack_socket_connected
-            ),
+            "slack_connected": (self.slack_client is not None and self.slack_socket_connected),
+            # Every OTHER channel's live state, from the same flags each channel's
+            # settings badge reads. Only `slack_connected` reached this payload
+            # before, so System > Services was silent about a Telegram or Discord
+            # channel that failed to start — the operator saw a healthy page and a
+            # bot that never answered. Derived by roster loop, so the next channel
+            # is covered without touching this dict.
+            "channels": self.channel_status(),
             # Governance enforcement health: "active" (enforcing),
             # "disabled" (permissive default / not restricting), "degraded" (a
             # fail-closed trip, integrity mismatch, or unverified policy this
@@ -4853,6 +6636,12 @@ class DashboardState:
                     f"Slot {name!r} already exists with memory_mode={existing.memory_mode!r}"
                 )
             return existing
+        # A brand-new chat arrives with no name and is auto-minted here; restore
+        # and rehydrate always pass the persisted key as ``name`` (and
+        # get-existing returns above). Only the mint path is a genuine new
+        # user-initiated chat, so only it may count toward the survey's session
+        # window -- otherwise every restart re-counts each restored user slot.
+        minted_new = not name
         if not name:
             self._slot_counter += 1
             ts = int(time.time())
@@ -4895,6 +6684,22 @@ class DashboardState:
         # SlotOrigin.USER), so a caller that forgets to declare loses
         # visibility instead of leaking — the direction this has to fail in.
         slot._origin = origin or (SlotOrigin.APP if app else "")
+        if minted_new and slot._origin == SlotOrigin.USER:
+            # Count only genuine, newly-minted user chats toward the survey's
+            # "new user" window (session_pulse_counter). `minted_new` excludes
+            # restore/rehydrate (which passes the persisted key as name) and
+            # get-existing, so a restart never re-counts already-seen sessions;
+            # only the request layer ever supplies origin=USER. Best-effort:
+            # the helper swallows its own I/O errors and never raises into
+            # slot creation.
+            #
+            # Off the loop, because this method is synchronous and every
+            # request-layer birth runs it on the gateway loop -- the counter's
+            # read + mkdir + tempfile write + replace would stall it on slow
+            # storage. The offload is the counter's, not this allocation's: this
+            # block must not become a suspension point, or callers could observe
+            # a half-configured slot.
+            increment_user_session_count_off_loop()
         if memory_mode and memory_mode != "persistent":
             self._restricted_keys.add(f"dashboard:{name}")
         if ephemeral:
@@ -5139,11 +6944,51 @@ class DashboardState:
     ]
 
     def load_folders(self) -> None:
-        """Load folder definitions from disk."""
+        """Load folder definitions from disk, dropping rows nothing can use.
+
+        ``folders.json`` is hand-editable, and a bare ``json.loads`` admits
+        whatever it holds: a non-list document, a non-dict entry, or a row with
+        no ``id``. Every consumer matches rows by id, and ``mutate_folders``
+        snapshots the store with ``dict(row)`` -- which raises on a non-dict and
+        surfaces as a 500, since no middleware maps handler exceptions. So ONE
+        bad row would take out every folder read and write until someone edited
+        the file, and hardening each consumer in turn only moves where it dies.
+
+        Filtered here instead, at the single point the rows enter memory. A row
+        with no usable id can never be the row a request addresses, so dropping
+        it is the correct answer and not merely the safe one; it is logged so a
+        silently shrinking sidebar is explainable. Same per-entry isolation the
+        cron loader applies for the same reason.
+
+        The id must be a non-empty STRING, not merely truthy. Ids are minted as
+        ``uuid.uuid4().hex[:12]``, so anything else is already corrupt -- and a
+        merely-truthy test lets a list or dict id through, which then reaches
+        ``counts.get(f["id"])`` in the archived-count join and raises
+        ``TypeError: unhashable type`` from inside the folder GET. Admitting a
+        row that cannot be used is the same failure as not filtering at all.
+        """
         path = config_dir() / self._FOLDERS_FILE
         try:
             if path.exists():
-                self._folders = json.loads(path.read_text(encoding="utf-8"))
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw, list):
+                    logger.warning(
+                        "folders.json is a %s, not a list — ignoring it",
+                        type(raw).__name__,
+                    )
+                    return
+                kept = [
+                    f
+                    for f in raw
+                    if isinstance(f, dict) and isinstance(f.get("id"), str) and f["id"]
+                ]
+                if len(kept) != len(raw):
+                    logger.warning(
+                        "dropped %d unusable folder row(s) from folders.json "
+                        "(not a dict, or no id)",
+                        len(raw) - len(kept),
+                    )
+                self._folders = kept
         except Exception:
             logger.warning("Failed to load folders", exc_info=True)
 
@@ -5165,10 +7010,13 @@ class DashboardState:
         """Load cron folder definitions from disk.
 
         Validates the loaded shape: the file must contain a JSON array of
-        folder objects. Anything else (a hand-edited ``{}``, a string, or
-        malformed entries) is discarded with a warning instead of being
-        assigned verbatim — a non-list value would flow to the frontend
-        and crash grouping (``folders.map is not a function``).
+        folder objects. A non-list root (a hand-edited ``{}``, a string) is
+        ignored wholesale — it would crash frontend grouping
+        (``folders.map is not a function``). Individual malformed entries are
+        dropped from the active list but kept verbatim in
+        ``_unparsed_cron_folder_entries`` so the next ``save_cron_folders``
+        round-trips them back to disk rather than silently erasing a user's
+        hand-edited-but-typo'd folder (mirrors the hooks store's contract).
         """
         path = config_dir() / self._CRON_FOLDERS_FILE
         try:
@@ -5181,35 +7029,45 @@ class DashboardState:
                         type(loaded).__name__,
                     )
                     return
-                valid = [
-                    f
-                    for f in loaded
-                    if isinstance(f, dict)
-                    and isinstance(f.get("id"), str)
-                    and f.get("id")
-                    and isinstance(f.get("name"), str)
-                    and f.get("name")
-                    and isinstance(f.get("order"), (int, float))
-                    and not isinstance(f.get("order"), bool)
-                ]
-                if len(valid) != len(loaded):
+
+                def _is_valid(f: Any) -> bool:
+                    return (
+                        isinstance(f, dict)
+                        and isinstance(f.get("id"), str)
+                        and bool(f.get("id"))
+                        and isinstance(f.get("name"), str)
+                        and bool(f.get("name"))
+                        and isinstance(f.get("order"), (int, float))
+                        and not isinstance(f.get("order"), bool)
+                    )
+
+                valid = [f for f in loaded if _is_valid(f)]
+                unparsed = [f for f in loaded if not _is_valid(f)]
+                if unparsed:
                     logger.warning(
-                        "Dropped %d malformed entr(ies) while loading %s",
-                        len(loaded) - len(valid),
+                        "Preserving %d malformed entr(ies) while loading %s "
+                        "(kept verbatim, not active)",
+                        len(unparsed),
                         self._CRON_FOLDERS_FILE,
                     )
                 self._cron_folders = valid
+                self._unparsed_cron_folder_entries = unparsed
         except Exception:
             logger.warning("Failed to load cron folders", exc_info=True)
 
     def save_cron_folders(self) -> None:
         """Persist cron folder definitions to disk (atomic write).
 
-        Raises on I/O failure so callers can surface a 500 to the client
-        rather than silently losing the write.
+        Writes the active folders plus any malformed entries preserved at load
+        time (``_unparsed_cron_folder_entries``), so a save triggered by an
+        unrelated folder operation cannot erase bytes a hand-edit left in a
+        shape this loader could not validate. Raises on I/O failure so callers
+        can surface a 500 to the client rather than silently losing the write.
         """
         path = config_dir() / self._CRON_FOLDERS_FILE
-        self._atomic_write_json_strict(path, self._cron_folders)
+        unparsed = getattr(self, "_unparsed_cron_folder_entries", [])
+        payload: list[Any] = [*self._cron_folders, *unparsed]
+        self._atomic_write_json_strict(path, payload)
 
     def create_cron_folder(self, name: str, folder_id: str) -> dict:
         """Create a new cron folder and persist.
@@ -5312,7 +7170,7 @@ class DashboardState:
                 self._chat_pins = []
                 return
             raw = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        except (UnicodeDecodeError, ValueError) as exc:
             # Malformed content — treat as empty (data corruption).
             logger.warning("chat_pins.json has malformed content: %s", exc)
             self._chat_pins = []
@@ -5880,8 +7738,7 @@ class DashboardState:
             # connect it. Guaranteed here rather than left to hold incidentally
             # across the branches above.
             if not any(
-                row["channel"] == SLACK_NAMESPACE and row["direction"] != "origin"
-                for row in links
+                row["channel"] == SLACK_NAMESPACE and row["direction"] != "origin" for row in links
             ):
                 append_link(ChannelLink(SLACK_NAMESPACE, slack_channel, slack_ts), "out")
             return links, True, visible_slack_channel, slack_ts or ""
@@ -6359,9 +8216,7 @@ class DashboardState:
         if exc is not None:
             logger.debug("WS send failed (client likely disconnected): %s", exc)
 
-    def _ws_client_allowed(
-        self, ws: web.WebSocketResponse, msg_type: str, data: object
-    ) -> bool:
+    def _ws_client_allowed(self, ws: web.WebSocketResponse, msg_type: str, data: object) -> bool:
         """Return True if *ws* should receive an event with *msg_type* / *data*.
 
         Deny-by-default (CWE-269): every non-dashboard-user connection is gated
@@ -6497,9 +8352,7 @@ class DashboardState:
                 data[key], ws_app, allowed, self, msg_type=msg_type
             )
         except Exception:
-            self._log.warning(
-                "subagent batch filter failed; dropping items", exc_info=True
-            )
+            self._log.warning("subagent batch filter failed; dropping items", exc_info=True)
             items = []
         return json.dumps({"type": msg_type, "data": {key: items}})
 

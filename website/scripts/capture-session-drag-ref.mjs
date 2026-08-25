@@ -15,6 +15,11 @@
  *   3. An incognito session shows the REFUSAL state and drops nothing.
  *   4. Sending transmits a LINK to the session — and NOT its content.
  *
+ * Scenario 5 covers the OTHER refusal: the open session dragged onto its own
+ * pane. It is not a guard — nothing was withheld, the user aimed at the pane they
+ * dragged from — so it must not borrow the privacy copy or its warn tone. The
+ * harness photographs both refusals so a reviewer can see they read differently.
+ *
  * Usage: node scripts/capture-session-drag-ref.mjs [outDir]
  */
 import { chromium } from 'playwright'
@@ -53,6 +58,10 @@ const slots = [
   // and asserting the shared constant in unit tests covers both.
   slot(PRIVATE, 'Personal notes', { messages: 9, memory_mode: 'incognito' }),
 ]
+
+/** Only the flat-view scenario needs folders — the flat toggle exists solely to
+ *  escape a folder tree, so the lane never renders without at least one. */
+const FOLDERS = [{ id: 'f-release', name: 'Release work', order: 0 }]
 
 const detail = {
   running: false,
@@ -108,12 +117,15 @@ async function main() {
   })
 
   let page = null
-  async function load(theme) {
+  async function load(theme, { folders = [], flat = false } = {}) {
     if (page) await page.close()
     page = await context.newPage()
     logPageProblems(page)
-    await stubDashboardApi(page, { slots, theme, extra })
+    await stubDashboardApi(page, { slots, theme, extra, folders })
     await page.addInitScript(s => localStorage.setItem('mc-active-slot', s), ACTIVE)
+    // Flat view is a persisted sidebar preference, so seed it before boot
+    // rather than clicking the toggle (which is only rendered once folders load).
+    if (flat) await page.addInitScript(() => localStorage.setItem('mc-sidebar-flat-view', '1'))
     await page.goto(base + '/', { waitUntil: 'domcontentloaded' })
     await page.waitForTimeout(2500)
   }
@@ -147,7 +159,7 @@ async function main() {
    * past a 5px distance constraint, and collision detection reads pointer
    * coordinates on each move.
    */
-  async function dragSessionToPane(key, { drop = true, midShot = null } = {}) {
+  async function dragSessionToPane(key, { drop = true, midShot = null, onMid = null } = {}) {
     const row = page.locator(`[data-slot-key="${key}"]`).first()
     const from = await row.boundingBox()
     if (!from) throw new Error(`session row not found: ${key}`)
@@ -172,6 +184,31 @@ async function main() {
     const zone = page.getByTestId('chat-pane-drop-zone')
     const zoneVisible = (await zone.count()) > 0
     const refused = zoneVisible ? (await zone.first().getAttribute('data-refused')) !== null : null
+    // The REASON, not just the fact. The two refusals must stay distinguishable:
+    // 'private' is a guard, 'self' is a no-op, and one wearing the other's copy is
+    // exactly the regression this reads for.
+    const reason = zoneVisible ? await zone.first().getAttribute('data-refused') : null
+    // What the pill actually says, so the copy is asserted rather than trusted to
+    // follow from the reason attribute.
+    const pillText = zoneVisible ? (await zone.first().innerText()).trim() : null
+    // The drag preview must still be on screen out here, over the pane. The
+    // sidebar rides inside OverlayDrawer's morph clip-path and a clip-path clips
+    // fixed-position descendants too, so an in-place overlay is erased the
+    // moment the cursor leaves the sidebar — exactly the half of the gesture
+    // that aims at the chat. A layout box alone does not prove visibility
+    // (clipping does not shrink it), so also walk the ancestor chain: any
+    // clip-path above the ghost means it is being cut.
+    const ghostLoc = page.getByTestId('session-drag-ghost')
+    const ghostBox = (await ghostLoc.count()) ? await ghostLoc.first().boundingBox() : null
+    const ghostClipped = await page.evaluate(() => {
+      const g = document.querySelector('[data-testid="session-drag-ghost"]')
+      if (!g) return null
+      for (let el = g.parentElement; el; el = el.parentElement) {
+        if (getComputedStyle(el).clipPath !== 'none') return true
+      }
+      return false
+    })
+    const ghostOverPane = !!ghostBox && ghostBox.x >= pane.x && ghostClipped === false
     // Where the cue is drawn, so "anchored on the composer" is guarded rather
     // than eyeballed: the outline must sit ON the composer, and the pill just
     // above it — NOT floating in the middle of the transcript.
@@ -189,6 +226,7 @@ async function main() {
       }
     }
     if (midShot) await shot(midShot)
+    if (onMid) await onMid()
     if (drop) {
       await page.mouse.up()
       await page.waitForTimeout(600)
@@ -197,17 +235,39 @@ async function main() {
       await page.mouse.up()
       await page.waitForTimeout(300)
     }
-    return { zoneVisible, refused, anchored }
+    return { zoneVisible, refused, reason, pillText, anchored, ghostOverPane }
+  }
+
+  /** Crop tight around the drop pill (which only exists mid-drag). */
+  async function pillShot(name, text) {
+    const box = await page.getByText(text, { exact: false }).first().boundingBox()
+    if (!box) return shot(name)
+    const pad = 22
+    await page.screenshot({
+      path: `${OUT}/${name}.png`,
+      clip: {
+        x: Math.max(0, box.x - pad),
+        y: Math.max(0, box.y - pad),
+        width: Math.min(VIEW.width - Math.max(0, box.x - pad), box.width + pad * 2),
+        height: Math.min(VIEW.height - Math.max(0, box.y - pad), box.height + pad * 2),
+      },
+    })
+    console.log('wrote', `${OUT}/${name}.png`)
   }
 
   // ---------------------------------------------------------------- scenario 1
   // Normal session, dark theme: affordance mid-drag, then the staged chip.
   await load('dark')
   await shot('01-before-drag-dark')
-  const normal = await dragSessionToPane(REF, { midShot: '02-drop-zone-dark' })
+  const normal = await dragSessionToPane(REF, {
+    midShot: '02-drop-zone-dark',
+    onMid: () => pillShot('02b-invite-pill-dark', 'Drop to reference'),
+  })
   record('drop zone appears while dragging a session', normal.zoneVisible)
   record('drop zone invites (not refuses) a normal session', normal.refused === false)
+  record('an invited drag carries no refusal reason', normal.reason === null, `reason=${normal.reason}`)
   record('cue is anchored on the composer, not floating mid-pane', normal.anchored === true)
+  record('drag preview stays visible out over the pane', normal.ghostOverPane === true)
 
   const chip = page.locator('[data-testid="session-ref-chip"]')
   const chipCount = await chip.count()
@@ -218,8 +278,13 @@ async function main() {
 
   // ---------------------------------------------------------------- scenario 2
   // The privacy guard: incognito shows the refusal and drops nothing.
-  const priv = await dragSessionToPane(PRIVATE, { midShot: '04-refused-incognito-dark' })
+  const priv = await dragSessionToPane(PRIVATE, {
+    midShot: '04-refused-incognito-dark',
+    onMid: () => pillShot('04b-private-pill-dark', 'Private sessions'),
+  })
   record('drop zone refuses an incognito session', priv.refused === true)
+  record('the incognito refusal names itself as the privacy guard', priv.reason === 'private',
+    `reason=${priv.reason}`)
   record('a refused drag outlines no destination', priv.anchored === null)
   const afterPrivate = await page.locator('[data-testid="session-ref-chip"]').count()
   record('dropping an incognito session stages nothing', afterPrivate === chipCount,
@@ -272,6 +337,67 @@ async function main() {
   await dragSessionToPane(REF)
   const afterDup = await page.locator('[data-testid="session-ref-chip"]').count()
   record('re-dropping the same session does not duplicate', afterDup === 2, `count=${afterDup}`)
+
+  // ---------------------------------------------------------------- scenario 5
+  // The self-drop: the OPEN session dragged onto its own pane. A no-op, but the
+  // user's near-miss rather than a guard firing — so it must NOT reuse the privacy
+  // copy (which would assert something untrue about this session) or its warn
+  // tone. Fresh loads so neither theme inherits a staged chip from above.
+  const SELF_LINE = "Can't drop a session into itself"
+  for (const theme of ['dark', 'light']) {
+    await load(theme)
+    const self = await dragSessionToPane(ACTIVE, {
+      midShot: `10-self-drop-${theme}`,
+      onMid: () => pillShot(`10b-self-pill-${theme}`, SELF_LINE),
+    })
+    record(`${theme}: dragging the open session onto its own pane is refused`, self.refused === true)
+    record(`${theme}: the self-drop names itself 'self', not 'private'`, self.reason === 'self',
+      `reason=${self.reason}`)
+    record(`${theme}: the pill shows the recursive line`, (self.pillText ?? '').includes(SELF_LINE),
+      JSON.stringify(self.pillText))
+    record(`${theme}: the self-drop does NOT borrow the privacy copy`,
+      !(self.pillText ?? '').includes('Private sessions'), JSON.stringify(self.pillText))
+    record(`${theme}: the self-drop outlines no destination`, self.anchored === null)
+    const stagedAfterSelf = await page.locator('[data-testid="session-ref-chip"]').count()
+    record(`${theme}: dropping a session on itself stages nothing`, stagedAfterSelf === 0,
+      `chips=${stagedAfterSelf}`)
+  }
+
+  // ---------------------------------------------------------------- scenario 6
+  // FLAT view (every chat in one lane, no folder tree). The same gesture has to
+  // work here — and reordering still must not, which is why the lane's
+  // DndContext registers the chat pane and nothing else.
+  await load('dark', { folders: FOLDERS, flat: true })
+  const laneCount = await page.getByTestId('flat-view-lane').count()
+  record('flat view is the lane under test', laneCount === 1, `lanes=${laneCount}`)
+  const flatDrag = await dragSessionToPane(REF, { midShot: '11-flat-drag-dark' })
+  record('flat view: drop zone appears while dragging a session', flatDrag.zoneVisible)
+  record('flat view: drop zone invites (not refuses) a normal session', flatDrag.refused === false)
+  record('flat view: drag preview stays visible out over the pane', flatDrag.ghostOverPane === true)
+  const flatChips = await page.locator('[data-testid="session-ref-chip"]').count()
+  const flatChipKey = flatChips
+    ? await page.locator('[data-testid="session-ref-chip"]').first().getAttribute('data-session-ref')
+    : null
+  record('flat view: drop stages a chip for that session', flatChips === 1 && flatChipKey === REF,
+    `count=${flatChips} key=${flatChipKey}`)
+  await composerShot('12-flat-chip-staged-dark')
+  // Order stays a pure function of the sort key: no in-lane drop target exists,
+  // so there is nothing a release inside the sidebar could reorder against.
+  const inLaneTargets = await page.locator('[data-folder-drop]').count()
+  record('flat view: no in-lane drop target, so hand-reordering stays off', inLaneTargets === 0,
+    `targets=${inLaneTargets}`)
+  // A refused (private) session must be refused here too.
+  const flatPrivate = await dragSessionToPane(PRIVATE)
+  record('flat view: drop zone refuses an incognito session', flatPrivate.refused === true)
+  const afterFlatPrivate = await page.locator('[data-testid="session-ref-chip"]').count()
+  record('flat view: dropping an incognito session stages nothing', afterFlatPrivate === 1,
+    `chips 1 -> ${afterFlatPrivate}`)
+  // The rows are drag sources now, which must not swallow the tap that switches
+  // session — MouseSensor only activates past 5px, so a click is still a click.
+  await page.locator('[data-slot-key="chat-flake"]').first().click()
+  await page.waitForTimeout(700)
+  const switched = await page.locator('[data-slot-key="chat-flake"] .session-active').count()
+  record('flat view: clicking a row still switches session', switched === 1, `active=${switched}`)
 
   await page.close()
   await context.close()

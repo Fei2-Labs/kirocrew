@@ -211,3 +211,173 @@ describe('TimezoneSelect', () => {
     expect(onChange).toHaveBeenCalledWith('America/Los_Angeles')
   })
 })
+
+describe('SearchableSelect — free-text values', () => {
+  function openFonts(props: Partial<React.ComponentProps<typeof SearchableSelect>> = {}) {
+    const onChange = vi.fn()
+    render(
+      <SearchableSelect
+        options={[{ value: 'Menlo', label: 'Menlo' }, { value: 'Hack', label: 'Hack' }]}
+        value=""
+        onChange={onChange}
+        aria-label="Font"
+        customValueOption={typed => ({ label: `Use “${typed}”` })}
+        {...props}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    return onChange
+  }
+
+  it('offers the typed text as a row when nothing matches, and commits it verbatim', async () => {
+    const onChange = openFonts()
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Berkeley Mono' } })
+    const opts = screen.getAllByRole('option')
+    expect(opts).toHaveLength(1)
+    expect(opts[0]).toHaveTextContent('Use “Berkeley Mono”')
+    fireEvent.click(opts[0])
+    expect(onChange).toHaveBeenCalledWith('Berkeley Mono')
+  })
+
+  it('puts the free-text row LAST so Enter still commits the top real match', async () => {
+    const onChange = openFonts()
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Men' } })
+    const opts = screen.getAllByRole('option')
+    expect(opts).toHaveLength(2)
+    expect(opts[0]).toHaveTextContent('Menlo')
+    expect(opts[1]).toHaveTextContent('Use “Men”')
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+    expect(onChange).toHaveBeenCalledWith('Menlo')
+  })
+
+  it('ignores Enter on an UNFILTERED list, so opening the picker cannot overwrite the saved value', async () => {
+    // The first row of an unfiltered list matches nothing the user expressed;
+    // committing it would silently replace their choice with whatever sits on top.
+    const onChange = vi.fn()
+    render(
+      <SearchableSelect
+        options={[{ value: '', label: 'Default' }, { value: 'Hack', label: 'Hack' }]}
+        value="Hack"
+        onChange={onChange}
+        aria-label="Font"
+        customValueOption={typed => ({ label: `Use “${typed}”` })}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    await screen.findByRole('listbox')
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' })
+    expect(onChange).not.toHaveBeenCalled()
+  })
+
+  it('previews the typed row the way the caller shapes it', async () => {
+    openFonts({
+      customValueOption: typed => ({
+        label: `Use “${typed}”`,
+        sublabel: '0O1lI',
+        previewFontFamily: `'${typed}', monospace`,
+      }),
+    })
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Berkeley Mono' } })
+    expect(screen.getByText('Use “Berkeley Mono”'))
+      .toHaveStyle({ fontFamily: "'Berkeley Mono', monospace" })
+  })
+
+  it('does not offer a free-text row duplicating an option, whatever the casing', async () => {
+    openFonts()
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'hack' } })
+    const opts = screen.getAllByRole('option')
+    expect(opts).toHaveLength(1)
+    expect(opts[0]).toHaveTextContent(/^Hack$/)
+  })
+
+  it('offers no free-text row without a customValueOption — its presence IS the opt-in', async () => {
+    openFonts({ customValueOption: undefined })
+    await screen.findByRole('listbox')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Berkeley Mono' } })
+    expect(screen.queryAllByRole('option')).toHaveLength(0)
+    expect(screen.getByText('No matches')).toBeInTheDocument()
+  })
+
+})
+
+describe('SearchableSelect — action row', () => {
+  function renderWithAction(onSelect: () => void, actionStatus?: string) {
+    render(
+      <SearchableSelect
+        options={[{ value: 'Menlo', label: 'Menlo' }]}
+        value=""
+        onChange={() => {}}
+        aria-label="Font"
+        action={{ label: 'List all installed fonts…', onSelect }}
+        actionStatus={actionStatus}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+  }
+
+  it('fires the action and leaves the popup open, so a repopulating list stays visible', async () => {
+    const onSelect = vi.fn()
+    renderWithAction(onSelect)
+    await screen.findByRole('listbox')
+    fireEvent.click(screen.getByRole('button', { name: 'List all installed fonts…' }))
+    expect(onSelect).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('listbox')).toBeInTheDocument()
+  })
+
+  it('is arrow-reachable — it carries data-option, since Tab closes the popup', async () => {
+    const onSelect = vi.fn()
+    renderWithAction(onSelect)
+    const list = await screen.findByRole('listbox')
+    const action = screen.getByRole('button', { name: 'List all installed fonts…' })
+    // Enrolled in the roving-focus ring the listbox hook walks.
+    expect(list).toContainElement(action)
+    expect(action).toHaveAttribute('data-option')
+    fireEvent.keyDown(action, { key: 'Enter' })
+    expect(onSelect).toHaveBeenCalledTimes(1)
+  })
+
+  it('commits no value, so it is not an option', async () => {
+    renderWithAction(vi.fn())
+    await screen.findByRole('listbox')
+    expect(screen.getAllByRole('option')).toHaveLength(1)
+  })
+
+  it('reports the action outcome INSIDE the popup, which overlays the row below', async () => {
+    renderWithAction(vi.fn(), 'No fonts beyond the ones already listed.')
+    const list = await screen.findByRole('listbox')
+    expect(list).toContainElement(screen.getByText('No fonts beyond the ones already listed.'))
+  })
+
+  it('renders no action row when none is given', async () => {
+    render(
+      <SearchableSelect options={[{ value: 'Menlo', label: 'Menlo' }]} value="" onChange={() => {}} aria-label="Font" />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    await screen.findByRole('listbox')
+    expect(screen.queryByRole('button', { name: 'List all installed fonts…' })).not.toBeInTheDocument()
+  })
+})
+
+describe('SearchableSelect — per-option presentation', () => {
+  it('renders a row in its own font, so the choice is visible before it is made', async () => {
+    render(
+      <SearchableSelect
+        options={[{
+          value: 'Hack', label: 'Hack', sublabel: '0O1lI',
+          previewFontFamily: "'Hack', monospace",
+        }]}
+        value=""
+        onChange={() => {}}
+        aria-label="Font"
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Font' }))
+    await screen.findByRole('listbox')
+    expect(screen.getByText('Hack')).toHaveStyle({ fontFamily: "'Hack', monospace" })
+    expect(screen.getByText('0O1lI')).toHaveStyle({ fontFamily: "'Hack', monospace" })
+  })
+})

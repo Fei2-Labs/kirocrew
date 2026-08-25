@@ -11,12 +11,14 @@ package, so we load them by path with importlib. Everything here is stdlib and
 runs on the full CI matrix (3.10 + 3.12); the TOML path is version-guarded
 because tomllib is 3.11+.
 """
-import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
+
+from skill_script_helpers import load_skill_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr"
@@ -25,12 +27,7 @@ PROFILES_DIR = SKILL_DIR / "profiles"
 
 
 def _load(module_name, filename):
-    path = SCRIPTS_DIR / filename
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_skill_script(module_name, SCRIPTS_DIR / filename)
 
 
 resolve_profile = _load("_pp_resolve_profile", "resolve_profile.py")
@@ -300,12 +297,19 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
                 "the script scan above",
         "npm": "covered by the npm-script scan above",
         "npx": "covered by the npm-script scan and the tsc/eslint assertions",
-        "python": "covered by the scripts/ scan and the pytest gate",
-        "python3": "covered by the scripts/ scan and the pytest gate",
-        "unshare": "namespace wrapper around the pytest gate",
-        # Diagnostic only: the blob-reconcile step in frontend-coverage-merge
-        # always exits 0 and never changes a job verdict, so it is not a gate.
-        "node": "runs the diagnostic frontend-blob-reconcile step, which never gates",
+        "python": "covered by the scripts/ scan and the scoped-test gate, which "
+                  "runs pytest (or falls back to the full suite)",
+        "python3": "covered by the scripts/ scan and the scoped-test gate, which "
+                   "runs pytest (or falls back to the full suite)",
+        "unshare": "namespace wrapper around the backend test gate",
+        # node runs two kinds of step: the diagnostic blob-reconcile step in
+        # frontend-coverage-merge (always exits 0, never a gate) and the
+        # bundle-size gate. The latter IS a gate and is carried in gates[]
+        # (analyze-mode build + scripts/check-bundle-size.mjs); this exemption
+        # covers only the diagnostic step. A future gating node step must be
+        # added to gates[] by hand -- the tool scan cannot see through this
+        # exemption, so keep the reason accurate.
+        "node": "diagnostic blob-reconcile step; the gating bundle-size step is in gates[]",
     }
     tools = set(re.findall(r"(?m)^\s*run: ([a-z][a-z0-9_-]+) ", run_text))
     tool_missing = sorted(
@@ -318,20 +322,126 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     )
 
 
-def test_floor_typechecks_the_way_ci_does():
-    """`npm run typecheck` is a no-op gate; the floor must use `tsc -b`.
+def test_test_gates_are_diff_scoped_and_carry_a_base_ref():
+    """The test gates must be diff-aware, and that means a base ref is mandatory.
 
-    ci.yml documents this: the root tsconfig is `files: []` plus project
-    references, so `tsc --noEmit` -- what the `typecheck` script runs -- checks
-    ZERO files and always passes. A floor carrying the convenient script would
-    look enforced and catch nothing, which is worse than having no gate.
+    A diff-aware gate whose base ref is missing cannot know which surface the
+    change touches, so it would reduce the wrong suite -- a sibling of the
+    "no-op that always passes" failure `references/gate-floor.md` calls worse
+    than a missing gate. The runner fails closed on an empty base, so the floor's
+    job is to always supply one.
+    """
+    data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
+    gates = data["gates"]
+
+    for surface in ("backend", "frontend"):
+        entries = [g for g in gates if f"run_scoped_tests.py --surface {surface}" in g]
+        assert len(entries) == 1, f"expected exactly one {surface} test gate, got {entries}"
+        entry = entries[0]
+        assert "SCOPED_TESTS_BASE_REF=" in entry, (
+            f"the {surface} test gate must pass SCOPED_TESTS_BASE_REF; without it "
+            "the runner cannot know which surface the diff touches"
+        )
+        # Resolve-then-use, so an unresolvable base returns nonzero instead of
+        # inlining an empty substitution and reducing on nothing.
+        assert entry.startswith('BASE="$(git merge-base HEAD origin/main)" &&'), (
+            f"the {surface} test gate must resolve the base first and short-circuit"
+        )
+
+    assert "python3 scripts/run_scoped_tests.py --test" in gates, (
+        "the runner's self-test must sit ahead of its scans -- a PR that changes "
+        "the reducer has to fail the self-test, not silently reduce"
+    )
+
+
+def test_scoped_frontend_gate_keeps_the_lanes_npm_test_used_to_carry():
+    """A reduced frontend run must not silently drop jscpd or the Electron specs.
+
+    `npm --prefix website test` ran three things: `pretest` (jscpd), `test:website`
+    (vitest) and `test:electron`. The cross-surface path runs only vitest, so the
+    other two have to appear as gates in their own right or they vanish from the
+    floor without anyone deciding that they should.
+    """
+    data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
+    gates = "\n".join(data["gates"])
+    for script in ("jscpd", "test:electron"):
+        assert f"run {script}" in gates, (
+            f"{script!r} was covered transitively by `npm test`; the reduced "
+            "frontend gate does not run it, so it needs its own floor entry"
+        )
+
+
+def test_scoped_runner_self_test_passes():
+    """The runner's escalations are its whole contract, so CI runs its self-test.
+
+    Its `--test` mode asserts that an unresolvable base fails closed, that every
+    hardcoded broad-impact path resolves on disk, that surface ownership treats
+    documentation as backend-owned rather than inert, that the cross-surface list
+    arrives in each runner's own path space, and that a hostile target cannot
+    reach argv as an option. A green suite that never exercises those is not
+    evidence.
+    """
+    script = REPO_ROOT / "scripts" / "run_scoped_tests.py"
+    assert script.is_file(), "scripts/run_scoped_tests.py is missing"
+    proc = subprocess.run(
+        [sys.executable, str(script), "--test"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f"run_scoped_tests.py --test failed (rc={proc.returncode}):\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+
+
+def test_floor_typechecks_the_way_ci_does():
+    """The floor spells out `tsc -b` rather than going through an npm script.
+
+    Build mode is what makes the check real: the root tsconfig is `files: []`
+    plus project references, and references are followed only by `-b`, so any
+    single-project invocation there compiles an EMPTY program and passes
+    unconditionally. Naming the command directly means the floor cannot be
+    changed out from under itself by an edit to `package.json` -- the same reason
+    ci.yml's Type check step spells it out too.
     """
     gates = "\n".join(
         json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))["gates"]
     )
     assert "tsc -b" in gates, "the gate floor no longer type-checks with `tsc -b`"
     assert "run typecheck" not in gates, (
-        "the floor uses the `typecheck` npm script, which checks zero files"
+        "the floor reaches type-checking through an npm script, so a package.json "
+        "edit can silently change what this gate runs"
+    )
+
+
+def test_typecheck_script_actually_type_checks():
+    """`npm run typecheck` must run in BUILD mode, or it checks nothing at all.
+
+    `website/tsconfig.json` is a solution-style config -- `{"files": [], "references":
+    [...]}`. TypeScript follows `references` only in build mode, so `tsc --noEmit`
+    there compiles an empty program: measured 0 files listed, exit 0 with a genuine
+    type error present in `src/App.tsx`. `npm run check` chains this script, so the
+    one command that looks like a pre-push gate would pass over the whole tree.
+
+    Nothing else pins the spelling, so without this a revert to `tsc --noEmit`
+    restores a gate that is enforced in appearance only.
+    """
+    scripts = json.loads(
+        (REPO_ROOT / "website" / "package.json").read_text(encoding="utf-8")
+    )["scripts"]
+    typecheck = scripts["typecheck"]
+
+    assert "tsc -b" in typecheck, (
+        f"website `typecheck` script is {typecheck!r}; it must use build mode "
+        "(`tsc -b`) because the root tsconfig has `files: []` and a "
+        "non-build invocation there type-checks zero files"
+    )
+    assert "--noEmit" not in typecheck, (
+        f"website `typecheck` script is {typecheck!r}; `--noEmit` selects "
+        "single-project mode, which compiles an empty program against the "
+        "solution-style root tsconfig"
     )
 
 

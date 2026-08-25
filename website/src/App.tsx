@@ -1,20 +1,24 @@
-import { useEffect, useState, useCallback, useRef, useMemo, createContext, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useAppSelector, useAppDispatch, store } from './store'
-import { fetchSlots, sseStatus, setUpdateProgress, setEnabledAppIds, changeApprovalMode } from './store/dashboardSlice'
+import { useAppSelector, useAppDispatch, useAppStore, store } from './store'
+import { fetchSlots, sseStatus, setUpdateProgress, setEnabledAppIds, changeApprovalMode, updateSlot } from './store/dashboardSlice'
+import { pendingSlotSwitch, pendingSlotSwitchTarget, performSlotSwitch } from './lib/slotSwitch'
+import { performAgentSlotSwitch } from './lib/agentSwitch'
 // Side-effect: registers every built-in surface in the registry. MUST run
 // before `getBuiltinSurfaces()` is invoked below to compute `NAV_ITEMS`.
 import './surfaces/builtins'
 import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectSurfaceActivityCount, selectAllSurfacesAttention, surfaceLabel, surfacePreviewEnabled } from './surfaces/registry'
-import { createSlot, appendMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { createSlot, appendSlotMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
 import { queryComposer } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
 import { applyNavIntentInMain } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
 import { agentSwitchFailureMessage } from './utils/agentSwitchFeedback'
-import { fetchNotifications, ackNotification } from './store/notificationsSlice'
+import { updateAffordance } from './utils/updateAffordance'
+import { metricColor } from './utils/metricColor'
+import { fetchNotifications, ackNotification, armBootNotificationsFallback } from './store/notificationsSlice'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useDashboardHealthProbe } from './hooks/useDashboardHealthProbe'
 import { useTheme } from './hooks/useTheme'
@@ -24,6 +28,10 @@ import { useIsMobile } from './hooks/useIsMobile'
 import { useSidePanelDock } from './hooks/useSidePanelDock'
 import { usePreviewFlagRevision } from './hooks/usePreviewFlag'
 import { setRailWidth, railWidthFor } from './hooks/useRailWidth'
+import { useFocusMode, useFocusChromeVisible, setFocusChromeVisible, FOCUS_INSET } from './hooks/useFocusMode'
+import { computeHeaderDragGaps, type DragGap } from './lib/dragGaps'
+import { isEmbeddedPane } from './lib/embedded'
+import { useHoverIntent } from './hooks/useHoverIntent'
 import { useNativeNotification } from './hooks/useNativeNotification'
 import { useNotificationSound } from './hooks/useNotificationSound'
 import { recordSessionStart, recordEvent } from './rum'
@@ -33,14 +41,14 @@ import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
 import { isMetricNumber, metricNumber } from './utils/metrics'
-import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
+import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, Fullscreen, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
 import AgentImportFlow from './components/AgentImportFlow'
 import PrivacyChapter from './components/PrivacyChapter'
 import { OnboardingShellHost } from './components/OnboardingChapterShell'
-import { PREVIEW_FOCUS_EVENT } from './components/WebPreviewPanel'
+import { PREVIEW_EXPAND_EVENT } from './components/WebPreviewPanel'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePersistedBool } from './hooks/usePersistedBool'
 import { isMacElectron, isWinElectron, isLinuxFramelessElectron } from './lib/electron'
@@ -53,6 +61,7 @@ import ArtifactPopoutFrame from './pages/ArtifactPopoutFrame'
 import TerminalPopoutFrame from './pages/TerminalPopoutFrame'
 
 import ErrorBoundary from './components/ErrorBoundary'
+import AskAgentButton from './components/AskAgentButton'
 import AppIcon from './components/AppIcon'
 import Clickable from './components/Clickable'
 import MarkdownRenderer, { Lightbox } from './components/MarkdownRenderer'
@@ -96,14 +105,14 @@ import { getBuiltinIcon } from './apps/builtinIcons'
 import { getThemeBranding } from './themeBranding'
 import { getTopBarWidgets } from './apps/topBarWidgets'
 import { getCapsuleSegments } from './apps/capsuleSegments'
-import { FEATURE_REQUEST_PROMPT_WITH_SKILL, FEATURE_REQUEST_PROMPT_FALLBACK } from './prompts/featureRequest'
-import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
+import { FEATURE_REQUEST_PROMPT_FALLBACK } from './prompts/featureRequest'
+import { useKeyboardShortcuts, IS_MAC } from './hooks/useKeyboardShortcuts'
 import { useInstanceShortcuts } from './hooks/useInstanceShortcuts'
 import { useCommandPalette } from './hooks/useCommandPalette'
 import { useProvider } from './providers/context'
 import { useAgents } from './hooks/useAgents'
 import ShortcutsModal from './components/ShortcutsModal'
-import CommandPalette from './components/CommandPalette'
+import QuickSearchSurface from './components/QuickSearchSurface'
 import ReportProblemModal from './components/ReportProblemModal'
 import FeedbackPill from './components/FeedbackPill'
 import KiroAccountModal, { type KiroAccountUsage } from './components/KiroAccountModal'
@@ -111,7 +120,18 @@ import WindowsTitlebarMenu from './components/WindowsTitlebarMenu'
 
 import { i18nT } from './i18n/t'
 import { appNavTarget } from './appNav'
+import { resolveSlotOverlays, type SlotOwners } from './apps/overlaySlots'
 import { fmtCompact, fmtPercent } from './i18n/format'
+
+// Lazy on purpose: the update-found popup (its policy module, Trans runtime
+// wiring, and mutation plumbing) is dead weight for every session without an
+// update, and the app-core chunk is at its size budget. The `updateAvailable`
+// mount gate at the render site means the chunk is fetched exactly when it
+// can render.
+const UpdateFoundModal = lazy(() => import('./components/UpdateFoundModal'))
+// Same boundary, same reason: the pill renders nothing without an update,
+// so its code rides the on-demand chunk instead of the app core.
+const UpdatePill = lazy(() => import('./components/UpdatePill'))
 
 const MAX_KIRO_BONUS_GRANT_NAME_CHARS = 100
 const MAX_KIRO_BONUS_CREDITS = 1_000_000
@@ -131,6 +151,7 @@ interface AppListEntry {
     ui?: {
       entry?: string
       pages?: Array<{ route: string; icon?: string; iconUrl?: string; label?: string }>
+      overlays?: Array<{ id?: string; label?: string; replaces?: string }>
     }
   }
 }
@@ -169,10 +190,12 @@ const NAV_ITEMS = getBuiltinSurfaces().map(s => ({
   previewFlag: s.previewFlag,
 }))
 
-/** Usage color class: green (<70%), yellow (70-90%), red (>90%). */
-export function metricColor(pct: number): string {
-  return pct > 0.9 ? 'text-danger' : pct > 0.7 ? 'text-warn' : 'text-muted'
-}
+/** Re-exported for the topbar readout's existing consumers; defined in
+ *  `utils/metricColor` so a pure test need not import the app root.
+ *  `memColorClass` is the historical alias for the same function — preserved so
+ *  the moved definition does not silently drop a public `App.tsx` export a
+ *  downstream edition might still name. */
+export { metricColor }
 export const memColorClass = metricColor
 
 /**
@@ -782,6 +805,7 @@ function NotificationsBellButton() {
         onClick={() => { if (open) closePanel(); else openPanel() }}
         title={unacked.length > 0 ? `${unacked.length} notification${unacked.length === 1 ? '' : 's'}` : i18nT('app.notifications')}
         aria-label={i18nT('app.notifications')}
+        aria-haspopup="dialog"
         aria-expanded={open}
       >
         <Bell size={15} />
@@ -794,8 +818,15 @@ function NotificationsBellButton() {
       {(open || closing) && createPortal(
         <div
           ref={popoverRef}
-          className="fixed z-[60] pointer-events-none"
-          style={isMobile ? { top: 48, bottom: 0, left: 0, right: 0 } : { top: 48, bottom: 0, right: 0, left: 12 }}
+          // Anchored 48px below the viewport top, which the shell has pushed
+          // down by the top inset — top-safe-offset-[48px] adds both.
+          //
+          // Both branches inset horizontally too, because a landscape iPhone is
+          // ~852px wide and so takes the NON-mobile branch (isMobile is
+          // max-width:767px) — that is where the sensor housing sits beside the
+          // sheet's right edge. left-safe-or-3 keeps the desktop 12px gutter
+          // and widens to the inset only when there is one.
+          className={`fixed z-[60] pointer-events-none top-safe-offset-[48px] bottom-safe ${isMobile ? 'left-safe right-safe' : 'right-safe left-safe-or-3'}`}
         >
           <ErrorBoundary
             scope="notifications-bell"
@@ -893,7 +924,25 @@ export default function App() {
   // Gateway (web) update flag OR desktop updater availability (mirrored from
   // Electron update-state by useUpdateSubscription) -- both light the same
   // Settings nav dot below.
-  const updateAvailable = useAppSelector(s => s.dashboard.status?.update_available || s.dashboard.desktopUpdateAvailable)
+  //
+  // `=== true` because the gateway's verdict is NULLABLE: null means a check that
+  // never ran or failed, and a truthiness test on it would be fine while a
+  // `!== false` test would claim an update on no evidence. Availability alone
+  // never licenses an apply action -- see `canApplyUpdate`.
+  const updateAvailable = useAppSelector(
+    s => s.dashboard.status?.update_available === true || s.dashboard.desktopUpdateAvailable
+  )
+  // Can the GATEWAY replace its own code? False on a wheel install and on a
+  // desktop bundle, where `POST /api/update` answers 400/409.
+  const canApplyUpdate = useAppSelector(s => s.dashboard.status?.update_can_apply)
+  const updateCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
+  // Availability and capability are separate facts; `updateAffordance` is the one
+  // place that combines them, so the modal and the nav badge cannot disagree.
+  const affordance = updateAffordance({
+    updateAvailable: useAppSelector(s => s.dashboard.status?.update_available),
+    canApply: canApplyUpdate,
+    command: updateCommand,
+  })
   const version = useAppSelector(s => s.dashboard.status?.version) || '—'
   // Track whether the session-expired auth banner is currently injected by
   // api/client.ts. When auth is the real reason the gateway is unreachable,
@@ -1122,10 +1171,10 @@ export default function App() {
   const [navCollapsed, setNavCollapsed] = useState(() => localStorage.getItem('mc-nav') === '1')
   const navCollapsedRef = useRef(navCollapsed)
   navCollapsedRef.current = navCollapsed
-  // Preview focus (expand) mode from the Web Preview tab collapses the left nav
+  // Preview expand mode from the Web Preview tab collapses the left nav
   // as a STARTING layout, not a lock — the brand toggle keeps its standard
-  // behavior while focus mode is on, so the rail can be brought back without
-  // leaving the preview. This ref holds the pre-focus state to restore on exit,
+  // behavior while expand mode is on, so the rail can be brought back without
+  // leaving the preview. This ref holds the pre-expand state to restore on exit,
   // and is cleared the moment the user toggles the rail themselves so their
   // choice is not undone. `navCollapsed` is driven directly rather than ORed
   // with a transient flag, because an OR makes the toggle look broken.
@@ -1136,9 +1185,9 @@ export default function App() {
   // already-cleared ref and lose the restore value.
   const navAutoCollapsed = useRef<boolean | null>(null)
   useEffect(() => {
-    const onFocus = (e: Event) => {
-      const focused = !!(e as CustomEvent<{ focused?: boolean }>).detail?.focused
-      if (focused) {
+    const onPreviewExpand = (e: Event) => {
+      const expanded = !!(e as CustomEvent<{ expanded?: boolean }>).detail?.expanded
+      if (expanded) {
         if (navAutoCollapsed.current === null) navAutoCollapsed.current = navCollapsedRef.current
         setNavCollapsed(true)
         return
@@ -1147,10 +1196,172 @@ export default function App() {
       navAutoCollapsed.current = null
       if (prior !== null) setNavCollapsed(prior)
     }
-    window.addEventListener(PREVIEW_FOCUS_EVENT, onFocus)
-    return () => window.removeEventListener(PREVIEW_FOCUS_EVENT, onFocus)
+    window.addEventListener(PREVIEW_EXPAND_EVENT, onPreviewExpand)
+    return () => window.removeEventListener(PREVIEW_EXPAND_EVENT, onPreviewExpand)
   }, [])
   const isMobile = useIsMobile()
+  // Focus mode: the top bar and nav rail leave the shell grid and become
+  // edge-triggered hover overlays, so the active surface fills the window.
+  // Desktop only — on mobile the top bar carries the ONLY route back to
+  // navigation (the hamburger), so hiding it there strands the user.
+  const { enabled: focusMode, toggle: toggleFocusMode } = useFocusMode()
+  const focusActive = focusMode && !isMobile
+  // Peek overlays. Edge strips are deliberate targets (the pointer has to reach
+  // the very edge), so the open delay is much shorter than the hover-card
+  // default — a 320ms wait on an intentional gesture reads as lag.
+  const topPeekTrigger = useRef<HTMLDivElement | null>(null)
+  const topPeekSurface = useRef<HTMLElement | null>(null)
+  const railPeekTrigger = useRef<HTMLDivElement | null>(null)
+  const railPeekSurface = useRef<HTMLElement | null>(null)
+  const topPeek = useHoverIntent({
+    enabled: focusActive, openMs: 120, closeMs: 260,
+    triggerRef: topPeekTrigger, surfaceRef: topPeekSurface,
+    // The revealed header doubles as the window-drag surface, and a drag region
+    // eats pointer events before hit-testing — so closing must be POSITIONAL:
+    // only a mousemove observed below the header band closes the bar, and event
+    // silence (pointer resting on the draggable empty region, dragging the
+    // window, or off-window) can never hide it. 42 is the header's height (its
+    // inline style below); +6 slack so grazing the band's bottom edge does not
+    // count as departure.
+    departWhen: e => e.clientY > 48,
+  })
+  const railPeek = useHoverIntent({
+    enabled: focusActive, openMs: 120, closeMs: 260,
+    triggerRef: railPeekTrigger, surfaceRef: railPeekSurface,
+    // Positional close, same contract as the top peek: only a mousemove observed
+    // to the RIGHT of the rail band closes it. Needed once edge-slam opening
+    // exists — an overlay opened with the pointer OFF-window has no
+    // enter/leave history for the event-based close to work from. 236 is the
+    // rail track width; +12 slack.
+    departWhen: e => e.clientX > 248,
+  })
+  // Edge-slam reveal: overshooting a trigger straight OUT of the window must
+  // OPEN the overlay, not cancel it (the overshoot fires mouseleave on its way
+  // out, which reads as departure — yet it is the strongest possible statement
+  // of intent, the same gesture that reveals the macOS Dock). `mouseout` with
+  // relatedTarget null is "the pointer left the document"; the event's
+  // coordinates are the last in-window sample, so a small clientY says it left
+  // through the top and a small clientX through the left. 20px is wider than the
+  // 10px trigger strips on purpose: a slam is coarse. Corner exits prefer the
+  // top bar (clientY checked first).
+  //
+  // Applies on every surface, including embedded instance panes (iframes with
+  // no Electron bridge) and browser tabs. In a browser a trip to the tab strip
+  // or URL bar also exits through the top and pops the header; that false
+  // positive is transient (the header closes as soon as the pointer re-enters
+  // below the band) and is accepted in exchange for the slam working uniformly.
+  useEffect(() => {
+    if (!focusActive) return
+    const onOut = (e: MouseEvent) => {
+      if (e.relatedTarget !== null) return
+      if (e.clientY <= 20) topPeek.openNow()
+      else if (e.clientX <= 20) railPeek.openNow()
+    }
+    document.addEventListener('mouseout', onOut)
+    return () => document.removeEventListener('mouseout', onOut)
+  }, [focusActive, topPeek.openNow, railPeek.openNow])
+  // A header-owned popover keeps the header on screen.
+  //
+  // The instance switcher's menu is portaled to document.body (Radix), so moving
+  // the pointer into it reads as leaving BOTH the trigger strip and the header:
+  // the close grace elapses, the header slides away, and the menu's anchor moves
+  // out from under it while the user is still using it.
+  //
+  // The signal is `aria-haspopup` AND `aria-expanded="true"`, not aria-expanded
+  // alone: the readout capsule's connection dot is an inline expand/collapse that
+  // ships `aria-expanded="true"` by default with nothing popped open, so an
+  // aria-expanded-only query would pin the header permanently from first paint.
+  //
+  // CONTRACT for header controls: any popover anchored in the header MUST render
+  // `aria-haspopup` on its trigger (Radix primitives do; hand-rolled ones must
+  // add it) — without it the header slides away under the open popover in focus
+  // mode. That is also the accessible-markup the control owes a screen reader,
+  // so the heuristic deliberately rides on it rather than on a bespoke attribute.
+  const [headerPopoverOpen, setHeaderPopoverOpen] = useState(false)
+  useEffect(() => {
+    if (!focusActive) { setHeaderPopoverOpen(false); return }
+    const header = topPeekSurface.current
+    if (!header) return
+    const read = () => setHeaderPopoverOpen(!!header.querySelector('[aria-haspopup][aria-expanded="true"]'))
+    read()
+    // childList as well as the attribute: a trigger can be mounted already-open
+    // (or unmounted while open), which an attribute-only filter never sees.
+    const mo = new MutationObserver(read)
+    mo.observe(header, { subtree: true, childList: true, attributes: true, attributeFilter: ['aria-expanded'] })
+    return () => mo.disconnect()
+  }, [focusActive])
+  // Is the dashboard header on screen right now? ONE fact, because the two
+  // pieces of Electron chrome that cannot be reached from the DOM both follow it
+  // and must not disagree: the native macOS traffic lights (AppKit views painted
+  // at a window coordinate) and the injected 42px window-drag bar.
+  const topChromeShown = topPeek.open || headerPopoverOpen
+  // An embedded pane cannot reach the host window's chrome itself: it is a
+  // cross-origin iframe with no preload, so the native traffic lights and the
+  // injected drag bar are unreachable from here. Relay the state up and let the
+  // host apply it — which is what makes the lights appear over a PANE's peeked
+  // header, not just the local one.
+  useEffect(() => {
+    if (!isEmbeddedPane()) return
+    try {
+      // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
+      window.parent?.postMessage({ type: 'mc-focus-chrome', v: 1, on: !focusActive || topChromeShown }, '*')
+    } catch {
+      /* no parent / cross-origin restriction — the next change re-posts */
+    }
+  }, [focusActive, topChromeShown])
+  const focusChromeVisible = useFocusChromeVisible()
+  // Control-free spans of the LOCAL header's band, for the macOS drag strips
+  // below — the same geometry a remote pane relays via mc-drag-gaps, computed
+  // directly since the local header lives in this document. Measured when the
+  // header is revealed (its controls are laid out by then; the slide is a
+  // transform, which does not move layout rects).
+  const [localHeaderDragGaps, setLocalHeaderDragGaps] = useState<DragGap[]>([])
+  useEffect(() => {
+    if (!(focusActive && isMacElectron && topChromeShown)) { setLocalHeaderDragGaps([]); return }
+    const header = topPeekSurface.current
+    if (!header) return
+    const measure = () => setLocalHeaderDragGaps(computeHeaderDragGaps(header, window.innerWidth))
+    measure()
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
+  }, [focusActive, topChromeShown])
+  useEffect(() => {
+    // The drag bar reads these classes (see the #electron-drag-bar rules in
+    // electron/main.js). Left at 42px while the header is hidden it is a drag
+    // region over the content focus mode just reclaimed: a drag region is
+    // resolved by the compositor before hit-testing, so the top band stops
+    // answering hover — including the hover that summons the header back. At
+    // 42px while the header IS shown it is what makes the revealed bar draggable
+    // by its empty regions, since the injected rules exempt every control on it.
+    document.body.classList.toggle('mc-focus-mode', focusActive)
+    document.body.classList.toggle('mc-focus-chrome', focusChromeVisible)
+    // The rail's own drop shadow is gated the same way, for the same reason the
+    // header's is: both stay MOUNTED and slide, so a shadow that is always on
+    // paints its tail into the content while the surface itself is off screen.
+    document.body.classList.toggle('mc-focus-rail', railPeek.open)
+    const api = (window as Window & { electronAPI?: { setFocusModeChrome?: (v: boolean) => void } }).electronAPI
+    api?.setFocusModeChrome?.(focusChromeVisible)
+  }, [focusActive, focusChromeVisible, railPeek.open])
+  // Same re-assert on window focus. Button visibility is window state this
+  // renderer does not own, so a fullscreen round-trip or the OS re-showing the
+  // buttons leaves the effect above with nothing to react to. Idempotent.
+  useEffect(() => {
+    if (!focusActive) return
+    const reassert = () => {
+      const api = (window as Window & { electronAPI?: { setFocusModeChrome?: (v: boolean) => void } }).electronAPI
+      api?.setFocusModeChrome?.(focusChromeVisible)
+    }
+    window.addEventListener('focus', reassert)
+    return () => window.removeEventListener('focus', reassert)
+  }, [focusActive, focusChromeVisible])
+  // Unmount-only restore, deliberately separate from the effect above: folding it
+  // into that cleanup would fire on every peek and flicker the buttons back on
+  // between the two commits.
+  useEffect(() => () => {
+    document.body.classList.remove('mc-focus-mode', 'mc-focus-chrome', 'mc-focus-rail')
+    const api = (window as Window & { electronAPI?: { setFocusModeChrome?: (v: boolean) => void } }).electronAPI
+    api?.setFocusModeChrome?.(true)
+  }, [])
   const [sidePanelDock] = useSidePanelDock()
   // Side panel docked to the bottom (desktop only) swaps the shell from a
   // 3-column grid with a full-height right rail to a 2-column grid with an
@@ -1160,6 +1371,25 @@ export default function App() {
   // (the native dashboard); a non-null id means a remote instance's embedded
   // dashboard is shown instead, so the Local pane is hidden (not unmounted).
   const activeInstanceId = useAppSelector(s => s.instances.activeId)
+  // Publish "is the chrome on screen" for the window, but only while no remote
+  // pane is filling it. When one is, the PANE owns the answer and relays it up
+  // (see the mc-focus-chrome handler in InstancesViewport): the peek the user is
+  // driving is the pane's, and this shell is display:none behind it. Two writers,
+  // one active at a time, so they cannot fight over the value.
+  useEffect(() => {
+    if (activeInstanceId !== null) return
+    setFocusChromeVisible(!focusActive || topChromeShown)
+  }, [activeInstanceId, focusActive, topChromeShown])
+  // Re-assert the Electron chrome state when the visible PANE changes. Not because
+  // the answer depends on which pane is showing — it does not — but because
+  // switching hides the local shell without necessarily changing the value above,
+  // so nothing re-sent it and the last send was simply trusted to have stuck. It
+  // had not: the traffic lights came back.
+  useEffect(() => {
+    if (!focusActive) return
+    const api = (window as Window & { electronAPI?: { setFocusModeChrome?: (v: boolean) => void } }).electronAPI
+    api?.setFocusModeChrome?.(focusChromeVisible)
+  }, [activeInstanceId, focusActive, focusChromeVisible])
   // Whether the shell's one-shot entrance animation has already played.
   //
   // The local pane is HIDDEN, not unmounted, while a remote instance tab is
@@ -1198,9 +1428,13 @@ export default function App() {
   // shown up while only the Main branch was gated.
   const advertisedNavItems = useMemo(
     () => NAV_ITEMS.filter(surfacePreviewEnabled),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- the revision is an
-    // invalidation token: what `surfacePreviewEnabled` reads lives in
-    // localStorage, not in React state, so nothing else here can express the dep.
+    // The revision is an invalidation token: what `surfacePreviewEnabled` reads
+    // lives in localStorage, not in React state, so nothing else here can
+    // express the dep. The directive stays on ONE line directly above the deps
+    // array -- `eslint-disable-next-line` targets the literal next line, so a
+    // rationale wrapped after it aims the directive at its own continuation and
+    // suppresses nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [previewFlagRevision],
   )
   // Apps nav reorder is dnd-kit sortable (mirrors QueueStack): rows reflow to
@@ -1248,13 +1482,22 @@ export default function App() {
   // lingers. Mirrors ChatSidebar's handleSidebarDragCancel.
   const handleAppDragCancel = useCallback(() => setActiveAppDragId(null), [])
   const appNavRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Monotonic stamp for app-nav fetches. Cancelling a pending RETRY is not enough:
+  // a fetch already in flight cannot be cancelled, so a slow mount response landing
+  // after an enable/disable refresh would publish stale slot ownership and bind the
+  // quick-search gesture to the wrong surface. Only the newest generation may write.
+  const appNavGenRef = useRef(0)
+  const [slotOwners, setSlotOwners] = useState<SlotOwners>({})
+  const queryClient = useQueryClient()
   const refreshAppNav = useCallback((attempt = 0) => {
     // Cancel any pending retry up-front so external triggers (the reconnect
     // effect, the mc:apps-changed handler) or a just-fired retry can never run
     // overlapping fetch chains — exactly one chain is ever active.
     if (appNavRetryRef.current) { clearTimeout(appNavRetryRef.current); appNavRetryRef.current = null }
+    const gen = ++appNavGenRef.current
     api.listApps()
       .then((apps: AppListEntry[]) => {
+        if (gen !== appNavGenRef.current) return
         const items = apps
           .flatMap(a => {
             // Eligibility, route, id and label come from the shared derivation in
@@ -1294,8 +1537,17 @@ export default function App() {
           })
         setAppNavItems(items)
         dispatch(setEnabledAppIds(items.map(i => i.id)))
+        // Publish this response under the shared apps key so readers that want the
+        // list -- an overlay opened later, the palette's apps provider -- are served
+        // from cache instead of issuing a second identical request.
+        queryClient.setQueryData(['apps'], apps)
+        // Which app (if any) currently owns a host overlay slot. Derived from the
+        // SAME response as the nav rail — an app-contributed overlay costs no
+        // extra request, and the shell never names a specific app.
+        setSlotOwners(resolveSlotOverlays(apps))
       })
       .catch(() => {
+        if (gen !== appNavGenRef.current) return
         // A transient failure (e.g. the gateway mid-restart right after a
         // `kirocrew update`, or the cold apps-dir scan) used to be swallowed
         // here, leaving the Apps rail empty until a manual reload or an app
@@ -1304,16 +1556,35 @@ export default function App() {
         if (attempt >= APP_NAV_MAX_RETRIES) return
         appNavRetryRef.current = setTimeout(() => refreshAppNav(attempt + 1), APP_NAV_RETRY_BASE_MS * 2 ** attempt)
       })
-  }, [dispatch])
+  }, [dispatch, queryClient])
   useEffect(() => {
     refreshAppNav()
     return () => { if (appNavRetryRef.current) clearTimeout(appNavRetryRef.current) }
   }, [refreshAppNav])
   useEffect(() => {
-    const handler = () => refreshAppNav()
+    const handler = () => {
+      // Mark the shared ['apps'] cache stale BEFORE the refetch: refreshAppNav
+      // publishes fresh data only on fetch SUCCESS (setQueryData), so when its
+      // bounded retry chain exhausts, an un-invalidated cache would keep
+      // serving stale rows marked fresh. Invalidating up front makes that
+      // failure mode stale-but-marked-stale, which is what lets dispatch
+      // sites skip a local ['apps'] invalidation of their own.
+      // refetchType 'none' keeps refreshAppNav the single fetcher: without it,
+      // an active ['apps'] observer (the /apps page) would refetch immediately
+      // on invalidation, duplicating the request refreshAppNav is about to make.
+      queryClient.invalidateQueries({ queryKey: ['apps'], refetchType: 'none' })
+      refreshAppNav()
+      // The Explore shelf's install state lives in the server-computed
+      // `installed` flag on the `['registry']` rows, which are cached with a
+      // multi-minute staleTime. Every install/uninstall/enable surface
+      // announces itself through this event, so drop that cache here too —
+      // otherwise a just-installed registry app keeps rendering a "Get"
+      // button until the cache expires.
+      queryClient.invalidateQueries({ queryKey: ['registry'] })
+    }
     window.addEventListener('mc:apps-changed', handler)
     return () => window.removeEventListener('mc:apps-changed', handler)
-  }, [refreshAppNav])
+  }, [refreshAppNav, queryClient])
   // Refetch the Apps nav when the gateway connection is *re*-established after a
   // drop — e.g. a `kirocrew update` restart disconnects then reconnects the
   // WebSocket. Only fires on a connected→disconnected→connected cycle, NOT the
@@ -1375,7 +1646,6 @@ export default function App() {
   })
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
   const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger)
-  const queryClient = useQueryClient()
   const provider = useProvider()
   const agentSwitchNotice = useAppSelector(s => s.chat.agentSwitchNotice)
   useEffect(() => {
@@ -1383,51 +1653,95 @@ export default function App() {
     const timer = window.setTimeout(() => dispatch(setAgentSwitchNotice(null)), 6000)
     return () => window.clearTimeout(timer)
   }, [agentSwitchNotice, dispatch])
-  const switchActiveSlotAgent = useCallback((slot: string, agent: string) => {
+  const switchActiveSlotAgent = useCallback(async (slot: string, agent: string) => {
     dispatch(setAgentSwitchNotice(null))
-    void api.chatSlotAgent(slot, agent)
-      .catch(error => dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error))))
+    try {
+      // Same protocol as onCycleModel below (#4523): without the store write
+      // the acting tab depends on the coalesced slots rebroadcast to see its
+      // own pick. performAgentSlotSwitch mirrors exactly what the response
+      // names ({agent, workspace} as one adjudicated pair; project is left
+      // to the rebroadcast).
+      await performAgentSlotSwitch(slot, agent, store.dispatch)
+    } catch (error) {
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error)))
+    }
   }, [dispatch])
   useKeyboardShortcuts({ onToggleShortcutsModal: toggleShortcutsModal, onNewChat: () => newChatMutation.mutate(), disabled: shortcutsOpen,
+    onToggleFocusMode: toggleFocusMode,
     onCycleAgent: () => {
       const slots = store.getState().dashboard.slots
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot || installedAgents.length === 0) return
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const currentAgent = currentSlot?.agent || defaultAgent
+      // Step from the newest in-flight target when one exists — see
+      // onCycleModel below. Agent names are never '', so the ''-falsy
+      // accessor is safe here.
+      const currentAgent = pendingSlotSwitch('agent', activeSlot) || currentSlot?.agent || defaultAgent
       const idx = installedAgents.findIndex((a: { name: string }) => a.name === currentAgent)
       const nextIdx = (idx + 1) % installedAgents.length
-      switchActiveSlotAgent(activeSlot, installedAgents[nextIdx].name)
+      void switchActiveSlotAgent(activeSlot, installedAgents[nextIdx].name)
     },
     onCyclePrevAgent: () => {
       const slots = store.getState().dashboard.slots
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot || installedAgents.length === 0) return
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const currentAgent = currentSlot?.agent || defaultAgent
+      // See onCycleAgent above.
+      const currentAgent = pendingSlotSwitch('agent', activeSlot) || currentSlot?.agent || defaultAgent
       const idx = installedAgents.findIndex((a: { name: string }) => a.name === currentAgent)
       const prevIdx = (idx - 1 + installedAgents.length) % installedAgents.length
-      switchActiveSlotAgent(activeSlot, installedAgents[prevIdx].name)
+      void switchActiveSlotAgent(activeSlot, installedAgents[prevIdx].name)
     },
-    onCycleReasoningEffort: () => {
+    onCycleReasoningEffort: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const current = currentSlot?.reasoning_effort || ''
-      const idx = REASONING_EFFORT_LEVELS.indexOf(current)
+      // Step from the newest in-flight target (see onCycleModel below). ''
+      // is a REAL effort target (provider default), so this base uses the
+      // null-aware accessor — the ''-falsy one would misread an in-flight
+      // "back to default" as "nothing pending" and mis-step the burst.
+      const base = pendingSlotSwitchTarget('reasoning_effort', activeSlot)
+        ?? (currentSlot?.reasoning_effort || '')
+      const idx = REASONING_EFFORT_LEVELS.indexOf(base)
       const nextIdx = (idx + 1) % REASONING_EFFORT_LEVELS.length
-      api.chatSlotReasoningEffort(activeSlot, REASONING_EFFORT_LEVELS[nextIdx])
+      const level = REASONING_EFFORT_LEVELS[nextIdx]
+      try {
+        await performSlotSwitch('reasoning_effort', activeSlot, level,
+          async () => {
+            const r = await api.chatSlotReasoningEffort(activeSlot, level)
+            return r?.reasoning_effort ?? level
+          },
+          (value) => store.dispatch(updateSlot({ key: activeSlot, reasoning_effort: value })))
+      } catch (e) {
+        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
+        console.error('onCycleReasoningEffort failed', e)
+      }
     },
-    onCyclePrevReasoningEffort: () => {
+    onCyclePrevReasoningEffort: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const current = currentSlot?.reasoning_effort || ''
-      const idx = REASONING_EFFORT_LEVELS.indexOf(current)
+      // See onCycleReasoningEffort above.
+      const base = pendingSlotSwitchTarget('reasoning_effort', activeSlot)
+        ?? (currentSlot?.reasoning_effort || '')
+      const idx = REASONING_EFFORT_LEVELS.indexOf(base)
       const prevIdx = (idx - 1 + REASONING_EFFORT_LEVELS.length) % REASONING_EFFORT_LEVELS.length
-      api.chatSlotReasoningEffort(activeSlot, REASONING_EFFORT_LEVELS[prevIdx])
+      const level = REASONING_EFFORT_LEVELS[prevIdx]
+      try {
+        await performSlotSwitch('reasoning_effort', activeSlot, level,
+          async () => {
+            const r = await api.chatSlotReasoningEffort(activeSlot, level)
+            return r?.reasoning_effort ?? level
+          },
+          (value) => store.dispatch(updateSlot({ key: activeSlot, reasoning_effort: value })))
+      } catch (e) {
+        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
+        console.error('onCyclePrevReasoningEffort failed', e)
+      }
     },
     onCycleApprovalMode: () => {
       const state = store.getState()
@@ -1447,30 +1761,69 @@ export default function App() {
       const prev = APPROVAL_MODE_LEVELS[(idx - 1 + APPROVAL_MODE_LEVELS.length) % APPROVAL_MODE_LEVELS.length]
       store.dispatch(changeApprovalMode({ mode: prev, slot: activeSlot }))
     },
-    onCycleModel: () => {
+    onCycleModel: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
       const models = queryClient.getQueryData<{ name: string }[]>(['available-models', provider.id])
       if (!models || models.length === 0) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const currentModel = currentSlot?.model || ''
-      const idx = currentModel ? models.findIndex(m => m.name === currentModel) : -1
+      // Step from the newest IN-FLIGHT target when one exists: each press of a
+      // burst must advance one step even though the store base has not
+      // settled yet — recomputing from the store made a rapid triple-press
+      // send the same "next" three times and land one step ahead (#4523).
+      const base = pendingSlotSwitch('model', activeSlot) || currentSlot?.model || ''
+      const idx = base ? models.findIndex(m => m.name === base) : -1
       const nextIdx = (idx + 1) % models.length
-      api.chatSlotModel(activeSlot, models[nextIdx].name)
+      const name = models[nextIdx].name
+      // Same protocol as ChatPage.switchModel (#4523): without the store
+      // write a dead websocket wedges the cycle on one step; the shared
+      // per-slot registry means neither the other cycle direction, the
+      // dropdown, nor another slot's press can interleave stale.
+      try {
+        await performSlotSwitch('model', activeSlot, name,
+          async () => {
+            const r = await api.chatSlotModel(activeSlot, name)
+            return r?.model ?? name
+          },
+          (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
+      } catch (e) {
+        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
+        console.error('onCycleModel failed', e)
+      }
     },
-    onCyclePrevModel: () => {
+    onCyclePrevModel: async () => {
       const activeSlot = store.getState().chat.activeSlot
       if (!activeSlot) return
       const models = queryClient.getQueryData<{ name: string }[]>(['available-models', provider.id])
       if (!models || models.length === 0) return
       const slots = store.getState().dashboard.slots
       const currentSlot = slots.find((s: { key: string }) => s.key === activeSlot)
-      const currentModel = currentSlot?.model || ''
-      const idx = currentModel ? models.findIndex(m => m.name === currentModel) : -1
+      // See onCycleModel above.
+      const base = pendingSlotSwitch('model', activeSlot) || currentSlot?.model || ''
+      const idx = base ? models.findIndex(m => m.name === base) : -1
       const prevIdx = idx <= 0 ? models.length - 1 : idx - 1
-      api.chatSlotModel(activeSlot, models[prevIdx].name)
+      const name = models[prevIdx].name
+      try {
+        await performSlotSwitch('model', activeSlot, name,
+          async () => {
+            const r = await api.chatSlotModel(activeSlot, name)
+            return r?.model ?? name
+          },
+          (value) => store.dispatch(updateSlot({ key: activeSlot, model: value })))
+      } catch (e) {
+        store.dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(e)))
+        // eslint-disable-next-line no-console -- failure diagnostic; the notice above already told the user
+        console.error('onCyclePrevModel failed', e)
+      }
     },
+    // Panel toggles. The sidebar lives here in App; the session list and the
+    // activity panel live on the chat page and already listen for these window
+    // events (their in-header buttons dispatch the same ones).
+    onToggleLeftSidebar: () => toggleNav(),
+    onToggleSessionPanel: () => window.dispatchEvent(new Event('toggle-pin-chat-sidebar')),
+    onToggleSidePanel: () => window.dispatchEvent(new Event('toggle-activity-panel')),
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,
   // 2=first remote, … — matching the InstanceTabBar left-to-right tab order.
@@ -1650,9 +2003,16 @@ export default function App() {
         gcOrphanedStorage(liveIds)
       }
     })
-    dispatch(fetchNotifications())
+    // The boot notifications fetch is owned by the WebSocket first-connect
+    // handler (its snapshot is taken after socket registration, so nothing
+    // can fall between snapshot and push -- see notificationsSlice). This
+    // only arms the fallback for a socket that never connects.
+    // Return the thunk promise: a late first connect serializes its own fetch
+    // behind this one via markBootNotificationsFetched() (see notificationsSlice).
+    const disarmNotificationsFallback = armBootNotificationsFallback(() => dispatch(fetchNotifications()))
     // Fetch status immediately to sync YOLO state (WS status push is periodic)
     api.status().then(s => { dispatch(sseStatus(s)); recordSessionStart(s) }).catch(() => {})
+    return disarmNotificationsFallback
   }, [dispatch])
   const { subscribeLogs, subscribeSubagents, forceReconnect } = useWebSocket()
   useDashboardHealthProbe(forceReconnect)
@@ -1726,31 +2086,78 @@ export default function App() {
     }
   }, [])
 
+  // The Provider's store, for reads inside async callbacks (requestFeature):
+  // the module-level singleton would bypass a test-injected store.
+  const appStore = useAppStore()
   const requestFeature = useCallback(async () => {
-    // Resolve skill availability in the dashboard so the agent never needs
-    // to probe the filesystem (which would trigger a tool-approval prompt).
-    let msg = FEATURE_REQUEST_PROMPT_FALLBACK
-    try {
-      const skills: { name: string }[] = await api.skills()
-      if (skills.some(s => s.name === 'feature-request')) {
-        msg = FEATURE_REQUEST_PROMPT_WITH_SKILL
-      }
-    } catch { /* skill list unavailable — use the self-contained fallback */ }
     const result = await dispatch(createSlot(undefined)).unwrap()
     const slot = result.key
+    const visibleMessage = i18nT('app.i_d_like_to_request_a_feature')
     navigate('/chat')
-    dispatch(appendMessage({ role: 'user', content: i18nT('app.i_d_like_to_request_a_feature'), cls: '', ts: new Date().toISOString() }))
-    dispatch(setSlotRunning(true))
+    // Both optimistic writes are addressed to the slot this flow CREATED, not
+    // the active one: createSlot.fulfilled has a switched-away guard, so when
+    // the user changes session while the create round-trip is in flight the
+    // new slot is registered but never activated — an active-slot append would
+    // put the bubble in an unrelated session's transcript, and an
+    // unconditional running flag would mark that session busy for a turn it
+    // never started (review finding on #4198).
+    dispatch(appendSlotMessage({ slot, message: { role: 'user', content: visibleMessage, cls: '', ts: new Date().toISOString() } }))
+    if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(true))
+    // A send the server never accepted has to say so where the request landed
+    // (#4198): an HTTP 4xx/5xx RESOLVES rather than rejecting, so the catch
+    // alone never saw the errors that matter — a refused send left the
+    // optimistic bubble on screen next to a slot stuck `running`, with nothing
+    // said. The error row is addressed to the slot that OWNS the bubble, not
+    // the active one (the user can switch sessions while the POST is in
+    // flight); the optimistic `running` is undone only while that slot is
+    // still on screen, because `slotRunning` describes the ACTIVE slot and
+    // clearing it after a switch would clobber another session's live
+    // indicator (a stale flag on this slot self-heals from the server snapshot
+    // on the next switch-back). The payload is a canned constant, so unlike
+    // the chat composers there is no typed text to hand back — the retry
+    // affordance is the feedback pill itself.
+    const reportFailedSend = (reason?: string) => {
+      // FRAMED, not bare: a raw backend reason ("slot agent mismatch") reads
+      // as the agent erroring mid-work, not as "your request never went out".
+      // Both keys are core-owned siblings, so an app's catalog cannot reword a
+      // core error row.
+      dispatch(appendSlotMessage({
+        slot,
+        message: {
+          role: 'error',
+          content: reason ? i18nT('pages.chatPage.send_failed_with_error', { error: reason }) : i18nT('pages.chatPage.send_failed'),
+          cls: '',
+        },
+      }))
+      if (appStore.getState().chat.activeSlot === slot) dispatch(setSlotRunning(false))
+    }
     try {
-      await api.sendChat(msg, slot, colorTheme)
-    } catch { /* WS will handle response */ }
-  }, [dispatch, navigate, colorTheme])
+      // maxAge bounds the seed's lifetime: if the visible send below fails,
+      // the queued instructions expire server-side (drain_pending_context
+      // discards expired entries) instead of silently attaching the
+      // feature-request workflow to a later, unrelated message.
+      await api.chatSlotContext(slot, FEATURE_REQUEST_PROMPT_FALLBACK, { source: 'feature-request', maxAge: 60 })
+    } catch { /* Send the visible request even if hidden context is unavailable. */ }
+    try {
+      const r = await api.sendChat(visibleMessage, slot, colorTheme)
+      const body = await r.json().catch(() => ({}))
+      // Resolution is not success: the server accepted neither `ok` nor
+      // `queued`, so no turn started and no WS response is coming.
+      if (!body.ok && !body.queued) reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
+    } catch { reportFailedSend() }
+  }, [dispatch, navigate, colorTheme, appStore])
 
   const toggleNav = () => {
     if (isMobile) { setMobileNavOpen(p => !p) }
-    else {
-      // The user has taken ownership of the rail: leaving preview focus mode
-      // must not overwrite this with the pre-focus state.
+    else if (focusActive) {
+      // The rail is a hover-held overlay in focus mode and always full width, so
+      // there is no collapsed state to toggle into. The same control puts it away
+      // instead — which is what its left-pointing chevron already reads as, and it
+      // leaves the user's collapse preference untouched for when focus mode is off.
+      railPeek.close()
+    } else {
+      // The user has taken ownership of the rail: leaving preview expand mode
+      // must not overwrite this with the pre-expand state.
       navAutoCollapsed.current = null
       setNavCollapsed(prev => { const next = !prev; safeSetItem('mc-nav', next ? '1' : '0'); return next })
     }
@@ -1759,14 +2166,19 @@ export default function App() {
   useEffect(() => { if (isMobile) setMobileNavOpen(false) }, [location.pathname]) // eslint-disable-line react-hooks/exhaustive-deps
   // Reset mobile nav state when leaving mobile viewport
   useEffect(() => { if (!isMobile) setMobileNavOpen(false) }, [isMobile])
-  const effectiveCollapsed = navCollapsed && !isMobile
+  // Focus mode forces the rail EXPANDED regardless of the user's collapse
+  // preference. A collapsed rail is 74px, and as a hover-held overlay that is a
+  // hard target to keep the pointer inside — it puts itself away the moment you
+  // drift off it. `navCollapsed` still holds the preference, so leaving focus mode
+  // restores whatever the user had.
+  const effectiveCollapsed = navCollapsed && !isMobile && !focusActive
   // Publish the rail track so consumers outside the shell can size against the
   // space actually left for content — ChatPage's activity panel decides
   // beside-vs-fill from it. Kept in sync with the gridTemplateColumns value
   // below; railWidthFor is the single source for both.
   useEffect(() => {
-    setRailWidth(railWidthFor({ isMobile, collapsed: effectiveCollapsed }))
-  }, [isMobile, effectiveCollapsed])
+    setRailWidth(focusActive ? 0 : railWidthFor({ isMobile, collapsed: effectiveCollapsed }))
+  }, [isMobile, effectiveCollapsed, focusActive])
   // The header's three grid tracks (see `.topbar` in index.css) size themselves:
   // the search width is a function of the window, the two side groups split the
   // remainder, and each group re-lays-out its own contents with a container
@@ -1846,7 +2258,7 @@ export default function App() {
       <div className="absolute inset-0" style={{ display: activeInstanceId === null ? 'block' : 'none' }}>
     <div
       data-testid="dashboard-shell"
-      className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
+      className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg p-safe ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
       // Retire the entrance animation once it has played, so re-showing this
       // pane cannot replay it. Guarded on BOTH the keyframe name and the event
       // target: `animationend` bubbles, and descendants (banners, cards) use
@@ -1859,13 +2271,21 @@ export default function App() {
         gridTemplateAreas: isMobile ? '"topbar" "content"' : bottomDock ? '"topbar topbar" "nav content" "nav actbar"' : '"topbar topbar topbar" "nav content actbar"',
         ...(!isMobile && {
           gridTemplateColumns: bottomDock
-            ? `${railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr)`
-            : `${railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr) auto`,
+            ? `${focusActive ? 0 : railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr)`
+            : `${focusActive ? 0 : railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr) auto`,
           // Transition fires only when the template string itself changes (the
           // collapse toggle) — content-driven resizes of the auto track (e.g.
           // the Activity panel opening) don't alter the value, so keeping this
           // unconditional is safe and avoids the gated-pulse snap regression.
           transition: 'grid-template-columns 150ms cubic-bezier(0.2, 0, 0, 1)',
+        }),
+        // Focus mode collapses the chrome tracks. Inline so it beats the Tailwind
+        // `grid-rows-[42px_...]` class rather than having to fight it there, and
+        // so the one platform that needs a gutter (see FOCUS_INSET) can keep it.
+        ...(focusActive && {
+          gridTemplateRows: bottomDock
+            ? `${FOCUS_INSET}px minmax(0,1fr) auto`
+            : `${FOCUS_INSET}px minmax(0,1fr)`,
         }),
       }}
     >
@@ -1879,9 +2299,64 @@ export default function App() {
       {/* Skip to content — visible only on focus for keyboard users */}
       <a href="#main-content" className="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-[9999] focus:px-4 focus:py-2 focus:rounded-lg focus:bg-accent focus:text-accent-fg focus:text-sm focus:font-medium">{i18nT('app.skip_to_content')}</a>
 
+      {/* Focus mode: edge strips that summon the hidden chrome. Rendered before
+          the chrome itself, but BELOW it in z-order (61 vs 62): the chrome covers
+          the strip it was summoned by, so hover and clicks land on the chrome's own
+          surface handlers and the strip never has to resize or opt out of
+          hit-testing — a hit target that changes under a resting pointer is what
+          made this flicker open/closed indefinitely. `focus-peek-strip` carries `-webkit-app-region:no-drag`, which
+          is load-bearing on the TOP one: Electron injects a 42px drag bar on
+          document.body, and an ordinary div inside it becomes a window-drag
+          region whose hover never reaches React. */}
+      {focusActive && (
+        <>
+          <div
+            ref={topPeekTrigger}
+            data-testid="focus-peek-top"
+            aria-hidden="true"
+            className="focus-peek-strip focus-peek-top absolute left-0 right-0 top-0 z-[61]"
+            {...topPeek.triggerProps}
+          />
+          <div
+            ref={railPeekTrigger}
+            data-testid="focus-peek-rail"
+            aria-hidden="true"
+            className="focus-peek-strip focus-peek-rail absolute left-0 bottom-0 z-[61]"
+            // Starts below the top strip so the two tile the corner rather than
+            // overlapping, where whichever won would be arbitrary.
+            style={{ top: FOCUS_INSET }}
+            {...railPeek.triggerProps}
+          />
+        </>
+      )}
+
       {/* Topbar */}
       {/* stable theming hook — see website/docs/theming-contract.md */}
-      <header className="topbar topbar-glass relative pl-2 pr-3 z-[45]" style={{ gridArea: 'topbar' }}>
+      <header
+        ref={topPeekSurface}
+        className="topbar topbar-glass relative pl-2 pr-3 z-[45]"
+        // In focus mode the header leaves the grid and becomes an overlay
+        // positioned against the shell (which is already `relative`), NOT the
+        // viewport: `position: fixed` would be measured against whichever
+        // ancestor happens to establish a containing block, and the shell is the
+        // app area either way. It stays MOUNTED and slides — unmounting it would
+        // tear down the notification/metrics popovers it owns and lose their
+        // state on every peek. z-[62] clears the whole chat-pane stack (max 61)
+        // and the rail (50) while staying under the update banner (70), side
+        // sheets (89/90) and every modal (100+).
+        style={focusActive
+          ? {
+            position: 'absolute',
+            top: 0, left: 0, right: 0, height: 42,
+            zIndex: 62,
+            transform: topChromeShown ? 'translateY(0)' : 'translateY(-100%)',
+            transition: 'transform 200ms cubic-bezier(0.2, 0, 0, 1)',
+            // Hidden chrome must not eat clicks aimed at the content beneath it.
+            pointerEvents: topChromeShown ? 'auto' : 'none',
+          }
+          : { gridArea: 'topbar' }}
+        {...(focusActive ? topPeek.surfaceProps : {})}
+      >
         {/* Left: mobile menu toggle + inline instance selector. The brand now
             lives in the sidebar (item 1.1). The selector reuses InstanceTabBar's
             visibility rule — it renders nothing unless >=1 remote instance
@@ -1907,20 +2382,26 @@ export default function App() {
           {!isMobile && isWinElectron && <WindowsTitlebarMenu />}
 
           {isMobile && (
-            <button className="p-2 rounded-md bg-transparent border-none cursor-pointer text-muted hover:text-text shrink-0" onClick={toggleNav} aria-label={i18nT('app.open_menu')}>
-              {/* `Menu` is the one icon in this app whose artwork does NOT fill its
-                  box: lucide draws its three rules from x=4 in a 24-unit viewBox, and
-                  the round cap adds half a stroke, so 3 units of the box are empty on
-                  the left. At size 20 that is 3 * 20/24 = 2.5px, which put the visible
-                  glyph at 18.5px while the button's box sat correctly on the 16px
-                  gutter -- reading as indented against a card border directly below it.
-                  A transform, not a margin: the box, the hit target and the hover pill
-                  stay on the 8px grid, and no sibling in the cluster shifts. Sized off
-                  the icon's own geometry, which `narrowFirstBaseline.test.ts` re-derives
-                  from lucide so a version bump that recentres `Menu` fails loudly.
-                  Icons that DO fill their box need none of this: the chat session
-                  toggle's `MessageSquare` starts at x=2, i.e. 0.67px at size 16. */}
-              <Menu size={20} className="-translate-x-[2.5px]" />
+            <button className="group p-2 rounded-md bg-transparent border-none cursor-pointer text-muted hover:text-text shrink-0" onClick={toggleNav} aria-label={i18nT('app.open_menu')}>
+              {/* The product logo, not a generic menu glyph. A narrow layout has exactly
+                  one nav affordance, and it opens the same rail whose header carries this
+                  same `avatar` on a wide one -- so it is the same asset, the same
+                  `rounded-md object-contain` treatment and the same hover tilt, which is
+                  live here because this bar is what a NARROW WINDOW gets, not only a
+                  touch device. Reading `avatar` rather than importing a file is what
+                  keeps a theme-supplied or user-configured logo in step: the branding
+                  registry resolves it once for the whole shell.
+
+                  A full-colour raster mark is an <img>, which is exactly what the
+                  `use-lucide-icons` rule's brand-mark exception prescribes -- a CSS mask
+                  over `currentColor` would flatten the art to one colour.
+
+                  Square box, so no optical correction exists: the art is square and
+                  `object-contain` fills the box, putting the ink on the 16px page gutter
+                  (topbar pl-2 + this button's p-2) that the page title and every card's
+                  left edge below it sit on, with the button's own box at 24 + 16 = 40px
+                  for the tap target. `narrowFirstBaseline.test.ts` re-derives that sum. */}
+              <img src={avatar} alt="" aria-hidden="true" className="w-6 h-6 rounded-md shrink-0 object-contain transition-transform duration-300 group-hover:rotate-[-8deg]" />
             </button>
           )}
           <InstanceTabBar variant="inline" />
@@ -1928,18 +2409,61 @@ export default function App() {
         {/* Centre track: the ⌘K trigger. A flow item, not an overlay — its width
             is the track's width, so it can never sit under a sibling cluster and
             never has to be dropped to stay clear of one. On mobile the same
-            track holds the icon-only form below. */}
+            track holds the icon-only form below.
+
+            Wrapped with the focus-mode toggle in ONE flex cell rather than added
+            as a fourth grid child: `.topbar` declares exactly three tracks, so a
+            bare sibling would be auto-placed into `.tb-right` and land inside the
+            readout capsule's cluster. Two controls, which is the ceiling
+            website/AUTOSDE.yaml's max-two-buttons-per-row sets. */}
         {!isMobile && (
+          <div data-topbar-overlay className="flex items-center gap-1.5 min-w-0">
           <button
             type="button"
-            data-topbar-overlay
             onClick={commandPalette.openPalette}
-            className="h-7 w-full px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-hover transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
-            aria-label={i18nT('app.search_sessions_files_and_commands')}
-            title={i18nT('app.search_everywhere_k')}
+            className="h-7 flex-1 min-w-0 px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-hover transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
+            /* The trigger has to describe the surface it actually opens. While an app
+               owns the quick-search slot the gesture opens a launcher -- typing runs
+               commands and does not search the corpora this label promises -- so
+               naming "search for anything" there is the most visible mispromise in
+               the product. */
+            aria-label={
+              slotOwners['quick-search']
+                ? i18nT('app.open_command_bar')
+                : i18nT('app.search_sessions_files_and_commands')
+            }
+            // Gated on the same condition as the label and aria-label above. Leaving
+            // this one unconditional made the hover contradict the words under the
+            // cursor and promise the corpus search the launcher deliberately omits --
+            // the diff's own fix applied to two of three attributes. The owned branch
+            // drops "(K)" because the chord is already printed in the visible label.
+            title={
+              slotOwners['quick-search']
+                ? i18nT('app.open_command_bar')
+                : i18nT('app.search_everywhere_k')
+            }
           >
-            <span className="text-[13px] truncate min-w-0">{i18nT('app.k_search_for_anything')}</span>
+            <span className="text-[13px] truncate min-w-0">
+              {slotOwners['quick-search']
+                ? i18nT('app.k_run_a_command')
+                : i18nT('app.k_search_for_anything')}
+            </span>
           </button>
+          {/* Focus mode. `aria-pressed` rather than a second label, so a screen
+              reader gets the state from the control instead of from copy that
+              would have to be kept in step with the icon. */}
+          <button
+            type="button"
+            data-testid="focus-mode-toggle"
+            onClick={toggleFocusMode}
+            className={`flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 ${focusMode ? 'text-accent' : 'text-muted hover:text-text'}`}
+            aria-label={i18nT('app.focus_mode')}
+            aria-pressed={focusMode}
+            title={i18nT(IS_MAC ? 'app.focus_mode_title_mac' : 'app.focus_mode_title')}
+          >
+            <Fullscreen size={15} />
+          </button>
+          </div>
         )}
         {/* Mobile centre track: the same trigger in its icon-only form, in the
             same window-centred track the desktop one uses, so the control does
@@ -1952,11 +2476,19 @@ export default function App() {
             type="button"
             onClick={commandPalette.openPalette}
             className="h-7 w-7 rounded-md border border-border bg-card text-muted flex items-center justify-center cursor-pointer shrink-0"
-            aria-label={i18nT('app.search_sessions_files_and_commands')}
+            aria-label={
+              slotOwners['quick-search']
+                ? i18nT('app.open_command_bar')
+                : i18nT('app.search_sessions_files_and_commands')
+            }
             // Not the "(⌘K)" title the desktop trigger carries: this form only
             // renders below 768px, where advertising a chord to a touch surface
             // names a gesture the device may have no way to produce.
-            title={i18nT('app.search_sessions_files_and_commands')}
+            title={
+              slotOwners['quick-search']
+                ? i18nT('app.open_command_bar')
+                : i18nT('app.search_sessions_files_and_commands')
+            }
           >
             <SearchIcon size={14} />
           </button>
@@ -2186,6 +2718,16 @@ export default function App() {
               <w.component />
             </ErrorBoundary>
           ))}
+          {/* Update pill — present only while an update exists; deep-links to
+              Settings › About. NOT gated on viewport: it is the download's
+              only progress home, and hiding it on narrow windows would make
+              "Download" consent produce zero visible feedback until the
+              staged-build modal fires minutes later. */}
+          {updateAvailable && (
+            <Suspense fallback={null}>
+              <UpdatePill />
+            </Suspense>
+          )}
           {/* Feedback — "Request a Feature" plus, on a prerelease build, a
               channel chip that opens the same Report a Problem flow. Its own
               bordered pill (28px tall, 12px radius), separated from the readout
@@ -2207,7 +2749,7 @@ export default function App() {
       </header>
 
       {agentSwitchNotice && (
-        <div role="status" className="fixed z-[70] top-14 left-4 right-4 sm:left-auto sm:w-[440px] bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 shadow-xl animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
+        <div role="status" className="fixed z-[70] top-safe-offset-14 left-safe-offset-4 right-safe-offset-4 sm:left-auto sm:w-[440px] bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 shadow-xl animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
           <span className="text-sm text-text flex-1">{agentSwitchNotice.message}</span>
           <button onClick={() => dispatch(setAgentSwitchNotice(null))} aria-label={i18nT('app.dismiss')} className="text-muted hover:text-text leading-none p-0.5"><X className="lucide-inline w-4 h-4" /></button>
         </div>
@@ -2223,9 +2765,14 @@ export default function App() {
             <div className="text-4xl mb-4"><AlertTriangle className="lucide-inline" /></div>
             <div className="text-lg font-bold text-text-strong mb-2">{i18nT('app.update_failed')}</div>
             <div className="text-sm text-danger mb-6">{updateError}</div>
-            <button className="px-4 py-1.5 rounded-lg text-[13px] font-medium cursor-pointer bg-card border border-border text-text hover:border-border-strong transition-colors" onClick={() => setUpdateError('')}>
-              {i18nT('app.dismiss')}
-            </button>
+            {/* A failed self-update is exactly what the agent can diagnose
+                (channel, feed, venv state), and a modal has no draft to lose. */}
+            <div className="flex items-center justify-center gap-3">
+              <AskAgentButton message={updateError} variant="solid" onHandoff={() => setUpdateError('')} />
+              <button className="px-4 py-1.5 rounded-lg text-[13px] font-medium cursor-pointer bg-card border border-border text-text hover:border-border-strong transition-colors" onClick={() => setUpdateError('')}>
+                {i18nT('app.dismiss')}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -2252,9 +2799,21 @@ export default function App() {
                     <div className="text-[13px] text-muted leading-relaxed">{i18nT('app.a_newer_version_is_available_no_changelog_entry')}</div>
                   </div>
                 )}
-                <button className="w-full py-2 rounded-lg text-[13px] font-medium cursor-pointer bg-accent text-accent-fg border-none hover:opacity-90 transition-opacity" onClick={handleUpdate}>
-                  {i18nT('app.update_now')}
-                </button>
+                {affordance === 'apply' ? (
+                  <button className="w-full py-2 rounded-lg text-[13px] font-medium cursor-pointer bg-accent text-accent-fg border-none hover:opacity-90 transition-opacity" onClick={handleUpdate}>
+                    {i18nT('app.update_now')}
+                  </button>
+                ) : affordance === 'command' ? (
+                  // This install cannot replace its own code from here: `POST
+                  // /api/update` is git fetch + reset, so a wheel install answers
+                  // 400/409 and a desktop bundle is owned by its own updater.
+                  // Settings > About carries the same command with an explanation
+                  // and a copy button.
+                  <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
+                    data-testid="modal-update-command">
+                    {updateCommand}
+                  </div>
+                ) : null}
               </>
             ) : (
               <div className="text-sm text-muted py-4 text-center"><CheckCircle className="lucide-inline" /> {i18nT('app.you_re_on_the_latest_version')}</div>
@@ -2281,6 +2840,11 @@ export default function App() {
       {/* Updating overlay */}
       {(updating || showUpdateModal) && <UpdateOverlay onCancel={() => { setUpdating(false); setShowUpdateModal(false) }} />}
       <UpdateModal />
+      {updateAvailable && (
+        <Suspense fallback={null}>
+          <UpdateFoundModal />
+        </Suspense>
+      )}
 
       {/* First-run modal chrome mounted ONCE (scrim + accent panel + floating
           mascots) so the import→customize hand-off swaps only the right-column
@@ -2729,7 +3293,7 @@ export default function App() {
                 animate={{ width: 220, x: 0 }}
                 exit={{ x: -240 }}
                 transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
-                className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-2 mb-2 shadow-sm z-50 overflow-hidden fixed top-0 left-0 bottom-0"
+                className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-2 mb-2 shadow-sm z-50 overflow-hidden fixed top-safe left-safe bottom-safe"
                 role="navigation"
                 aria-label={i18nT('app.main_navigation')}
               >
@@ -2739,10 +3303,31 @@ export default function App() {
           </AnimatePresence>
         ) : (
           <nav
-            className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-0 mb-2 shadow-sm z-50 overflow-hidden"
-            style={{ gridArea: 'nav', width: 'auto' }}
+            ref={railPeekSurface}
+            className="focus-chrome-rail bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-0 mb-2 shadow-sm z-50 overflow-hidden"
+            // Focus mode: same overlay treatment as the header. The rail's own
+            // `mx-2` means translateX(-100%) would leave its 8px left margin
+            // showing as a sliver, hence the extra 12px of travel. Width has to
+            // become explicit — out of the grid there is no track to fill — and
+            // it is the rail TRACK minus the 16px of horizontal margin, so the
+            // overlay is exactly as wide as the docked rail would have been at
+            // the user's current collapse state.
+            style={focusActive
+              ? {
+                position: 'absolute',
+                left: 0,
+                top: FOCUS_INSET,
+                bottom: 0,
+                width: railWidthFor({ isMobile: false, collapsed: effectiveCollapsed }) - 16,
+                zIndex: 62,
+                transform: railPeek.open ? 'translateX(0)' : 'translateX(calc(-100% - 12px))',
+                transition: 'transform 200ms cubic-bezier(0.2, 0, 0, 1)',
+                pointerEvents: railPeek.open ? 'auto' : 'none',
+              }
+              : { gridArea: 'nav', width: 'auto' }}
             role="navigation"
             aria-label={i18nT('app.main_navigation')}
+            {...(focusActive ? railPeek.surfaceProps : {})}
           >
             {navBody}
           </nav>
@@ -2750,7 +3335,26 @@ export default function App() {
       })()}
 
       {/* Content */}
-      <div className="flex flex-col min-h-0 min-w-0" style={{ gridArea: 'content' }}>
+      <div
+        className="flex flex-col min-h-0 min-w-0"
+        // Focus mode reclaims the 236px rail column, which leaves everything in
+        // this column — the chat sessions drawer first — flush against the
+        // window's left edge, while the same surfaces stay inset 8px at the
+        // bottom by their own `mb-2`/`pb-2`. The inset goes on the COLUMN rather
+        // than on the drawer: the drawer's collapse animates a clip-path whose
+        // insets are computed in its own container space against its `width`
+        // prop, so padding it would desync the morph from the toggle it converges
+        // on. Padding the column shifts the drawer and that toggle together.
+        // Transition matched to the shell's own column animation so the 8px
+        // arrives with the track change instead of snapping ahead of it.
+        style={focusActive
+          ? {
+            gridArea: 'content',
+            paddingLeft: FOCUS_INSET,
+            transition: 'padding-left 150ms cubic-bezier(0.2, 0, 0, 1)',
+          }
+          : { gridArea: 'content' }}
+      >
         <div className={`flex min-h-0 min-w-0 flex-1 ${terminalPosition === 'right' ? 'flex-row' : 'flex-col'}`}>
         <main id="main-content" tabIndex={-1} className={`flex flex-col min-h-0 min-w-0 flex-1 overflow-x-hidden ${needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'}`}>
           <MigrationCheck />
@@ -2808,13 +3412,23 @@ export default function App() {
       {/* Remote instance panes — embedded dashboards kept warm (mounted, hidden)
           so switching is instant; the active instance fills the pane. */}
       <InstancesViewport macInset={macInset} />
+      {/* macOS focus mode: window-drag strips for the LOCAL header, placed to be
+          structurally identical to the pane strips that provably work — the
+          .host-drag-strip mechanism, in the same top-level container, OUTSIDE
+          the shell's grid/overflow/stacking context, painted after everything
+          drag-related. Every in-shell variant failed on the desktop app. */}
+      {activeInstanceId === null && focusActive && macInset && topChromeShown &&
+        localHeaderDragGaps.map((g, i) => (
+          <div key={`fm-drag-${i}`} aria-hidden data-testid="focus-mac-drag-strip" className="host-drag-strip" style={{ left: g.x, width: g.w, zIndex: 63 }} />
+        ))}
       </div>{/* /pane stack */}
     </div>
     )}
     </WsContext.Provider>
     {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
     <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsageState} />
-    <CommandPalette
+    <QuickSearchSurface
+      owners={slotOwners}
       open={commandPalette.open}
       onClose={commandPalette.close}
       openShortcuts={toggleShortcutsModal}

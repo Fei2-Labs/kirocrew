@@ -46,12 +46,15 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import urlparse
+
+from kiro_crew import platform_compat, windows_acl
 
 logger = logging.getLogger(__name__)
 
@@ -93,12 +96,39 @@ PROVIDER_EXECUTABLE_CANDIDATES = {
     executable: tuple(
         f"{directory}/{executable}" for directory in PROVIDER_EXECUTABLE_DIRS
     )
-    for executable in ("gh", "glab")
+    for executable in ("gh", "glab", "az")
 }
+
+# Windows equivalents of the well-known dirs above, as the *subdirectory* each
+# installer creates under a Program Files root. Expanded at call time rather
+# than at import, because the roots come from the environment. These lead the
+# ambient PATH for the same reason the POSIX list does: a machine-wide install
+# is SYSTEM/Administrators-owned, so it should win over a user-writable shim
+# that happens to sit earlier on PATH.
+WINDOWS_PROVIDER_EXECUTABLE_SUBDIRS = {
+    "gh": ("GitHub CLI",),
+    "glab": ("GitLab CLI", "glab"),
+}
+WINDOWS_PROGRAM_ROOT_VARS = ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)")
 
 # Generic operator override for the gh binary, honored by every caller after
 # its own caller-specific override (KIROCREW_ISSUE_RADAR_GH / KIROCREW_SAGE_GH).
 GH_BIN_ENV = "KIROCREW_GH_BIN"
+
+# Parent-prevalidated gh channel for sandboxed children. A Linux script-cron
+# sandbox maps only the gateway's own uid into its user namespace, so every
+# root-owned path component (`/`, `/usr`, `/home`) stats as the overflow uid
+# 65534 and the ownership walk in validate_provider_executable refuses ANY gh
+# on the host -- the uid signal is destroyed, not merely inconvenient. The
+# gateway therefore runs the FULL validation outside the sandbox (real uids)
+# and hands the child `<resolved path>|<st_dev>:<st_ino>`; the child re-checks
+# everything the namespace leaves intact (regular file, executable, not
+# world-writable, outside the agent-writable tree) plus the device:inode
+# identity pin, which closes the swap-between-validate-and-exec window the
+# skipped ownership walk would otherwise reopen. Private (underscore) because
+# only the script-cron spawn path may set it; a set-but-malformed value fails
+# loudly like the operator overrides above.
+GH_PREVALIDATED_ENV = "_KIROCREW_GH_PREVALIDATED"
 
 # gh's own auth + network/TLS vars, forwarded (when present) on top of the
 # platform's minimal safe-key base; everything else in the parent env is
@@ -167,7 +197,7 @@ def agent_writable_roots() -> tuple[Path, ...]:
 
 
 def check_provider_path_component(path: Path, *, label: str, uid: int, strict: bool) -> None:
-    """Apply the ownership/permission policy to one path component."""
+    """Apply the POSIX ownership/permission policy to one path component."""
     try:
         path_stat = path.stat()
     except OSError as exc:
@@ -189,6 +219,77 @@ def check_provider_path_component(path: Path, *, label: str, uid: int, strict: b
         # entry out, and a world-writable FILE can be rewritten in place.
         if not (stat.S_ISDIR(path_stat.st_mode) and path_stat.st_mode & stat.S_ISVTX):
             raise ValueError(f"{label} is world-writable")
+
+
+def check_provider_path_component_windows(
+    path: Path, *, label: str, me_sid: str, strict: bool
+) -> None:
+    """Apply the same policy to one path component, read from its Windows ACL.
+
+    Same two questions as the POSIX walk — is this owned by a third account,
+    and can anything outside the trusted set replace it — answered from the
+    security descriptor because ``st_uid`` and the mode bits carry no
+    information on Windows (see :mod:`kiro_crew.windows_acl`).
+
+    *me_sid* is the gateway user's SID, the analog of ``uid``. Note that an
+    administrator's own SID is covered by ``S-1-5-32-544`` regardless, exactly
+    as POSIX trusts ``uid 0``.
+
+    The component must also sit on a **local volume**, which arrives on the
+    descriptor as ``volume_is_local`` rather than as a second platform call from
+    here. ``WELL_KNOWN_TRUSTED_SIDS`` holds machine-local alias SIDs --
+    ``S-1-5-18`` and ``S-1-5-32-544`` are the same string on every machine and
+    denote a different principal on each -- so the descriptor of a file on a
+    remote share names the FILE SERVER's SYSTEM and Administrators, and trusting
+    them would mean "whoever administers that server may replace the binary this
+    gateway executes". Both remote shapes are covered, including the mapped
+    network drive (``Z:\\gh.exe``) that path inspection alone cannot tell from a
+    local disk.
+
+    Keeping that read inside :func:`windows_acl.describe` is what leaves this
+    function a pure decision over one dataclass, so the policy stays testable on
+    a non-Windows runner.
+    """
+    try:
+        security = windows_acl.describe(path)
+    except windows_acl.AclUnavailable as exc:
+        # An unreadable ACL is a refusal: a trust check that cannot see the
+        # descriptor has not cleared anything.
+        raise ValueError(f"{label} security descriptor is unreadable: {exc}") from exc
+
+    if not security.volume_is_local:
+        raise ValueError(
+            f"{label} is not on a local volume; the trust policy's well-known SIDs "
+            "are machine-local and carry no meaning off this host"
+        )
+
+    if security.null_dacl:
+        raise ValueError(f"{label} has a NULL DACL, which grants everyone full control")
+    if security.unparsable_ace_types:
+        types = ",".join(str(t) for t in security.unparsable_ace_types)
+        raise ValueError(f"{label} carries ACE types this policy cannot evaluate (type {types})")
+
+    trusted = set(windows_acl.WELL_KNOWN_TRUSTED_SIDS)
+    if strict:
+        # Strict mode is the analog of "root-owned and unwritable by the
+        # gateway user": the machine, not the user, must own and control it.
+        if security.owner_sid not in trusted:
+            raise ValueError(
+                f"{label} is not owned by the system "
+                f"(owner {security.owner_name}, {security.owner_sid})"
+            )
+    else:
+        trusted.add(me_sid)
+        if security.owner_sid not in trusted:
+            raise ValueError(
+                f"{label} is owned by another account "
+                f"({security.owner_name}, {security.owner_sid})"
+            )
+
+    offenders = [writer for writer in security.writers if writer.sid not in trusted]
+    if offenders:
+        joined = "; ".join(writer.describe() for writer in offenders)
+        raise ValueError(f"{label} can be replaced by {joined}")
 
 
 def validate_provider_executable(candidate: str) -> str:
@@ -218,23 +319,64 @@ def validate_provider_executable(candidate: str) -> str:
     Set ``KIROCREW_PROVIDER_BIN_STRICT=1`` on shared or multi-tenant hosts to
     restore the previous rule: canonical, symlink-free, root-owned and
     unwritable by the gateway user through every parent.
+
+    On **Windows** the same two questions are answered from the object's ACL
+    rather than from ``st_uid`` and the mode bits, which carry no information
+    there (see :mod:`kiro_crew.windows_acl`). An **elevated** gateway is refused
+    for the same reason a root one is: its children would be elevated too.
     """
     if not os.path.isabs(candidate):
         raise ValueError("path must be absolute")
-    getuid = getattr(os, "getuid", None)
-    geteuid = getattr(os, "geteuid", getuid)
-    if getuid is None or geteuid is None:
-        raise ValueError("filesystem ownership checks are unavailable")
-    if geteuid() == 0:
-        raise ValueError("provider execution is disabled for a root gateway")
+
+    windows = sys.platform == "win32"
+    uid = -1
+    me_sid = ""
+    if windows:
+        # Both of these live in platform_compat because it already owns "read
+        # this process's own access token" for the codebase. Both are tri-state
+        # and BOTH non-True answers refuse: an unreadable token is not a
+        # not-elevated token, and an unverifiable SID is not a trusted one.
+        elevated = platform_compat.is_token_elevated()
+        if elevated is None:
+            raise ValueError("provider execution is disabled: the gateway token is unreadable")
+        if elevated:
+            raise ValueError("provider execution is disabled for an elevated gateway")
+        me_sid = platform_compat.current_user_sid() or ""
+        if not me_sid:
+            raise ValueError("provider execution is disabled: the gateway user's SID is unverifiable")
+    else:
+        getuid = getattr(os, "getuid", None)
+        geteuid = getattr(os, "geteuid", getuid)
+        if getuid is None or geteuid is None:
+            raise ValueError("filesystem ownership checks are unavailable")
+        if geteuid() == 0:
+            raise ValueError("provider execution is disabled for a root gateway")
+        uid = geteuid()
     strict = strict_provider_bins()
+
+    def _check(target: Path, *, label: str) -> None:
+        """Dispatch one component to the platform's ownership policy."""
+        if windows:
+            check_provider_path_component_windows(target, label=label, me_sid=me_sid, strict=strict)
+        else:
+            check_provider_path_component(target, label=label, uid=uid, strict=strict)
 
     original = Path(candidate)
     try:
         resolved = original.resolve(strict=True)
     except OSError as exc:
         raise ValueError("path does not exist") from exc
-    if strict and original != resolved:
+    # Windows paths are case-insensitive and ``resolve()`` rewrites a component
+    # to its on-disk casing, so a candidate spelled `gh.exe` against a file
+    # named `gh.EXE` differs from its resolution without any symlink being
+    # involved. Comparing case-sensitively there would refuse a plain install
+    # in strict mode and pointlessly re-walk the same parents in relaxed mode.
+    same_path = (
+        original.as_posix().casefold() == resolved.as_posix().casefold()
+        if windows
+        else original == resolved
+    )
+    if strict and not same_path:
         raise ValueError("path must be canonical and contain no symlinks")
 
     try:
@@ -242,6 +384,8 @@ def validate_provider_executable(candidate: str) -> str:
             raise ValueError("path is not a regular file")
     except OSError as exc:
         raise ValueError("executable hierarchy is not accessible") from exc
+    # On Windows this is close to an existence test (the OS has no execute
+    # bit), so it is a coherence check there rather than part of the trust policy.
     if not os.access(resolved, os.X_OK):
         raise ValueError("file is not executable")
 
@@ -250,12 +394,11 @@ def validate_provider_executable(candidate: str) -> str:
             if resolved == root or root in resolved.parents:
                 raise ValueError(f"executable is inside the agent-writable tree {root}")
 
-    uid = geteuid()
-    check_provider_path_component(resolved, label="executable", uid=uid, strict=strict)
+    _check(resolved, label="executable")
     # A symlink's own directory chain is part of the provenance too (relaxed
     # mode allows symlinks, so /opt/homebrew/bin gets checked as well).
     parents = list(path_parents(resolved))
-    if not strict and original != resolved:
+    if not strict and not same_path:
         parents += [p for p in path_parents(original) if p not in parents]
     for parent in parents:
         try:
@@ -263,8 +406,27 @@ def validate_provider_executable(candidate: str) -> str:
                 raise ValueError("executable parent is not a directory")
         except OSError as exc:
             raise ValueError("executable hierarchy is not accessible") from exc
-        check_provider_path_component(parent, label="executable parent", uid=uid, strict=strict)
+        _check(parent, label="executable parent")
     return str(resolved)
+
+
+def _wellknown_windows_dirs(executable: str) -> tuple[str, ...]:
+    """Directories a machine-wide Windows install of *executable* lives in.
+
+    Expanded at call time rather than at import, because the Program Files
+    roots come from the environment.
+    """
+    if sys.platform != "win32":
+        return ()
+    dirs: list[str] = []
+    for variable in WINDOWS_PROGRAM_ROOT_VARS:
+        root = os.environ.get(variable)
+        if not root:
+            continue
+        for subdir in WINDOWS_PROVIDER_EXECUTABLE_SUBDIRS.get(executable, ()):
+            dirs.append(os.path.join(root, subdir))
+            dirs.append(os.path.join(root, subdir, "bin"))
+    return tuple(dict.fromkeys(dirs))
 
 
 def provider_executable_candidates(executable: str) -> tuple[str, ...]:
@@ -275,27 +437,120 @@ def provider_executable_candidates(executable: str) -> tuple[str, ...]:
     already runs from their terminal is found even when it lives somewhere this
     module has never heard of (asdf, mise, ``~/.local/bin``). ``PATH`` is not
     consulted in strict mode, which by definition only trusts system dirs.
+
+    Resolution inside a directory is delegated to :func:`shutil.which`, which
+    applies whatever the platform defines as "runnable there": ``PATHEXT`` on
+    Windows, so a bare ``gh`` matches ``gh.exe``, and ``X_OK`` on POSIX. Joining
+    the bare name by hand is why this scan previously found nothing at all on
+    Windows.
+
+    A hit is then required to actually LIE INSIDE the directory that was asked
+    for, because on Windows ``which`` does not only search ``path``::
+
+        if sys.platform == "win32":
+            # The current directory takes precedence on Windows.
+            ...
+            path.insert(0, curdir)
+
+    -- so `which(name, path=directory)` searches the process CWD *first*, and a
+    checkout that happens to contain a `gh.exe` would win over every well-known
+    install dir. Verified: with an attacker copy in the CWD, that call returns
+    `.\\gh.exe`. Since the gateway's CWD is not something this module controls,
+    the containment check is what makes delegating to ``which`` safe.
+
+    The containment test uses ``abspath``, deliberately not ``resolve``: the
+    question here is only "did this come from the directory I asked for", while
+    where a symlink ultimately points is the trust walk's job -- and that walk
+    resolves and re-checks every component with its own policy.
     """
+
+    def _inside(candidate: str, directory: str) -> bool:
+        """True when *candidate* resolves to a file directly in *directory*."""
+        base = os.path.normcase(os.path.abspath(directory)).rstrip(os.sep)
+        target = os.path.normcase(os.path.abspath(candidate))
+        return os.path.dirname(target) == base
+
     ordered: dict[str, None] = dict.fromkeys(PROVIDER_EXECUTABLE_CANDIDATES.get(executable, ()))
+    searched = list(_wellknown_windows_dirs(executable))
     if not strict_provider_bins():
-        for entry in (os.environ.get("PATH") or "").split(os.pathsep):
-            if not entry:
-                continue
-            found = os.path.join(entry, executable)
-            if os.path.isfile(found) and os.access(found, os.X_OK):
-                ordered.setdefault(os.path.abspath(found), None)
+        searched += [e for e in (os.environ.get("PATH") or "").split(os.pathsep) if e]
+    for directory in searched:
+        found = shutil.which(executable, path=directory)
+        if found and _inside(found, directory):
+            ordered.setdefault(os.path.abspath(found), None)
     return tuple(ordered)
 
 
 # Resolution results keyed by (override env NAME, its value, the generic
 # KIROCREW_GH_BIN value) so a changed override never serves a stale binary
 # while repeat calls skip the stat-heavy validation walk.
-_RESOLVE_CACHE: dict[tuple[str, str | None, str | None], str] = {}
+_RESOLVE_CACHE: dict[tuple[str, str | None, str | None, str | None], str] = {}
 
 
 def reset_cache() -> None:
     """Forget every cached gh resolution (test hook and operator-facing reset)."""
     _RESOLVE_CACHE.clear()
+
+
+def _consume_prevalidated(value: str) -> str:
+    """Validate a parent-prevalidated gh handoff inside a sandboxed child.
+
+    ``value`` is ``<resolved path>|<st_dev>:<st_ino>`` written by
+    :func:`prevalidated_gh_env` in the gateway, where the full ownership walk
+    already ran with real uids. Inside the child's user namespace that walk is
+    unavailable (root maps to the overflow uid), so this re-checks every
+    property the namespace leaves intact and pins the file's identity to the
+    device:inode the parent validated -- a binary swapped in after the parent's
+    check has a different inode and is refused. Any failure raises loudly:
+    a set-but-wrong handoff is a defect to surface, never to silently skip.
+    """
+    try:
+        path_part, _, identity = value.rpartition("|")
+        dev_s, _, ino_s = identity.partition(":")
+        expected = (int(dev_s), int(ino_s))
+    except ValueError as exc:
+        raise SetupError(f"{GH_PREVALIDATED_ENV} is malformed: {value!r}") from exc
+    if not path_part:
+        raise SetupError(f"{GH_PREVALIDATED_ENV} is malformed: {value!r}")
+    resolved = Path(path_part)
+    try:
+        st = resolved.stat()
+    except OSError as exc:
+        raise SetupError(f"{GH_PREVALIDATED_ENV} target is not accessible: {exc}") from exc
+    if (st.st_dev, st.st_ino) != expected:
+        raise SetupError(
+            f"{GH_PREVALIDATED_ENV} identity mismatch: the binary at {path_part} "
+            "is not the file the gateway validated"
+        )
+    if not stat.S_ISREG(st.st_mode):
+        raise SetupError(f"{GH_PREVALIDATED_ENV} target is not a regular file")
+    if st.st_mode & stat.S_IWOTH:
+        raise SetupError(f"{GH_PREVALIDATED_ENV} target is world-writable")
+    if not os.access(resolved, os.X_OK):
+        raise SetupError(f"{GH_PREVALIDATED_ENV} target is not executable")
+    for root in agent_writable_roots():
+        if resolved == root or root in resolved.parents:
+            raise SetupError(
+                f"{GH_PREVALIDATED_ENV} target is inside the agent-writable tree {root}"
+            )
+    return str(resolved)
+
+
+def prevalidated_gh_env() -> dict[str, str]:
+    """Env entry handing a fully-validated gh to a sandboxed child, or ``{}``.
+
+    Gateway-side producer for :data:`GH_PREVALIDATED_ENV`: runs the normal
+    :func:`resolve_gh` (full ownership walk, real uids) and pins the result's
+    device:inode. A host without a usable gh returns ``{}`` -- the child's own
+    resolution then fails with the ordinary setup message, so scripts that
+    never call gh are unaffected.
+    """
+    try:
+        resolved = resolve_gh()
+        st = os.stat(resolved)
+    except (SetupError, OSError):
+        return {}
+    return {GH_PREVALIDATED_ENV: f"{resolved}|{st.st_dev}:{st.st_ino}"}
 
 
 def resolve_gh(*, override_env: str = "", cache: bool = True) -> str:
@@ -308,22 +563,26 @@ def resolve_gh(*, override_env: str = "", cache: bool = True) -> str:
     set-but-wrong override is an operator mistake to surface, not to silently
     skip (silently ignoring it would fall through to a binary the operator was
     explicitly trying to avoid).
-
-    Windows is refused outright: every consumer of this runner is POSIX-only
-    (the validation policy is built on POSIX ownership semantics).
     """
-    if sys.platform == "win32":
-        raise SetupError(
-            "gh execution requires a POSIX platform (macOS/Linux); "
-            "run the Kiro Crew gateway under WSL on Windows"
-        )
     key = (
         override_env,
         os.environ.get(override_env) if override_env else None,
         os.environ.get(GH_BIN_ENV),
+        os.environ.get(GH_PREVALIDATED_ENV),
     )
     if cache and key in _RESOLVE_CACHE:
         return _RESOLVE_CACHE[key]
+
+    # Parent-prevalidated handoff (sandboxed children) wins first: inside the
+    # child's user namespace the ownership walk below cannot succeed for ANY
+    # binary under a root-owned hierarchy, so the gateway validated outside
+    # and pinned the identity -- see GH_PREVALIDATED_ENV.
+    prevalidated = os.environ.get(GH_PREVALIDATED_ENV)
+    if prevalidated is not None:
+        resolved = _consume_prevalidated(prevalidated)
+        if cache:
+            _RESOLVE_CACHE[key] = resolved
+        return resolved
 
     override_names = ([override_env] if override_env else []) + [GH_BIN_ENV]
     for name in override_names:
@@ -474,10 +733,30 @@ def run_gh(
             "gh spawn audit unavailable — refusing to run gh unaudited"
         ) from exc
     try:
+        # Deliberately BYTES here (no `text=True`), then decoded below.
+        #
+        # `text=True` alone decodes with the LOCALE encoding, which is the ANSI
+        # codepage on Windows -- so a non-ASCII issue title crashed this call.
+        # Verified on a cp936 host: `UnicodeDecodeError: 'gbk' codec can't decode
+        # byte 0xac`, raised inside subprocess's own reader THREAD, so `run`
+        # returns with `stdout=None` and the caller dies on the None rather than
+        # on a decode error it could attribute. Not Windows-only in principle --
+        # any non-UTF-8 locale does it.
+        #
+        # `encoding="utf-8"` would fix the codec but not the attribution: a
+        # strict failure still dies in that reader thread, and `errors="replace"`
+        # instead lets U+FFFD through into a JSON *string value*, where the JSON
+        # stays syntactically valid, `json.loads` succeeds, and the replacement
+        # character reaches stored issue records. Decoding here keeps both
+        # properties: strict, so nothing is silently corrupted, and in our own
+        # frame, so a failure is attributable and carries no payload bytes.
         proc = subprocess.run(
             list(argv),
-            capture_output=True, text=True, timeout=timeout, check=False,
-            input=input_text, env=gh_env(pin_host=pin_host),
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            input=input_text.encode("utf-8") if input_text is not None else None,
+            env=gh_env(pin_host=pin_host),
         )
     except FileNotFoundError:
         _audit_run(audit_caller, operation, "failure", error="gh not found")
@@ -493,11 +772,26 @@ def run_gh(
         # caller's own error taxonomy handle it.
         _audit_run(audit_caller, operation, "failure", error=type(exc).__name__)
         raise
-    if proc.returncode != 0:
-        _audit_run(audit_caller, operation, "failure", error=f"exit {proc.returncode}")
+    try:
+        decoded = subprocess.CompletedProcess(
+            proc.args,
+            proc.returncode,
+            stdout=proc.stdout.decode("utf-8") if proc.stdout is not None else None,
+            stderr=proc.stderr.decode("utf-8") if proc.stderr is not None else None,
+        )
+    except UnicodeDecodeError as exc:
+        # gh emits UTF-8, so this is a genuine anomaly rather than a locale
+        # mismatch. Audit and raise with the stream and offset only -- never the
+        # offending bytes, which are provider payload.
+        _audit_run(audit_caller, operation, "failure", error="undecodable output")
+        raise SetupError(
+            f"gh returned output that is not valid UTF-8 (at byte {exc.start})"
+        ) from exc
+    if decoded.returncode != 0:
+        _audit_run(audit_caller, operation, "failure", error=f"exit {decoded.returncode}")
     else:
         _audit_run(audit_caller, operation, "ok")
-    return proc
+    return decoded
 
 
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")

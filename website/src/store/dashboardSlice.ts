@@ -1,4 +1,5 @@
 import { safeSetItem } from '../utils/safeStorage'
+import { jsonEqual } from '../utils/structuralEqual'
 import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
 import { api } from '../api/client'
 import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
@@ -13,6 +14,13 @@ interface DashboardState {
   status: StatusData | null
   connected: boolean
   slots: ChatSlot[]
+  // Slot keys in the order the session sidebar actually DISPLAYS them
+  // (pinned-first + the user's sort, flat-view aware). Published by
+  // ChatSidebar; consumed by the chat-jump / chat-cycle keyboard shortcuts so
+  // Ctrl/Alt+N targets the Nth visible row rather than the Nth element of
+  // `slots` (which arrives in backend insertion order). Empty until the
+  // sidebar first renders — consumers fall back to `slots` order then.
+  sidebarOrder: string[]
   approvalMode: string
   channelTrusted: boolean
   refreshTrigger: number
@@ -57,6 +65,7 @@ const initialState: DashboardState = {
   status: null,
   connected: false,
   slots: [],
+  sidebarOrder: [],
   approvalMode: 'normal',
   channelTrusted: false,
   refreshTrigger: 0,
@@ -128,6 +137,52 @@ const evictSlotSubagents = (state: DashboardState, slotKey: string): void => {
   delete state.subagentText[slotKey]
 }
 
+/** Apply an authoritative slot list, reusing the object identity of every row
+ *  whose content is unchanged, and touching `state.slots` only when the list
+ *  actually moved.
+ *
+ *  Membership AND order come from `next` — the server is authoritative on both.
+ *  Only per-row identity is carried across, and only for a structurally equal
+ *  row, so no consumer can read stale content off a reused reference. The
+ *  comparison uses the shared `jsonEqual`, whose key-order independence and
+ *  field-agnosticism this relies on: a row may have been patched in place by
+ *  `touchSlotActivity` / `updateSlot` / `patchSlotLink` since it was stored (so
+ *  its key order can differ from the payload's), and a comparator that listed
+ *  `ChatSlot`'s fields would stop seeing a newly added one and pin a stale row
+ *  on screen — a correctness bug, where an extra re-render is only a cost.
+ *
+ *  Identity is load-bearing here rather than a micro-optimisation. The sidebar
+ *  renders every row as a Framer `motion.div` with `layout="position"` inside one
+ *  `LayoutGroup`, and every selector over `dashboard.slots` invalidates when the
+ *  array or any row changes reference. Assigning the incoming array wholesale
+ *  hands every row a new reference on every frame, so one slot's status change
+ *  re-renders and re-measures the entire list — which reads as the sidebar
+ *  reloading rather than as one session becoming active. Slot pushes coalesce at
+ *  200ms server-side, so a single active turn delivers several full lists per
+ *  second and the effect is continuous.
+ *
+ *  Skipping the assignment (rather than assigning an equal array) is the half
+ *  that matters most: it leaves the array reference alone, which lets a
+ *  downstream `useMemo` skip its filter and sort entirely instead of recomputing
+ *  an equal result. */
+const applySlots = (state: DashboardState, next: ChatSlot[]): void => {
+  const prev = state.slots ?? []
+  const byKey = new Map(prev.map(s => [s.key, s]))
+  let changed = prev.length !== next.length
+  const merged = next.map((incoming, i) => {
+    const existing = byKey.get(incoming.key)
+    // Reusing a draft row inside a freshly assigned array is fine: Immer
+    // finalizes drafts found in the assigned value within the same scope, so an
+    // untouched row resolves back to its base object and keeps its identity.
+    const reused = existing !== undefined && jsonEqual(existing, incoming) ? existing : incoming
+    // Positional compare, so a pure reorder counts as changed even though every
+    // row is individually reusable.
+    if (reused !== prev[i]) changed = true
+    return reused
+  })
+  if (changed) state.slots = merged
+}
+
 const dashboardSlice = createSlice({
   name: 'dashboard',
   initialState,
@@ -157,10 +212,13 @@ const dashboardSlice = createSlice({
       // the sidebar until restoration finishes, and marking it loaded would
       // claim a snapshot arrived when none has.
       if (action.payload.length === 0 && !state.slotsLoaded) return
-      state.slots = action.payload
+      applySlots(state, action.payload)
       state.slotsLoaded = true
       reconcileSlots(state, new Set(action.payload.map(s => s.key)))
     },
+    // Sidebar → shortcuts order feed (see DashboardState.sidebarOrder). The
+    // dispatch site diff-guards, so every action here is a real order change.
+    setSidebarOrder(state, action: PayloadAction<string[]>) { state.sidebarOrder = action.payload },
     // Live TODO-list delta. Patched into the SAME slots array that sseSlots
     // populates rather than a parallel map, so the mid-turn push and the
     // reconnect snapshot can never disagree about a slot's list. A delta for an
@@ -370,7 +428,7 @@ const dashboardSlice = createSlice({
         // unread drain still runs — that is this path's documented job, and a
         // badge self-heals — but eviction is withheld once the stream is live.
         const fresh = !state.slotsLoaded
-        state.slots = action.payload
+        applySlots(state, action.payload)
         state.slotsLoaded = true
         reconcileSlots(state, new Set(action.payload.map((s: { key: string }) => s.key)), fresh)
       })
@@ -378,7 +436,7 @@ const dashboardSlice = createSlice({
   },
 })
 
-export const { sseStatus, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
+export const { sseStatus, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
   setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
 
 /**

@@ -11,7 +11,7 @@ import { asArray } from '../lib/format'
 import ReadOnlyTag from '../components/ReadOnlyTag'
 import UntaggedIssueCard from './tagging/UntaggedIssueCard'
 import LabelsPanel, { settingsKeyForCategory } from './tagging/LabelsPanel'
-import { repoScopeKey } from '../lib/links'
+import { providerTerms, readOnlyHint, repoScopeKey } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
 /** Tagging dashboard — bulk-label triage for the issues that have no labels at all.
@@ -468,7 +468,7 @@ function TaggingDashboard() {
             )}
             {!canWrite && (
               <span className="text-[12px] text-muted inline-flex items-center gap-1">
-                <ReadOnlyTag /> {i18nT('apps.issueRadar.views.taggingView.applying_needs_write_access')}
+                <ReadOnlyTag repoRef={active} /> {i18nT('apps.issueRadar.views.taggingView.applying_needs_write_access')}
               </span>
             )}
             <button
@@ -509,8 +509,8 @@ function TaggingDashboard() {
               onClick={() => applyAll.mutate(applicable)}
               disabled={!canWrite || applyBusy || applicable.length === 0}
               title={canWrite
-                ? i18nT('apps.issueRadar.views.taggingView.write_every_staged_label_to_github')
-                : i18nT('apps.issueRadar.views.taggingView.read_only_repo_needs_triage_or_push_access')}
+                ? i18nT('apps.issueRadar.views.taggingView.write_every_staged_label_to', { provider: providerTerms(active).providerName })
+                : readOnlyHint(active, i18nT('apps.issueRadar.views.taggingView.read_only_repo_needs_triage_or_push_access'))}
               className="inline-flex items-center gap-1.5 text-[13px] px-2.5 py-1 rounded-md bg-accent text-white hover:opacity-90 disabled:opacity-40 cursor-pointer"
             >
               <Check size={12} />
@@ -557,6 +557,7 @@ function TaggingDashboard() {
               <UntaggedIssueCard
                 key={iss.number}
                 issue={iss}
+                repoRef={active}
                 labels={repoLabels}
                 staged={stagedFor(iss.number)}
                 suggestions={suggestions[String(iss.number)] ?? []}

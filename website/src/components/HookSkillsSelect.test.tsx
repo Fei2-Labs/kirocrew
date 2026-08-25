@@ -37,11 +37,14 @@ describe('HookSkillsSelect', () => {
     })
   })
 
-  it('does not render inline remove buttons — only the Add trigger', async () => {
+  it('renders chips without inline buttons — removal lives in the dropdown Selected section', async () => {
     renderWithProviders(
       <HookSkillsSelect selected={['kirocrew-dev/prepare-pr']} onChange={vi.fn()} />,
     )
     await waitFor(() => expect(screen.getByText('prepare-pr')).toBeInTheDocument())
+    // Only the "Add skill" trigger is a button in the chip row; per-chip removal
+    // is a menu item inside HookSkillsDropdown (a separated region), so the row
+    // never exceeds the two-button cap regardless of how many skills are selected.
     const buttons = screen.getAllByRole('button')
     expect(buttons).toHaveLength(1)
     expect(buttons[0]).toHaveTextContent(/add skill/i)

@@ -16,12 +16,21 @@ import kiro_crew.embeddings as embeddings_mod
 from kiro_crew.embeddings import ReembedProgress, reembed_progress, validate_custom_model_path
 from kiro_crew.vector_memory import VectorMemoryStore
 
-_MODEL_BYTES = b"g" * 1_100_000
+# Wider than the production floor so the file is not read as a truncated
+# placeholder.
+_MODEL_SIZE = embeddings_mod._GGUF_MIN_BYTES + 100_000
 
 
 def _write_model(path: Path) -> Path:
+    """Write a stand-in model file of _MODEL_SIZE bytes.
+
+    Sparse rather than a bytes literal: nothing here reads the content, only
+    ``stat().st_size``, and a literal this size would be allocated while the
+    module is IMPORTED -- charging every xdist worker for it at collection.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_MODEL_BYTES)
+    with path.open("wb") as fh:
+        fh.truncate(_MODEL_SIZE)
     return path
 
 
@@ -1141,12 +1150,28 @@ def _store(tmp_path: Path, dim: int = 8) -> VectorMemoryStore:
     return s
 
 
+def _basis_embed(dim: int = 8):
+    """One stable vector per text, orthogonal across texts.
+
+    A text-independent constant makes every write after the first score as a
+    duplicate against the indexed vector, so a loop seeding N memories leaves
+    one row behind and the progress denominator below reads 1 instead of N.
+    """
+    slots: dict[str, int] = {}
+
+    def embed(text: str) -> list[float]:
+        slot = slots.setdefault(text, len(slots) % dim)
+        return [1.0 if i == slot else 0.0 for i in range(dim)]
+
+    return embed
+
+
 class TestBackfillProgressReporting:
     """Without a denominator the indicator can only spin."""
 
     def test_reports_total_up_front(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
-        store.embed_fn = lambda t: [0.5] * 8
+        store.embed_fn = _basis_embed()
         for i in range(3):
             store.write_episodic(f"memory number {i} long enough to be stored here")
         store.db.execute("UPDATE episodic_memories SET embedding = NULL")
@@ -1161,7 +1186,7 @@ class TestBackfillProgressReporting:
 
     def test_progress_is_monotonic(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
-        store.embed_fn = lambda t: [0.5] * 8
+        store.embed_fn = _basis_embed()
         for i in range(4):
             store.write_episodic(f"memory number {i} long enough to be stored here")
         store.db.execute("UPDATE episodic_memories SET embedding = NULL")

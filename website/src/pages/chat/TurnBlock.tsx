@@ -7,6 +7,7 @@ import { isWorkflowRunTool } from './WorkflowRunCard'
 import { isSpawnRunTool } from './SubagentRunCard'
 import { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from './subagentCompletion'
+import { isDiffToolMessage } from './toolDiff'
 import { OPTION_MARKER_RE } from '../../app-sdk/protocol/optionMarker'
 
 // A workflow_run launch renders as its own always-visible inline card
@@ -39,9 +40,18 @@ const isMcpAppItem = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
   it.kind === 'single' && it.msg.role === 'tool' &&
   typeof it.msg.meta?.tool_call_id === 'string' &&
   appToolCallIds.has(it.msg.meta.tool_call_id)
+// An edit-tool row promoting an inline diff presentation (ToolCallLine
+// renders a DiffBlock card or summary chip below the pill). It stays out of
+// BOTH folds — a file change is a result, not a working step: the same class
+// as the prose ```diff the final summary used to carry, which neither fold
+// ever hid. Density relief is per-card (ToolCallLine's fold chip) plus the
+// size caps in presentToolDiff, so an edit-heavy turn is N foldable cards,
+// not an immovable wall (see rfc-tool-derived-diff-cards.md).
+const isDiffCardItem = (it: TurnItem) =>
+  it.kind === 'single' && isDiffToolMessage(it.msg)
 const isTool = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
   it.kind === 'single' && it.msg.role === 'tool' && !isWorkflowRunItem(it) &&
-  !isSpawnRunItem(it) && !isMcpAppItem(it, appToolCallIds)
+  !isSpawnRunItem(it) && !isMcpAppItem(it, appToolCallIds) && !isDiffCardItem(it)
 const isHiddenTool = (it: TurnItem) => it.kind === 'single' && it.msg.role === 'tool' && !it.msg.content.startsWith('🔧')
 const isConclusion = (it: TurnItem) => it.kind === 'single' && (it.msg.role === 'assistant' || it.msg.role === 'streaming' || it.msg.role === 'file')
 /**
@@ -115,7 +125,8 @@ const isVisibleInline = (it: TurnItem, appToolCallIds: ReadonlySet<string>) =>
   isRenderable(it) || isHandBack(it) || isAlwaysVisible(it) || isCrewReply(it) ||
   isWorkflowRunItem(it) || isSpawnRunItem(it) ||
   isSubagentCompletionItem(it) ||
-  isWorkflowCompletionItem(it) || isMcpAppItem(it, appToolCallIds)
+  isWorkflowCompletionItem(it) || isMcpAppItem(it, appToolCallIds) ||
+  isDiffCardItem(it)
 
 /** Stable empty set so the mcpApps selector returns a referentially-equal
  *  value when the slot has no app renders (avoids useless re-renders). */
@@ -312,7 +323,7 @@ export default function TurnBlock({ turn, renderItem, collapseAll = false, appTo
 function CollapseToggle({ expanded, onToggle, label }: { expanded: boolean; onToggle: () => void; label: string }) {
   return (
     <div className="px-4 py-0 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <button className="flex items-center gap-1.5 text-[12px] text-muted/60 hover:text-muted cursor-pointer bg-transparent border-none py-1 transition-colors" onClick={onToggle}>
+      <button className="flex items-center gap-2 text-[12px] leading-5 text-muted/60 hover:text-muted cursor-pointer bg-transparent border-none py-1 transition-colors" onClick={onToggle}>
         <ChevronRight size={12} className={`transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`} />
         {label}
       </button>
@@ -329,8 +340,8 @@ function CollapsibleSection({ expanded, children }: { expanded: boolean; childre
       transition={{ height: { duration: 0.3, ease: [0.4, 0, 0.2, 1] }, opacity: { duration: 0.2 } }}
       style={{ overflow: 'hidden' }}
     >
-      <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-        <div className="border-l-2 border-l-border opacity-60">{children}</div>
+      <div className="mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+        <div className="shadow-[inset_2px_0_0_0_var(--border)] forced-colors:border-l-2 opacity-60">{children}</div>
       </div>
     </motion.div>
   )

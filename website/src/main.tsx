@@ -15,9 +15,12 @@ import { ThemeProvider } from './hooks/useTheme'
 import { UIModeProvider } from './hooks/useUIMode'
 import ThemeExperienceLayer from './components/ThemeExperienceLayer'
 import { initRum } from './rum'
+import { isEmbeddedPane } from './lib/embedded'
 // i18n must initialize before the first render — a component rendering ahead of
-// init would emit its bare translation key instead of text.
-import { initI18n } from './i18n'
+// init would emit its bare translation key instead of text. The `/all` entry is
+// what registers every language; plain `./i18n` is English-only, so importing it
+// here would render English for every user whatever language they picked.
+import { initI18n } from './i18n/all'
 import { LanguageProvider } from './i18n/LanguageProvider'
 import App from './App'
 import { queryClient } from './api/queryClient'
@@ -85,9 +88,25 @@ if (import.meta.env.DEV) {
 // creates the module-level highlight worker pool, so the first code surface a
 // user opens paints immediately instead of paying chunk + worker + grammar
 // startup on click.
+//
+// NOT in an embedded remote-instance pane. Each warm pane is a full copy of this
+// SPA in its own realm, and every realm that evaluates PierreImpl spawns
+// PIERRE_WORKER_POOL_SIZE workers, each loading its own highlighter bundle + WASM
+// regex engine. With the default warm-set cap that is 4 workers x 5 panes = 20
+// eagerly-spawned workers in one renderer process, and the background panes paint
+// nothing, so 16 of them buy no responsiveness at all. Observed consequence: the
+// renderer accumulated 20 DedicatedWorker threads and was killed by a V8 fatal
+// abort raised on one of them, taking the whole window black.
+//
+// Panes are not left slower than before in any case a user can see: the lazy
+// import in pierre/index.tsx still creates the pool on the first real code
+// surface, so a pane the user actually opens a diff in pays exactly the
+// pre-warm cost it used to pay on click.
 const idle: (cb: () => void) => void =
   typeof requestIdleCallback === 'function' ? cb => requestIdleCallback(cb) : cb => setTimeout(cb, 2000)
-idle(() => { import('./pierre/PierreImpl').catch(() => { /* warmed on first use instead */ }) })
+if (!isEmbeddedPane()) {
+  idle(() => { import('./pierre/PierreImpl').catch(() => { /* warmed on first use instead */ }) })
+}
 
 const WorldsPopout = lazy(() => import('./pages/WorldsPopout'))
 

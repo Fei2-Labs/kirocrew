@@ -22,19 +22,39 @@
  * ?theme=dark   ?form=mobile|desktop
  * ?count=11     the unread count to render in the badge
  * ?fix=off      strip the gutter that admits the badge's overhang (before state)
+ * ?pins=N       render N pinned-crew chips in the identity group's chip row
+ *               (default 0 — the group renders exactly as it did without them)
+ * ?unread=N     unread count carried by the LAST pinned chip, the one a cut reaches
+ * ?roww=N       pin the chip row's clip width to N px, to photograph one cut
+ * ?fade=on      re-inject the retired alpha mask across the row's last 18px
+ *               (before state for the cut-edge cue)
  */
 import { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { Home, Search, Bell, Lightbulb, Bug, Layers, Coins, AudioWaveform, ChevronDown, Menu } from 'lucide-react'
+import { Home, Search, Bell, Lightbulb, Bug, Layers, Coins, AudioWaveform, ChevronDown } from 'lucide-react'
 
-import { initI18n } from '../src/i18n'
+import { initI18n } from '../src/i18n/all'
 import '../src/index.css'
 
 const params = new URLSearchParams(location.search)
 const theme = params.get('theme') || 'dark'
 const count = params.get('count') || '99+'
+const pins = Number(params.get('pins') || '0')
+const unread = Number(params.get('unread') || '0')
+const rowW = params.get('roww')
 document.documentElement.setAttribute('data-theme', theme === 'light' ? 'kiro-light' : 'kiro-dark')
 initI18n('zh-CN')
+
+// The retired cue: an alpha mask over the row's last 18px. Injected verbatim so
+// the before state is the shipped one rather than a paraphrase of it.
+if (params.get('fade') === 'on') {
+  const s = document.createElement('style')
+  s.textContent =
+    '.crew-chip-row{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 18px),transparent 100%);' +
+    'mask-image:linear-gradient(to right,#000 calc(100% - 18px),transparent 100%)}' +
+    ".crew-chip-row[data-cut='true']::after{content:none}"
+  document.head.appendChild(s)
+}
 
 // The pre-fix state for the badge-overhang scene. `.tb-right` reserves the
 // badge's 4px overhang with padding and puts its outer box back with an equal
@@ -48,6 +68,49 @@ if (params.get('fix') === 'off') {
 }
 
 const seg = 'flex items-center gap-1 px-1.5 py-0.5 rounded-md text-muted'
+
+/** The pinned-crew chip row, verbatim from InstanceTabBar's `CrewChipRow` +
+ *  `SwitcherChip` + `UnreadBadge` class strings, so the real stylesheet decides
+ *  what a cut looks like.
+ *
+ *  `?roww` pins the CLIP width. In production that width is whatever flex-shrink
+ *  leaves the row after the active chip and the trailing dropdown, i.e. a
+ *  continuous value — pinning it is how one specific cut gets photographed twice
+ *  under identical geometry. `data-cut` is forced on for the same reason: the
+ *  shipped attribute comes from a ResizeObserver measurement this harness does
+ *  not run. */
+function PinnedChipRow() {
+  const names = ['prod-us-east-1', 'staging-eu-west-1', 'sandbox'].slice(0, pins)
+  return (
+    <div
+      data-testid="crew-chip-row"
+      data-cut="true"
+      className="crew-chip-row relative flex flex-nowrap items-center gap-1 min-w-0 overflow-hidden"
+      style={rowW ? { width: Number(rowW), flex: 'none' } : undefined}
+    >
+      {names.map((name, i) => (
+        <button
+          key={name}
+          type="button"
+          data-chip={i === names.length - 1 ? 'last' : undefined}
+          aria-label={name}
+          className="flex items-center gap-1.5 h-6 px-2 rounded-md text-[12px] whitespace-nowrap transition-colors shrink-0 border focus-ring border-border text-text"
+        >
+          <span className="w-1.5 h-1.5 rounded-full shrink-0 bg-[var(--ok)]" aria-hidden />
+          <span className="tb-drop-crew-name truncate max-w-[140px]">{name}</span>
+          {i === names.length - 1 && unread > 0 ? (
+            <span
+              data-badge-chip
+              className="ml-0.5 min-w-[16px] h-4 px-1 rounded-full text-[10px] leading-4 text-center font-bold shrink-0 bg-accent text-accent-fg"
+            >
+              {unread}
+            </span>
+          ) : null}
+        </button>
+      ))}
+    </div>
+  )
+}
 
 /** Verbatim from App.tsx's NotificationsBellButton -- including the wrapper,
  *  whose `relative` is the badge's containing block. Kept byte-faithful on
@@ -138,7 +201,13 @@ function TopBarMobile() {
   return (
     <header className="topbar topbar-glass relative pl-3 pr-3" data-topbar style={{ height: 42 }}>
       <div className="tb-left relative h-full px-2">
-        <button className="p-2 rounded-md bg-transparent border-none text-muted shrink-0" aria-label="nav"><Menu size={20} /></button>
+        {/* The nav button, verbatim from App.tsx. `/logo.png` is a GATEWAY route, so
+            the harness serves nothing for it and the shot shows an empty rounded box:
+            the layout under test is the 24px box the classes fix, which `object-contain`
+            cannot change, so the missing bitmap costs the rungs nothing. */}
+        <button className="group p-2 rounded-md bg-transparent border-none text-muted shrink-0" aria-label="nav">
+          <img src="/logo.png" alt="" aria-hidden="true" className="w-6 h-6 rounded-md shrink-0 object-contain transition-transform duration-300 group-hover:rotate-[-8deg]" />
+        </button>
         <div className="instance-tab-bar-inline flex items-center h-full gap-1 min-w-0">
           <div className="flex items-center gap-1 min-w-0">
             <button
@@ -150,12 +219,22 @@ function TopBarMobile() {
               <Home className="lucide-inline shrink-0" />
               <span className="tb-drop-crew-name truncate max-w-[140px]">本地</span>
             </button>
+            {pins > 0 ? <PinnedChipRow /> : null}
             <button
               type="button"
               aria-label="切换 crew"
               className="relative flex items-center justify-center h-6 w-6 shrink-0 rounded-md border border-transparent text-muted"
             >
               <ChevronDown className="lucide-inline shrink-0" />
+              {pins > 0 && unread > 0 ? (
+                <span
+                  data-badge-trigger
+                  aria-hidden
+                  className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-[3px] rounded-full bg-accent text-accent-fg text-[10px] font-semibold leading-[14px] text-center pointer-events-none"
+                >
+                  {unread}
+                </span>
+              ) : null}
             </button>
           </div>
         </div>

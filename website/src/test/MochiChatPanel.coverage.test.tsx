@@ -631,7 +631,7 @@ describe('ChatPanel context menu', () => {
     await screen.findByText('old turn')
     const menu = await openMenu(container)
     await userEvent.click(menu.getByRole('menuitem', { name: 'Reset Mochi' }))
-    expect(await screen.findByText('Reset Mochi?')).toBeInTheDocument()
+    expect(await screen.findByText('Reset \u201cMochi\u201d?')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Reset' }))
     await waitFor(() => expect(resetMochi).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(screen.queryByText('old turn')).not.toBeInTheDocument())

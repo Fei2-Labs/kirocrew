@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
-import { describe, it, expect, vi } from 'vitest'
-import { render, fireEvent } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, fireEvent, waitFor } from '@testing-library/react'
 import MarkdownRenderer, { artifactSlugFromHref } from '../components/MarkdownRenderer'
+import { __resetPathKindCache } from '../hooks/usePathKind'
 
 // The agent emits `[<name>](/artifacts/<slug>)` markdown links;
 // the renderer must intercept clicks on those anchors and route the slug to
@@ -36,6 +37,10 @@ describe('artifactSlugFromHref', () => {
 
 describe('MarkdownRenderer artifact link interception', () => {
   const ARTIFACT_MD = '[My Report](/artifacts/my-report)'
+  const realFetch = globalThis.fetch
+
+  beforeEach(() => { __resetPathKindCache() })
+  afterEach(() => { globalThis.fetch = realFetch; vi.restoreAllMocks() })
 
   it('invokes onArtifactOpen with the slug when an artifact anchor is clicked', () => {
     const onArtifactOpen = vi.fn()
@@ -59,6 +64,31 @@ describe('MarkdownRenderer artifact link interception', () => {
     expect(em).not.toBeNull()
     fireEvent.click(em!)
     expect(onArtifactOpen).toHaveBeenCalledWith('my-report')
+  })
+
+  it('does not also open the file panel when artifact and path handlers are wired', async () => {
+    globalThis.fetch = vi.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'X-Path-Kind': 'file' }),
+    } as Response)) as unknown as typeof fetch
+    const onArtifactOpen = vi.fn()
+    const onFileOpen = vi.fn()
+    const { container } = render(
+      <MarkdownRenderer
+        content={ARTIFACT_MD}
+        onArtifactOpen={onArtifactOpen}
+        onFileOpen={onFileOpen}
+      />,
+    )
+
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+
+    const anchor = container.querySelector('a[href="/artifacts/my-report"]')!
+    fireEvent.click(anchor)
+    await waitFor(() => expect(onArtifactOpen).toHaveBeenCalledWith('my-report'))
+    expect(onFileOpen).not.toHaveBeenCalled()
   })
 
   it('does not invoke onArtifactOpen on shift+click (lets the navigation happen)', () => {

@@ -56,11 +56,9 @@ class TestReadRssKb:
             assert result == -1 or result > 0
 
     def test_returns_minus_one_when_all_sources_fail(self) -> None:
-        """If /proc/self/status and resource both fail, return -1."""
-        with patch("builtins.open", side_effect=OSError("mocked")):
-            with patch.dict("sys.modules", {"resource": None}):
-                with patch.object(sys, "platform", "linux"):
-                    result = _read_rss_kb()
+        """When the shared reader cannot measure, the diagnostic says so."""
+        with patch("kiro_crew.mcp_gateway.gatewayd._proc_rss_bytes", return_value=0):
+            result = _read_rss_kb()
         assert result == -1
 
     def test_rss_is_in_kilobytes(self) -> None:

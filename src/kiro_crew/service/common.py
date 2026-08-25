@@ -24,6 +24,26 @@ LAUNCHD_LABEL = "dev.kirocrew.gateway"  # launchd Label
 _AUTH_ENV_VAR = "KIRO_API_KEY"
 
 
+def systemd_quote(value: str) -> str:
+    """Double-quote a value for a systemd unit token.
+
+    systemd splits unquoted ``ExecStart`` / ``Environment=`` tokens on
+    whitespace, so paths and environment values containing spaces must be
+    quoted.  Percent signs are doubled because systemd performs specifier
+    expansion even inside quotes, and backslashes / quotes use C-style escapes.
+
+    Control characters are rejected rather than escaped: a newline would end
+    the physical value and let the remainder be parsed as fresh unit directives.
+    """
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(
+            "refusing to render a systemd unit value containing a control "
+            "character (possible unit-file injection): " + repr(value)
+        )
+    escaped = value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def launchd_live_program() -> "os.PathLike[str]":
     """Stable path the launchd agent's ``ProgramArguments[0]`` points at.
 
@@ -138,9 +158,8 @@ def service_environment(home: str) -> "dict[str, str]":
         env["KIROCREW_KIRO_BIN"] = os.path.abspath(kiro_bin)
     # KIROCREW_PORT is the ONLY input DASHBOARD_PORT reads, so a service that
     # cannot carry it can only ever bind the default 5476 — broken by
-    # construction on a host where that port is already taken, which includes
-    # every host running Kiro Crew's own instance tunnel (it pins
-    # local_port == remote_port). Propagated the same way KIROCREW_KIRO_BIN is:
+    # construction on a host where that port is already taken. Propagated the
+    # same way KIROCREW_KIRO_BIN is:
     # captured from the installer's environment, so
     # `KIROCREW_PORT=5477 kirocrew service install` bakes 5477 into the unit.
     #

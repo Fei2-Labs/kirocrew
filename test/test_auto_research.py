@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew.apps.builtins.auto_research.handlers import (
     DEFAULT_DEPTH_DECAY,
     DEFAULT_EXECUTION_MODE,
@@ -730,6 +731,7 @@ class TestStalledCampaignVerdict:
         status, _ = _stalled_campaign_verdict(self.CID, [p])
         assert status == CampaignStatus.FAILED
 
+    @requires_symlinks
     def test_marker_symlink_is_not_trusted(self, _isolate: Path):
         """A LINK at the marker path is rejected by the reader outright — a
         marker symlinked to an unbounded source (e.g. /dev/zero) must never
@@ -803,6 +805,7 @@ class TestStalledCampaignVerdict:
         d.mkdir(parents=True, exist_ok=True)
         assert _read_worker_done(self.CID) is None
 
+    @requires_symlinks
     def test_clear_marker_symlink_removes_link_not_target(self, _isolate: Path):
         """A symlink at the marker path is unlinked — its target's contents
         must never be recursively deleted."""
@@ -3268,6 +3271,43 @@ class TestGrillParse:
         from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
 
         assert _parse_grill_nodes("no json here") == []
+
+    def test_stray_bracket_in_prose_does_not_corrupt_the_payload(self):
+        # The old outermost find('[') .. rfind(']') span ran from the "[1]:"
+        # marker to the trailing "[12]." citation, so the slice never parsed
+        # and a valid payload was silently lost.
+        from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
+
+        raw = (
+            'Expanding item [1]: [{"kind":"research","text":"How is it stored?"}] '
+            "as noted in [12]."
+        )
+        assert _parse_grill_nodes(raw) == [{"kind": "research", "text": "How is it stored?"}]
+
+    def test_two_different_node_arrays_refuse_the_guess(self):
+        # The shared extractor's ambiguity contract: two DIFFERENT node-shaped
+        # arrays mean the caller cannot know which is the real payload.
+        from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
+
+        raw = (
+            'For example [{"kind":"research","text":"Example?"}] but my answer is '
+            '[{"kind":"research","text":"Real?"}]'
+        )
+        assert _parse_grill_nodes(raw) == []
+
+    def test_fenced_reply_is_accepted(self):
+        # Fence markers are just prose to the shared scanner.
+        from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
+
+        raw = '```json\n[{"kind":"research","text":"How is it stored?"}]\n```'
+        assert _parse_grill_nodes(raw) == [{"kind": "research", "text": "How is it stored?"}]
+
+    def test_nesting_bomb_degrades_to_no_nodes(self):
+        # A RecursionError from the stdlib decoder must not escape into the
+        # grill-expand handler (it would surface as HTTP 500, not empty nodes).
+        from kiro_crew.apps.builtins.auto_research.handlers import _parse_grill_nodes
+
+        assert _parse_grill_nodes("[" * 100_000) == []
 
     def test_node_depth(self):
         from kiro_crew.apps.builtins.auto_research.handlers import _node_depth

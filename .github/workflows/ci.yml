@@ -298,6 +298,29 @@ jobs:
           python3 scripts/check_changelog_history.py --test
           python3 scripts/check_changelog_history.py
 
+  loop-bound-locks:
+    name: Loop-Bound Locks Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check for bare module-global asyncio primitives
+        # An asyncio.Lock/Event/Queue created at module scope binds to the
+        # import-time (or first-use) event loop and raises RuntimeError when
+        # acquired from another loop (Python 3.10+). #4800 converted every
+        # module-global lock to kiro_crew.loop_lock.LoopBoundLock; this gate
+        # keeps the declaration form of the class extinct (the registry form
+        # — dicts holding lazily-created locks — is a review concern; see the
+        # script docstring). Whole-tree, not diff-scoped: the backlog is zero
+        # after the conversion, so there is nothing to charge to whoever
+        # pushes next.
+        run: |
+          # Self-test first: it plants one probe per rule family, so a rule
+          # that silently stops matching fails here instead of shipping green.
+          python3 scripts/check_loop_bound_locks.py --test
+          python3 scripts/check_loop_bound_locks.py
+
   harness-parity:
     name: Harness Parity Gate
     runs-on: ubuntu-latest
@@ -404,13 +427,37 @@ jobs:
       - name: Check formatting (black, baselined)
         run: python3 scripts/check_black_formatting.py
 
+      # Text-mode subprocess calls must pin their decode encoding: without one
+      # the child's output decodes with the Windows ANSI code page (#5249).
+      # Self-test first: it plants one probe per rule family, so a typo that
+      # silently disables a rule fails here instead of shipping green.
+      - name: Check subprocess text-mode encoding (gate, baselined)
+        run: |
+          python3 scripts/check_subprocess_encoding.py --test
+          python3 scripts/check_subprocess_encoding.py
+
+      # A secret-bearing file must be locked down BEFORE any content reaches it:
+      # a post-publish lockdown leaves the payload at its final path under the
+      # inherited DACL, which on Windows is not covered by atomic_write's POSIX
+      # mode at all. #5307 converted the last seven such writers; this keeps a
+      # new one from reintroducing the shape. Known-unconverted sites live in
+      # KNOWN_UNCONVERTED in the script, keyed to an open issue, and that list is
+      # shrink-only -- a paid-off entry fails the gate until it is deleted.
+      - name: Check lockdown-before-publish (secret writers)
+        run: python3 scripts/check_lockdown_before_publish.py
+
       # isort/flake8/mypy below are BLOCKING (config in pyproject.toml + setup.cfg).
+      #
+      # The two repo-root modules are named explicitly: `src/kiro_crew test` misses
+      # them, and between them they hold the host-protection floor for all three
+      # testpaths -- the isolation fixtures and the xdist worker budget -- so they
+      # are the last files that should go unlinted.
 
       - name: Check imports (isort)
-        run: isort --check-only src/kiro_crew test
+        run: isort --check-only src/kiro_crew test conftest.py xdist_budget.py
 
       - name: Lint (flake8)
-        run: flake8 src/kiro_crew test
+        run: flake8 src/kiro_crew test conftest.py xdist_budget.py
 
       - name: Type check (mypy)
         run: mypy src/kiro_crew/
@@ -611,6 +658,31 @@ jobs:
       - name: Run tests (Windows shard ${{ matrix.group }}/${{ env.SHARD_COUNT }})
         # bash (Git Bash on windows-latest), not pwsh: the invocation shares
         # the POSIX job's line-continuation and env-interpolation syntax.
+        #
+        # --max-worker-restart=0 overrides setup.cfg's =2 for THIS job only.
+        # pytest-timeout has no SIGALRM on Windows, so it falls back to the
+        # thread method, which cannot fail a single test -- it terminates the
+        # whole worker. Every per-test timeout here therefore lands as
+        # "node down: Not properly terminated", and xdist then enters its
+        # node-replacement path, where #2803 documented a broken invariant (a
+        # node in assigned_work but absent from registered_collections). That
+        # path either dies with INTERNALERROR or, as in #4227, never completes
+        # the session and burns the full 40-minute cap. Refusing the
+        # replacement keeps us out of it: the first dead worker ends the run
+        # promptly with the victim named. setup.cfg keeps =2 deliberately, to
+        # absorb a one-off memory-pressure crash on a developer machine; a CI
+        # runner has no such need.
+        #
+        # Measured on windows-latest-equivalent pins (pytest 9.0.3, xdist
+        # 3.5.0, pytest-timeout 2.2.0) with one test forced past the timeout:
+        # =2 hung indefinitely with no summary and no victim named, and a
+        # single slow test took down TWO workers because the crashed item is
+        # re-dispatched to a live one. =0 exited 1 in 12s and named the test.
+        # The trade-off is deliberate: refusing the replacement abandons the
+        # work still pending on that shard, so a killed shard reports fewer
+        # tests than it collected. That is the right trade for CI -- the job
+        # is red either way, and a named red in 12 minutes beats an
+        # uninterpretable one at the 40-minute cap.
         shell: bash
         env:
           REDUCED: ${{ steps.scope.outputs.reduced }}
@@ -619,12 +691,12 @@ jobs:
           if [ "$REDUCED" = "true" ]; then
             TARGETS=()
             while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then TARGETS+=("$line"); fi; done < "$TARGETS_FILE"
-            pytest -q -n auto --timeout=180 --no-cov \
+            pytest -q -n auto --timeout=180 --no-cov --max-worker-restart=0 \
               --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
               "${TARGETS[@]}"
             exit 0
           fi
-          pytest -q -n auto --timeout=180 --no-cov \
+          pytest -q -n auto --timeout=180 --no-cov --max-worker-restart=0 \
             --splits "$SHARD_COUNT" --group ${{ matrix.group }}
         # Nothing is deselected here either, and the same guards carry it: Windows has no
         # namespace sandbox at all, so `userns_available()` is False and every
@@ -1105,20 +1177,23 @@ jobs:
 
       - name: Type check
         working-directory: website
-        # `tsc -b`, NOT `npm run typecheck`: the root tsconfig has `files: []`
-        # + project references, so `tsc --noEmit` (what `typecheck` runs) checks
-        # ZERO files and always passes. `tsc -b` actually type-checks the project.
+        # Spelled out rather than `npm run typecheck` so this gate cannot be
+        # changed from package.json. Build mode is required either way: the root
+        # tsconfig is `files: []` + project references, and references are followed
+        # only by `-b`, so a plain `tsc --noEmit` there compiles an empty program.
         run: npx tsc -b
 
       - name: Lint
         working-directory: website
         # Blocking: fails on any eslint error and on any NEW warning above the
-        # current baseline. Ratchet --max-warnings down toward 0 as the ~1116
+        # current baseline. Ratchet --max-warnings down toward 0 as the
         # pre-existing warnings (no-explicit-any, jsx-a11y, no-console) are burned
-        # down; do not raise it. (Baseline bumped 1066 -> 1116 by the final
-        # Brazil->GitHub sync, which imported upstream warnings that never faced
-        # this gate; burn-down resumes from 1116.)
-        run: npx eslint src/ --max-warnings 1116
+        # down; do not raise it.
+        #
+        # The ceiling must EQUAL the measured count, not sit above it: slack is
+        # silent admission, and a warning that lands inside it never surfaces
+        # again. Re-measure with `cd website && npx eslint src/` when burning down.
+        run: npx eslint src/ --max-warnings 664
 
       - name: Copy/paste detection
         working-directory: website
@@ -1152,7 +1227,7 @@ jobs:
         # unrecognised flag makes those scripts refuse to run rather than fall through to
         # their destructive conversion path.
         #
-        # ONLY TWO KINDS OF CHECK CAN FAIL THIS STEP.
+        # ONLY THREE KINDS OF CHECK CAN FAIL THIS STEP.
         #
         #   DIFF-SCOPED, zero tolerance — a finding on a line you wrote is yours and there
         #   is no number to raise:
@@ -1168,8 +1243,16 @@ jobs:
         #                       reference and its catalog entry are edited independently, so
         #                       a catalog-only rename dangles references in files the PR
         #                       never opens. Needs no base ref, so it cannot skip itself.
-        #     [plurals]         a `{n} {t('item')}s` concatenation.
+        #     [plurals]         an i18nT-adjacent `{n} {t('item')}s` concatenation.
         #     [pseudolocale]    `en-XA.json` stale against its generator.
+        #
+        #   WHOLE-REPO CEILING — fails only when the class GROWS:
+        #     [plurals-hardcoded] the same plural-glue defect with NO i18nT in it, e.g.
+        #                       a fully hardcoded aria-label gluing `?'s':''` onto a
+        #                       noun. The frozen sites are pinned at HARDCODED_CEILING
+        #                       in i18n-plural-codemod.mjs and ratchet DOWN as they are
+        #                       converted; a failure lists every site with file:line so
+        #                       the added one is findable.
         #
         # EVERYTHING ELSE IS REPORT ONLY — [untranslated], [allcaps], [extractable] and
         # [dynamic-keys]. Each is a stored whole-repo total, written by whichever branch
@@ -1184,7 +1267,7 @@ jobs:
         #
         # `check-i18n-strings.mjs` drives a SECOND eslint invocation with its own config.
         # `no-literal-string` at `mode: 'all'` reports thousands of findings, and folding
-        # those into the 1116 budget above would make an i18n regression indistinguishable
+        # those into the budget above would make an i18n regression indistinguishable
         # from a new `no-explicit-any`.
         run: |
           # `actions/checkout` fetches depth 1, so the base branch is not present and
@@ -1460,6 +1543,45 @@ jobs:
           path: website/build/coverage/
           if-no-files-found: error
 
+  bundle-size:
+    name: Bundle Size Gate
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # A backend-only diff cannot change the frontend bundle, so this gate has
+    # nothing to measure there. Meta diffs (.github/**, scripts/**) leave both
+    # surface flags false and still run the gate -- this job's own config lives
+    # in that bucket.
+    if: needs.changes.outputs.only_backend != 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install dependencies
+        working-directory: website
+        run: npm ci --no-audit --no-fund
+
+      - name: Build in analyze mode
+        working-directory: website
+        # `--mode analyze` activates the kirocrew-bundle-report plugin (see
+        # vite.config.ts), which emits dist/bundle-report.json with per-chunk
+        # sizes. A normal `npm run build` deliberately never writes one, so the
+        # gate below measures a dedicated build instead of taxing the real one.
+        # The memory flag mirrors package.json's `build` script.
+        run: node --max-old-space-size=6144 ./node_modules/vite/bin/vite.js build --mode analyze
+
+      - name: Per-chunk size gate
+        working-directory: website
+        # Explicit ceilings for known-large chunks, a 500 KB default for every
+        # other chunk; fails with one line per breach. Budgets and rationale:
+        # website/scripts/check-bundle-size.mjs (CHUNK_BUDGETS).
+        run: node scripts/check-bundle-size.mjs
+
   e2e:
     name: E2E (stub ACP backend, offline)
     runs-on: ubuntu-latest
@@ -1503,9 +1625,53 @@ jobs:
           mkdir -p src/kiro_crew/static
           cp -R website/dist src/kiro_crew/static/dist
 
-      - name: Install Playwright browser (Chromium)
+      # The browser install is the single largest source of red on this job, and
+      # never because a test failed: across 112 consecutive E2E jobs the
+      # conclusions were 76 success / 36 cancelled / 0 failure, and 22 of those
+      # cancels trace to this step. `--with-deps` runs `apt-get update` first, and
+      # when the runner's default mirror (azure.archive.ubuntu.com) answers `Ign:`
+      # apt falls back to archive.ubuntu.com and stalls silently -- observed at
+      # 23min, 15min and 12min, against a 25min job budget that then has nothing
+      # left for the specs.
+      #
+      # `--with-deps` is dropped rather than retried because it buys nothing this
+      # gate asserts on. Every shared library Chromium needs is already on the
+      # ubuntu-latest image (the apt log reports libnss3, libx11-6, libxcb1,
+      # libasound2 and libxkbcommon0 as `already the newest version`); the only
+      # packages it newly installs are 9 CJK/Thai/Cyrillic font packages. The suite
+      # has no pixel comparison (no toHaveScreenshot / toMatchSnapshot anywhere
+      # under website/), playwright.config.ts pins `locale: 'en-US'` so every spec
+      # renders the English catalog, and the i18n render gate below reads
+      # textContent rather than measuring geometry. A future spec that asserts
+      # glyph METRICS for a non-Latin script would need those fonts back -- add
+      # them as their own bounded, non-fatal step, not by restoring `--with-deps`.
+      #
+      # The version key must be exact: a restore-key prefix could hand the job a
+      # different Chromium revision than @playwright/test expects.
+      - name: Resolve Playwright version
+        id: playwright-version
         working-directory: website
-        run: npx playwright install --with-deps chromium
+        run: |
+          version="$(node -p \
+            "require('./package-lock.json').packages['node_modules/@playwright/test'].version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.playwright-version.outputs.version }}-chromium
+
+      # Runs unconditionally rather than behind `cache-hit != 'true'`: on a hit it
+      # is a ~2s no-op, and that keeps a partially-written cache entry from turning
+      # into a missing-browser failure inside the specs.
+      - name: Install Playwright browser (Chromium)
+        # A step-level cap. The download itself takes ~7s, so anything approaching
+        # this is a stalled mirror or CDN -- fail here with budget left for the
+        # specs instead of consuming the job's 25min and reporting nothing.
+        timeout-minutes: 6
+        working-directory: website
+        run: npx playwright install chromium
 
       - name: i18n render-time gate (en-XA + shipped locales)
         # Phase 5 of the i18n plan. Every other i18n gate reads SOURCE or CATALOG

@@ -23,6 +23,7 @@
  * markdown renderer) into a pure module.
  */
 import type { ChatMessage } from '../../types'
+import { normalizeModelKey } from '../../lib/model'
 
 const SINGLE_PREFIX = '[Subagent completion event]'
 const BATCH_PREFIX = '[Subagent batch completion event]'
@@ -80,6 +81,55 @@ const OUTCOME_BY_GLYPH: Record<string, SubagentOutcome> = {
   '⚠': 'interrupted',
 }
 
+/**
+ * True only when a model was BOTH requested and served, both ids are known, and
+ * they name genuinely different models after canonical normalization. The
+ * ``"auto"`` sentinel (no explicit pin) and an unknown ("") id never count as a
+ * downgrade — a downgrade is a broken PROMISE, and neither made one.
+ *
+ * Comparison delegates to the shared ``normalizeModelKey`` (``lib/model.ts``,
+ * which mirrors the backend ``_normalize_model_key``) so "same model" has ONE
+ * definition across the frontend: config pins are dotted (`claude-opus-4.8`)
+ * while adapters advertise dashed (`claude-opus-4-8`) and case can differ, and
+ * `normalizeModelKey` folds all three plus `auto`/`default`. A raw `!==` here
+ * would false-flag an honored pin as a downgrade (GPT / Design / First
+ * Principles review on #3582).
+ *
+ * `normalizeModelKey` does NOT fold a provider/partition prefix or a version
+ * suffix, so a served canonical id (`us.anthropic.claude-opus-4-8-...-v1:0`)
+ * would still differ from its alias pin (`claude-opus-4.8`). Rather than diverge
+ * the shared key here, we strip ONLY a leading provider/partition prefix and a
+ * trailing version/revision suffix from the served key, then require EXACT
+ * equality with the pin. This deliberately does NOT accept an arbitrary
+ * `-`-delimited substring: a pin `claude-opus-4` against served `claude-opus-4-1`
+ * is a genuine version-family change and must still flag (UX review on #3582) —
+ * a loose containment check would silently pass it, the exact miss this feature
+ * exists to catch. (A full alias→canonical fold belongs in the shared registry —
+ * tracked separately, #5339.)
+ */
+export function isModelDowngrade(requestedModel: string, resolvedModel: string): boolean {
+  const req = requestedModel.trim()
+  const res = resolvedModel.trim()
+  if (!req || !res) return false
+  const reqKey = normalizeModelKey(req)
+  // `normalizeModelKey` folds `auto`/`default` to `"auto"` — no pin, so nothing
+  // to downgrade from.
+  if (reqKey === 'auto') return false
+  const resKey = normalizeModelKey(res)
+  if (reqKey === resKey) return false
+  // Fold the served key to its bare model id: drop a KNOWN leading
+  // provider/partition prefix and a trailing version/revision suffix, then
+  // require exact equality — never an arbitrary substring.
+  // Leading: `us-`/`eu-`/… region, `anthropic-`/`openai-`/`bedrock-`/`global-`.
+  // Trailing: a version/revision tail like `-v1:0`, `:0`, `-20250101`.
+  let bare = resKey
+  bare = bare.replace(/^(?:[a-z]{2}-)?(?:anthropic-|openai-|bedrock-|global-)+/, '')
+  bare = bare.replace(/(?::\d+|-v\d+(?::\d+)?|-\d{6,})$/g, '')
+  if (bare === reqKey) return false
+  return true
+}
+
+
 export interface ParsedSingleCompletion {
   kind: 'single'
   agentId: string
@@ -87,6 +137,13 @@ export interface ParsedSingleCompletion {
   agentName: string
   outcome: SubagentOutcome
   task: string
+  /** Model the spawn requested (pinned), '' when none was pinned. Mirrors the
+   *  backend `requestedModel` meta key (#3582). */
+  requestedModel: string
+  /** Model the session actually served, '' when unknown/inconclusive. Mirrors
+   *  the backend `resolvedModel` meta key; the card shows this and flags a
+   *  downgrade when it differs from `requestedModel`. */
+  resolvedModel: string
   /** Everything after the header block — the agent's own output. */
   body: string
 }
@@ -196,6 +253,8 @@ function fromMeta(content: string, meta: Record<string, unknown> | undefined): P
       agentName: isStr(d.agentName) ? d.agentName : '',
       outcome: d.outcome as SubagentOutcome,
       task: isStr(d.task) ? d.task.trim() : '',
+      requestedModel: isStr(d.requestedModel) ? d.requestedModel : '',
+      resolvedModel: isStr(d.resolvedModel) ? d.resolvedModel : '',
       body: keptNote ? [keptNote, body].filter(Boolean).join('\n\n') : body,
     }
   }
@@ -307,6 +366,9 @@ export function parseSubagentCompletion(
     agentName: m[2] || '',
     outcome: OUTCOME_BY_GLYPH[glyph[0]] || 'ok',
     task: (task?.[1] || '').trim(),
+    // Legacy scrollback prose never carried a model; the meta path supplies it.
+    requestedModel: '',
+    resolvedModel: '',
     body: keptNote ? [keptNote, body].filter(Boolean).join('\n\n') : body,
   }
 }

@@ -115,16 +115,17 @@ def score_by_dimension(results: list[ScenarioResult]) -> dict[str, dict[str, Any
     dim_stats: dict[str, dict[str, int]] = {}
     for r in results:
         for dim in r.dimensions:
-            if dim not in dim_stats:
-                dim_stats[dim] = {"total": 0, "passed": 0}
-            dim_stats[dim]["total"] += 1
-            dim_stats[dim]["passed"] += 1 if r.passed else 0
+            stats = dim_stats.setdefault(dim, {"total": 0, "passed": 0})
+            stats["total"] += 1
+            stats["passed"] += int(r.passed)
 
+    # Every entry is created by the loop above and immediately counted, so `total`
+    # is at least 1 for each key and the division needs no zero guard.
     return {
         dim: {
             "total": s["total"],
             "passed": s["passed"],
-            "rate": round(s["passed"] / s["total"], 3) if s["total"] > 0 else 1.0,
+            "rate": round(s["passed"] / s["total"], 3),
         }
         for dim, s in dim_stats.items()
     }
@@ -247,7 +248,11 @@ class EvalRunner:
             conv_log.init()
             lesson_store = LessonStore(base_dir=ws)
             vector_store = VectorMemoryStore(db_path=ws / "vector_memory.db")
-            vector_store.init()
+            # Off the loop: init() now tightens the DB and its sidecars to
+            # owner-only, which on Windows shells out to icacls up to 11 times.
+            # This runs once per scenario, so a synchronous call would freeze the
+            # loop for seconds on every one.
+            await asyncio.to_thread(vector_store.init)
 
             # Wrap provider factory so all sessions share the same workspace root
             # (default factory creates per-session subdirs, which isolates memory)

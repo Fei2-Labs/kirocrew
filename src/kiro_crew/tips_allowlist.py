@@ -32,6 +32,8 @@ TIP_DOC_ALLOWLIST: frozenset[str] = frozenset(
         "discord-integration.md",
         "dynamic-subagent-sizing.md",
         "feature-tips.md",
+        "imessage-integration.md",
+        "feishu-integration.md",
         "knowledge-library-how-it-works.md",
         "mcp-apps.md",
         "memory-and-learning.md",
@@ -47,5 +49,6 @@ TIP_DOC_ALLOWLIST: frozenset[str] = frozenset(
         "webex-integration.md",
         "wecom-integration.md",
         "weixin-integration.md",
+        "whatsapp-integration.md",
     }
 )

@@ -138,9 +138,11 @@ describe('slot teardown parity', () => {
       slotContextTokens: Object.fromEntries(keys.map(k => [k, { used: 1234, window: 200000 }])),
       stopPressedAt: Object.fromEntries(keys.map(k => [k, 999])),
       followups: Object.fromEntries(keys.map(k => [k, { items: [], ts: 1 }])),
-      folderSuggestions: Object.fromEntries(keys.map(k => [k, { folderId: 'f', folderName: 'F', breadcrumb: 'F', ts: 1 }])),
+      folderSuggestions: Object.fromEntries(keys.map(k => [k, { folderId: 'f', folderName: 'F', breadcrumb: 'F', ts: 1, turns: 0 }])),
       subagentQueued: Object.fromEntries(keys.map(k => [k, 2])),
       goalLoops: Object.fromEntries(keys.map(k => [k, { cycle_count: 1, max_cycles: 5 }])),
+      slotPaneHasMore: Object.fromEntries(keys.map(k => [k, true])),
+      slotPaneBounded: Object.fromEntries(keys.map(k => [k, 50])),
     }
   }
 
@@ -148,6 +150,7 @@ describe('slot teardown parity', () => {
     'slotMessages', 'slotActivity', 'slotRun', 'slotHydrated', 'slotSide',
     'slotSideClosed', 'slotStatusDetail', 'slotContextPct', 'slotContextTokens',
     'stopPressedAt', 'followups', 'folderSuggestions', 'subagentQueued', 'goalLoops',
+    'slotPaneHasMore', 'slotPaneBounded',
   ] as const
 
   const keysOf = (state: unknown, map: string) =>

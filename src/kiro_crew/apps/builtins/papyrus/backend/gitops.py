@@ -35,6 +35,7 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.papyrus.backend import procio, store
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.git_divergence import divergence_count_args, parse_divergence_counts
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
@@ -585,13 +586,14 @@ async def status(project: Path) -> GitStatus:
     _c, remote_out, _e = await _git(["remote"], cwd=project)
 
     ahead = behind = 0
-    code, counts, _e = await _git(
-        ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], cwd=project
-    )
+    code, counts_out, _e = await _git(divergence_count_args("@{upstream}"), cwd=project)
     if code == 0:
-        parts = counts.strip().split()
-        if len(parts) == 2 and all(p.isdigit() for p in parts):
-            ahead, behind = int(parts[0]), int(parts[1])
+        # Display surface, not a gate: an unreadable count folds to 0/0 so the
+        # status panel still renders. The refusal policy for unreadable counts
+        # lives at the update gates, which act on the numbers.
+        parsed = parse_divergence_counts(counts_out)
+        if parsed is not None:
+            ahead, behind = parsed.ahead, parsed.behind
 
     changed = [line for line in porcelain.strip().splitlines() if line]
     return GitStatus(

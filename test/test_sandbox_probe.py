@@ -571,7 +571,7 @@ class TestProbeScaffolding:
         monkeypatch.setattr(sb.os, "close", tracking_close)
         monkeypatch.setattr(sb.os, "fork", boom)
 
-        ok, transient, reason, _remedy = sb._probe_unshare_once()
+        ok, transient, reason, _remedy = sb._probe_unshare_via_fork()
 
         assert (ok, transient) == (False, True)
         assert reason == "fork failed with errno 11 (EAGAIN)"
@@ -586,7 +586,7 @@ class TestProbeScaffolding:
         monkeypatch.setattr(sb, "_probe_reap", reaped.append)
         monkeypatch.setattr(sb, "_probe_parent_sequence", lambda *_a: (True, False, "ok", ""))
 
-        assert sb._probe_unshare_once() == (True, False, "ok", "")
+        assert sb._probe_unshare_via_fork() == (True, False, "ok", "")
         assert reaped == [4242]
 
     @_linux_only
@@ -601,7 +601,7 @@ class TestProbeScaffolding:
         monkeypatch.setattr(sb, "_probe_parent_sequence", boom)
 
         with pytest.raises(RuntimeError):
-            sb._probe_unshare_once()
+            sb._probe_unshare_via_fork()
         assert reaped == [4242]
 
     def test_non_linux_never_probes(self, monkeypatch):
@@ -794,3 +794,258 @@ class TestProbeChildFdSweep:
 
         assert os.waitstatus_to_exitcode(status) == 0
         assert data == b"01", "sentinel lock fd must close; kept report pipe must survive"
+
+
+def _forked_child_thread_count() -> int:
+    """Thread count as observed by a fresh ``os.fork()`` child of THIS process.
+
+    ``st_nlink`` of ``/proc/self/task`` is ``2 + threads``, so the child does no
+    imports and no I/O beyond one ``stat`` and one pipe write -- the same
+    fork-and-count pattern as ``TestProbeRunsInAFreshProcess._EXPERIMENT``'s
+    ``forked()`` helper, which inlines it because the experiment runs under
+    ``-I -S`` in a disposable interpreter and cannot import this module. Reads 1
+    unless an ``os.register_at_fork(after_in_child=...)`` hook armed earlier in
+    this process starts a thread inside every child; -1 when the child could not
+    report.
+    """
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            os.write(w, str(max(1, os.stat("/proc/self/task").st_nlink - 2)).encode())
+            os.close(w)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+    os.close(w)
+    try:
+        data = os.read(r, 8)
+    finally:
+        os.close(r)
+        os.waitpid(pid, 0)
+    return int(data or -1)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the userns probe is Linux-only")
+class TestProbeRunsInAFreshProcess:
+    """The probe child must not inherit the caller's fork hooks.
+
+    ``unshare(CLONE_NEWUSER)`` implies ``CLONE_THREAD``, so the kernel returns
+    EINVAL unless the caller's thread group holds exactly one task. An
+    ``os.register_at_fork(after_in_child=...)`` handler runs INSIDE ``os.fork()``,
+    so a dependency that restarts a thread in every child -- OpenTelemetry's
+    metric reader does -- makes a forked probe child multithreaded before it can
+    measure anything. That EINVAL is classified permanent and cached, and every
+    later sandboxed spawn in the process then fails closed: one such probe cost a
+    release gate 40 tests, none of them a metrics test.
+    """
+
+    #: The experiment, run in a DISPOSABLE interpreter. Arming the hook is the point
+    #: of the test and CPython cannot unregister one, so doing it in the pytest worker
+    #: would leave every later fork in that worker starting an unrequested thread --
+    #: the exact side effect this fix exists to remove. The child takes the hook with
+    #: it when it exits. Prints three counts: forked-before, forked-after, spawned.
+    #: Its ``forked()`` inlines ``_forked_child_thread_count``'s fork-and-count
+    #: pattern: under ``-I -S`` there is no site directory, so it cannot import
+    #: this module.
+    _EXPERIMENT = r"""
+import os, subprocess, sys, threading, time
+
+def forked():
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        os.write(w, str(max(1, os.stat("/proc/self/task").st_nlink - 2)).encode())
+        os.close(w)
+        os._exit(0)
+    os.close(w)
+    n = int(os.read(r, 8) or -1)
+    os.close(r)
+    os.waitpid(pid, 0)
+    return n
+
+before = forked()
+os.register_at_fork(after_in_child=lambda: threading.Thread(
+    target=time.sleep, args=(30,), daemon=True).start())
+after = forked()
+code = "import os;print(max(1, os.stat('/proc/self/task').st_nlink - 2))"
+spawned = int(subprocess.run([sys.executable, "-I", "-S", "-c", code],
+                             capture_output=True, text=True, check=True).stdout.strip())
+print(before, after, spawned)
+"""
+
+    def test_a_fork_hook_cannot_reach_the_spawned_child(self):
+        """The property the fix rests on, measured rather than argued.
+
+        Asserted as a DIFFERENCE within one process: a bare "the spawned child has
+        one thread" would pass just as well on a host where nothing armed a hook,
+        which is every host until something does.
+        """
+        out = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", self._EXPERIMENT],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        before, after, spawned = (int(part) for part in out.split())
+
+        assert before == 1, f"the experiment started with a hook already armed ({before})"
+        assert after > 1, "a forked child does not inherit the fork hook; premise gone"
+        assert spawned == 1, "a freshly spawned interpreter must be single-threaded"
+
+    def test_both_paths_report_the_same_verdict_on_this_host(self):
+        """Spawn and fork must agree, or the fix would be changing the answer.
+
+        Only the reason text is compared for its leading step+errno: the spawned
+        path's transient failure strings name a Popen-owned child differently, and
+        that difference is not a verdict.
+
+        The comparison only means something while the fork child that PRODUCED the
+        verdict was single-threaded. An ``os.register_at_fork`` hook armed earlier
+        in the same worker (test ordering under xdist decides this) starts a thread
+        inside every child, and the fork path then reports the deliberate
+        ``_PROBE_STEP_MULTITHREADED`` collapse instead of the kernel's verdict --
+        an unknown reading, so it is skipped, not compared (see
+        docs/system-specs/common/testing-conventions.md; the collapse itself is
+        issue #4219's open decision).
+
+        Two guards, because the hook-started thread is SHORT-LIVED and each fork
+        races it independently: the `_forked_child_thread_count` pre-check is
+        cheap and catches the steady state, but a clean pre-check child does not
+        prove the verdict child was clean. The decisive check therefore reads the
+        collapse off the verdict tuple itself, after the probe ran.
+        """
+        child_threads = _forked_child_thread_count()
+        if child_threads < 0:
+            pytest.fail(
+                "the fork-child thread probe could not report: the forked child "
+                "died before writing its /proc/self/task count -- the helper is "
+                "broken on this host, which says nothing about fork hooks"
+            )
+        if child_threads > 1:
+            pytest.skip(
+                "the fork path cannot reach the kernel's verdict on this worker: a "
+                f"fresh fork child reports {child_threads} thread(s) -- an "
+                "os.register_at_fork hook armed earlier in this worker starts a "
+                "thread inside every child, so there is no comparable verdict "
+                "(the collapse is deliberate; see issue #4219)"
+            )
+        spawned = sb._probe_unshare_via_spawn()
+        assert spawned is not None, "this host can spawn an interpreter"
+        forked = sb._probe_unshare_via_fork()
+        if sb._probe_reason_is_multithreaded_collapse(forked[2]):
+            pytest.skip(
+                "the fork child that produced the verdict came up multithreaded "
+                "despite a clean pre-check: the at-fork-hook thread is short-lived "
+                "and each fork races it independently, so the kernel's verdict is "
+                "unobtainable from this worker's fork children (the collapse is "
+                "deliberate; see issue #4219)"
+            )
+        assert spawned[0] == forked[0], (spawned, forked)
+        assert spawned[1] == forked[1], (spawned, forked)
+        assert spawned[3] == forked[3], (spawned, forked)
+
+    def test_verdict_comparison_skips_when_fork_children_start_threaded(self, monkeypatch):
+        """A hook-started thread means SKIP -- never a false red on an unlucky shard."""
+        monkeypatch.setattr(
+            sys.modules[__name__], "_forked_child_thread_count", lambda: 2
+        )
+        probed = {"n": 0}
+
+        def _count_probe():
+            probed["n"] += 1
+            return None
+
+        monkeypatch.setattr(sb, "_probe_unshare_via_spawn", _count_probe)
+        with pytest.raises(pytest.skip.Exception):
+            self.test_both_paths_report_the_same_verdict_on_this_host()
+        assert probed["n"] == 0, "the guard must skip BEFORE probing anything"
+
+    def test_verdict_comparison_skips_when_the_verdict_child_itself_collapsed(
+        self, monkeypatch
+    ):
+        """A clean pre-check does not clear the verdict child -- each fork races.
+
+        The at-fork-hook thread is short-lived, so the `_forked_child_thread_count`
+        pre-check child and `_probe_unshare_via_fork`'s verdict child can disagree:
+        pre-check counts 1, verdict child still comes up multithreaded and reports
+        the collapse. That reading is unknown, never a red -- the skip must be
+        decided off the verdict tuple itself.
+        """
+        monkeypatch.setattr(
+            sys.modules[__name__], "_forked_child_thread_count", lambda: 1
+        )
+        monkeypatch.setattr(
+            sb, "_probe_unshare_via_spawn",
+            lambda: (False, False, "unshare(CLONE_NEWNS) failed with errno 1 (EPERM)", "apparmor_userns"),
+        )
+        collapse = (
+            False,
+            False,
+            "unshare(CLONE_NEWUSER) failed with errno 22 (EINVAL); the probe child "
+            f"had 2 threads, which alone makes it return EINVAL (CLONE_NEWUSER "
+            f"implies CLONE_THREAD) -- {sb._PROBE_MULTITHREADED_REASON}",
+            "no_user_ns",
+        )
+        monkeypatch.setattr(sb, "_probe_unshare_via_fork", lambda: collapse)
+        with pytest.raises(pytest.skip.Exception):
+            self.test_both_paths_report_the_same_verdict_on_this_host()
+
+    def test_verdict_comparison_still_fails_on_a_real_disagreement(self, monkeypatch):
+        """The guard must not swallow a genuine disagreement on a clean shard.
+
+        Each case differs from the spawn tuple in exactly ONE compared field, so
+        the raise can only originate from that field's assertion -- a stub that
+        differs in several fields at once would stay green even if all but one
+        of the comparisons were deleted.
+        """
+        monkeypatch.setattr(
+            sys.modules[__name__], "_forked_child_thread_count", lambda: 1
+        )
+        monkeypatch.setattr(
+            sb, "_probe_unshare_via_spawn", lambda: (True, False, "ok", "")
+        )
+        for forked_stub in (
+            (False, False, "ok", ""),  # differs only at [0]: availability verdict
+            (True, True, "ok", ""),  # differs only at [1]: transient flag
+            (True, False, "ok", "no_user_ns"),  # differs only at [3]: remedy token
+        ):
+            monkeypatch.setattr(sb, "_probe_unshare_via_fork", lambda s=forked_stub: s)
+            with pytest.raises(AssertionError):
+                self.test_both_paths_report_the_same_verdict_on_this_host()
+
+    def test_verdict_comparison_fails_when_the_probe_cannot_report(self, monkeypatch):
+        """A helper that cannot report is a broken helper, never a hook skip."""
+        monkeypatch.setattr(
+            sys.modules[__name__], "_forked_child_thread_count", lambda: -1
+        )
+        with pytest.raises(pytest.fail.Exception):
+            try:
+                self.test_both_paths_report_the_same_verdict_on_this_host()
+            except pytest.skip.Exception as exc:
+                # Skipped is a SIBLING of Failed, so it would escape the raises
+                # block and mark this very test SKIPPED -- reporting the exact
+                # regression it exists to catch as a green run.
+                raise AssertionError(
+                    "a probe that cannot report must fail, not skip"
+                ) from exc
+
+    def test_no_executable_falls_back_instead_of_inventing_a_verdict(self, monkeypatch):
+        """An interpreter we cannot start says nothing about the host's namespaces."""
+        monkeypatch.setattr(sb.sys, "executable", "")
+        monkeypatch.setattr(sb, "_probe_spawn_unavailable_logged", False)
+        assert sb._probe_unshare_via_spawn() is None
+
+        monkeypatch.setattr(
+            sb, "_probe_unshare_via_fork", lambda: (True, False, "fork path ran", "")
+        )
+        assert sb._probe_unshare_once() == (True, False, "fork path ran", "")
+
+    def test_the_shim_imports_nothing_first_party(self):
+        """It runs under ``-I -S``: no site directory, so a kiro_crew import would fail."""
+        assert "kiro_crew" not in sb._PROBE_SHIM_CODE
+        for line in sb._PROBE_SHIM_CODE.splitlines():
+            if line.startswith(("import ", "from ")):
+                assert "kiro_crew" not in line, line

@@ -15,7 +15,6 @@ the per-test ``KIROCREW_HOME`` that Kiro Crew's conftest pins.
 from __future__ import annotations
 
 import asyncio
-import builtins
 import json
 import os
 import sys
@@ -993,6 +992,28 @@ class TestEnvTargetResolver:
         assert isinstance(env, dict)
         assert work_dir == key.work_dir
 
+    def test_python_env_prefixes_are_stripped_from_spawned_env(self, monkeypatch):
+        """PYTHONPATH/PYTHONHOME/PYTHONPYCACHEPREFIX must not reach a pooled
+        Python-based MCP backend: the first two cause import conflicts, and
+        PYTHONPYCACHEPREFIX would make the backend mirror its stdlib into the
+        shared bytecode cache (see pycache_gc.py). This scrub reuses
+        sandbox._PYTHON_ENV_PREFIXES rather than a hand-listed set of keys, so
+        it can't silently drift from the kiro-cli/agent spawn path's scrub.
+        """
+        key = _pool_key(server="pyenv-mcp")
+        monkeypatch.delenv("KIROCREW_MCP_TARGET_PYENV_MCP", raising=False)
+        monkeypatch.setenv("MC_MCP_TARGET_PYENV_MCP", "py-backend --stdio")
+        monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
+        monkeypatch.setenv("PYTHONHOME", "/host/python")
+        monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/host/cache/pycache")
+
+        resolved = gw.env_target_resolver(key)
+        assert resolved is not None
+        _command, _args, env, _work_dir = resolved
+
+        for leaked_key in ("PYTHONPATH", "PYTHONHOME", "PYTHONPYCACHEPREFIX"):
+            assert leaked_key not in env
+
 
 # --- backend acquire / respawn ----------------------------------------------
 
@@ -1195,6 +1216,102 @@ class TestRespawnBackendForStub:
         pool.unreserve.assert_called_once_with(key)
         await _drain_task(got_task)
 
+    @pytest.mark.asyncio
+    async def test_replay_skipped_when_owner_rekeyed_mid_respawn(self, monkeypatch):
+        """A ``claim`` frame can retarget this connection's identity during
+        the respawn's acquire/prime awaits. The captured URIs belong to the
+        OLD principal — replaying them would resubscribe the old owner's
+        resources onto the rekeyed stub, the exact leak
+        ``evict_stub_subscriptions`` exists to prevent. The replay gate must
+        recheck the live owner and skip when it changed."""
+        key = _pool_key(server="respawn-rekey-mcp")
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        old = _fake_backend()
+        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
+        old.resource_subscription_uris = MagicMock(  # type: ignore[method-assign]
+            return_value=["file:///old-owner.txt"]
+        )
+        fresh = _fake_backend(key, pid=7171)
+        fresh.attach_stub = AsyncMock(  # type: ignore[method-assign]
+            return_value=asyncio.Queue()
+        )
+        fresh.replay_resource_subscriptions = AsyncMock()  # type: ignore[method-assign]
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        old_caller = CallerContext(session_key="dashboard:old")
+        conn = gw._StubConn("stub-r6", [], "pool", old_caller)
+        # The claim lands while prime_initialize is awaited: the connection
+        # identity names a NEW principal before the replay gate runs.
+        fresh.prime_initialize = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda *_a, **_k: setattr(
+                conn, "caller", CallerContext(session_key="dashboard:new")
+            )
+        )
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            key,
+            lambda k: None,
+            "stub-r6",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+            caller=old_caller,
+            conn=conn,
+        )
+
+        assert out is not None  # the respawn itself still succeeds
+        fresh.replay_resource_subscriptions.assert_not_awaited()
+        _backend, _inbox, task = out
+        await _drain_task(task)
+
+    @pytest.mark.asyncio
+    async def test_replay_proceeds_when_owner_unchanged(self, monkeypatch):
+        """Control for the rekey gate: an unchanged owner still gets its
+        subscriptions replayed onto the fresh backend."""
+        key = _pool_key(server="respawn-stable-mcp")
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        old = _fake_backend()
+        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
+        old.resource_subscription_uris = MagicMock(  # type: ignore[method-assign]
+            return_value=["file:///same-owner.txt"]
+        )
+        fresh = _fake_backend(key, pid=7272)
+        fresh.prime_initialize = AsyncMock()  # type: ignore[method-assign]
+        fresh.attach_stub = AsyncMock(  # type: ignore[method-assign]
+            return_value=asyncio.Queue()
+        )
+        fresh.replay_resource_subscriptions = AsyncMock()  # type: ignore[method-assign]
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        same_caller = CallerContext(session_key="dashboard:same")
+        conn = gw._StubConn("stub-r7", [], "pool", same_caller)
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            key,
+            lambda k: None,
+            "stub-r7",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+            caller=same_caller,
+            conn=conn,
+        )
+
+        assert out is not None
+        fresh.replay_resource_subscriptions.assert_awaited_once_with(
+            "stub-r7", ["file:///same-owner.txt"], caller=same_caller
+        )
+        _backend, _inbox, task = out
+        await _drain_task(task)
+
 
 # --- zombie diagnostic ------------------------------------------------------
 
@@ -1227,38 +1344,16 @@ class TestReadRssKb:
         assert isinstance(got, int)
         assert got == -1 or got > 0
 
-    @_POSIX_ONLY
-    def test_falls_back_to_getrusage_when_procfs_is_unreadable(self, monkeypatch):
-        import resource
-
-        real_open = builtins.open
-
-        def _no_procfs(path, *args, **kwargs):
-            if isinstance(path, str) and path.startswith("/proc/"):
-                raise OSError("no procfs")
-            return real_open(path, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "open", _no_procfs)
-        rusage = MagicMock()
-        rusage.ru_maxrss = 4096
-        monkeypatch.setattr(resource, "getrusage", MagicMock(return_value=rusage))
-        monkeypatch.setattr(sys, "platform", "darwin")
-        # macOS reports ru_maxrss in bytes, so it must be divided down to KB.
+    def test_delegates_to_the_shared_current_rss_reader(self, monkeypatch):
+        # The per-platform duplicate that used to live here read ru_maxrss on
+        # macOS -- a peak that never falls. There is now one reader, and this
+        # pins the delegation (and the bytes -> KB conversion) so a second
+        # implementation cannot quietly reappear.
+        monkeypatch.setattr(gw, "_proc_rss_bytes", lambda: 4096)
         assert gw._read_rss_kb() == 4
 
-    @_POSIX_ONLY
-    def test_returns_minus_one_when_every_source_fails(self, monkeypatch):
-        import resource
-
-        real_open = builtins.open
-
-        def _no_procfs(path, *args, **kwargs):
-            if isinstance(path, str) and path.startswith("/proc/"):
-                raise OSError("no procfs")
-            return real_open(path, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "open", _no_procfs)
-        monkeypatch.setattr(resource, "getrusage", MagicMock(side_effect=OSError("nope")))
+    def test_returns_minus_one_when_the_reader_cannot_measure(self, monkeypatch):
+        monkeypatch.setattr(gw, "_proc_rss_bytes", lambda: 0)
         assert gw._read_rss_kb() == -1
 
 
@@ -1311,6 +1406,26 @@ class TestWriteDiagnostic:
         lines = path.read_text(encoding="utf-8").strip().splitlines()
         assert [json.loads(line)["n"] for line in lines] == [1, 2]
 
+    def test_multiple_records_share_a_single_open(self, monkeypatch, tmp_path):
+        # Records passed in one call MUST go through one open-append-close
+        # cycle: a second append that lands while the first writer's handle is
+        # still closing fails with a sharing violation on Windows, and the
+        # never-raises contract would silently drop the record.
+        path = tmp_path / "diag.jsonl"
+        opens: list[str] = []
+        real_open = Path.open
+
+        def counting_open(self, *args, **kwargs):
+            if self == path:
+                opens.append(str(args))
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", counting_open)
+        gw._write_diagnostic(path, {"tag": "probe", "n": 1}, {"tag": "zombie_detected", "n": 2})
+        assert len(opens) == 1
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
+        assert [json.loads(line)["tag"] for line in lines] == ["probe", "zombie_detected"]
+
 
 class TestZombieDiagnostic:
     @pytest.mark.asyncio
@@ -1354,6 +1469,49 @@ class TestZombieDiagnostic:
         assert isinstance(records[-1]["tasks"], list)
         assert isinstance(records[-1]["traceback"], list)
         # Setting stop_event is what lets the watchdog respawn a clean daemon.
+        assert stop.is_set()
+
+    @pytest.mark.asyncio
+    async def test_zombie_dump_survives_a_windows_sharing_violation(self, monkeypatch, tmp_path):
+        # Regression for the Windows write race: the probe baseline and the
+        # zombie dump used to be two back-to-back open-append-close cycles,
+        # and on Windows the second open can land while the first writer's
+        # handle is still closing, failing with a sharing violation
+        # (a PermissionError) that the never-raises writer swallows — losing
+        # the zombie_detected record. Simulate that deterministically by
+        # failing every open of the diagnostic file after the first: with the
+        # records batched through a single open, the dump still lands; with
+        # the old unserialized double-write, it is dropped and this test reds.
+        diag = tmp_path / "diag.jsonl"
+        monkeypatch.setattr(gw, "_zombie_diagnostic_path", lambda: diag)
+        monkeypatch.setattr(gw, "_ZOMBIE_PROBE_INTERVAL_SECS", 0.01)
+        server = MagicMock()
+        server.is_serving.return_value = False
+        stop = asyncio.Event()
+
+        opened = []
+        real_open = Path.open
+
+        def sharing_violation_open(self, *args, **kwargs):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if self == diag and "a" in mode:
+                opened.append(mode)
+                if len(opened) > 1:
+                    raise PermissionError(
+                        13, "The process cannot access the file because it is "
+                        "being used by another process"
+                    )
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", sharing_violation_open)
+        await asyncio.wait_for(
+            gw._zombie_diagnostic(cast(Any, server), BackendPool(max_backends=1), set(), stop),
+            timeout=5,
+        )
+
+        records = [json.loads(line) for line in diag.read_text().strip().splitlines()]
+        tags = [record["tag"] for record in records]
+        assert tags == ["probe", "zombie_detected"]
         assert stop.is_set()
 
     @pytest.mark.asyncio

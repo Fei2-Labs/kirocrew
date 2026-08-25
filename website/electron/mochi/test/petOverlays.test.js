@@ -156,7 +156,9 @@ test("a stale closed handler does not evict the replacement overlay", () => {
 function stubElectronForOpen() {
   const created = [];
   class FakeWebContents {
-    on() {}
+    constructor() { this.listeners = new Map(); }
+    on(event, callback) { this.listeners.set(event, callback); }
+    emit(event, ...args) { this.listeners.get(event)?.(...args); }
     send() {}
     isDestroyed() { return false; }
     isLoading() { return true; }
@@ -166,6 +168,8 @@ function stubElectronForOpen() {
     constructor(opts) {
       this.opts = opts;
       this.webContents = new FakeWebContents();
+      this.visible = false;
+      this.showInactiveCalls = 0;
       created.push(this);
     }
     setFocusable() {}
@@ -180,16 +184,33 @@ function stubElectronForOpen() {
     // actually asserted instead of merely not crashing.
     setContentProtection(on) { this.contentProtection = on; }
     setAlwaysOnTop() {}
+    setBounds(b) { this.bounds = b; }
     loadURL() {}
-    isVisible() { return false; }
+    isVisible() { return this.visible; }
     isDestroyed() { return false; }
-    showInactive() {}
+    showInactive() { this.visible = true; this.showInactiveCalls += 1; }
+    hide() { this.visible = false; }
     close() {}
     on() {}
   }
-  const DISPLAY = { id: 1, bounds: { x: 0, y: 0, width: 1440, height: 900 } };
+  // `workArea` is not optional on a real Electron Display, and getAllDisplayInfo
+  // reads it whenever the arrangement changes — a bounds-only double throws
+  // there instead of exercising the handler.
+  const DISPLAY = {
+    id: 1,
+    bounds: { x: 0, y: 0, width: 1440, height: 900 },
+    workArea: { x: 0, y: 25, width: 1440, height: 875 },
+  };
+  const displays = [DISPLAY];
+  // Display listeners are recorded rather than swallowed: whether they are
+  // RELEASED on teardown is the contract behind #4673, and an `on() {}` stub
+  // cannot see a leak.
+  const displayListeners = [];
   return {
     created,
+    displays,
+    displayListeners,
+    DISPLAY,
     electron: {
       app: { on() {}, setActivationPolicy() {}, dock: { show() {} } },
       BrowserWindow: FakeWindow,
@@ -197,9 +218,13 @@ function stubElectronForOpen() {
       shell: { openExternal() {}, showItemInFolder() {} },
       screen: {
         getPrimaryDisplay: () => DISPLAY,
-        getAllDisplays: () => [DISPLAY],
+        getAllDisplays: () => displays,
         getCursorScreenPoint: () => ({ x: 0, y: 0 }),
-        on() {},
+        on(event, fn) { displayListeners.push({ event, fn }); },
+        removeListener(event, fn) {
+          const at = displayListeners.findIndex((l) => l.event === event && l.fn === fn);
+          if (at >= 0) displayListeners.splice(at, 1);
+        },
       },
     },
   };
@@ -248,6 +273,113 @@ test("the pet overlay is a non-activating panel on macOS only", () => {
   }
 });
 
+// ── Display-listener lifecycle (#4673) ─────────────────────────────────────
+// openPetWindow watches the display arrangement so the overlay set can follow
+// it. That subscription used to sit behind a one-way latch and was never
+// released, so it outlived every teardown: macOS fires
+// display-metrics-changed on a space switch and on wake from sleep, the leaked
+// handler saw an empty overlay map, rebuilt one overlay per display and
+// wireHandshake revealed them — the pet flashed back onto the desktop of a user
+// who had DISABLED Mochi, until the host's next 5s reconcile tick closed it
+// again. Nothing on that path consults the enabled state, so the fix is
+// lifecycle symmetry here, not an async probe on the redraw path.
+
+test("closePetWindow releases the display listeners openPetWindow bound", () => {
+  const { mod, displayListeners } = loadPetOverlays();
+  try {
+    mod.openPetWindow("http://localhost:6777", "tok");
+    assert.deepStrictEqual(
+      displayListeners.map((l) => l.event).sort(),
+      ["display-added", "display-metrics-changed", "display-removed"],
+      "all three arrangement events are watched while a pet is live",
+    );
+
+    mod.closePetWindow();
+    assert.deepStrictEqual(displayListeners, [], "teardown must release every one");
+
+    // The latch is RESET, not merely unset: a re-enable re-arms exactly once, so
+    // an enable/disable cycle can neither leak a handler nor double-fire one.
+    mod.openPetWindow("http://localhost:6777", "tok");
+    assert.strictEqual(displayListeners.length, 3, "a re-open re-arms once, not twice");
+  } finally {
+    mod.closePetWindow();
+  }
+});
+
+test("a display event after teardown does not flash the pet back on screen", () => {
+  const { mod, created, displayListeners } = loadPetOverlays();
+  try {
+    mod.openPetWindow("http://localhost:6777", "tok");
+    assert.strictEqual(created.length, 1, "one overlay for the single display");
+    const metrics = displayListeners.find((l) => l.event === "display-metrics-changed");
+    assert.ok(metrics, "the handler under test must be registered while live");
+
+    mod.closePetWindow();
+    // Exactly what the leak did: deliver the event to the handler that was
+    // registered. It must now build nothing — the guard holds even for an event
+    // already dispatched when teardown ran.
+    metrics.fn();
+    assert.strictEqual(created.length, 1, "no overlay may be created for a torn-down pet");
+    assert.strictEqual(mod.isPetWindowOpen(), false, "and the pet stays gone");
+  } finally {
+    mod.closePetWindow();
+  }
+});
+
+test("a display event while the pet is live still follows the new geometry", () => {
+  // The guard must not be over-broad: a resolution or arrangement change with a
+  // LIVE pet still has to resize its overlay, which is the behaviour the
+  // listeners exist for.
+  const { mod, created, displayListeners, DISPLAY } = loadPetOverlays();
+  try {
+    mod.openPetWindow("http://localhost:6777", "tok");
+    const metrics = displayListeners.find((l) => l.event === "display-metrics-changed");
+    DISPLAY.bounds = { x: 0, y: 0, width: 1280, height: 800 };
+    DISPLAY.workArea = { x: 0, y: 25, width: 1280, height: 775 };
+
+    metrics.fn();
+    assert.strictEqual(created.length, 1, "an existing display reuses its overlay");
+    assert.deepStrictEqual(
+      created[0].bounds,
+      DISPLAY.bounds,
+      "the live overlay follows the new display bounds",
+    );
+  } finally {
+    mod.closePetWindow();
+  }
+});
+
+test("a display added while hide-all is active stays hidden", () => {
+  const { mod, created, displays, displayListeners } = loadPetOverlays();
+  try {
+    mod.openPetWindow("http://localhost:6777", "tok");
+    created[0].webContents.emit("did-finish-load");
+    assert.strictEqual(created[0].isVisible(), true, "the initial overlay is shown");
+
+    mod.hidePetWindow();
+    assert.strictEqual(created[0].isVisible(), false, "hide-all hides the live overlay");
+
+    displays.push({
+      id: 2,
+      bounds: { x: 1440, y: 0, width: 1920, height: 1080 },
+      workArea: { x: 1440, y: 0, width: 1920, height: 1040 },
+    });
+    displayListeners.find((listener) => listener.event === "display-added").fn();
+    assert.strictEqual(created.length, 2, "the new display receives an overlay");
+    created[1].webContents.emit("did-finish-load");
+    assert.strictEqual(
+      created[1].isVisible(),
+      false,
+      "the new overlay must not undo hide-all",
+    );
+
+    mod.showPetWindow();
+    assert.ok(created.every((win) => win.isVisible()), "one restore shows every overlay");
+  } finally {
+    mod.closePetWindow();
+  }
+});
+
 // ── Overlay error-page recovery ────────────────────────────────────────────
 // A pet overlay covers a whole frameless, click-through display, so a gateway
 // error page (401/403/4xx/5xx) rendered in it would trap the user behind an
@@ -272,11 +404,12 @@ function fakeWin() {
     destroyed: false,
     hidden: false,
     loadedUrl: null,
+    loadOptions: null,
     isDestroyed() { return this.destroyed; },
     hide() { this.hidden = true; },
     showInactive() { this.hidden = false; },
     isVisible() { return !this.hidden; },
-    loadURL(u) { this.loadedUrl = u; },
+    loadURL(u, options) { this.loadedUrl = u; this.loadOptions = options; },
     on() {},
   };
 }
@@ -314,7 +447,7 @@ test("handleOverlayNavigation hides+latches an error page and clears on a good l
   }
 });
 
-test("rearmBlankedOverlays reloads only blanked windows, with the token the host resolved", () => {
+test("rearmBlankedOverlays reloads only blanked windows with a minted query token", () => {
   const BLANK = 99312;
   const OK = 99313;
   const blanked = fakeWin();
@@ -325,10 +458,25 @@ test("rearmBlankedOverlays reloads only blanked windows, with the token the host
     _handleOverlayNavigation(blanked, 403); // latch the blanked one; healthy never errored
     rearmBlankedOverlays("http://localhost:5476", "tok123");
     assert.match(blanked.loadedUrl || "", /token=tok123/, "blanked overlay reloads with the host's token");
+    assert.equal(blanked.loadOptions, undefined, "a minted token needs no extra request headers");
     assert.equal(healthy.loadedUrl, null, "a non-blanked overlay is left untouched");
   } finally {
     _getOverlays().delete(BLANK);
     _getOverlays().delete(OK);
+  }
+});
+
+test("rearmBlankedOverlays reloads a borrowed session through the default session", () => {
+  const DID = 99315;
+  const win = fakeWin();
+  _registerOverlay(DID, win);
+  try {
+    _handleOverlayNavigation(win, 403);
+    rearmBlankedOverlays("http://localhost:5476", "borrowed-session", true);
+    assert.doesNotMatch(win.loadedUrl || "", /[?&]token=/, "a borrowed session must not be stringified into a query token");
+    assert.equal(win.loadOptions, undefined, "the BrowserWindow default session supplies the borrowed cookie");
+  } finally {
+    _getOverlays().delete(DID);
   }
 });
 
@@ -362,24 +510,40 @@ test("did-navigate delegates to the single navigation handler (no inline retry p
   assert.ok(!idxSrc.includes("setPetReauthProvider"), "index.js must not wire a reauth provider anymore");
 });
 
-test("every showInactive reveal is guarded by the blanked latch", () => {
+test("every showInactive reveal uses the shared hidden/error policy", () => {
   const reveals = fsSrc.match(/win\.showInactive\(\)/g) || [];
-  const guarded = fsSrc.match(/!overlayBlanked\.has\(win\)[\s\S]{0,80}win\.showInactive\(\)/g) || [];
+  const guarded = fsSrc.match(/canRevealOverlay\(win\)[\s\S]{0,80}win\.showInactive\(\)/g) || [];
   assert.ok(reveals.length >= 3, "expected the three overlay reveal sites (handshake, showPetWindow, transfer)");
-  assert.equal(guarded.length, reveals.length, "every showInactive reveal must be latch-guarded");
+  assert.equal(guarded.length, reveals.length, "every showInactive reveal must use the shared policy");
+  assert.match(
+    fsSrc,
+    /return !petWindowsHidden && !overlayBlanked\.has\(win\)/,
+    "the shared policy must preserve hide-all and the error-page latch",
+  );
 });
 
-test("reconcile re-arms with a current-target token: remote its own, self the cached local token", () => {
-  // The host passes the token it ALREADY resolved this tick; for self it reuses
-  // the probe-maintained cached token (empty-cookie case), only when something
-  // is actually blanked — and NEVER mints here, or a persistent non-auth error
-  // would churn a fresh session token every tick.
+test("reconcile re-arms with scalar credential values and delivery mode", () => {
+  // The host passes the credential it ALREADY resolved this tick; for self it
+  // preserves the probe-maintained delivery mode (including a borrowed-cookie
+  // credential), only when something is actually blanked — and NEVER resolves
+  // repeatedly here, or a persistent non-auth error would churn session tokens.
   const callAt = idxSrc.indexOf("rearmBlankedOverlays(mochiPetBaseUrl");
-  assert.ok(callAt >= 0, "reconcile must call rearmBlankedOverlays with the resolved base url + token");
-  const region = idxSrc.slice(idxSrc.indexOf("if (hasBlankedOverlay())"), callAt + 60);
+  assert.ok(callAt >= 0, "reconcile must call rearmBlankedOverlays with resolved auth");
+  const region = idxSrc.slice(idxSrc.indexOf("if (hasBlankedOverlay())"), callAt + 90);
   assert.match(region, /hasBlankedOverlay\(\)/, "only re-arm when an overlay is actually blanked");
-  assert.match(region, /SELF_INSTANCE/, "self supplies a local token (empty-cookie case)");
-  assert.match(region, /gatewayToken\(\)/, "self reuses the probe-maintained cached token");
-  assert.ok(!region.includes('cachedGatewayToken = ""'),
-    "must NOT clear the token cache in the rearm path — probe-driven invalidation only, or a persistent non-auth error mints every tick");
+  assert.match(region, /SELF_INSTANCE/, "self resolves its gateway credential");
+  assert.match(region, /const auth = await gatewayToken\(\)/, "self obtains the gateway auth record once");
+  assert.match(region, /rearmToken = auth\.value/, "only the credential value reaches rearm");
+  assert.match(region, /rearmViaCookie = auth\.viaCookie/, "rearm retains cookie delivery mode");
+  assert.match(region, /rearmBlankedOverlays\(mochiPetBaseUrl, rearmToken, rearmViaCookie\)/,
+    "rearm receives scalar token and delivery mode, never the auth record");
+  assert.ok(!region.includes('cachedGatewayAuth = { value: "" }'),
+    "must NOT clear the credential cache in the rearm path — probe-driven invalidation only, or a persistent non-auth error mints every tick");
+});
+
+test("reconcile synchronizes hide-all before opening overlays", () => {
+  const sync = idxSrc.indexOf("setPetWindowsHidden(mochiWindowsHidden)");
+  const open = idxSrc.indexOf("openPetWindow(mochiPetBaseUrl, mochiPetToken)", sync);
+  assert.ok(sync >= 0, "reconcile must push the authoritative hide-all state down");
+  assert.ok(open > sync, "the reveal policy must be synchronized before overlays open");
 });

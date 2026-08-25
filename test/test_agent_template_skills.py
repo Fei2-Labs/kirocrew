@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew.agent_discovery import (
     _extract_skills,
     agent_skill_globs,
@@ -40,6 +41,18 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.learn import LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader
+
+
+@pytest.fixture(autouse=True)
+def _owner_caller(monkeypatch):
+    """Run as the dashboard owner: these tests exercise handler behavior PAST
+    the owner boundary on the agents module's mutating endpoints, which has
+    its own enumerate-the-invariant coverage in
+    test_agents_endpoints_owner_auth.py."""
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.agents.is_owner_dashboard_request",
+        lambda request: True,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -236,6 +249,7 @@ class TestSkillKeyRoundTrip:
             == "kiro-user/utils/tiny-url"
         )
 
+    @requires_symlinks
     def test_symlinked_skill_dir_inverts_to_the_same_key(self, fake_home):
         """An AIM ``--local`` install symlinks ``~/.kiro/skills/<name>`` to a
         directory elsewhere. The written URI and its inversion must agree, or the

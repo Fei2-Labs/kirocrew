@@ -58,6 +58,15 @@ from kiro_crew.mcp_shared import ToolCancelled
 _GOV = "kiro_crew.platform.governance_profiles"
 
 
+def _learn_add_properties() -> dict[str, Any]:
+    """The ``learn_add`` tool's advertised input properties."""
+    from kiro_crew.mcp_tools.learn import schemas
+
+    spec = next(s for s in schemas() if s["name"] == "learn_add")
+    props: dict[str, Any] = spec["inputSchema"]["properties"]
+    return props
+
+
 class _RecordingSel:
     """Stand-in for ``sel()`` that records instead of writing the SEL log."""
 
@@ -749,16 +758,40 @@ class TestLearnAddTool:
     def _allowed(self):
         return patch.object(mcp_core, "_vet_memory_writes_governance", return_value=None)
 
-    def test_a_workspace_scoped_lesson_requires_a_workspace_name(self) -> None:
+    def test_the_tool_no_longer_offers_a_workspace_scope(self) -> None:
+        # The workspace tier never reached a prompt, so advertising it told the
+        # model it could restrict a correction when the save changed nothing.
+        #
+        # A stale client still holding that schema is REFUSED, not silently
+        # converted. This test previously pinned the opposite ("ignored rather than
+        # honoured"), which was wrong in the dangerous direction: forcing the
+        # payload to global takes a correction meant for one workspace and applies
+        # it in every session, which is worse than the inert tier it replaced.
         with patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:c"):
             with self._allowed():
-                with patch.object(mcp_core, "_post", side_effect=AssertionError("no write")):
+                with patch.object(mcp_core, "_post", return_value={"ok": True}) as p:
                     out = _call_tool_inner(
-                        "learn_add", {"rule": "r", "scope": "workspace"}
+                        "learn_add",
+                        {"rule": "r", "category": "tool", "scope": "workspace", "workspace": "w"},
                     )
-        assert out == "Error: workspace name is required when scope='workspace'"
+        assert out.startswith("Error:")
+        assert "repo_scope" in out
+        p.assert_not_called()
+        props = _learn_add_properties()
+        assert "workspace" not in props
+        assert "scope" not in props
 
-    def test_the_negative_clause_and_workspace_are_forwarded(self) -> None:
+    def test_an_absent_scope_still_saves_globally(self) -> None:
+        # The refusal above must not catch the normal path: no scope key at all is
+        # the ordinary global save, and that is what the payload still carries.
+        with patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:c"):
+            with self._allowed():
+                with patch.object(mcp_core, "_post", return_value={"ok": True}) as p:
+                    out = _call_tool_inner("learn_add", {"rule": "r", "category": "tool"})
+        assert out == "Saved lesson: r"
+        assert p.call_args.args[1] == {"rule": "r", "category": "tool", "scope": "global"}
+
+    def test_the_negative_clause_and_repo_scope_are_forwarded(self) -> None:
         with patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:c"):
             with self._allowed():
                 with patch.object(mcp_core, "_post", return_value={"ok": True}) as p:
@@ -767,22 +800,29 @@ class TestLearnAddTool:
                         {
                             "rule": "always X",
                             "category": "preference",
-                            "scope": "workspace",
-                            "workspace": "default",
                             "negative": "never Y",
+                            "repo_scope": "src/kiro_crew",
                         },
                     )
-        assert out == "Saved lesson (workspace): always X"
+        assert out == "Saved lesson (applies only in src/kiro_crew): always X"
         assert p.call_args.args == (
             "/api/lessons",
             {
                 "rule": "always X",
                 "category": "preference",
-                "scope": "workspace",
+                "scope": "global",
                 "negative": "never Y",
-                "workspace": "default",
+                "repo_scope": "src/kiro_crew",
             },
         )
+
+    def test_the_advertised_repo_scope_cap_tracks_the_enforced_one(self) -> None:
+        # The hint must be derived from the field the validator enforces, so a
+        # future cap change cannot leave the model told an obsolete limit.
+        from kiro_crew.validation import LEARN_ADD_SCHEMA
+
+        enforced = next(f.max_len for f in LEARN_ADD_SCHEMA.fields if f.name == "repo_scope")
+        assert _learn_add_properties()["repo_scope"]["maxLength"] == enforced
 
     def test_an_unknown_session_error_becomes_an_actionable_message(self) -> None:
         with patch.object(mcp_core, "_resolve_session_key", return_value="dashboard:c"):

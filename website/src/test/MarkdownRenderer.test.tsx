@@ -330,6 +330,82 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     })
   })
 
+  it('opens a confirmed Markdown file link in the file viewer instead of navigating to the chat route', async () => {
+    globalThis.fetch = vi.fn((url: unknown) => {
+      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
+      const hit = asked === '/home/user/a.md'
+      return Promise.resolve({
+        ok: hit,
+        status: hit ? 200 : 404,
+        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
+      } as Response)
+    }) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md:12)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+
+    const anchor = container.querySelector('a[href="/home/user/a.md:12"]')
+    expect(anchor).not.toBeNull()
+    fireEvent.click(anchor!)
+    expect(onFileOpen).toHaveBeenCalledWith('/home/user/a.md', { line: 12 })
+  })
+
+  it('swallows a plain Markdown file-link click while its path probe is pending', async () => {
+    let resolveProbe: ((response: Response) => void) | undefined
+    globalThis.fetch = vi.fn(() => new Promise<Response>((resolve) => { resolveProbe = resolve })) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
+
+    const anchor = container.querySelector('a[href="/home/user/a.md"]')
+    expect(anchor).not.toBeNull()
+    expect(fireEvent.click(anchor!)).toBe(false)
+    expect(onFileOpen).not.toHaveBeenCalled()
+
+    resolveProbe?.({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response)
+  })
+
+  it('does not probe a decoded root-relative UNC path', async () => {
+    globalThis.fetch = vi.fn() as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    render(<MarkdownRenderer content={'[open](/%2Fserver/share/report.md)'} onFileOpen={onFileOpen} />)
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+    expect(onFileOpen).not.toHaveBeenCalled()
+  })
+
+  it('prefers a literal Markdown link filename over its line-reference sibling', async () => {
+    globalThis.fetch = vi.fn((url: unknown) => {
+      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
+      const hit = asked === '/tmp/report.md' || asked === '/tmp/report.md:12'
+      return Promise.resolve({
+        ok: hit,
+        status: hit ? 200 : 404,
+        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
+      } as Response)
+    }) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { getByRole } = render(
+      <MarkdownRenderer content={'[open](/tmp/report.md%3A12)'} onFileOpen={onFileOpen} />,
+    )
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+
+    fireEvent.click(getByRole('link', { name: 'open' }))
+    expect(onFileOpen).toHaveBeenCalledWith('/tmp/report.md:12')
+  })
+
+  it('leaves an unconfirmed root-relative application link to navigate normally', async () => {
+    stubKind(null, false)
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[docs](/docs/page)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
+
+    const anchor = container.querySelector('a[href="/docs/page"]')
+    expect(anchor).not.toBeNull()
+    expect(fireEvent.click(anchor!)).toBe(true)
+    expect(onFileOpen).not.toHaveBeenCalled()
+  })
+
   it('leaves an inert chip glyph-free, so the affordance stays meaningful', async () => {
     stubKind(null, false)
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
@@ -434,6 +510,13 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     // Mid-stream, '/Users' is itself a valid candidate en route to the real
     // path; probing every chunk would flash the wrong affordance.
     render(<MarkdownRenderer content={'`/Users/me/pro`'} streaming />)
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+  })
+
+  it('does not probe a Markdown file link while the message is still streaming', async () => {
+    stubKind('file')
+    render(<MarkdownRenderer content={'[open](/Users/me/pro)'} streaming onFileOpen={vi.fn()} />)
     await Promise.resolve()
     expect(globalThis.fetch).not.toHaveBeenCalled()
   })

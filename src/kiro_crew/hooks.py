@@ -13,6 +13,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import stat as _stat
 import tempfile
 import threading
@@ -25,7 +26,7 @@ from pathlib import Path
 
 from kiro_crew import platform_compat, security, webhooks
 from kiro_crew.config import paths as _config_paths
-from kiro_crew.platform import current_context
+from kiro_crew.platform import current_context, redact_via_context
 from kiro_crew.platform.governance import (
     CU_CLASS_OBSERVE,
     computer_use_action_classes,
@@ -37,6 +38,7 @@ from kiro_crew.security import (
     is_sensitive_path,
     is_sensitive_write_path,
 )
+from kiro_crew.sel import sel
 from kiro_crew.validation import _bounded_pattern_search
 
 logger = logging.getLogger(__name__)
@@ -619,17 +621,42 @@ class HookManager:
         deny_targets = [normalized, tool_name]
         if command:
             deny_targets.append(command)
-        # A file-search builtin's scope lives only in its arguments — it carries no
-        # ``command``, and its title need not name the root it walks — so this target is
-        # the only form in which a deny rule can see a whole-tree walk.
-        search_target = _search_deny_target(raw_params)
-        if search_target:
-            deny_targets.append(search_target)
         for target in deny_targets:
             reason = authority.is_denied(
                 target,
                 self._config.auto_deny_tools,
                 denied_regexes=denied_regexes,
+                reason_notes=denied_notes,
+            )
+            if reason:
+                return ToolHookResult.deny(reason)
+
+        # A file-search builtin's scope lives only in its arguments -- it carries no
+        # ``command``, and its title need not name the root it walks -- so this target is
+        # the only form in which a deny rule can see a whole-tree walk.
+        #
+        # It is evaluated in its OWN tier, not appended to the loop above, because it is
+        # not a command line: run through the shared rule set it collides with the
+        # command-oriented built-ins on argument text (the ``mkfs.*`` rule denying a
+        # read-only search of a directory named ``mkfs-tests``), and the only per-rule
+        # remedy -- disabling that rule by id -- also stops it protecting real shell
+        # commands.
+        #
+        # The patterns that PARTICIPATE are passed explicitly: the operator's own enabled
+        # regexes, never the merged effective set.  That is what makes provenance
+        # structural rather than inferred -- classifying the merged set by pattern TEXT
+        # cannot tell an operator's rule from a shipped one when the text coincides
+        # (``mkfs.*`` is a natural thing to type), and reading the operator's own rule as
+        # shipped would silently drop an explicit deny.  The shipped catalogue takes no
+        # part here at all: none of its rules is authored against the synthesized grammar
+        # (ratcheted in the tests), so a built-in's only possible hit is the incidental
+        # one this tier exists to drop.
+        search_target = _search_deny_target(raw_params)
+        if search_target:
+            reason = authority.is_denied_synthesized_target(
+                search_target,
+                [p.pattern for p in self._config.denied_commands_user_added if p.enabled],
+                extra_patterns=self._config.auto_deny_tools,
                 reason_notes=denied_notes,
             )
             if reason:
@@ -1570,8 +1597,12 @@ def _context_matches(matcher: str, mode: str, context: str) -> bool:
     - ``contains``: pipe-delimited substrings, case-insensitive OR.
     """
     if mode == "regex":
-        # Prepend (?i) for case-insensitive matching (the subprocess runs raw re.search)
-        pattern = f"(?i){matcher}" if not matcher.startswith("(?") else matcher
+        # Prepend (?i) for case-insensitive matching (the subprocess runs raw re.search).
+        # Only skip the prepend when the pattern already starts with an inline-flag
+        # group (e.g. (?i), (?im), (?aiLmsux)).  Non-flag groups like (?:, (?=, (?<,
+        # (?P must still get the (?i) prefix.
+        _has_inline_flags = re.match(r"^\(\?[aiLmsux]+[):]", matcher) is not None
+        pattern = matcher if _has_inline_flags else f"(?i){matcher}"
         result = _bounded_pattern_search(pattern, context)
         if result is None:
             # Timeout, oversized, or invalid pattern — fail closed (no match)
@@ -2643,6 +2674,17 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # no value is returned. The audit is owed regardless, because the file holds
     # live credential material whatever this reader touches.
     "kiro_cli.idc_identity_probe": ".local/share/kiro-cli/data.sqlite3",
+    # Same store, read by ``kiro_crew.kiro_prerequisite.identity_fingerprint`` to
+    # answer one question on the turn path: does the account signed in NOW differ
+    # from the one the running kiro-cli children loaded? Only stable account
+    # claims participate (start_url, region, oauth_flow, scopes, client_id) plus
+    # the non-secret ``auth.*`` / ``api.codewhisperer.*`` marker rows; the values
+    # are hashed and only a digest leaves the function. The rotating and secret
+    # fields (access_token, refresh_token, expires_at, client_secret) are excluded
+    # by an ALLOWLIST, so a field added to the blob later cannot join by default.
+    # Audited on the observation a caller acts on rather than per poll -- the
+    # reader holds a short cache -- for the same reason as the mint entry below.
+    "kiro_prerequisite.identity_fingerprint": ".local/share/kiro-cli/data.sqlite3",
     # Class 2. kiro-cli's MCP OAuth artifact cache under ``~/.aws/sso/cache``.
     # ``kiro_crew.connections.mint.grant_present`` STATS the paired
     # ``<sha256(mcp_url)>.token.json`` / ``.registration.json`` artifacts to learn
@@ -2653,6 +2695,15 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # the observation a caller acts on, not per poll; see
     # ``mint._grant_observed`` for why that boundary is not fail-closed.
     "connections_mint.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
+    # Class 2, same artifacts and same posture as the mint entry above: the
+    # status module (``kiro_crew.connections.status``) STATS the identical
+    # paired grant artifacts to answer the dashboard's authorization question.
+    # A separate id, not a reuse of the mint's, so the SEL trail says which
+    # surface looked. Audited only on the acted-on observation -- the stamping
+    # of a provider's first-connect timestamp -- never per poll sweep; see
+    # ``status.reconcile_connected_since`` for why that boundary is
+    # best-effort rather than fail-closed (stats only, no bytes returned).
+    "connections_status.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
 }
 
 
@@ -2706,6 +2757,7 @@ class ScriptHook:
     enabled: bool = True
     last_run: float = 0.0
     last_status: str = ""  # "ok", "error", "timeout", "blocked"
+    last_error: str = ""  # human-readable reason for the most recent non-ok status
     run_count: int = 0
 
     def to_dict(self) -> dict:
@@ -2717,6 +2769,17 @@ class ScriptHook:
         matcher = data.get("matcher", data.get("pattern", ""))
         skills_raw = data.get("skills", [])
         skills = skills_raw if isinstance(skills_raw, list) else []
+        # Redact + truncate a persisted last_error on load: hooks.json is
+        # operator-writable and an agent-written (or hand-edited) error can carry
+        # a credential. It flows from_dict() -> /api/hooks -> the dashboard
+        # InfoTip, so it is an output boundary and must be scrubbed here too, not
+        # only at write time. Non-string values default to "".
+        raw_last_error = data.get("last_error", "")
+        last_error = (
+            redact_via_context(raw_last_error)[:500]
+            if isinstance(raw_last_error, str) and raw_last_error
+            else ""
+        )
         return cls(
             id=data.get("id", str(uuid.uuid4())[:8]),
             name=data.get("name", ""),
@@ -2729,6 +2792,7 @@ class ScriptHook:
             enabled=data.get("enabled", True),
             last_run=data.get("last_run", 0.0),
             last_status=data.get("last_status", ""),
+            last_error=last_error,
             run_count=data.get("run_count", 0),
         )
 
@@ -2793,6 +2857,26 @@ def _script_hooks_capability_denied(session_key: str = "") -> str | None:
         return None
 
 
+def _audit_governance_hook_decision(
+    session_key: str, hook_label: str, outcome: str, reason: str
+) -> None:
+    """Best-effort SEL audit for a script/skills-only hook governance decision.
+
+    Shared by both ``run_script_hook`` and the skills-only path in ``fire()`` to
+    avoid duplicating the try/import/call pattern at every call site.
+    """
+    try:
+        sel().log_governance_decision(
+            session_key=session_key,
+            tool_name=hook_label,
+            scope="capabilities.script_hooks",
+            outcome=outcome,
+            reason=reason,
+        )
+    except Exception:
+        logger.debug("hook governance audit (%s) failed", outcome, exc_info=True)
+
+
 async def run_script_hook(
     hook: ScriptHook, context: str = "", hook_event: dict | None = None
 ) -> ScriptHookResult:
@@ -2812,19 +2896,11 @@ async def run_script_hook(
     if gov_denied:
         hook.last_run = time.time()
         hook.last_status = "blocked"
+        hook.last_error = f"Blocked by governance: {gov_denied}"
         hook.run_count += 1
-        try:
-            from kiro_crew.sel import sel
-
-            sel().log_governance_decision(
-                session_key=sk,
-                tool_name=f"run_script_hook:{hook.name or hook.id}",
-                scope="capabilities.script_hooks",
-                outcome="denied",
-                reason=gov_denied,
-            )
-        except Exception:
-            logger.debug("script_hook deny audit failed", exc_info=True)
+        _audit_governance_hook_decision(
+            sk, f"run_script_hook:{hook.name or hook.id}", "denied", gov_denied
+        )
         return ScriptHookResult(
             hook_id=hook.id,
             hook_name=hook.name,
@@ -2914,20 +2990,29 @@ async def run_script_hook(
                     pass
         elapsed = int((time.monotonic() - start) * 1000)
         exit_code = proc.returncode or 0
+        stderr_text = stderr_b.decode(errors="replace").strip()
+        # Redact the FULL stderr through the canonical companion-aware shim
+        # before truncating, so a credential straddling the 500-char boundary
+        # cannot leak as an unredacted fragment. The field surfaces on the
+        # dashboard and must not expose secrets (#4708).
+        stderr_safe = redact_via_context(stderr_text)[:500] if stderr_text else ""
         hook.last_run = time.time()
         if exit_code == 2:
             hook.last_status = "blocked"
+            hook.last_error = stderr_safe or "Blocked (exit 2)"
         elif exit_code == 0:
             hook.last_status = "ok"
+            hook.last_error = ""
         else:
             hook.last_status = "error"
+            hook.last_error = stderr_safe or f"Exited with code {exit_code}"
         hook.run_count += 1
         return ScriptHookResult(
             hook_id=hook.id,
             hook_name=hook.name,
             event=hook.event,
             stdout=stdout_b.decode(errors="replace").strip(),
-            stderr=stderr_b.decode(errors="replace").strip(),
+            stderr=stderr_text,
             exit_code=exit_code,
             duration_ms=elapsed,
         )
@@ -2947,6 +3032,7 @@ async def run_script_hook(
         elapsed = int((time.monotonic() - start) * 1000)
         hook.last_run = time.time()
         hook.last_status = "timeout"
+        hook.last_error = f"Timed out after {hook.timeout}s"
         hook.run_count += 1
         return ScriptHookResult(
             hook_id=hook.id,
@@ -2959,6 +3045,7 @@ async def run_script_hook(
         elapsed = int((time.monotonic() - start) * 1000)
         hook.last_run = time.time()
         hook.last_status = "error"
+        hook.last_error = str(exc)[:500]
         hook.run_count += 1
         return ScriptHookResult(
             hook_id=hook.id,
@@ -3106,6 +3193,32 @@ class ScriptHookStore:
             if "skills" in data:
                 skills_raw = data["skills"]
                 hook.skills = [str(s) for s in skills_raw if isinstance(s, str)] if isinstance(skills_raw, list) else []
+            # Post-merge validation on the merged hook: skills injection only
+            # fires for a standalone skills hook (no command) on
+            # UserPromptSubmit/AgentSpawn (see fire()). Reject any other pairing
+            # so a partial update can't leave a config that saves but never fires.
+            if hook.skills:
+                if hook.command:
+                    raise ValueError(
+                        "skills cannot be combined with a command — the skills "
+                        "would never fire; use a skills-only hook or drop the skills"
+                    )
+                if hook.event in (
+                    HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE, HOOK_EVENT_STOP,
+                ):
+                    raise ValueError(
+                        f"skills hooks cannot fire on {hook.event} events — "
+                        "choose UserPromptSubmit or AgentSpawn"
+                    )
+            # Post-merge validation: reject invalid regex on the merged state
+            # (a partial update sending only matcher without matcher_mode would
+            # bypass the schema-level regex check which sees the request, not
+            # the merged hook).
+            if hook.matcher_mode == "regex" and hook.matcher:
+                try:
+                    re.compile(hook.matcher)
+                except re.error as exc:
+                    raise ValueError(f"invalid regex: {exc}") from None
             self._save()
         return hook
 
@@ -3218,40 +3331,25 @@ class ScriptHookStore:
                 if gov_denied:
                     hook.last_run = time.time()
                     hook.last_status = "blocked"
+                    hook.last_error = f"Blocked by governance: {gov_denied}"
                     hook.run_count += 1
-                    try:
-                        from kiro_crew.sel import sel
-
-                        sel().log_governance_decision(
-                            session_key=sk,
-                            tool_name=f"skills_only_hook:{hook.name or hook.id}",
-                            scope="capabilities.script_hooks",
-                            outcome="denied",
-                            reason=gov_denied,
-                        )
-                    except Exception:
-                        logger.debug("skills_only_hook deny audit failed", exc_info=True)
+                    _audit_governance_hook_decision(
+                        sk, f"skills_only_hook:{hook.name or hook.id}", "denied", gov_denied
+                    )
                     logger.info(
                         "Hook %s (%s): skills-only blocked by governance: %s",
                         hook.name, event, gov_denied,
                     )
                     continue
                 # Audit the allow decision before proceeding.
-                try:
-                    from kiro_crew.sel import sel
-
-                    sel().log_governance_decision(
-                        session_key=sk,
-                        tool_name=f"skills_only_hook:{hook.name or hook.id}",
-                        scope="capabilities.script_hooks",
-                        outcome="allowed",
-                        reason="skills-only hook permitted",
-                    )
-                except Exception:
-                    logger.debug("skills_only_hook allow audit failed", exc_info=True)
+                _audit_governance_hook_decision(
+                    sk, f"skills_only_hook:{hook.name or hook.id}", "allowed",
+                    "skills-only hook permitted",
+                )
                 skills_directive = " ".join(f"${s.split('/')[-1]}" for s in hook.skills)
                 hook.last_run = time.time()
                 hook.last_status = "ok"
+                hook.last_error = ""
                 hook.run_count += 1
                 result = ScriptHookResult(
                     hook_id=hook.id,

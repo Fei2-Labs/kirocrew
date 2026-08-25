@@ -84,6 +84,13 @@ Sub-agent synthesis:'`. Its visible reply is the consolidated, user-facing summa
 so treat it as the deliverable: restate the goal, synthesize across the agents
 rather than repeating each in turn, and give concrete next actions.
 
+The prompt itself is appended to the slot as an `inject` row carrying
+`meta.injectKind = "synthesis"`, and the turn is dispatched with
+`_synthetic_payload=True`. Both matter: the row is what stops the prompt reaching
+the conversation log unattributed (it previously replayed as though the user had
+typed it), and the flag is what keeps a synthetic turn out of the
+time-to-first-token distribution.
+
 ## Sub-agent delivery failure
 
 The sub-agent completed but injecting its result into the parent session timed out.
@@ -113,6 +120,30 @@ than N pings.
 
 ## Automatic recovery continuations
 
+## How an `inject` row is rendered
+
+Role `inject` covers several unrelated things, so the render side does not guess
+from the text. Every `inject` row carries `meta.injectKind`, stamped at the append
+site, and `meta` (unlike an `inject` row's `cls`) survives the persistence
+boundary:
+
+| `injectKind` | Row is | Renders as |
+|---|---|---|
+| `synthesis` | The post-fan-out consolidation prompt | Collapsed one-line note |
+| `recovery` | A runner-authored continuation | Its own recovery card, or a generic note if the marker is unrecognised |
+| `cron` | A scheduled job's output — the user's own | Labelled bubble (also carries `cronLabel`) |
+| `user_replay` | The user's original message, replayed because the turn emitted nothing | Ordinary bubble; it is speech |
+
+`resolveInjectCard` in `website/src/pages/chat/RecoveryCard.tsx` is the single
+decision point, shared by `ChatPage` and the `transcriptRenderers` registry so the
+surfaces cannot disagree. It prefers a recognised content marker (durable, and
+carrying per-kind copy no tag reproduces), then applies a POSITIVE allowlist:
+only `recovery` and `synthesis` become a note. Everything else — including a row
+with no stamp, written by a gateway older than the field — keeps whatever the
+surface drew before, so no history changes rendering underneath the user.
+
+## Turn-recovery continuations
+
 The runner injects a synthetic continuation when a turn ended for a system reason
 rather than because the model was done. Each has its own prefix in
 `dashboard/state.py`, each renders as an `inject` message (not a user bubble), and
@@ -120,11 +151,32 @@ none is mirrored to a linked Slack or Telegram thread as though the user typed i
 
 | Prefix | Fired when |
 |---|---|
-| `[Tool refusal — automatic recovery]` | A tool call was refused for a recoverable system reason (a host-gate policy deny, or the read-only bash gate) and the turn ended early. Carries the reason back so the model can adapt instead of stalling for the user. |
+| `[Tool refusal — automatic recovery]` | A tool call was refused for a recoverable system reason (a host-gate policy deny, the read-only bash gate, or a PreToolUse hook block) and the in-band notice below could not carry the reason. **Fallback only** — see the in-band note under the table. |
 | `[Stalled turn — automatic recovery]` | A genuinely wedged turn was detected and reset. Tells the model the interruption was a system stall, NOT the user, and to resume from its last committed step rather than restart. |
 | `[Tool stall — automatic recovery]` | The per-session watchdog judged an in-flight tool dead and cancelled the session. Hands over the stall context so the model can check partial results and continue. |
 | `[Interrupted turn — automatic recovery]` | A transient backend 5xx cut a turn short after tokens or tool calls had already streamed. |
 | `[Empty response — automatic recovery]` | The model returned no output twice. Continue the pending request; do not restart from scratch or re-run steps that already succeeded. |
+| `[Unfinished action — automatic recovery]` | The turn ended right after announcing an immediate action ("I'll do that now") without making the tool call, so nothing actually happened yet a billed turn was recorded. Instructs the model to carry out the announced action now — unless it was actually deferred pending the user's approval or an unmet condition, in which case it is told to hold and say what it is waiting for (a semantic consent backstop, since the terminal-promise detector's approval-gate deny-list cannot enumerate every conditional phrasing). Bounded to one attempt per turn; a second consecutive promise-only ending falls through and lands normally with a give-up notice. |
+
+**A tool deny is explained IN-BAND first, and the injection above is the
+fallback.** ACP's permission response carries only `outcome`/`optionId`, so the
+host cannot attach a reason to a rejection — kiro-cli hands the model the fixed
+tool result `"User denied tool execution"`, which reads as the person having
+clicked No. `chat_runner._steer_policy_notice` therefore steers
+`state.build_refusal_steer_notice`'s body into the turn **before** answering the
+permission request. Holding the unanswered request is what makes that race-free:
+the turn is provably in flight, so the notice is queued and folded in at the next
+model-inference boundary — the one right after the rejected tool resolves — and
+the model adapts inside the SAME turn. It is opt-in by positive capability
+(`supports_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
+steer is unchanged.
+
+`should_queue_refusal_recovery` then suppresses the extra turn only when every
+refusal got a notice AND a `steering_consumed` echo accounted for all of them. An
+unconfirmed notice counts as undelivered: skipping wrongly leaves the model with
+kiro-cli's wrong attribution and no correction, while queueing wrongly costs one
+turn the model is told twice — which is what this path cost before in-band
+delivery existed.
 
 The recovery classification for the last two is **structural**: the queue entry
 carries `kind == "synthetic_recovery"` (`SYNTHETIC_RECOVERY_KIND`), set at insert

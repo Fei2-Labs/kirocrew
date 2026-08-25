@@ -902,7 +902,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       setMessages(prev => [...prev, {
         id: `approval-error-${id}-${Date.now()}`,
         role: 'assistant',
-        content: i18nT('apps.mochi.chat.send_failed'),
+        // A stale pre-owner session is an AUTH failure, not a network one:
+        // the generic "check your connection" copy would send the user
+        // debugging the wrong thing, so name the real remedy (sign in again).
+        content: res.staleOwnerSession
+          ? i18nT('api.client.stale_owner_session_sign_in_again')
+          : i18nT('apps.mochi.chat.send_failed'),
         timestamp: Date.now(),
       }])
       return
@@ -1496,6 +1501,10 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
         <textarea
           ref={inputRef}
           {...ime.bindComposition<HTMLTextAreaElement>({
+            onFocus: (e) => {
+              e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border-focus)'
+              e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-glow)'
+            },
             onBlur: (e) => {
               e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border)'
               e.currentTarget.style.boxShadow = editingTs ? '0 0 0 2px var(--accent-glow)' : 'none'
@@ -1549,10 +1558,6 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
             lineHeight: '1.4',
             maxHeight: 120, overflowY: 'auto',
             boxShadow: editingTs ? '0 0 0 2px var(--accent-glow)' : undefined,
-          }}
-          onFocus={(e) => {
-            e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border-focus)'
-            e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-glow)'
           }}
         />
         <button onClick={handleSend} title={i18nT('apps.mochi.chat.send')} aria-label={i18nT('apps.mochi.chat.send')} style={{
@@ -1882,7 +1887,9 @@ const trustScopeBtnStyle: React.CSSProperties = {
   textAlign: 'left',
 }
 
-const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => void; onImageClick?: (b64: string) => void; onApproval?: (id: string, action: string, pattern?: string) => void; onEdit?: (content: string) => void; animate?: boolean }>(({ message, onOption, onImageClick, onApproval, onEdit, animate = true }) => {
+// Exported for the capture harness (capture/mochi-trust-label.tsx), which mounts
+// the real approval card as screenshot evidence; not part of the app's API.
+export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => void; onImageClick?: (b64: string) => void; onApproval?: (id: string, action: string, pattern?: string) => void; onEdit?: (content: string) => void; animate?: boolean }>(({ message, onOption, onImageClick, onApproval, onEdit, animate = true }) => {
   const mounted = React.useRef(false)
   const shouldAnimate = animate && !mounted.current
   const [copied, setCopied] = React.useState(false)
@@ -1957,8 +1964,21 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
               {req.fullCommand && (
                 <button
                   onClick={() => onApproval?.(req.id, 'trust_command', req.fullCommand)}
+                  // The untruncated command as a tooltip: the label is budget-clamped,
+                  // and this grant is an exact-string match, so the user must be able
+                  // to read the whole thing before agreeing to it.
+                  title={req.fullCommand}
                   style={trustScopeBtnStyle}
-                ><Shield size={11} />{i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}</button>
+                ><Shield size={11} style={{ flexShrink: 0 }} />
+                  {/* The label WRAPS rather than ellipsizing: the panel column
+                      (~240px of text) shows only ~28 chars per line, so a CSS
+                      ellipsis would re-collide the very labels the 64-char budget
+                      distinguishes. minWidth:0 lets the flex item shrink;
+                      overflowWrap:'anywhere' lets an unbreakable run (a sha, a
+                      base64 arg) wrap instead of clipping past the panel edge. */}
+                  <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+                    {i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}
+                  </span></button>
               )}
               {showTrustBase && (
                 <button

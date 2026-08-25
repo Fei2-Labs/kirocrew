@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.paths import config_dir
 from kiro_crew.deploy import engine
 from kiro_crew.platform_compat import file_lock
@@ -129,7 +130,7 @@ def locked_registry() -> Generator[dict[str, Any], None, None]:
                 tmp_fd.flush()
                 os.fsync(tmp_fd.fileno())
                 tmp_fd.close()
-                os.replace(tmp_fd.name, str(_registry_path()))
+                replace_with_retry(tmp_fd.name, _registry_path())
             except BaseException:
                 tmp_fd.close()
                 try:
@@ -210,7 +211,7 @@ def save_registry(reg: dict[str, Any]) -> dict[str, Any]:
                 tmp_fd.flush()
                 os.fsync(tmp_fd.fileno())
                 tmp_fd.close()
-                os.replace(tmp_fd.name, str(_registry_path()))
+                replace_with_retry(tmp_fd.name, _registry_path())
             except BaseException:
                 tmp_fd.close()
                 try:
@@ -334,6 +335,14 @@ def create_aws_profile(name: str, region: str, *, account: str = "",
                 "or environment variables."
             )
         python_bin = sys.executable or "python3"
+        # Deliberately a bare "aws" (NOT the deploy engine's absolute resolver,
+        # #4770): this command is persisted into ~/.aws/config and later run by
+        # whichever AWS CLI/SDK reads that profile — possibly a different user
+        # shell, possibly long after the CLI was reinstalled elsewhere. An
+        # absolute path resolved in the gateway's environment today can be
+        # wrong or stale in that consumer's environment, and would turn a
+        # PATH-configurable lookup into a frozen location. The consumer
+        # resolves "aws" against its own PATH.
         script = (
             "import json,subprocess;"
             'r=subprocess.run(["aws","sts","assume-role","--role-arn",'

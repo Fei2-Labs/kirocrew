@@ -1235,6 +1235,33 @@ class TestTheStoredPushDestinationIsValidated:
     destination rather than trusting persisted input. Raised by the GPT review of this branch.
     """
 
+    @pytest.fixture(autouse=True)
+    def _public_dns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve every hostname to a fixed public address.
+
+        ``resolve_origin_url``'s identity-pinning step re-runs ``validate_target_url``,
+        whose ``_host_is_blocked`` SSRF check does a LIVE ``socket.getaddrinfo`` resolve
+        and fails CLOSED on any resolver error. On a transient runner DNS hiccup
+        ``github.com`` read as blocked and a legitimate remote resolved to ``""``,
+        flaking the legitimate-remote cases in CI (#5229); the foreign-remote cases
+        short-circuit on the allowlist before DNS and cannot flake, but the pin covers
+        the whole class so no case here ever reaches a resolver. These tests are about
+        URL/identity validation, not address screening — the address decision has its
+        own tests below — so resolution is stubbed, same shape as the ``public_dns``
+        fixture in ``test/test_meetings_providers.py``. The patch swaps the shared
+        ``socket`` module's ``getaddrinfo`` for the whole process while a test runs
+        (``clone_setup.socket`` IS that module; monkeypatch restores it at teardown);
+        these tests do no other network I/O, so do not copy this fixture into ones
+        that do. The fail-closed production behaviour is deliberately untouched: it is
+        correct for a real DNS failure; the defect was a unit test exercising the real
+        resolver.
+        """
+        monkeypatch.setattr(
+            clone_setup.socket,
+            "getaddrinfo",
+            lambda *_a, **_kw: [(2, 1, 6, "", ("93.184.216.34", 443))],
+        )
+
     @pytest.mark.parametrize(
         "url",
         [
@@ -1280,6 +1307,60 @@ class TestTheStoredPushDestinationIsValidated:
         if clone_setup._remote_slug(url):
             cfg["target_url"] = "https://github.com/owner/repo"
         assert clone_setup.resolve_origin_url(cfg) == url
+
+
+class TestTheAddressDecisionItself:
+    """The SSRF screen the class above stubs out gets its own direct coverage.
+
+    ``TestTheStoredPushDestinationIsValidated`` pins ``getaddrinfo`` so it no longer
+    exercises ``_host_is_blocked`` incidentally (#5229) — which was the helper's ONLY
+    coverage in the repo. Losing the pinned-away coverage without an equivalent is how
+    a later edit to the screen (say, dropping the ``is_private`` predicate, or turning
+    the fail-closed ``except`` into fail-open) would land silently. Same split as the
+    ``public_dns`` precedent in ``test/test_meetings_providers.py``: the scheme tests
+    stub resolution, and the address decision is tested on its own.
+    """
+
+    def _pin(self, monkeypatch: pytest.MonkeyPatch, result) -> None:
+        if isinstance(result, Exception):
+
+            def _resolve(*_a, **_kw):
+                raise result
+
+        else:
+
+            def _resolve(*_a, **_kw):
+                return [(2, 1, 6, "", (result, 443))]
+
+        monkeypatch.setattr(clone_setup.socket, "getaddrinfo", _resolve)
+
+    def test_a_public_address_is_allowed(self, monkeypatch) -> None:
+        self._pin(monkeypatch, "93.184.216.34")
+        assert clone_setup._host_is_blocked("github.com") is False
+
+    @pytest.mark.parametrize(
+        "address",
+        [
+            "127.0.0.1",  # loopback
+            "10.0.0.7",  # private
+            "169.254.169.254",  # link-local (the cloud metadata range)
+            "0.0.0.0",  # unspecified
+        ],
+    )
+    def test_an_internal_address_is_blocked(self, monkeypatch, address) -> None:
+        """An allowlisted NAME pointed at an internal ADDRESS is the rebinding case."""
+        self._pin(monkeypatch, address)
+        assert clone_setup._host_is_blocked("github.com") is True
+
+    def test_a_resolver_error_fails_closed(self, monkeypatch) -> None:
+        """The contract the fixture above leans on: a DNS error means BLOCKED.
+
+        This is exactly the behaviour that made #5229 a test-hermeticity defect and
+        not a production one — pin it so the fail-closed ``except`` cannot quietly
+        become fail-open.
+        """
+        self._pin(monkeypatch, OSError("resolver down"))
+        assert clone_setup._host_is_blocked("github.com") is True
 
 
 class TestApprovalIsOneShotNotPersistent:
@@ -1374,7 +1455,7 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
     """`mode="strict"` hides credential READS; it does not make the filesystem read-only.
 
     Measured on this host before the fix: a strict-mode child ran
-    `open('~/.kiro/crew/.data-home-ready','a')` and exited 0 — it MODIFIED Kiro Crew's own
+    `open('~/.kiro/crew/config.json','a')` and exited 0 — it MODIFIED Kiro Crew's own
     write-protected config. Those paths are `security.write_protected_home_paths()`, enforced
     by the platform HOOK layer, which a sandboxed subprocess never passes through, so the
     protection was inert for exactly the code that most needs it: the target repository's
@@ -3343,6 +3424,7 @@ class TestOneClickCommitWorksInAPushDisabledClone:
 
         Raised by the Opus 5 review of this branch.
         """
+        import contextlib
         import threading
 
         monkeypatch.setattr(store, "data_dir", lambda: tmp_path / "data")
@@ -3385,18 +3467,44 @@ class TestOneClickCommitWorksInAPushDisabledClone:
         # two-thread race reproduced the bug only ~1 run in 3 (measured with the lock
         # removed), which is too flaky to be a regression test. `A` parks *after* staging its
         # diff — the exact window where B's `checkout -B` used to carry A's change into B's
-        # commit — and releases once B has finished. With the lock held, B cannot enter that
-        # window at all, so `_gate` is never waited on and the test still completes.
+        # commit.
+        #
+        # A's park ends when B has PROVED the clone lock is contended, not when B
+        # finishes: B cannot finish while A holds the lock, so waiting for B's
+        # completion parks A against the very lock under test and always burns the
+        # whole timeout. Anything that lets B past the gate — no lock, or a lock
+        # that is not actually shared — leaves `b_blocked` unset, so A stays parked
+        # in the window for the full timeout and the interleaving reproduces.
         results: dict[str, dict] = {}
         staged_a = threading.Event()
-        b_done = threading.Event()
+        b_blocked = threading.Event()
+        contended: list[str] = []
+        b_thread_name = "committer-B"
         real_apply = commit_mod.materialize_queued_diff
+        real_clone_lock = commit_mod.clone_lock
+
+        @contextlib.contextmanager
+        def _clone_lock_reporting_contention():
+            lock = real_clone_lock()
+            if threading.current_thread().name == b_thread_name:
+                # A non-blocking acquire that FAILS is proof A still holds this
+                # exact lock. One that succeeds means the lock is not shared, so
+                # say nothing and let A keep the window open.
+                if lock.acquire(blocking=False):
+                    lock.release()
+                else:
+                    contended.append(b_thread_name)
+                    b_blocked.set()
+            with lock:
+                yield
+
+        monkeypatch.setattr(commit_mod, "clone_lock", _clone_lock_reporting_contention)
 
         def _apply_with_park(**kwargs):
             out = real_apply(**kwargs)
             if kwargs.get("diff_text", "").find("FINDING_A") >= 0:
                 staged_a.set()
-                b_done.wait(timeout=30)
+                b_blocked.wait(timeout=30)
             return out
 
         monkeypatch.setattr(commit_mod, "materialize_queued_diff", _apply_with_park)
@@ -3406,16 +3514,16 @@ class TestOneClickCommitWorksInAPushDisabledClone:
                 results[fp] = commit_mod.commit_finding(fp)
             finally:
                 if fp == "fpB":
-                    b_done.set()
+                    b_blocked.set()
 
         t_a = threading.Thread(target=_run, args=("fpA",))
-        t_b = threading.Thread(target=_run, args=("fpB",))
+        t_b = threading.Thread(target=_run, args=("fpB",), name=b_thread_name)
         t_a.start()
         staged_a.wait(timeout=30)  # A is now parked mid-mutation (or already done)
         t_b.start()
         for t in (t_b, t_a):
             t.join(timeout=90)
-        b_done.set()
+        b_blocked.set()
 
         # Whatever landed, no single commit may contain BOTH findings.
         log = subprocess.run(
@@ -3432,6 +3540,10 @@ class TestOneClickCommitWorksInAPushDisabledClone:
             assert not (
                 "FINDING_A" in body and "FINDING_B" in body
             ), f"commit {sha[:8]} published both findings — the mutations interleaved"
+
+        # And it held because B queued behind A, not because the scheduler happened
+        # to keep them apart: A's park only ends once B has proved the lock is held.
+        assert contended == [b_thread_name], "B never had to wait for A's clone lock"
 
     def test_the_clone_mutations_share_one_lock(self) -> None:
         """Structural: the draft route must hold the lock across its WHOLE sequence.

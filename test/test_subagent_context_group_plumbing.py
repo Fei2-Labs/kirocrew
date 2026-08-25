@@ -28,6 +28,10 @@ from kiro_crew.subagent import (
 )
 from kiro_crew.subagent_persistence import create_agent_folder, read_state
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 
 def _mock_sessions() -> MagicMock:
     sessions = MagicMock()

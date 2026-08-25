@@ -83,11 +83,28 @@ _AMBIENT_READ_ALLOWLIST = frozenset(
         ("_rewrite_inputs_fingerprint", "os.environ:PATH"),
         ("_rewrite_inputs_fingerprint", "os.environ:PATHEXT"),
         ("_rewrite_inputs_fingerprint", "sys.executable"),
+        # Output-AFFECTING: the filtered source view whose values are written
+        # into the env sidecar (credential-keyed names removed so an
+        # agent-writable spec cannot dereference a secret under a benign key).
+        # Deliberately NOT fingerprinted -- encountering a placeholder marks the
+        # pass uncacheable instead (see test_env_placeholder_pass_is_never_cached
+        # and test_a_spec_without_placeholders_still_caches), so a resolved value
+        # is re-resolved on every boot and can never be served stale.
+        ("_placeholder_source_env", "os.environ:<dynamic>"),
+        # Output-NEUTRAL: distinguishes a credential-filtered refusal from a
+        # plain typo purely to pick the log message; the substitution result is
+        # the literal ``${VAR}`` either way.
+        ("_expand_env_placeholders", "os.environ:<dynamic>"),
         # Output-AFFECTING since issue #3495: decides whether an env-declaring
         # server is pooled at all. Read once per pass in rewrite_agents and
         # fingerprinted as "forward_declared_env" (see
         # test_forward_declared_env_change_invalidates).
         ("forward_declared_env_enabled", "config-import:kiro_crew.config.loader"),
+        # Output-AFFECTING: decides which secret-prefixed keys are folded into
+        # effective_env_hash and passed on stub argv. Read once per pass in
+        # rewrite_agents and fingerprinted as "pool_identity_env" (see
+        # test_pool_identity_env_change_invalidates).
+        ("pool_identity_env_keys", "config-import:kiro_crew.config.loader"),
     }
 )
 
@@ -268,7 +285,13 @@ def test_rewrite_pass_ambient_reads_match_pinned_allowlist() -> None:
     )
 
 
-def _mk_tree(root: Path, *, n_agents: int = 2, with_env: bool = True) -> Path:
+def _mk_tree(
+    root: Path,
+    *,
+    n_agents: int = 2,
+    with_env: bool = True,
+    env: dict[str, Any] | None = None,
+) -> Path:
     src = root / "agents"
     src.mkdir(parents=True, exist_ok=True)
     settings = root / "settings"
@@ -287,7 +310,7 @@ def _mk_tree(root: Path, *, n_agents: int = 2, with_env: bool = True) -> Path:
             "srv": {"command": _CMD, "args": [f"a{i}"], "poolable": True}
         }
         if with_env:
-            servers["srv"]["env"] = {"K": "v"}
+            servers["srv"]["env"] = {"K": "v"} if env is None else dict(env)
         (src / f"agent-{i}.json").write_text(
             json.dumps({"name": f"agent-{i}", "mcpServers": servers})
         )
@@ -307,6 +330,10 @@ def _forward_declared_env_on(monkeypatch: pytest.MonkeyPatch) -> None:
     this per-call to prove the flag is itself a fingerprint input.
     """
     monkeypatch.setattr(rewriter, "forward_declared_env_enabled", lambda: True)
+    # Same reasoning for the identity set: pin it to the default (nothing opted
+    # in) so these tests never read the developer's real config, and let
+    # ``test_pool_identity_env_change_invalidates`` override it per-call.
+    monkeypatch.setattr(rewriter, "pool_identity_env_keys", lambda: frozenset())
 
 
 def _rewrite(root: Path, **overrides: Any) -> tuple[dict[str, int], dict[str, str]]:
@@ -381,6 +408,95 @@ def test_forward_declared_env_change_invalidates(
     assert rewrite_counter["n"] == 4, "flag flip must not serve the cache"
     # Forwarding off: the env-declaring servers are declassified (unwrapped).
     assert off != on
+
+
+def test_pool_identity_env_change_invalidates(
+    tmp_path: Path,
+    rewrite_counter: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming a key in ``mcp_gateway.pool_identity_env`` regenerates the overlays.
+
+    The list decides which keys are folded into ``effective_env_hash`` and passed
+    on stub argv. Serving a cached overlay across an edit is not a cosmetic
+    staleness: the cached stub would keep hashing the OLD set while gatewayd
+    hashes the new one, so the coherence gate would refuse to forward and the
+    setting would appear to do nothing.
+    """
+    _mk_tree(tmp_path, with_env=True)
+    # Declare a rotating-secret-shaped key so the list has something to act on.
+    # With nothing opted in this key is withheld from a shared backend, so the
+    # pre-classification leaves the server UNWRAPPED (issue #3495 cause B).
+    spec_path = tmp_path / "agents" / "agent-0.json"
+    spec = json.loads(spec_path.read_text())
+    spec["mcpServers"]["srv"]["env"]["OAUTH_TOKEN"] = "t"
+    spec_path.write_text(json.dumps(spec))
+
+    before = _rewrite(tmp_path)
+    assert rewrite_counter["n"] == 2
+    # agent-0 declares 'srv' (env-bearing) plus the injected 'global-x'. Only
+    # global-x is wrapped while OAUTH_TOKEN is withheld.
+    assert before[0]["agent-0.json"] == 1, "a withheld key must block pooling"
+
+    monkeypatch.setattr(
+        rewriter, "pool_identity_env_keys", lambda: frozenset({"OAUTH_TOKEN"})
+    )
+    after = _rewrite(tmp_path)
+    assert rewrite_counter["n"] == 4, "an identity-list edit must not serve the cache"
+    # Non-vacuous, and the feature's headline behaviour: naming the key folds it
+    # into the pool identity, so it is no longer withheld and 'srv' pools too.
+    assert after[0]["agent-0.json"] == 2
+    assert before != after
+
+
+def test_env_placeholder_pass_is_never_cached(
+    tmp_path: Path,
+    rewrite_counter: dict[str, int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared ``${env:VAR}`` re-resolves on every boot.
+
+    The resolved value is baked into the sidecar at write time (so the stub and
+    gatewayd hash one agreed source), which makes the VARIABLE an input the
+    stat-based fingerprint cannot see. Rather than fingerprint the environment,
+    the pass is left uncacheable -- otherwise a rotated credential would keep
+    serving the OLD value for as long as no file changed.
+    """
+    monkeypatch.setenv("WH_TOKEN", "first")
+    _mk_tree(tmp_path, n_agents=1, env={"TOKEN": "${env:WH_TOKEN}"})
+    _rewrite(tmp_path)
+    sidecar_dir = tmp_path / "mcp-gateway" / "stubs" / "env"
+    assert any("first" in p.read_text() for p in sidecar_dir.glob("*.json"))
+
+    # No fingerprint is left behind, so nothing can be served from cache.
+    fp = tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME
+    assert not fp.exists(), "a placeholder pass must not store a fingerprint"
+
+    before = rewrite_counter["n"]
+    monkeypatch.setenv("WH_TOKEN", "second")
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] > before, "a changed env value must be re-resolved"
+    assert any("second" in p.read_text() for p in sidecar_dir.glob("*.json"))
+    assert not any("first" in p.read_text() for p in sidecar_dir.glob("*.json"))
+
+
+def test_a_spec_without_placeholders_still_caches(
+    tmp_path: Path, rewrite_counter: dict[str, int]
+) -> None:
+    """The placeholder opt-out must not disable the cache for everyone else.
+
+    Pins the blast radius of ``env_placeholder_seen``: a declared env with no
+    ``${...}`` reference is unaffected and an unchanged boot is still served
+    from cache.
+    """
+    _mk_tree(tmp_path, n_agents=1, env={"K": "literal-value"})
+    _rewrite(tmp_path)
+    fp = tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME
+    assert fp.is_file(), "a placeholder-free pass must still cache"
+
+    before = rewrite_counter["n"]
+    _rewrite(tmp_path)
+    assert rewrite_counter["n"] == before, "an unchanged boot must serve the cache"
 
 
 def test_source_content_change_invalidates(
@@ -507,6 +623,226 @@ def test_deleted_agent_spec_invalidates_and_prunes(
     _rewrite(tmp_path)
     assert rewrite_counter["n"] == before + 1  # one agent left
     assert not overlay.exists()
+
+
+def test_transient_overlay_write_failure_keeps_the_previous_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stale-overlay prune keeps a TRANSIENT failure's previous overlay
+    instead of keying on write success (#5328): a single transient
+    overlay-write failure must leave that agent's previous, healthy overlay
+    on disk — stale-but-working beats no overlay at all — while the other
+    agents still rewrite."""
+    src = _mk_tree(tmp_path)
+    _rewrite(tmp_path)
+    victim = tmp_path / "mcp-gateway" / "agents" / "agent-1.json"
+    survivor = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
+    assert victim.is_file()
+    before_bytes = victim.read_bytes()
+
+    # Change agent-1's CONTENT (not just mtime): a successful write would now
+    # produce different bytes, so surviving-with-old-bytes proves both that
+    # the write failed and that the prune spared the file.
+    spec_path = src / "agent-1.json"
+    spec = json.loads(spec_path.read_text())
+    spec["mcpServers"]["srv"]["args"] = ["changed-args"]
+    spec_path.write_text(json.dumps(spec))
+
+    real_write = rewriter.atomic_write
+    fail = {"on": True}
+
+    def flaky(target: Path, *args: Any, **kwargs: Any) -> None:
+        if fail["on"] and Path(target).name == "agent-1.json":
+            raise OSError("disk full")
+        real_write(target, *args, **kwargs)
+
+    monkeypatch.setattr(rewriter, "atomic_write", flaky)
+    _rewrite(tmp_path)
+    fail["on"] = False
+
+    assert victim.is_file()  # healthy overlay survived the failed pass
+    assert victim.read_bytes() == before_bytes  # ...byte-identical, not rewritten
+    assert survivor.is_file()  # the unaffected agent still rewrote
+    # Degraded pass not cached: the next boot retries the write.
+    fp = tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME
+    assert not fp.exists()
+
+    # Fault cleared: the retry rewrites agent-1 and the stale bytes go away.
+    _rewrite(tmp_path)
+    assert victim.read_bytes() != before_bytes
+    assert fp.is_file()
+
+
+def test_transient_agent_read_failure_keeps_the_previous_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same keying, other transient arm: a source spec that fails to READ this
+    pass keeps its previous overlay (before #5328 the read-failure
+    ``continue`` skipped ``written.add`` and the prune deleted the healthy
+    overlay) — AND its env sidecars: the kept overlay's stub argv still
+    points ``--env-file`` at them, and a read-failure pass cannot enumerate
+    the victim's sidecar names, so the sidecar prune is skipped for the whole
+    (already-uncacheable) pass. Pruning them would spawn the kept overlay's
+    backends credential-less for the rest of the gateway's lifetime."""
+    src = _mk_tree(tmp_path)
+    _rewrite(tmp_path)
+    victim = tmp_path / "mcp-gateway" / "agents" / "agent-1.json"
+    assert victim.is_file()
+    before_bytes = victim.read_bytes()
+    env_dir = tmp_path / "mcp-gateway" / "stubs" / "env"
+    sidecars_before = set(env_dir.glob("*.json"))
+    assert sidecars_before  # _mk_tree declares env, so sidecars exist
+
+    _bump_mtime(src / "agent-1.json")  # invalidate so the next call rewrites
+    real_read = Path.read_text
+    fail = {"on": True}
+    victim_src = src / "agent-1.json"
+
+    def flaky(self: Path, *args: Any, **kwargs: Any) -> str:
+        if fail["on"] and self == victim_src:
+            raise OSError("transient I/O error")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    _rewrite(tmp_path)
+    fail["on"] = False
+
+    assert victim.is_file()  # overlay survived the unreadable-source pass
+    assert victim.read_bytes() == before_bytes
+    # Every sidecar survived too — overlay/sidecar coherence is kept.
+    assert set(env_dir.glob("*.json")) == sidecars_before
+    # Degraded pass not cached: the next boot retries the read.
+    assert not (tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).exists()
+
+
+def test_malformed_source_still_prunes_its_overlay(
+    tmp_path: Path,
+) -> None:
+    """Deterministic bad content (JSONDecodeError / non-dict) is NOT a
+    transient keep: the pass is cacheable and the cached-path prune keys on
+    the stored outputs, so sparing the overlay here would let two boots over
+    identical inputs behave differently. Bad content prunes exactly like a
+    deleted source, as before #5328."""
+    src = _mk_tree(tmp_path)
+    _rewrite(tmp_path)
+    overlay = tmp_path / "mcp-gateway" / "agents" / "agent-1.json"
+    assert overlay.is_file()
+
+    (src / "agent-1.json").write_text("{not json")
+    _rewrite(tmp_path)
+    assert not overlay.exists()  # deterministic skip -> pruned, and cacheable
+    assert (tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).is_file()
+
+
+def test_write_failure_does_not_suppress_the_prune_for_deleted_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prune keep-set is per-source, never a pass-wide failure switch: in
+    ONE degraded pass, a deleted source still loses its overlay while the
+    write-failure victim keeps its previous one. Guards against 'fixing'
+    #5328 by skipping the prune whenever anything failed, which would leak
+    overlays for genuinely-deleted agents."""
+    src = _mk_tree(tmp_path, n_agents=3)
+    _rewrite(tmp_path)
+    overlay_dir = tmp_path / "mcp-gateway" / "agents"
+    assert (overlay_dir / "agent-0.json").is_file()
+    assert (overlay_dir / "agent-1.json").is_file()
+    assert (overlay_dir / "agent-2.json").is_file()
+
+    (src / "agent-0.json").unlink()  # genuinely deleted -> must be pruned
+    real_write = rewriter.atomic_write
+
+    def flaky(target: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(target).name == "agent-1.json":
+            raise OSError("disk full")
+        real_write(target, *args, **kwargs)
+
+    monkeypatch.setattr(rewriter, "atomic_write", flaky)
+    _rewrite(tmp_path)
+
+    assert not (overlay_dir / "agent-0.json").exists()  # prune still ran
+    assert (overlay_dir / "agent-1.json").is_file()  # victim kept its overlay
+    assert (overlay_dir / "agent-2.json").is_file()  # healthy agent rewrote
+
+
+def test_write_failure_pass_keeps_the_kept_overlays_sidecars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass that kept a previous overlay must not prune that overlay's env
+    sidecars. With a server RENAME (srv -> srv2) in the failing agent's spec,
+    ``written_sidecars`` holds only the new name — pruning the old ``srv``
+    sidecar would leave the kept overlay's ``--env-file`` dangling and spawn
+    that backend credential-less until the next boot. The sidecar prune is
+    therefore skipped on any transient-keep pass (already uncacheable, so a
+    healthy boot re-sweeps)."""
+    src = _mk_tree(tmp_path)
+    _rewrite(tmp_path)
+    env_dir = tmp_path / "mcp-gateway" / "stubs" / "env"
+    sidecars_before = set(env_dir.glob("*.json"))
+    assert sidecars_before
+
+    # Rename agent-1's server so the new pass enumerates a DIFFERENT sidecar
+    # name, then fail agent-1's overlay write so the old overlay is kept.
+    spec_path = src / "agent-1.json"
+    spec = json.loads(spec_path.read_text())
+    spec["mcpServers"]["srv2"] = spec["mcpServers"].pop("srv")
+    spec_path.write_text(json.dumps(spec))
+
+    real_write = rewriter.atomic_write
+
+    def flaky(target: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(target).name == "agent-1.json":
+            raise OSError("disk full")
+        real_write(target, *args, **kwargs)
+
+    monkeypatch.setattr(rewriter, "atomic_write", flaky)
+    _rewrite(tmp_path)
+
+    # The old (agent-1, srv) sidecar — still referenced by the kept overlay's
+    # --env-file — survived the pass.
+    assert sidecars_before <= set(env_dir.glob("*.json"))
+    # Degraded pass not cached: the next boot retries and re-sweeps.
+    assert not (tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME).exists()
+
+
+def test_kept_overlay_target_mappings_stay_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A kept overlay's stub must keep resolving to its OWN backend command.
+    The stub's pool key hashes the OLD args, so if the pass only published
+    ``target_env`` from freshly-rewritten specs, the retained stub would miss
+    its args-hashed entry and fall back to the bare server-name key — which,
+    with two agents declaring the same server name, is ANOTHER agent's
+    command. The pass therefore harvests every kept overlay's wrapped entries
+    into ``target_env`` after the prune (mirroring the cached path)."""
+    src = _mk_tree(tmp_path)
+    _, healthy_env = _rewrite(tmp_path)
+    # The fixture gives agent-0/agent-1 the same server name with different
+    # args, so each contributes its own args-hashed key.
+    hashed_before = {k for k in healthy_env if "__" in k}
+    assert len(hashed_before) >= 2
+
+    # Change agent-1's args and fail its overlay write: its overlay (old
+    # args) is kept, and the fresh pass publishes only the NEW args' hash.
+    spec_path = src / "agent-1.json"
+    spec = json.loads(spec_path.read_text())
+    spec["mcpServers"]["srv"]["args"] = ["changed-args"]
+    spec_path.write_text(json.dumps(spec))
+
+    real_write = rewriter.atomic_write
+
+    def flaky(target: Path, *args: Any, **kwargs: Any) -> None:
+        if Path(target).name == "agent-1.json":
+            raise OSError("disk full")
+        real_write(target, *args, **kwargs)
+
+    monkeypatch.setattr(rewriter, "atomic_write", flaky)
+    _, degraded_env = _rewrite(tmp_path)
+
+    # Every hash-keyed mapping the healthy pass published is still present:
+    # the kept overlay's old-args hash (what its live stub actually sends)
+    # resolves to its own command, not the bare-key fallback.
+    assert hashed_before <= set(degraded_env)
 
 
 def test_missing_overlay_file_forces_full_rewrite(
@@ -803,12 +1139,16 @@ def test_transient_settings_read_failure_is_not_cached(
 ) -> None:
     """The settings/mcp.json read site has the same transient-failure rule as
     the agent-spec site: a pass that treated an existing settings file as
-    absent (and pruned its overlay) must not be cached, and a fingerprint from
-    an earlier healthy run must be removed."""
+    absent must not be cached, and a fingerprint from an earlier healthy run
+    must be removed. Since #5328 the degraded pass also KEEPS the previous
+    settings overlay (the prune is keyed on source existence, not on whether
+    this pass managed to read the source)."""
     src = _mk_tree(tmp_path)
     _rewrite(tmp_path)  # healthy run: fingerprint exists
     fp = tmp_path / "mcp-gateway" / "agents" / _FINGERPRINT_NAME
     assert fp.is_file()
+    settings_overlay = tmp_path / "mcp-gateway" / "settings" / "mcp.json"
+    assert settings_overlay.is_file()
 
     _bump_mtime(src / "agent-0.json")  # invalidate so the next call rewrites
     real_read = Path.read_text
@@ -824,12 +1164,16 @@ def test_transient_settings_read_failure_is_not_cached(
     fail["on"] = False
 
     assert not fp.exists()  # degraded pass not cached, stale fingerprint gone
+    # The previous healthy settings overlay survived the degraded pass —
+    # unlinking it here would strip every session's global MCP servers until
+    # a later pass succeeds (#5328).
+    assert settings_overlay.is_file()
 
     before = rewrite_counter["n"]
     _rewrite(tmp_path)
     assert rewrite_counter["n"] == before + 2  # full retry after fault clears
     assert fp.is_file()
-    # The settings overlay is back (the degraded pass had pruned it).
+    # The settings overlay is (still) present after the healthy retry.
     assert (tmp_path / "mcp-gateway" / "settings" / "mcp.json").is_file()
 
 

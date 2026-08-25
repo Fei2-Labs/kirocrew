@@ -16,6 +16,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from chat_test_helpers import _make_state
 
+# Both legs gate on the SHIPPED capability objects, so the refusal cases below
+# read them instead of a matching fake. Same roster the mirror-link suite uses.
+from test_chat_mirror import (
+    NON_PROACTIVE_CHANNELS,
+    _channels_declaring_proactive,
+    _real_caps_transport,
+)
+
 from kiro_crew.dashboard.chat_runner import (
     _deliver_cross_surface_reply,
     _deliver_cross_surface_user_message,
@@ -27,13 +35,40 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
 )
 
+#: A channel whose REAL capabilities permit a proactive send, so both legs must
+#: DELIVER to it. Named rather than derived: if Weixin's declaration is ever
+#: locked down, this fails loudly here instead of quietly moving suites.
+PROACTIVE_CHANNEL = "weixin"
 
-def _fake_transport(channel_type: str = "telegram", proactive: bool = True):
+
+def _fake_transport(channel_type: str = "telegram", proactive: bool = True, may_send: bool = True):
     return SimpleNamespace(
         channel_type=channel_type,
-        capabilities=SimpleNamespace(supports_proactive_send=proactive, max_message_chars=4096),
+        capabilities=SimpleNamespace(
+            supports_proactive_send=proactive,
+            max_message_chars=4096,
+            # 0 = not byte-capped, so chunk_for_transport takes the character
+            # path these tests are about. Webex is the byte-capped one.
+            max_message_bytes=0,
+        ),
         send_message=AsyncMock(return_value="mid-1"),
+        # Part of the MessagingTransport contract the send ladder consults: a
+        # proactive send re-checks that the link's recipient is still on the
+        # roster. Permissive here so these tests keep exercising delivery;
+        # test_channel_transport_outbound_authz owns the refusal path.
+        may_send_to=lambda conversation_id, thread_id=None, principal="": may_send,
     )
+
+
+def test_the_pinned_proactive_channel_still_declares_proactive_send() -> None:
+    """Guards the two delivery assertions below from becoming vacuous.
+
+    They prove the legs deliver where the capability allows it. Pointing them at
+    a channel that had since been locked would turn both into tests of the skip
+    path wearing a delivery test's name.
+    """
+    assert PROACTIVE_CHANNEL in _channels_declaring_proactive(True)
+    assert PROACTIVE_CHANNEL not in NON_PROACTIVE_CHANNELS
 
 
 class TestGovernanceDegradationFailsClosed:
@@ -185,14 +220,35 @@ class TestDeliverCrossSurfaceReply:
 
     @pytest.mark.asyncio
     async def test_skips_when_not_proactive(self, tmp_path):
+        """The leg must honour a False ``supports_proactive_send``.
+
+        SYNTHETIC capability, so this branch is covered whatever
+        ``NON_PROACTIVE_CHANNELS`` holds this week: it has been empty, and a suite
+        parametrized over an empty set drives NOTHING while still reporting green.
+        Real-capability coverage is the accepting counterpart below; this keeps the
+        refusing branch alive.
+        """
+        channel = "synthetic"
         state = _make_state(tmp_path)
-        tp = _fake_transport("wecom", proactive=False)
+        tp = _fake_transport(channel, proactive=False)
         state.register_channel_transport(tp)
         state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("wecom", channel_id="u1")
+            return_value=ChannelLink(channel, channel_id="u1")
         )
         await _deliver_cross_surface_reply(state, "k", "hi")
         tp.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delivers_when_real_capabilities_allow_it(self, tmp_path):
+        """The positive counterpart, on real capabilities rather than a fake."""
+        state = _make_state(tmp_path)
+        tp = _real_caps_transport(PROACTIVE_CHANNEL)
+        state.register_channel_transport(tp)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink(PROACTIVE_CHANNEL, channel_id="u1")
+        )
+        await _deliver_cross_surface_reply(state, "k", "hi")
+        tp.send_message.assert_awaited_once_with("u1", "hi", thread_id=None)
 
     @pytest.mark.asyncio
     async def test_skips_empty_text(self, tmp_path):
@@ -220,6 +276,27 @@ class TestDeliverCrossSurfaceReply:
         assert tp.send_message.await_args.args[1] == expected
 
     @pytest.mark.asyncio
+    async def test_a_markdown_split_credential_is_redacted_in_display_form(self, tmp_path):
+        """This leg passes no RENDERER, and a renderer is where a turn gets that floor.
+
+        ``AKIA**IOSF**ODNN7EXAMPLE`` survives a byte-for-byte scan and the client
+        reassembles it whole once it renders the emphasis away, so the mirror has to
+        scan the DISPLAYED form — the same argument, and the same context-aware
+        redactor, as the Slack chokepoint already applies.
+        """
+        state = _make_state(tmp_path)
+        tp = _fake_transport("telegram")
+        state.register_channel_transport(tp)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink("telegram", channel_id="123")
+        )
+
+        await _deliver_cross_surface_reply(state, "k", "token AKIA**IOSF**ODNN7EXAMPLE ok")
+
+        sent = tp.send_message.await_args.args[1]
+        assert "AKIAIOSFODNN7EXAMPLE" not in sent.replace("*", "")
+
+    @pytest.mark.asyncio
     async def test_send_failure_is_swallowed(self, tmp_path):
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
@@ -229,6 +306,37 @@ class TestDeliverCrossSurfaceReply:
             return_value=ChannelLink("telegram", channel_id="123")
         )
         await _deliver_cross_surface_reply(state, "k", "hi")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_a_byte_capped_channel_chunks_on_BYTES(self, tmp_path):
+        """The mirror leg measures in the transport's own unit.
+
+        A character count cannot express a byte cap without being wrong in one
+        direction: the only safe char value is the byte budget over four, which
+        cut an ASCII reply into quarters, while the true char cap would let a CJK
+        reply exceed the byte limit and be truncated on send.
+        """
+        state = _make_state(tmp_path)
+        tp = _fake_transport("webex")
+        # What Webex declares: a byte cap plus the 4x-pessimistic char floor.
+        tp.capabilities.max_message_bytes = 400
+        tp.capabilities.max_message_chars = 100
+        state.register_channel_transport(tp)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink("webex", channel_id="ROOM")
+        )
+
+        # 350 ASCII chars is 350 bytes: under the byte cap, so ONE send — where
+        # the char floor alone would have made it four.
+        await _deliver_cross_surface_reply(state, "k", "x" * 350)
+        assert tp.send_message.await_count == 1
+
+        # The same length in 3-byte characters is 1050 bytes, so it must split.
+        tp.send_message.reset_mock()
+        await _deliver_cross_surface_reply(state, "k", "界" * 350)
+        assert tp.send_message.await_count > 1
+        for call in tp.send_message.await_args_list:
+            assert len(call.args[1].encode("utf-8")) <= 400
 
     @pytest.mark.asyncio
     async def test_long_reply_is_chunked(self, tmp_path):
@@ -300,14 +408,27 @@ class TestDeliverCrossSurfaceUserMessage:
 
     @pytest.mark.asyncio
     async def test_skips_when_not_proactive(self, tmp_path):
+        """Synthetic capability, for the same reason as the reply leg's twin."""
+        channel = "synthetic"
         state = _make_state(tmp_path)
-        tp = _fake_transport("wecom", proactive=False)
+        tp = _fake_transport(channel, proactive=False)
         state.register_channel_transport(tp)
         state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("wecom", channel_id="u1")
+            return_value=ChannelLink(channel, channel_id="u1")
         )
         await _deliver_cross_surface_user_message(state, "k", "hi")
         tp.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delivers_when_real_capabilities_allow_it(self, tmp_path):
+        state = _make_state(tmp_path)
+        tp = _real_caps_transport(PROACTIVE_CHANNEL)
+        state.register_channel_transport(tp)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink(PROACTIVE_CHANNEL, channel_id="u1")
+        )
+        await _deliver_cross_surface_user_message(state, "k", "hi")
+        tp.send_message.assert_awaited_once_with("u1", "💬 hi", thread_id=None)
 
     @pytest.mark.asyncio
     async def test_skips_empty_message(self, tmp_path):
@@ -348,3 +469,81 @@ class TestDeliverCrossSurfaceUserMessage:
             return_value=ChannelLink("telegram", channel_id="123")
         )
         await _deliver_cross_surface_user_message(state, "k", "hi")  # must not raise
+
+
+# A reply whose code block spans the transport's message cap: the shape of a cron
+# log or diff dump, and the one a fixed-width slice mangles. Lines inside the
+# block carry prose markup a channel's dialect converter WOULD rewrite if the part
+# they land in has lost the opener.
+_FENCED_REPLY = (
+    "Here is the diff:\n\n"
+    "```diff\n"
+    "**never bold** inside a code block\n"
+    "# never a heading inside a code block\n"
+    "- never a bullet inside a code block\n"
+    "~~never struck~~ inside a code block\n"
+    "```\n"
+)
+_CODE_MARKERS = (
+    "**never bold** inside a code block",
+    "# never a heading inside a code block",
+    "- never a bullet inside a code block",
+    "~~never struck~~ inside a code block",
+)
+
+
+def _lines_the_channel_would_read_as_prose(part: str) -> list[str]:
+    """Lines of *part* that fall OUTSIDE a fence, as a dialect converter sees them."""
+    from kiro_crew.messaging.split import FENCE_OUTSIDE, iter_fence_lines
+
+    return [line for line, role in iter_fence_lines(part) if role == FENCE_OUTSIDE]
+
+
+class TestALongFencedReplyStaysCode:
+    """The mirror pre-splits, so the split it does IS the one the channel gets.
+
+    Each part arrives already under the cap, so a channel's own fence-safe
+    splitter is a no-op on it: whatever cut this leg makes is final. A fixed-width
+    slice through the block leaves part two with no opener, every line in it takes
+    the prose branch of the channel's dialect converter, and the markup INSIDE the
+    code gets rewritten.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_code_line_escapes_its_fence(self, tmp_path):
+        state = _make_state(tmp_path)
+        tp = _fake_transport("telegram")
+        tp.capabilities.max_message_chars = 90
+        state.register_channel_transport(tp)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink("telegram", channel_id="123")
+        )
+
+        await _deliver_cross_surface_reply(state, "k", _FENCED_REPLY)
+
+        parts = [c.args[1] for c in tp.send_message.await_args_list]
+        assert len(parts) > 1, "precondition: the reply must actually have been split"
+        for part in parts:
+            prose = _lines_the_channel_would_read_as_prose(part)
+            for marker in _CODE_MARKERS:
+                assert marker not in prose, (
+                    f"a code line landed outside its fence in this part, so the "
+                    f"channel will rewrite the markup inside it:\n{part}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_every_source_line_still_arrives(self, tmp_path):
+        """Fence scaffolding is added, never substituted for content."""
+        state = _make_state(tmp_path)
+        tp = _fake_transport("telegram")
+        tp.capabilities.max_message_chars = 90
+        state.register_channel_transport(tp)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink("telegram", channel_id="123")
+        )
+
+        await _deliver_cross_surface_reply(state, "k", _FENCED_REPLY)
+
+        delivered = "\n".join(c.args[1] for c in tp.send_message.await_args_list)
+        for marker in _CODE_MARKERS:
+            assert marker in delivered

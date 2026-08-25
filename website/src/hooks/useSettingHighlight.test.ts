@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import type { ReactNode } from 'react'
@@ -8,6 +8,15 @@ import { useSettingHighlight } from './useSettingHighlight'
 // Mock scrollIntoView (not available in jsdom)
 beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
+})
+
+// Three tests here install fake timers and restore them INLINE on their last
+// line. An assertion that fails before that line leaves fake timers installed for
+// every LATER test in the file, so one real failure reports as a cascade of
+// unrelated timeouts and the actual cause is buried. Restoring here makes that
+// impossible; it is idempotent when timers were never faked.
+afterEach(() => {
+  vi.useRealTimers()
 })
 
 function wrapper(initialEntries: string[]) {
@@ -103,12 +112,15 @@ describe('useSettingHighlight against the real registry and catalogs', () => {
    * catalogs under a real language switch, so those two failures are reachable.
    */
   afterAll(async () => {
-    const { i18next } = await import('../i18n')
+    const { i18next } = await import('../i18n/all')
     await i18next.changeLanguage('en')
   })
 
   it('highlights a control whose rendered label is translated', async () => {
-    const { i18next } = await import('../i18n')
+    // `/all` for the Japanese catalog: `../i18n` registers English only, so the
+    // switch below would fall back to English and the label match would be
+    // self-consistently wrong.
+    const { i18next } = await import('../i18n/all')
     const { i18nT } = await import('../i18n/t')
     const { SETTINGS_REGISTRY } = await import('../components/commandPalette/settingsRegistry.gen')
 

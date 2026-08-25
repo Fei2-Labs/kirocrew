@@ -120,7 +120,6 @@ function renderPage() {
           <Route path="/apps" element={<AppsPage />} />
           <Route path="/apps/detail/:name" element={<DetailProbe />} />
           <Route path="/apps/:name" element={<DetailProbe />} />
-          <Route path="/secretary-ui" element={<div data-testid="app-ui-route" />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -372,12 +371,17 @@ describe('AppsPage — query failures and empty states', () => {
 })
 
 describe('AppsPage — Library actions', () => {
-  it('opens the app UI page from the card and the detail page from its name', async () => {
+  it('opens the app at its AppHost route from the card, and the detail page from its name', async () => {
     renderPage()
     await catalogReady()
     goLibrary()
+    // Open must resolve through the same appNavTarget derivation the sidebar and
+    // command palette use: a third-party (non-builtin) app is AppHost-routed at
+    // /apps/<name>, NOT its raw manifest page route (which only a native builtin
+    // serves, and which otherwise dead-ends at BuiltinAppRoute -> /chat).
     fireEvent.click(await screen.findByRole('button', { name: 'Open' }))
-    expect(await screen.findByTestId('app-ui-route')).toBeInTheDocument()
+    const probe = await screen.findByTestId('detail-route')
+    expect(probe).toHaveAttribute('data-path', '/apps/secretary')
   })
 
   it('routes to the detail page when the card name is clicked', async () => {
@@ -578,14 +582,20 @@ describe('AppsPage — editorial layer wiring', () => {
     expect(await screen.findByTestId('detail-route')).toHaveAttribute('data-path', '/apps/detail/pets')
   })
 
-  it('enables from the spotlight and Gets from the feature card', async () => {
+  it('enables from the lead card and Gets from a row card', async () => {
     // Pets sorts ahead of Zeta App (both verified), so the switched-off builtin
-    // takes the spotlight and the uninstalled core app takes the feature card.
+    // takes the derived `full` lead; Zeta App and Zulu Utility fill the derived
+    // `row` (which needs TWO cards -- with one leftover pick the lead stands
+    // alone and Zeta would only render as a list row).
     listApps.mockResolvedValue([BUILTIN_OFF])
     listRegistry.mockResolvedValue({
       apps: [
         {
           name: 'zeta-app', displayName: 'Zeta App', author: 'kirocrew', description: 'Later in the alphabet.',
+          version: '1.0.0', tags: ['github'], installed: false, provenance: 'core',
+        },
+        {
+          name: 'zulu-utility', displayName: 'Zulu Utility', author: 'kirocrew', description: 'Fills the second row slot.',
           version: '1.0.0', tags: ['github'], installed: false, provenance: 'core',
         },
         // Explore renders server rows, so the installed built-in reaches the
@@ -617,6 +627,66 @@ describe('AppsPage — Library enable and update', () => {
     expect(probe).toHaveAttribute('data-path', '/apps/detail/secretary')
     expect(probe).toHaveAttribute('data-auto', 'update')
     // Navigation only — the page must not call the update endpoint itself.
+    expect(updateApp).not.toHaveBeenCalled()
+  })
+
+  it('syncs a PATH-installed app in place instead of routing at the registry', async () => {
+    // A directory install has no registry row, so the streaming registry install
+    // the detail page runs can only answer "not found in registry". Its refresh
+    // is POST /api/apps/{name}/update, which re-copies the recorded directory.
+    listApps.mockResolvedValue([{
+      ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
+      source: '/home/u/apps/orchestrator-switch', origin: 'local',
+    }])
+    listRegistry.mockResolvedValue({ apps: [] })
+    renderPage()
+    await screen.findByText('No apps available')
+    goLibrary()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    await waitFor(() => expect(updateApp).toHaveBeenCalledWith('orchestrator-switch'))
+    expect(screen.queryByTestId('detail-route')).toBeNull()
+  })
+
+  it('reflects a completed in-place sync, which is otherwise invisible', async () => {
+    // Re-copying a source directory usually carries the SAME version, so the
+    // card re-renders identically and silence is indistinguishable from a
+    // no-op. Without this the primary action the fix creates has no success
+    // signal at all.
+    listApps.mockResolvedValue([{
+      ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
+      source: '/home/u/apps/orchestrator-switch', origin: 'local',
+    }])
+    listRegistry.mockResolvedValue({ apps: [] })
+    renderPage()
+    await screen.findByText('No apps available')
+    goLibrary()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    expect(await screen.findByText(/Synced Orchestrator Switch from its source directory/)).toBeInTheDocument()
+  })
+
+  it('surfaces a failed in-place sync instead of leaving the card silent', async () => {
+    listApps.mockResolvedValue([{
+      ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
+      source: '/home/u/apps/orchestrator-switch', origin: 'local',
+    }])
+    listRegistry.mockResolvedValue({ apps: [] })
+    updateApp.mockRejectedValue(new Error('source path no longer exists'))
+    renderPage()
+    await screen.findByText('No apps available')
+    goLibrary()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    expect(await screen.findByText('source path no longer exists')).toBeInTheDocument()
+  })
+
+  it('still routes a registry-sourced app at the registry when it has no update', async () => {
+    listApps.mockResolvedValue([{ ...SECRETARY, source: 'registry:secretary' }])
+    listRegistry.mockResolvedValue({ apps: [] })
+    renderPage()
+    await screen.findByText('No apps available')
+    goLibrary()
+    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    const probe = await screen.findByTestId('detail-route')
+    expect(probe).toHaveAttribute('data-auto', 'update')
     expect(updateApp).not.toHaveBeenCalled()
   })
 

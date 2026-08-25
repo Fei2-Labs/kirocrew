@@ -238,23 +238,56 @@ class TestAcpSessionProviderStream:
         assert collected[2].kind == EVENT_COMPLETE
 
     @pytest.mark.asyncio
-    async def test_stream_command_delegates_to_stream(self):
+    async def test_stream_command_routes_through_handle_stream_command(self):
+        """Slash commands go through the handle's NATIVE commands/execute path,
+        never through prompt() — a prompt round-trip would hand the command to
+        the model, which summarizes kiro-cli's output instead of returning it
+        (issue #4972)."""
         handle = _make_handle()
-        events = [AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")]
+        events = [
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="13 tools"),
+            AcpEvent(kind=EVENT_COMPLETE, stop_reason=""),
+        ]
+        seen_commands: list[str] = []
 
-        async def mock_prompt(msg):
+        async def mock_stream_command(command):
+            seen_commands.append(command)
             for e in events:
                 yield e
 
+        async def mock_prompt(msg):  # pragma: no cover — must never run
+            raise AssertionError("stream_command must not route through prompt()")
+            yield  # make it a generator
+
+        handle.stream_command = mock_stream_command
         handle.prompt = mock_prompt
         runtime = _make_runtime()
         provider = AcpSessionProvider(handle, runtime)
 
-        collected = []
-        async for event in provider.stream_command("/help"):
-            collected.append(event)
+        collected = [e async for e in provider.stream_command("/tools")]
 
-        assert len(collected) == 1
+        assert seen_commands == ["/tools"]
+        assert [e.kind for e in collected] == [EVENT_TEXT_CHUNK, EVENT_COMPLETE]
+        assert collected[0].text == "13 tools"
+
+    @pytest.mark.asyncio
+    async def test_stream_command_translates_runtime_dead(self):
+        """Runtime death mid-command stays inside the AcpError hierarchy
+        (AcpProcessDied), mirroring stream()'s translation."""
+
+        async def dead_stream_command(command):
+            raise AcpRuntimeDead("runtime died")
+            yield  # make it a generator
+
+        handle = _make_handle()
+        handle.stream_command = dead_stream_command
+        runtime = _make_runtime()
+        runtime.saw_not_logged_in = lambda: False
+        provider = AcpSessionProvider(handle, runtime)
+
+        with pytest.raises(AcpProcessDied):
+            async for _ in provider.stream_command("/tools"):
+                pass
 
 
 class TestAcpSessionProviderToolApproval:

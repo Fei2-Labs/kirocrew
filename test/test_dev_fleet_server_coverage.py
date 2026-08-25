@@ -98,6 +98,9 @@ def _pin_module_state(monkeypatch):
     monkeypatch.setattr(mod, "_BUILD_PATH_CACHE", "/usr/bin")
     monkeypatch.setattr(mod, "_warm_build_path", AsyncMock())
     monkeypatch.setattr(mod, "_pod_env", lambda: {})
+    # Shutdown admission state: each test starts with a clean (non-shutdown) process.
+    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
 
 
 # --------------------------------------------------------------------------
@@ -211,6 +214,32 @@ async def test_load_fallback_repos_empty_when_remote_listing_fails(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Git info identity
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_git_info_returns_full_oid_and_short_display_head(monkeypatch):
+    full_head = "a" * 40
+
+    async def fake_git(_path, *args, **_kwargs):
+        values = {
+            ("rev-parse", "--abbrev-ref", "HEAD"): "feat/cache",
+            ("rev-parse", "HEAD"): full_head,
+            ("status", "--porcelain"): "",
+            ("rev-list", "--count", "HEAD..origin/main"): "0",
+            ("log", "-1", "--format=%ct"): "123",
+        }
+        return values.get(args)
+
+    monkeypatch.setattr(mod, "_git", fake_git)
+    monkeypatch.setattr(mod, "_upstream_remote", AsyncMock(return_value="origin"))
+
+    info = await mod._git_info("/wt")
+
+    assert info["head_oid"] == full_head
+    assert info["head"] == full_head[:7]
+
+
+# --------------------------------------------------------------------------
 # PR cache + html base
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
@@ -254,6 +283,142 @@ async def test_pr_status_cached_fresh_entry_is_served(monkeypatch):
 
     assert (await mod._pr_status_cached("feat"))["state"] == "OPEN"
     fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pr_status_cached_merged_same_head_retains_terminal_cache(monkeypatch):
+    """Same branch + same head OID → MERGED entry remains terminal (no refetch)."""
+    fetch = AsyncMock(return_value={"state": "OPEN"})
+    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(
+        mod,
+        "_PR_CACHE",
+        {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": "a" * 40}},
+    )
+
+    result = await mod._pr_status_cached("feat", head_oid="a" * 40)
+    assert result is not None and result["state"] == "MERGED"
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pr_status_cached_merged_new_head_invalidates_and_refetches(monkeypatch):
+    """Same branch + new head OID → stale MERGED entry is discarded; fresh lookup runs."""
+    fetch = AsyncMock(return_value={"state": "OPEN"})
+    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(
+        mod,
+        "_PR_CACHE",
+        {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": "a" * 40}},
+    )
+
+    result = await mod._pr_status_cached("feat", head_oid="b" * 40)
+    # The stale MERGED entry must NOT be returned after a head change.
+    assert result is not None and result["state"] == "OPEN"
+    fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pr_status_cached_rejects_old_merged_pr_for_reused_head(monkeypatch):
+    old_head = "a" * 40
+    new_head = "b" * 40
+    fetch = AsyncMock(return_value={"state": "MERGED", "_head_oid": old_head})
+    contained = AsyncMock(return_value=False)
+    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(mod, "_head_contained_in_pr", contained)
+    monkeypatch.setattr(
+        mod,
+        "_PR_CACHE",
+        {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": old_head}},
+    )
+
+    result = await mod._pr_status_cached("feat", head_oid=new_head)
+
+    assert result is None
+    contained.assert_awaited_once_with(mod._repo(), new_head, old_head)
+    assert mod._PR_CACHE["feat"]["data"] is None
+    assert mod._PR_CACHE["feat"]["cached_head"] == new_head
+
+
+@pytest.mark.asyncio
+async def test_pr_status_cached_accepts_local_ancestor_of_merged_pr_head(monkeypatch):
+    local_head = "a" * 40
+    pr_head = "b" * 40
+    fetch = AsyncMock(return_value={"state": "MERGED", "_head_oid": pr_head})
+    contained = AsyncMock(return_value=True)
+    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(mod, "_head_contained_in_pr", contained)
+    monkeypatch.setattr(mod, "_PR_CACHE", {})
+
+    result = await mod._pr_status_cached("feat", head_oid=local_head)
+
+    assert result is not None and result["state"] == "MERGED"
+    contained.assert_awaited_once_with(mod._repo(), local_head, pr_head)
+    assert mod._PR_CACHE["feat"]["cached_head"] == local_head
+
+
+@pytest.mark.asyncio
+async def test_pr_status_cached_accepts_fetched_merged_pr_for_same_head(monkeypatch):
+    head = "a" * 40
+    fetch = AsyncMock(return_value={"state": "MERGED", "_head_oid": head})
+    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(mod, "_PR_CACHE", {})
+
+    result = await mod._pr_status_cached("feat", head_oid=head)
+
+    assert result is not None and result["state"] == "MERGED"
+    assert mod._PR_CACHE["feat"]["cached_head"] == head
+
+
+@pytest.mark.asyncio
+async def test_pr_status_cached_merged_no_head_oid_remains_terminal(monkeypatch):
+    """Callers that omit head_oid continue to treat MERGED as terminal (fail-soft)."""
+    fetch = AsyncMock(return_value={"state": "OPEN"})
+    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(
+        mod,
+        "_PR_CACHE",
+        {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": "a" * 40}},
+    )
+
+    result = await mod._pr_status_cached("feat")  # no head_oid
+    assert result is not None and result["state"] == "MERGED"
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pr_status_cached_lookup_failure_does_not_cache_stale_merged(monkeypatch):
+    """When the fresh lookup returns None (gh failure), the cache stores None safely."""
+    fetch = AsyncMock(return_value=None)
+    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(
+        mod,
+        "_PR_CACHE",
+        {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": "a" * 40}},
+    )
+
+    result = await mod._pr_status_cached("feat", head_oid="b" * 40)
+    assert result is None
+    fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pr_status_cached_null_cached_head_invalidated_by_new_head(monkeypatch):
+    """Entry written without head_oid (cached_head=None) is invalidated when a head-bearing
+    caller provides a head_oid — prevents re-armed staleness after no-head write-back."""
+    fetch = AsyncMock(return_value={"state": "OPEN"})
+    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    # Simulate a cache entry that was written by a no-head caller (cached_head missing/None).
+    monkeypatch.setattr(
+        mod,
+        "_PR_CACHE",
+        {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": None}},
+    )
+
+    result = await mod._pr_status_cached("feat", head_oid="a" * 40)
+    # An unknown cached identity cannot match a known full head, so refetch.
+    assert result is not None and result["state"] == "OPEN"
+    fetch.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -887,6 +1052,23 @@ async def test_prunable_active_worktree_is_kept(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_prunable_passes_full_head_oid_to_pr_status_cached(monkeypatch, tmp_path):
+    """Prune cache invalidation uses full commit identity for branch reuse."""
+    full_head = "a" * 40
+    cache = AsyncMock(return_value=None)
+    monkeypatch.setattr(mod, "_pr_status_cached", cache)
+    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
+    git = AsyncMock(return_value=full_head)
+    monkeypatch.setattr(mod, "_git", git)
+
+    await mod._prunable(str(tmp_path), "feat")
+
+    git.assert_awaited_once_with(str(tmp_path), "rev-parse", "HEAD")
+    cache.assert_awaited_once_with("feat", full_head)
+
+
+@pytest.mark.asyncio
 async def test_prune_candidates_splits_and_skips_main(monkeypatch):
     monkeypatch.setattr(
         mod, "_discover_worktrees",
@@ -974,8 +1156,45 @@ async def test_fleet_handler_fresh_bypasses_cache(monkeypatch):
     monkeypatch.setattr(mod, "_fleet_refresh", refresh)
     monkeypatch.setattr(mod, "_fleet_cached", AsyncMock(return_value={"worktrees": []}))
     resp = await mod.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet?fresh=1"))
-    assert json.loads(resp.text)["worktrees"] == [{"name": "a"}]
+    # The row also carries the request-time `provision_run_id` overlay, which is
+    # authoritative: a provision that finished after the snapshot was built has
+    # no reattachable run, so the pointer must read None rather than the id the
+    # snapshot froze.
+    assert json.loads(resp.text)["worktrees"] == [{"name": "a", "provision_run_id": None}]
     refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fleet_handler_overlays_runs_started_after_snapshot(monkeypatch):
+    """A run started AFTER the cached snapshot was built is still reported.
+
+    The fleet cache is stale-while-revalidate, so a run pointer baked into the
+    snapshot left a freshly-mounted page with nothing to reattach its progress
+    stepper to for a full cache cycle plus a rebuild -- no progress, and a button
+    still inviting a second press. Both pointers share that cause: the sync's,
+    and each row's provision run.
+    """
+    cached = {
+        "worktrees": [
+            {"name": "main", "provision_run_id": None},
+            {"name": "feature-x", "provision_run_id": None},
+        ],
+        "sync_run_id": None,
+    }
+    monkeypatch.setattr(mod, "_fleet_cached", AsyncMock(return_value=cached))
+    monkeypatch.setattr(mod, "_SYNC_RID", "rid-after-snapshot")
+    monkeypatch.setattr(
+        mod, "_provision_reattach_ids", AsyncMock(return_value={"feature-x": "prov-rid-7"})
+    )
+    resp = await mod.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet"))
+    body = json.loads(resp.text)
+    assert body["sync_run_id"] == "rid-after-snapshot"
+    rows = {w["name"]: w["provision_run_id"] for w in body["worktrees"]}
+    assert rows == {"main": None, "feature-x": "prov-rid-7"}
+    # The snapshot and its rows are the cache's own objects, shared with every
+    # other in-flight request, so the overlay must copy rather than write through.
+    assert cached["sync_run_id"] is None
+    assert [w["provision_run_id"] for w in cached["worktrees"]] == [None, None]
 
 
 @pytest.mark.asyncio
@@ -1809,3 +2028,52 @@ async def test_worktree_detail_survives_pod_probe_failure(monkeypatch, tmp_path)
     assert detail["pod_running"] is False
     assert detail["disk_mb"] is None
     assert detail["commits"] == []
+
+
+def test_main_boots_platform_before_serving(monkeypatch):
+    """main() must install the platform context BEFORE create_app/run_app.
+
+    The app backend launches this module as its own subprocess, which inherits
+    no installed platform context. If it served without booting, the first read
+    of current_context() (e.g. the sandbox floor resolved while wrapping the
+    app's own git worktree scan) would raise on a non-standalone edition and the
+    error would surface verbatim in the UI. The ORDER is the invariant: boot
+    resolves the profile and installs the context, so create_app never runs
+    against a cold context.
+    """
+    calls: list[str] = []
+
+    def _fake_boot(_cfg):
+        calls.append("boot")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(mod, "boot_platform", _fake_boot)
+    monkeypatch.setattr(mod.KiroCrewConfig, "load", classmethod(lambda cls: SimpleNamespace()))
+    monkeypatch.setattr(mod, "create_app", lambda: calls.append("create_app") or MagicMock())
+    monkeypatch.setattr(mod.web, "run_app", lambda *a, **k: calls.append("run_app"))
+
+    assert mod.main() == 0
+    assert calls == ["boot", "create_app", "run_app"]
+
+
+def test_main_fails_closed_when_platform_cannot_compose(monkeypatch):
+    """A composition failure must ABORT main(), never serve a cold backend.
+
+    Mirrors the CLI entry point's fail-closed posture: a non-standalone profile
+    whose companion cannot compose must not fall through to serving the backend
+    with no security overlay.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+
+    def _boom(_cfg):
+        raise PlatformCompositionError("companion missing")
+
+    served: list[str] = []
+    monkeypatch.setattr(mod, "boot_platform", _boom)
+    monkeypatch.setattr(mod.KiroCrewConfig, "load", classmethod(lambda cls: SimpleNamespace()))
+    monkeypatch.setattr(mod, "create_app", lambda: served.append("create_app") or MagicMock())
+    monkeypatch.setattr(mod.web, "run_app", lambda *a, **k: served.append("run_app"))
+
+    with pytest.raises(PlatformCompositionError):
+        mod.main()
+    assert served == []

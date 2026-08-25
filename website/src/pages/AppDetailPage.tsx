@@ -18,6 +18,7 @@ import { api } from '../api/client'
 import { PageHeader, Card, CardTitle, Badge, Btn } from '../components/ui'
 import AppIcon from '../components/AppIcon'
 import TrustAppModal, { APP_EXECUTION_DENIED, isTrustDeniedError, useTrustGate } from '../components/appstore/TrustAppModal'
+import { isRegistrySourced } from '../components/appstore/types'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
 import AskAgentButton from '../components/AskAgentButton'
@@ -25,6 +26,7 @@ import AskAgentButton from '../components/AskAgentButton'
 import { i18nT } from '../i18n/t'
 import { appDisplayName, appDescription, appHighlights } from '../components/appstore/appManifest'
 import { isBuiltinServerRow, mergeBuiltinRow } from '../components/appstore/mergeBuiltinRow'
+import { manifestArt, manifestArtList, classifyManifestArt } from '../components/appstore/useHeroArt'
 import { fmtDateNumeric } from '../i18n/format'
 type AppInfo = {
   name: string
@@ -104,6 +106,15 @@ interface AppManifest {
   // (preserved through AppManifest.extra) rather than on a registry entry —
   // built-ins are not part of the /api/apps/registry feed.
   iconUrl?: string
+  iconUrlDark?: string
+  // Repo-relative icon paths. An external app declares these (the backend
+  // rewrites them into blob-proxy URLs on a registry row); `iconUrl` is the
+  // built-in spelling.
+  iconPath?: string
+  iconPathDark?: string
+  // The repo an external app's art paths are relative to, when the manifest
+  // declares it.
+  repo?: string
   heroImage?: string
   heroImageDark?: string
   heroImageDetail?: string
@@ -198,6 +209,14 @@ export default function AppDetailPage() {
   const [app, setApp] = useState<AppInfo | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  /**
+   * Success reflection for an in-place sync. This page otherwise has only an
+   * error surface, so a successful ``update`` re-rendered a byte-identical page:
+   * re-copying a source directory normally carries the same version, which makes
+   * silence indistinguishable from a no-op. The list card states the outcome for
+   * the same reason, and both paths this fix wires need to say it.
+   */
+  const [successMsg, setSuccessMsg] = useState('')
   const clearError = useCallback(() => {
     setError('')
   }, [])
@@ -264,27 +283,58 @@ export default function AppDetailPage() {
             manifest: m,
           })
         } else {
+          // A non-built-in installed app may have no registry row carrying art
+          // at all — a local-directory install has none, and a row built from a
+          // cached manifest older than the release that added the art carries
+          // those fields empty. The manifest on disk still has the paths, but
+          // they are repo-relative, so every fallback below goes through
+          // `manifestArt` to reach the blob proxy. The repo it resolves against
+          // is the row's when there is one, else the manifest's own, else the
+          // git URL the app was installed from — which the install records
+          // independently of the store's caches.
+          const artRepo = registryEntry?.repo || m.repo || installed.sourceUrl || ''
+          // A page's own icon ships inside the app's UI bundle, not at the repo
+          // root, so a relative value resolves against the app's UI asset route —
+          // the same base the rail and the command palette use. A cross-origin
+          // value is refused here for the same reason it is everywhere else on
+          // this path: the manifest is untrusted, and requesting it would leak the
+          // viewer to whatever host it names.
+          const pageIcon: unknown = m.ui?.pages?.[0]?.iconUrl
+          const pageIconKind = classifyManifestArt(pageIcon)
+          const pageIconUrl = pageIconKind === 'same-origin' ? pageIcon as string
+            : pageIconKind === 'relative' ? `/apps/${installed.name}/ui/${pageIcon as string}`
+              : ''
           setApp({
             name: installed.name,
             displayName: installed.displayName || m.displayName || installed.name,
             description: m.description || '',
             version: registryEntry?.version || m.version || installed.version || '0.0.0',
             author: m.author || registryEntry?.author || '',
-            // A non-built-in installed app may have no registry entry at all (a
-            // local-directory install), so the manifest is the only source for
-            // icon/hero metadata; without this fallback the page renders the
-            // generic Package box.
             icon: registryEntry?.icon || m.ui?.pages?.[0]?.icon || '',
-            iconUrl: registryEntry?.iconUrl || m.iconUrl || m.ui?.pages?.[0]?.iconUrl || '',
-            iconUrlDark: registryEntry?.iconUrlDark || m.iconUrlDark || '',
+            // `iconPath` is preferred over a manifest-declared `iconUrl` for the
+            // same reason the backend honours only `iconPath`: a repo-relative
+            // path stays on our own proxy, which enforces the extension
+            // allowlist and the trusted-repo gate. The `iconUrl` fallback goes
+            // through the same resolver rather than straight to `<img>`, so a
+            // manifest naming an external host is refused on this surface too.
+            iconUrl: registryEntry?.iconUrl || manifestArt(m.iconPath, artRepo)
+              || manifestArt(m.iconUrl, artRepo) || pageIconUrl || '',
+            iconUrlDark: registryEntry?.iconUrlDark || manifestArt(m.iconPathDark, artRepo)
+              || manifestArt(m.iconUrlDark, artRepo) || '',
             tags: m.tags || registryEntry?.tags || [],
             highlights: m.highlights || registryEntry?.highlights || [],
-            screenshots: registryEntry?.screenshots || m.screenshots || [],
-            screenshotsDark: registryEntry?.screenshotsDark || m.screenshotsDark || [],
-            heroImage: registryEntry?.heroImage || m.heroImage || '',
-            heroImageDark: registryEntry?.heroImageDark || m.heroImageDark || '',
-            heroImageDetail: registryEntry?.heroImageDetail || m.heroImageDetail || '',
-            heroImageDetailDark: registryEntry?.heroImageDetailDark || m.heroImageDetailDark || '',
+            screenshots: registryEntry?.screenshots || manifestArtList(m.screenshots, artRepo),
+            screenshotsDark: registryEntry?.screenshotsDark
+              || manifestArtList(m.screenshotsDark, artRepo),
+            heroImage: registryEntry?.heroImage || manifestArt(m.heroImage, artRepo),
+            heroImageDark: registryEntry?.heroImageDark || manifestArt(m.heroImageDark, artRepo),
+            heroImageDetail: registryEntry?.heroImageDetail
+              || manifestArt(m.heroImageDetail, artRepo),
+            heroImageDetailDark: registryEntry?.heroImageDetailDark
+              || manifestArt(m.heroImageDetailDark, artRepo),
+            // Left as the row's own value: this field also names the repo in the
+            // trust-consent prompt and the details list, and widening those to a
+            // fallback identifier is a separate decision from resolving art.
             repo: registryEntry?.repo || '',
             installed: true,
             installedVersion: installed.version,
@@ -343,6 +393,15 @@ export default function AppDetailPage() {
     autoActionTriggered.current = true
     // Clear the state so a refresh or Back/Forward doesn't re-fire it.
     navigate(`${location.pathname}${location.search}`, { replace: true, state: null })
+    // An installed app whose bytes came from a directory on this machine has no
+    // registry row to install from — its refresh is the update endpoint, which
+    // re-copies the source directory recorded at install. The streaming registry
+    // install is for everything else: a registry-sourced app, and an app not
+    // installed at all.
+    if (stateAction === 'update' && app.installed && !isRegistrySourced(app)) {
+      handleAction('update')
+      return
+    }
     handleInstall()
   }, [app, location]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -497,6 +556,7 @@ export default function AppDetailPage() {
     }
     setActionLoading(action)
     clearError()
+    setSuccessMsg('')
     try {
       if (action === 'enable') { await runEnable(app.name); return }
       if (action === 'disable') await api.disableApp(app.name)
@@ -505,6 +565,17 @@ export default function AppDetailPage() {
         recordEvent('app_disable', { app: app.name, version: app.installedVersion || app.version })
       }
       await load()
+      // `load()` clears the error but does not speak to success, and a same-version
+      // re-copy changes nothing visible, so say it explicitly. The Sync button that
+      // reaches here is not gated on source, and `handle_update_app` re-clones a
+      // registry-sourced app from the registry rather than copying a directory, so
+      // each case has to name where the update actually came from.
+      if (action === 'update') {
+        setSuccessMsg(isRegistrySourced(app)
+          ? i18nT('pages.appsPage.updated_from_the_registry', { name: appDisplayName(app) })
+          : i18nT('pages.appsPage.synced_from_its_source_directory', { name: appDisplayName(app) }))
+        setTimeout(() => setSuccessMsg(''), 4000)
+      }
       window.dispatchEvent(new Event('mc:apps-changed'))
     } catch (e: unknown) {
       // A third-party app that has not been granted execution trust yet is a
@@ -601,6 +672,17 @@ export default function AppDetailPage() {
         <button className="flex items-center gap-1.5 text-[13px] text-muted hover:text-text mb-5 bg-transparent border-none cursor-pointer p-0 font-body transition-colors" onClick={() => navigate('/apps')}>
           <ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}
         </button>
+
+        {/* In-place sync succeeded. Stated because nothing else on the page
+            changes when a re-copy carries the same version. No dismiss control:
+            unlike the error box below — which persists until cleared and so needs
+            one — this clears itself, and a close button on a self-closing notice
+            is a control whose only outcome is to race the timer. */}
+        {successMsg && (
+          <div className="mb-4 bg-ok/10 border border-ok/20 rounded-lg p-3 animate-rise">
+            <span className="text-ok text-sm block">{successMsg}</span>
+          </div>
+        )}
 
         {/* Error */}
         {error && (
@@ -758,7 +840,7 @@ export default function AppDetailPage() {
                        desktop shell. Replacing the button with a static claim
                        left every browser user at a dead end — and this page is
                        where store rows land, so it was the common path. Same
-                       pattern as AppListRow / FeatureCard. */
+                       pattern as AppListRow / FeaturedSpotlight rows. */
                     <>
                     <Btn onClick={() => handleAction('enable')} disabled={actionLoading === 'enable'}><Power size={14} /> {i18nT('pages.appDetailPage.enable')}</Btn>
                     {desktopOnly && (

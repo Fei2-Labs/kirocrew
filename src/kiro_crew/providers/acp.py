@@ -27,6 +27,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SESSION_SHARING,
     EVENT_COMPACTION_STATUS,
@@ -487,6 +488,18 @@ class AcpProvider(LLMProvider):
         until someone adds it deliberately.
         """
         return self._client.backend in ACP_BACKENDS_SESSION_SHARING
+
+    @property
+    def uses_kiro_identity_store(self) -> bool:
+        """True when this provider's child signs in from kiro-cli's own store.
+
+        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
+        H5/H14). Declaring it here is what lets the session layer ask the
+        question through the ABC instead of probing private attributes, so an
+        adapted provider is classified by its own declaration rather than by
+        whichever internal shape it happens to expose.
+        """
+        return self._client.backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
 
     async def _start_kiro_runtime(self) -> None:
         """Spawn an AcpRuntime + session; time the kiro cold-start split.
@@ -1217,6 +1230,7 @@ class AcpProvider(LLMProvider):
             server_name=e.server_name,
             oauth_url=e.oauth_url,
             subagents=e.subagents,
+            runtime_global=e.runtime_global,
             sub_session_id=e.sub_session_id,
             is_shell=e.is_shell,
             # Canonical, non-model-authored tool identity (_meta.kiro). The
@@ -1336,6 +1350,11 @@ class AcpProvider(LLMProvider):
         """Delegate a mid-turn steer to the inner client (kiro-cli
         ``_session/steer``). Fire-and-forget; returns False if not steerable."""
         return await self._client.steer(message)
+
+    @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the inner client's last steer (0.0 if never)."""
+        return float(getattr(self._client, "last_steer_monotonic", 0.0) or 0.0)
 
     @property
     def supports_steer(self) -> bool:

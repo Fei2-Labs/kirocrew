@@ -70,9 +70,10 @@ class TestTeamsConfig:
         assert cfg.teams.hard_threshold_pct == 50
         assert cfg.teams.soft_threshold_pct == 50
 
-        # out-of-range values clamped to [0, 100]
+        # out-of-range values clamped to [1, 100] (1 floor: a 0% threshold
+        # would mean "always over")
         tc = TeamsConfig(soft_threshold_pct=-10, hard_threshold_pct=200)
-        assert tc.soft_threshold_pct == 0
+        assert tc.soft_threshold_pct == 1
         assert tc.hard_threshold_pct == 100
 
     def test_app_password_marked_sensitive(self) -> None:

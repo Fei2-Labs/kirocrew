@@ -54,6 +54,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // the Windows titleBarOverlay colors. Separate from setThemeMode because that
   // carries the preference (system/dark/light) while this carries the outcome.
   setTitleBarOverlayTheme: (mode) => ipcRenderer.send("titlebar-overlay-theme", String(mode || "")),
+  // Focus mode: report whether the dashboard header is on screen so the native
+  // macOS traffic lights can follow it. They are AppKit views painted at a window
+  // coordinate, so the renderer cannot hide or move them itself — with the header
+  // collapsed they would sit over the reclaimed content.
+  setFocusModeChrome: (visible) => ipcRenderer.send("focus-mode-chrome", !!visible),
   // Dev mode IPC: renderer signals main process to show/hide DevTools menu item.
   setDevMode: (enabled) => ipcRenderer.send("dev-mode-changed", !!enabled),
   // Windows custom titlebar: menu surfaces render in the dashboard so hover
@@ -84,6 +89,21 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Privacy-pane dialog only if macOS is actually the one saying no. Without
   // this the toast is a dead end: macOS never re-prompts after a denial.
   reportMicDenied: () => ipcRenderer.send("mic:denied"),
+  // Pierre highlight-churn accounting (see src/lib/pierrePerf.ts). Fields are
+  // coerced here because preload is the trust boundary: the main process writes
+  // them into a log line, so a renderer bug must not be able to put an object or
+  // a huge string there. Fire-and-forget — the renderer never waits on a
+  // diagnostic, and the main process drops it entirely unless KIROCREW_DEBUG.
+  reportPierrePerf: (w) =>
+    ipcRenderer.send("pierre-perf", {
+      calls: Number(w && w.calls) || 0,
+      chars: Number(w && w.chars) || 0,
+      keys: Number(w && w.keys) || 0,
+      maxKeysForOneSurface: Number(w && w.maxKeysForOneSurface) || 0,
+      repeatKeyCalls: Number(w && w.repeatKeyCalls) || 0,
+      maxLen: Number(w && w.maxLen) || 0,
+      heapMB: Number(w && w.heapMB) || -1,
+    }),
   // The system-wide summon hotkey as ACTUALLY bound by main.js (registration
   // can degrade to the default or to nothing when a key is taken), so the
   // shortcuts UI advertises what really works. Resolves
@@ -195,4 +215,7 @@ contextBridge.exposeInMainWorld("updateAPI", {
   // Channel switcher (Settings > About): "" follows the build stamp,
   // "insider"|"stable" opts the production app onto that lane.
   setChannel: (channel) => ipcRenderer.invoke("update:set-channel", channel),
+  // Auto-download opt-out (Settings > About). ON by default: a discovered
+  // update downloads in the background and installs on the next quit.
+  setAutoDownload: (enabled) => ipcRenderer.invoke("update:set-auto-download", enabled),
 });

@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+from kiro_crew.messaging.tables import TABLE_POLICY_OFF
 from kiro_crew.messaging.transport import (
     InboundMessage,
     MessagingTransport,
@@ -42,9 +43,18 @@ SLACK_CAPABILITIES = TransportCapabilities(
     edit=True,
     reactions=True,
     files_inbound=True,  # slack/files.py -> messaging/attachments.py ingestion
-    files_outbound=True,  # /api/slack/upload-file external-upload flow
+    # Read by SlackRenderer._uploads_enabled before it extracts local image
+    # references out of a sealed reply and uploads them (slack/files.py ->
+    # files_upload_v2). It is the flag the capability ledger defines, not the
+    # dashboard's /api/slack/upload-file route, which is a human upload flow no
+    # renderer consults: declaring the flag for that route is what made this a
+    # mislabel. Flipping it to False makes the renderer keep printing the
+    # markdown path, which is the honest degradation, never a silent drop.
+    files_outbound=True,
     rich_blocks=True,
     threads=True,
+    # Slack's established format pipeline already flattens tables byte-for-byte.
+    table_mode=TABLE_POLICY_OFF,
     max_message_chars=SLACK_MSG_LIMIT,
     # 10 = the platform cap on a checkboxes element's options[] — the widget
     # Slack actually renders for [OPTIONS:]. The previous 5 was copied from
@@ -108,6 +118,27 @@ class SlackTransport(MessagingTransport):
                 )
             )
         return out
+
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Never consulted -- permits, and says why.
+
+        An override with a reason rather than an inherited default, so a reader
+        does not have to infer this transport's stance. The shared send ladder
+        (``chat_runner._resolve_channel_target``) returns early for
+        ``SLACK_NAMESPACE`` before any transport call: Slack's proactive traffic
+        goes through the gateway's own client and streaming path, which is not
+        registered in ``channel_transports``. Nothing routes here, so there is no
+        decision this method can enforce.
+
+        It could not answer anyway: a Slack link persists a **channel** id
+        (``D…``/``C…``) while the roster holds user ids, so the same
+        conversation-id-is-not-a-principal problem applies. Slack's own proactive
+        paths do their allow-list checks at their own call sites.
+        """
+        return bool(conversation_id)
 
     # -- Inbound adapter ----------------------------------------------------
     def authorize(self, msg: InboundMessage) -> bool:

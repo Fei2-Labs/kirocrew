@@ -122,6 +122,10 @@ export interface LiveStatus {
   agents: Record<string, AgentQueueStatus>
   agents_paused: boolean
   expired: boolean
+  /** Whether a dispatch sent now would be admitted (transcript ingress open).
+   *  Present on the meeting poll (`GET /meetings/{id}`), whose consumer gates
+   *  the microphone on it; absent from the bare `/status` endpoint. */
+  accepting_dispatches?: boolean
 }
 
 export interface Task {

@@ -32,7 +32,11 @@ class TestSpawnRunSessionKeyRouting:
             env.pop("KIROCREW_SESSION_KEY", None)
             env.pop("KIROCREW_HOME", None)  # ensure config_dir() uses patched Path.home()
             with patch.dict("os.environ", env, clear=True):
-                kirocrew_dir = tmp_path / "fake_home" / ".kirocrew"
+                # The gateway writes session_pid files into the data home
+                # (config_dir() -> ~/.kiro/crew), which is where the fallback
+                # reader looks; there is no legacy fallback for these per-boot
+                # runtime files.
+                kirocrew_dir = tmp_path / "fake_home" / ".kiro" / "crew"
                 kirocrew_dir.mkdir(parents=True)
                 (kirocrew_dir / f"session_pid_{os.getppid()}.txt").write_text("sess-from-pid")
 
@@ -86,7 +90,14 @@ class TestSendMessageCronSession:
         monkeypatch.setattr("kiro_crew.mcp_core._vet_channel_governance", lambda _sk, _t: None)
 
     def test_default_notification_only(self):
-        """Non-cron bare send_message(text=...) → no session in payload, notification only."""
+        """Non-cron bare send_message(text=...) → no session in payload, notification only.
+
+        Nothing is forwarded because nothing needs to be: a bare send reaches the
+        in-process dashboard notification, not a channel. The verified identity is
+        forwarded only for a ``channel_type`` send, where it becomes the governance
+        subject at the egress chokepoint, and for a cron, whose key drives the
+        Slack-DM routing default.
+        """
         with patch("kiro_crew.mcp_core._post") as mock_post, patch.dict(
             "os.environ", {"KIROCREW_SESSION_KEY": "dashboard:chat-1"}
         ):

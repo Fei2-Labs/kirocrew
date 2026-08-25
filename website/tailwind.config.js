@@ -5,6 +5,53 @@
  * transform — see the note in `ui/dialog.tsx`.
  */
 import tailwindcssAnimate from 'tailwindcss-animate'
+import tailwindPlugin from 'tailwindcss/plugin'
+
+/* iOS safe-area utilities, emitted locally.
+ *
+ * The dashboard is a standalone-display PWA whose viewport declares
+ * viewport-fit=cover, so on a notched iPhone the web view spans the whole
+ * screen. The shell insets its in-flow chrome once with `p-safe`; every
+ * `fixed` surface escapes that padding and opts in on its own, which
+ * src/test/safeArea.guard.test.ts enforces.
+ *
+ * This was `tailwindcss-safe-area@0.8.0` and is now ~25 lines here instead.
+ * That package's current line is Tailwind v4-only, so a v3 project is pinned
+ * to a terminal 0.8.0 forever -- including its wrong-edge logical utilities
+ * (`me-safe`/`pe-safe`/`end-safe` read safe-area-inset-LEFT for an inline-END
+ * property), which then need their own test banning them. Emitting only the
+ * families this codebase actually uses removes the pin, the ban, and the
+ * dependency in one move; the utility names are identical either way.
+ *
+ * `offset` is env + n (keeps a surface's intended gap ABOVE the inset).
+ * `or` is max(env, n) (a minimum gutter that widens only when there is one).
+ * Both go through matchUtilities, which is what makes an arbitrary value like
+ * `top-safe-offset-[42px]` resolve as well as a spacing-scale step.
+ */
+const EDGES = ['top', 'right', 'bottom', 'left']
+const inset = edge => `env(safe-area-inset-${edge})`
+
+const safeArea = tailwindPlugin(({ addUtilities, matchUtilities, theme }) => {
+  addUtilities({
+    '.p-safe': {
+      paddingTop: inset('top'),
+      paddingRight: inset('right'),
+      paddingBottom: inset('bottom'),
+      paddingLeft: inset('left'),
+    },
+    ...Object.fromEntries(EDGES.map(e => [`.${e}-safe`, { [e]: inset(e) }])),
+  })
+  for (const edge of EDGES) {
+    matchUtilities(
+      { [`${edge}-safe-offset`]: v => ({ [edge]: `calc(${inset(edge)} + ${v})` }) },
+      { values: theme('spacing'), supportsNegativeValues: true },
+    )
+    matchUtilities(
+      { [`${edge}-safe-or`]: v => ({ [edge]: `max(${inset(edge)}, ${v})` }) },
+      { values: theme('spacing') },
+    )
+  }
+})
 
 /** Alpha-aware theme color backed by a CSS variable.
  *
@@ -27,8 +74,24 @@ const withAlpha = (cssVar) => ({ opacityValue }) =>
     : `color-mix(in srgb, var(${cssVar}) calc(${opacityValue} * 100%), transparent)`
 
 /** @type {import('tailwindcss').Config} */
+
+/**
+ * Content sources. The core app is always scanned. When a downstream edition is
+ * composed through the `KIROCREW_EDITION_DIR` seam (see `editionExtensionPlugin`
+ * in vite.config.ts), the edition's OWN sources must be scanned too — otherwise
+ * any utility class used only by edition components (e.g. `z-[95]`) is silently
+ * absent from the generated stylesheet, and the edition UI renders unstyled with
+ * no build error. Gated on the same `KIROCREW_ALLOW_EDITION=1` opt-in as the
+ * vite plugin (which fails the build on a dir without the opt-in), so a stray
+ * env var can never widen the scan of a stock build.
+ */
+const content = ['./index.html', './src/**/*.{ts,tsx}']
+if (process.env.KIROCREW_EDITION_DIR && process.env.KIROCREW_ALLOW_EDITION === '1') {
+  content.push(`${process.env.KIROCREW_EDITION_DIR}/**/*.{ts,tsx}`)
+}
+
 export default {
-  content: ['./index.html', './src/**/*.{ts,tsx}'],
+  content,
   darkMode: ['selector', '[data-theme="dark"]'],
   theme: {
     extend: {
@@ -104,6 +167,17 @@ export default {
         'slide-in-right': { from: { opacity: '0', transform: 'translateX(16px)' }, to: { opacity: '1', transform: 'translateX(0)' } },
         'slide-in-left': { from: { opacity: '0', transform: 'translateX(-16px)' }, to: { opacity: '1', transform: 'translateX(0)' } },
         'scale-in': { from: { opacity: '0', transform: 'scale(.92)' }, to: { opacity: '1', transform: 'scale(1)' } },
+        /* Entrance for the follow-up option chips. The midpoint is explicit
+           because the overshoot is the point: the chip rises past its resting
+           line and settles back, which is what makes a row of them read as
+           arriving rather than blinking into place. Carrying the overshoot in
+           the keyframe rather than only in the easing keeps its size fixed at
+           4px instead of scaling with the travel distance. */
+        'chip-hop': {
+          '0%': { opacity: '0', transform: 'translateY(12px)' },
+          '55%': { opacity: '1', transform: 'translateY(-4px)' },
+          '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
         shimmer: { '0%': { backgroundPosition: '-200% 0' }, '100%': { backgroundPosition: '200% 0' } },
         /* Indeterminate progress: a review that is genuinely at 0% for minutes
            needs to read as working, not stalled. */
@@ -132,6 +206,12 @@ export default {
         'slide-in-right': 'slide-in-right .3s cubic-bezier(.16,1,.3,1) backwards',
         'slide-in-left': 'slide-in-left .25s cubic-bezier(.16,1,.3,1) backwards',
         'scale-in': 'scale-in .2s cubic-bezier(.16,1,.3,1) backwards',
+        /* `backwards` holds the 0% state through the stagger delay, so a chip
+           further down the ladder stays invisible until its turn instead of
+           appearing at rest and then jumping. Under prefers-reduced-motion the
+           delay is zeroed in index.css — the global rule only zeroes duration,
+           and a held 0% state would otherwise keep the chip hidden. */
+        'chip-hop': 'chip-hop .42s cubic-bezier(.34,1.56,.64,1) backwards',
         shimmer: 'shimmer 1.5s ease-in-out infinite',
         blink: 'blink .6s step-end infinite',
         'dot-breathe': 'dot-breathe 2s ease-in-out infinite',
@@ -146,5 +226,5 @@ export default {
       },
     },
   },
-  plugins: [tailwindcssAnimate],
+  plugins: [tailwindcssAnimate, safeArea],
 }

@@ -18,6 +18,7 @@ import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
 import { api } from '../api/client'
 import { PageHeader, Card, Badge, Btn, Input } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
+import { useConfirm } from '../components/ConfirmDialog'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../components/ui/dropdown-menu'
 import ReadingWidthToggle from '../components/ReadingWidthToggle'
 import { useReadingWidth } from '../hooks/useReadingWidth'
@@ -278,6 +279,7 @@ function ArtifactPopoutControl({ slug, name }: { slug: string; name: string }) {
 export default function ArtifactDetailPage({ popout = false }: { popout?: boolean } = {}) {
   const { slug = '' } = useParams<{ slug: string }>()
   const navigate = useNavigate()
+  const { confirm, confirmDialog, confirmOpen } = useConfirm()
   // Claimed once from the library's "New Artifact" action, which creates the
   // document empty and hands it over here. Two behaviours hang off it: the editor
   // opens focused (so the user starts typing rather than hunting for an Edit
@@ -693,13 +695,16 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     }
   }, [justCreatedBlank, queryClient])
 
-  const cancelEditing = useCallback(() => {
-    if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+  const cancelEditing = useCallback(async () => {
+    if (dirty && !(await confirm({
+      title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+      confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+    }))) return
     setEditing(false)
     setEditedContent('')
     setSaveError(null)
     setPreviewDuringEdit(false)
-  }, [dirty])
+  }, [dirty, confirm])
 
   const handleSave = useCallback(async (snapshot = false) => {
     if (!artifact || !dirty) return
@@ -814,6 +819,12 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   useEffect(() => {
     if (!editing) return
     const h = (e: KeyboardEvent) => {
+      // While the discard-confirm dialog is open, the keyboard belongs to it.
+      // Escape dismisses it via the dialog's own handler (re-running the guard
+      // here would re-open the dialog the same keystroke just closed), and the
+      // save shortcut must not fire — a mid-dialog Cmd+S would persist the very
+      // draft the user is about to confirm discarding.
+      if (confirmOpen) return
       if ((e.metaKey || e.ctrlKey) && e.key === 's' && dirty) {
         e.preventDefault()
         // Cmd+Shift+S → snapshot (creates a new version), Cmd+S → silent save.
@@ -823,7 +834,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)
-  }, [editing, dirty, cancelEditing])
+  }, [editing, dirty, cancelEditing, confirmOpen])
 
   // Tell the WS transport this artifact is being edited, so a live
   // `artifact_update` does not refetch the content out from under the editor and
@@ -1467,11 +1478,11 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               value={nameDraft}
               aria-label={i18nT('pages.artifactDetailPage.artifact_name')}
               onChange={(e) => setNameDraft(e.target.value)}
-              onBlur={commitRename}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') { e.preventDefault(); void commitRename() }
-                else if (e.key === 'Escape') { e.preventDefault(); setRenaming(false) }
-              }}
+              {...ime.bindEnter({
+                onEnter: () => void commitRename(),
+                onEscape: () => setRenaming(false),
+                onBlur: () => void commitRename(),
+              })}
               className="px-2 py-0.5 text-2xl font-bold tracking-tight text-text-strong w-full max-w-[36rem]"
             />
           ) : (
@@ -1489,8 +1500,11 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         />
         <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
           {!popout && (
-            <Btn onClick={() => {
-              if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+            <Btn onClick={async () => {
+              if (dirty && !(await confirm({
+                title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+                confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+              }))) return
               navigate('/artifacts')
             }} className="flex items-center gap-1">
               <ArrowLeft size={13} /> {i18nT('pages.artifactDetailPage.back')}
@@ -1573,9 +1587,9 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
                 if (e.key === ',' || e.key === ' ') {
                   // Space cycles IME candidates mid-composition; committing here
                   // would post the composing buffer and kill candidate selection.
-                  if (ime.isComposing(e)) return
-                  e.preventDefault()
-                  if (newTag.trim()) addTag(newTag)
+                  // The claim is key-agnostic: it consumes the separator only
+                  // when the IME is not itself using the keypress.
+                  if (ime.claimEnter(e) && newTag.trim()) addTag(newTag)
                 }
                 if (e.key === 'Escape') { ime.reset(); setNewTag(''); setAddingTag(false) }
               }}
@@ -1587,7 +1601,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               })}
               autoFocus
               placeholder={i18nT('pages.artifactDetailPage.tag')}
-              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none"
+              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none focus-ring"
               style={{ width: '90px' }}
               aria-label={i18nT('pages.artifactDetailPage.add_a_tag')}
             />
@@ -1617,8 +1631,11 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               options={versionOptions}
               optionLabels={versionOptionLabels}
               value={selectedVersion === null ? 'live' : String(selectedVersion)}
-              onChange={(raw) => {
-                if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+              onChange={async (raw) => {
+                if (dirty && !(await confirm({
+                  title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+                  confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+                }))) return
                 setEditing(false)
                 setEditedContent('')
                 if (raw === 'live') {
@@ -2021,6 +2038,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
           />
         </div>
       </div>
+      {confirmDialog}
     </>
   )
 }

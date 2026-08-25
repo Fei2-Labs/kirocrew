@@ -1,5 +1,32 @@
 """Representative fixtures for adapter + blast-radius tests."""
 
+import os
+import tempfile
+
+
+def _symlinks_creatable() -> bool:
+    """Whether this platform lets an unprivileged process create a symlink.
+
+    Windows grants SeCreateSymbolicLinkPrivilege only to an administrator or a
+    Developer Mode account, so on such a host the planted-link tests cannot even
+    stage their attack. The guard those tests cover runs everywhere -- only
+    staging the plant is privileged.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        probe = os.path.join(d, "probe")
+        try:
+            os.symlink(d, probe)
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+#: Gate for every test that stages a planted symlink. Probed once per process;
+#: importing modules decorate classes and functions at definition time, so this
+#: must be a plain constant rather than a fixture.
+SYMLINKS_OK = _symlinks_creatable()
+
+
 # A sensitive file (gateway/lifecycle) with a guard removal + an import add,
 # plus a small non-sensitive file — the blast-radius signal fixture.
 _SERVER_DIFF = """--- a/src/kiro_crew/gateway/server.py

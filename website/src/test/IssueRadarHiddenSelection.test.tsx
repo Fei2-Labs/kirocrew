@@ -95,7 +95,8 @@ describe('detail pane when the selection is hidden by a filter', () => {
 
     await waitFor(() =>
       expect(screen.getByText(/hidden by the active filters/i)).toBeInTheDocument())
-    // NOT the empty-app placeholder.
+    // NOT the empty-app placeholder. On GitHub that sentence is unchanged by the
+    // multi-provider work; Azure DevOps has its own (see `emptyDetailKey`).
     expect(screen.queryByText('Select an issue to see its details.')).toBeNull()
 
     // Clearing the filter brings the selection back.

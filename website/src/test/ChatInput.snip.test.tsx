@@ -2,26 +2,33 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, fireEvent } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 
-// Toggle capture-support + mobile per test.
-const h = vi.hoisted(() => ({ supported: true, mobile: false }))
+// Toggle capture support and input capability per test.
+const h = vi.hoisted(() => ({ supported: true, mobile: false, touch: false }))
 vi.mock('../hooks/useScreenSnip', () => ({ isScreenSnipSupported: () => h.supported }))
 vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => h.mobile }))
+vi.mock('../utils/isTouchDevice', () => ({ isTouchDevice: () => h.touch }))
 vi.mock('../api/client', () => ({ api: new Proxy({}, { get: () => vi.fn() }) }))
 
 import ChatInput from '../components/ChatInput'
 
-// Screenshot lives inside the "+" drop-up menu ("Add files & options"),
-// which renders only when onUploadFiles is provided (ChatPage always passes both).
 const base = { value: '', onChange: vi.fn(), onSend: vi.fn(), onUploadFiles: vi.fn() }
 const openPlusMenu = () => fireEvent.click(screen.getByTitle('Add files & options'))
 const snipItem = () => screen.queryByRole('button', { name: /screenshot/i })
 
+function expectDirectFilePicker(container: HTMLElement) {
+  const fileInput = screen.getByLabelText('Attach files', { selector: 'input[type="file"]' })
+  const picker = container.querySelector('label[aria-label="Attach files"]')
+  expect(picker).toHaveAttribute('for', fileInput.id)
+  expect(container.querySelector('button[title="Add files & options"]')).toBeNull()
+}
+
 beforeEach(() => {
   h.supported = true
   h.mobile = false
+  h.touch = false
 })
 
-describe('ChatInput screenshot action (in + menu)', () => {
+describe('ChatInput screenshot action', () => {
   it('shows Screenshot in the + menu and fires onScreenshot when screen capture is supported', () => {
     const onScreenshot = vi.fn()
     renderWithProviders(<ChatInput {...base} onScreenshot={onScreenshot} isMac={false} />)
@@ -46,10 +53,17 @@ describe('ChatInput screenshot action (in + menu)', () => {
     expect(snipItem()).toBeNull()
   })
 
-  it('hides Screenshot on mobile even when capture is supported', () => {
+  it('uses the accessible direct file picker on mobile instead of Screenshot', () => {
     h.mobile = true
-    renderWithProviders(<ChatInput {...base} onScreenshot={vi.fn()} isMac={true} />)
-    openPlusMenu()
+    const { container } = renderWithProviders(<ChatInput {...base} onScreenshot={vi.fn()} isMac={true} />)
+    expectDirectFilePicker(container)
+    expect(snipItem()).toBeNull()
+  })
+
+  it('uses the accessible direct file picker on touch devices', () => {
+    h.touch = true
+    const { container } = renderWithProviders(<ChatInput {...base} onScreenshot={vi.fn()} isMac={true} />)
+    expectDirectFilePicker(container)
     expect(snipItem()).toBeNull()
   })
 })

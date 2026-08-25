@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import config_dir, read_local_secret
 from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.github_runner import prevalidated_gh_env
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import (
@@ -197,6 +198,36 @@ def _kill_proc_group(proc: subprocess.Popen) -> None:
         proc.kill()
     except Exception:
         pass
+
+
+def _drain_after_kill(proc: subprocess.Popen, job_id: str | None) -> None:
+    """Reap a SIGKILLed child's pipes without leaking fds or hijacking the result.
+
+    ``communicate(timeout=5)`` can ITSELF raise ``TimeoutExpired``: the child
+    outlived the group kill (uninterruptible I/O, or no pgid resolved so only
+    ``proc.kill()`` was tried), or another process inherited the write end of
+    the pipe and holds it open, so EOF never arrives. Waiting longer cannot help
+    once SIGKILL has been sent, and the caller has already decided the outcome —
+    so swallow that one exception rather than letting it displace the caller's
+    ``raise`` / ``return``. Closing the pipes has to happen either way:
+    ``Popen._communicate`` closes them as a side effect of reaching EOF, which
+    is exactly the path not taken here, and nothing else ever closes them.
+    """
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Post-kill drain timed out (5s) for cron %s (pid %s); the child "
+            "outlived SIGKILL or another process holds the pipe — closing pipes",
+            job_id, proc.pid,
+        )
+    finally:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
 
 if TYPE_CHECKING:
@@ -684,6 +715,12 @@ def run_script_sandboxed(
         # The child must dial the gateway the credential above was minted for:
         # same dial_port, resolved once above, not a second resolution here.
         clean_env["_KIROCREW_DIAL_PORT"] = str(dial_port)
+        # Pre-resolve gh OUTSIDE the sandbox and pin its identity for the
+        # child: the sandbox's single-uid user namespace maps every root-owned
+        # path component to the overflow uid, so the child's own ownership
+        # walk refuses ANY gh on the host. Empty when the host has no usable
+        # gh -- scripts that never call gh are unaffected either way.
+        clean_env.update(prevalidated_gh_env())
 
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         proc = popen_limited(
@@ -698,7 +735,7 @@ def run_script_sandboxed(
                 # Popen.communicate does not kill the child on timeout
                 # (unlike subprocess.run) — clean up before re-raising.
                 _kill_proc_group(proc)
-                proc.communicate(timeout=5)
+                _drain_after_kill(proc, job_id)
                 raise
         finally:
             cancelled = _unregister_proc(job_id, proc)
@@ -706,8 +743,25 @@ def run_script_sandboxed(
             return {"status": "cancelled", "error": "Cancelled by user"}
 
         if proc.returncode != 0 and not stdout.strip():
-            error_text = stderr[:500] or f"exit {proc.returncode}"
-            error_text = redact(error_text)
+            # Report the TERMINAL stderr context, not the head. A process that
+            # dies hard leaves its diagnosis LAST -- the traceback is the final
+            # thing written -- while whatever a startup path logged first (a
+            # data-home migration warning, a deprecation notice, an import
+            # banner) sits in front of it. Bounding from the head therefore
+            # reports the noise and truncates the cause, and the operator reads
+            # a cron failure whose message describes something that did not kill
+            # the job.
+            #
+            # ``rstrip`` first so a trailing newline does not spend part of the
+            # budget, and so an all-whitespace stderr still falls through to the
+            # exit-code fallback rather than reporting blank text.
+            #
+            # Redact the WHOLE stream before bounding: slicing first would cut
+            # a credential that straddles the 500-char boundary in half, and
+            # ``redact`` cannot recognise the surviving fragment, so it would
+            # reach logs and the persisted ``last_error`` unmasked.
+            tail = redact(stderr.rstrip())
+            error_text = tail[-500:] if tail else f"exit {proc.returncode}"
             return {"status": "error", "error": error_text}
 
         try:
@@ -715,7 +769,10 @@ def run_script_sandboxed(
         except (json.JSONDecodeError, IndexError):
             return {
                 "status": "error",
-                "error": f"Bad output: {redact(stdout[:200])}",
+                # Redact the complete stdout BEFORE truncating: slicing first
+                # could cut a credential at the boundary, leaving its unredacted
+                # head in the diagnostic.
+                "error": f"Bad output: {redact(stdout)[:200]}",
             }
     except subprocess.TimeoutExpired:
         return {"status": "error", "error": f"Script timed out after {timeout}s"}
@@ -893,7 +950,7 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
                 output, stderr_out = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 _kill_proc_group(proc)
-                proc.communicate(timeout=5)
+                _drain_after_kill(proc, job_id)
                 return {"status": "error", "output": f"❌ Command timed out after {timeout}s", "exit_code": -1}
         finally:
             if job_id:
@@ -905,7 +962,13 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
         if proc.returncode != 0:
             output = f"⚠️ Exit code {proc.returncode}\n\n{output}"
             if stderr_out:
-                output += f"\n\nstderr:\n{stderr_out[:1000]}"
+                # A command that dies hard leaves its diagnosis last: report the
+                # stderr tail, not the head, so a chatty startup warning can't
+                # displace the terminal error. Redact the complete stderr BEFORE
+                # truncating: slicing first could cut off a credential's
+                # detectable prefix (e.g. the scheme of a token-bearing URL),
+                # letting the raw secret tail through redaction.
+                output += f"\n\nstderr:\n{redact(stderr_out.rstrip())[-1000:]}"
         return {
             "status": "ok" if proc.returncode == 0 else "error",
             "output": output,

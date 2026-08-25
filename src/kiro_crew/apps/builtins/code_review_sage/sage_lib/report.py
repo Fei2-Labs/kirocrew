@@ -17,7 +17,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,22 +39,22 @@ except ImportError:  # pragma: no cover - standalone fallback
 _RISK_W = {"low": 0, "medium": 35, "high": 60}
 _BLAST_W = {"SMALL": 0, "MEDIUM": 25, "LARGE": 40}
 
-# LLM-authored free-text fields. These are model output and must never be
-# surfaced raw: the dashboard reads the local rows.json / focus-report.html this
-# module writes DIRECTLY (no redaction in between), so we scrub here. Per
-# untrusted-LLM-output guidance ("should not be trusted at all") + the security-controls
-# guideline (scan with redact_exfiltration_urls + redact_credentials before any
-# external surface). The artifact-archive path also redacts; this closes the
-# local-file gap. ``pipeline._redact`` is a no-op when the redaction lib is
-# unavailable (standalone), so this is safe everywhere.
-_LLM_ROW_FIELDS = ("problem", "why_it_matters", "solution_assessment", "rationale")
-
 # Nesting depth past which a value is stringified rather than walked. The record
 # is worker-written JSON, so depth is attacker-chosen; recursing without a bound
 # turns a deep payload into a RecursionError on the report path.
 _REDACT_MAX_DEPTH = 6
 
 
+# Why the helpers below exist at all: the strings a worker and the reviewing model
+# write reach three local artifacts this module produces -- focus-report.html,
+# rows.json and report.json -- with nothing between `build_report` and the file, so
+# the scrub happens here. Per untrusted-LLM-output guidance ("should not be trusted
+# at all") plus the security-controls guideline (scan with redact_exfiltration_urls
+# AND redact_credentials before any external surface). `read_report` redacts AGAIN on
+# the way out, because the reports dir is writable by that worker, and the
+# artifact-archive path redacts too. ``pipeline._redact`` is a no-op when the
+# redaction lib is unavailable (standalone), so these calls are safe to make
+# everywhere.
 def _redact_deep(value: object, skip: frozenset[str] = frozenset(),
                  _depth: int = 0) -> object:
     """Redact every string inside `value` -- keys and values, at any depth --
@@ -800,19 +799,18 @@ def _atomic_write(path: Path, text: str) -> None:
 
     The reports dir is reachable by the review worker, so any of these output
     names can be a planted symlink; `write_text` would follow it and overwrite
-    the linked file, and the `os.chmod` after it would follow it too. Staging a
+    the linked file, and the lockdown after it would follow it too. Staging a
     private temp file in the same directory and renaming over the name swaps the
     NAME without following a link, so a plant is destroyed rather than honoured.
     Mirrors `learning.py:_atomic_write`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    fd, tmp = store.open_locked_temp(path.parent)
     try:
         try:
             os.write(fd, text.encode("utf-8"))
         finally:
             os.close(fd)  # always close the fd, even if os.write raised
-        os.chmod(tmp, 0o600)  # 0600 before it takes the real name, not after
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):

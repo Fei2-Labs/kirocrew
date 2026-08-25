@@ -1,10 +1,14 @@
 import { describe, it, expect } from 'vitest'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import {
   formatBytes,
   ownerOf,
   summarizeBundle,
   renderReport,
   diffSummaries,
+  loadBundleSummary,
 } from '../../scripts/lib/bundleReport.mjs'
 
 describe('formatBytes', () => {
@@ -185,5 +189,52 @@ describe('diffSummaries', () => {
     const s = summarizeBundle(bundleFixture())
     expect(diffSummaries(s, s).owners).toEqual([])
     expect(diffSummaries(s, s).chunkBytesDelta).toBe(0)
+  })
+})
+
+describe('loadBundleSummary', () => {
+  // The shared on-disk contract used by both check-bundle-size.mjs and
+  // bundle-report.mjs -- returns errors, never exits.
+  function withDir(fn: (dir: string) => void) {
+    const dir = mkdtempSync(path.join(tmpdir(), 'bundle-load-'))
+    try {
+      fn(dir)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  it('returns code missing for an absent file, appending the caller hint', () => {
+    withDir((dir) => {
+      const res = loadBundleSummary(path.join(dir, 'nope.json'), { hint: 'Run the analyze build.' })
+      expect(res.error?.code).toBe('missing')
+      expect(res.error?.message).toContain('No bundle report')
+      expect(res.error?.message).toContain('Run the analyze build.')
+    })
+  })
+
+  it('returns code invalid for unparseable JSON, a non-object, and a wrong version', () => {
+    withDir((dir) => {
+      const file = path.join(dir, 'bundle-report.json')
+      writeFileSync(file, '{nope')
+      expect(loadBundleSummary(file).error?.code).toBe('invalid')
+      writeFileSync(file, '"just a string"')
+      expect(loadBundleSummary(file).error?.code).toBe('invalid')
+      writeFileSync(file, JSON.stringify({ version: 2, chunks: [] }))
+      const res = loadBundleSummary(file)
+      expect(res.error?.code).toBe('invalid')
+      expect(res.error?.message).toContain('version 2')
+    })
+  })
+
+  it('returns the parsed summary for a valid v1 report', () => {
+    withDir((dir) => {
+      const file = path.join(dir, 'bundle-report.json')
+      writeFileSync(file, JSON.stringify({ version: 1, chunks: [{ fileName: 'assets/a-abc123.js', size: 10 }] }))
+      const res = loadBundleSummary(file)
+      expect(res.error).toBeUndefined()
+      expect(res.summary?.version).toBe(1)
+      expect(res.summary?.chunks).toHaveLength(1)
+    })
   })
 })

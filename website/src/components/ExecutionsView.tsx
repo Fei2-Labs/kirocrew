@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ChevronRight } from 'lucide-react'
 import { api } from '../api/client'
 import { Badge, Btn, Skeleton } from './ui'
-import { useAppSelector } from '../store'
+import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateTimeNumeric, fmtDuration as fmtDurationParts, fmtUnit } from '../i18n/format'
@@ -32,16 +32,14 @@ const fmtTime = (ts: number) => fmtDateTimeNumeric(ts)
 export default function ExecutionsView({ selectedJobId }: { selectedJobId?: string }) {
   const [page, setPage] = useState(0)
   const [expanded, setExpanded] = useState<string | null>(null)
-  const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
-
   const { data: jobsData } = useQuery({
-    queryKey: ['cron-jobs', refreshTrigger],
+    queryKey: ['cron-jobs'],
     queryFn: () => api.crons().then(r => r.jobs || []),
   })
   const jobIds = new Set((jobsData || []).map((j: { id: string }) => j.id))
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['cron-history-all', page, selectedJobId, refreshTrigger],
+    queryKey: ['cron-history-all', page, selectedJobId],
     queryFn: async () => {
       const res = await api.cronHistoryAll({ offset: page * PAGE_SIZE, limit: PAGE_SIZE + 1, jobId: selectedJobId })
       const items: HistoryEntry[] = res.runs || []
@@ -59,7 +57,7 @@ export default function ExecutionsView({ selectedJobId }: { selectedJobId?: stri
   }
 
   if (isLoading) return <div className="flex justify-center py-12"><Skeleton className="h-6 w-32 rounded" /></div>
-  if (error) return <div className="text-danger text-sm text-center py-8">{error instanceof Error ? error.message : i18nT('components.executionsView.failed_to_load')}</div>
+  if (error) return <div className="py-8 flex justify-center"><ErrorNotice message={error instanceof Error ? error.message : i18nT('components.executionsView.failed_to_load')} askAgent /></div>
   if (entries.length === 0) return <div className="text-muted text-sm text-center py-12">{i18nT('components.executionsView.no_execution_history_yet')}</div>
 
   return (

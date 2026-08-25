@@ -304,12 +304,40 @@ describe('useMeetingSession preset selection', () => {
 })
 
 describe('useMeetingSession transcription binding', () => {
-  it('starts the microphone when the meeting is active', async () => {
-    apiMocks.meeting.mockResolvedValue({ meta: meta({ status: 'active' }), live: null })
+  it('starts the microphone when the meeting is active and ingress is open', async () => {
+    apiMocks.meeting.mockResolvedValue({
+      meta: meta({ status: 'active' }),
+      live: { accepting_dispatches: true },
+    })
     await mountLoaded()
 
     await waitFor(() => expect(stt.start).toHaveBeenCalled())
     expect(stt.stop).not.toHaveBeenCalled()
+  })
+
+  it('keeps the microphone closed while the server holds ingress shut', async () => {
+    // `POST /start` persists `active` before initializing agents, and every
+    // dispatch in that window 409s — the poll says so via
+    // `accepting_dispatches: false`, and the mic must believe it or early
+    // finals burn the retry schedule and are lost.
+    apiMocks.meeting.mockResolvedValue({
+      meta: meta({ status: 'active' }),
+      live: { accepting_dispatches: false },
+    })
+    const view = await mountLoaded()
+    await waitFor(() => expect(view.result.current.status).toBe('active'))
+
+    expect(stt.start).not.toHaveBeenCalled()
+  })
+
+  it('keeps the microphone closed when the meeting is active with no live session', async () => {
+    // `active` on disk with `live: null` (a gateway restart dropped the
+    // session) means a dispatch CANNOT land; unknown must read as not-ready.
+    apiMocks.meeting.mockResolvedValue({ meta: meta({ status: 'active' }), live: null })
+    const view = await mountLoaded()
+    await waitFor(() => expect(view.result.current.status).toBe('active'))
+
+    expect(stt.start).not.toHaveBeenCalled()
   })
 
   it('stops the microphone when the meeting is not active', async () => {
@@ -323,7 +351,10 @@ describe('useMeetingSession transcription binding', () => {
 
   it('restarts a socket that dropped while the meeting stayed active', async () => {
     stt.active = true
-    apiMocks.meeting.mockResolvedValue({ meta: meta({ status: 'active' }), live: null })
+    apiMocks.meeting.mockResolvedValue({
+      meta: meta({ status: 'active' }),
+      live: { accepting_dispatches: true },
+    })
     const view = await mountLoaded()
     await waitFor(() => expect(view.result.current.status).toBe('active'))
     expect(stt.start).not.toHaveBeenCalled()

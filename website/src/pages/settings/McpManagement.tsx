@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
-import { AlertTriangle, ExternalLink, Gauge, ListChecks, Server as ServerIcon } from 'lucide-react'
+import { AlertTriangle, ExternalLink, Gauge, ListChecks, RefreshCw, Server as ServerIcon } from 'lucide-react'
 import {
   api,
+  ApiError,
   type McpManagedServer,
   type McpMeasureProgress,
   type McpShareRecommendation,
@@ -95,11 +96,13 @@ const STRENGTH_LABEL_KEY: Record<string, string> = {
 const REASON_LABEL_KEY: Record<string, string> = {
   observed_hazard: 'pages.mcpManagement.assessment.reason_observed_hazard',
   not_stdio: 'pages.mcpManagement.assessment.reason_not_stdio',
-  first_party_session_scoped: 'pages.mcpManagement.assessment.reason_first_party',
+  session_bound_by_construction:
+    'pages.mcpManagement.assessment.reason_session_bound_by_construction',
   rotating_secret_env: 'pages.mcpManagement.assessment.reason_rotating_secret_env',
   not_probed: 'pages.mcpManagement.assessment.reason_not_probed',
-  per_client_capability: 'pages.mcpManagement.assessment.reason_per_client_capability',
-  caller_sensitive_initialize: 'pages.mcpManagement.assessment.reason_caller_sensitive',
+  degrades_when_shared: 'pages.mcpManagement.assessment.reason_degrades_when_shared',
+  handshake_not_reproducible:
+    'pages.mcpManagement.assessment.reason_handshake_not_reproducible',
   declares_caller_identity: 'pages.mcpManagement.assessment.reason_declares_caller_identity',
   all_tools_read_only: 'pages.mcpManagement.assessment.reason_all_tools_read_only',
   preflight_passed: 'pages.mcpManagement.assessment.reason_preflight_passed',
@@ -110,17 +113,63 @@ const REASON_LABEL_KEY: Record<string, string> = {
 }
 
 /**
+ * The states a row can be in, as a closed set.
+ *
+ * Deliberately NOT the i18n keys. Every reader other than the label itself asks
+ * "is this row shared" or "was it declined", and comparing against a catalog key
+ * makes that question depend on a string that lives in 13 JSON files: rename the
+ * key and `!== 'pages.mcpManagement.state_shared'` quietly becomes "never shared",
+ * which silently drops the accent colour, the sharing-without-support warning and
+ * the assessment count with nothing for `tsc` to catch. This PR renamed one of
+ * these keys once already. A discriminant makes the same mistake a type error.
+ */
+type McpRowState = 'no_stub' | 'direct_env' | 'shared' | 'stub' | 'direct'
+
+const STATE_LABEL_KEY: Record<McpRowState, string> = {
+  no_stub: 'pages.mcpManagement.state_no_stub',
+  direct_env: 'pages.mcpManagement.state_direct_env',
+  shared: 'pages.mcpManagement.state_shared',
+  stub: 'pages.mcpManagement.state_stub',
+  direct: 'pages.mcpManagement.state_direct',
+}
+
+/**
  * What the server is running as, as ONE function used by both sub-views.
  *
  * The assessment table has to name the current state to be able to show it
  * disagreeing with the verdict, and two copies of this mapping would be free to
  * drift into saying different things about the same row.
+ *
+ * This is the SOLE derivation of a row's state. The chip's text, the chip's
+ * colour, the per-row note and the sharing-without-support warning all read its
+ * answer instead of recomputing their own, because a second spelling of any of
+ * these states is the defect this change exists to remove: one copy gets corrected
+ * and the other keeps saying `shared`.
  */
-function stateLabelKey(s: McpManagedServer, sharingOn: boolean): string {
-  if (!s.can_stub) return 'pages.mcpManagement.state_no_stub'
-  if (s.stub && sharingOn) return 'pages.mcpManagement.state_shared'
-  if (s.stub) return 'pages.mcpManagement.state_stub'
-  return 'pages.mcpManagement.state_direct'
+function rowState(s: McpManagedServer, sharingOn: boolean): McpRowState {
+  if (!s.can_stub) return 'no_stub'
+  // The rewriter's decision outranks allowlist membership and the global switch,
+  // but only for a row the operator opted IN, because that is the only row whose
+  // state would otherwise be reported as shared.
+  //
+  // The state is `direct`, not a fourth thing: on this branch the rewriter passes
+  // the ORIGINAL spec through and never reaches `_build_stub_entry`, so no stub is
+  // created and the session launches the server itself -- which is what `direct`
+  // means everywhere else on this page. `(env)` marks WHY an opted-in server ended
+  // up there, and is the only part that is new.
+  //
+  // Scoped to the ENV obstacle on purpose: the rewriter also declines when it
+  // cannot resolve the command, and the row payload carries no signal for that, so
+  // such a row still reads `shared`. Naming it here would be a claim this data
+  // cannot support -- it belongs with the backend-computed-state follow-up.
+  //
+  // A row the operator did NOT opt in reads plain `direct`: there the field is
+  // forward-looking ("stubbing this would still not pool it"), which the batch
+  // action uses as a skip reason, and nothing has been declined yet to explain.
+  if (s.stub && s.pooling_blocked_by_env === true) return 'direct_env'
+  if (s.stub && sharingOn) return 'shared'
+  if (s.stub) return 'stub'
+  return 'direct'
 }
 
 /** Evidence tiers that argue AGAINST sharing, as opposed to merely not endorsing it.
@@ -148,9 +197,18 @@ const CONTRARY_STRENGTHS = new Set(['refuted', 'disqualified'])
  *     only coloured signal on the page.
  *
  * Both of those are quiet. What speaks is `refuted` or `disqualified`.
+ *
+ * A row the rewriter declined to stub is not sharing at all, so it cannot be
+ * sharing-without-support however damning its evidence is. That exclusion is not
+ * spelled here: this asks `rowState` whether the row's state IS `shared`,
+ * because a second spelling of "is sharing right now" is the same mistake as the
+ * colour that used to disagree with the label -- one copy gets a new state added
+ * to it and the other does not. Reading the label fixes both readers at once: the
+ * warning icon on the row and the count the assessment view sends the operator
+ * over to find.
  */
 function sharedWithoutSupport(s: McpManagedServer, sharingOn: boolean): boolean {
-  if (!(s.stub && sharingOn)) return false
+  if (rowState(s, sharingOn) !== 'shared') return false
   const rec = s.recommendation
   if (!rec) return false
   return CONTRARY_STRENGTHS.has(rec.strength)
@@ -307,7 +365,7 @@ function AssessmentRow({
       <td className="px-4 py-3 align-top text-right">
         <span
           className={[
-            'inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-mono text-[11px]',
+            'inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 font-mono text-[11px]',
             unsupported
               ? 'border border-[var(--danger)] text-[var(--danger)]'
               : 'border border-[var(--border)] text-[var(--muted)]',
@@ -318,7 +376,7 @@ function AssessmentRow({
               to a screen reader because the row's Assessment cell already states
               the verdict in words. */}
           {unsupported && <AlertTriangle size={11} aria-hidden="true" />}
-          {i18nT(stateLabelKey(server, sharingOn))}
+          {i18nT(STATE_LABEL_KEY[rowState(server, sharingOn)])}
         </span>
       </td>
     </tr>
@@ -567,6 +625,13 @@ function AssessmentView({
         <div className="border-t border-[var(--border)] px-4 py-3 text-[12.5px] leading-relaxed text-[var(--muted)]">
           {i18nT('pages.mcpManagement.assessment.legend')}
         </div>
+        {/* This view renders the same state chips through the same derivation, so a
+            term defined only under the OTHER tab is undecodable to the operator
+            auditing sharing here -- which is this fix's whole audience. ONE key,
+            rendered wherever the chip can appear, in its own block on both tabs. */}
+        <div className="border-t border-[var(--border)] px-4 py-3 text-[12.5px] leading-relaxed text-[var(--muted)]">
+          {i18nT('pages.mcpManagement.state_direct_env_legend')}
+        </div>
       </section>
     </div>
   )
@@ -576,6 +641,15 @@ export function McpManagement() {
   const qc = useQueryClient()
   const [confirmSharing, setConfirmSharing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Pending-effect information, kept separate from `error` so a stub change that
+  // needs a restart is not painted as a failure. Distinct from the enable-all
+  // `notice` below, which is that control's own inline hint rather than a
+  // page-level statement about the gateway.
+  const [restartNotice, setRestartNotice] = useState<string | null>(null)
+  // A third state rather than a reuse of either sibling above: `notice` reports a
+  // stub-set change and `restartNotice` reports a pending restart, and one banner
+  // shared by unrelated actions would let either overwrite the other's result.
+  const [resolveNotice, setResolveNotice] = useState<string | null>(null)
 
   const statusQ = useQuery<GatewayStatus>({
     queryKey: ['mcpGatewayStatus'],
@@ -613,12 +687,16 @@ export function McpManagement() {
     mutationFn: ({ name, stub }: { name: string; stub: boolean }) =>
       api.mcpGatewaySetStub(name, stub),
     // A 200 means the config was persisted, NOT that the broker reached the
-    // wanted state: a failed start still answers 200 with `applied: false`.
-    // Reporting that as success would draw a live-looking switch over routing
-    // that never came up.
+    // wanted state. A stub change is never applied in place -- the daemon's
+    // routing is built with the agent-spec rewrite at startup -- so the normal
+    // outcome is `restart_required`, which is pending information rather than a
+    // failure. `applied: false` with no restart hint is the real fault case:
+    // the gateway never wired the apply callback, so nothing was recorded.
     onSuccess: res => {
       invalidate()
-      if (res && res.applied === false) {
+      if (res && res.restart_required) {
+        setRestartNotice(i18nT('pages.mcpManagement.stub_restart_required'))
+      } else if (res && res.applied === false) {
         setError(i18nT('pages.mcpManagement.stub_not_live'))
       }
     },
@@ -636,6 +714,61 @@ export function McpManagement() {
       }
     },
     onError: onApplyError('pages.mcpManagement.sharing_failed'),
+  })
+
+  // Pre-resolving an npm-launcher server lets its launch exec the installed
+  // tree, so session start does no dependency resolution. The timed pass keeps
+  // an unpinned spec current on its own; this is the operator asking to check
+  // upstream now, so it reports what the pass produced rather than only that it
+  // ran. A 409 means a pass is already in flight, which is information, not a
+  // failure to retry.
+  const resolveRefresh = useMutation({
+    mutationFn: () => api.mcpResolveRefresh(),
+    onSuccess: res => {
+      invalidate()
+      if (!res.ok) {
+        // Not an error: the operator has nothing routed, which is the same class
+        // of fact the sharing card states as plain text rather than as an alarm.
+        setResolveNotice(i18nT('pages.mcpManagement.resolve_no_targets'))
+        return
+      }
+      const ready = res.ready?.length ?? 0
+      // `ready === 0` has two causes that must NOT read the same. Everything was
+      // already fresh (nothing to do), or every install failed -- a registry
+      // outage, a rejected token. Reporting the second as "nothing needed" tells
+      // someone who just pressed this button that launches now skip the network
+      // when not one of them does. The per-package outcome is already in the
+      // response; count it rather than inferring from `ready` alone.
+      const failed = Object.values(res.resolved ?? {}).filter(state => state === 'error').length
+      if (failed > 0) {
+        setResolveNotice(
+          ready > 0
+            ? i18nT('pages.mcpManagement.resolve_partly_ready', {
+                ready: String(ready),
+                failed: String(failed),
+              })
+            : i18nT('pages.mcpManagement.resolve_all_failed', { failed: String(failed) }),
+        )
+        return
+      }
+      setResolveNotice(
+        ready > 0
+          ? i18nT('pages.mcpManagement.resolve_ready', { ready: String(ready) })
+          : i18nT('pages.mcpManagement.resolve_none_ready'),
+      )
+    },
+    onError: err => {
+      invalidate()
+      // 409 is the endpoint reporting an in-flight pass, which it deliberately
+      // encodes as information rather than a failure to retry. Painting it as
+      // "could not pre-resolve" contradicts the state the response carries: the
+      // pass the second tab is being told about is running fine.
+      if (err instanceof ApiError && err.status === 409) {
+        setResolveNotice(i18nT('pages.mcpManagement.resolve_already_running'))
+        return
+      }
+      setError(i18nT('pages.mcpManagement.resolve_failed'))
+    },
   })
 
   const busy = setStub.isPending || setSharing.isPending
@@ -666,8 +799,21 @@ export function McpManagement() {
   // ``recommendation`` at all counts too: an older gateway reached through Make
   // Live sends no verdict field, and that row is exactly as unmeasured as one
   // whose verdict says so.
+  //
+  // A row whose handshake did not reproduce counts as well, and this is load
+  // bearing rather than a nicety. The backend deliberately re-measures such a row
+  // every pass (a divergence is reported, never frozen), and the row's own text
+  // tells the operator that measuring again retests it. Leaving it out of this
+  // count disabled the only control that does so, which is an offered action with
+  // no path to it.
   const unmeasuredCount = useMemo(
-    () => servers.filter(s => !s.recommendation || s.recommendation.strength === 'unknown').length,
+    () =>
+      servers.filter(
+        s =>
+          !s.recommendation ||
+          s.recommendation.strength === 'unknown' ||
+          s.recommendation.reasons.some(r => r.code === 'handshake_not_reproducible'),
+      ).length,
     [servers],
   )
 
@@ -710,7 +856,7 @@ export function McpManagement() {
       // acting on a half-measured fleet.
       if (unmeasuredCount > 0) {
         await api.mcpMeasureStart()
-        if (!(await waitForMeasurePass(qc))) return { enabled: 0, skipped: 0, pending: true }
+        if (!(await waitForMeasurePass(qc))) return { enabled: 0, skipped: 0, pending: true, restart_required: false }
       }
       // Send every row that COULD be stubbed and let the server decide which
       // ones the evidence allows. The client cannot answer that soundly: the
@@ -728,9 +874,8 @@ export function McpManagement() {
       const fresh = await api.mcpGatewayServers()
       const rows = fresh?.servers ?? []
       const candidates = rows.filter(s => s.can_stub && !s.stub).map(s => s.name)
-      if (candidates.length === 0) return { enabled: 0, skipped: 0, pending: false }
-      // Batch form: one config write and one pool re-apply, so the allowlist
-      // cannot land half-flipped.
+      if (candidates.length === 0) return { enabled: 0, skipped: 0, pending: false, restart_required: false }
+      // Batch form: one config write, so the allowlist cannot land half-flipped.
       const res = await api.mcpGatewaySetStubMany(candidates, true, true)
       // Counts come from the RESPONSE, never from the request: the two differ by
       // design now, and reporting the request would claim stubs that were skipped.
@@ -740,6 +885,9 @@ export function McpManagement() {
         skipped: (res.skipped ?? []).length,
         pending: false,
         applied: res.applied,
+        // Carried through so the success handler can tell "waiting for a restart"
+        // (the normal answer) from "nothing was recorded" (a fault).
+        restart_required: res.restart_required === true,
       }
     },
     onSuccess: r => {
@@ -754,8 +902,17 @@ export function McpManagement() {
           skipped: r.skipped,
         }),
       )
-      // Same asymmetry as the single toggle: persisted is not live.
-      if (r.applied === false) setError(i18nT('pages.mcpManagement.stub_not_live'))
+      // A stub change is never applied in place, so `restart_required` is the
+      // normal answer and must not read as a fault. The not-live error is gated on
+      // something having been WRITTEN: when the server skips every candidate it
+      // deliberately never calls the apply hook, so `applied: false` there means
+      // "nothing to apply", not "the gateway could not start" -- and the
+      // "0 of N enabled" notice above already says what happened.
+      if (r.restart_required) {
+        setRestartNotice(i18nT('pages.mcpManagement.stub_restart_required'))
+      } else if (r.enabled > 0 && r.applied === false) {
+        setError(i18nT('pages.mcpManagement.stub_not_live'))
+      }
     },
     onError: () => {
       invalidate()
@@ -850,6 +1007,16 @@ export function McpManagement() {
         </div>
       )}
 
+      {restartNotice && (
+        <div
+          role="status"
+          className="flex items-start gap-2 rounded-lg border border-[var(--accent)] bg-[var(--accent-subtle,transparent)] px-3.5 py-2.5 text-[13px] text-[var(--text)]"
+        >
+          <RefreshCw size={14} className="mt-0.5 shrink-0 text-[var(--accent)]" aria-hidden="true" />
+          <span>{restartNotice}</span>
+        </div>
+      )}
+
       {/* Global: route every stub to one shared backend. */}
       <section className="rounded-xl border border-[var(--border)] bg-[var(--card)] px-5 py-4">
         <div className="flex items-start gap-5">
@@ -913,6 +1080,52 @@ export function McpManagement() {
         </div>
       </section>
 
+      {/* Global: pre-resolve npm-launcher servers so launches skip resolution. */}
+      <section className="rounded-xl border border-[var(--border)] bg-[var(--card)] px-5 py-4">
+        <div className="flex items-start gap-5">
+          <div className="flex-1">
+            <div className="text-[15px] font-semibold text-[var(--text)]">
+              {i18nT('pages.mcpManagement.resolve_label')}
+            </div>
+            <p
+              id="mcp-resolve-desc"
+              className="mt-1.5 max-w-[64ch] text-[13px] leading-relaxed text-[var(--muted)]"
+            >
+              {i18nT('pages.mcpManagement.resolve_description')}
+            </p>
+            {/* A control that can do nothing has to say so BEFORE it is pressed.
+                Pre-resolving acts on the routed set, and routing is what a stub
+                creates, so with nothing stubbed there is nothing to resolve --
+                the same gate the sharing card states in plain text above. */}
+            {stubCount === 0 && (
+              <p className="mt-2 text-[12.5px] text-[var(--muted)]">
+                {i18nT('pages.mcpManagement.resolve_needs_a_stub')}
+              </p>
+            )}
+            {resolveNotice && (
+              <p className="mt-2 text-[12.5px] text-[var(--text)]" role="status">
+                {resolveNotice}
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            aria-describedby="mcp-resolve-desc"
+            disabled={resolveRefresh.isPending}
+            onClick={() => {
+              setError(null)
+              setResolveNotice(null)
+              resolveRefresh.mutate()
+            }}
+            className="shrink-0 rounded-lg border border-[var(--border)] px-3 py-1.5 text-[13px] text-[var(--text)] transition-colors hover:bg-[var(--hover)] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {resolveRefresh.isPending
+              ? i18nT('pages.mcpManagement.resolve_updating')
+              : i18nT('pages.mcpManagement.resolve_update_now')}
+          </button>
+        </div>
+      </section>
+
       {/* Per server: interpose the stub. */}
       <section className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--card)]">
         {/* Both switches on this page are next-chat scoped: the apply path
@@ -936,6 +1149,7 @@ export function McpManagement() {
             onClick={() => {
               setError(null)
               setNotice(null)
+              setRestartNotice(null)
               enableAll.mutate()
             }}
             disabled={
@@ -972,6 +1186,10 @@ export function McpManagement() {
               <th className="w-[34%] px-4 pb-2.5 pt-3.5 text-left text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">
                 {i18nT('pages.mcpManagement.col_used_by')}
               </th>
+              {/* Column widths are unchanged from before this PR. An earlier
+                  revision widened STATE to hold a full cause sentence; that
+                  sentence now lives once, in the legend, so the table needs no
+                  extra room and no data-dependent reflow. */}
               <th className="w-[16%] px-4 pb-2.5 pt-3.5 text-left text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">
                 {i18nT('pages.mcpManagement.col_state')}
               </th>
@@ -982,7 +1200,16 @@ export function McpManagement() {
           </thead>
           <tbody>
             {servers.map(s => {
-              const shared = s.stub && !!status?.enabled
+              // `rowState` is the ONE derivation of this row's state, and the
+              // colour and the reason line read its answer rather than recomputing
+              // it. Deriving them separately is what produced this defect -- the
+              // text can be corrected while the colour still says `shared`, and an
+              // operator scanning the column by colour reads the old answer every
+              // visit -- so a second spelling of "is shared" here would rebuild the
+              // divergence one state later.
+              const state = rowState(s, !!status?.enabled)
+              const shared = state === 'shared'
+              const directEnv = state === 'direct_env'
               // The assessment view's warning sends the operator here, so the
               // rows it counted have to be findable without memorising names.
               const flagged = sharedWithoutSupport(s, !!status?.enabled)
@@ -1002,7 +1229,11 @@ export function McpManagement() {
                   <td className="px-4 py-3">
                     <span
                       className={[
-                        'inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-mono text-[11px]',
+                        // A state is a term, not a sentence: breaking `not shared
+                        // (env)` across two ragged lines reads as a broken badge
+                        // beside the single-line `shared` and `direct` pills, and
+                        // every shipped locale is longer than the English.
+                        'inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 font-mono text-[11px]',
                         flagged
                           ? 'border border-[var(--danger)] text-[var(--danger)]'
                           : shared
@@ -1011,8 +1242,25 @@ export function McpManagement() {
                       ].join(' ')}
                     >
                       {flagged && <AlertTriangle size={11} aria-hidden="true" />}
-                      {i18nT(stateLabelKey(s, !!status?.enabled))}
+                      {i18nT(STATE_LABEL_KEY[state])}
                     </span>
+                    {/* Only on a row the operator opted in, and it carries ONLY what
+                        the legend cannot: that the opt-in on the lit toggle beside it
+                        survives. The cause is defined once, in the legend -- keeping
+                        a copy of it here made the row and the legend two catalogs
+                        that must agree about one state in 13 locales, which is a
+                        drift surface for the very defect this change removes.
+                        What no legend can do is reach the operator BEFORE they
+                        resolve the contradiction themselves: STUB is lit, the state
+                        says no stub, and switching the toggle off throws away an
+                        opt-in that the rewriter will honour as soon as the env
+                        obstacle clears. On a row that was never opted in there is
+                        nothing to have been declined. */}
+                    {directEnv && (
+                      <span className="mt-1 block text-[11px] leading-snug text-[var(--muted)]">
+                        {i18nT('pages.mcpManagement.state_direct_env_reason')}
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-right">
                     <Switch
@@ -1021,6 +1269,7 @@ export function McpManagement() {
                       label={i18nT('pages.mcpManagement.stub_aria', { name: s.name })}
                       onClick={() => {
                         setError(null)
+                        setRestartNotice(null)
                         setStub.mutate({ name: s.name, stub: !s.stub })
                       }}
                     />
@@ -1049,6 +1298,16 @@ export function McpManagement() {
         </table>
         <div className="border-t border-[var(--border)] px-4 py-3 text-[12.5px] leading-relaxed text-[var(--muted)]">
           {i18nT('pages.mcpManagement.legend')}
+        </div>
+        {/* Its OWN block, not a second string inside the paragraph above. Two
+            catalog values sharing one text run is a reordering defect in any
+            language whose clause order differs -- the repo's render gate calls it
+            `fragment/multi-unit` and AGENTS.md says merge, not join. Kept separate
+            rather than merged INTO the paragraph because that paragraph must stay
+            byte-identical to its base value in 13 locales; as its own block the new
+            term is also findable by scanning. */}
+        <div className="border-t border-[var(--border)] px-4 py-3 text-[12.5px] leading-relaxed text-[var(--muted)]">
+          {i18nT('pages.mcpManagement.state_direct_env_legend')}
         </div>
       </section>
         </>

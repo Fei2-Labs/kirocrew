@@ -45,10 +45,15 @@ This module defines a **namespaced, versioned, typed** protocol extension:
            }
        }
 
-   Gatewayd inspects this capability at backend boot. Backends that **do
-   not** advertise the extension are treated as single-session: gatewayd
-   will refuse to pool them and fall back to per-session spawn (the
-   equivalent of the old ``UNPOOLABLE_SERVERS`` list, but auto-detected).
+   Gatewayd inspects this capability at backend boot and uses it to decide
+   whether to INJECT the caller block. It does NOT decide pooling: a backend
+   that never advertises is pooled all the same, and simply never receives an
+   identity -- pooled and identity-blind, which is worse than either alone.
+   The "refuse to pool an unadvertised backend" behaviour described in earlier
+   revisions of this docstring was never implemented; ``rewriter.py`` records
+   the same fact next to ``UNPOOLABLE_SERVERS``, which is empty and remains the
+   only mechanism of its kind. A backend that cannot consume the block must be
+   listed there.
 
 3. **Typed context** — tool handlers receive a ``CallerContext`` dataclass
    as an explicit argument. No contextvars, no env reads, no implicit state.

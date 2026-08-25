@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import fields
 
+import pytest
+
 from kiro_crew.messaging.transport import TransportCapabilities
 
 #: Something behaves differently when the value changes. Cite the behaviour.
@@ -31,6 +33,13 @@ ENFORCED = {
     # size. CHARACTER count — byte-capped platforms must declare a byte-safe
     # char value (see webex).
     "max_message_chars",
+    # The same limit in UTF-8 BYTES, preferred over the char count by
+    # messaging.renderer.chunk_for_transport, which both cross-surface mirror
+    # legs (dashboard/chat_runner.py, slack/gateway.py's subagent reply ladder)
+    # now call. 0 means "not byte-capped" and keeps the char path. Enforced by
+    # construction: a byte-capped transport that declares it gets fence-aware
+    # byte splitting, and one that does not keeps the 4x-pessimistic char floor.
+    "max_message_bytes",
     # Gates mirror-link creation (HTTP 400) and the outbound mirror leg.
     "supports_proactive_send",
     # Gates whether a dashboard connect marks the binding as an inbound resume
@@ -46,6 +55,41 @@ ENFORCED = {
     # no widget (trailer stripped; their text fallback is the
     # approval-ladder work).
     "max_buttons",
+    # Gates whether a renderer extracts local image references out of a sealed
+    # segment and uploads them (discord/renderer.py::_uploads_enabled ->
+    # client.send_message_with_files). A channel declaring False keeps printing
+    # the markdown path, which is the honest degradation -- never a silent drop.
+    "files_outbound",
+    # Read by Renderer.render_tables_for_target at every opted-in outbound
+    # boundary. ``table_mode`` selects off/cards/grid/native/auto and
+    # ``native_tables`` prevents an unsupported native claim from leaking raw
+    # pipes. Pinned per channel by test_channel_table_rendering.py.
+    "table_mode",
+    "native_tables",
+    # Decides whether an EMPTY message id from ``send_message`` means "refused"
+    # (most platforms) or "delivered, this platform returns no id" (WeCom's
+    # proactive command, Feishu's reply -- both RAISE on failure instead). Read
+    # through messaging.transport.delivery_confirmed at all three proactive-send
+    # call sites: slack/gateway.py's channel reply leg and both legs in
+    # dashboard/handlers/messaging.py. Declaring it wrongly is silent in both
+    # directions -- a lost message reported as delivered, or a delivered cron
+    # result reported as lost with its dedup hash left unadvanced, repeating the
+    # same result every tick. Pinned against each transport's own send_message,
+    # by AST and in both directions, in
+    # test_channel_transport_outbound_authz.py::TestTheMessageIdConventionIsDeclared.
+    "returns_message_id",
+    # Whether the platform parses a broadcast-mention grammar in a message body.
+    # messaging.renderer.display_safe_for reads it at the channel-neutral proactive
+    # sinks (dashboard/handlers/messaging.py) and applies the ZWSP defang only
+    # where one exists -- Webex declares False because its allow-list IS email
+    # addresses and the defang makes every address uncopyable.
+    "mention_grammars",
+    # Gates whether a renderer attaches an Adaptive Card at all
+    # (webex/renderer.py::_options_card and ::on_prompt_choice). A channel
+    # declaring False keeps the numbered-text and typed-reply forms, which work
+    # everywhere -- so the flag decides whether a widget appears, not whether the
+    # user can answer.
+    "rich_blocks",
 }
 
 #: Declared honestly, read by nothing yet. The capability-gated interface
@@ -56,8 +100,6 @@ ASPIRATIONAL = {
     "edit",
     "reactions",
     "files_inbound",
-    "files_outbound",
-    "rich_blocks",
     "threads",
 }
 
@@ -90,6 +132,23 @@ class TestCorrectedDeclarations:
 
         assert TELEGRAM_CAPABILITIES.threads is True
 
+    def test_telegram_declares_the_outbound_files_it_uploads(self) -> None:
+        # renderer._send_uploads extracts local image references through the
+        # shared messaging/outbound_files.py and uploads them via multipart
+        # sendPhoto / sendMediaGroup. Declared False while the channel printed
+        # filesystem paths; the declaration and the upload path move together.
+        from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES
+
+        assert TELEGRAM_CAPABILITIES.files_outbound is True
+
+    def test_telegram_declares_the_rich_rendering_it_performs(self) -> None:
+        # sendRichMessage carries every table-bearing seal (renderer._seal_text)
+        # and renders structured markdown natively; inline keyboards carry the
+        # interactive half. Declared False while doing both.
+        from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES
+
+        assert TELEGRAM_CAPABILITIES.rich_blocks is True
+
     def test_slack_declares_its_shipped_send_limit_not_the_platform_ceiling(self) -> None:
         # slack/format.py splits at SLACK_MSG_LIMIT (3900). The old 40000
         # would have let a capability-aware caller emit messages 10x larger
@@ -110,21 +169,107 @@ class TestCorrectedDeclarations:
     def test_webex_char_declaration_is_safe_under_its_byte_cap(self) -> None:
         # Webex caps messages in UTF-8 BYTES (WEBEX_MAX_TEXT) and its client
         # tail-truncates overflow. The declared CHAR count must be safe at
-        # 4 bytes/char, or the mirror leg silently loses data on CJK text.
+        # 4 bytes/char, or a caller that can only count chars loses data on CJK
+        # text. It stays declared alongside the byte cap as that caller's floor.
         from kiro_crew.webex.client import WEBEX_MAX_TEXT
         from kiro_crew.webex.transport import WEBEX_CAPABILITIES
 
         assert WEBEX_CAPABILITIES.max_message_chars * 4 <= WEBEX_MAX_TEXT
 
+    def test_teams_char_declaration_is_safe_under_its_byte_cap(self) -> None:
+        # A Teams activity is JSON on the wire, so the cap is effectively in BYTES.
+        # The declared CHAR count must survive the worst case (an astral codepoint
+        # is 4 UTF-8 bytes) or the mirror leg silently loses a long non-ASCII reply
+        # and a renderer chunk comes back 413.
+        from kiro_crew.teams.client import (
+            _MAX_UTF8_BYTES_PER_CHAR,
+            TEAMS_MAX_ACTIVITY_TEXT_BYTES,
+        )
+        from kiro_crew.teams.transport import TEAMS_CAPABILITIES
+
+        assert (
+            TEAMS_CAPABILITIES.max_message_chars * _MAX_UTF8_BYTES_PER_CHAR
+            <= TEAMS_MAX_ACTIVITY_TEXT_BYTES
+        )
+
+    @pytest.mark.asyncio
+    async def test_teams_serializes_without_ascii_escaping(self) -> None:
+        # The multiplier above is only true with ensure_ascii=False. aiohttp's
+        # default escapes every non-ASCII codepoint to \\uXXXX -- 6 bytes each, 12
+        # for an astral pair -- which triples the worst case and breaks the pin
+        # above without changing any number it reads. Asserted on the session the
+        # client really builds, not on the literal passed to it.
+        from kiro_crew.teams.client import TeamsClient
+
+        client = TeamsClient(app_id="a", app_password="p")
+        try:
+            session = await client._ensure_session()
+            assert session._json_serialize("✅🙂") == '"✅🙂"'
+        finally:
+            await client.close()
+
+    def test_wecom_char_declaration_is_safe_under_its_byte_cap(self) -> None:
+        # WeCom caps `stream.content` / `markdown.content` in UTF-8 BYTES
+        # (20480). The declared CHARACTER count must be safe at 4 bytes/char, or
+        # a CJK reply sits under the character cap and ~3x over the byte cap --
+        # and WeCom rejects the whole frame, so the user gets nothing at all.
+        # Declared 20000 CHARS until this was corrected.
+        from kiro_crew.wecom.client import WECOM_MAX_REPLY_BYTES
+        from kiro_crew.wecom.transport import WECOM_CAPABILITIES
+
+        assert WECOM_CAPABILITIES.max_message_chars * 4 <= WECOM_MAX_REPLY_BYTES
+
+    def test_a_byte_capped_transport_declares_the_real_budget_too(self) -> None:
+        # The char floor alone is 4x pessimistic, which fragmented an ASCII reply
+        # into quarters on the mirror leg. The byte value is the real capacity and
+        # is what chunk_for_transport uses.
+        from kiro_crew.webex.client import WEBEX_MAX_TEXT
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        assert WEBEX_CAPABILITIES.max_message_bytes == WEBEX_MAX_TEXT
+
+    def test_only_byte_capped_transports_declare_a_byte_budget(self) -> None:
+        """0 is the honest default, and it keeps every other channel on chars.
+
+        A transport declaring a byte cap it does not have would route its replies
+        through the byte splitter and chunk them against the wrong unit.
+        """
+        from kiro_crew.discord.transport import DISCORD_CAPABILITIES
+        from kiro_crew.slack.transport import SLACK_CAPABILITIES
+        from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES
+
+        assert TransportCapabilities().max_message_bytes == 0
+        for caps in (SLACK_CAPABILITIES, DISCORD_CAPABILITIES, TELEGRAM_CAPABILITIES):
+            assert caps.max_message_bytes == 0
+
+    def test_webex_declares_the_capabilities_it_now_performs(self) -> None:
+        """Files, cards and threading all ship, so all three are declared.
+
+        Each of these was False while the code could not do it. Flipping one
+        without the code, or shipping the code without flipping it, is the
+        drift this ledger exists to catch — so pin them against their consumers.
+        """
+        from kiro_crew.webex.cards import MAX_CARD_ACTIONS
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        assert WEBEX_CAPABILITIES.files_inbound is True  # webex/attachments.py
+        assert WEBEX_CAPABILITIES.files_outbound is True  # client.send_file
+        assert WEBEX_CAPABILITIES.rich_blocks is True  # webex/cards.py
+        assert WEBEX_CAPABILITIES.threads is True  # send_message(parent_id=...)
+        assert WEBEX_CAPABILITIES.max_buttons == MAX_CARD_ACTIONS
+        # Still absent, and deliberately: the Webex Messaging API has neither.
+        assert WEBEX_CAPABILITIES.reactions is False
+        assert WEBEX_CAPABILITIES.streaming is False
+
     def test_the_file_directions_are_declared_separately(self) -> None:
-        # One boolean was undecidable: discord ingests but cannot upload,
-        # slack does both. A gate reading a single `files` flag got the
-        # wrong answer for one of them.
+        # One boolean was undecidable: the two directions land per channel and in
+        # different changes, so a gate reading a single `files` flag got the wrong
+        # answer for one of them.
         from kiro_crew.discord.transport import DISCORD_CAPABILITIES
         from kiro_crew.slack.transport import SLACK_CAPABILITIES
 
         assert DISCORD_CAPABILITIES.files_inbound is True
-        assert DISCORD_CAPABILITIES.files_outbound is False
+        assert DISCORD_CAPABILITIES.files_outbound is True
         assert SLACK_CAPABILITIES.files_inbound is True
         assert SLACK_CAPABILITIES.files_outbound is True
 
@@ -172,12 +317,15 @@ class TestSessionResumeIsDeclaredOnlyWhereItIsHonoured:
         )
 
     def test_no_other_transport_declares_it(self) -> None:
+        from kiro_crew.feishu.transport import FEISHU_CAPABILITIES
+        from kiro_crew.imessage.transport import IMESSAGE_CAPABILITIES
         from kiro_crew.slack.transport import SLACK_CAPABILITIES
         from kiro_crew.teams.transport import TEAMS_CAPABILITIES
         from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES
         from kiro_crew.webex.transport import WEBEX_CAPABILITIES
         from kiro_crew.wecom.transport import WECOM_CAPABILITIES
         from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
+        from kiro_crew.whatsapp.transport import WHATSAPP_CAPABILITIES
 
         others = {
             "slack": SLACK_CAPABILITIES,
@@ -186,6 +334,9 @@ class TestSessionResumeIsDeclaredOnlyWhereItIsHonoured:
             "webex": WEBEX_CAPABILITIES,
             "wecom": WECOM_CAPABILITIES,
             "weixin": WEIXIN_CAPABILITIES,
+            "imessage": IMESSAGE_CAPABILITIES,
+            "whatsapp": WHATSAPP_CAPABILITIES,
+            "feishu": FEISHU_CAPABILITIES,
         }
         claiming = [name for name, caps in others.items() if caps.supports_session_resume]
         assert claiming == [], (

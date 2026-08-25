@@ -22,6 +22,8 @@ from sage_lib import results
 from sage_lib import review_driver as D
 from sage_lib import store
 
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
+
 
 def _record(cid: str = "CR-1") -> dict:
     return {
@@ -248,6 +250,7 @@ class TestStakedSlot(_Base):
     def test_an_empty_slot_is_already_the_wanted_state(self):
         self.assertTrue(results.stake_shared("CR-never-seen", self.root))
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_symlink_is_removed_not_followed(self):
         # os.unlink removes the link itself, so the target it aimed at must survive.
         target = self.root / "elsewhere.json"

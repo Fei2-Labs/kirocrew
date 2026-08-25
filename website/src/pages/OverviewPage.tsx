@@ -7,8 +7,11 @@ import { useUptime } from '../hooks/useUptime'
 import { api } from '../api/client'
 import { Card, CardTitle, StatCard } from '../components/ui'
 import { TunnelStatus } from '../components/TunnelStatus'
+import { TailnetMobileCard } from '../components/TailnetMobileCard'
 import ErrorBoundary from '../components/ErrorBoundary'
 import { getOverviewStatCards } from './overviewStatCards'
+import { getOverviewPanel } from './overviewPanel'
+import { isOverviewBuiltinSuppressed } from './overviewBuiltins'
 import { MemoryTab, UsageTab } from './overview'
 import { useProvider } from '../providers'
 import type { NormalizedUsage } from '../providers'
@@ -170,6 +173,11 @@ export default function OverviewPage() {
     return <DrillIn title={i18nT('pages.overviewPage.usage')} onBack={() => setView(null)}><UsageTab /></DrillIn>
   }
 
+  // Resolved once per render, and bound to a capitalized local so JSX treats it
+  // as a component rather than an intrinsic element.
+  const overviewPanel = getOverviewPanel()
+  const OverviewPanelComp = overviewPanel?.component
+
   return (
     <>
       {/* Health hero. Status only — Overview edits no config, so it hosts no
@@ -215,11 +223,43 @@ export default function OverviewPage() {
         })}
       </div>
 
+      {/* Mobile access. Above the summary cards and full width, because it is a
+          guided sequence rather than a metric: it owns the one next action, and
+          in its terminal state it renders a QR the operator scans off the screen.
+          Isolated so a throwing card cannot take the Overview down with it.
+
+          Suppressible downstream: a distribution that disables tailnet outright
+          can remove this surface via `suppressOverviewBuiltin('tailnet-mobile')`
+          rather than patching this file on every sync. Gated OUTSIDE the
+          ErrorBoundary and the spacing wrapper so a suppressed build renders no
+          element at all — leaving the `mb-6` div behind would keep a 24px gap
+          where the card used to be. The core suppresses nothing. */}
+      {!isOverviewBuiltinSuppressed('tailnet-mobile') && (
+        <ErrorBoundary scope="overview-tailnet-mobile" fallback={null}>
+          <div className="mb-6">
+            <TailnetMobileCard />
+          </div>
+        </ErrorBoundary>
+      )}
+
       {/* Deep-surface summary cards */}
       <div className="grid gap-3.5 grid-cols-2 max-[760px]:grid-cols-1">
         <UsageSummaryCard onOpen={() => setView('usage')} />
         <MemorySummaryCard onOpen={() => setView('memory')} />
       </div>
+
+      {/* Extension slot: the single downstream-owned panel for the region below
+          the summary cards. One surface, one owner — a second registration
+          fails loud at the seam rather than negotiating layout here. Absent in
+          the stock build, and isolated so a throwing panel takes only itself
+          down, not the whole Overview. */}
+      {overviewPanel && OverviewPanelComp ? (
+        <ErrorBoundary scope={`overview-panel:${overviewPanel.id}`} fallback={null}>
+          <div className="mt-6">
+            <OverviewPanelComp />
+          </div>
+        </ErrorBoundary>
+      ) : null}
     </>
   )
 }
