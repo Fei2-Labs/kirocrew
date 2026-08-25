@@ -2,7 +2,7 @@
   "id": "FEAT-002",
   "type": "feat",
   "description": "Add comprehensive tests for the table-driven validation (covering all newly-validated fields) and an anti-drift test that ensures any new persisted string field added to CronJob gets validation coverage.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "Step 1 - Create test/test_cron_string_field_validation.py following the patterns in test/test_cron_name_cap.py. Import CronService from kiro_crew.cron and the validation table/set (CRON_VALIDATED_STRING_FIELDS or _CRON_STRING_FIELD_CAPS) from kiro_crew.cron. Import relevant constants from kiro_crew.validation (MAX_SHORT_STRING, MAX_CRON_MESSAGE, CHANNEL_MAX_LEN).",
     "Step 2 - Add a parametrized test class TestBuildJobFieldValidation that tests _build_job rejects non-string and oversize values for each of the newly-covered fields: channel, thread_ts, agent_id, created_by, folder_id, session_key, model, command, script, timezone. Use @pytest.mark.parametrize with a list of (field_name, oversize_value, non_string_value) tuples. Each test creates a CronService(base_dir=tmp_path) and calls svc.add_job(name='j', message='m', every_secs=3600, **{field: bad_value}) and asserts ValueError is raised with the appropriate message.",
@@ -25,5 +25,5 @@
     "grep -n 'anti.drift\\|AntiDrift\\|anti_drift' test/test_cron_string_field_validation.py to confirm anti-drift test exists"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "Created test/test_cron_string_field_validation.py with 12 test functions. Covers all 10 newly-validated fields (channel, thread_ts, agent_id, created_by, folder_id, session_key, model, command, script, timezone) with parametrized type and length rejection tests for both add_job and update_job paths. Anti-drift test inspects CronJob dataclass annotations and asserts every str/str|None field not in the runtime-only exclusion set is present in CRON_VALIDATED_STRING_FIELDS. AST parsing verified successfully. Cannot run tests at runtime due to missing croniter dependency (INTEGRATIONS_ONLY network)."
 }
