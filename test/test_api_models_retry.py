@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kiro_crew import sandbox
+from kiro_crew.acp.types import ACP_BACKEND_KIRO, ACP_BACKEND_OPENCODE
 from kiro_crew.dashboard.handlers import agents
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 
@@ -61,8 +62,12 @@ def _kiro_request(tmp_path: Path) -> MagicMock:
 
 
 def _kiro_cfg() -> SimpleNamespace:
-    # Any non-"claude_code" provider takes the subprocess path under test.
-    return SimpleNamespace(agent=SimpleNamespace(provider="kiro"))
+    # The Kiro backend takes the subprocess path under test.
+    return SimpleNamespace(agent=SimpleNamespace(provider="acp", acp_backend=ACP_BACKEND_KIRO))
+
+
+def _opencode_cfg() -> SimpleNamespace:
+    return SimpleNamespace(agent=SimpleNamespace(provider="acp", acp_backend=ACP_BACKEND_OPENCODE))
 
 
 def _run(coro):
@@ -92,6 +97,33 @@ class _FakeProc:
 
     async def communicate(self):
         return self._stdout, self._stderr
+
+
+def test_opencode_models_come_from_the_matching_live_provider(tmp_path):
+    opencode = MagicMock()
+    opencode._client = SimpleNamespace(backend=ACP_BACKEND_OPENCODE)
+    opencode.available_models.return_value = [
+        {"modelId": "opencode/hy3-free", "name": "HY3 Free"}
+    ]
+    stale_kiro = MagicMock()
+    stale_kiro._client = SimpleNamespace(backend=ACP_BACKEND_KIRO)
+    stale_kiro.available_models.return_value = [{"modelId": "claude-sonnet-4-6"}]
+    request = _kiro_request(tmp_path)
+    request.app["state"] = SimpleNamespace(
+        sessions=SimpleNamespace(active_providers=lambda: [stale_kiro, opencode])
+    )
+
+    with patch.object(agents.KiroCrewConfig, "load", return_value=_opencode_cfg()):
+        resp = _run(agents.api_models(request))
+
+    assert resp.status == 200
+    assert _body(resp) == [
+        {
+            "model_name": "opencode/hy3-free",
+            "display_name": "HY3 Free",
+            "description": "",
+        }
+    ]
 
 
 def test_kiro_binary_unresolved_returns_503(tmp_path):

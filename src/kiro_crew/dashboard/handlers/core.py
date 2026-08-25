@@ -1740,14 +1740,17 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # ACP_BACKENDS_SELECTABLE, the single source of truth for this set).
     "agent.acp_backend": {"type": "enum", "values": sorted(ACP_BACKENDS_SELECTABLE)},
     # Default model for new sessions. Membership can NOT be validated against a
-    # fixed list: the real vocabulary is whatever the live kiro-cli advertises
-    # (/api/models spawns it to find out), and it spans both canonical registry
-    # keys ("opus-4.8-1m") and kiro's own ids ("claude-opus-4.8"). So this is a
-    # grammar check instead — model-id charset only, no separators or shell
-    # metacharacters — and an unknown-but-well-formed id is rejected downstream
-    # by kiro itself rather than silently accepted here. "auto"/"" = defer to
-    # the agent config / kiro's own default.
-    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-\[\]]*$"},
+    # fixed list: the real vocabulary is whatever the live backend advertises.
+    # OpenCode BYOK ids are provider/model paths (and a model segment may itself
+    # carry a namespace), so slash is permitted as a bounded identifier separator;
+    # whitespace and shell metacharacters remain excluded. An unknown well-formed
+    # id is rejected downstream by its backend. "auto"/"" = defer to the agent
+    # config / backend default.
+    "agent.model": {
+        "type": "str",
+        "max_len": 64,
+        "pattern": r"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|[A-Za-z0-9][A-Za-z0-9._\-]*(?:/[A-Za-z0-9][A-Za-z0-9._\-]*)+)\Z",
+    },
     # Per-task-class model overrides. Same grammar as agent.model (the real
     # vocabulary is whatever the backend advertises). "" / "auto" defers to the
     # chat default. `validate_fn` additionally rejects a well-formed id the
@@ -1755,13 +1758,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.role_models.background": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": r"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|[A-Za-z0-9][A-Za-z0-9._\-]*(?:/[A-Za-z0-9][A-Za-z0-9._\-]*)+)\Z",
         "validate_fn": _validate_role_model,
     },
     "agent.role_models.subagent": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": r"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|[A-Za-z0-9][A-Za-z0-9._\-]*(?:/[A-Za-z0-9][A-Za-z0-9._\-]*)+)\Z",
         "validate_fn": _validate_role_model,
     },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},

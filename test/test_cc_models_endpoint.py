@@ -15,7 +15,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from kiro_crew import model_registry
+from kiro_crew.acp.types import ACP_BACKEND_OPENCODE
 from kiro_crew.dashboard.handlers.agents import (
+    _advertised_acp_models,
     _advertised_cc_models,
     _cc_models,
 )
@@ -38,8 +40,9 @@ def _request_with_providers(providers: dict) -> MagicMock:
 
 
 class _FakeProvider:
-    def __init__(self, models):
+    def __init__(self, models, backend="claude"):
         self._models = models
+        self._client = SimpleNamespace(backend=backend)
 
     def available_models(self):
         return self._models
@@ -76,6 +79,24 @@ class TestAdvertisedCcModels:
         )
         out = _advertised_cc_models(_request_with_providers({"s": prov}))
         assert out[0]["model_name"] == "opus-4.8-1m"
+
+    def test_opencode_uses_its_own_newest_provider_and_wire_id(self):
+        """A stale Kiro session must not hide the selected OpenCode model."""
+        kiro = _FakeProvider([{"modelId": "claude-sonnet-4-6"}], backend="")
+        opencode = _FakeProvider(
+            [{"modelId": "opencode/hy3-free", "name": "HY3 Free"}],
+            backend=ACP_BACKEND_OPENCODE,
+        )
+        out = _advertised_acp_models(
+            _request_with_providers({"kiro": kiro, "opencode": opencode}), ACP_BACKEND_OPENCODE
+        )
+        assert out == [
+            {
+                "model_name": "opencode/hy3-free",
+                "display_name": "HY3 Free",
+                "description": "",
+            }
+        ]
 
     def test_empty_when_no_active_sessions(self):
         assert _advertised_cc_models(_request_with_providers({})) == []

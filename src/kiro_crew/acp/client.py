@@ -176,6 +176,13 @@ COPILOT_ACP_ARG = "--acp"
 # (env override, then augmented PATH).
 OPENCODE_BIN = "opencode"
 OPENCODE_ACP_SUBCMD = "acp"
+# An OpenCode model id is a provider name plus one or more safe path segments.
+# The same form reaches `session/set_model`, never a shell, but validation keeps a
+# user-edited config from turning the model picker into an arbitrary string source.
+_OPENCODE_MODEL_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+)
+_OPENCODE_CONFIG_FILE = "opencode.json"
 
 CLAUDE_ACP_BIN = "claude-agent-acp"
 # On-disk name of the Claude backend CLI.  The claude-agent-acp adapter
@@ -367,6 +374,47 @@ def _resolve_copilot_bin() -> str | None:
             return str(candidates[0])
 
     return None
+
+
+def _configured_opencode_models() -> list[dict[str, str]]:
+    """Read enabled BYOK model ids from the operator-owned OpenCode config.
+
+    OpenCode ACP may publish only its current model even when its own config
+    enables several providers. This read mirrors its provider/models structure;
+    it never reads credentials and skips malformed entries rather than making
+    session startup depend on an optional picker enhancement.
+    """
+    config = Path.home() / ".config" / "opencode" / _OPENCODE_CONFIG_FILE
+    try:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    providers = payload.get("provider") if isinstance(payload, dict) else None
+    if not isinstance(providers, dict):
+        return []
+    models: list[dict[str, str]] = []
+    for provider_id, provider in providers.items():
+        if not isinstance(provider_id, str) or not _OPENCODE_MODEL_ID_RE.fullmatch(provider_id):
+            continue
+        configured = provider.get("models") if isinstance(provider, dict) else None
+        if not isinstance(configured, dict):
+            continue
+        for model_id, model in configured.items():
+            if not isinstance(model_id, str) or not _OPENCODE_MODEL_ID_RE.fullmatch(model_id):
+                continue
+            if isinstance(model, dict) and model.get("disabled") is True:
+                continue
+            full_id = f"{provider_id}/{model_id}"
+            if not _OPENCODE_MODEL_ID_RE.fullmatch(full_id):
+                continue
+            models.append(
+                {
+                    "modelId": full_id,
+                    "name": str(model.get("name") or model_id) if isinstance(model, dict) else model_id,
+                    "description": "",
+                }
+            )
+    return models
 
 
 def _resolve_opencode_bin() -> str | None:
@@ -2548,6 +2596,30 @@ class AcpClient:
         """Models advertised by the backend at session init (may be empty)."""
         return list(self._available_models)
 
+    def add_configured_opencode_models(self, models: Sequence[dict[str, str]]) -> None:
+        """Merge configured OpenCode BYOK models into its partial ACP listing.
+
+        OpenCode ACP can advertise only its current model while the local OpenCode
+        configuration names further enabled provider/model ids. Those ids are safe
+        candidates for the same server's `session/set_model`; preserve ACP rows
+        first and append only valid, non-duplicate configured entries.
+        """
+        if not self._is_opencode:
+            return
+        seen = {str(entry.get("modelId", "")) for entry in self._available_models}
+        for model in models:
+            model_id = str(model.get("modelId", "")).strip()
+            if not _OPENCODE_MODEL_ID_RE.fullmatch(model_id) or model_id in seen:
+                continue
+            self._available_models.append(
+                {
+                    "modelId": model_id,
+                    "name": str(model.get("name", "") or model_id),
+                    "description": str(model.get("description", "")),
+                }
+            )
+            seen.add(model_id)
+
     def _advertised_model_ids(self) -> list[str]:
         """Advertised model ids, for the model-rejection error path.
 
@@ -3534,6 +3606,13 @@ class AcpClient:
             _model_log, _ = redact_exfiltration_urls(str(self._model))
             _model_log, _ = redact_credentials(_model_log)
             logger.info("ACP session created: %s (model=%s)", self._session_id, _model_log)
+        if self._is_opencode:
+            # OpenCode ACP can advertise only the active model. Merge its local
+            # enabled BYOK provider/model rows after either session/new or load
+            # so every picker and availability check sees selectable siblings.
+            self.add_configured_opencode_models(
+                await asyncio.to_thread(_configured_opencode_models)
+            )
         self._last_activity = time.monotonic()
 
         # Seek to end of JSONL so we only read new tool results.

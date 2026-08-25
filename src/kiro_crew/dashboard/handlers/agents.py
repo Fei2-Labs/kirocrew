@@ -17,6 +17,7 @@ from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
 from kiro_crew.agent import (
     AGENT_FILENAME,
     clear_model_pin,
@@ -771,23 +772,24 @@ def _normalize_model_key(name: str) -> str:
     return key
 
 
-def _advertised_cc_models(request: web.Request) -> list[dict]:
-    """Map the first active CC provider's advertised models to the API shape.
+def _advertised_acp_models(request: web.Request, backend: str) -> list[dict]:
+    """Return the newest active *backend* session's advertised model list.
 
-    claude-agent-acp captures its real versioned list at session init (see
-    AcpClient._capture_available_models). Backend provider ids are mapped back to
-    canonical registry keys (``from_provider_id``) so they dedup cleanly against
-    the registry rows in :func:`_cc_models` and the wire value stays canonical.
-    A provider id with no registry entry passes through unchanged (forward-compat
-    for models the registry doesn't list yet). Returns ``[]`` when no session has
-    initialized or the backend advertised nothing.
+    ACP backends own independent model namespaces. Looking at the first live
+    provider after a backend switch can return Kiro/Copilot rows while the global
+    config selects OpenCode, leaving the picker unable to select the active
+    OpenCode model. Claude is the sole registry-normalized backend; every other
+    adapter's advertised id is already the wire value and must pass through.
     """
     try:
         state: DashboardState = request.app["state"]
         providers = state.sessions.active_providers()
     except (KeyError, AttributeError):
         return []
-    for provider in providers:
+    for provider in reversed(providers):
+        client = getattr(provider, "_client", None)
+        if getattr(client, "backend", None) != backend:
+            continue
         getter = getattr(provider, "available_models", None)
         if not callable(getter):
             continue
@@ -795,19 +797,32 @@ def _advertised_cc_models(request: web.Request) -> list[dict]:
             advertised = getter()
         except Exception:
             continue
-        if advertised:
-            return [
+        if not advertised:
+            continue
+        rows: list[dict] = []
+        for model in advertised:
+            model_id = str(model.get("modelId", "")).strip()
+            if not model_id:
+                continue
+            rows.append(
                 {
-                    "model_name": model_registry.from_provider_id(
-                        m.get("modelId", ""), "claude_code"
+                    "model_name": (
+                        model_registry.from_provider_id(model_id, "claude_code")
+                        if backend == ACP_BACKEND_CLAUDE
+                        else model_id
                     ),
-                    "display_name": m.get("name", "") or m.get("modelId", ""),
-                    "description": m.get("description", ""),
+                    "display_name": model.get("name", "") or model_id,
+                    "description": model.get("description", ""),
                 }
-                for m in advertised
-                if m.get("modelId")
-            ]
+            )
+        if rows:
+            return rows
     return []
+
+
+def _advertised_cc_models(request: web.Request) -> list[dict]:
+    """Map the newest active Claude backend's advertised models to API rows."""
+    return _advertised_acp_models(request, ACP_BACKEND_CLAUDE)
 
 
 def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict]:
@@ -1033,8 +1048,6 @@ async def api_models(request: web.Request) -> web.Response:
     # list is the one the backend returned at session/new and captured in
     # the provider's available_models().  Fall through to the kiro-cli
     # spawn only when the backend IS kiro.
-    from kiro_crew.acp.types import ACP_BACKEND_KIRO  # noqa: F811
-
     try:
         from kiro_crew.config.loader import KiroCrewConfig
 
@@ -1049,7 +1062,7 @@ async def api_models(request: web.Request) -> web.Response:
     if _backend == ACP_BACKEND_KIRO:
         pass  # fall through to the kiro-cli spawn path below
     else:
-        provider_models = _advertised_cc_models(request)
+        provider_models = _advertised_acp_models(request, _backend)
         if provider_models:
             return web.json_response(provider_models)
         # No live session yet -- return 503 so the client retries.
