@@ -1259,15 +1259,26 @@ async def api_stt_transcribe(request: web.Request) -> web.Response:
     try:
         os.close(fd)
         size = 0
-        with open(tmp, "wb") as f:
+        too_large = False
+        # Offload blocking file I/O to a worker thread so the event loop
+        # is never stalled by synchronous writes.  64 KB chunk size matches
+        # the part_stream.CHUNK_BYTES rationale (minimises on-loop stall).
+        fh = await asyncio.to_thread(open, tmp, "wb")
+        try:
             while True:
-                chunk = await field.read_chunk(8192)  # type: ignore[union-attr]
+                chunk = await field.read_chunk(64 * 1024)  # type: ignore[union-attr]
                 if not chunk:
                     break
                 size += len(chunk)
                 if size > 25 * 1024 * 1024:  # 25 MB cap
-                    return web.json_response({"error": "audio too large"}, status=413)
-                f.write(chunk)
+                    too_large = True
+                    break
+                await asyncio.to_thread(fh.write, chunk)
+        finally:
+            await asyncio.to_thread(fh.close)
+
+        if too_large:
+            return web.json_response({"error": "audio too large"}, status=413)
 
         text = await transcribe_audio(tmp)
         if text:
