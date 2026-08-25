@@ -68,6 +68,11 @@ context recycle catches it.
 `_spawn_exec_shim.py` applies **after `exec`**, in the single-threaded child.
 `sandbox.create_subprocess_limited()` is the accessor every agent-influenced ASYNC spawn
 uses: it prepends the shim via `spawn_shim_argv()` and passes `preexec_fn=None`.
+The shim runs as `sys.executable -I -B -S -c <captured source>`: `-I` excludes
+environment and user-site influence, `-S` prevents site initialization, and `-B`
+prevents this isolated interpreter from writing bytecode beside a bundled stdlib.
+That last flag is explicit because `-I` ignores Electron's `PYTHONPYCACHEPREFIX`,
+and interpreter flags do not propagate through a later `sys.executable` exec.
 
 Four profiles:
 

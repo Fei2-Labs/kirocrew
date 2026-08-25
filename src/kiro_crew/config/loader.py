@@ -1441,9 +1441,16 @@ class AgentConfig:
         default="",
         metadata=_meta(
             "ACP Backend",
-            "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. "
-            "KAS runs chat but has no native subagent progress reporting yet.",
-            enum=["", "kas"],
+            "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, "
+            "'copilot' = GitHub Copilot CLI, 'opencode' = OpenCode (BYOK: serves "
+            "any OpenAI-compatible endpoint configured in opencode.json). "
+            "KAS runs chat but has no native subagent progress reporting yet. "
+            "Must admit every ACP_BACKENDS_SELECTABLE member (acp/types.py — "
+            "pinned both ways by test_harness_parity's H4 test): a value "
+            "missing here is DELETED by jsonschema validation before the "
+            "loader's degrade log can fire, so the backend silently never "
+            "engages.",
+            enum=["", "kas", "copilot", "opencode"],
         ),
     )
     default_agent: str = field(

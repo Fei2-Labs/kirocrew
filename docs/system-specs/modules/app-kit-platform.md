@@ -502,6 +502,15 @@ Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
 consumers: `website/src/pages/AppsPage.tsx` (`pickFeatured`),
 `website/src/components/appstore/types.ts` (`isVerified`, `sourceLabel`).
 
+App backend processes receive `apps.registry.minimal_env()`: a fixed allowlist,
+not the gateway's ambient environment. `PYTHONPYCACHEPREFIX` is part of that
+allowlist because the desktop shell points it at the writable data home and a
+builtin or unvenved Python backend can use the bundled `sys.executable`. Dropping
+it makes imports create `__pycache__` beside signed package sources and invalidates
+the desktop application signature. Credential-bearing variables remain denied by
+default; foreign interpreter paths use the separate `strip_python_env=True`
+boundary and still remove all Python environment controls.
+
 ## 13. An app token's WebSocket stream is scoped by its manifest, deny-by-default
 
 `/api/ws` is the third surface an app token reaches, alongside the HTTP API and

@@ -951,7 +951,7 @@ function spawnGateway(resolve) {
           const pyExe = path.resolve(path.dirname(bin), "..", "python.exe");
           if (fs.existsSync(pyExe)) {
             spawnBin = pyExe;
-            spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
+            spawnArgs = ["-B", "-s", "-m", "kiro_crew", ...spawnArgs];
           } else {
             // The .cmd shim is here but python.exe is not. That is the same
             // extraction race as the incomplete-stdlib case above, caught one
@@ -999,9 +999,9 @@ function spawnGateway(resolve) {
             // Gatekeeper then fails the installed app, and Squirrel's
             // installer can trip over the corrupted target during updates.
             // CPython creates the directory tree on demand (PEP 3147 /
-            // sys.pycache_prefix). Inherited by every Python child the
-            // gateway spawns (app servers run on the same interpreter), so
-            // the whole process tree stays out of the bundle.
+            // sys.pycache_prefix). Ordinary Python children inherit it; paths
+            // that deliberately scrub Python env rely on the bundled
+            // launcher's interpreter-level -B floor instead.
             PYTHONPYCACHEPREFIX: path.join(kirocrewDir, "cache", "pycache"),
           },
         });

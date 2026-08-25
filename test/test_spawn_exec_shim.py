@@ -160,10 +160,10 @@ class TestSpawnShimArgv:
     def test_prefix_is_an_isolated_interpreter_running_captured_source(self):
         prefix = spawn_shim_argv()
         assert prefix[0] == sys.executable
-        # -I keeps env/user-site out; -S additionally skips site, so a
-        # sitecustomize dropped into site-packages cannot run ahead of the shim.
-        assert prefix[1:4] == ("-I", "-S", "-c")
-        assert "def main(" in prefix[4]
+        # -I keeps env/user-site out; -B prevents that isolated interpreter from
+        # writing beside a signed bundled stdlib; -S additionally skips site.
+        assert prefix[1:5] == ("-I", "-B", "-S", "-c")
+        assert "def main(" in prefix[5]
         assert prefix[-1] == "--"
 
     def test_tool_profile_carries_limits_and_the_oom_bias(self):

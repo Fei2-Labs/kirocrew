@@ -122,8 +122,26 @@ import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields, fmtPercent } from '../i18n/format'
+import { Badge } from './ui'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
+const providerDisplayName = (providerLabel: string): string => {
+  switch (providerLabel) {
+    case 'acp':
+      return i18nT('pages.settings.chatPanel.backend_kiro_cli')
+    case 'copilot':
+      return i18nT('pages.settings.chatPanel.backend_copilot')
+    case 'kas':
+      return i18nT('pages.settings.chatPanel.backend_kas')
+    case 'opencode':
+      return i18nT('pages.settings.chatPanel.backend_opencode')
+    case 'claude_code':
+      return i18nT('pages.settings.chatPanel.backend_claude_code')
+    default:
+      return providerLabel
+  }
+}
+
 const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
@@ -373,6 +391,8 @@ interface ChatInputProps {
   agentName?: string
   agentSource?: string
   modelName?: string
+  /** Persisted ACP backend identity for this session (for example "opencode"). */
+  providerLabel?: string
   onAgentClick?: (rect: DOMRect) => void
   onModelClick?: (rect: DOMRect) => void
   onProjectClick?: (rect: DOMRect) => void
@@ -726,6 +746,7 @@ function ChatInput({
   agentName,
   agentSource,
   modelName,
+  providerLabel,
   onAgentClick,
   onModelClick,
   onProjectClick,
@@ -3330,7 +3351,7 @@ function ChatInput({
       </AnimatePresence>
 
       {/* Context shelf — plain full-width row below input */}
-      {!showGhost && (onProjectClick || (onModelClick && modelName)) && (
+      {!showGhost && (providerLabel || onProjectClick || (onModelClick && modelName)) && (
         <div ref={shelfRef} className="pt-1 flex items-center gap-2 min-w-0">
           <div className="flex items-center gap-2 min-w-0 flex-1">
           {onAgentClick && agentName && (
@@ -3347,6 +3368,16 @@ function ChatInput({
               <Bot size={13} className="shrink-0 opacity-70" />
               {!shelfCompact && <span className="truncate max-w-[160px]">{agentName}</span>}
             </button>
+          )}
+          {providerLabel && (
+            <Badge
+              variant="muted"
+              className="max-w-[150px] min-w-0 shrink text-[12px] font-body"
+              title={providerDisplayName(providerLabel)}
+              data-testid="provider-label"
+            >
+              <span className="truncate">{providerDisplayName(providerLabel)}</span>
+            </Badge>
           )}
           {onProjectClick && (
           /* Two sibling buttons inside one visual pill, NOT a nested button:

@@ -101,6 +101,7 @@ def _make_state(tmp_path, **kwargs):
     sessions.remove = AsyncMock()
     sessions.recycle_background = AsyncMock()
     sessions.get_pid = MagicMock(return_value=None)
+    sessions.provider_label_for = MagicMock(return_value="")
     # Real in-memory Slack-link store rather than bare MagicMocks. The unlink
     # path unpacks get_slack_link into (thread_ts, channel_id) and branches on
     # whether a link is PRESENT, and a MagicMock satisfies neither: it iterates

@@ -180,8 +180,9 @@ that dir is appended to the MCP spawn `PATH` automatically
 `python -m kiro_crew <sub>` when the `kirocrew.exe` wrapper isn't resolvable.
 In the desktop bundle the relocatable `bin\kirocrew.cmd` shim is preferred
 over `Scripts\kirocrew.exe` (whose embedded interpreter path names the build
-machine) and is unwrapped to `<root>\python.exe -P -s -m kiro_crew <sub>` when
-spawned.
+machine) and is unwrapped to `<root>\python.exe -B -P -s -m kiro_crew <sub>` when
+spawned. `-B` keeps runtime bytecode out of the signed bundle even after managed
+MCP environment scrubbing removes `PYTHONPYCACHEPREFIX`.
 
 ## Kiro sandbox delegation and the unsandboxed-exec opt-in
 

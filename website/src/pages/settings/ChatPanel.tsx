@@ -334,11 +334,12 @@ export function ChatPanel() {
   // source of truth — see acp.types), so a backend that adds a new selectable
   // seam only needs this array updated to expose it here.
   const acpBackend = mcCfg?.agent?.acp_backend ?? ''
-  const ACP_BACKEND_OPTIONS = ['', 'copilot', 'kas']
+  const ACP_BACKEND_OPTIONS = ['', 'copilot', 'kas', 'opencode']
   const acpBackendLabels = [
     i18nT('pages.settings.chatPanel.backend_kiro_cli'),
     i18nT('pages.settings.chatPanel.backend_copilot'),
     i18nT('pages.settings.chatPanel.backend_kas'),
+    i18nT('pages.settings.chatPanel.backend_opencode'),
   ]
   const acpBackendMut = useMutation({
     mutationFn: (v: string) => api.patchConfig('agent.acp_backend', v),

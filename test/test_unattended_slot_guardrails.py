@@ -864,7 +864,7 @@ class TestScopedGrantIsNeverPersisted:
         # The trust/YOLO gate still branches on _slot_is_trusted's verdict; the
         # low-fidelity qualifier only excludes backend-subagent events whose
         # command bytes never reached the caches (see chat_runner).
-        assert "if (slot_trusted or yolo_active) and not _child_low_fidelity:" in src
+        assert "if (slot_trusted or auto_approve_active) and not _child_low_fidelity:" in src
 
     def test_the_runner_writes_the_policy_through_the_helper(self) -> None:
         """Pins the call site, not just the helper.
@@ -874,7 +874,8 @@ class TestScopedGrantIsNeverPersisted:
         assertion above would still pass.
         """
         src = inspect.getsource(chat_runner._run_chat)
-        assert "_persistable_session_policy(slot, state.is_yolo_active())" in src
+        assert "_persistable_session_policy(" in src
+        assert "state.is_yolo_active() or configured_auto_approve" in src
         assert "_slot_is_trusted(slot) or state.is_yolo_active()" not in src
         # Assigned unconditionally, so a turn starting after the grant went away
         # clears a policy an earlier turn stored.

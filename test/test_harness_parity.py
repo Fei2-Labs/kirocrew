@@ -27,19 +27,24 @@ from kiro_crew.acp import client as acp_client
 from kiro_crew.acp import runtime as acp_runtime
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_MODEL_NAMESPACE,
     ACP_BACKENDS_SELECTABLE,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
     PROVIDER_LABEL_CLAUDE,
+    PROVIDER_LABEL_COPILOT,
     PROVIDER_LABEL_DEFAULT,
     PROVIDER_LABEL_KAS,
+    PROVIDER_LABEL_OPENCODE,
 )
 from kiro_crew.config.loader import AgentConfig, _normalize_acp_backend
 from kiro_crew.providers import acp as providers_acp
@@ -117,6 +122,18 @@ def test_enum_and_selectability_are_separate() -> None:
     assert ACP_BACKEND_KIRO in enum
     for value in enum:
         assert _normalize_acp_backend(value) in ACP_BACKENDS_SELECTABLE
+    # And the reverse: every selectable backend must survive schema validation.
+    # A selectable value missing from the enum is DELETED by
+    # ``validate_config_data`` before ``_normalize_acp_backend`` runs, so the
+    # operator's persisted choice silently degrades to kiro with no log line —
+    # the backend looks installed and selectable yet never engages.
+    for backend in ACP_BACKENDS_SELECTABLE:
+        assert backend in enum, (
+            f"selectable backend {backend!r} is missing from the acp_backend "
+            "config enum, so a persisted selection is deleted at validation "
+            "and silently never engages — add it to AgentConfig.acp_backend's "
+            "enum metadata in config/loader.py"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +245,7 @@ def test_capability_sets_are_subsets_of_known_backends() -> None:
         ("ACP_BACKENDS_STEER", ACP_BACKENDS_STEER),
         ("ACP_BACKENDS_INTERNAL_SANDBOX", ACP_BACKENDS_INTERNAL_SANDBOX),
         ("ACP_BACKENDS_ACP_RUNTIME", ACP_BACKENDS_ACP_RUNTIME),
+        ("ACP_BACKENDS_MODEL_NAMESPACE", ACP_BACKENDS_MODEL_NAMESPACE),
     ):
         assert members <= ACP_BACKENDS_KNOWN, f"{name} names an unknown backend"
 
@@ -285,6 +303,8 @@ def test_every_known_backend_has_a_label() -> None:
         ACP_BACKEND_KIRO: PROVIDER_LABEL_DEFAULT,
         ACP_BACKEND_CLAUDE: PROVIDER_LABEL_CLAUDE,
         ACP_BACKEND_KAS: PROVIDER_LABEL_KAS,
+        ACP_BACKEND_COPILOT: PROVIDER_LABEL_COPILOT,
+        ACP_BACKEND_OPENCODE: PROVIDER_LABEL_OPENCODE,
     }
     assert set(labels) == set(ACP_BACKENDS_KNOWN), (
         "a known backend has no PROVIDER_LABEL_* of its own, so it would persist "
@@ -304,6 +324,29 @@ def test_model_preflight_allows_unknown_advertised_set() -> None:
     assert acp_client.model_is_unusable("anything", set()) is False
     assert acp_client.model_is_unusable("anything", None) is False
     assert acp_client.model_is_unusable("absent", {"present"}) is True
+
+
+def test_model_namespace_membership() -> None:
+    """H12: the pre-flight namespace set names exactly the backends whose
+    advertised ids are the ids their own ``session/set_model`` accepts.
+
+    The claude seam must NOT be a member: it advertises bare ids
+    (``claude-opus-4-8[1m]``) while the configured model is the prefixed
+    provider id, so a membership test across those namespaces withholds every
+    legitimate model. copilot and opencode MUST be members — their advertised
+    ``provider/model`` ids are exactly what their ``session/set_model``
+    accepts, so a config carrying a kiro-namespace id (e.g.
+    ``agents.default.model = claude-opus-4.6``) must be withheld at startup
+    rather than sent and rejected by the backend.
+    """
+    assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_MODEL_NAMESPACE
+    for backend in (
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_COPILOT,
+        ACP_BACKEND_OPENCODE,
+    ):
+        assert backend in ACP_BACKENDS_MODEL_NAMESPACE
 
 
 # ---------------------------------------------------------------------------

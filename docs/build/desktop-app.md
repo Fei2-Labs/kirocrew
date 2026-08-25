@@ -317,7 +317,26 @@ same way). Key details:
 - **Interpreter** is a python-build-standalone CPython 3.12 with `@executable_path`-
   relative dylib references (genuinely portable, no system Python dependency).
 - **Entry point** is `bin/kirocrew` — a shell script that execs
-  `bin/python3.12 -s -m kiro_crew "$@"`.
+  `bin/python3.12 -B -s -m kiro_crew "$@"`. The interpreter-level `-B` is the
+  immutable signed-bundle floor: it survives environment scrubbing in managed MCP
+  probe and pooled-backend paths.
+- **Bytecode stays outside the signed resources** — Electron exports
+  `PYTHONPYCACHEPREFIX=<data home>/cache/pycache` for the gateway interpreter, so
+  ordinary imports cannot create `__pycache__` under `backend-dist/`. Gateway
+  helpers that deliberately launch `sys.executable -I` cannot rely on that
+  variable because isolated mode ignores every `PYTHON*` environment setting;
+  the prerequisite process-group supervisor, Linux namespace probe, resource-limit
+  spawn shim, and bounded regex evaluator therefore add the interpreter-level
+  `-B` flag. Each isolated interpreter must carry its own `-B`: the flag is not
+  inherited by a later `exec()` of `sys.executable`. App backend children are not
+  isolated interpreters; their `minimal_env()` allowlist instead preserves the
+  cache prefix because a builtin backend can fall back to the same bundled
+  interpreter. Managed MCP discovery probes and pooled backends deliberately scrub
+  inherited Python variables, including the cache prefix; the bundled console
+  launcher therefore carries its own `-B`, and Windows paths that unwrap the `.cmd`
+  shim repeat that flag explicitly. Third-party and customized probes remain fully
+  scrubbed. Together these paths keep normal startup from changing sealed resources
+  after codesigning.
 - **Stdlib probes verified** — `stdlib_probe_gate` fails the build if any package
   the launcher's readiness check probes is missing from the pruned tree, so a
   drifted probe list breaks the build instead of every user's launch (see

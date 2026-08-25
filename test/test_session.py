@@ -1551,6 +1551,44 @@ class TestRecordSuccessFailure:
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         assert mgr.get_provider("nonexistent") is None
 
+    def test_provider_label_for_reads_persisted_backend_identity(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._session_map = MagicMock()
+        mgr._session_map.has_hint.return_value = True
+        mgr._session_map.get_provider.return_value = "opencode"
+
+        assert mgr.provider_label_for("dashboard:chat-1") == "opencode"
+        mgr._session_map.get_provider.assert_called_once_with("dashboard:chat-1")
+
+    def test_provider_label_for_normalizes_legacy_kiro_entry(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._session_map = MagicMock()
+        mgr._session_map.has_hint.return_value = True
+        mgr._session_map.get_provider.return_value = ""
+
+        assert mgr.provider_label_for("dashboard:chat-1") == "acp"
+
+    def test_provider_label_for_returns_empty_for_unbound_session(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._session_map = MagicMock()
+        mgr._session_map.has_hint.return_value = False
+
+        assert mgr.provider_label_for("dashboard:chat-1") == ""
+        mgr._session_map.get_provider.assert_not_called()
+
+    def test_provider_label_for_prefers_live_provider(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider = MagicMock()
+        mgr.get_provider = MagicMock(return_value=provider)
+        mgr._session_map = MagicMock()
+
+        with patch("kiro_crew.session._provider_label", return_value="opencode") as label:
+            assert mgr.provider_label_for("dashboard:chat-1") == "opencode"
+
+        label.assert_called_once_with(provider)
+        mgr._session_map.has_hint.assert_not_called()
+        mgr._session_map.get_provider.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_pool_size_clamping(self, cfg, caplog):
         cfg.session.pool_size = 999

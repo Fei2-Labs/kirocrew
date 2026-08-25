@@ -174,6 +174,12 @@ class TestEnvHelpers:
         monkeypatch.setenv("PATH", "/usr/bin")
         assert registry.minimal_env(PATH="/opt/bin")["PATH"] == "/opt/bin"
 
+    def test_minimal_env_keeps_external_bytecode_cache(self, monkeypatch):
+        cache_dir = "/writable/kirocrew/cache/pycache"
+        monkeypatch.setenv("PYTHONPYCACHEPREFIX", cache_dir)
+
+        assert registry.minimal_env()["PYTHONPYCACHEPREFIX"] == cache_dir
+
     def test_anonymous_git_env_strips_credential_carriers(self, monkeypatch):
         monkeypatch.setenv("PATH", "/usr/bin")
         monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")

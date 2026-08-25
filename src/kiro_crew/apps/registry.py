@@ -166,6 +166,10 @@ _SAFE_ENV_KEYS = frozenset(
         "NODE_PATH",
         "NVM_DIR",
         "PYTHONPATH",
+        # Desktop points this at the writable data home. App backends may use
+        # the bundled sys.executable, so dropping it would write bytecode beside
+        # signed package sources and invalidate the application signature.
+        "PYTHONPYCACHEPREFIX",
         "VIRTUAL_ENV",
         "CONDA_DEFAULT_ENV",
         "CONDA_PREFIX",

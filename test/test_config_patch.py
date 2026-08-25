@@ -636,6 +636,15 @@ class TestDefaultModelPatch:
         assert "model" not in data["agent"]
 
     @pytest.mark.asyncio
+    async def test_opencode_provider_model_id_persists(self, tmp_config) -> None:
+        app, _ = _make_app_with_sessions()
+        model = "swedeapi/moonshotai/Kimi-K3"
+        async with TestClient(TestServer(app)) as c:
+            assert (await _patch(c, "agent.model", model)).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["model"] == model
+
+    @pytest.mark.asyncio
     async def test_overlong_id_rejected(self, tmp_config) -> None:
         app, _ = _make_app_with_sessions()
         async with TestClient(TestServer(app)) as c:

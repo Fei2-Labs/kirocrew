@@ -113,10 +113,11 @@ function renderChatPage(opts: {
   mode?: string
   activeSlot?: string | null
   slots?: ChatSlot[]
+  creatingSlot?: boolean
   /** Render the companion-panel variant on a HOST route (see the noUrlSync suite). */
   hostEmbed?: { noUrlSync?: boolean }
 }) {
-  const { route = '/chat', entries, mode, activeSlot = null, slots = [], hostEmbed } = opts
+  const { route = '/chat', entries, mode, activeSlot = null, slots = [], creatingSlot = false, hostEmbed } = opts
   const preload: PreloadState = {
     dashboard: {
       status: { platform: 'darwin' }, connected: true, slots, approvalMode: 'normal',
@@ -130,7 +131,7 @@ function renderChatPage(opts: {
       lastChunkSeq: undefined, history: [], historyHasMore: false, historyOffset: 0,
       pendingInput: null, slotContextPct: {}, voicePlaying: false, voiceAudio: null,
       subagents: {}, toolLog: [], activityOpen: false, activityTab: 'logs', slotActivity: {}, slotHistory: [],
-      slotMessages: {}, slotLoading: false,
+      slotMessages: {}, slotLoading: false, creatingSlot,
     },
   }
   const store = createTestStore(preload as Partial<RootState>)
@@ -606,5 +607,38 @@ describe('late slot-list load does not override a user switch (deep-link race)',
     // The late deep-link activation MUST NOT revert to chat-1-100.
     await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2-200'))
     expect(store.getState().chat.activeSlot).not.toBe('chat-1-100')
+  })
+})
+
+// Regression: while a createSlot thunk is in flight (chat.creatingSlot: true)
+// and the optimistic new slot is already in the list, the auto-select effect
+// must NOT read stale localStorage and switchSlot onto an OLDER session — the
+// thunk's own fulfilled handler must activate the new slot once it resolves.
+describe('creatingSlot holds auto-select off a stale localStorage session', () => {
+  it('keeps the new session eligible for activation after creation resolves', async () => {
+    const fresh = slot('chat-9-900', 'Fresh New')
+    // Stale localStorage names an older session that IS in the slot list.
+    localStorage.setItem('mc-active-slot-chat', 'chat-1-100')
+    const { store } = renderChatPage({
+      route: '/chat',
+      slots: [...slots, fresh],
+      creatingSlot: true,
+    })
+    expect(store.getState().chat.creatingSlot).toBe(true)
+    // Let effects settle. The guard prevents a switchSlot fetch for the stale key.
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+    expect(detailCalls()).not.toContain('chat-1-100')
+    expect(store.getState().chat.activeSlot).toBeNull()
+
+    // createSlot.fulfilled clears the guard and claims the newly created slot.
+    await act(async () => {
+      store.dispatch({
+        type: 'chat/createSlot/fulfilled',
+        payload: fresh,
+        meta: { requestStatus: 'fulfilled', originActiveSlot: null, activate: true },
+      })
+    })
+    expect(store.getState().chat.creatingSlot).toBe(false)
+    expect(store.getState().chat.activeSlot).toBe('chat-9-900')
   })
 })

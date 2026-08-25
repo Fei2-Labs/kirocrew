@@ -44,6 +44,7 @@ from kiro_crew.acp.client import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_OPENCODE,
     EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_MCP_OAUTH_REQUEST,
@@ -481,6 +482,55 @@ class TestModelAndConfigGuards:
         )
         assert client._model == "global.anthropic.claude-sonnet-4-6"
         assert client._resolved_model_id == "global.anthropic.claude-sonnet-4-6"
+
+    def test_reads_enabled_opencode_models_without_credential_fields(self, tmp_path, monkeypatch):
+        config_dir = tmp_path / ".config" / "opencode"
+        config_dir.mkdir(parents=True)
+        (config_dir / "opencode.json").write_text(
+            json.dumps(
+                {
+                    "provider": {
+                        "swedeapi": {
+                            "apiKey": "must-not-reach-model-list",
+                            "models": {
+                                "gpt-5.6-sol": {},
+                                "disabled": {"disabled": True},
+                            },
+                        }
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(acp_client.Path, "home", lambda: tmp_path)
+
+        assert acp_client._configured_opencode_models() == [
+            {
+                "modelId": "swedeapi/gpt-5.6-sol",
+                "name": "gpt-5.6-sol",
+                "description": "",
+            }
+        ]
+
+    def test_configured_opencode_models_extend_current_acp_model(self, tmp_path):
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
+        client._capture_available_models(
+            {"models": {"availableModels": [{"modelId": "opencode/hy3-free"}]}}
+        )
+
+        client.add_configured_opencode_models(
+            [
+                {"modelId": "swedeapi/gpt-5.6-sol", "name": "GPT 5.6 Sol"},
+                {"modelId": "swedeapi/moonshotai/Kimi-K3", "name": "Kimi K3"},
+                {"modelId": "not a model", "name": "Ignored"},
+                {"modelId": "opencode/hy3-free", "name": "Duplicate"},
+            ]
+        )
+
+        assert [model["modelId"] for model in client.available_models()] == [
+            "opencode/hy3-free",
+            "swedeapi/gpt-5.6-sol",
+            "swedeapi/moonshotai/Kimi-K3",
+        ]
 
     def test_capture_available_models_tolerates_odd_payloads(self, tmp_path):
         client = _client(tmp_path)

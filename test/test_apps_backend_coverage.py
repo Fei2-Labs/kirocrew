@@ -1073,6 +1073,21 @@ class TestSpawnEnvironment:
         assert env["KIROCREW_PROXY_SECRET"] == "s3cr3t"
         assert env["KIROCREW_APP_NAME"] == "envapp"
 
+    def test_external_bytecode_cache_reaches_python_backend(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bundled Python must not write bytecode beside signed package sources."""
+
+        (spawn_root / "server.py").write_text("x = 1\n")
+        cache_dir = "/writable/kirocrew/cache/pycache"
+        monkeypatch.setenv("PYTHONPYCACHEPREFIX", cache_dir)
+        seen = _capture_popen(monkeypatch)
+
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("pycache-app", _manifest("server.py"))
+
+        assert seen["kwargs"]["env"]["PYTHONPYCACHEPREFIX"] == cache_dir
+
     def test_a_missing_proxy_secret_is_tolerated(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:

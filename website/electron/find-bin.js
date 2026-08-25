@@ -90,7 +90,7 @@ function findKirocrewBin(
     path.resolve(dirname, "backend-dist", "kirocrew-backend", "bin", "kirocrew.cmd"),
     // 3. Bundled POSIX layout (packaging/build-desktop.sh): a
     //    python-build-standalone interpreter copied into backend-dist with a
-    //    `bin/kirocrew` launcher wrapper (exec python3.12 -s -m kiro_crew).
+    //    `bin/kirocrew` launcher wrapper (exec python3.12 -B -s -m kiro_crew).
     //    This is what a freshly-built .app actually ships. Keep this in sync
     //    with build-desktop.sh's BACKEND_OUT/bin/kirocrew path.
     path.join(resourcesPath || "", "backend-dist", "kirocrew-backend", "bin", "kirocrew"),

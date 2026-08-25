@@ -611,6 +611,7 @@ export default function ChatPane({
           agentName={paneSlot?.agent || 'default'}
           agentSource={installedAgents.find((a) => a.name === (paneSlot?.agent || 'default'))?.source}
           modelName={shownModel}
+          providerLabel={paneSlot?.provider_label}
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}

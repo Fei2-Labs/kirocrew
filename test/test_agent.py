@@ -1119,7 +1119,7 @@ class TestKirocrewBinSubpath:
         monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
         (tmp_path / "bin").mkdir()
         cmd_shim = tmp_path / "bin" / "kirocrew.cmd"
-        cmd_shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        cmd_shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -B -s -m kiro_crew %*\r\n')
         (tmp_path / "Scripts").mkdir()
         (tmp_path / "Scripts" / "kirocrew.exe").write_bytes(b"MZ")
         assert _kirocrew_bin_subpath(tmp_path) == cmd_shim
@@ -1150,7 +1150,7 @@ class TestKirocrewBinSubpath:
         from kiro_crew.agent import _bin_is_usable
 
         shim = tmp_path / "kirocrew.cmd"
-        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -B -s -m kiro_crew %*\r\n')
         assert _bin_is_usable(shim) is True
 
     def test_resolver_walk_finds_cmd_shim_in_bundle_layout(self, tmp_path: Path, monkeypatch):
@@ -1175,7 +1175,7 @@ class TestKirocrewBinSubpath:
         (pkg_dir / "__init__.py").write_text("")
         (root / "bin").mkdir()
         cmd_shim = root / "bin" / "kirocrew.cmd"
-        cmd_shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        cmd_shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -B -s -m kiro_crew %*\r\n')
         # The test host is POSIX, where the resolver's X_OK gate is real.
         cmd_shim.chmod(0o755)
         (root / "Scripts").mkdir()
@@ -1228,7 +1228,7 @@ class TestKirocrewMcpInvocation:
         """A resolved bin/kirocrew.cmd is never emitted verbatim (#4439).
 
         Mirrors website/electron/main.js: the shim is unwrapped to
-        ``<root>/python.exe -s -m kiro_crew <sub>`` so kiro-cli spawns the
+        ``<root>/python.exe -B -s -m kiro_crew <sub>`` so kiro-cli spawns the
         interpreter, not a batch file.
         """
         from kiro_crew.agent import _kirocrew_mcp_invocation
@@ -1236,7 +1236,7 @@ class TestKirocrewMcpInvocation:
         root = tmp_path / "kirocrew-backend"
         (root / "bin").mkdir(parents=True)
         shim = root / "bin" / "kirocrew.cmd"
-        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -B -s -m kiro_crew %*\r\n')
         interpreter = root / "python.exe"
         interpreter.write_bytes(b"MZ")
         interpreter.chmod(0o755)  # X_OK is real on the POSIX test host
@@ -1244,9 +1244,10 @@ class TestKirocrewMcpInvocation:
         with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value=str(shim)):
             cmd, args = _kirocrew_mcp_invocation("mcp-cron")
         assert cmd == str(interpreter)
-        # -P keeps the spawn CWD off sys.path (the bundle interpreter is
-        # pinned 3.12, so the 3.11+ flag is safe); -s drops user site-packages.
-        assert args == ["-P", "-s", "-m", "kiro_crew", "mcp-cron"]
+        # -B keeps the signed bundle immutable even after Python env scrubbing;
+        # -P keeps the spawn CWD off sys.path (the bundle interpreter is pinned
+        # 3.12, so the 3.11+ flag is safe); -s drops user site-packages.
+        assert args == ["-B", "-P", "-s", "-m", "kiro_crew", "mcp-cron"]
 
     def test_cmd_shim_without_interpreter_falls_back_to_sys_executable(self, tmp_path: Path):
         """Corrupted bundle: shim present but python.exe missing -> sys.executable."""
@@ -1255,7 +1256,7 @@ class TestKirocrewMcpInvocation:
         root = tmp_path / "kirocrew-backend"
         (root / "bin").mkdir(parents=True)
         shim = root / "bin" / "kirocrew.cmd"
-        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -B -s -m kiro_crew %*\r\n')
 
         with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value=str(shim)):
             cmd, args = _kirocrew_mcp_invocation("mcp-core")

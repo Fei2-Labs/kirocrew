@@ -623,7 +623,7 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
 
     A resolved ``bin\\kirocrew.cmd`` (the Windows bundle's relocatable shim,
     see :func:`_kirocrew_bin_subpath`) is unwrapped to the sibling
-    interpreter — ``<root>\\python.exe -P -s -m kiro_crew <sub>`` — instead of
+    interpreter — ``<root>\\python.exe -B -P -s -m kiro_crew <sub>`` — instead of
     being emitted verbatim. This mirrors ``website/electron/main.js``, which
     refuses to spawn the shim it resolved (Node's ``spawn()`` rejects
     ``.cmd``/``.bat`` without ``shell:true``, CVE-2024-27980 hardening) and
@@ -649,7 +649,7 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
             # generic ``sys.executable`` fallbacks below and above stay
             # ``-P``-free because the project still supports Python 3.10,
             # which lacks the flag.
-            return str(interpreter), ["-P", "-s", "-m", "kiro_crew", subcommand]
+            return str(interpreter), ["-B", "-P", "-s", "-m", "kiro_crew", subcommand]
         return sys.executable, ["-m", "kiro_crew", subcommand]
     return bin_path, [subcommand]
 

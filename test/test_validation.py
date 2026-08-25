@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from unittest.mock import patch
+
 import pytest
 
+from kiro_crew import validation as validation_module
 from kiro_crew.validation import (
     ARTIFACT_SAVE_SCHEMA,
     CHANNEL_ID_RE,
@@ -979,6 +984,20 @@ class TestValidateMcpToolArguments:
                      {"type": "object",
                       "properties": {"s": {"type": "string", "pattern": "x+"}}},
                      "could not be safely evaluated")
+
+    def test_pattern_child_disables_bytecode_writes(self):
+        """Isolated mode ignores PYTHONPYCACHEPREFIX, so the child also needs -B."""
+        completed = subprocess.CompletedProcess(args=[], returncode=0)
+        with patch.object(validation_module.subprocess, "run", return_value=completed) as run:
+            assert validation_module._bounded_pattern_search("x", "x") is True
+
+        assert run.call_args.args[0] == [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            validation_module._PATTERN_CHILD_SRC,
+        ]
 
     def test_exclusive_bounds_min_items_unique(self):
         schema = {

@@ -475,7 +475,7 @@ def _bounded_pattern_search(pattern: str, value: str) -> bool | None:
         return None
     try:
         proc = subprocess.run(  # noqa: S603 — fixed argv, own interpreter
-            [sys.executable, "-I", "-c", _PATTERN_CHILD_SRC],
+            [sys.executable, "-I", "-B", "-c", _PATTERN_CHILD_SRC],
             input=json.dumps({"p": pattern, "v": value}).encode("utf-8"),
             capture_output=True,
             timeout=_PATTERN_TIMEOUT_SECS,

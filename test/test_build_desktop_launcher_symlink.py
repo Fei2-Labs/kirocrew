@@ -191,7 +191,7 @@ def test_resolves_through_symlink_chain(tmp_path):
 def test_forwards_arguments_through_symlink(tmp_path):
     """Resolution is worthless if the argv is mangled on the way through.
 
-    Asserts the module invocation contract (``-s -m kiro_crew``) and that a
+    Asserts the module invocation contract (``-B -s -m kiro_crew``) and that a
     quoted argument containing a space survives as ONE argument.
     """
     bundle = tmp_path / "bundle"
@@ -202,7 +202,7 @@ def test_forwards_arguments_through_symlink(tmp_path):
     proc = _invoke(shim, "config", "set", "a b")
 
     assert proc.returncode == 0, proc.stderr
-    assert "ARGS=-s -m kiro_crew config set a b" in proc.stdout, proc.stdout
+    assert "ARGS=-B -s -m kiro_crew config set a b" in proc.stdout, proc.stdout
 
     # And the word-splitting guard: "$@" (not $@) keeps "a b" a single argv entry.
     stub = bundle / "bin" / "python3.12"
@@ -210,8 +210,8 @@ def test_forwards_arguments_through_symlink(tmp_path):
     stub.chmod(0o755)
     proc = _invoke(shim, "config", "set", "a b")
     assert proc.returncode == 0, proc.stderr
-    # -s, -m, kiro_crew, config, set, "a b" == 6
-    assert "COUNT=6" in proc.stdout, proc.stdout
+    # -B, -s, -m, kiro_crew, config, set, "a b" == 7
+    assert "COUNT=7" in proc.stdout, proc.stdout
 
 
 def test_launcher_keeps_the_symlink_walk(tmp_path):
@@ -235,3 +235,15 @@ def test_launcher_keeps_the_symlink_walk(tmp_path):
     assert 'DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' not in launcher, (
         "launcher reverted to the naive BASH_SOURCE form that broke issue #845"
     )
+
+
+def test_every_bundled_python_entry_disables_bytecode_writes():
+    """Signed bundle entry points carry ``-B`` independent of child env scrubs."""
+    build_script = SCRIPT.read_text()
+    electron_main = (
+        Path(__file__).parent.parent / "website" / "electron" / "main.js"
+    ).read_text()
+
+    assert 'exec "$DIR/python3.12" -B -s -m kiro_crew "$@"' in build_script
+    assert '"%%~dp0..\\\\python.exe" -B -s -m kiro_crew %%*' in build_script
+    assert 'spawnArgs = ["-B", "-s", "-m", "kiro_crew", ...spawnArgs]' in electron_main
