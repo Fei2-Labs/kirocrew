@@ -29,6 +29,17 @@ This is a downstream fork. Core architecture, docs, and behavior track
 repository for the full documentation tree. Fork-specific additions (Copilot and
 BYOK integration) are documented here.
 
+## Contributors
+
+Thank you to everyone who has opened a merged pull request against this
+fork. Upstream Kiro Crew credits its own contributors in the
+[upstream README](https://github.com/kirodotdev/KiroCrew#contributors).
+
+<a href="https://github.com/clarezoe" title="clarezoe"><img src="https://github.com/clarezoe.png?size=64" width="64" height="64" alt="clarezoe" /></a>
+
+If you contributed and would like to be credited differently or removed,
+please open an issue or a pull request.
+
 ## License
 
 Inherited from upstream Kiro Crew.
