@@ -99,18 +99,28 @@ describe('ChatInput — hold-to-talk mode', () => {
   // capture keeps running.
   it('keeps the hold target mounted when a streaming partial lands mid-capture', () => {
     localStorage.setItem('mc-voice-mode', '1')
+    const startFn = vi.fn(() => Promise.resolve())
     const { rerender } = renderWithProviders(
-      <ChatInput {...base} {...voiceProps} voiceRecording />,
+      <ChatInput {...base} {...voiceProps} onVoiceStart={startFn} voiceCaptureActive />,
     )
-    expect(screen.getByTestId('hold-to-talk')).toBeTruthy()
+    const bar = screen.getByTestId('hold-to-talk') as HTMLButtonElement
+    expect(bar).toBeTruthy()
 
-    // A partial arrives: the composer now holds text, but the finger is still down.
-    rerender(<ChatInput {...base} {...voiceProps} voiceRecording value="arm auto merge on" />)
+    // A real pointer gesture initiates capture — this is what sets touchPtt.owns.
+    fireEvent.pointerDown(bar, { pointerId: 1, pointerType: 'touch', isPrimary: true, clientY: 400 })
+
+    // Re-render with the capture now gated (voiceRecording) and a streaming partial.
+    rerender(
+      <ChatInput {...base} {...voiceProps} onVoiceStart={startFn} voiceRecording voiceCaptureActive value="arm auto merge on" />,
+    )
     expect(screen.getByTestId('hold-to-talk')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Switch to keyboard' })).toBeTruthy()
 
+    // Release the gesture.
+    fireEvent.pointerUp(bar, { pointerId: 1, pointerType: 'touch', isPrimary: true, clientY: 400 })
+
     // Capture ends — only now may the draft reclaim the textarea.
-    rerender(<ChatInput {...base} {...voiceProps} value="arm auto merge on" />)
+    rerender(<ChatInput {...base} {...voiceProps} onVoiceStart={startFn} value="arm auto merge on" />)
     expect(screen.queryByTestId('hold-to-talk')).toBeNull()
   })
 
@@ -121,18 +131,23 @@ describe('ChatInput — hold-to-talk mode', () => {
   // veto answer "no capture" for audio that exists.
   it('keeps the hold target mounted on ungated capture, before ownership lands', () => {
     localStorage.setItem('mc-voice-mode', '1')
+    const startFn = vi.fn(() => Promise.resolve())
     // Hold mode must be established FIRST. Rendering straight into a draft with
     // capture live is the *other* scenario — dictation started from the mic over a
     // draft — and asserting the bar there is what locked in an unstoppable mic.
     const { rerender } = renderWithProviders(
-      <ChatInput {...base} {...voiceProps} voiceRecording={false} voiceCaptureActive />,
+      <ChatInput {...base} {...voiceProps} onVoiceStart={startFn} voiceRecording={false} voiceCaptureActive />,
     )
-    expect(screen.getByTestId('hold-to-talk')).toBeTruthy()
+    const bar = screen.getByTestId('hold-to-talk') as HTMLButtonElement
+    expect(bar).toBeTruthy()
+
+    // A real pointer gesture initiates capture — this is what sets touchPtt.owns.
+    fireEvent.pointerDown(bar, { pointerId: 1, pointerType: 'touch', isPrimary: true, clientY: 400 })
 
     // Ownership has not landed yet (`voiceRecording` still false) while a partial
-    // already fills the composer: the bar must survive on the ungated flag alone.
+    // already fills the composer: the bar must survive on the touch ownership.
     rerender(
-      <ChatInput {...base} {...voiceProps} voiceRecording={false} voiceCaptureActive value="a streaming partial" />,
+      <ChatInput {...base} {...voiceProps} onVoiceStart={startFn} voiceRecording={false} voiceCaptureActive value="a streaming partial" />,
     )
     expect(screen.getByTestId('hold-to-talk')).toBeTruthy()
   })
@@ -152,6 +167,55 @@ describe('ChatInput — hold-to-talk mode', () => {
     expect((stop as HTMLButtonElement).disabled).toBe(false)
   })
 
+  // The scenario from the issue: a coarse-pointer device with a hardware keyboard
+  // (e.g. iPad with a keyboard case). Hold mode is on and the composer is empty,
+  // so the bar is mounted. The user starts dictation with the KEYBOARD push-to-talk
+  // binding. A streaming partial lands, giving the composer a draft. Without the
+  // ownership gate, voiceHoldMode stayed true because `holdTarget !== null`. With
+  // the fix, `touchPtt.owns` is false because no pointer gesture was fired, and
+  // voiceHoldMode becomes false once the draft arrives.
+  it('does not promote composer into hold mode when keyboard PTT starts capture on a touch device', () => {
+    localStorage.setItem('mc-voice-mode', '1')
+    // Hold mode on, composer empty — bar is mounted.
+    const { rerender } = renderWithProviders(
+      <ChatInput {...base} {...voiceProps} />,
+    )
+    expect(screen.getByTestId('hold-to-talk')).toBeTruthy()
+
+    // Keyboard binding starts capture (voiceCaptureActive true), no pointer gesture
+    // on the hold target. A streaming partial arrives in the composer value.
+    rerender(
+      <ChatInput {...base} {...voiceProps} voiceCaptureActive voiceRecording value="a streaming partial from keyboard" />,
+    )
+
+    // touchPtt.owns is false (no gesture), so the draft suspends hold mode.
+    // The hold target should NOT remain mounted.
+    expect(screen.queryByTestId('hold-to-talk')).toBeNull()
+  })
+
+  // The drain-window settling hint ("Finishing...") should only appear for captures
+  // the touch gesture owns. If capture was started by the keyboard binding (no
+  // pointer gesture), the bar must not show settling even when recording is true.
+  it('shows settling hint only for touch-owned captures, not keyboard-started ones', () => {
+    localStorage.setItem('mc-voice-mode', '1')
+    // Hold mode on, composer empty. Keyboard starts capture (no pointer gesture).
+    const { rerender } = renderWithProviders(
+      <ChatInput {...base} {...voiceProps} />,
+    )
+    expect(screen.getByTestId('hold-to-talk')).toBeTruthy()
+
+    // Keyboard-initiated capture: voiceRecording=true but no pointer gesture was
+    // fired. The composer is still empty so hold mode stays on.
+    rerender(
+      <ChatInput {...base} {...voiceProps} voiceCaptureActive voiceRecording />,
+    )
+
+    // The bar should exist (hold mode still on — no draft), but should NOT show
+    // "settling" or "Finishing" because the touch hook does not own this capture.
+    const bar = screen.getByTestId('hold-to-talk')
+    expect(bar.textContent).not.toContain('Finishing')
+  })
+
   // Label, icon, action and disabled state all come from one predicate, because
   // deriving them separately is how a control comes to say one thing and do
   // another. The path that caught it: a streaming partial lands mid-capture, so the
@@ -160,16 +224,22 @@ describe('ChatInput — hold-to-talk mode', () => {
   // stopped the recording instead.
   it('keeps the mic label and its action in agreement during streaming capture', () => {
     localStorage.setItem('mc-voice-mode', '1')
-    // Establish hold mode before the draft exists, so this is a transcript landing
-    // mid-gesture rather than dictation started over a draft.
+    const startFn = vi.fn(() => Promise.resolve())
+    // Establish hold mode before the draft exists.
     const { rerender } = renderWithProviders(
-      <ChatInput {...base} {...voiceProps} voiceRecording voiceCaptureActive />,
+      <ChatInput {...base} {...voiceProps} onVoiceStart={startFn} voiceCaptureActive />,
     )
+    const bar = screen.getByTestId('hold-to-talk') as HTMLButtonElement
+
+    // A real pointer gesture sets touchPtt.owns.
+    fireEvent.pointerDown(bar, { pointerId: 1, pointerType: 'touch', isPrimary: true, clientY: 400 })
+
+    // Now capture is fully live and a streaming partial arrives.
     rerender(
-      <ChatInput {...base} {...voiceProps} voiceRecording voiceCaptureActive value="a streaming partial" />,
+      <ChatInput {...base} {...voiceProps} onVoiceStart={startFn} voiceRecording voiceCaptureActive value="a streaming partial" />,
     )
 
-    // Hold mode survives the draft while capture is live, so this is still a switch.
+    // Hold mode survives the draft while touch-owned capture is live, so this is still a switch.
     const mic = screen.getByRole('button', { name: 'Switch to keyboard' })
     // ...and a mode cannot be changed mid-capture, so the switch is disabled rather
     // than silently doing the other job.

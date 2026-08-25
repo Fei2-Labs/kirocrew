@@ -111,6 +111,16 @@ export interface TouchPushToTalkState {
    * and has not yet promised anything.
    */
   bar: HoldBarState
+  /**
+   * Whether this gesture currently owns the capture session.
+   *
+   * A state mirror of `ownerRef` — true when the gesture owns the session
+   * (`ownerRef === 'gesture'`), false otherwise. The consumer reads this to
+   * distinguish a capture started by the touch gesture from one started by
+   * another route (keyboard PTT, mic button), without inferring ownership from
+   * a mounted DOM node or a recording flag.
+   */
+  owns: boolean
 }
 
 export function useTouchPushToTalk(
@@ -147,6 +157,7 @@ export function useTouchPushToTalk(
   const armTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const capTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const ownerRef = useRef<'gesture' | null>(null)
+  const [owns, setOwnsState] = useState(false)
   const startPendingRef = useRef(false)
   /**
    * This gesture committed and its capture has not finished draining yet.
@@ -252,6 +263,7 @@ export function useTouchPushToTalk(
    *  anything. */
   const setOwner = useCallback((owner: 'gesture' | null) => {
     ownerRef.current = owner
+    setOwnsState(owner !== null)
     if (owner === null) {
       startSeqRef.current++
       startPendingRef.current = false
@@ -502,5 +514,5 @@ export function useTouchPushToTalk(
           ? 'tap-too-short'
           : 'idle'
 
-  return { phase, holding: phase === 'holding', armedCancel, bar }
+  return { phase, holding: phase === 'holding', armedCancel, bar, owns }
 }

@@ -2360,26 +2360,8 @@ function ChatInput({
   const transcribeInFlight = voiceTranscribeActive ?? voiceTranscribing
   /** State, not a ref: the hold target mounts only once hold mode is on, and the
    *  gesture hook can only bind its listeners when that arrival is observable.
-   *  Declared above `voiceHoldMode` because that predicate reads it — see there. */
+   *  Declared above the hook call because the hook binds to this element. */
   const [holdTarget, setHoldTarget] = useState<HTMLButtonElement | null>(null)
-  /*
-   * A draft suspends hold mode, EXCEPT while the gesture's own capture is still
-   * running — otherwise a transcript landing in the composer would unmount the
-   * bar from under the finger that is still holding it.
-   *
-   * `holdTarget !== null` is what distinguishes the gesture's capture from any
-   * other, and it has to be asked: `captureInFlight` alone also matches capture
-   * started from the mic-as-record-button, which is the ONLY dictation route a
-   * draft leaves open. That capture would then promote a draft composer into
-   * hold mode, where the bar renders `settling` (disabled) and the mic renders a
-   * disabled mode switch — an open microphone with nothing on screen that can
-   * stop it. The bar only exists while hold mode is already on, so its target is
-   * the memory of which route opened this capture, and it survives into the
-   * render that observes `captureInFlight` because unmounting it is what clears
-   * it.
-   */
-  const voiceHoldMode = voiceModeAvailable && voiceModePref
-    && (!composerHasDraft || (captureInFlight && holdTarget !== null))
   const touchVoice = useMemo(
     () => ({
       recording: captureInFlight,
@@ -2391,8 +2373,25 @@ function ChatInput({
   )
   const touchPtt = useTouchPushToTalk(touchVoice, {
     target: holdTarget,
-    disabled: !voiceHoldMode || disabled || transcribeInFlight || optimizing,
+    disabled: disabled || transcribeInFlight || optimizing,
   })
+  /*
+   * A draft suspends hold mode, EXCEPT while the gesture's own capture is still
+   * running — otherwise a transcript landing in the composer would unmount the
+   * bar from under the finger that is still holding it.
+   *
+   * `touchPtt.owns` is the direct ownership signal from the hook: it is true
+   * when the touch gesture started this capture, and false otherwise. This
+   * replaces the earlier proxy (`holdTarget !== null`, meaning "the bar is
+   * mounted") which could not distinguish a keyboard-started capture on a device
+   * with both inputs from one the touch gesture owns. The hook already cannot be
+   * live outside hold mode — it binds to `holdTarget`, which only renders under
+   * `voiceHoldMode &&` — so the redundant `!voiceHoldMode` term that previously
+   * existed in its `disabled` prop is no longer needed and the declaration cycle
+   * that required it is broken.
+   */
+  const voiceHoldMode = voiceModeAvailable && voiceModePref
+    && (!composerHasDraft || (captureInFlight && touchPtt.owns))
   /**
    * True when the mic press changes MODE rather than starting a recording.
    *
