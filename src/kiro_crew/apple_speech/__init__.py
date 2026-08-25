@@ -389,33 +389,12 @@ def _drop_sandbox_launcher(path: str | None) -> None:
 async def _sandboxed_off_loop(argv: list[str]) -> tuple[list[str], dict[str, str], str | None]:
     """Offload :func:`_sandboxed` to a worker thread without a cancellation leak.
 
-    A plain ``asyncio.to_thread`` hop is the leak: cancelling the awaiting
-    coroutine abandons the hop while the worker thread is still inside
-    ``sandboxed_spawn_argv``, the thread goes on to materialize the
-    launcher/profile, and the returned tuple is never bound — so no ``finally``
-    and no session field can ever reach the cleanup path. Shielding the hop
-    keeps the worker's result recoverable: on cancellation, wait for it to
-    settle, drop the launcher it made, then re-raise. Same shape as
-    ``kiro_prerequisite``'s sandboxed-spawn preparation.
-
-    ``SandboxUnavailableError`` still propagates to the caller unchanged — the
-    shield only intercepts cancellation, and that raise carries no tuple and
-    hence no file to drop.
+    Delegates to the shared :func:`sandbox.sandboxed_spawn_argv_off_loop` which
+    owns the shield-and-recover pattern for every async caller of the chokepoint.
     """
-    task = asyncio.create_task(asyncio.to_thread(_sandboxed, argv))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        cleanup: str | None = None
-        # `BaseException`, not `Exception`: a repeat cancellation can land on
-        # this recovery await, and letting it out of the handler would skip the
-        # drop below — the exact leak this helper exists to close. Swallow it
-        # so the drop still runs and the ORIGINAL cancellation is the one that
-        # propagates (same shape as `_to_native_audio`'s reap-on-cancel).
-        with contextlib.suppress(BaseException):
-            _, _, cleanup = await task
-        _drop_sandbox_launcher(cleanup)
-        raise
+    return await sandbox.sandboxed_spawn_argv_off_loop(
+        argv, "strict", env=_build_env()
+    )
 
 
 def _mkstemp_path(suffix: str) -> str:

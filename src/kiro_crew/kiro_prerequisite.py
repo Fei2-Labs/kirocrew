@@ -63,7 +63,7 @@ from kiro_crew.kiro_cli import (
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     resource_limit_supervisor_argv,
-    sandboxed_spawn_argv,
+    sandboxed_spawn_argv_off_loop,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -1402,29 +1402,17 @@ async def _prepare_sandboxed_spawn(
 ) -> tuple[list[str], dict[str, str], str | None]:
     """Prepare filesystem-heavy sandbox state on a worker thread.
 
-    Cancellation waits for preparation to settle so a launcher/profile created
-    by the worker is still removed instead of becoming an untracked temp file.
+    Delegates to the shared :func:`sandboxed_spawn_argv_off_loop` which owns
+    the shield-and-recover pattern for every async caller of the chokepoint.
     """
-
-    task = asyncio.create_task(
-        asyncio.to_thread(
-            sandboxed_spawn_argv,
-            argv,
-            mode=mode,
-            env=env,
-            strip_python_env=True,
-            extra_hidden_dirs=extra_hidden_dirs,
-            extra_visible_dirs=extra_visible_dirs,
-        )
+    return await sandboxed_spawn_argv_off_loop(
+        argv,
+        mode=mode,
+        env=env,
+        strip_python_env=True,
+        extra_hidden_dirs=extra_hidden_dirs,
+        extra_visible_dirs=extra_visible_dirs,
     )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        cleanup_path: str | None = None
-        with contextlib.suppress(Exception):
-            _, _, cleanup_path = await task
-        await _unlink_off_loop(cleanup_path)
-        raise
 
 
 async def _run_process(
