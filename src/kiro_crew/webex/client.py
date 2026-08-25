@@ -162,8 +162,7 @@ _PERSON_CACHE_MAX = 256
 # Bounded because the user is waiting on a reply, and this runs before the turn
 # starts: past this the honest answer is "still scanning, re-send shortly".
 _SCAN_WAIT_BUDGET_S = 60.0
-# Bounds on the server-supplied Retry-After: a missing header must not mean zero
-# (a hot loop) and a hostile one must not park the turn.
+
 # Host suffixes a Device Manager URL may name. The bearer token rides device
 # registration, so the destination cannot be free-form — and both inputs that can
 # name it are untrusted in different ways:
@@ -200,6 +199,11 @@ def _is_webex_host(url: str) -> bool:
 #: Refusal reason for a scan that outlasted the budget. Reaches the user through
 #: ``messaging.attachments``, so it reads as an instruction rather than an error.
 _STILL_SCANNING = "still being scanned, re-send shortly"
+
+# Bounds on the server-supplied Retry-After for the SCAN-WAIT ladder (the 423 path
+# in ``download_content``, via ``_retry_after``): a missing header must not mean zero
+# (a hot loop) and a hostile one must not park the turn. The 429 API back-off in
+# ``_api`` is a separate policy with its own narrower bounds, and does not read these.
 _RETRY_AFTER_MIN_S = 1.0
 _RETRY_AFTER_MAX_S = 15.0
 # Chunk size for streaming a download to disk, so a 100 MB file never lands in
@@ -538,7 +542,7 @@ class WebexClient:
         error yields ``[]``: history is supplementary and must not fail a turn.
         """
         result = await self._api("GET", f"/messages{query}", None)
-        items = (result or {}).get("items") if isinstance(result, dict) else None
+        items = result.get("items") if isinstance(result, dict) else None
         return [i for i in (items or []) if isinstance(i, dict)]
 
     async def head_content(self, url: str) -> tuple[str, str, int]:
@@ -1090,7 +1094,7 @@ class WebexClient:
         if cached is not None:
             return cached
         person = await self._api("GET", f"/people/{person_id}", None)
-        emails = (person or {}).get("emails") or [] if isinstance(person, dict) else []
+        emails = (person.get("emails") or []) if isinstance(person, dict) else []
         email = str(emails[0]).lower() if emails else ""
         # Bounded: a room's membership is small, but a long-lived gateway seeing
         # many rooms should not accumulate without limit.
@@ -1115,7 +1119,7 @@ class WebexClient:
         if cached is not None:
             return cached
         room = await self._api("GET", f"/rooms/{room_id}", None)
-        room_type = str((room or {}).get("type") or "") if isinstance(room, dict) else ""
+        room_type = str(room.get("type") or "") if isinstance(room, dict) else ""
         if len(self._room_types) >= _PERSON_CACHE_MAX:
             self._room_types.pop(next(iter(self._room_types)), None)
         # Cached even when empty: a bot removed from the room would otherwise
@@ -1166,11 +1170,13 @@ class WebexClient:
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as resp:
                     if resp.status == 429 and attempt == 0:
-                        retry_after = 1.0
                         try:
                             retry_after = float(resp.headers.get("Retry-After", "1"))
                         except (TypeError, ValueError):
-                            pass
+                            # Mirrors the header default above, so a malformed value
+                            # paces exactly like a missing one. The clamp below is
+                            # what bounds the wait either way.
+                            retry_after = 1.0
                         await asyncio.sleep(min(max(retry_after, 0.5), 10.0))
                         continue
                     if 200 <= resp.status < 300:
