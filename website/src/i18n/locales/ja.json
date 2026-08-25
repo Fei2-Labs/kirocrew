@@ -5691,7 +5691,18 @@
       "try_again": "もう一度試してください",
       "waiting": "待機中",
       "we_could_not_check_kiro_cli": "Kiro CLI を確認できませんでした。",
-      "your_crew_is_almost_ready": "クルーの準備がほぼ完了しました。"
+      "your_crew_is_almost_ready": "クルーの準備がほぼ完了しました。",
+      "copied": "コピーしました",
+      "copy_command": "コマンドをコピー",
+      "how_to_fix": "解決方法",
+      "if_this_keeps_happening": "問題が続く場合",
+      "linux_sandbox_guide": "Linux サンドボックスガイド",
+      "remedy_apparmor_service_install": "Kiro Crew をサービスとしてインストールしてください。ユーザー名前空間の権限のみを許可する狭い範囲の AppArmor プロファイル (kirocrew-userns) も Kiro Crew サービスに限定して書き込まれます。マシン上の他の部分の制限が緩められることはありません。",
+      "remedy_max_user_namespaces": "ユーザー名前空間の作成がユーザーごとの上限に達しました。通常これは、要塞化されたホストで user.max_user_namespaces が 0 になっていることを意味します。値を引き上げ、再起動後も維持されるよう /etc/sysctl.d/ に保存してください。",
+      "remedy_no_user_ns": "このカーネルはユーザー名前空間のサポート (CONFIG_USER_NS) なしでビルドされているため、変更できる設定はありません。別のカーネルを使うことが唯一の解決策です。",
+      "remedy_userns_denied": "カーネルがユーザー名前空間の作成を拒否しました。Debian 系のホストではこのレガシー設定を確認し、再起動後も維持されるよう /etc/sysctl.d/ に値を保存してください。コンテナ内の場合は通常、コンテナ自身の seccomp フィルターが unshare を拒否しているため、ホストの設定ではなく コンテナの実行フラグで解決します。",
+      "run_kirocrew_doctor_on_the_gateway_host_for_a_ful": "どのサンドボックスの手順が失敗したかを含む完全な前提条件レポートを得るには、これをゲートウェイホストで実行してください。",
+      "this_host_allows_user_namespaces_but_the_kernel_d": "このホストはユーザー名前空間を許可していますが、カーネルがマウント名前空間を拒否しました。これは Ubuntu 23.10 以降の特徴で、ユーザー名前空間を作成したプロセスを制限付きの AppArmor プロファイルに移動させます。Kiro Crew は認証情報を露出させるよりも、隔離されていない状態で エージェントを実行することを拒否するため、プロファイルが設定されるまでブロックされたままになります。"
     },
     "linkPreview": {
       "copied": "コピー済み",
