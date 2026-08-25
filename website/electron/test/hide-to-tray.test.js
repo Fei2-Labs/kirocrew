@@ -368,7 +368,7 @@ describe("main.js tray-close wiring", () => {
     const helper = MAIN_JS.match(/const showFromTray = \(\) => \{([\s\S]*?)\};/);
     assert.ok(helper, "could not locate showFromTray");
     assert.match(helper[1], /cancelPendingTrayHide\(mainWindow\)/);
-    assert.match(MAIN_JS, /\{ label: `Show \$\{app\.name\}`, click: showFromTray \}/);
+    assert.match(MAIN_JS, /\{ label: `Show \$\{app\.name\}`, click: trayShowWindow \}/);
     assert.match(MAIN_JS, /tray\.on\("click", showFromTray\)/);
   });
 

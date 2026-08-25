@@ -298,6 +298,9 @@ if (!app.requestSingleInstanceLock()) {
 let mainWindow = null;
 let tray = null;
 let gatewayProcess = null;
+let gatewayOperationInFlight = false;
+let gatewayOperation = null;
+let trayShowWindow = null;
 // How the gateway on this flavor's port was obtained — ONE mutually-exclusive
 // state (previously three module-level booleans that encoded it redundantly and
 // could drift out of sync). Vocabulary + the recovery-strategy mapping live in
@@ -774,7 +777,12 @@ function startGateway() {
         // legacy gateways are reused as before. A gateway owned by the other
         // channel app triggers the takeover prompt.
         const outcome = await resolveGatewayConflict();
-        if (outcome === "reuse") { resolve(true); return; }
+        if (outcome === "reuse") {
+          gatewayStartFailure = null;
+          refreshTrayMenu();
+          resolve(true);
+          return;
+        }
         if (outcome === "probe-failed") {
           gatewayStartFailure = {
             error: `could not verify the previous gateway process on port ${PORT}`,
@@ -1010,6 +1018,7 @@ function spawnGateway(resolve) {
         // transitioned: any stale adopted/service classification must not
         // outlive the spawn.
         gatewayOwnership = "spawned";
+        refreshTrayMenu();
         // The child inherits its own dup of the fd; close our copy so it doesn't leak.
         if (typeof childOut === "number") { try { fs.closeSync(childOut); } catch { /* ignore */ } }
 
@@ -1044,6 +1053,8 @@ function spawnGateway(resolve) {
           // first (Node fires both 'error' then 'exit' on spawn failure).
           if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
           gatewayProcess = null;
+          gatewayOwnership = "none";
+          refreshTrayMenu();
         });
         resolve(true);
 }
@@ -1061,7 +1072,12 @@ function spawnGateway(resolve) {
  */
 async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
   const proc = gatewayProcess;
-  if (!proc || proc.exitCode !== null) { gatewayProcess = null; return; }
+  if (!proc || proc.exitCode !== null) {
+    gatewayProcess = null;
+    gatewayOwnership = "none";
+    refreshTrayMenu();
+    return;
+  }
   console.log("Stopping gateway gracefully...");
   // Resolve the secret location at call time. Collect every readable candidate
   // value and let gateway-stop POST each one — the gateway answers 200 only to
@@ -1097,6 +1113,8 @@ async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
     killTreeFn: killGatewayTreeOnWindowsBounded,
   });
   gatewayProcess = null;
+  gatewayOwnership = "none";
+  refreshTrayMenu();
 }
 
 /**
@@ -2345,6 +2363,61 @@ function createWindow() {
   return mainWindow;
 }
 
+function gatewayTrayStatus() {
+  if (gatewayOperation) return `${gatewayOperation}…`;
+  if (gatewayProcess || gatewayOwnership !== "none") return "Running";
+  return "Stopped";
+}
+
+function refreshTrayMenu() {
+  if (!tray || !trayShowWindow) return;
+  const running = gatewayProcess || gatewayOwnership !== "none";
+  const owned = gatewayOwnership === "spawned";
+  const invokeGatewayAction = async (action) => {
+    if (gatewayOperationInFlight) return;
+    gatewayOperationInFlight = true;
+    gatewayOperation = action[0].toUpperCase() + action.slice(1);
+    refreshTrayMenu();
+    try {
+      if (action === "start") {
+        gatewayStartFailure = null;
+        await startGateway();
+      } else if (action === "stop") {
+        if (!owned) return;
+        await stopGatewayGracefully();
+      } else {
+        if (!owned) return;
+        await stopGatewayGracefully();
+        gatewayStartFailure = null;
+        await startGateway();
+      }
+    } catch (err) {
+      console.error(`Gateway ${action} failed:`, err);
+      sendStatus(`Gateway ${action} failed: ${err.message}`);
+    } finally {
+      gatewayOperationInFlight = false;
+      gatewayOperation = null;
+      refreshTrayMenu();
+    }
+  };
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: `Show ${app.name}`, click: trayShowWindow },
+      { type: "separator" },
+      { label: `Gateway: ${gatewayTrayStatus()}`, enabled: false },
+      { label: "Start Gateway", enabled: !running, click: () => invokeGatewayAction("start") },
+      { label: "Stop Gateway", enabled: owned, click: () => invokeGatewayAction("stop") },
+      { label: "Restart Gateway", enabled: owned, click: () => invokeGatewayAction("restart") },
+      { type: "separator" },
+      { label: "New Connection Window…", click: () => openNewConnectionWindow() },
+      { type: "separator" },
+      { label: "Open Config File", click: () => shell.openPath(store.path) },
+      { type: "separator" },
+      { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
+    ])
+  );
+}
+
 function createTray() {
   // A tray gesture asking for the window back must first disarm any hide that
   // hideToTray() deferred to the fullscreen exit, or the show is undone moments
@@ -2353,6 +2426,7 @@ function createTray() {
     cancelPendingTrayHide(mainWindow);
     mainWindow?.show();
   };
+  trayShowWindow = showFromTray;
   // Nightly ships its own icon (night-sky variant) so the menu-bar presence
   // matches the Dock identity; app.name was set channel-aware at boot.
   const nightly = identityFamily(app.getVersion()) === "nightly";
@@ -2388,17 +2462,7 @@ function createTray() {
   tray.setToolTip(app.name);
   // Each connection opens as its own window on every platform (native window
   // tabs were removed with the single-surface shell redesign).
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: `Show ${app.name}`, click: showFromTray },
-      { type: "separator" },
-      { label: "New Connection Window…", click: () => openNewConnectionWindow() },
-      { type: "separator" },
-      { label: "Open Config File", click: () => shell.openPath(store.path) },
-      { type: "separator" },
-      { label: "Quit", click: () => { isQuitting = true; app.quit(); } },
-    ])
-  );
+  refreshTrayMenu();
   tray.on("click", showFromTray);
 }
 
