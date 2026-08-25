@@ -80,6 +80,7 @@ export default function ChatPane({
   const connectionsUiOn = useConnectionsUiEnabled()
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
+  const [uploadError, setUploadError] = useState('')
   const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
   const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
@@ -270,13 +271,28 @@ export default function ChatPane({
   })
 
   // File upload as a mutation (isPending replaces a manual `uploading` flag).
+  // api.uploadFiles does NOT throw on a non-2xx: it resolves { paths, error }.
+  // Surface res.error the way ChatPage does (issue #5707) so a server refusal
+  // (unsupported type, content-signature mismatch, over-cap) is reported at
+  // the composer instead of the spinner silently stopping with no attachment.
   const uploadMutation = useMutation({
     mutationFn: (files: File[]) => api.uploadFiles(files),
-    onSuccess: (res) => { if (res.paths?.length) setPendingFiles((prev) => [...prev, ...res.paths]) },
+    onSuccess: (res) => {
+      if (res.error) { setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: res.error })); return }
+      if (res.paths?.length) setPendingFiles((prev) => [...prev, ...res.paths])
+    },
+    // A thrown fetch (network failure, session-expired, resize error) carries
+    // its own message; render it rather than an empty interpolation.
+    onError: (err: unknown) => { setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: (err as Error)?.message || i18nT('api.client.unexpected_server_response') })) },
   })
   const uploadFiles = useCallback((files: File[]) => {
-    if (!files.length || files.length > 20) return
-    if (files.find((f) => f.size > 50 * 1024 * 1024)) return
+    if (!files.length) return
+    // Client-side refusals are the same silent-failure class as #5707: without
+    // a message a >20-file or >50 MB drop just vanishes. Mirror ChatPage.
+    if (files.length > 20) { setUploadError(i18nT('pages.chatPage.too_many_files_max_20')); return }
+    const big = files.find((f) => f.size > 50 * 1024 * 1024)
+    if (big) { setUploadError(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
+    setUploadError('')
     uploadMutation.mutate(files)
   }, [uploadMutation])
 
@@ -655,6 +671,17 @@ export default function ChatPane({
           onDragOver={dropTargetProps.onDragOver}
           onDragLeave={dropTargetProps.onDragLeave}
         />
+
+        {/* Upload-error surface (issue #5707): a server refusal resolves as
+            { paths: [], error } rather than throwing, so without this the
+            spinner just stops with no attachment and no message. Mirrors the
+            banner ChatPage renders, reusing its existing i18n strings. */}
+        {uploadError && (
+          <div className="mx-3 mb-2 flex items-center gap-2 rounded-lg border border-border bg-bg-elevated px-3 py-2">
+            <span className="text-sm text-text flex-1 min-w-0 break-words">{uploadError}</span>
+            <button onClick={() => setUploadError('')} aria-label={i18nT('pages.chatPage.dismiss_upload_error')} className="text-muted hover:text-text shrink-0"><X className="lucide-inline" /></button>
+          </div>
+        )}
 
         {/* Agent picker portal — anchored to the input-bar agent button. */}
         {agentDD.open && agentBtnRect && createPortal(
