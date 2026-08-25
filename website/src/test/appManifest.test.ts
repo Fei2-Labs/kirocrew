@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path'
 import i18next from 'i18next'
 import {
   APP_MANIFEST_KEY, appDisplayName, appDescription, appPageLabel, appHighlights,
+  appUseCases, appConfiguration,
 } from '../components/appstore/appManifest'
 import en from '../i18n/locales/en.json'
 import zh from '../i18n/locales/zh-CN.json'
@@ -98,6 +99,16 @@ describe('resolvers', () => {
     expect(appDisplayName(app)).toBe('Vendor App')
     expect(appDescription(app)).toBe('Their copy.')
     expect(appHighlights({ name: app.name, highlights: ['a', 'b'] })).toEqual(['a', 'b'])
+    expect(appUseCases({ name: app.name, useCases: ['their use'] })).toEqual(['their use'])
+    expect(appConfiguration({ name: app.name, configuration: ['their setup'] }))
+      .toEqual(['their setup'])
+  })
+
+  it('drops malformed third-party guidance instead of returning a non-array to the renderer', () => {
+    expect(appUseCases({ name: 'vendor-app', useCases: 'not an array' })).toEqual([])
+    expect(appConfiguration({ name: 'vendor-app', configuration: { step: 'invalid' } })).toEqual([])
+    expect(appUseCases({ name: 'vendor-app', useCases: ['valid', 7] })).toEqual([])
+    expect(appConfiguration({ name: 'vendor-app', configuration: ['valid', null] })).toEqual([])
   })
 
   it('falls back to the id when a third-party app has no displayName', () => {
@@ -155,6 +166,15 @@ describe('resolvers', () => {
     const same = keys.map((_, i) => `manifest ${i}`)
     expect(appHighlights({ name, highlights: same }))
       .toEqual(keys.map(k => lookup(en, k)))
+  })
+
+  it('resolves built-in use cases and configuration through sibling manifest keys', () => {
+    const name = Object.keys(APP_MANIFEST_KEY)[0]
+    const namespace = APP_MANIFEST_KEY[name].description.replace(/\.description$/, '')
+    expect(appUseCases({ name, useCases: ['manifest use'] }))
+      .toEqual([lookup(en, `${namespace}.use_case_1`)])
+    expect(appConfiguration({ name, configuration: ['manifest setup'] }))
+      .toEqual([lookup(en, `${namespace}.configuration_1`)])
   })
 
   it('prefers the page label key, then the passed label, then the id', () => {

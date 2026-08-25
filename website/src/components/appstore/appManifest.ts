@@ -61,6 +61,8 @@ type ManifestKeys = {
   /** Absent for an app that contributes no page (e.g. an overlay-only app). */
   pageLabel?: string
   highlights: string[]
+  useCases: string[]
+  configuration: string[]
 }
 
 export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
@@ -75,6 +77,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.agentWorlds.manifest.highlight_4',
       'apps.agentWorlds.manifest.highlight_5',
     ],
+    useCases: ['apps.agentWorlds.manifest.use_case_1'],
+    configuration: ['apps.agentWorlds.manifest.configuration_1'],
   },
   'auto-improvement': {
     displayName: 'apps.autoImprovement.manifest.display_name',
@@ -88,6 +92,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.autoImprovement.manifest.highlight_5',
       'apps.autoImprovement.manifest.highlight_6',
     ],
+    useCases: ['apps.autoImprovement.manifest.use_case_1'],
+    configuration: ['apps.autoImprovement.manifest.configuration_1'],
   },
   'auto-research': {
     displayName: 'apps.autoResearch.manifest.display_name',
@@ -102,12 +108,16 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.autoResearch.manifest.highlight_6',
       'apps.autoResearch.manifest.highlight_7',
     ],
+    useCases: ['apps.autoResearch.manifest.use_case_1'],
+    configuration: ['apps.autoResearch.manifest.configuration_1'],
   },
   'auto-triage-pipeline': {
     displayName: 'apps.autoTriagePipeline.manifest.display_name',
     description: 'apps.autoTriagePipeline.manifest.description',
     pageLabel: 'apps.autoTriagePipeline.manifest.page_label',
     highlights: [],
+    useCases: ['apps.autoTriagePipeline.manifest.use_case_1'],
+    configuration: ['apps.autoTriagePipeline.manifest.configuration_1'],
   },
   'channels': {
     displayName: 'apps.channels.manifest.display_name',
@@ -120,6 +130,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.channels.manifest.highlight_4',
       'apps.channels.manifest.highlight_5',
     ],
+    useCases: ['apps.channels.manifest.use_case_1'],
+    configuration: ['apps.channels.manifest.configuration_1'],
   },
   'code-review-sage': {
     displayName: 'apps.codeReviewSage.manifest.display_name',
@@ -132,12 +144,16 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.codeReviewSage.manifest.highlight_4',
       'apps.codeReviewSage.manifest.highlight_5',
     ],
+    useCases: ['apps.codeReviewSage.manifest.use_case_1'],
+    configuration: ['apps.codeReviewSage.manifest.configuration_1'],
   },
   // Overlay-only: no `pageLabel`, because this app contributes no page.
   'command-bar': {
     displayName: 'apps.commandBar.manifest.display_name',
     description: 'apps.commandBar.manifest.description',
     highlights: [],
+    useCases: ['apps.commandBar.manifest.use_case_1'],
+    configuration: ['apps.commandBar.manifest.configuration_1'],
   },
   'crew-companion': {
     displayName: 'apps.crewCompanion.manifest.display_name',
@@ -150,6 +166,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.crewCompanion.manifest.highlight_4',
       'apps.crewCompanion.manifest.highlight_5',
     ],
+    useCases: ['apps.crewCompanion.manifest.use_case_1'],
+    configuration: ['apps.crewCompanion.manifest.configuration_1'],
   },
   'design-critique': {
     displayName: 'apps.designCritique.manifest.display_name',
@@ -165,6 +183,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.designCritique.manifest.highlight_7',
       'apps.designCritique.manifest.highlight_8',
     ],
+    useCases: ['apps.designCritique.manifest.use_case_1'],
+    configuration: ['apps.designCritique.manifest.configuration_1'],
   },
   // `design-tweak` ships no `highlights` (matching `spec-builder`'s precedent
   // below): app.json declares no `highlights` field, so the App Store card
@@ -174,6 +194,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
     description: 'apps.designTweak.manifest.description',
     pageLabel: 'apps.designTweak.manifest.page_label',
     highlights: [],
+    useCases: ['apps.designTweak.manifest.use_case_1'],
+    configuration: ['apps.designTweak.manifest.configuration_1'],
   },
   'dev-fleet': {
     displayName: 'apps.devFleet.manifest.display_name',
@@ -188,6 +210,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.devFleet.manifest.highlight_6',
       'apps.devFleet.manifest.highlight_7',
     ],
+    useCases: ['apps.devFleet.manifest.use_case_1'],
+    configuration: ['apps.devFleet.manifest.configuration_1'],
   },
   'file-explorer': {
     displayName: 'apps.fileExplorer.manifest.display_name',
@@ -201,6 +225,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.fileExplorer.manifest.highlight_5',
       'apps.fileExplorer.manifest.highlight_6',
     ],
+    useCases: ['apps.fileExplorer.manifest.use_case_1'],
+    configuration: ['apps.fileExplorer.manifest.configuration_1'],
   },
   'issue-radar': {
     displayName: 'apps.issueRadar.manifest.display_name',
@@ -217,6 +243,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.issueRadar.manifest.highlight_8',
       'apps.issueRadar.manifest.highlight_9',
     ],
+    useCases: ['apps.issueRadar.manifest.use_case_1'],
+    configuration: ['apps.issueRadar.manifest.configuration_1'],
   },
   'md-notebook': {
     displayName: 'apps.mdNotebook.manifest.display_name',
@@ -232,6 +260,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.mdNotebook.manifest.highlight_7',
       'apps.mdNotebook.manifest.highlight_8',
     ],
+    useCases: ['apps.mdNotebook.manifest.use_case_1'],
+    configuration: ['apps.mdNotebook.manifest.configuration_1'],
   },
   'meetings': {
     displayName: 'apps.meetings.manifest.display_name',
@@ -244,6 +274,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.meetings.manifest.highlight_4',
       'apps.meetings.manifest.highlight_5',
     ],
+    useCases: ['apps.meetings.manifest.use_case_1'],
+    configuration: ['apps.meetings.manifest.configuration_1'],
   },
   'mochi': {
     displayName: 'apps.mochi.manifest.display_name',
@@ -257,6 +289,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.mochi.manifest.highlight_5',
       'apps.mochi.manifest.highlight_6',
     ],
+    useCases: ['apps.mochi.manifest.use_case_1'],
+    configuration: ['apps.mochi.manifest.configuration_1'],
   },
   'ops-mission-control': {
     displayName: 'apps.opsMissionControl.manifest.display_name',
@@ -270,6 +304,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.opsMissionControl.manifest.highlight_5',
       'apps.opsMissionControl.manifest.highlight_6',
     ],
+    useCases: ['apps.opsMissionControl.manifest.use_case_1'],
+    configuration: ['apps.opsMissionControl.manifest.configuration_1'],
   },
   'papyrus': {
     displayName: 'apps.papyrus.manifest.display_name',
@@ -284,6 +320,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.papyrus.manifest.highlight_6',
       'apps.papyrus.manifest.highlight_7',
     ],
+    useCases: ['apps.papyrus.manifest.use_case_1'],
+    configuration: ['apps.papyrus.manifest.configuration_1'],
   },
   'personal-shopper': {
     displayName: 'apps.personalShopper.manifest.display_name',
@@ -296,6 +334,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.personalShopper.manifest.highlight_4',
       'apps.personalShopper.manifest.highlight_5',
     ],
+    useCases: ['apps.personalShopper.manifest.use_case_1'],
+    configuration: ['apps.personalShopper.manifest.configuration_1'],
   },
   'pptx-maker': {
     displayName: 'apps.pptxMaker.manifest.display_name',
@@ -309,6 +349,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.pptxMaker.manifest.highlight_5',
       'apps.pptxMaker.manifest.highlight_6',
     ],
+    useCases: ['apps.pptxMaker.manifest.use_case_1'],
+    configuration: ['apps.pptxMaker.manifest.configuration_1'],
   },
   'projects': {
     displayName: 'apps.projects.manifest.display_name',
@@ -321,6 +363,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.projects.manifest.highlight_4',
       'apps.projects.manifest.highlight_5',
     ],
+    useCases: ['apps.projects.manifest.use_case_1'],
+    configuration: ['apps.projects.manifest.configuration_1'],
   },
   // `spec-builder` ships no `highlights`, so its list is empty on both sides and
   // `appHighlights()` returns the manifest's own empty array. An entry is still
@@ -330,6 +374,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
     description: 'apps.specBuilder.manifest.description',
     pageLabel: 'apps.specBuilder.manifest.page_label',
     highlights: [],
+    useCases: ['apps.specBuilder.manifest.use_case_1'],
+    configuration: ['apps.specBuilder.manifest.configuration_1'],
   },
   'workflows': {
     displayName: 'apps.workflows.manifest.display_name',
@@ -342,6 +388,8 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.workflows.manifest.highlight_4',
       'apps.workflows.manifest.highlight_5',
     ],
+    useCases: ['apps.workflows.manifest.use_case_1'],
+    configuration: ['apps.workflows.manifest.configuration_1'],
   },
 }
 
@@ -409,4 +457,26 @@ export function appHighlights(app: { name?: string; highlights?: string[]; _regi
   const k = keysFor(app)
   if (!k || k.highlights.length !== manifest.length) return manifest
   return k.highlights.map(key => i18nT(key))
+}
+
+/** Localised, operator-oriented situations where the app is a good fit. */
+export function appUseCases(app: { name?: string; useCases?: unknown; _registry?: string }): string[] {
+  const manifest = Array.isArray(app.useCases)
+    && app.useCases.every((item): item is string => typeof item === 'string')
+    ? app.useCases
+    : []
+  const k = keysFor(app)
+  if (!k || k.useCases.length !== manifest.length) return manifest
+  return k.useCases.map(key => i18nT(key))
+}
+
+/** Localised, concise setup/configuration instructions for an app. */
+export function appConfiguration(app: { name?: string; configuration?: unknown; _registry?: string }): string[] {
+  const manifest = Array.isArray(app.configuration)
+    && app.configuration.every((item): item is string => typeof item === 'string')
+    ? app.configuration
+    : []
+  const k = keysFor(app)
+  if (!k || k.configuration.length !== manifest.length) return manifest
+  return k.configuration.map(key => i18nT(key))
 }
