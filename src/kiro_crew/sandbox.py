@@ -20,6 +20,7 @@ Config: ``"sandbox": "auto" | "off"`` in ``~/.kiro/crew/config.json``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ctypes
 import ctypes.util
 import errno
@@ -3979,6 +3980,54 @@ def sandboxed_spawn_argv(
     # (e.g. ``npx @playwright/mcp``).
     scrubbed[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
     return wrapped, scrubbed, cleanup
+
+
+async def sandboxed_spawn_argv_off_loop(
+    argv: list[str],
+    mode: str = "standard",
+    *,
+    env: dict[str, str] | None = None,
+    strip_python_env: bool = False,
+    extra_hidden_dirs: tuple[str, ...] = (),
+    extra_visible_dirs: tuple[str, ...] = (),
+    first_party_fixed_argv: bool = False,
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Run :func:`sandboxed_spawn_argv` on a worker thread, shielded from cancellation.
+
+    Every async caller of ``sandboxed_spawn_argv`` reaches it through a thread
+    hop.  Cancelling that hop abandons the returned tuple while the worker
+    still materializes the launcher/profile, leaking the temp file forever.
+    Shielding the hop keeps the worker's result recoverable: on cancellation we
+    wait for the thread to settle, unlink the launcher it created, and re-raise.
+
+    ``BaseException`` (not ``Exception``) in the suppress: a second cancellation
+    can land on the recovery await, and letting it escape would skip the unlink
+    -- the exact leak this helper exists to close.
+    """
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            sandboxed_spawn_argv,
+            argv,
+            mode,
+            env=env,
+            strip_python_env=strip_python_env,
+            extra_hidden_dirs=extra_hidden_dirs,
+            extra_visible_dirs=extra_visible_dirs,
+            first_party_fixed_argv=first_party_fixed_argv,
+        )
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        cleanup: str | None = None
+        with contextlib.suppress(BaseException):
+            _, _, cleanup = await task
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
+        raise
 
 
 # ── cgroup v2 scope enforcement (fork bomb + memory DoS) ──

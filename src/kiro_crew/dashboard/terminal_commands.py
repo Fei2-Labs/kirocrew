@@ -82,6 +82,7 @@ provide and are not labelled differently.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import logging
 import os
@@ -799,9 +800,21 @@ async def _run_probe(argv: list[str], cwd: str | None) -> str | None:
         #   escapes the route as an HTTP 500 on a keystroke — for a tier whose
         #   entire contract is "no completions is a normal answer", the right
         #   degradation is no menu, not an error the client must special-case.
-        wrapped, env, cleanup = await loop.run_in_executor(
-            discovery_executor(), functools.partial(_prepare_probe, argv),
+        task = asyncio.create_task(
+            asyncio.to_thread(_prepare_probe, argv),
         )
+        try:
+            wrapped, env, cleanup = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cleanup_path: str | None = None
+            with contextlib.suppress(BaseException):
+                _, _, cleanup_path = await task
+            if cleanup_path:
+                try:
+                    os.unlink(cleanup_path)
+                except OSError:
+                    pass
+            raise
     except (SandboxUnavailableError, OSError, RuntimeError):
         return None
     async with _gate():
