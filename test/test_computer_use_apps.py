@@ -659,12 +659,24 @@ class TestBrowserHostedDashboardIsRefused:
             "Kiro Crew",  # the plain tab title
             "(3) Kiro Crew",  # the unread-badge prefix (App.tsx)
             "Artifacts — Kiro Crew",  # a popout frame's suffix
-            "kirocrew",  # the no-space spelling
             "KIRO CREW",  # case must not matter
         ],
     )
     def test_a_browser_window_titled_like_the_dashboard_is_refused(self, title):
         assert policy.check_app(self._chrome(title), PolicyConfig()) is not None, title
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "kirocrew",  # no-space spelling — a path component, not the dashboard
+            "clarezoe — kirocrew — zsh",  # Terminal with repo as cwd
+            "~/My Apps/kirocrew",  # path in title bar
+        ],
+    )
+    def test_terminal_with_kirocrew_path_is_NOT_refused(self, title):
+        """The no-space 'kirocrew' appears in Terminal/editor titles when the
+        working directory is this repo. It must not trigger the denylist."""
+        assert policy.check_app(self._chrome(title), PolicyConfig()) is None, title
 
     def test_an_ordinary_browser_window_is_still_allowed(self):
         """The rule must not make browsers undrivable — that is the whole point of
