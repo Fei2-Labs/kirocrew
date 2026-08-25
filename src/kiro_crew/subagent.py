@@ -1365,6 +1365,49 @@ class SubagentInfo:
 # Callback: (subagent_info) -> None
 AnnounceCallback = Callable[[SubagentInfo], Awaitable[None]]
 
+# Sentinel prefixes the spawn-rejection paths (empty task, memory guard,
+# admission policy, invalid cwd, governance, approval denial, missing approval
+# mechanism, app queue-capacity) write into ``SubagentInfo.error``; none of
+# them ever runs the agent. The injection-failure notice keys on them so a run
+# that was turned away reads as rejected instead of "finished". One rejection
+# cannot carry the prefix: the unknown-agent refusal's wording is
+# startswith-matched by ``mcp_tools.spawn._is_unknown_agent_refusal`` (and
+# pinned by its tests), so it keeps its own spelling and degrades to the
+# generic failure copy here — which stays truthful, just less specific.
+_SPAWN_REJECTION_PREFIXES: tuple[str, ...] = ("spawn rejected", "spawn refused")
+
+
+def _injection_notice_outcome(info: "SubagentInfo") -> str:
+    """One-sentence outcome line for the injection-failure fallback notice.
+
+    ``notify_injection_failed`` fires whenever a terminal report could not be
+    injected into the parent — for EVERY terminal state, not just successful
+    completion. Asserting "finished" for a run that was stopped or rejected
+    before it executed misdescribes the outcome, so the line branches on the
+    record's canonical :attr:`SubagentInfo.outcome` with two before-start
+    refinements: ``_exec_started`` (the marker ``_run_inner`` sets when
+    execution actually begins) distinguishes a stop that landed before the run
+    ever executed, and a rejection-sentinel ``error`` marks a spawn that was
+    turned away. The "no result to deliver" phrasings are guarded on the
+    absence of any output so they can never contradict the result-path
+    recovery hint. Pure function of the record, unit-tested per branch.
+    """
+    outcome = info.outcome
+    if outcome == "stopped":
+        if info._exec_started is None and not info.result and not info.result_path:
+            return "The run was stopped before it started, so there is no result to deliver."
+        return "The run was stopped before it completed."
+    if outcome == "failed":
+        if (
+            info.error.startswith(_SPAWN_REJECTION_PREFIXES)
+            and not info.result
+            and not info.result_path
+        ):
+            return "The run was rejected before it started, so there is no result to deliver."
+        return "The agent failed before a result could be delivered."
+    return "The agent finished but result delivery timed out."
+
+
 # Event callback: (event_type, info, extra_data) -> None
 SubagentEventCallback = Callable[[str, "SubagentInfo", dict], Awaitable[None]]
 
@@ -2984,7 +3027,11 @@ class SubagentManager:
         Appends a synthetic error to the dashboard slot (UI) and queues a
         failure message into ``slot._pending_subagent_failures`` so the LLM
         learns about the failure on the next ``_run_chat`` turn and can read
-        the result from disk if needed.
+        the result from disk if needed. The notice's outcome line is derived
+        from the record (:func:`_injection_notice_outcome`) rather than
+        asserting completion: this path fires for every terminal state whose
+        report could not be injected, including runs cancelled or rejected
+        before they ever executed.
         """
         try:
             # Lazy: the dashboard layer must not be imported by a core module at
@@ -3017,7 +3064,7 @@ class SubagentManager:
                 f"{SUBAGENT_COMPLETION_PREFIX}\n"
                 f"Agent `{info.id}` ❌ {reason}\n"
                 f"Task: {task_preview}\n"
-                f"The agent finished but result delivery timed out.{result_hint}"
+                f"{_injection_notice_outcome(info)}{result_hint}"
             )
 
             # Queue for LLM context drain on next _run_chat
@@ -3393,9 +3440,9 @@ class SubagentManager:
                         parent_session_key=parent_session_key,
                         done=True,
                         error=(
-                            "spawn queue is at capacity; the app spawn was not queued "
-                            "to avoid a stale ownership check — retry to revalidate and "
-                            "spawn"
+                            "spawn refused: queue is at capacity; the app spawn was not "
+                            "queued to avoid a stale ownership check — retry to revalidate "
+                            "and spawn"
                         ),
                         batch_id=batch_id,
                         batch_total=max(0, int(batch_total)),
