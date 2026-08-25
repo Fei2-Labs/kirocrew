@@ -1442,6 +1442,36 @@ Examples:
     tel_sub.add_parser("disable", help="Turn the anonymous beacon off permanently")
     tel_sub.add_parser("enable", help="Turn the anonymous beacon back on")
 
+    byok_parser = sub.add_parser(
+        "byok",
+        help="Manage bring-your-own-key provider API keys for BYOK backends",
+        epilog="""
+Examples:
+  kirocrew byok list
+  kirocrew byok set OPENAI_API_KEY            # prompts for the value (not echoed)
+  kirocrew byok set ANTHROPIC_API_KEY sk-ant-...
+  kirocrew byok remove OPENAI_API_KEY
+  kirocrew byok clear
+
+Keys are stored owner-only at <data-home>/byok.json and injected into a
+BYOK-capable backend's environment at spawn (e.g. GitHub Copilot CLI). Set the
+agent backend with: kirocrew config set agent.acp_backend copilot
+""",
+        formatter_class=_fmt,
+    )
+    byok_sub = byok_parser.add_subparsers(dest="byok_action")
+    byok_sub.add_parser("list", help="List configured key names (values masked)")
+    byok_set = byok_sub.add_parser("set", help="Add or replace a key")
+    byok_set.add_argument("name", help="Environment variable name, e.g. OPENAI_API_KEY")
+    byok_set.add_argument(
+        "value",
+        nargs="?",
+        help="Key value. Omit to be prompted without echo (safer — keeps it out of shell history)",
+    )
+    byok_rm = byok_sub.add_parser("remove", help="Remove a key")
+    byok_rm.add_argument("name", help="Environment variable name to remove")
+    byok_sub.add_parser("clear", help="Remove all configured keys")
+
     policy_parser = cli_help.add_command(sub, "policy")
     policy_sub = policy_parser.add_subparsers(dest="policy_action")
     policy_show = policy_sub.add_parser(

@@ -4853,6 +4853,13 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
 _CREW_SECRET_LEAVES: list[str] = [
     ".env",
+    # Bring-your-own-key store (acp.byok): the operator's own model-provider API
+    # keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...), injected into a BYOK backend's
+    # child environment at spawn. Live bearer credentials, so the agent's own file
+    # and bash tools must neither read them (exfiltration) nor rewrite them
+    # (repoint a backend at an attacker's key). The BYOK module and CLI open it
+    # directly rather than through this gate, so management still works.
+    "byok.json",
     # The Notes builtin stores a GitHub Personal Access Token here so it can
     # push a vault. Owner-only mode (0600) does not isolate another process
     # running as the same UID, and the token is a live bearer credential for the

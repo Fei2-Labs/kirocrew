@@ -6,10 +6,12 @@ at ``/artifacts/deploy`` in the main dashboard.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 
 from kiro_crew.config.paths import config_dir
+from kiro_crew.platform_compat import is_link_or_junction, unlink_link_or_junction
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,24 @@ _SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 
 
 _MANAGED_MARKER = ".kirocrew-managed"
+
+
+def _remove_managed_tree(path: Path) -> None:
+    """Remove a managed skill tree without following nested junctions/symlinks."""
+    if is_link_or_junction(path):
+        unlink_link_or_junction(path)
+        return
+    os.chmod(path, 0o700)
+    for child in path.iterdir():
+        if child.is_dir() and not is_link_or_junction(child):
+            _remove_managed_tree(child)
+        elif child.exists() or is_link_or_junction(child):
+            if is_link_or_junction(child):
+                unlink_link_or_junction(child)
+            else:
+                os.chmod(child, 0o600)
+                child.unlink()
+    path.rmdir()
 
 
 def _register_core_skills() -> None:
@@ -42,8 +62,8 @@ def _register_core_skills() -> None:
 
         # Migration: if an existing entry is a symlink (from older versions),
         # unlink it and replace with a fresh copy regardless of target match.
-        if link.is_symlink():
-            link.unlink()
+        if is_link_or_junction(link):
+            unlink_link_or_junction(link)
         elif link.exists():
             # Real directory exists at that name — only remove if we created it
             if not (link / _MANAGED_MARKER).exists():
@@ -54,7 +74,7 @@ def _register_core_skills() -> None:
                     link,
                 )
                 continue
-            shutil.rmtree(link)
+            _remove_managed_tree(link)
 
         # Always copy (not symlink) so realpath stays within skill root.
         try:

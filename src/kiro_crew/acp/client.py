@@ -54,6 +54,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_COPILOT,
     ACP_BACKEND_KIRO,
+    ACP_BACKENDS_BYOK,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
@@ -615,7 +616,9 @@ def _resolve_ssh_auth_sock(env: dict[str, str]) -> None:
             return
 
 
-def _resolve_spawn_env(env: dict[str, str], *, kiro_api_key: bool = False) -> dict[str, str]:
+def _resolve_spawn_env(
+    env: dict[str, str], *, kiro_api_key: bool = False, byok: bool = False
+) -> dict[str, str]:
     """Repair stale credential pointers in *env* before an agent spawn.
 
     Bundles :func:`_resolve_ssh_auth_sock` (glob + stat over ``/tmp``) and
@@ -635,6 +638,13 @@ def _resolve_spawn_env(env: dict[str, str], *, kiro_api_key: bool = False) -> di
     deliberately exempts it, so an inherited copy would otherwise ride into a
     foreign agent process. The file read is IO, which is why both branches
     ride this same off-loop hop.
+
+    With ``byok=True`` (a backend in :data:`ACP_BACKENDS_BYOK`, e.g. GitHub
+    Copilot CLI), the operator's own provider keys are read from the owner-only
+    BYOK store (:mod:`kiro_crew.acp.byok`) and injected into *env* so the child
+    authenticates with them — the store value wins over any inherited variable.
+    Another file read, folded into this same hop. Never combined with
+    ``kiro_api_key=True``: kiro-cli is not a BYOK backend.
     """
     _resolve_ssh_auth_sock(env)
     resolve_krb5_ccname(env)
@@ -646,6 +656,10 @@ def _resolve_spawn_env(env: dict[str, str], *, kiro_api_key: bool = False) -> di
         inject_kiro_cli_api_key(env)
     else:
         strip_kiro_cli_api_key(env)
+    if byok:
+        from kiro_crew.acp.byok import inject_byok_env
+
+        inject_byok_env(env)
     return env
 
 
@@ -2879,7 +2893,12 @@ class AcpClient:
         # ONE thread hop. Guarded: the sandbox temp file is live, so a
         # cancellation here must not orphan it.
         env = await self._to_thread_guarding_sandbox(
-            functools.partial(_resolve_spawn_env, kiro_api_key=self._is_kiro), env
+            functools.partial(
+                _resolve_spawn_env,
+                kiro_api_key=self._is_kiro,
+                byok=self.backend in ACP_BACKENDS_BYOK,
+            ),
+            env,
         )
         # Match the OS launchers' sensitive + Python env scrub in the parent.
         # Windows Kiro delegation has no POSIX `env -u` wrapper, so this is the
