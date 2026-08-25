@@ -186,6 +186,13 @@ async def api_hooks_create(request: web.Request) -> web.Response:
         hook = await _mutate_hook_store(store.create, validated)
     except _StoreUnavailable:
         return _store_unavailable_response()
+    except ValueError as exc:
+        # store.create now enforces the same invariants as store.update via the
+        # shared validator, so it can raise ValueError. The HOOK_CREATE_SCHEMA
+        # check above normally rejects bad input first, but catch it here too so
+        # any schema/validator drift surfaces as a 400 (like the update handler)
+        # rather than an unhandled 500.
+        return web.json_response({"error": str(exc), "code": "invalid_hook"}, status=400)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="hook.create",

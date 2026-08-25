@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import platform
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -194,6 +196,102 @@ class TestScriptHookStore:
         retrieved = store2.get(hook.id)
         assert retrieved is not None
         assert retrieved.name == "persist-test"
+
+
+class TestCappedScriptHookOutput:
+    @pytest.mark.asyncio
+    async def test_reader_keeps_only_the_cap_but_drains_to_eof(self):
+        from kiro_crew.hooks import _read_capped_stream
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"abcdefgh")
+        reader.feed_eof()
+
+        retained, truncated = await _read_capped_stream(reader, 5)
+
+        assert retained == b"abcde"
+        assert truncated is True
+        assert await reader.read() == b""
+
+    def test_decode_marks_a_multibyte_boundary(self):
+        from kiro_crew.hooks import _HOOK_TRUNCATION_MARKER, _decode_capped
+
+        raw = ("€" * 2).encode("utf-8")[:4]
+        decoded = _decode_capped(raw, truncated=True)
+
+        assert decoded.startswith("€")
+        assert "\ufffd" in decoded
+        assert decoded.endswith(_HOOK_TRUNCATION_MARKER)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_observes_both_reader_tasks(self):
+        from kiro_crew.hooks import _communicate_capped
+
+        class BlockingReader:
+            def __init__(self):
+                self.entered = asyncio.Event()
+                self.cancelled = asyncio.Event()
+
+            async def read(self, _size):
+                self.entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+
+        stdout = BlockingReader()
+        stderr = BlockingReader()
+        proc = SimpleNamespace(
+            stdin=None,
+            stdout=stdout,
+            stderr=stderr,
+            wait=AsyncMock(),
+        )
+        task = asyncio.create_task(_communicate_capped(proc, b"", 32))
+        await asyncio.gather(stdout.entered.wait(), stderr.entered.wait())
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert stdout.cancelled.is_set()
+        assert stderr.cancelled.is_set()
+        proc.wait.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_real_hook_caps_and_marks_both_streams(self, tmp_path, monkeypatch):
+        from kiro_crew.hooks import _HOOK_STREAM_CAP_BYTES, _HOOK_TRUNCATION_MARKER
+
+        # This test exercises real pipe draining, not host sandbox discovery.
+        # Keep the subprocess real while making its isolation wrappers stable
+        # across Linux, namespace-sandbox, and Windows CI environments.
+        monkeypatch.setattr("kiro_crew.sandbox.wrap_argv", lambda argv, **k: (list(argv), None))
+        monkeypatch.setattr("kiro_crew.sandbox.cgroup_scope_argv", lambda argv: list(argv))
+
+        command = _script_command(
+            tmp_path / "large_output.py",
+            "import sys\n" "sys.stdout.write('o' * 70000)\n" "sys.stderr.write('e' * 70000)\n",
+        )
+        hook = ScriptHook(
+            id="large-output",
+            name="large-output",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command=command,
+            timeout=30,
+        )
+
+        result = await run_script_hook(hook, "ctx")
+
+        assert result.exit_code == 0
+        assert result.stdout.endswith(_HOOK_TRUNCATION_MARKER)
+        assert result.stderr.endswith(_HOOK_TRUNCATION_MARKER)
+        assert len(result.stdout.encode("utf-8")) <= (
+            _HOOK_STREAM_CAP_BYTES + len(_HOOK_TRUNCATION_MARKER.encode("utf-8"))
+        )
+        assert len(result.stderr.encode("utf-8")) <= (
+            _HOOK_STREAM_CAP_BYTES + len(_HOOK_TRUNCATION_MARKER.encode("utf-8"))
+        )
 
 
 class TestRunScriptHook:

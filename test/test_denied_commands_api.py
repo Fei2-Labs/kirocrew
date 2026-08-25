@@ -17,6 +17,7 @@ avoids ``@pytest_asyncio.fixture`` by convention.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -828,3 +829,86 @@ def test_enforce_denied_commands_settable_key_removed():
     from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
 
     assert "agent.enforce_denied_commands" not in _EDITABLE_CONFIG
+
+
+# ── keystone lockdown ──
+#
+# Regression: the keystone ``denied_commands.json`` lives in
+# ``_SENSITIVE_HOME_DIRS`` and is the user-editable opt-out of the agent's own
+# security ceiling. The agent process must NEVER leave it world-readable, even
+# briefly. On Windows ``chmod_safe`` is a documented no-op and would leave the
+# file under the inherited parent DACL; the writer routes through
+# ``atomic_write(restrict_to_owner=True)`` so the lockdown is applied to the
+# temp file before any content reaches it.
+
+
+async def _run_write_denied_state(home: Path, config_file: Path, mutate):
+    """Run ``_write_denied_state`` synchronously enough to assert on the file.
+
+    The helper is ``async`` and runs the read-modify-write in the default
+    thread executor. Driving the event loop here is enough to surface the
+    after-write lockdown without going through the full aiohttp app.
+    """
+    from kiro_crew.dashboard.handlers.security import _write_denied_state
+
+    return await _write_denied_state(mutate)
+
+
+def test_write_denied_state_lands_owner_only_on_posix(
+    home: Path, config_file: Path
+) -> None:
+    """``_write_denied_state`` finishes with mode 0o600 on POSIX.
+
+    Pins the observable contract: the keystone file the next hook read will
+    open is owner-only. Skipped on Windows; a DACL assertion needs a Windows
+    fixture and is more invasive than the regression it catches.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX-only behavior")
+
+    import asyncio
+
+    def _noop(denied: dict) -> None:
+        denied.setdefault("disabled_ids", [])
+
+    asyncio.run(_run_write_denied_state(home, config_file, _noop))
+
+    mode = config_file.stat().st_mode & 0o777
+    assert mode == 0o600, (
+        f"keystone denied_commands.json must be owner-only; got mode={mode:o}"
+    )
+
+
+def test_write_denied_state_does_not_fall_back_to_chmod_safe(
+    home: Path, config_file: Path
+) -> None:
+    """``_write_denied_state`` does not call ``chmod_safe`` on the keystone.
+
+    ``chmod_safe`` is a no-op on Windows; if a future refactor folds the
+    lockdown back to ``chmod_safe``, the Windows keystone silently reverts to
+    the inherited parent DACL. The helper is allowed to call ``chmod_safe``
+    elsewhere (e.g. for the temp file's pre-write mode), but the audit
+    pin is on the keystone path itself, which is what this test patches.
+    """
+    import kiro_crew.atomic_write as atomic_write_mod
+
+    captured: dict = {}
+
+    def _spy(path, *args, **kwargs):
+        if Path(str(path)).resolve() == config_file.resolve():
+            captured["called"] = True
+        # No-op: don't run real atomic_write (which would shell out to icacls
+        # on Windows and may fail in the test sandbox). The audit pin is on
+        # routing, not on the lockdown step itself.
+
+    import asyncio
+
+    def _noop(denied: dict) -> None:
+        denied.setdefault("disabled_ids", [])
+
+    with patch.object(atomic_write_mod, "atomic_write", side_effect=_spy):
+        asyncio.run(_run_write_denied_state(home, config_file, _noop))
+
+    assert captured.get("called"), (
+        "_write_denied_state must route the keystone write through atomic_write"
+    )

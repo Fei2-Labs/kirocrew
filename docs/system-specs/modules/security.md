@@ -578,11 +578,19 @@ complete, and the keystone floor closes the whole class).
   `UserDeniedPattern`). Missing file / keys → the safe "nothing disabled" state
   (fail-safe for a deny gate).
 - **Write (dashboard):** the 6 `/api/security/…` mutations run
-  `_write_denied_state` — an atomic (0600) read-modify-write of
-  `denied_commands.json` under the shared config lock; `_reload_live_hooks`
-  splices the new opt-out fields onto the live `HookManager` (preserving its flat
-  hook keys) so the change enforces without a restart. These operator endpoints
-  open the file directly and do NOT route through the agent tool gate.
+  `_write_denied_state` — an atomic read-modify-write of `denied_commands.json`
+  under the shared config lock, routed through
+  `atomic_write(restrict_to_owner=True)`. The lockdown lands on the temp file
+  before any content reaches it, so the keystone never exists in a
+  world-readable file: 0o600 on POSIX, owner-only DACL on Windows. On a
+  lockdown failure `atomic_write` raises by default (the same fail-loud
+  contract the other keystone writers in `apps/builtins/*` use for their
+  `policy_store.py` and `secrets.py`), so a transient icacls failure cannot
+  leave the ceiling under the inherited parent DACL.
+  `_reload_live_hooks` splices the new opt-out fields onto the live
+  `HookManager` (preserving its flat hook keys) so the change enforces without
+  a restart. These operator endpoints open the file directly and do NOT route
+  through the agent tool gate.
 
 `HooksConfig.from_dict` remains **fully defensive** against malformed values
 (type-checks every field; booleans — `disable_all`, the auto-approve flags, a

@@ -5280,3 +5280,46 @@ class TestResetOutputEscapesUntrustedPaths:
         # Both paths are repr'd, so a control byte in either could not execute.
         assert "'" in str(exc.value), "paths are quoted (repr), not raw"
         assert "a.json" in str(exc.value) and "b.json" in str(exc.value)
+
+
+class TestSelHookRejectedRedaction:
+    """#5582: ``_sel_hook_rejected`` must redact ``command`` before its 200-char cut.
+
+    The old spelling sliced ``command[:200]`` inside the f-string and redacted
+    the assembled message afterwards, so a credential cut at the boundary lost
+    its tail, stopped matching the credential regex, and the raw prefix escaped
+    into the SEL audit row.
+    """
+
+    def _capture_sel(self, monkeypatch) -> list:
+        import kiro_crew.agent as agent_mod
+
+        events: list = []
+
+        class _Log:
+            def log(self, event) -> None:
+                events.append(event)
+
+        monkeypatch.setattr(agent_mod, "sel", lambda: _Log())
+        return events
+
+    def test_credential_straddling_the_cut_is_not_leaked(self, monkeypatch) -> None:
+        from kiro_crew.agent import _sel_hook_rejected
+
+        events = self._capture_sel(monkeypatch)
+        # fabricated AKIA-shaped literal, inlined (a ``secret``-named binding
+        # trips CodeQL's name-based sensitive-source heuristic); the 200-char
+        # cut lands 8 chars into the 20-char key
+        command = "x" * 192 + "AKIAIOSFODNN7EXAMPLE" + " --flag"
+        _sel_hook_rejected("preToolUse", command, "denied")
+        assert len(events) == 1
+        assert "AKIA" not in events[0].resources
+
+    def test_plain_command_truncation_unchanged(self, monkeypatch) -> None:
+        """Ordinary path is result-preserving: no secret ⇒ the same 200-char slice."""
+        from kiro_crew.agent import _sel_hook_rejected
+
+        events = self._capture_sel(monkeypatch)
+        _sel_hook_rejected("preToolUse", "c" * 250, "denied")
+        assert len(events) == 1
+        assert events[0].resources == f"event=preToolUse command={'c' * 200}"

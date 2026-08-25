@@ -353,28 +353,27 @@ async def _write_denied_state(mutate) -> dict:
 
     ``mutate(denied: dict) -> None`` edits the opt-out object (the file root) in
     place. Runs under the shared config lock. Returns the updated object so the
-    caller can hot-reload the live HookManager. The file is written 0600 (owner-
-    only, like other keystone secrets).
+    caller can hot-reload the live HookManager. The file is locked down to the
+    owner only on every write: 0600 on POSIX and an owner-only DACL on Windows.
+    The lockdown is applied to the temp file before any content reaches it, so
+    the keystone never exists in a world-readable file.
 
     The blocking read-modify-write (disk read, JSON (de)serialize, atomic
     replace) runs in a thread executor so it never stalls the gateway event
     loop; the async config lock still serializes concurrent mutations.
     """
-    from kiro_crew.agent import _atomic_json_write
+    from kiro_crew.atomic_write import atomic_write
     path: Path = denied_commands_path()
 
     def _read_modify_write() -> dict:
         denied = _read_denied_strict()
         mutate(denied)
         path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_json_write(path, denied)
-        # Keystone file: restrict to owner (best-effort; matches other secrets).
-        try:
-            from kiro_crew.platform_compat import chmod_safe
-
-            chmod_safe(path, 0o600)
-        except Exception:
-            logger.debug("could not chmod denied_commands.json to 0600", exc_info=True)
+        atomic_write(
+            path,
+            json.dumps(denied, indent=2) + "\n",
+            restrict_to_owner=True,
+        )
         return denied
 
     async with _get_config_lock():

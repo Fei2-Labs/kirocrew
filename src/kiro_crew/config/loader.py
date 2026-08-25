@@ -242,8 +242,9 @@ DEFAULT_SESSION_TIMEOUT = 3600  # 60 min
 # Auto-compaction threshold, as a percentage of the context window. Named
 # because two code paths need it — the dataclass field default (used only when
 # there is no config file) and the dict-load fallback in ``load()`` (used when
-# a config file omits the key). Restating the number in both is how
-# ``pool_size`` came to have a field default of 0 and a load fallback of 2.
+# a config file omits the key). Restating the number in both lets them disagree
+# with nothing on disk to show it, which is why ``pool_size`` is named the same
+# way (``DEFAULT_POOL_SIZE``) rather than written twice.
 DEFAULT_AUTOCOMPACT_PCT = 70.0
 # Margin BELOW the configured compaction threshold at which the "context is
 # getting large" warning fires. A margin rather than an absolute percentage
@@ -252,7 +253,15 @@ DEFAULT_AUTOCOMPACT_PCT = 70.0
 # absolute warn level at or above the configured threshold makes the warning arm
 # unreachable and the early signal disappears for whoever did not change the
 # default. Kept here rather than in either consumer so the two cannot drift.
-CONTEXT_WARN_MARGIN_PCT = 20.0
+#
+# 10 points, so the warning carries one fixed meaning — "within 10 points of
+# compaction" — whatever threshold the operator configures. Width is what makes
+# the signal readable: at 20 the warning covers the top 20 of the 70 usable
+# points on the default threshold and fires on every turn from half the context
+# window onward, which is where an always-on warning stops being read.
+# ``test_the_warning_stays_a_minority_of_the_usable_range`` holds the band under
+# a quarter of the range so it cannot widen back into noise.
+CONTEXT_WARN_MARGIN_PCT = 10.0
 # session.pool_size — warm pool OFF by default. Each pooled slot is a full
 # kiro-cli process plus the MCP stdio servers its agent spec spawns (~109 MB per
 # backend), and a non-zero value is also reserved out of the memory term that

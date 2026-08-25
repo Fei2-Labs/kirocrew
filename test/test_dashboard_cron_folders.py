@@ -536,6 +536,48 @@ class TestCronFoldersPersistence:
         with pytest.raises(OSError):
             state.save_cron_folders()
 
+    def test_create_does_not_mutate_live_list_before_save_succeeds(self, tmp_path, monkeypatch):
+        """Ghost-folder regression that distinguishes persist-first from the old
+        append-then-save-then-pop: capture the LIVE ``_cron_folders`` at the
+        moment the persist runs. The old code had already appended the new
+        folder to the live list by then (a concurrent GET would see the ghost);
+        the fix persists a candidate and leaves the live list untouched until
+        the save returns, so the live list must NOT contain the folder at
+        persist time. Reverting the fix makes this assertion fail.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path, raising=False)
+        state = DashboardState.__new__(DashboardState)
+        state._cron_folders = [{"id": "existing", "name": "Keep", "order": 0}]
+        live_at_persist: list[bool] = []
+
+        def _observe(path, data):
+            # Read the LIVE attribute (not the data being written): the fix must
+            # not have committed the new folder to _cron_folders yet.
+            live_at_persist.append(any(f["id"] == "newid" for f in state._cron_folders))
+
+        monkeypatch.setattr(state, "_persist_cron_folders", lambda folders: _observe(None, folders))
+        state.create_cron_folder("New", "newid")
+        # At persist time the live list still held only the pre-existing folder.
+        assert live_at_persist == [False]
+        # After a successful create the folder is committed to the live list.
+        assert [f["id"] for f in state._cron_folders] == ["existing", "newid"]
+
+    def test_create_leaves_live_list_unchanged_on_save_failure(self, tmp_path, monkeypatch):
+        """A failed create must leave ``_cron_folders`` exactly as it was — the
+        new folder is never exposed."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path, raising=False)
+        state = DashboardState.__new__(DashboardState)
+        state._cron_folders = [{"id": "existing", "name": "Keep", "order": 0}]
+        before = list(state._cron_folders)
+
+        def _boom(self, path, data):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(DashboardState, "_atomic_write_json_strict", _boom, raising=True)
+        with pytest.raises(OSError):
+            state.create_cron_folder("New", "newid")
+        assert state._cron_folders == before
+
     def test_startup_wiring_calls_load_cron_folders(self):
         # The two gateway startup paths call load_folders(); each must also
         # call load_cron_folders() immediately after.

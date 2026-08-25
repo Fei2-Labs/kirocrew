@@ -195,19 +195,6 @@ KNOWN_UNCONVERTED: dict[str, tuple[str, str]] = {
     # `home_dir / "config.json"` rather than the local `dst_cfg` the line spells.
     # That is the more durable key: renaming the local no longer stales the entry.
     "src/kiro_crew/pod/runtime.py::write_pod_config": ("#5346", 'home_dir / "config.json"'),
-    # Surfaced once _atomic_json_write was recognised as a writer. The most
-    # security-relevant of these five: denied_commands.json is the command
-    # opt-out keystone, and its own docstring says it is written "0600
-    # (owner-only, like other keystone secrets)" -- but the 0600 lands AFTER the
-    # helper has already published the payload at the final path.
-    #
-    # Deliberately tracked rather than converted here. _atomic_json_write takes
-    # no restrict_to_owner, and its rename goes through replace_with_retry for
-    # Windows PermissionError, which its docstring calls load-bearing for spawn
-    # correctness -- so the conversion is either a new parameter threaded through
-    # ~20 callers or a swap that drops that retry. Either is its own change with
-    # its own review, not a rider on a gate.
-    "src/kiro_crew/dashboard/handlers/security.py::_read_modify_write": ("#5346", "path"),
 }
 
 

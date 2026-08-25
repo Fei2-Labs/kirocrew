@@ -2944,8 +2944,8 @@
       "workspace": {
         "co_author": "Co-author",
         "co_author_conflict": "Co-author changed this file",
-        "co_author_conflict_discard": "Discard my edits and reload",
-        "co_author_conflict_discard_confirm": "Discard your unsaved edits to “{{file}}” and load the co-author’s version? This cannot be undone.",
+        "co_author_conflict_discard": "Discard my changes and reload",
+        "co_author_conflict_discard_confirm": "Discards your unsaved changes to “{{file}}” and loads the co-author’s version. This cannot be undone.",
         "commit_and_push": "Commit & Push",
         "commit_message_prompt": "Describe this commit. It stages every change in the paper.",
         "compile": "Compile",
@@ -6848,6 +6848,8 @@
     },
     "schedulePage": {
       "actions": "Actions",
+      "owning_session_help": "A job without an owning session is invisible to cron_list in chat and is managed from this page or the CLI.",
+      "owning_session_tooltip": "Owning session: {{key}}",
       "view_calendar": "Calendar",
       "view_executions": "Executions",
       "view_list": "List",

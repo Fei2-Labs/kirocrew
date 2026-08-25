@@ -82,6 +82,7 @@ from kiro_crew.mcp_gateway.stub import fallback_counts as stub_fallback_counts
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.peer_resolve import resolve_peer_identity
 from kiro_crew.platform_compat import IS_WINDOWS
+from kiro_crew.platform_compat import count_open_fds as _shared_count_open_fds
 from kiro_crew.platform_compat import get_process_start_id as _get_process_start_id
 from kiro_crew.platform_compat import proc_rss_bytes as _proc_rss_bytes
 from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES, warm_backend
@@ -3290,41 +3291,19 @@ def _count_open_fds() -> int:
     the count per snapshot lets us confirm or eliminate that path without
     deploying a separate tracer.
 
-    Platform implementations:
-    - Linux: ``/proc/self/fd``
-    - macOS/BSD: ``/dev/fd``
-    - Windows: ``GetProcessHandleCount`` via ctypes (handle count, not
-      fd count — the field documents this as platform-dependent)
+    Delegates to :func:`platform_compat.count_open_fds` — the one shared
+    per-platform probe (Linux ``/proc/self/fd``, macOS/BSD ``/dev/fd``,
+    Windows ``GetProcessHandleCount``), also behind the
+    ``kirocrew.process.open_fds`` gauge — so this diagnostic cannot drift
+    from the figure the metrics report. The shared probe subtracts the
+    enumeration fd on POSIX, so the value here is exactly one lower than the
+    raw count the pre-consolidation duplicate reported; immaterial for a
+    zombie-diagnostic snapshot field.
 
     Returns ``-1`` when the platform cannot provide the value.
     """
-    # Linux — preferred, most precise.
-    try:
-        return len(os.listdir("/proc/self/fd"))
-    except OSError:
-        pass
-
-    # macOS / BSD — /dev/fd is a per-process virtual directory.
-    try:
-        return len(os.listdir("/dev/fd"))
-    except OSError:
-        pass
-
-    # Windows — count kernel handles for the current process.
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-            handle_count = wintypes.DWORD()
-            current_process = kernel32.GetCurrentProcess()
-            if kernel32.GetProcessHandleCount(current_process, ctypes.byref(handle_count)):
-                return handle_count.value
-        except (OSError, AttributeError, ValueError):
-            pass
-
-    return -1
+    count = _shared_count_open_fds()
+    return -1 if count is None else count
 
 
 def _read_rss_kb() -> int:

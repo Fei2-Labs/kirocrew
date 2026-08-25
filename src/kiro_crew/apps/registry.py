@@ -5224,6 +5224,31 @@ def _report_retained_stale_checkouts(
         logger.info("Retained stale checkout: %s", stale)
 
 
+async def _retained_startup_refusal(
+    name: str, log_lines: list[str]
+) -> dict[str, Any] | None:
+    """Return a retryable refusal while old-version startup code remains live."""
+    # Deferred to avoid registry -> hooks_integration -> manager import cycles at
+    # module load. The dispatcher exists only in the gateway process; without it
+    # there is no in-process retained startup task to own.
+    from kiro_crew.apps.hooks_integration import stop_retained_startup_hooks
+
+    if await stop_retained_startup_hooks(name, bounded=True):
+        return None
+    message = (
+        f"cannot reinstall {name!r} while its timed-out startup hook is still "
+        "running; retry after it exits"
+    )
+    log_lines.append(message)
+    return {
+        "ok": False,
+        "name": name,
+        "error": message,
+        "code": "startup_hook_still_running",
+        "retryable": True,
+    }
+
+
 async def install_from_registry(
     name: str,
     log_lines: list[str] | None = None,
@@ -5455,6 +5480,10 @@ async def install_from_registry(
     is_self_managed = entry.get("resources") == "app"
     if log_lines is None:
         log_lines = []
+
+    startup_refusal = await _retained_startup_refusal(name, log_lines)
+    if startup_refusal is not None:
+        return startup_refusal
 
     # Validate minKiroCrewVersion if declared
     min_version = (manifest or {}).get("minKiroCrewVersion", "")
@@ -5926,6 +5955,15 @@ async def install_from_registry(
                 )
             if dep_result.missing:
                 log_lines.append(f"Missing commands: {', '.join(dep_result.missing)}")
+
+        # A clone/build/install script can take minutes. Recheck at the shared
+        # replacement boundary so startup execution that became retained during
+        # that work cannot overlap either managed file replacement or
+        # self-managed metadata replacement.
+        startup_refusal = await _retained_startup_refusal(name, log_lines)
+        if startup_refusal is not None:
+            outcome = startup_refusal
+            return outcome
 
         # Step 4: Register with KiroCrew
         if is_self_managed:

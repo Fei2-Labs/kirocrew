@@ -1894,6 +1894,32 @@ class TestEnsureWorkerSlot:
         assert "spec_slot_name_denied" in ops
 
     @pytest.mark.asyncio
+    async def test_denied_name_audit_redacts_before_truncating(self, tmp_path, _quiet_sel):
+        """#5582: a credential straddling the 64-char audit cut must not leak.
+
+        The old spelling ``_redact(name[:64])`` sliced first, so a key cut at
+        the boundary lost its tail, stopped matching the credential regex, and
+        the raw prefix escaped into the SEL audit row.
+
+        The fabricated AKIA-shaped literal is deliberately inlined rather than
+        bound to a ``secret``-named variable: CodeQL's name-based sensitive-
+        source heuristic would otherwise taint this real call path and flag
+        every downstream ``logger.warning(..., name, ...)`` in production code
+        as clear-text secret logging (10 false alerts on unchanged lines).
+        """
+        # fails the grammar; the 64-char cut lands 8 chars into the 20-char key
+        name = "x" * 56 + "AKIAIOSFODNN7EXAMPLE" + " tail"
+        state = _State()
+        assert await r._ensure_worker_slot(state, name, _entry(tmp_path)) is None
+        denied = [
+            c.kwargs["resources"]
+            for c in _quiet_sel.log_api_access.call_args_list
+            if c.kwargs["operation"] == "spec_slot_name_denied"
+        ]
+        assert denied, "the denial must still be audited"
+        assert all("AKIA" not in res for res in denied)
+
+    @pytest.mark.asyncio
     async def test_a_cold_slot_is_created_scoped_and_titled(self, tmp_path):
         state = _State()
         with _no_rehydrate():
@@ -2270,6 +2296,35 @@ class TestSerializeMessages:
         state = _State(**{"spec-builder-demo": slot})
         out = await r._serialize_messages(state, "spec-builder-demo")
         assert out == [{"role": "tool", "content": "fs_write tasks.md", "ts": "1"}]
+
+    @pytest.mark.asyncio
+    async def test_a_tool_line_credential_straddling_the_cut_is_not_leaked(self):
+        """#5582: a credential straddling the 200-char cut must not leak.
+
+        The old spelling ``_redact(first[:200])`` sliced first, so a key cut at
+        the boundary lost its tail, stopped matching the credential regex, and
+        the raw prefix escaped into the embedded-chat payload.
+        The fabricated AKIA-shaped literal is inlined rather than bound to a
+        ``secret``-named variable, which would trip CodeQL's name-based
+        sensitive-source heuristic on this real call path.
+        """
+        # cut lands 8 chars into the fabricated 20-char key
+        first = "x" * 192 + "AKIAIOSFODNN7EXAMPLE" + " trailing"
+        slot = _Slot("spec-builder-demo")
+        slot.messages = [{"role": "tool", "content": first + "\nmore", "ts": "1"}]
+        state = _State(**{"spec-builder-demo": slot})
+        out = await r._serialize_messages(state, "spec-builder-demo")
+        assert "AKIA" not in out[0]["content"]
+        assert len(out[0]["content"]) <= 200
+
+    @pytest.mark.asyncio
+    async def test_a_plain_tool_line_truncation_unchanged(self):
+        """Ordinary path is result-preserving: no secret ⇒ the same 200-char slice."""
+        slot = _Slot("spec-builder-demo")
+        slot.messages = [{"role": "tool", "content": "t" * 250 + "\nmore", "ts": "1"}]
+        state = _State(**{"spec-builder-demo": slot})
+        out = await r._serialize_messages(state, "spec-builder-demo")
+        assert out[0]["content"] == "t" * 200
 
     @pytest.mark.asyncio
     async def test_an_empty_tool_turn_does_not_raise_on_the_first_line(self):

@@ -24,6 +24,7 @@
     "hide_full_changelog": "▾ Hide Full Changelog",
     "i_d_like_to_request_a_feature": "I’d like to request a feature!",
     "iam_identity_center": "IAM Identity Center",
+    "kiro_credit_usage_api_key": "Kiro credit usage — not available with API key authentication",
     "kiro_credit_usage_unavailable": "Kiro credit usage — unavailable",
     "memory_unavailable": "Memory: unavailable",
     "metrics_are_stale_latest_fetch_failed": "Metrics are stale, latest fetch failed",
@@ -1201,8 +1202,8 @@
     },
     "papyrus": {
       "workspace": {
-        "co_author_conflict_discard_button": "Discard edits",
-        "co_author_conflict_discard_title": "Discard unsaved edits?"
+        "co_author_conflict_discard_button": "Discard changes",
+        "co_author_conflict_discard_title": "Discard unsaved changes?"
       }
     }
   },
@@ -1223,6 +1224,7 @@
       "account_details_unavailable": "Account details unavailable",
       "checking_account": "Checking account…",
       "checking_credit_usage": "Checking credit usage",
+      "credit_usage_api_key_auth": "Credit usage isn’t available for API key authentication",
       "credit_usage_unavailable": "Credit usage unavailable",
       "days_until_expiration": "Days until expiration: {{count}}",
       "estimated_overage_cost": "Estimated overage cost",
@@ -1827,9 +1829,7 @@
       "snapshotting": "Snapshotting…",
       "split_view": "Split view",
       "toggle_file_browser": "Toggle file browser",
-      "tracking_description": "Tracking {{path}}",
-      "view_preview": "View Preview",
-      "view_source": "View Source"
+      "tracking_description": "Tracking {{path}}"
     },
     "markdownRenderer": {
       "click_to_browse_shift_click_to_open_in_file_explorer": "Click to browse / Shift+click to open in File Explorer",
@@ -2622,7 +2622,7 @@
       "created_and_registered_profile": "Created + registered profile '{{name}}'.",
       "deploy_artifact": "Deploy {{name}}",
       "deployments_count": "Deployments ({{count}})",
-      "destroy_confirm": "DESTROY '{{name}}'? Permanently deletes bucket {{bucket}} and distribution {{distribution}}. Cannot be undone.",
+      "destroy_confirm": "Permanently deletes bucket {{bucket}} and distribution {{distribution}} for '{{name}}'. Cannot be undone.",
       "destroying": "Destroying '{{name}}' (CloudFront disable can take 5–15 min).",
       "error": "Error: {{error}}",
       "is_the_default_profile": "{{name}} is the default profile",
@@ -2640,13 +2640,13 @@
       "fullstack_also_requires_the_permissions_boundary": "Fullstack also requires the permissions-boundary policy below — create it BEFORE the first deploy (role creation is conditioned on it).",
       "make_default": "Make default",
       "not_reachable": "not reachable",
-      "recall_confirm": "Recall '{{name}}'? Empties bucket {{bucket}} (URL → 404, reversible). Edge caches may serve briefly; already-downloaded content can't be recalled.",
+      "recall_confirm": "Empties bucket {{bucket}} for '{{name}}' (URL → 404, reversible). Edge caches may serve briefly; already-downloaded content can't be recalled.",
       "recalled": "Recalled '{{name}}'.",
       "register": "Register",
       "registered_profile": "Registered profile '{{name}}'.",
       "remove_failed": "remove failed",
       "remove_from_registry": "Remove {{name}} from registry",
-      "remove_profile_confirm": "Remove '{{name}}' from the registry? Your ~/.aws/config is NOT touched.",
+      "remove_profile_confirm": "Removes '{{name}}' from the registry. Your ~/.aws/config is NOT touched.",
       "removed_from_registry_your_aws_config_is_untouche": "Removed from registry (your ~/.aws/config is untouched).",
       "unknown": "unknown",
       "unknown_2": "(unknown)",
@@ -2729,6 +2729,8 @@
       "deploying": "Deploying…",
       "expired": "Expired",
       "filter_artifacts": "Filter {{provider}} artifacts…",
+      "folder_one": "{{count}} folder",
+      "folder_other": "{{count}} folders",
       "gallery": "Gallery",
       "import_from_a_file": "Import from a file…",
       "live": "Live",
@@ -2773,6 +2775,8 @@
       "prompts_description": "Reusable prompt templates from {{registry}}"
     },
     "channelPage": {
+      "agent_joining_one": "{{count}} agent joining",
+      "agent_joining_other": "{{count}} agents joining",
       "failed_to_add_agent": "Failed to add agent",
       "failed_to_clear_context_error": "Failed to clear context: {{error}}",
       "failed_to_create_channel": "Failed to create channel",
@@ -2952,6 +2956,7 @@
         "expand_agent_list": "Expand subagent list",
         "open_in_subagents_sidebar": "Open {{label}} in subagents sidebar",
         "retry_failed_count": "Retry failed ({{count}})",
+        "stop_all": "Stop all",
         "stop_all_running_subagents": "Stop all running subagents",
         "stop_running_subagent": "Stop running subagent",
         "stop_subagent": "Stop subagent {{name}}"
@@ -3056,6 +3061,23 @@
         "select_file_hint": "Select a file from the tree to open it in a new tab",
         "title": "Files",
         "tree_error": "Couldn't load the file tree"
+      },
+      "subagentRunCard": {
+        "agent_finished_one": "{{count}} agent finished",
+        "agent_finished_other": "{{count}} agents finished",
+        "agent_launched_one": "{{count}} agent launched",
+        "agent_launched_other": "{{count}} agents launched",
+        "agent_one": "{{count}} agent",
+        "agent_other": "{{count}} agents",
+        "agent_queued_one": "{{count}} agent queued",
+        "agent_queued_other": "{{count}} agents queued",
+        "agent_running_one": "{{count}} agent running",
+        "agent_running_other": "{{count}} agents running"
+      },
+      "turnBlock": {
+        "hide_tool_calls": "Hide tool calls",
+        "worked_through_step_one": "Worked through {{count}} step",
+        "worked_through_step_other": "Worked through {{count}} steps"
       }
     },
     "chatPage": {
@@ -3104,6 +3126,8 @@
       "send_failed_with_error": "Send failed: {{error}}"
     },
     "chatSidebar": {
+      "archive_session_one": "Archive {{count}} session",
+      "archive_session_other": "Archive {{count}} sessions",
       "default_agent": "Default agent: {{name}}",
       "delete_folder_confirm": "Delete \"{{name}}\"? Sessions will be ungrouped.",
       "filter_tags": "Filter tags: {{name}}",
@@ -3134,6 +3158,8 @@
       "last_7_days": "Last 7 Days",
       "dashboard_source": "Dashboard",
       "connected_to": "Connected to {{label}}",
+      "session_failed_to_switch_one": "{{count}} session failed to switch",
+      "session_failed_to_switch_other": "{{count}} sessions failed to switch",
       "started_in_channel": "This conversation started in {{channel}}.",
       "started_in_direct_message": "This conversation started in a direct message.",
       "session_source": "Session",
@@ -3142,6 +3168,10 @@
       "no_inactive_sessions_to_archive": "No inactive sessions to archive.",
       "older": "Older",
       "show": "Show",
+      "show_hidden_folder_one": "Show {{count}} hidden folder",
+      "show_hidden_folder_other": "Show {{count}} hidden folders",
+      "sub_agent_needs_approval_one": "{{count}} sub-agent needs approval",
+      "sub_agent_needs_approval_other": "{{count}} sub-agents need approval",
       "switch_failed": "Switch failed",
       "switch_to_board_view": "Switch to board view",
       "switch_to_flat_view_all_chats_without_folders": "Switch to flat view (all chats without folders)",
@@ -3188,7 +3218,11 @@
       "add_state_lanes": "Add automatic columns",
       "lane_seed_failed": "Could not add the automatic columns.",
       "lane_seed_retry": "Try again",
-      "lane_legacy_column_hint": "shows every session"
+      "lane_legacy_column_hint": "shows every session",
+      "switch_session_one": "Switch {{count}} session",
+      "switch_session_other": "Switch {{count}} sessions",
+      "workflow_running_one": "{{count}} workflow running",
+      "workflow_running_other": "{{count}} workflows running"
     },
     "connectionsPage": {
       "action_failed": "Action failed: {{error}}",
@@ -3446,7 +3480,8 @@
       "total_runs": "Total Runs",
       "matcher_placeholder_regex": "Matcher (regex, e.g. \\b(auth|login)\\b)",
       "matcher_placeholder_contains": "Matcher (contains, e.g. deploy|release)",
-      "skills_inert_warning": "These skills can't fire on this configuration: {{skills}}. To save, switch to UserPromptSubmit or AgentSpawn without a command — or remove the skills."
+      "skills_inert_warning": "These skills can't fire on this configuration: {{skills}}. To save, switch to UserPromptSubmit or AgentSpawn without a command — or remove the skills.",
+      "test_failed": "Test failed"
     },
     "kiroCrewAgentsPage": {
       "a_unique_identifier_for_this_workspace_agents_re": "A unique identifier for this workspace. Agents reference workspaces by name.",
@@ -3716,6 +3751,8 @@
         "tool_call_budget_per_subagent_1_200_default_100": "Tool-call budget per subagent (1–200). Default: 100."
       },
       "mcpTab": {
+        "applied_change_one": "Applied {{count}} change",
+        "applied_change_other": "Applied {{count}} changes",
         "edit_json_for": "Edit JSON for {{name}}",
         "mcp_servers_count": "MCP Servers ({{count}})",
         "off_count": "({{count}} off)",
@@ -3990,6 +4027,8 @@
       "failed_to_load_jobs": "Failed to load jobs",
       "h_ago": "{{n}}h ago",
       "hide_message": "Hide message",
+      "job_could_not_be_deleted_one": "{{failed}} of {{count}} job could not be deleted",
+      "job_could_not_be_deleted_other": "{{failed}} of {{count}} jobs could not be deleted",
       "just_now": "just now",
       "last_error": "Last Error",
       "last_output": "Last Output",

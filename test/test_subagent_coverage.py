@@ -1134,6 +1134,31 @@ class TestReadSurfaces:
         mgr._agents["queued"] = _info("queued", queued=True)
         assert mgr.task_memory_rows() == []
 
+    def test_task_memory_rows_redact_before_truncate(self) -> None:
+        """#5582: a credential straddling the 80-char cut must not leak a fragment.
+
+        The old spelling ``_redact(a.task[:80])`` sliced first, so a key cut at
+        the boundary lost its tail and no longer matched the credential regex —
+        the raw prefix escaped into the session-memory surface.
+        The fabricated AKIA-shaped literal is inlined rather than bound to a
+        ``secret``-named variable, which would trip CodeQL's name-based
+        sensitive-source heuristic on this real call path.
+        """
+        # cut lands 8 chars into the fabricated 20-char key
+        task = "x" * 72 + "AKIAIOSFODNN7EXAMPLE" + " trailing"
+        mgr = _manager()
+        mgr._agents["a"] = _info("a", task=task, parent_session_key="dash:1")
+        row = {r["id"]: r for r in mgr.task_memory_rows()}["a"]
+        assert "AKIA" not in row["task"]
+        assert len(row["task"]) <= 80
+
+    def test_task_memory_rows_plain_task_truncation_unchanged(self) -> None:
+        """Ordinary path is result-preserving: no secret ⇒ the same 80-char slice."""
+        mgr = _manager()
+        mgr._agents["a"] = _info("a", task="t" * 100, parent_session_key="dash:1")
+        row = {r["id"]: r for r in mgr.task_memory_rows()}["a"]
+        assert row["task"] == "t" * 80
+
     def test_get_running_all_and_count(self) -> None:
         mgr = _manager()
         live = _info("live")

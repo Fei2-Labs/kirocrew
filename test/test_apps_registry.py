@@ -481,6 +481,122 @@ async def test_provenance_signer_comes_from_cloned_manifest(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_registry_fresh_reinstall_checks_retained_startup_before_clone(
+    monkeypatch, tmp_path
+):
+    """Missing metadata must not hide retained old-version startup ownership."""
+    src = tmp_path / "app-sources" / "demoapp"
+    _identity_harness(
+        monkeypatch,
+        src,
+        cloned_manifest={"name": "demoapp", "version": "2.0.0"},
+    )
+    monkeypatch.setattr(registry, "get_app", lambda _name: None)
+
+    from kiro_crew.apps import hooks_integration
+
+    cleanup_calls: list[tuple[str, bool]] = []
+
+    async def _cleanup(app_name: str, *, bounded: bool) -> bool:
+        cleanup_calls.append((app_name, bounded))
+        return False
+
+    monkeypatch.setattr(
+        hooks_integration, "stop_retained_startup_hooks", _cleanup
+    )
+
+    async def _must_not_clone(*args, **kwargs):
+        raise AssertionError("fresh reinstall must not clone while old code runs")
+
+    monkeypatch.setattr(registry, "_clone_build_app", _must_not_clone)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["ok"] is False
+    assert result["code"] == "startup_hook_still_running"
+    assert result["retryable"] is True
+    assert cleanup_calls == [("demoapp", True)]
+
+
+@pytest.mark.asyncio
+async def test_registry_fresh_reinstall_rechecks_retained_startup_before_replacement(
+    monkeypatch, tmp_path
+):
+    """A fresh-looking reinstall must recheck ownership after clone and build."""
+    src = tmp_path / "app-sources" / "demoapp"
+    _identity_harness(
+        monkeypatch,
+        src,
+        cloned_manifest={"name": "demoapp", "version": "2.0.0"},
+    )
+    monkeypatch.setattr(registry, "get_app", lambda _name: None)
+
+    from kiro_crew.apps import hooks_integration
+
+    cleanup_calls: list[tuple[str, bool]] = []
+
+    async def _cleanup(app_name: str, *, bounded: bool) -> bool:
+        cleanup_calls.append((app_name, bounded))
+        return len(cleanup_calls) == 1
+
+    monkeypatch.setattr(
+        hooks_integration, "stop_retained_startup_hooks", _cleanup
+    )
+
+    def _must_not_replace(*args, **kwargs):
+        raise AssertionError("fresh reinstall must not replace files while old code runs")
+
+    monkeypatch.setattr(registry, "install_app", _must_not_replace)
+    monkeypatch.setattr(registry, "update_app", _must_not_replace)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["ok"] is False
+    assert result["code"] == "startup_hook_still_running"
+    assert result["retryable"] is True
+    assert cleanup_calls == [("demoapp", True), ("demoapp", True)]
+
+
+@pytest.mark.asyncio
+async def test_registry_reinstall_rechecks_retained_startup_before_replacement(
+    monkeypatch, tmp_path
+):
+    """A hook retained during clone/build must still block old-file replacement."""
+    src = tmp_path / "app-sources" / "demoapp"
+    _identity_harness(
+        monkeypatch,
+        src,
+        cloned_manifest={"name": "demoapp", "version": "2.0.0"},
+    )
+    monkeypatch.setattr(registry, "get_app", lambda _name: {"name": "demoapp"})
+
+    from kiro_crew.apps import hooks_integration
+
+    cleanup_calls: list[tuple[str, bool]] = []
+
+    async def _cleanup(app_name: str, *, bounded: bool) -> bool:
+        cleanup_calls.append((app_name, bounded))
+        # No task at admission time; one becomes retained while clone/build runs.
+        return len(cleanup_calls) == 1
+
+    monkeypatch.setattr(
+        hooks_integration, "stop_retained_startup_hooks", _cleanup
+    )
+
+    def _must_not_update(*args, **kwargs):
+        raise AssertionError("registry reinstall must not replace old files")
+
+    monkeypatch.setattr(registry, "update_app", _must_not_update)
+
+    result = await registry.install_from_registry("demoapp")
+
+    assert result["ok"] is False
+    assert result["code"] == "startup_hook_still_running"
+    assert result["retryable"] is True
+    assert cleanup_calls == [("demoapp", True), ("demoapp", True)]
+
+
+@pytest.mark.asyncio
 async def test_identity_gate_runs_before_the_build(monkeypatch, tmp_path):
     """A mismatched repo must be refused BEFORE _run_app_build executes — build
     ecosystems run repo-authored lifecycle scripts (npm preinstall, setup.py),

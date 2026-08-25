@@ -46,6 +46,7 @@ from kiro_crew.platform_compat import RENAME_NOREPLACE_AVAILABLE, rename_norepla
 try:
     from kiro_crew.security import (
         is_sensitive_path,
+        redact_and_truncate,
         redact_credentials,
         redact_exfiltration_urls,
     )
@@ -256,6 +257,21 @@ def _redact(text: str) -> str:
     text, _ = redact_exfiltration_urls(text)
     text, _ = redact_credentials(text)
     return text
+
+
+def _redact_and_truncate(text: str, max_chars: int) -> str:
+    """Scrub like ``_redact``, then truncate — never ``_redact(x[:n])``.
+
+    Truncating first can cut a credential at the boundary, leaving a fragment
+    the redaction regexes no longer match, so the raw remainder would leak.
+    Fails CLOSED exactly like ``_redact``: with no security module there is no
+    way to scrub, so withhold the text rather than serving a bounded raw slice.
+    """
+    if not isinstance(text, str) or not text:
+        return text or ""
+    if not _HAS_SECURITY:
+        return _UNSCRUBBABLE
+    return redact_and_truncate(text, max_chars)
 
 
 def _audit(operation: str, resources: str = "", outcome: str = "success") -> None:
@@ -2230,7 +2246,7 @@ async def _ensure_worker_slot(
     # admission predicate creation and discovery enforce (_usable_name, which is
     # the grammar plus redaction-stability -- see _load_index).
     if not _usable_name(name):
-        _audit("spec_slot_name_denied", _redact(name[:64]), outcome="denied")
+        _audit("spec_slot_name_denied", _redact_and_truncate(name, 64), outcome="denied")
         logger.warning("refusing a spec slot for a name that fails the grammar")
         return None
     # Resolved ONCE, before any await below. Recomputing it afterwards let a
@@ -3124,7 +3140,7 @@ async def _serialize_messages(state: Any, slot_key: str) -> list[dict]:
             # Mirror the main chat: surface tool activity as a compact line
             # (first line, bounded) so the embedded chat shows the agent working.
             first = (content or "").strip().splitlines()[0] if content else ""
-            out.append({"role": "tool", "content": _redact(first[:200]), "ts": ts})
+            out.append({"role": "tool", "content": _redact_and_truncate(first, 200), "ts": ts})
             continue
         out.append({"role": role, "content": _redact(content or ""), "ts": ts})
     return out
