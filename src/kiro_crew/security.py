@@ -5130,6 +5130,12 @@ _CREW_SECRET_LEAVES: list[str] = [
     # gateway's own writers open these paths directly and do NOT route through this
     # gate, so legitimate startup/spawn writes still work.
     "run",
+    # Canonical run/command/outbox metadata and SQLite's WAL/SHM/journal
+    # sidecars. Once coordinator authority moves here, an agent that can read
+    # or rewrite this directory can steal task payloads, forge completion
+    # delivery, or alter its own execution/lease state. Protect the whole
+    # directory so every SQLite sidecar inherits the same read/write floor.
+    "run-coordinator",
     # Encrypted secret vault directory — denylists the entire subdirectory so
     # the key file, ciphertext store, lock, and atomic-write temp files are all
     # unreadable to the agent through any Kiro Crew-mediated channel (PR 1 of

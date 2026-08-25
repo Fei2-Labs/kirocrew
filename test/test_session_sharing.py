@@ -472,12 +472,14 @@ class TestSessionSharingMultiAgent:
         # Disable stagger so both spawns start immediately
         manager._spawn_stagger_secs = 0.0
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info1 = manager.spawn("task A", parent_session_key="dashboard:slot1")
             info2 = manager.spawn("task B", parent_session_key="dashboard:slot1")
-            await asyncio.sleep(1.0)
+            await asyncio.gather(_wait_until_done(info1), _wait_until_done(info2))
 
         # Both should use session sharing
         assert info1._session_sharing is True
@@ -500,12 +502,14 @@ class TestSessionSharingMultiAgent:
         )
         manager._spawn_stagger_secs = 0.0
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info1 = manager.spawn("task A", parent_session_key="dashboard:slot1")
             info2 = manager.spawn("task B", parent_session_key="dashboard:slot2")
-            await asyncio.sleep(1.0)
+            await asyncio.gather(_wait_until_done(info1), _wait_until_done(info2))
 
         assert info1._session_sharing is True
         assert info2._session_sharing is True

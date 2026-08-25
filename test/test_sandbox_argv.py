@@ -243,6 +243,23 @@ class TestBuildSeatbeltProfile:
         for f in _CC_FILES:
             assert os.path.join(home, f) in profile
 
+    @pytest.mark.parametrize("sandbox_level", ("standard", "cc", "strict"))
+    def test_custom_data_home_coordinator_is_fully_denied(
+        self, tmp_path, monkeypatch, sandbox_level
+    ):
+        custom_home = tmp_path / "custom-crew-home"
+        monkeypatch.setenv("KIROCREW_HOME", str(custom_home))
+
+        profile = _build_seatbelt_profile(
+            sandbox_level,
+            extra_visible_dirs=(str(custom_home / "run-coordinator" / "keep"),),
+        )
+
+        escaped = str(custom_home / "run-coordinator").replace('"', '\\"')
+        assert f'(deny file-read* (subpath "{escaped}"))' in profile
+        assert f'(deny file-write* (subpath "{escaped}"))' in profile
+        assert f'(deny file-link (subpath "{escaped}"))' in profile
+
     def test_cc_mode_skips_aws_dir(self):
         """CC mode does NOT deny .aws as a directory (credential_process needs it)."""
         profile = _build_seatbelt_profile("cc")
@@ -315,6 +332,25 @@ class TestBuildLauncherScript:
         script = _build_launcher_script("standard")
         # Standard dirs don't include .aws
         assert "HIDE_SSH = False" in script
+
+    @pytest.mark.parametrize("sandbox_level", ("standard", "cc", "strict"))
+    @_POSIX_ONLY
+    def test_custom_data_home_coordinator_reaches_both_mask_loops(
+        self, tmp_path, monkeypatch, sandbox_level
+    ):
+        custom_home = tmp_path / "custom-crew-home"
+        monkeypatch.setenv("KIROCREW_HOME", str(custom_home))
+
+        script = _build_launcher_script(
+            sandbox_level,
+            extra_visible_dirs=(str(custom_home / "run-coordinator" / "keep"),),
+        )
+        dirs = json.loads(re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S).group(1))
+        files = json.loads(re.search(r"SENSITIVE_FILES = (\[.*?\])\n", script, re.S).group(1))
+        coordinator_dir = str(custom_home / "run-coordinator")
+
+        assert coordinator_dir in dirs
+        assert coordinator_dir in files
 
     @_POSIX_ONLY
     def test_auth_staging_is_hidden_except_for_trusted_auth_spawn(self):
@@ -2004,6 +2040,10 @@ class TestKiroInternalSandboxExclusion:
         if content is not None:
             p.write_text(content)
         monkeypatch.setattr("kiro_crew.sandbox._KIRO_INTERNAL_SETTINGS_PATH", str(p))
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: str(Path.home() / ".kiro" / "crew" / "run-coordinator"),
+        )
         return p
 
     # --- kiro_internal_sandbox_enabled() helper ---
@@ -2080,6 +2120,34 @@ class TestKiroInternalSandboxExclusion:
         assert argv[0] == "env"
         assert "-u" in argv
         assert "AWS_SECRET_ACCESS_KEY" in argv
+
+    @pytest.mark.parametrize("mode", ["auto", "off"])
+    def test_darwin_custom_data_home_refuses_nested_sandbox_owners(
+        self, tmp_path, monkeypatch, mode
+    ):
+        self._write_settings(tmp_path, monkeypatch, '{"sandbox": true}')
+        custom_ledger = tmp_path / "custom-crew-home" / "run-coordinator"
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: str(custom_ledger),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_uses_custom_home",
+            lambda: True,
+        )
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "darwin")
+
+        with (
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+            patch("kiro_crew.sandbox.sandbox_exec_argv") as mock_sb,
+            pytest.raises(sandbox_mod.SandboxUnavailableError) as caught,
+        ):
+            wrap_argv(["kiro-cli", "acp"], mode=mode)
+
+        assert caught.value.kind == "foreign_sandbox"
+        assert "KIROCREW_HOME" in str(caught.value)
+        assert str(custom_ledger) in caught.value.detail
+        mock_sb.assert_not_called()
 
     def test_darwin_non_kiro_spawn_stays_wrapped(self, tmp_path, monkeypatch):
         """Non-kiro spawns have no internal sandbox — seatbelt stays on."""
