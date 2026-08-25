@@ -154,16 +154,20 @@ to verify none crept back in. Which keys are plural comes from that registry,
 never from sniffing a `_one` / `_other` suffix, because real copy ends in those
 words (`panel_to_add_one` is "panel to add one.").
 
-A **fully hardcoded** literal commits the same defect with no `i18nT` in it:
+A **fully hardcoded** literal commits the same defect with no `i18nT` in it,
+in any of four spellings:
 
 ```tsx
-// WRONG for the same reason — the suffix is chosen in JS, in English
-aria-label={`Retry ${n} failed subagent${n > 1 ? 's' : ''}`}
+// WRONG for the same reason — the plural form is chosen in JS, in English
+aria-label={`Retry ${n} failed subagent${n > 1 ? 's' : ''}`}   // template glue
+<span>{n} agent{n > 1 ? 's' : ''}</span>                        // JSX-text glue
+const label = 'agent' + (n > 1 ? 's' : '')                      // concatenation
+const word = n === 1 ? 'category' : 'categories'                // whole words
 ```
 
-`--check` counts these too (`[plurals-hardcoded]`), against a ceiling that fails
-only when the class grows: the frozen sites each need a new catalog key, so they
-are converted by hand and the ceiling ratchets down with them.
+`--check` counts all of these too (`[plurals-hardcoded]`), against a ceiling that
+fails only when the class grows: the frozen sites each need a new catalog key, so
+they are converted by hand and the ceiling ratchets down with them.
 
 ## One key, one meaning
 
