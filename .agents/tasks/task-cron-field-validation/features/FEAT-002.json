@@ -1,0 +1,29 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Add comprehensive tests for the table-driven validation (covering all newly-validated fields) and an anti-drift test that ensures any new persisted string field added to CronJob gets validation coverage.",
+  "status": "completed",
+  "steps": [
+    "Step 1 - Create test/test_cron_string_field_validation.py following the patterns in test/test_cron_name_cap.py. Import CronService from kiro_crew.cron and the validation table/set (CRON_VALIDATED_STRING_FIELDS or _CRON_STRING_FIELD_CAPS) from kiro_crew.cron. Import relevant constants from kiro_crew.validation (MAX_SHORT_STRING, MAX_CRON_MESSAGE, CHANNEL_MAX_LEN).",
+    "Step 2 - Add a parametrized test class TestBuildJobFieldValidation that tests _build_job rejects non-string and oversize values for each of the newly-covered fields: channel, thread_ts, agent_id, created_by, folder_id, session_key, model, command, script, timezone. Use @pytest.mark.parametrize with a list of (field_name, oversize_value, non_string_value) tuples. Each test creates a CronService(base_dir=tmp_path) and calls svc.add_job(name='j', message='m', every_secs=3600, **{field: bad_value}) and asserts ValueError is raised with the appropriate message.",
+    "Step 3 - Add a parametrized test class TestUpdateJobFieldValidation that tests _update_job_locked rejects non-string and oversize truthy values for each of the newly-covered fields. First create a valid job, then call svc.update_job(job.id, **{field: bad_value}) and assert ValueError + job unchanged.",
+    "Step 4 - Add tests confirming falsy-skip semantics are preserved: for each field, passing None or '' in an update does NOT raise (it is a no-op). For create, optional fields like channel=None and thread_ts=None are accepted.",
+    "Step 5 - Add the anti-drift test: TestAntiDrift class with a test that (a) inspects the CronJob dataclass to find all string-typed fields (using dataclasses.fields() or type annotation inspection), (b) excludes fields that are runtime-only / not caller-supplied (id, last_status, last_error, last_result, last_posted_hash, last_failure_hash, approval_mode), (c) asserts that every remaining string field is present in CRON_VALIDATED_STRING_FIELDS. This ensures a new field cannot ship without validation coverage. Include a comment explaining the excluded fields.",
+    "Step 6 - Add a test that the validation table field names are a subset of the CronJob dataclass field names (no typos in the table)."
+  ],
+  "acceptance_criteria": [
+    "All tests are syntactically valid Python (passes AST parse)",
+    "Tests cover type rejection (non-string) and length rejection (oversize) for every newly-validated field",
+    "Tests cover falsy-skip semantics for update path",
+    "Anti-drift test enumerates CronJob string fields and asserts coverage against the validation table",
+    "Anti-drift test will fail if a new string field is added to CronJob without adding it to the validation table",
+    "Test file follows the project's existing test patterns (pytest fixtures, monkeypatch for _DEFAULT_DIR, CronService(base_dir=tmp_path))"
+  ],
+  "verification": [
+    "python -c \"import ast; ast.parse(open('test/test_cron_string_field_validation.py').read()); print('test file parses OK')\"",
+    "grep -c 'def test_' test/test_cron_string_field_validation.py to confirm multiple tests exist",
+    "grep -n 'anti.drift\\|AntiDrift\\|anti_drift' test/test_cron_string_field_validation.py to confirm anti-drift test exists"
+  ],
+  "blocked_reason": null,
+  "findings": "Created test/test_cron_string_field_validation.py with 12 test functions. Covers all 10 newly-validated fields (channel, thread_ts, agent_id, created_by, folder_id, session_key, model, command, script, timezone) with parametrized type and length rejection tests for both add_job and update_job paths. Anti-drift test inspects CronJob dataclass annotations and asserts every str/str|None field not in the runtime-only exclusion set is present in CRON_VALIDATED_STRING_FIELDS. AST parsing verified successfully. Cannot run tests at runtime due to missing croniter dependency (INTEGRATIONS_ONLY network)."
+}
