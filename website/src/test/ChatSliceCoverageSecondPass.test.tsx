@@ -243,8 +243,8 @@ describe('chatSlice slot-detail refresh merges', () => {
   it('re-inserts a reasoning block above its answer and keeps an unanchored one', () => {
     // Reasoning is never persisted server-side, so the refresh fired on
     // chat_done would drop it without this merge. The second block's scan hits
-    // a `user` row before any answer, so it has no anchor and must still
-    // survive rather than being silently dropped.
+    // a `user` row before any answer, so it has NO anchor — the tail is its
+    // position and it must still survive rather than being silently dropped.
     let s = chatReducer(initial, setActiveSlot('A'))
     s = chatReducer(s, replaceMessages([
       msg({ role: 'thinking', content: 'because…' }),
@@ -260,6 +260,184 @@ describe('chatSlice slot-detail refresh merges', () => {
     expect(roles).toEqual(['thinking', 'assistant', 'user', 'thinking'])
     expect(s.messages[0].content).toBe('because…')
     expect(s.messages[3].content).toBe('orphan reasoning')
+  })
+
+  it('drops an anchored block whose anchor row is missing from the reloaded page (#5798)', () => {
+    // A block whose recorded anchor (a tool id or answer text that CAME from
+    // the server) misses its lookup has no position in the new list — the
+    // classic case is switchSlot's bounded page on a long session, where every
+    // out-of-window block used to be appended at the tail as a wall of bare
+    // "Thinking" chips. In-window blocks keep merging; anchorless ones keep
+    // the tail.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      // Old turn, about to fall outside the bounded page.
+      msg({ role: 'thinking', content: 'old reasoning 1' }),
+      msg({ role: 'tool', content: '🔧 old tool', ts: '1', meta: { tool_call_id: 'tc-old-1' } }),
+      msg({ role: 'thinking', content: 'old reasoning 2' }),
+      msg({ role: 'assistant', content: 'old answer', ts: '2' }),
+      // Recent turn, inside the page.
+      msg({ role: 'thinking', content: 'recent reasoning' }),
+      msg({ role: 'tool', content: '🔧 recent tool', ts: '3', meta: { tool_call_id: 'tc-new' } }),
+      msg({ role: 'assistant', content: 'recent answer', ts: '4' }),
+      // Live in-flight reasoning: nothing follows it, so no anchor.
+      msg({ role: 'thinking', content: 'live reasoning' }),
+    ]))
+    // The bounded reload window holds only the recent turn.
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'tool', content: '🔧 recent tool', ts: '3', meta: { tool_call_id: 'tc-new' } }),
+      msg({ role: 'assistant', content: 'recent answer', ts: '4' }),
+    ])))
+    expect(s.messages.map(m => m.content)).toEqual([
+      'recent reasoning', '🔧 recent tool', 'recent answer', 'live reasoning',
+    ])
+  })
+
+  it('never re-appends dropped out-of-window blocks on a later refresh', () => {
+    // The wall in #5798 was self-sustaining: unanchored blocks appended at the
+    // tail re-derived a null anchor there and were re-appended forever. After
+    // the drop, a second refresh over the same window must stay clean.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'thinking', content: 'out of window' }),
+      msg({ role: 'tool', content: '🔧 paged out', ts: '1', meta: { tool_call_id: 'tc-gone' } }),
+      msg({ role: 'thinking', content: 'in window' }),
+      msg({ role: 'assistant', content: 'answer', ts: '2' }),
+    ]))
+    const page = [msg({ role: 'assistant', content: 'answer', ts: '2' })]
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', page)))
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', page)))
+    expect(s.messages.map(m => m.content)).toEqual(['in window', 'answer'])
+  })
+
+  it('keeps a block anchored to unconfirmed text through a racing mid-turn refresh', () => {
+    // A WS-reconnect refreshSlot can land MID-TURN: the fetch snapshots the
+    // server before the streaming text is persisted, and later chunks extend
+    // the anchor text past whatever the snapshot holds. A lookup miss there
+    // says nothing about the block being stale — a `streaming` anchor row (or
+    // a finalized one with no server ts yet) must keep the block at the tail,
+    // not drop it. Only a server-confirmed anchor (tool id / ts-carrying
+    // answer) makes a miss mean "drop".
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'live reasoning' }),
+      msg({ role: 'streaming', content: 'partial ans that keeps growing' }),
+    ]))
+    // Server snapshot taken before the segment flush: no streamed text yet.
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking' && m.content === 'live reasoning')).toBe(true)
+  })
+
+  it('keeps a block whose tool anchor landed after the refresh snapshot was taken', () => {
+    // The tool-frame variant of the same race: refreshSlot snapshots the
+    // server, THEN a tool frame arrives over WS, THEN the fetch fulfills. The
+    // block's anchor is a server-minted tool id (confirmed), but it sits PAST
+    // everything the snapshot contains — the snapshot is old, not the block.
+    // The coverage cut must keep it; dropping here permanently deletes the
+    // live turn's reasoning.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'pre-tool reasoning' }),
+      msg({ role: 'tool', content: '🔧 landed after snapshot', meta: { tool_call_id: 'tc-post-snap' } }),
+    ]))
+    // Snapshot predates the tool frame: it holds only the user row.
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking' && m.content === 'pre-tool reasoning')).toBe(true)
+  })
+
+  it('keeps the newer block when two turns produced identical answer text', () => {
+    // Two turns can end with byte-identical answers ("Done."). A text-only
+    // anchor match lets the OLDER block steal the newer answer row on a
+    // bounded reload, and the NEWER block — now unmatched but confirmed and
+    // inside coverage — is permanently dropped. A text anchor that recorded a
+    // server ts must match only the row with that exact ts: the old block
+    // misses (its row is out of window → dropped, which is #5798-correct),
+    // and the new block lands on its own row.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'thinking', content: 'old reasoning' }),
+      msg({ role: 'assistant', content: 'Done.', ts: '2' }),
+      msg({ role: 'thinking', content: 'new reasoning' }),
+      msg({ role: 'assistant', content: 'Done.', ts: '4' }),
+    ]))
+    // Bounded page holds only the NEWER duplicate-text answer.
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'assistant', content: 'Done.', ts: '4' }),
+    ])))
+    const thinking = s.messages.filter(m => m.role === 'thinking').map(m => m.content)
+    expect(thinking).toEqual(['new reasoning'])
+    expect(s.messages[0].content).toBe('new reasoning')
+  })
+
+  it('does not let a duplicate-content sibling tool extend coverage past a post-snapshot anchor', () => {    // Two tool calls render identical text (e.g. two `🔧 bash` runs) but carry
+    // distinct server-minted ids. A refresh snapshots the OLDER call; reasoning
+    // plus the NEWER call land before the fetch fulfills. Coverage identity
+    // must be the strongest class only (tool id here) — if the older incoming
+    // row could text-match the newer existing row, coverage would falsely
+    // extend past the newer anchor and the live reasoning would be dropped.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'tool', content: '🔧 bash', ts: '1', meta: { tool_call_id: 'tc-old' } }),
+      msg({ role: 'thinking', content: 'live reasoning between twins' }),
+      msg({ role: 'tool', content: '🔧 bash', meta: { tool_call_id: 'tc-new' } }),
+    ]))
+    // Snapshot holds only the older twin.
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'tool', content: '🔧 bash', ts: '1', meta: { tool_call_id: 'tc-old' } }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking' && m.content === 'live reasoning between twins')).toBe(true)
+  })
+
+  it('ignores re-injected client-only rows (permissions) as coverage evidence', () => {
+    // `incoming` is not a pure server snapshot: the refresh reducer re-injects
+    // preserved live permission cards into it. A permission row present in
+    // BOTH lists must not vouch for coverage — otherwise a reconnect snapshot
+    // taken before a tool/permission pair, refreshed after the pair arrived,
+    // would advance the cut past the absent tool anchor and drop its live
+    // reasoning. Coverage comes only from the pure fetched page.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'reasoning before tool' }),
+      msg({ role: 'tool', content: '🔧 write file', meta: { tool_call_id: 'tc-gated' } }),
+      msg({ role: 'permission', content: 'Approve write?', ts: '9', meta: { approval_id: 'ap-1' } }),
+    ]))
+    // Server snapshot predates the tool frame; the reducer re-injects the
+    // preserved permission card into the incoming list (positioned last).
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking' && m.content === 'reasoning before tool')).toBe(true)
+  })
+
+  it('drops evicted confirmed blocks when the page shares no identity but is provably newer', () => {
+    // A long-disconnected session can advance past the bounded page size, so
+    // the fresh page shares NO row with the stale cache. Coverage reads -1
+    // (decline), but keeping everything re-creates the #5798 wall with blocks
+    // that go permanently anchorless. Server timestamps disambiguate: a
+    // confirmed anchor whose ts is older than the page's oldest row belongs to
+    // evicted history and is dropped; ts-less/unconfirmed anchors are kept.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'thinking', content: 'ancient reasoning' }),
+      msg({ role: 'tool', content: '🔧 old tool', ts: '100', meta: { tool_call_id: 'tc-ancient' } }),
+      msg({ role: 'assistant', content: 'ancient answer', ts: '200' }),
+      // Live in-flight reasoning with an unconfirmed (ts-less) streaming anchor.
+      msg({ role: 'thinking', content: 'live reasoning' }),
+      msg({ role: 'streaming', content: 'still going' }),
+    ]))
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'much later question', ts: '5000' }),
+      msg({ role: 'assistant', content: 'much later answer', ts: '5001' }),
+    ], { running: true })))
+    const thinking = s.messages.filter(m => m.role === 'thinking').map(m => m.content)
+    expect(thinking).toEqual(['live reasoning'])
   })
 
   it('carries a durable client identity onto the reloaded copy by exact ts', () => {
