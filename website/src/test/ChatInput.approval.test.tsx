@@ -202,16 +202,35 @@ describe('ChatInput approval flow', () => {
     expect(screen.queryByText('Trust reads')).not.toBeInTheDocument()
   })
 
-  it('trust action falls back to resolveApproval when no activeSlot', async () => {
+  it('withholds ALL trust controls when no slot backs the composer (#5486)', () => {
+    // Without a slot, a trust decision could only resolve through the one-shot
+    // api.resolveApproval, which has no trust verb — so the controls must not
+    // be offered at all (class invariant of #5400/#5434: a surface offers only
+    // trust verbs its resolve path honors). Note the card is read-only, so
+    // BOTH Trust reads and the Trust dropdown are on the line here.
     const state = stateWithApproval()
     state.chat!.activeSlot = null
     const store = createTestStore(state)
     renderWithProviders(<ChatInput {...defaultProps} />, { store })
+    expect(screen.getByText('Allow once')).toBeInTheDocument()
+    expect(screen.getByText('Reject')).toBeInTheDocument()
+    expect(screen.queryByText('Trust')).not.toBeInTheDocument()
+    expect(screen.queryByText('Trust reads')).not.toBeInTheDocument()
+  })
+
+  it('records the decision that was actually granted, not the one requested (#5486)', async () => {
+    // The reachable trust path: the slot-scoped grant carries the trust verb
+    // verbatim, so the UI state may (and must) report 'trust'.
+    const store = createTestStore(stateWithApproval())
+    renderWithProviders(<ChatInput {...defaultProps} />, { store })
     fireEvent.click(screen.getByText('Trust'))
     fireEvent.click(screen.getByText('Trust all tools'))
     await waitFor(() => {
-      expect(api.resolveApproval).toHaveBeenCalledWith('ap-123', 'approve')
+      expect(api.approveChatSlot).toHaveBeenCalledWith('slot-1', 'trust', { request_id: 'ap-123' })
     })
+    const resolved = store.getState().chat.messages[1].meta?.resolved
+    expect(resolved).toBe('trust')
+    expect(api.resolveApproval).not.toHaveBeenCalled()
   })
 
   it('handles API error gracefully without crashing', async () => {

@@ -190,8 +190,31 @@ function sameBlocks(a: PasteBlock[], b: PasteBlock[]): boolean {
   return b.every(x => ids.has(x.id))
 }
 
-function toApiDecision(d: string): 'approve' | 'reject' {
-  return (d === 'approved' || d === 'trust' || d === 'trust_reads') ? 'approve' : 'reject'
+/** The decisions that request a STANDING trust grant. Single source for this
+ *  surface: the routing guard in `handleApprovalAction` and the tests read this
+ *  set, so a new tier added to the Trust controls must be added here to reach
+ *  the slot-backed grant path — an unlisted verb falls through to
+ *  `oneShotResolution`, which fails closed (#5486). */
+export const TRUST_DECISIONS = new Set(['trust_command', 'trust_base', 'trust', 'trust_reads'])
+
+/** Resolve one approval decision over the ONE-SHOT `api.resolveApproval`
+ *  endpoint, which has no trust verb: it can honor exactly `approve` or
+ *  `reject`, and the next identical call prompts again.
+ *
+ *  Returns the wire verb to send AND the decision to RECORD in UI state —
+ *  which is the grant actually made, never the one requested (#5400 on the
+ *  spawn-approval card, #5434 on the collapsed tool row, #5486 here):
+ *  - a trust verb downgrades to a one-shot allow, recorded as 'approved',
+ *    because no standing grant was created;
+ *  - a verb this surface does not recognize resolves as a rejection and is
+ *    recorded as 'rejected', so the row wears the rejected affordance instead
+ *    of an unlabeled state — deny-by-default is the fail-closed direction for
+ *    an unknown decision on a permission surface. */
+export function oneShotResolution(decision: string): { wire: 'approve' | 'reject'; granted: string } {
+  if (TRUST_DECISIONS.has(decision) || decision === 'approved') {
+    return { wire: 'approve', granted: 'approved' }
+  }
+  return { wire: 'reject', granted: 'rejected' }
 }
 
 /** Approval sources that run unattended, with no human bound to the chat the
@@ -835,6 +858,14 @@ function ChatInput({
     || (pendingApproval?.content || '').match(/^(?:🔧\s*)?\[([a-z_]+)\]/)?.[1]
     || ''
   const approvalIsUnattended = UNATTENDED_APPROVAL_SOURCES.has(approvalSource)
+  /** Offer trust verbs ONLY when the slot-backed resolve path that records
+   *  standing trust (api.approveChatSlot) is available and a human is attached.
+   *  FAIL-CLOSED, same class invariant as #5400/#5434: a surface must not offer
+   *  a trust verb its resolve path does not honor. Without a slot the resolve
+   *  would fall back to the one-shot api.resolveApproval, which has no trust
+   *  verb — the composer would report a standing grant that was never created
+   *  (#5486). */
+  const approvalCanTrust = !approvalIsUnattended && !!activeSlot
   const simplified = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
   const approvalLabelRaw = sanitizeLlmOutput(pendingApproval?.content || '').replace(/^🔧\s*/, '')
@@ -891,8 +922,12 @@ function ChatInput({
     if (!approvalId) return
     setApprovalSubmitting(true)
     setApprovalNotice(null)
-    const finish = () => {
-      dispatch(resolveByApprovalId({ id: approvalId, decision }))
+    // `granted` is the decision the backend ACTUALLY made. It differs from the
+    // requested `decision` only on the downgrade path below, where a trust verb
+    // resolves as a one-shot allow — the UI state must record the grant that
+    // was made, never the one that was asked for (#5486).
+    const finish = (granted: string = decision) => {
+      dispatch(resolveByApprovalId({ id: approvalId, decision: granted }))
       setApprovalSubmitting(false)
     }
     const fail = (err: unknown) => {
@@ -918,21 +953,24 @@ function ChatInput({
       console.error('Approval failed:', err)
       setApprovalNotice(i18nT('components.chatInput.could_not_submit_that_decision_see_the_console_f'))
     }
-    if (['trust_command', 'trust_base', 'trust', 'trust_reads'].includes(decision) && activeSlot) {
-      // Defence in depth: the Trust controls are not rendered for unattended
-      // sources, but never let a trust grant be applied on their behalf. The
-      // grant would land on THIS slot (api.approveChatSlot is slot-scoped),
-      // widening its auto-approval surface for a job that is not this session.
-      // Downgrade to a one-shot allow instead of silently over-granting.
-      if (approvalIsUnattended) {
-        api.resolveApproval(approvalId, 'approve').then(finish).catch(fail)
-        return
-      }
+    if (TRUST_DECISIONS.has(decision) && !approvalIsUnattended && activeSlot) {
+      // The ONLY path that records standing trust: the slot-scoped
+      // api.approveChatSlot carries the trust verb verbatim (#5486).
       const extra: Record<string, string> = { request_id: approvalId }
       if (pattern) extra.pattern = pattern
-      api.approveChatSlot(activeSlot, decision, extra).then(finish).catch(fail)
+      api.approveChatSlot(activeSlot, decision, extra).then(() => finish()).catch(fail)
     } else {
-      api.resolveApproval(approvalId, toApiDecision(decision)).then(finish).catch(fail)
+      // Everything else resolves one-shot. This includes the defence-in-depth
+      // downgrade for a trust verb that arrives with no slot-backed path
+      // (unattended source, or no activeSlot): the controls are not rendered
+      // in those states, but never let a trust grant be applied on their
+      // behalf — for an unattended source the grant would land on THIS slot,
+      // widening its auto-approval surface for a job that is not this
+      // session. `oneShotResolution` downgrades it to a one-shot allow and
+      // reports the decision actually made ('approved'), so the composer
+      // never claims a standing grant the backend never recorded.
+      const { wire, granted } = oneShotResolution(decision)
+      api.resolveApproval(approvalId, wire).then(() => finish(granted)).catch(fail)
     }
   }, [approvalId, activeSlot, approvalIsUnattended, approvalSource, dispatch])
 
@@ -2733,8 +2771,8 @@ function ChatInput({
                   )}
                   <div className="flex gap-1.5 flex-wrap items-center">
                       <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('approved')}><CheckCircle size={12} className="shrink-0" />{i18nT('components.chatInput.allow_once')}</button>
-                      {approvalIsReadOnly && !approvalIsUnattended && <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('trust_reads')}><BookOpen size={12} className="shrink-0" />{i18nT('components.chatInput.trust_reads')}</button>}
-                      {!approvalIsUnattended && (
+                      {approvalIsReadOnly && approvalCanTrust && <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('trust_reads')}><BookOpen size={12} className="shrink-0" />{i18nT('components.chatInput.trust_reads')}</button>}
+                      {approvalCanTrust && (
                         <TrustDropdown
                             fullCommand={approvalFullCommand || approvalLabelRaw}
                             baseCommand={approvalBaseCommand || approvalLabelRaw.split(/\s+/)[0] || ''}

@@ -17,9 +17,11 @@ import type { PendingApproval } from './index'
 // Resume identifier: `approval.request_id`. Plain approve/reject resolves through
 // the id-scoped `api.resolveApproval(request_id, action)` → POST
 // /api/approvals/<id>/<action> (ChatInput.tsx). The slot-scoped
-// `api.approveChatSlot(slot, …)` is used ONLY for trust grants, and downgrades to
-// `resolveApproval` for unattended sources — so this layer resumes by
-// `request_id`, never by inventing a new call. A stale/closed id is a no-op.
+// `api.approveChatSlot(slot, …)` is used ONLY for trust grants; trust verbs are
+// not offered at all when no slot backs the surface or the source is unattended,
+// and a trust verb that still arrives in those states downgrades to a one-shot
+// `resolveApproval` allow recorded as 'approved' (#5486) — so this layer resumes
+// by `request_id`, never by inventing a new call. A stale/closed id is a no-op.
 //
 // `ToolInvocationState` mirrors the shape of the Vercel AI SDK `UIToolInvocation`
 // lifecycle as a STATE MODEL ONLY — a way to reason about the phases of one tool
