@@ -5665,7 +5665,8 @@
     },
     "folderSuggestionCard": {
       "folder_suggestion": "Предложение папки",
-      "move_to_folder_question": "Переместить эту сессию в папку «{{folder}}»?",
+      "move_to_folder_question": "Переместить эту сессию в <folder/>?",
+      "move_to_folder_question_spoken": "Переместить эту сессию в папку «{{folder}}»?",
       "no_thanks": "Не сейчас",
       "yes_move_it": "Переместить"
     },

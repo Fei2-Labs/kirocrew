@@ -200,7 +200,7 @@ import { TagPopoverProvider } from '../hooks/useTagPopover'
 import { AnimatePresence, motion, useMotionValue, useTransform } from 'framer-motion'
 import DetailPanel from '../components/DetailPanel'
 
-import type { ChatMessage, Artifact } from '../types'
+import type { ChatMessage, Artifact, ChatFolder } from '../types'
 
 import ToolCallLine from './chat/ToolCallLine'
 import { shouldMountSidePanel, isSidePanelHidden, sidePanelDockMotion } from './chat/sidePanelMount'
@@ -941,6 +941,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const pendingQuestion = useAppSelector(s => pendingQuestionFor(s.chat.pendingQuestions, s.chat.activeSlot))
   const pendingFollowup = useAppSelector(s => (s.chat.activeSlot ? s.chat.followups?.[s.chat.activeSlot] : undefined))
   const folderSuggestion = useAppSelector(s => (s.chat.activeSlot ? s.chat.folderSuggestions?.[s.chat.activeSlot] : undefined))
+  // Tint for the suggestion card's folder glyph, so the destination looks like
+  // the same folder the sidebar draws. Shares the sidebar's ['chat-folders']
+  // cache, and is `enabled` only while a card is up: the card is offered at most
+  // once per slot, so an unconditional fetch would pay for every chat mount.
+  // An unresolved color is fine — FolderGlyph paints untinted.
+  const { data: chatFolders = [] } = useQuery<ChatFolder[]>({
+    queryKey: ['chat-folders'],
+    queryFn: () => api.chatFolders(),
+    enabled: !!folderSuggestion,
+  })
+  const suggestedFolderColor = folderSuggestion
+    ? chatFolders.find(f => f.id === folderSuggestion.folderId)?.color
+    : undefined
   const followupTsBySlot = useAppSelector(s => s.chat.followups) ?? EMPTY_FOLLOWUPS
   // The ambient tip yields to functional surfaces that own the above-composer band
   const tipSuppressed = useAppSelector(s =>
@@ -7370,6 +7383,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                       <FolderSuggestionCard
                         folderName={folderSuggestion.folderName}
                         breadcrumb={folderSuggestion.breadcrumb}
+                        folderColor={suggestedFolderColor}
                         onAccept={folderSuggestionAccept}
                         onDecline={folderSuggestionDecline}
                       />

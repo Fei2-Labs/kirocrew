@@ -5585,7 +5585,8 @@
     },
     "folderSuggestionCard": {
       "folder_suggestion": "Suggerimento cartella",
-      "move_to_folder_question": "Spostare questa sessione nella cartella «{{folder}}»?",
+      "move_to_folder_question": "Spostare questa sessione in <folder/>?",
+      "move_to_folder_question_spoken": "Spostare questa sessione nella cartella «{{folder}}»?",
       "no_thanks": "Non ora",
       "yes_move_it": "Sposta"
     },

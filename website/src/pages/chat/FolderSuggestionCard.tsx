@@ -1,12 +1,18 @@
-import { FolderInput } from 'lucide-react'
+import { CornerDownRight } from 'lucide-react'
 import { motion } from 'framer-motion'
+import { Trans } from 'react-i18next'
 
+import FolderGlyph from '../../components/FolderGlyph'
 import { i18nT } from '../../i18n/t'
 
 export interface FolderSuggestionCardProps {
   /** Folder name, and its root→leaf breadcrumb when the folder is nested. */
   folderName: string
   breadcrumb: string
+  /** Palette color of the suggested folder, for the glyph tint. Omitted when the
+   *  folder list has not loaded yet — the glyph then paints untinted rather than
+   *  holding the card back. */
+  folderColor?: string
   /** File the session into the suggested folder. */
   onAccept: () => void
   /** Leave the session where it is. The card is not re-offered either way. */
@@ -34,7 +40,7 @@ export interface FolderSuggestionCardProps {
  * ChatPage render site), so a wrong guess costs the composer band a few turns rather
  * than the whole session.
  */
-export default function FolderSuggestionCard({ folderName, breadcrumb, onAccept, onDecline }: FolderSuggestionCardProps) {
+export default function FolderSuggestionCard({ folderName, breadcrumb, folderColor, onAccept, onDecline }: FolderSuggestionCardProps) {
   // Show the breadcrumb only when it adds ancestry: for a root folder it is just
   // the name again, and rendering both reads as a duplicate.
   const parentPath = breadcrumb && breadcrumb !== folderName ? breadcrumb : ''
@@ -54,29 +60,58 @@ export default function FolderSuggestionCard({ folderName, breadcrumb, onAccept,
       aria-label={i18nT('components.folderSuggestionCard.folder_suggestion')}
       data-testid="folder-suggestion-card"
     >
-      {/* Always the lucide glyph, never the folder's own emoji: an emoji is a
+      {/* CornerDownRight, not a second folder: the destination now carries its
+          own FolderGlyph inside the sentence, and two folder glyphs 14px apart
+          read as two different folders. Mirrors SessionMoveUndoBar, which pairs
+          the same rail arrow with the same destination glyph, and takes its
+          `text-accent` token class rather than an inline accent. Stays at 14px:
+          this card's lead icon was 14px before this PR, and shrinking it to the
+          bar's 12px would resize a surface the diff is not otherwise touching.
+          Always a lucide glyph, never the folder's own emoji: an emoji is a
           font-dependent bitmap that renders as a tofu box wherever the platform
-          has no emoji font, and it would not inherit --accent, so the card's one
-          icon would stop tracking the theme. */}
-      <FolderInput size={14} className="shrink-0" aria-hidden="true" style={{ color: 'var(--accent)' }} />
+          has no emoji font, and it would not inherit the accent. */}
+      <CornerDownRight size={14} className="shrink-0 text-accent" aria-hidden="true" />
 
       <div className="min-w-0 flex-1">
-        {/* One interpolated string, not a concatenation of "Move this session
-            into folder" + name + "?": a split sentence cannot be reordered by a
-            translator, and several locales need the folder name somewhere other
-            than last. The name is quoted so a folder called "trash" or "later"
-            reads as a destination rather than as part of the question.
-            `title` mirrors the parentPath line below: this span truncates, and
-            for a ROOT folder the breadcrumb is suppressed, so the question is
-            the only place the name appears — without the tooltip a long name
-            clipped mid-word would leave no way to confirm the destination
-            before pressing a button that does not name it either. */}
+        {/* Two copies of one question, and only one is ever perceived.
+            FolderGlyph is aria-hidden, so the icon that replaced the WORD
+            "folder" says nothing to a screen reader — on its own, AT would hear
+            "Move this session to later?", the exact ambiguity this card's copy
+            exists to remove. So the spoken key keeps the word and the quotes,
+            and the visible line is aria-hidden to stop the question being
+            announced twice. */}
+        <span className="sr-only">
+          {i18nT('components.folderSuggestionCard.move_to_folder_question_spoken', { folder: folderName })}
+        </span>
+        {/* One interpolated string with a self-closing <folder/> slot (the
+            repo's Trans convention, cf. components.agentDropdownList
+            .set_default_agent), NOT a prefix + name concatenation: the folder
+            name never enters the catalog, and each locale places the slot where
+            its own grammar wants it — ja/ko put the predicate last.
+            A flex row rather than `truncate` on the whole line, because Trans
+            emits the catalog's text as anonymous flex items around the slot:
+            that keeps the locale's word order AND lets the name itself be the
+            part that ellipsizes. `title` carries the full sentence, since for a
+            ROOT folder the breadcrumb below is suppressed and this line is the
+            only place the name appears. */}
         <span
-          className="block text-[12px] leading-tight truncate"
+          aria-hidden="true"
+          data-testid="folder-suggestion-question"
+          className="flex min-w-0 items-baseline whitespace-pre text-[12px] leading-tight"
           style={{ color: 'var(--text)' }}
-          title={i18nT('components.folderSuggestionCard.move_to_folder_question', { folder: folderName })}
+          title={i18nT('components.folderSuggestionCard.move_to_folder_question_spoken', { folder: folderName })}
         >
-          {i18nT('components.folderSuggestionCard.move_to_folder_question', { folder: folderName })}
+          <Trans
+            i18nKey="components.folderSuggestionCard.move_to_folder_question"
+            components={{
+              folder: (
+                <span className="inline-flex min-w-0 items-baseline gap-1">
+                  <FolderGlyph color={folderColor} size={12} className="shrink-0 translate-y-[2px]" />
+                  <span data-testid="folder-suggestion-folder-name" className="truncate font-medium" style={{ color: 'var(--text-strong)' }}>{folderName}</span>
+                </span>
+              ),
+            }}
+          />
         </span>
         {parentPath && (
           <span className="block text-[11px] leading-tight mt-0.5 truncate" style={{ color: 'var(--muted)' }} title={parentPath}>

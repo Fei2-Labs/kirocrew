@@ -5505,7 +5505,8 @@
     },
     "folderSuggestionCard": {
       "folder_suggestion": "ফোল্ডার প্রস্তাব",
-      "move_to_folder_question": "এই সেশনটি “{{folder}}” ফোল্ডারে সরানো হবে?",
+      "move_to_folder_question": "এই সেশনটি <folder/>-এ সরানো হবে?",
+      "move_to_folder_question_spoken": "এই সেশনটি “{{folder}}” ফোল্ডারে সরানো হবে?",
       "no_thanks": "এখন নয়",
       "yes_move_it": "সরান"
     },

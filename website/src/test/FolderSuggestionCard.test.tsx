@@ -5,17 +5,15 @@ import userEvent from '@testing-library/user-event'
 import FolderSuggestionCard from '../pages/chat/FolderSuggestionCard'
 import reducer, { setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, startLocalTurn, confirmOptimisticSend, FOLDER_SUGGESTION_MAX_TURNS } from '../store/chatSlice'
 
-vi.mock('../i18n/t', () => ({
-  i18nT: (key: string, vars?: Record<string, unknown>) =>
-    key === 'components.folderSuggestionCard.move_to_folder_question'
-      ? `Move this session into folder \u201c${vars?.folder}\u201d?`
-      : key.split('.').pop() ?? key,
-}))
+// No i18n mock on purpose: the visible question renders through <Trans>, which
+// reads the REAL catalog no matter what `i18nT` is stubbed to return. Mocking one
+// and not the other would assert a sentence the app never shows.
+const SPOKEN = (name: string) => `Move this session into folder \u201c${name}\u201d?`
 
 function renderCard(over: Partial<React.ComponentProps<typeof FolderSuggestionCard>> = {}) {
   const onAccept = vi.fn()
   const onDecline = vi.fn()
-  render(
+  const utils = render(
     <FolderSuggestionCard
       folderName="feature"
       breadcrumb="Kiro Crew › feature"
@@ -24,13 +22,44 @@ function renderCard(over: Partial<React.ComponentProps<typeof FolderSuggestionCa
       {...over}
     />,
   )
-  return { onAccept, onDecline }
+  return { onAccept, onDecline, ...utils }
 }
 
 describe('FolderSuggestionCard', () => {
-  it('asks about the suggested folder with the name interpolated, not concatenated', () => {
+  it('renders the destination as a folder glyph plus the name in bold', () => {
     renderCard()
-    expect(screen.getByText('Move this session into folder \u201cfeature\u201d?')).toBeInTheDocument()
+    const question = screen.getByTestId('folder-suggestion-question')
+    // The whole sentence, assembled by Trans from ONE catalog value.
+    expect(question.textContent).toBe('Move this session to feature?')
+    // The word "folder" is now the glyph, and the name carries the weight.
+    expect(question.querySelector('svg')).toBeTruthy()
+    const name = screen.getByTestId('folder-suggestion-folder-name')
+    expect(name.textContent).toBe('feature')
+    // font-medium, the weight SessionMoveUndoBar gives the same destination name.
+    expect(name.className).toContain('font-medium')
+  })
+
+  it('keeps the word "folder" for a screen reader, which cannot see the glyph', () => {
+    // FolderGlyph is aria-hidden, so without this copy AT would hear
+    // "Move this session to later?" — the ambiguity the card exists to remove.
+    renderCard({ folderName: 'later', breadcrumb: 'later' })
+    expect(screen.getByText(SPOKEN('later'))).toBeInTheDocument()
+    // ...and the visible line is hidden from AT, so it is announced once.
+    expect(screen.getByTestId('folder-suggestion-question').getAttribute('aria-hidden')).toBe('true')
+  })
+
+  it('tints the glyph with the folder color when one is known', () => {
+    // Asserted on the svg's `fill` ATTRIBUTE, which is stored verbatim. The
+    // stroke paint rides on `style.color`, and both paints are `color-mix(...)`
+    // values that the test DOM drops as unparseable while a browser honours
+    // them — so style is not observable here and the attribute is.
+    const { unmount } = renderCard({ folderColor: 'var(--folder-violet)' })
+    const tinted = screen.getByTestId('folder-suggestion-question').querySelector('svg') as SVGElement
+    expect(tinted.getAttribute('fill') ?? '').toContain('var(--folder-violet)')
+    unmount()
+    renderCard()
+    const plain = screen.getByTestId('folder-suggestion-question').querySelector('svg') as SVGElement
+    expect(plain.getAttribute('fill')).toBe('var(--bg-elevated)')
   })
 
   it('shows the breadcrumb as ancestry context when the folder is nested', () => {
@@ -40,18 +69,15 @@ describe('FolderSuggestionCard', () => {
 
   it('hides the breadcrumb for a root folder, where it only repeats the name', () => {
     renderCard({ folderName: 'Errands', breadcrumb: 'Errands' })
-    // The question still renders the name; the redundant second line does not.
-    expect(screen.getByText('Move this session into folder \u201cErrands\u201d?')).toBeInTheDocument()
+    expect(screen.getByTestId('folder-suggestion-question').textContent).toBe('Move this session to Errands?')
     expect(screen.queryByTitle('Errands')).not.toBeInTheDocument()
   })
 
-  it('keeps the whole question reachable on hover, since the line truncates', () => {
-    // The question line is single-line `truncate`, and for a ROOT folder the
-    // breadcrumb is suppressed — so this tooltip is the only way to recover a
-    // folder name that got clipped.
+  it('keeps the whole question reachable on hover, since the name truncates', () => {
+    // The name is the part that ellipsizes, and for a ROOT folder the breadcrumb
+    // is suppressed — so this tooltip is the only way to recover a clipped name.
     renderCard({ folderName: 'Errands', breadcrumb: 'Errands' })
-    const question = screen.getByText('Move this session into folder \u201cErrands\u201d?')
-    expect(question.getAttribute('title')).toBe('Move this session into folder \u201cErrands\u201d?')
+    expect(screen.getByTestId('folder-suggestion-question').getAttribute('title')).toBe(SPOKEN('Errands'))
   })
 
   it('calls onAccept once for the move button', async () => {

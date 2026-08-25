@@ -5307,9 +5307,10 @@
     },
     "folderSuggestionCard": {
       "folder_suggestion": "[Ƒøĺðèŕ şùğğèşţìøñ ···············]",
-      "move_to_folder_question": "[Ṁøṽè ţĥìş şèşşìøñ ìñţø ƒøĺðèŕ “{{folder}}”? ·················]",
+      "move_to_folder_question_spoken": "[Ṁøṽè ţĥìş şèşşìøñ ìñţø ƒøĺðèŕ “{{folder}}”? ·················]",
       "no_thanks": "[Ñøţ ñøẁ ···········]",
-      "yes_move_it": "[Ṁøṽè ìţ ···········]"
+      "yes_move_it": "[Ṁøṽè ìţ ···········]",
+      "move_to_folder_question": "[Ṁøṽè ţĥìş şèşşìøñ ţø <folder/>? ···············]"
     },
     "followUpBar": {
       "scroll_left": "[Şçŕøĺĺ ĺèƒţ ··········]",
