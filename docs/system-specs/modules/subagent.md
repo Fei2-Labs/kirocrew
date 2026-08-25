@@ -235,6 +235,33 @@ The slow-command record (`record_slow_command`, `subagent_persistence.py`) is ap
 
 `subagent_tool` is fired on **`EVENT_TOOL_CALL`** (not only `EVENT_PERMISSION_REQUEST`) — kiro-auto-allowed tools surface only as informational `tool_call` updates, so this is the sole progress signal a simple/read-only task emits. Payload carries `{tool, tool_kind, turns, tool_count}`; `info.tool_count` increments per observed tool call. The `subagent_snapshot` reconnect payload (`dashboard/ws.py`) also carries `tool_count` and `stalled` so a reloading client recovers progress/stall state (a transition-only WS signal always needs a matching snapshot field).
 
+
+### Model Provenance (#3582)
+
+Every subagent card names the model the run actually ran on, so a model-pinned
+review's real model is auditable. `SubagentInfo` carries two fields: `requested_model`
+— the EFFECTIVE pin, i.e. the per-spawn `model` OR, when empty, the
+`agent.role_models['subagent']` config pin (AGENTS.md's documented way to pin a
+subagent model), resolved once at spawn — and `resolved_model`, the id the live
+session actually served, read via the provider's public `served_model` accessor
+(`_resolved_model_of`, which normalizes the `DEFAULT_MODEL` "auto" sentinel to `""`
+= unknown). `resolved_model` is captured at spawn (ACP reports it immediately) and
+refreshed on the first text chunk (covers the CC path); a known value is never
+clobbered back to `""`.
+
+The resolved id rides the wire as a `model` field on the `subagent_spawn`,
+`subagent_done`, and reconnect `subagent_snapshot` payloads. The single-completion
+meta (`subagent_completion_meta.single_completion_meta`, mirrored by
+`website/src/pages/chat/subagentCompletion.ts`) additionally carries `requestedModel`
+and `resolvedModel`. The frontend renders the resolved model as a chip beside the
+agent pill (Subagents panel + completion card) and flags a **downgrade** — an amber
+chip plus a persistent `role="status"` "Requested X, served Y" banner — when the two
+name different models. "Same model" is decided by the shared `normalizeModelKey`
+(`website/src/lib/model.ts`, mirroring the backend `_normalize_model_key`): dotted vs
+dashed spellings and case fold, and `auto`/`default` fold to "no pin", so an honored
+pin whose wire spelling differs does not false-flag. Wave-digest completions
+(`wave_chunk_meta`/`wave_final_meta`) do NOT yet carry model fields — batch members
+are unauditable for now (scoped increment; tracked as follow-up).
 ## Completion Injection
 
 Subagent results are routed back to the **originating session** via

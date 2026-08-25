@@ -196,7 +196,10 @@ def install_pdftoppm() -> tuple[bool, str]:
             # chmod AFTER the write and before any caller can resolve it, so the
             # launcher is never observable without its exec bit.
             if not platform_compat.IS_WINDOWS:
-                platform_compat.chmod_safe(launcher, _LAUNCHER_MODE)
+                # 0o700 here is the EXEC bit, not secrecy: the body is generated
+                # launcher text with no payload, so nothing is exposed in the
+                # window before the chmod. The marker must sit on the call line.
+                platform_compat.chmod_safe(launcher, _LAUNCHER_MODE)  # lockdown-ok: exec bit
         except OSError as exc:
             return False, f"cannot write {launcher.name}: {exc}"
 

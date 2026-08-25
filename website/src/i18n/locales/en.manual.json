@@ -1168,7 +1168,6 @@
       "group_apps": "Apps",
       "group_commands": "Commands",
       "group_settings": "Settings",
-      "keep_typing": "Type at least {{min}} characters",
       "leave_scope": "Back to all commands",
       "no_matches": "No matches",
       "no_sessions": "No sessions match",
@@ -1182,6 +1181,17 @@
       "cmd_toggle_theme": "Toggle Theme",
       "search_failed": "Search failed",
       "retry": "Retry",
+      "action_enter": "Open View",
+      "action_ask": "Ask",
+      "group_attention": "Needs You",
+      "ask_agent": "Ask the agent: “{{query}}”",
+      "action_open": "Open",
+      "action_open_app": "Open App Page",
+      "action_open_session": "Open Session",
+      "action_run": "Run",
+      "action_search_sessions": "Search Sessions",
+      "action_show_recent": "Show Recent",
+      "no_match_show_recent": "No sessions match “{{query}}” — show recent instead",
       "kind": {
         "app": "App",
         "command": "Command",
@@ -1348,6 +1358,13 @@
       "terminal": "Terminal"
     },
     "chatInput": {
+      "send_a_message_or_tap_the_mic_for_voice": "Send a message, or tap the mic for voice",
+      "release_to_transcribe": "Release to transcribe",
+      "hold_to_talk": "Hold to talk",
+      "release_to_cancel": "Release to cancel",
+      "slide_up_to_cancel": "Slide up to cancel",
+      "switch_to_keyboard": "Switch to keyboard",
+      "switch_to_voice": "Switch to voice",
       "drop_to_attach": "Drop to attach",
       "agent": "Agent: {{name}}",
       "approve_sub_agent": "Approve sub-agent: {{name}}",
@@ -1387,7 +1404,9 @@
       "voice_input": "Voice input",
       "queue": "Queue",
       "queue_run_after_the_current_work_finishes_desc": "Run after the current work finishes",
-      "steer_act_on_this_right_away_desc": "Act on this right away"
+      "steer_act_on_this_right_away_desc": "Act on this right away",
+      "finishing": "Finishing…",
+      "keep_holding_to_record": "Keep holding to record"
     },
     "chatPane": {
       "earlier_messages_load_failed": "Couldn't load earlier messages. Scroll to the top of the session to try again.",
@@ -2813,6 +2832,8 @@
         "stopped": "Stopped",
         "subagent": "Subagent {{label}}",
         "subagents": "Subagents",
+        "model_label": "Model: {{model}}",
+        "model_downgraded": "Requested {{requested}}, served {{resolved}}",
         "workflows": "Workflows",
         "workspace_empty": "No files in this workspace yet",
         "workspace_truncated": "Large workspace — showing the first 10,000 files"
@@ -3022,6 +3043,7 @@
         "all_files": "All files",
         "changed": "Changed",
         "close_search": "Close search",
+        "ctx_add_to_chat": "Add to chat",
         "filter_placeholder": "Filter files…",
         "refresh": "Refresh",
         "resize": "Resize file browser",
@@ -3723,6 +3745,9 @@
         "consolidated_sessions_failed": "Consolidated {{succeeded}}/{{total}} sessions ({{failed}} failed)",
         "controls_how_conversation_history_is_consolidate": "Controls how conversation history is consolidated into memory.",
         "learned_user_preferences_coding_style_tools_work": "Learned user preferences (coding style, tools, workflows). Auto-updated by memory consolidation.",
+        "lesson_already_covered": "An existing lesson already covers this ({{reason}}). Reword it to add something new.",
+        "lesson_already_stored": "This lesson is already stored.",
+        "lesson_not_saved": "Lesson not saved ({{reason}}). Edit it and try again.",
         "persistent_lessons_injected_into_every_session_a": "Persistent lessons injected into every session. Auto-extracted from task runner failures. Add manually via 'kirocrew learn add'. When vector memory is active, lessons are managed in the Semantic tab as lesson.* entries.",
         "save": "Save"
       },
@@ -4007,6 +4032,19 @@
       "script_source_failed": "Could not load the script source.",
       "script_source_truncated": "Truncated — the script is larger than the preview limit."
     },
+    "servicesTab": {
+      "channels": "Channels",
+      "connect_error": "Connection error",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
+      "webex": "Webex",
+      "wecom": "WeCom",
+      "weixin": "WeChat",
+      "whatsapp": "WhatsApp",
+      "feishu": "Feishu"
+    },
     "sessionArchive": {
       "no_matches_for_query": "No matches for \"{{query}}\".",
       "truncated_showing_first_200kb": "… truncated (showing first 200KB) …"
@@ -4226,7 +4264,14 @@
         "summarize_each_session_by_intent_in_the_right_pa": "Summarize each session by intent. Uses tokens on turns that change the session.",
         "failed_to_save_session_summaries": "Failed to save session summaries setting",
         "role_model_auto": "Auto (provider picks)",
-        "effort_needs_reasoning_model": "Applies only on reasoning-capable models, so it has no effect on the model selected above."
+        "effort_needs_reasoning_model": "Applies only on reasoning-capable models, so it has no effect on the model selected above.",
+        "throttle_fallback": "Rate-limit fallback",
+        "fallback_model": "Fallback model",
+        "model_tried_when_your_current_model_stays_rate_li": "Model tried when your current model stays rate-limited past its retry budget.",
+        "fallback_auto_hint": "Auto (default) lets the backend route to an available model. A fallback swap is announced in chat and sticks until your model recovers. Disabled turns fallback off.",
+        "fallback_disabled": "Disabled",
+        "fallback_auto": "Auto (recommended)",
+        "failed_to_save_fallback_model": "Failed to save fallback model"
       },
       "displayPanel": {
         "color": "Color {{n}}",
@@ -4341,6 +4386,8 @@
         "profile_unusable_body": "A profile named below could not be loaded, so its surface is held at the policy fallback ceiling — deny-all unless a looser fallback is declared. Correct the file in the profiles folder of your Kiro Crew data home — it is reloaded automatically.",
         "profile_unusable_detail": "The file was unreadable, failed to parse, or extends a profile that is missing. A restart is only needed if the file is already valid for a newer build than the one running.",
         "profile_unusable_which": "Affected: {{profiles}}.",
+        "unknown_scopes_title": "Profile scopes not in this build",
+        "unknown_scopes_tip": "These profiles name capability scopes this build does not register — typically scopes a companion edition adds, though a misspelled scope key lands here too. They are skipped and have no effect in this build.",
         "disabling_all_built_in_denies_removes_kirocrew_s": "Disabling all built-in denies removes Kiro Crew’s protection against destructive and credential-exfiltration commands. Some commands may stay blocked by independent defense-in-depth controls (sensitive paths, IMDS, git-publish).",
         "enabled": "Enabled",
         "expand_category_rules": "Expand {{category}} rules",
@@ -4594,7 +4641,24 @@
         "saving": "Saving…",
         "settings_are_saved_but_the_channel_is_not_runnin": "Settings are saved but the channel is not running. Restart the gateway to connect.",
         "verified_with_webex_and_saved_restart_the_gatewa": "Verified with Webex and saved. Restart the gateway to connect.",
-        "where_to_find_the_bot_token": "Where to find the bot token"
+        "where_to_find_the_bot_token": "Where to find the bot token",
+        "empty_allowlist_hint": "No allowed emails: the bot rejects every message. Add your Webex account email below.",
+        "soft_threshold_must_be_1_to_100": "Soft context threshold must be a whole number between 1 and 100.",
+        "hard_threshold_must_be_1_to_100": "Hard context threshold must be a whole number between 1 and 100.",
+        "soft_threshold_must_not_exceed_hard": "Soft context threshold must not be higher than the hard one — the hard threshold is checked first, so a higher soft value would never be reached.",
+        "allow_group_spaces": "Answer in group spaces",
+        "allow_group_spaces_desc": "Off by default. A reply in a space is visible to everyone in it, including people not on the allowed-emails list.",
+        "allowed_room_ids": "Allowed space IDs",
+        "allowed_room_ids_desc": "Empty means no space is answered, so turning the switch on alone grants nothing. The sender must also be on the allowed-emails list. A space ID is an opaque string — list yours with:\ncurl -H \"Authorization: Bearer $WEBEX_BOT_TOKEN\" https://webexapis.com/v1/rooms",
+        "allowed_room_ids_empty_hint": "No space is answered yet. Add the bot to the space, then paste that space's ID here.",
+        "room_id_placeholder": "Y2lzY29zcGFyazovL3VzL1JPT00v…",
+        "behaviour": "Behavior",
+        "reply_in_thread": "Reply in thread",
+        "reply_in_thread_desc": "Reply under the message's own thread when it has one, which keeps a busy space readable.",
+        "soft_context_threshold": "Soft context threshold %",
+        "soft_context_threshold_desc": "When a conversation's context passes this, suggest /compact or /new instead of compacting automatically.",
+        "hard_context_threshold": "Hard context threshold %",
+        "hard_context_threshold_desc": "Compact automatically at this point, even without a decision, so the context window never overflows."
       },
       "weixinPanel": {
         "connect_via_qr": "Connect via QR",
@@ -4706,6 +4770,12 @@
         "allowlist_description": "Numeric Telegram user IDs permitted to DM the bot. Empty = deny all (fail closed): a Telegram bot is globally reachable by @username.",
         "description": "Talk to your agent from Telegram over the Bot API (long-polling — no webhook or public address needed). Add allowed user IDs so the bot can respond.",
         "empty_allowlist_hint": "No allowed user IDs: the bot rejects every message (fail closed). Add your numeric Telegram user ID below.",
+        "forum_activation_always": "Every message",
+        "forum_activation_description": "When the bot replies inside an allow-listed topic. A direct message is always answered, whichever option is selected here.",
+        "forum_activation_hint": "Choose Only when addressed to hold a conversation with other people in the same topic — the bot then answers only when its @handle is used, or when one of its own messages is replied to.",
+        "forum_activation_label": "Answer in topics",
+        "forum_activation_mention": "Only when addressed",
+        "forum_activation_off": "Never",
         "forum_allowlist_description": "Numeric supergroup chat_ids permitted to run forum-topic sessions. These are negative (e.g. -1001234567890) — find one by adding a bot like @getidsbot to the group. Empty = deny all groups (fail closed).",
         "forum_allowlist_label": "Allowed supergroup chat IDs",
         "forum_empty_hint": "Forum enabled but no allow-listed chats: all forum traffic is denied. Add your supergroup chat_id (a negative number like -100…).",
@@ -4713,8 +4783,12 @@
         "forum_toggle_label": "Serve forum Topics as per-Topic sessions",
         "guide_body": "Message `@BotFather` on Telegram, send `/newbot`, and follow the prompts. BotFather replies with a bot token — paste it below. To find your numeric user ID, message `@userinfobot`.",
         "guide_link_label": "Open @BotFather",
+        "show_thinking_description": "After each answer, post the reasoning as a collapsed quote you can expand. Off by default: Telegram's rate limit is per chat and shared with the streaming edits the answer already spends, so this costs one extra message per turn.",
+        "show_thinking_label": "Post the model's reasoning",
         "token_description": "From @BotFather after creating your bot (looks like 110201543:AAHdqT…).",
-        "token_placeholder": "Paste Telegram bot token (123456:ABC-…)"
+        "token_placeholder": "Paste Telegram bot token (123456:ABC-…)",
+        "voice_replies_description": "Send each answer as a voice message as well as text, using your voice_reply provider settings. Off by default: it costs a second message per turn against Telegram's per-chat rate budget, and text-to-speech may not be installed. Short answers are never spoken, and the text reply always lands first. Use /voice on or /voice off to change one conversation.",
+        "voice_replies_label": "Speak the answers"
       },
       "weComPanel": {
         "allow_all_bypass_note": "Allow-all is on: the userid list above is bypassed. It is kept for when you switch back.",

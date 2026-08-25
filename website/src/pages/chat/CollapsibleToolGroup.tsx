@@ -17,8 +17,11 @@ interface CollapsibleToolGroupProps {
   permissionMeta?: Record<string, unknown>
   /** Number of pending permission messages in this group (shown as indicator when > 1). */
   pendingPermCount?: number
-  /** Callback for approve/reject (and trust, only when `canTrust`) — same as PermissionMessage.onApprove. */
-  onApprove?: (decision: string) => void | Promise<void>
+  /** Callback for approve/reject (and trust, only when `canTrust`) — same as PermissionMessage.onApprove.
+   *  MUST return the request's promise: it feeds `submitDecision`'s rollback
+   *  (rejection restores the buttons). No `void` arm, so a fire-and-forget
+   *  handler — the shape behind #5524 — cannot compile here. */
+  onApprove?: (decision: string) => Promise<unknown>
   /**
    * Offer the standing-trust tier. FAIL-CLOSED: leave unset unless this mount's
    * `onApprove` routes to an endpoint that actually RECORDS standing trust
@@ -111,7 +114,7 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
   return (
     <div className="my-1">
       <button
-        className={`flex items-center gap-2 px-4 py-2 rounded-md text-[13px] leading-5 font-mono text-muted bg-card ring-1 ring-inset forced-colors:border cursor-pointer transition-all w-full text-left ${needsAttention && !expanded ? 'ring-amber-400 hover:ring-amber-300' : localResolved ? 'ring-ok/60 hover:ring-ok/80' : 'ring-border hover:ring-border-strong'} hover:text-text`}
+        className={`flex items-center gap-2 px-4 py-2 rounded-md text-[13px] leading-5 font-mono text-muted bg-card ring-1 ring-inset forced-colors:border cursor-pointer transition-all w-full text-left ${needsAttention ? 'ring-amber-400 hover:ring-amber-300' : localResolved ? 'ring-ok/60 hover:ring-ok/80' : 'ring-border hover:ring-border-strong'} hover:text-text`}
         onClick={() => { userToggled.current = true; setExpanded(e => !e) }}
         aria-expanded={expanded}
         aria-label={`${expanded ? i18nT('pages.chat.collapsibleToolGroup.collapse') : i18nT('pages.chat.collapsibleToolGroup.expand')} ${labelText}`}
@@ -131,13 +134,19 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
         <span>{labelNode}</span>
       </button>
 
-      {/* Inline approval: command preview + action buttons */}
-      {needsAttention && !expanded && onApprove && truncated && (
+      {/* Inline approval: command preview + action buttons. Rendered in BOTH
+          disclosure states: a pending group auto-expands while the agent is
+          running (ChatMessageList sets autoExpand on recent running groups),
+          and grouped permission messages render null inside the children, so
+          gating this row on !expanded left the expanded pending group with no
+          actionable buttons — a dead end exactly while the agent is parked
+          waiting on the user (#5487). */}
+      {needsAttention && onApprove && truncated && (
         <div className="mt-1 ml-4 pl-3 shadow-[inset_2px_0_0_0_theme(colors.amber.400)] forced-colors:border-l-2">
           <pre className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 font-mono overflow-x-auto whitespace-pre-wrap break-all max-h-[4.5em] overflow-y-auto mb-2"><ToolInputText text={truncated} /></pre>
         </div>
       )}
-      {needsAttention && !expanded && onApprove && (
+      {needsAttention && onApprove && (
         <div className="mt-1 ml-4 pl-3 flex gap-2 flex-wrap">
           <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('approved') }}><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.approve')}</button>
           {canTrust && <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('trust') }}><Handshake className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.trust')}</button>}

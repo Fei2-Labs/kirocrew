@@ -42,6 +42,15 @@ export interface PanelTab {
   // ── document fields ──
   path?: string
   content?: string
+  /** The on-disk bytes this buffer was last known to match — the dirty
+   *  baseline. `openFile` compares the live buffer against it to tell "the
+   *  user edited this tab" from "the file changed on disk", and only the
+   *  former survives a re-open of the same path; a successful save and every
+   *  disk-originated refresh (cold-tab hydration, file watch, panel Refresh,
+   *  error placeholder) restamp it. TRANSIENT — stripped in `serializeBucket`
+   *  alongside the body it mirrors, so persistence stays metadata-only and a
+   *  restored tab is dirty-by-default until hydration re-establishes both. */
+  savedContent?: string
   original?: string
   modified?: string
   /** Last selected working-tree diff view for file tabs. Persisted with the
@@ -356,7 +365,10 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
  *  can be MBs and blow the localStorage quota. Terminal + view tabs and all
  *  tab METADATA (path / slug / sessionId / cwd / order / focus) are kept, so
  *  document tabs restore as lightweight references and re-fetch their content
- *  on demand; artifact tabs self-hydrate by slug via ArtifactPanel's query. */
+ *  on demand; artifact tabs self-hydrate by slug via ArtifactPanel's query.
+ *  The saved baseline is stripped with the body: it is a second copy of the
+ *  same bytes, and a restored tab without one is treated as dirty until its
+ *  content is re-fetched, which restamps it. */
 /** Lean single-bucket projection for persistence. Diff and app tabs are
  *  transient — a restored diff can only re-fetch the CURRENT working-tree diff,
  *  never the original turn snapshot, so it renders a misleading/unreliable diff;
@@ -368,7 +380,7 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
 function serializeBucket(b: Bucket): string {
   const tabs = b.tabs
     .filter(t => t.kind !== 'diff' && t.kind !== 'app')
-    .map(t => { const copy = { ...t }; delete copy.content; delete copy.revealLine; return copy })
+    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.revealLine; return copy })
   // If the focused tab was a dropped diff/app tab, refocus a surviving tab.
   const activeId = tabs.some(t => t.id === b.activeId)
     ? b.activeId
@@ -517,11 +529,31 @@ export function usePanelTabs(slotKey: string | null = null) {
     // keys the incoming object HAS. Omitting it would leave a previous chip's
     // line on the tab, so a later plain click on the same file would re-jump to
     // a line the user did not ask for.
-    upsert({
-      id: `file:${path}`, kind: 'file', title: basename(path), path, content, slot,
-      revealLine: opts?.line != null ? { line: opts.line, endLine: opts.endLine, nonce: nextRevealNonce() } : undefined,
-      ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
-    }, opts?.replaceId)
+    const reveal = opts?.line != null ? { line: opts.line, endLine: opts.endLine, nonce: nextRevealNonce() } : undefined
+    update(b => {
+      const prev = b.tabs.find(t => t.id === `file:${path}`)
+      if (prev && prev.content !== prev.savedContent) {
+        // The tab holds edits that were never saved (its buffer differs from
+        // its saved baseline; a baseline-less tab with a buffer — legacy or
+        // restored-but-not-yet-hydrated — counts the same way). Re-opening
+        // must FOCUS it, not revert it: the disk bytes in `content` here are
+        // not what the user was looking at, and silently replacing the buffer
+        // destroyed their work with no prompt and no undo. Everything EXCEPT
+        // the buffer and its baseline is refreshed (focus, reveal target,
+        // slot, diff-mode preference).
+        return upsertInBucket(b, {
+          id: `file:${path}`, kind: 'file', title: basename(path), path, slot,
+          revealLine: reveal,
+          ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
+        }, opts?.replaceId)
+      }
+      return upsertInBucket(b, {
+        id: `file:${path}`, kind: 'file', title: basename(path), path, content, slot,
+        savedContent: content,
+        revealLine: reveal,
+        ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
+      }, opts?.replaceId)
+    })
   }, [upsert])
 
   const openDiff = useCallback((path: string, modified: string, original = '') => {

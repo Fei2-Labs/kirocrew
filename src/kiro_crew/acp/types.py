@@ -237,6 +237,17 @@ ACP_BACKENDS_MODEL_NAMESPACE = frozenset(
 # membership rather than "not claude" (harness-parity H5).
 ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO})
 
+# Backends that authenticate to a model provider with the OPERATOR's own API key
+# (bring-your-own-key) rather than the backend's built-in subscription. Such a
+# backend reads the key from its own process environment, so membership here is
+# what makes acp.client inject the owner-only BYOK store (acp.byok) into the
+# spawned child's env. Opt-in like every capability set (harness-parity H6/H7):
+# GitHub Copilot CLI's --acp mode reads OPENAI_API_KEY / ANTHROPIC_API_KEY / etc.
+# from its environment; kiro-cli authenticates with its own KIRO_API_KEY and is
+# deliberately NOT a member (it must never receive a foreign provider key), and
+# the dormant claude seam has its own credential path.
+ACP_BACKENDS_BYOK = frozenset({ACP_BACKEND_COPILOT})
+
 # ── Provider labels ──
 # The backend identity key persisted in the session map. It indexes three
 # things, so every producer must agree on it: resume compatibility

@@ -6,6 +6,8 @@ import asyncio
 import json
 import subprocess
 
+import pytest
+
 from kiro_crew.dashboard.handlers import updates
 
 
@@ -187,6 +189,64 @@ class TestUpdateCheckGitGuard:
         resp = asyncio.run(updates.api_update_apply(_Req()))
         assert resp.status == 409
         assert json.loads(resp.body)["code"] == "git_fetch_failed"
+        assert not any("pull" in c for c in calls)
+
+    @pytest.mark.parametrize(
+        "rev_list_result",
+        [
+            (128, b""),  # rev-list itself failed (e.g. the upstream ref is gone)
+            (0, b"garbage\n"),  # output that is not two integer counts
+        ],
+        ids=["git_failed", "unparseable"],
+    )
+    def test_apply_fails_closed_when_the_distance_is_unreadable(
+        self, monkeypatch, tmp_path, rev_list_result
+    ):
+        # The diverged refusal above only works if the guard can COUNT. A
+        # distance it cannot read must refuse too — never read as "in sync"
+        # and wave the pull through.
+        _init_repo(tmp_path)
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_capability.running_from_checkout",
+            lambda root, **kw: True,
+        )
+
+        async def _no_provider():
+            return None
+
+        monkeypatch.setattr("kiro_crew.platform.update_provider.apply_policy_update", _no_provider)
+        monkeypatch.setattr(updates, "update_blocked_reason", lambda url: None)
+
+        calls: list[tuple[str, ...]] = []
+        # git status --porcelain (clean), pre-guard git fetch, then rev-list.
+        outputs = [(0, b""), (0, b""), rev_list_result]
+
+        class _Proc:
+            def __init__(self, rc: int, out: bytes) -> None:
+                self.returncode = rc
+                self._out = out
+
+            async def communicate(self):
+                return (self._out, b"")
+
+        async def _fake_exec(*args, **kwargs):
+            calls.append(tuple(str(a) for a in args))
+            rc, out = outputs.pop(0) if outputs else (0, b"")
+            return _Proc(rc, out)
+
+        monkeypatch.setattr(updates.asyncio, "create_subprocess_exec", _fake_exec)
+
+        class _State:
+            def push_refresh(self, kind: str) -> None:
+                pass
+
+        class _Req:
+            app = {"state": _State()}
+
+        resp = asyncio.run(updates.api_update_apply(_Req()))
+        assert resp.status == 409
+        assert json.loads(resp.body)["code"] == "git_read_failed"
         assert not any("pull" in c for c in calls)
 
     def test_the_apply_pull_is_fast_forward_only(self):

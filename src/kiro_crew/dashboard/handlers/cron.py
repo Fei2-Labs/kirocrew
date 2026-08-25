@@ -1401,6 +1401,10 @@ async def api_cron_folders_update(request: web.Request) -> web.Response:
     """PATCH /api/cron-folders/{folder_id} — rename a cron folder."""
     state: DashboardState = request.app["state"]
     folder_id = request.match_info["folder_id"]
+    if not folder_id or len(folder_id) > MAX_SHORT_STRING:
+        return web.json_response(
+            {"error": "invalid folder_id format", "code": "invalid_folder_id"}, status=400
+        )
     try:
         body = await request.json()
     except Exception:
@@ -1435,6 +1439,10 @@ async def api_cron_folders_delete(request: web.Request) -> web.Response:
     """DELETE /api/cron-folders/{folder_id} — delete folder and clear assignments."""
     state: DashboardState = request.app["state"]
     folder_id = request.match_info["folder_id"]
+    if not folder_id or len(folder_id) > MAX_SHORT_STRING:
+        return web.json_response(
+            {"error": "invalid folder_id format", "code": "invalid_folder_id"}, status=400
+        )
     async with _get_cron_folders_lock():
         try:
             found = await asyncio.to_thread(state.delete_cron_folder, folder_id)

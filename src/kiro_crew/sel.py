@@ -946,7 +946,7 @@ class SecurityEventLog:
             # at the call site (warn, don't crash): a read-only FS / chmod
             # failure must not take down SecurityEventLog init.
             try:
-                platform_compat.restrict_to_owner(key_path)
+                platform_compat.restrict_to_owner(key_path)  # lockdown-ok: load-time re-assert; the only preceding write to key_path is the legacy-key migration rename in a mutually exclusive branch
             except OSError:
                 # Logs the key file PATH, never the key bytes.
                 logger.warning(  # nosemgrep: python-logger-credential-disclosure
@@ -1086,7 +1086,7 @@ class SecurityEventLog:
                 lock_fh.write(b"\0")
                 lock_fh.flush()
             try:
-                os.chmod(lock_path, 0o600)
+                os.chmod(lock_path, 0o600)  # lockdown-ok: the rotation lock holds no data (a single NUL byte), so there is no payload to expose
             except OSError:
                 pass  # perms are hygiene here; the file holds no data
         except OSError:

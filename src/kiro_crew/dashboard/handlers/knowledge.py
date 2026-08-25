@@ -12,9 +12,11 @@ import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any
 
 from aiohttp import web
 
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
 from kiro_crew.dashboard.handlers.files import (
@@ -52,6 +54,7 @@ from kiro_crew.knowledge.llm_pool import DEFAULT_EXTRACTION_EFFORT, LLMPool
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.retrieval import HybridRetriever
 from kiro_crew.knowledge.spend import source_spend
+from kiro_crew.knowledge.store import KnowledgeBundleError
 from kiro_crew.knowledge.sync import SyncScheduler
 from kiro_crew.knowledge.watcher import KnowledgeWatcher
 from kiro_crew.messaging.raster import SNIFF_BYTES
@@ -73,12 +76,129 @@ def _sel_log(tool: str, **kwargs: object) -> None:
     )
 
 
+_BUNDLE_LIST_FIELDS = ("items", "entities", "relations", "sources", "source_locations", "mentions")
+# The fields import_bundle's redaction loops pass to _redact(); each has to be
+# a string or null before it reaches _redact() -> redact_exfiltration_urls(),
+# whose regex .finditer() raises an unhandled TypeError on anything else.
+_BUNDLE_REDACTED_FIELDS = {
+    "items": ("title", "summary", "content"),
+    "entities": ("name", "description"),
+    "relations": ("relation_type", "description"),
+}
+
+
+def _validate_knowledge_bundle(body: object) -> str | None:
+    """Return an error string if body isn't an importable bundle shape, else None.
+
+    Runs before the redaction loops and the store call so a malformed bundle
+    fails with a clean 400 instead of an unhandled AttributeError/TypeError
+    (non-dict body or entries) or a silently-committed corrupt row (non-JSON
+    sources.properties / entities.aliases, which every reader parses with
+    json.loads()).
+    """
+    if not isinstance(body, dict):
+        return "bundle must be a JSON object"
+    for field in _BUNDLE_LIST_FIELDS:
+        value = body.get(field, [])
+        if not isinstance(value, list):
+            return f"'{field}' must be a list"
+        for entry in value:
+            if not isinstance(entry, dict):
+                return f"'{field}' entries must be objects"
+    for field, keys in _BUNDLE_REDACTED_FIELDS.items():
+        for entry in body.get(field, []):
+            for key in keys:
+                value = entry.get(key)
+                if value is not None and not isinstance(value, str):
+                    return f"'{field}.{key}' must be a string or null"
+    # store.import_bundle() writes these two columns through unparsed (with
+    # '{}'/'[]' defaults when ABSENT), so anything present must already be the
+    # JSON text every reader json.loads() back: readers such as the source
+    # detail handlers parse the raw column with no empty-string guard, and
+    # find_entity() calls .lower() on each parsed alias.  Only absent/null
+    # falls through to the store defaults; a present non-string (1 -> TEXT
+    # "1"), an empty string, or the wrong parsed shape would commit a row
+    # that crashes a later, unrelated read.  json.loads raises RecursionError
+    # (not ValueError) on deeply-nested input, so catch it here too.
+    for src in body.get("sources", []):
+        props = src.get("properties")
+        if props is None:
+            continue
+        if not isinstance(props, str):
+            return "'sources.properties' must be a JSON object string or null"
+        try:
+            parsed = json.loads(props)
+        except (ValueError, RecursionError):
+            return "'sources.properties' must be valid JSON"
+        if not isinstance(parsed, dict):
+            return "'sources.properties' must be a JSON object"
+    for ent in body.get("entities", []):
+        aliases = ent.get("aliases")
+        if aliases is None:
+            continue
+        if not isinstance(aliases, str):
+            return "'entities.aliases' must be a JSON array string or null"
+        try:
+            parsed = json.loads(aliases)
+        except (ValueError, RecursionError):
+            return "'entities.aliases' must be valid JSON"
+        if not isinstance(parsed, list) or not all(isinstance(a, str) for a in parsed):
+            return "'entities.aliases' must be a JSON array of strings"
+    return None
+
+
 def _store(request: web.Request):
     return request.app["state"].knowledge_store
 
 
 def _pipeline(request: web.Request):
     return request.app.get("knowledge_pipeline")
+
+
+async def _json_object_body(
+    request: web.Request, *, allow_absent: bool = False
+) -> tuple[dict[str, Any] | None, web.Response | None]:
+    """Parse the request body as a JSON **object**, or produce the 400 to return.
+
+    ``await request.json()`` happily returns a list, string, or number for a
+    body that is valid JSON but not an object, and every caller in this module
+    then calls ``.get()`` on the result -- which raises and turns a client
+    mistake into a 500. One owner for the parse-and-shape guard keeps the
+    module's ``request.json()`` call sites on a single contract instead of
+    bespoke per-handler guards.
+
+    Returns ``(body, None)`` on success, or ``(None, error_response)`` when
+    the caller should return early. *allow_absent* treats a request without a
+    readable body as an empty object, for endpoints whose fields all have
+    defaults.
+
+    Deliberately separate from ``_shared.read_bounded_json``, which shares the
+    ``invalid_json``/``body_not_object`` codes: switching these nine sites onto
+    it would mean choosing a byte cap per endpoint (its ``max_bytes`` must be
+    a number, and knowledge bundles have no principled ceiling today), would
+    change the ``"invalid JSON"`` message text existing tests and callers pin,
+    and it has no *allow_absent*. Consolidating the two helpers is deferred
+    scope, not a disagreement about the contract.
+    """
+    if allow_absent and not request.can_read_body:
+        return {}, None
+    try:
+        parsed = await request.json()
+    except (LookupError, RecursionError, ValueError):
+        # json.JSONDecodeError and UnicodeDecodeError are ValueError
+        # subclasses; LookupError is an unknown charset= codec in the
+        # client's Content-Type header; RecursionError is a deeply nested
+        # JSON document blowing the parser's stack. All are client mistakes.
+        # Transport failures (disconnect mid-body, read timeout) deliberately
+        # propagate: they are not a client JSON mistake and keep their 500
+        # status class.
+        return None, web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(parsed, dict):
+        return None, web.json_response(
+            {"error": "body must be a JSON object", "code": "body_not_object"},
+            status=400)
+    return parsed, None
 
 
 def _create_embedder(app):
@@ -418,10 +538,10 @@ async def update_item(request: web.Request) -> web.Response:
     item_id = request.match_info["id"]
     if not store.get_item(item_id):
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     allowed = {"tags", "item_type", "status", "title", "summary", "namespace"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if not fields:
@@ -751,10 +871,10 @@ async def pick_folder(request: web.Request) -> web.Response:
 async def add_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources -- add a remote source."""
     store = _store(request)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     name = body.get("name", "")
     source_type = body.get("source_type", "")
     uri = body.get("uri", "")
@@ -1100,10 +1220,10 @@ async def rename_source(request: web.Request) -> web.Response:
     source_id = request.match_info["id"]
     if not store.db.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone():
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     name = body.get("name")
     if not isinstance(name, str):
         return web.json_response({"error": "name must be a string"}, status=400)
@@ -1228,7 +1348,10 @@ async def retry_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/retry -- reset file to pending."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body = await request.json()
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1247,7 +1370,10 @@ async def skip_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/skip -- mark file as skipped."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body = await request.json()
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1272,10 +1398,10 @@ async def ingest_text(request: web.Request) -> web.Response:
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     text = body.get("text", "")
     if not text:
         return web.json_response({"error": "no text provided"}, status=400)
@@ -1520,10 +1646,17 @@ async def export_all(request: web.Request) -> web.Response:
 
 async def import_bundle(request: web.Request) -> web.Response:
     """POST /api/knowledge/import -- accept .knowledge JSON bundle."""
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
+    shape_error = _validate_knowledge_bundle(body)
+    if shape_error is not None:
+        _sel_log("import", outcome="rejected", reason=shape_error)
+        return web.json_response(
+            {"error": f"malformed bundle: {shape_error}", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
     # Redact imported text fields (may contain LLM-derived content from another instance)
     for item in body.get("items", []):
         redacted_title = _redact(item.get("title"))
@@ -1539,7 +1672,48 @@ async def import_bundle(request: web.Request) -> web.Response:
         redacted_type = _redact(rel.get("relation_type"))
         rel["relation_type"] = redacted_type if redacted_type is not None else ""
         rel["description"] = _redact(rel.get("description"))
-    result = _store(request).import_bundle(body)
+    try:
+        result = _store(request).import_bundle(body)
+    except KnowledgeBundleError as exc:
+        # The store enforces the JSON-column well-formedness invariant
+        # (sources.properties / entities.aliases) at the writer; surface its
+        # typed rejection as a clean 400.  Unlike the driver errors below,
+        # its message is validator-crafted (the same class as the handler's
+        # own shape errors above), so it is safe to render verbatim.
+        _sel_log("import", outcome="rejected", reason=str(exc))
+        return web.json_response(
+            {"error": f"malformed bundle: {exc}", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
+    except (KeyError, OverflowError, sqlite3.IntegrityError,
+            sqlite3.ProgrammingError, sqlite3.DataError) as exc:
+        # Only failures that genuinely mean a bad bundle earn a 400:
+        # IntegrityError (constraint/FK violations), ProgrammingError and
+        # DataError (bad values reaching the SQL layer), KeyError (missing
+        # required field), and OverflowError (a bundle integer field, e.g.
+        # chunk_index, too large for SQLite's 64-bit INTEGER, raised at bind
+        # time inside the store call -- neither a KeyError nor a
+        # sqlite3.Error, so it needs its own arm).  The exception detail
+        # stays server-side: the dashboard renders ``error`` verbatim, so
+        # raw driver text must not reach the client.
+        logger.warning("Knowledge bundle import rejected: %s", exc)
+        _sel_log("import", outcome="rejected", reason=str(exc))
+        return web.json_response(
+            {"error": "malformed bundle", "code": "malformed_knowledge_bundle"},
+            status=400,
+        )
+    except sqlite3.Error as exc:
+        # Operational store failures -- OperationalError from a locked DB
+        # past busy_timeout or a full disk, and every other sqlite3.Error --
+        # are not the client's fault: a 400 "malformed bundle" for a valid
+        # file sends the user off debugging their export.  Surface them as a
+        # 5xx with a generic body; the detail is logged server-side only.
+        logger.exception("Knowledge bundle import failed in the store")
+        _sel_log("import", outcome="error", reason=str(exc))
+        return web.json_response(
+            {"error": "internal server error", "code": "knowledge_import_failed"},
+            status=500,
+        )
     _sel_log("import", **result)
     return web.json_response(result)
 
@@ -1618,7 +1792,10 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     if not await embedder.is_available_async():
         return web.json_response({"error": "Embedding model not available"}, status=503)
 
-    body = await request.json() if request.can_read_body else {}
+    body, body_err = await _json_object_body(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     rebuild = body.get("rebuild", False)
     force = body.get("force", False)
 
@@ -1789,11 +1966,10 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "pipeline not configured",
              "code": "pipeline_unavailable"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_err = await _json_object_body(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # _json_object_body returns (dict, None) on success
     result = await add_agent_document(
         pipeline,
         title=str(body.get("title") or ""),

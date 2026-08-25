@@ -383,9 +383,15 @@ export interface TelegramConfigData {
   enabled: boolean
   allowed_user_ids: string[]
   soft_threshold_pct: number
+  /** Post the model's reasoning after each answer as a collapsed quote. */
+  show_thinking?: boolean
+  /** Speak each answer as a voice/audio message alongside the text. */
+  voice_replies?: boolean
   // Forum per-topic config. chat_ids are negative supergroup ids as strings.
   allow_forum?: boolean
   allowed_forum_chat_ids?: string[]
+  /** When to answer inside an allow-listed topic: "always" | "mention" | "off". */
+  forum_activation?: string
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -413,8 +419,11 @@ export interface TelegramConfigSave {
   enabled: boolean
   allowed_user_ids: string[]
   soft_threshold_pct: number
+  show_thinking?: boolean
+  voice_replies?: boolean
   allow_forum?: boolean
   allowed_forum_chat_ids?: string[]
+  forum_activation?: string
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -464,6 +473,17 @@ export interface WebexConfigData {
   bot_token_preview: string
   enabled: boolean
   allowed_emails: string[]
+  /** Answer in group spaces as well as DMs. Off by default: a reply in a space is
+   *  visible to every member, including people not on the email allow-list. */
+  allow_group_rooms: boolean
+  /** Spaces the bot may answer in. Empty = deny all, so the switch alone grants nothing. */
+  allowed_room_ids: string[]
+  /** Reply under the message's own thread when it has one. */
+  reply_in_thread: boolean
+  /** Context % at which the bot suggests /compact instead of auto-compacting. */
+  soft_threshold_pct: number
+  /** Context % at which it force-compacts so the window never overflows. */
+  hard_threshold_pct: number
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -474,6 +494,11 @@ export interface WebexConfigSave {
   bot_token_clear: boolean
   enabled: boolean
   allowed_emails: string[]
+  allow_group_rooms: boolean
+  allowed_room_ids: string[]
+  reply_in_thread: boolean
+  soft_threshold_pct: number
+  hard_threshold_pct: number
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -747,6 +772,14 @@ export interface GovernancePolicyData {
    *  could not be read or parsed — enforcement is correct (fail-closed) but the
    *  operator should know the ceiling is synthetic, not intentional. */
   fallback_profiles?: string[]
+  /** Capability scopes a profile names that this build does not register —
+   *  typically scopes a companion edition adds, though a misspelled scope key
+   *  lands here too. Keyed by profile stem, sorted scope names as values;
+   *  present only for profiles carrying such scopes, and deliberately NOT
+   *  narrowed to the host profile — every loaded profile reports. Producer:
+   *  the governance security payload (PR #5544). Tolerated at load time and
+   *  inert in this build. */
+  unknown_profile_scopes?: Record<string, string[]>
   /** True when governance resolution failed — the viewer shows a soft notice. */
   unavailable: boolean
   scopes: GovernanceScope[]
@@ -816,6 +849,97 @@ export interface TailnetStatusData {
   /** Epoch seconds of that startup resolution; `0` when it never resolved. */
   resolved_at: number
   state: 'pinned' | 'off' | 'unresolved' | 'active'
+}
+
+/** The single next action for tailnet mobile access.
+ *
+ * Ordered by what blocks what, and derived SERVER-side (see
+ * `handlers/tailnet_mobile._derive_step`) so this list is rendered, never
+ * re-computed here — one owner for the state machine.
+ *
+ * - `pinned` — an administrator's policy forbids tailnet access. Dead end.
+ * - `install` / `start_daemon` / `sign_in` / `enable_magicdns` — the four ways
+ *   there is no usable tailnet name, kept apart because each is a different
+ *   errand for the operator.
+ * - `trust_off` — a name exists but the gateway will not accept it as an origin
+ *   yet, so publishing would yield a reachable dashboard answering 403.
+ * - `restart_gateway` — configured and resolvable NOW, but this server resolved
+ *   nothing at startup (it booted before tailscaled). Genuinely not trusted
+ *   until a restart, so it must not render as ready.
+ * - `occupied` — serve holds the mount for something that is not this dashboard,
+ *   or its state is undeterminable; publishing would REPLACE it.
+ * - `publish` — everything in place, one action left.
+ * - `ready` — published and trusted.
+ */
+export type TailnetMobileStep =
+  | 'pinned'
+  | 'install'
+  | 'start_daemon'
+  | 'sign_in'
+  | 'enable_magicdns'
+  | 'trust_off'
+  | 'restart_gateway'
+  | 'occupied'
+  | 'publish'
+  | 'ready'
+
+/** Live readiness for tailnet mobile access (`GET /api/tailnet/mobile`).
+ *
+ * Unlike `TailnetStatusData` this IS a live daemon probe: it answers "what can
+ * this machine do next", where the other answers "what does the running server
+ * already trust". Both are needed and they are not interchangeable. */
+export interface TailnetMobileData {
+  step: TailnetMobileStep
+  /** MagicDNS name as resolved right now; `''` when unresolvable. */
+  host: string
+  origin: string
+  installed: boolean
+  reachable: boolean
+  logged_in: boolean
+  /** Other devices on this tailnet. `0` means there is nothing to reach this
+   *  dashboard FROM — publishing and the QR both still succeed, so this is the
+   *  only signal that the scan is going to fail. */
+  peer_count: number
+  /** How many of those are online right now. */
+  peers_online: number
+  /** `dashboard.tailscale.enabled` — the origin-trust config switch. */
+  trusted: boolean
+  /** Whether the RUNNING server resolved a name at startup. */
+  startup_trusted: boolean
+  /** `null` when serve state could not be determined — never render as false. */
+  published: boolean | null
+  keep_awake: boolean
+  governance_pinned: boolean
+  /** Verbatim daemon/serve text. Shown as-is; never rephrased client-side. */
+  detail: string
+  download_url: string
+  qr_ttl_secs: number
+  serve_port: number
+  dashboard_port: number
+}
+
+/** Result of a publish/unpublish attempt. `detail` carries the daemon's own
+ *  words, which is the only part guaranteed to stay correct if Tailscale
+ *  rewords its errors. */
+export interface TailnetMobileMutation {
+  ok: boolean
+  code: string
+  detail: string
+}
+
+/** A minted mobile-access QR. Carries a LIVE session token in both fields, so
+ *  it is fetched only on explicit user action and never cached. */
+export interface TailnetMobileQr {
+  /** `https://<host>/?token=<token>` — treat as a credential. */
+  url: string
+  /** PNG data URI, rendered server-side (no client QR library). */
+  image: string
+  /** Lifetime of the session the link opens. */
+  ttl_secs: number
+  /** Window in which the LINK must be opened — much shorter than `ttl_secs`,
+   *  and the part that surprises people. */
+  link_window_secs: number
+  host: string
 }
 
 /**
@@ -1723,6 +1847,11 @@ export const api = {
   // telemetry main switch: the usage rows it reads are always written.
   telemetryContextTrace: (slot: string) =>
     fetch('/api/telemetry/context-trace?slot=' + encodeURIComponent(slot)).then(j),
+  /** Per-turn usage rows for one session — the Spend table's drill-down.
+   *  Same always-written row store as the context trace; the dashboard reads
+   *  every row (the endpoint's app-ownership filter applies to app callers). */
+  usageTurns: (slot: string) =>
+    fetch('/api/usage/turns?slot=' + encodeURIComponent(slot)).then(j),
   /** Intent summary for the chat summary panel.
    *
    *  Read-only: it never triggers generation. Summaries are produced at turn end
@@ -1787,6 +1916,17 @@ export const api = {
   // setting IS a config value and the status endpoint only reports what the
   // running server resolved from it at startup.
   tailnetStatus: () => get('/api/tailnet/status').then(j) as Promise<TailnetStatusData>,
+  // Mobile access. `tailnetMobile` is a LIVE probe (two daemon round trips
+  // server-side), so poll it gently; the three mutations below are user-driven.
+  tailnetMobile: () => get('/api/tailnet/mobile').then(j) as Promise<TailnetMobileData>,
+  tailnetMobilePublish: () =>
+    post('/api/tailnet/mobile/publish', {}).then(j) as Promise<TailnetMobileMutation>,
+  tailnetMobileUnpublish: () =>
+    post('/api/tailnet/mobile/unpublish', {}).then(j) as Promise<TailnetMobileMutation>,
+  // Mints a session token. Called ONLY from an explicit user action — never on
+  // render — because the response is a live credential.
+  tailnetMobileQr: (ttl?: string) =>
+    post('/api/tailnet/mobile/qr', ttl ? { ttl } : {}).then(j) as Promise<TailnetMobileQr>,
   // Denied commands (Settings → Security). Every endpoint returns the full
   // refreshed snapshot so callers can seed their query cache from the response.
   deniedCommands: () => get('/api/security/denied-commands').then(j) as Promise<DeniedCommandsData>,
@@ -2066,7 +2206,12 @@ export const api = {
 
   // Lessons
   lessons: () => fetch('/api/lessons').then(j),
-  createLesson: (rule: string, category: string) => post('/api/lessons', { rule, category }).then(j),
+  createLesson: (rule: string, category: string) =>
+    post('/api/lessons', { rule, category }).then(j) as Promise<{
+      ok: boolean
+      outcome: 'inserted' | 'enriched' | 'unchanged' | 'deduped' | 'refused'
+      reason: string
+    }>,
   deleteLesson: (rule: string) => del('/api/lessons', { rule }).then(j),
   // Hooks
   hooks: () => fetch('/api/hooks').then(j),

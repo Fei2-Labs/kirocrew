@@ -3,7 +3,7 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import FolderSuggestionCard from '../pages/chat/FolderSuggestionCard'
-import reducer, { setFolderSuggestion, clearFolderSuggestion } from '../store/chatSlice'
+import reducer, { setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, startLocalTurn, confirmOptimisticSend, FOLDER_SUGGESTION_MAX_TURNS } from '../store/chatSlice'
 
 vi.mock('../i18n/t', () => ({
   i18nT: (key: string, vars?: Record<string, unknown>) =>
@@ -139,5 +139,74 @@ describe('folderSuggestions reducers', () => {
     s = reducer(s, clearFolderSuggestion({ slot: 'a', ts: 1 }))
     expect(s.folderSuggestions['a']).toBeUndefined()
     expect(s.folderSuggestions['b']).toMatchObject({ folderId: 'f2' })
+  })
+})
+
+describe('folderSuggestions age out by rendered, confirmed user send', () => {
+  const base = () => reducer(undefined, { type: '@@INIT' })
+  const seed = (slot = 'dashboard_chat-1') =>
+    reducer(base(), setFolderSuggestion({ slot, folderId: 'f1', folderName: 'feature', breadcrumb: 'feature', ts: 100 }))
+  // Aging is an explicit action dispatched ONLY by the render site that showed
+  // the card (ChatPage, active slot) after the server confirmed delivery. It is
+  // deliberately NOT baked into startLocalTurn (failed sends must not count) or
+  // confirmOptimisticSend (ChatPane surfaces confirm sends without rendering
+  // the card, and an unseen card must never age).
+  const aged = (slot: string, ts = 100) => ageFolderSuggestion({ slot, ts })
+
+  it('survives FOLDER_SUGGESTION_MAX_TURNS aged sends and is gone on the next one', () => {
+    let s = seed()
+    for (let n = 1; n <= FOLDER_SUGGESTION_MAX_TURNS; n++) {
+      s = reducer(s, aged('dashboard_chat-1'))
+      expect(s.folderSuggestions['dashboard_chat-1']).toMatchObject({ turns: n })
+    }
+    s = reducer(s, aged('dashboard_chat-1'))
+    expect(s.folderSuggestions['dashboard_chat-1']).toBeUndefined()
+  })
+
+  it('a FAILED or unrendered send does not age the card — neither shared send reducer touches it', () => {
+    // startLocalTurn (the optimistic dispatch, fired even for sends that then
+    // fail) and confirmOptimisticSend (fired by ChatPane surfaces that never
+    // render the card) must both leave the card untouched, however often they
+    // run. Only the explicit ageFolderSuggestion dispatch counts.
+    let s = seed()
+    for (let n = 0; n <= FOLDER_SUGGESTION_MAX_TURNS + 2; n++) {
+      s = reducer(s, startLocalTurn('dashboard_chat-1'))
+      s = reducer(s, confirmOptimisticSend({ slot: 'dashboard_chat-1', sendId: `send-${n}` }))
+    }
+    expect(s.folderSuggestions['dashboard_chat-1']).toMatchObject({ turns: 0 })
+  })
+
+  it('a stale ts does not age a replacement card that landed mid-flight', () => {
+    // The send left while the ts=100 card was visible; a ts=200 replacement
+    // arrived before the response. The confirmed send may only age the
+    // generation the user actually saw, which no longer exists.
+    let s = seed()
+    s = reducer(s, setFolderSuggestion({ slot: 'dashboard_chat-1', folderId: 'f2', folderName: 'other', breadcrumb: 'other', ts: 200 }))
+    s = reducer(s, aged('dashboard_chat-1', 100))
+    expect(s.folderSuggestions['dashboard_chat-1']).toMatchObject({ folderId: 'f2', turns: 0 })
+  })
+
+  it('ages only the slot that sent — a card parked in another session is untouched', () => {
+    let s = seed('a')
+    s = reducer(s, setFolderSuggestion({ slot: 'b', folderId: 'f2', folderName: 'other', breadcrumb: 'other', ts: 200 }))
+    for (let n = 0; n <= FOLDER_SUGGESTION_MAX_TURNS; n++) s = reducer(s, aged('a'))
+    expect(s.folderSuggestions['a']).toBeUndefined()
+    expect(s.folderSuggestions['b']).toMatchObject({ folderId: 'f2', turns: 0 })
+  })
+
+  it('does not mutate Object.prototype when a send names a polluting slot key', () => {
+    const s = reducer(seed(), ageFolderSuggestion({ slot: '__proto__', ts: 100 }))
+    expect(s.folderSuggestions['dashboard_chat-1']).toMatchObject({ turns: 0 })
+    expect((Object.prototype as Record<string, unknown>).turns).toBeUndefined()
+  })
+
+  it('starts the count from a card that predates the field', () => {
+    // A slice preloaded from an older shape (or a hand-built test fixture) can
+    // have no `turns`; the first aged send must count as one, not NaN.
+    const s = reducer(
+      { ...base(), folderSuggestions: { a: { folderId: 'f', folderName: 'F', breadcrumb: 'F', ts: 1 } } } as never,
+      ageFolderSuggestion({ slot: 'a', ts: 1 }),
+    )
+    expect(s.folderSuggestions['a']).toMatchObject({ turns: 1 })
   })
 })

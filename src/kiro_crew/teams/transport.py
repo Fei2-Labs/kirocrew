@@ -11,9 +11,10 @@ Dependency direction is ``teams -> messaging`` (allowed); the neutral
 Teams is DM-only and fail-closed:
 
 * Direct/personal rooms only: in a channel or group chat the bot's reply would
-  land in front of non-authorized members, exposing tool output (same reasoning
-  as the Webex/Telegram direct-only gate). Non-personal scopes are denied and
-  audited BEFORE authorization.
+  land in front of non-authorized members, exposing tool output. Webex and
+  Telegram admit a non-DM room only because each pairs a per-room session with an
+  explicit room allow-list; Teams has neither, so non-personal scopes are denied
+  and audited BEFORE authorization.
 * No streaming: the renderer posts a typing indicator, keeps it alive, and
   delivers the final answer in one shot (``streaming=False``). Buttons ARE real
   here -- an Adaptive Card ``Action.Submit`` round-trips as a message activity --
@@ -231,6 +232,61 @@ class TeamsTransport(MessagingTransport):
         """
         conversation_id = self._store.conversation_for(identity)
         return conversation_id if conversation_id and self._store.get(conversation_id) else ""
+
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Authorize a proactive send by reverse-mapping the conversation.
+
+        Teams links persist a conversation id, not a principal, so the roster is
+        reached through ``_reachable_conversation`` -- the same predicate
+        ``resolve_configured_target`` and ``configured_targets`` answer from, which
+        is what keeps "may I send here" and "where do I send" from drifting. A
+        conversation is authorized only while some CURRENTLY allow-listed identity
+        still resolves onto it, so dropping an identity from the allow-list stops
+        its proactive traffic.
+
+        Reads the ``ServiceUrlStore`` synchronously, as this seam requires, which
+        means it has to tell "not in the store" from "the store is not read yet".
+        Those look identical through the accessors and mean opposite things: the
+        store is PERSISTED and ``send_message`` awaits its own ``ensure_loaded``, so
+        a route sitting on disk is deliverable even on the first send of a process.
+        The transport is also registered BEFORE ``connect``, and ``connect`` only
+        starts the warm-up rather than awaiting it, so an unloaded store is a real
+        window rather than a corner case.
+
+        An unloaded store is a REFUSAL rather than a permit, which is safe only
+        because the gateway awaits :meth:`warm_routes` before registering this
+        transport: nothing can reach this check with the store unread. Permitting
+        instead would leave a startup window in which a recipient already removed
+        from the allow-list is still reachable, because ``send_message`` awaits its
+        own ``ensure_loaded`` and would reload the persisted route and deliver.
+        """
+        if not conversation_id:
+            return False
+        if not self._store.loaded:
+            # Unreachable while warm_routes precedes registration; kept as the
+            # fail-closed floor if that ordering is ever changed.
+            return False
+        return any(
+            self._reachable_conversation(identity) == conversation_id for identity in self._allowed
+        )
+
+    async def warm_routes(self) -> None:
+        """Read the persisted route store, before anything can consult it.
+
+        Awaited by the gateway BEFORE the transport is registered, which is what
+        lets :meth:`may_send_to` treat an unloaded store as a refusal: the
+        authorization seam is synchronous and cannot load it, so a window where the
+        store is empty is a window where either a revoked recipient is reachable or
+        a deliverable send is refused. Closing the window removes the choice.
+
+        Does not block the loop despite the disk read: ``ensure_loaded`` does its
+        own ``asyncio.to_thread``. Idempotent, so the warm-up task ``connect``
+        starts remains harmless.
+        """
+        await self._store.ensure_loaded()
 
     # -- Lifecycle ----------------------------------------------------------
     async def connect(self) -> None:

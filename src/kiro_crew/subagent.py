@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import cached_project_agent_names, list_agents
-from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.loader import DEFAULT_MODEL, KiroCrewConfig
 from kiro_crew.constants import SUBAGENT_COMPLETION_PREFIX
 from kiro_crew.context import (
     CONTEXT_GROUP_LESSONS,
@@ -64,8 +64,14 @@ from kiro_crew.hooks import (
     safe_read_file,
 )
 from kiro_crew.llm_helpers import (
+    FALLBACK_CANDIDATE_ATTEMPTS,
     TRANSIENT_RETRIES,
+    TURN_FALLBACK_ATTR,
+    FallbackState,
     acp_error_is_transient,
+    advance_fallback_candidate,
+    configured_fallback_chain,
+    provider_fallback_active,
     transient_retry_delay,
 )
 from kiro_crew.mcp_gateway import STUB_MODULE
@@ -441,6 +447,31 @@ def _resolve_injection_timeout() -> float:
 INJECTION_TIMEOUT = _resolve_injection_timeout()
 
 
+def _resolved_model_of(client: object) -> str:
+    """The model id *client*'s live session actually resolved to serve, or ``""``.
+
+    Reads the provider's PUBLIC ``served_model`` accessor (never private
+    ``_client`` internals, which are free to move) — the same contract the
+    poisoned-conversation canary and ``AcpProvider.served_model`` use. Both
+    provider shapes are covered: ``AcpSessionProvider.served_model`` prefers the
+    explicit ``set_model`` and falls back to the ``session/new|load`` response's
+    ``currentModelId`` (so a session on the backend-selected DEFAULT is still
+    readable at spawn), while the raw ``AcpClient`` reports ``_resolved_model_id``
+    once the backend has answered (known after the first turn on the CC path).
+
+    The ``DEFAULT_MODEL`` (``"auto"``) sentinel — "let the backend pick", not yet
+    resolved — is filtered to ``""`` (unknown/inconclusive) so a caller never
+    renders it as if it were a real model, and callers must treat ``""`` as
+    "don't show", never as a wildcard. Never raises — an unreadable or
+    duck-typed client (test doubles) yields ``""``.
+    """
+    try:
+        model = str(getattr(client, "served_model", "") or "").strip()
+    except Exception:
+        return ""
+    return "" if model == DEFAULT_MODEL else model
+
+
 def _subagent_default_model() -> str:
     """Explicit sub-agent model pin (``agent.role_models['subagent']``), or ``""``.
 
@@ -536,7 +567,9 @@ def _digest_hold_secs() -> float:
 DIGEST_HOLD_SECS = _digest_hold_secs()
 
 
-def _timeout_context(info: "SubagentInfo", *, include_elapsed: bool = True, turn_limit: int = 0) -> str:
+def _timeout_context(
+    info: "SubagentInfo", *, include_elapsed: bool = True, turn_limit: int = 0
+) -> str:
     """Build a human-readable context string for timeout errors.
 
     ``turn_limit`` is the resolved effective turn cap (per-spawn override →
@@ -695,9 +728,7 @@ def _proc_subtree_counts(pid: Optional[int]) -> tuple[Optional[int], Optional[in
     return (procs, stubs)
 
 
-def _attributed_count(
-    total: Optional[int], sharers: int, previous: Optional[int]
-) -> Optional[int]:
+def _attributed_count(total: Optional[int], sharers: int, previous: Optional[int]) -> Optional[int]:
     """One co-tenant's share of a subtree *total*, or *previous* if unmeasured.
 
     Counts follow the same per-sharer split as the RSS/CPU attribution (see
@@ -1186,6 +1217,24 @@ class SubagentInfo:
     _raw_task: str = ""  # unredacted task for kiro-cli execution prompt
     # CC-specific overrides (ignored for ACP)
     model: str = ""
+    # The model id the live session ACTUALLY resolved to serve, read back from
+    # the provider's public ``served_model`` accessor. Distinct from ``model``,
+    # which is only the REQUESTED pin (often "" ⇒ provider default): the ACP
+    # backend reports the served id even on the default, and a routing/config/
+    # availability downgrade makes the two differ. "" means unknown/inconclusive
+    # (never a wildcard) — the ACP session/new response fills it at spawn, while
+    # the CC/raw path only knows it after the first turn, so it is refreshed at
+    # completion too. Surfaced on the subagent WS frames and completion meta so a
+    # model-pinned review's actual model is auditable (issue #3582).
+    resolved_model: str = ""
+    # The EFFECTIVE requested model — the per-spawn pin (``model``) OR, when that
+    # is empty, the ``agent.role_models['subagent']`` config pin (AGENTS.md names
+    # the config pin as *the* way to pin a subagent model). This is the side the
+    # downgrade comparison must use: a config-pinned run served a different model
+    # is exactly the "unverifiable pin" this feature exists to catch, and keying
+    # off the bare per-spawn ``model`` would miss it (Design review on #3582).
+    # "" ⇒ no pin (the provider default). Resolved once at spawn.
+    requested_model: str = ""
     # Per-call reasoning-effort override (spawn_run ``reasoning_effort``).
     # Wins over the ``role_efforts['subagent']`` pin; ``""`` defers to it.
     # Like ``model``, a non-empty value forces the dedicated-process path.
@@ -1748,6 +1797,8 @@ class SubagentManager:
                 outcome=OUTCOME_INTERRUPTED,
                 task=task_preview,
                 note="orphaned by gateway restart",
+                requested_model=str(state.get("requested_model") or ""),
+                resolved_model=str(state.get("resolved_model") or ""),
             )
         else:
             msg = (
@@ -1761,6 +1812,8 @@ class SubagentManager:
                 outcome=OUTCOME_FAILED,
                 task=task_preview,
                 note="lost to gateway restart",
+                requested_model=str(state.get("requested_model") or ""),
+                resolved_model=str(state.get("resolved_model") or ""),
             )
 
         # Redact before any delivery path (injection or Slack DM)
@@ -2446,6 +2499,11 @@ class SubagentManager:
                 "outcome": info.outcome,
                 "task": _redact(info.task),
                 "agent": _redact(info.agent),
+                # The model actually served (issue #3582). By the terminal
+                # report this is the authoritative value on every provider — the
+                # CC/raw path has completed at least one turn, so its
+                # ``_resolved_model_id`` is populated (refreshed in ``_run``).
+                "model": info.resolved_model,
                 "result": _done_result(info.result),
             },
         )
@@ -3633,14 +3691,16 @@ class SubagentManager:
         """
         if not key.startswith("subagent:"):
             return False
-        conv_id = key[len("subagent:"):]
+        conv_id = key[len("subagent:") :]
         try:
             state = read_state(conv_id) or {}
         except Exception:
             return False
         return bool(state.get("keep"))
 
-    def _promote_conversation(self, conv_id: str, conv_key: str, last_used: float | None = None) -> None:
+    def _promote_conversation(
+        self, conv_id: str, conv_key: str, last_used: float | None = None
+    ) -> None:
         """Single choke point for promoting a conversation's retention (#1115).
 
         Writes all three retention surfaces together so they cannot drift:
@@ -3676,15 +3736,19 @@ class SubagentManager:
                 if not state.get("keep"):
                     continue
                 conv_key = str(state.get("conversation_key") or "") or f"subagent:{d.name}"
-                conv_id = conv_key[len("subagent:"):]
+                conv_id = conv_key[len("subagent:") :]
                 sid = str(state.get("session_id") or "")
                 last_used = float(state.get("updated_at") or state.get("started") or 0.0)
-                out.append((
-                    conv_id, conv_key, sid,
-                    str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
-                    str(state.get("cwd") or ""),
-                    last_used,
-                ))
+                out.append(
+                    (
+                        conv_id,
+                        conv_key,
+                        sid,
+                        str(state.get("provider") or PROVIDER_LABEL_DEFAULT),
+                        str(state.get("cwd") or ""),
+                        last_used,
+                    )
+                )
             except Exception:
                 logger.debug("registry rebuild: skipping %s", d, exc_info=True)
         return out
@@ -4046,15 +4110,11 @@ class SubagentManager:
         task = asyncio.create_task(self._deliver_followups(info))
         self._followup_watchers[run_id] = task
 
-        def _done(
-            t: "asyncio.Task", _id: str = run_id, _info: SubagentInfo = run_info
-        ) -> None:
+        def _done(t: "asyncio.Task", _id: str = run_id, _info: SubagentInfo = run_info) -> None:
             self._followup_watchers.pop(_id, None)
             _info._followup_watcher = False
             if not t.cancelled() and t.exception() is not None:
-                logger.warning(
-                    "follow_up watcher for %s failed", _id, exc_info=t.exception()
-                )
+                logger.warning("follow_up watcher for %s failed", _id, exc_info=t.exception())
                 return
             if (
                 not t.cancelled()
@@ -4122,7 +4182,7 @@ class SubagentManager:
             # sweep, so the messages vanished with no event. The slice keeps
             # anything queued while we were announcing (the done-callback
             # re-arms for it).
-            info.pending_followups = info.pending_followups[len(dropped):]
+            info.pending_followups = info.pending_followups[len(dropped) :]
             return
         # SNAPSHOT, do not drain: messages stay in ``pending_followups`` until
         # their outcome is SETTLED (dispatched, or their failure announced).
@@ -4137,12 +4197,10 @@ class SubagentManager:
             return
 
         def _settle() -> None:
-            info.pending_followups = info.pending_followups[len(messages):]
+            info.pending_followups = info.pending_followups[len(messages) :]
 
         if info.user_stopped:
-            logger.info(
-                "follow_up for %s suppressed — the user stopped the run", info.id
-            )
+            logger.info("follow_up for %s suppressed — the user stopped the run", info.id)
             self._audit_followup(info, "followup_suppressed")
             _settle()
             await self._announce_followup_failure(
@@ -4171,9 +4229,7 @@ class SubagentManager:
                 break
             await asyncio.sleep(self._FOLLOWUP_BUSY_RETRY_SECS)
         if err:
-            logger.warning(
-                "follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0]
-            )
+            logger.warning("follow_up delivery for %s failed: %s", info.id, err.split(":", 1)[0])
             self._audit_followup(info, "followup_failed")
             _settle()
             # continue_conversation's typed failures are already done
@@ -4181,9 +4237,7 @@ class SubagentManager:
             if child is not None:
                 await self._announce_followup_failure(info, "", failure_info=child)
             else:
-                await self._announce_followup_failure(
-                    info, f"follow_up dispatch failed: {err}"
-                )
+                await self._announce_followup_failure(info, f"follow_up dispatch failed: {err}")
         else:
             self._audit_followup(info, "followup_dispatched")
             _settle()
@@ -4211,9 +4265,8 @@ class SubagentManager:
         label_msgs = messages if messages is not None else info.pending_followups
         synthetic = failure_info or SubagentInfo(
             id=uuid.uuid4().hex[:8],
-            task=f"[follow_up of run {info.id}] " + _redact(
-                "; ".join(m[:120] for m in label_msgs) or "queued follow-up"
-            ),
+            task=f"[follow_up of run {info.id}] "
+            + _redact("; ".join(m[:120] for m in label_msgs) or "queued follow-up"),
             done=True,
             parent_session_key=info.parent_session_key,
             error=reason,
@@ -4221,9 +4274,7 @@ class SubagentManager:
         try:
             await self._on_done(synthetic)
         except Exception:
-            logger.warning(
-                "follow_up failure announce for %s failed", info.id, exc_info=True
-            )
+            logger.warning("follow_up failure announce for %s failed", info.id, exc_info=True)
 
     def _audit_followup(self, info: SubagentInfo, outcome: str) -> None:
         try:
@@ -4247,9 +4298,7 @@ class SubagentManager:
         busy = self._conversation_busy(conv_key)
         if busy is not None:
             return False, f"conversation_busy: run {busy.id} is in flight"
-        provider_label = (
-            self._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
-        )
+        provider_label = self._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
         sid = self._sessions.forget_conversation(conv_key)
         self._conversations.pop(conv_key, None)
         # Demote the persisted source of truth too (#1115): with the disk
@@ -4757,7 +4806,9 @@ class SubagentManager:
             try:
                 await asyncio.to_thread(mark_delivered, agent_id)
             except Exception:
-                logger.debug("Failed to mark drained subagent %s delivered", agent_id, exc_info=True)
+                logger.debug(
+                    "Failed to mark drained subagent %s delivered", agent_id, exc_info=True
+                )
 
     def _settle_digest_holds(self, info: SubagentInfo) -> None:
         """Settle delivery tombstones for wave members whose injection was
@@ -5345,6 +5396,11 @@ class SubagentManager:
         # that role is unpinned the helper returns "" so we omit the kwarg and
         # keep deferring to the provider's configured default, exactly as before.
         eff_model = info.model or _subagent_default_model()
+        # Record the EFFECTIVE pin (per-spawn OR the role_models['subagent']
+        # config pin) as the requested side of the downgrade comparison — keying
+        # off the bare per-spawn ``model`` would miss a config-pinned run served a
+        # different model (Design review on #3582).
+        info.requested_model = eff_model
         if eff_model:
             extra_kwargs["model"] = eff_model
         # Sub-agent reasoning effort (per-call override -> role_efforts['subagent']
@@ -5494,8 +5550,41 @@ class SubagentManager:
         child_escalation_limit = max(turn_limit * 3, 60)
         # Reports inherited agent (not just info.agent) so telemetry shows
         # the actual agent used for this subagent session.
+        #
+        # Read back the model the live session actually resolved to serve, so
+        # the panel shows what ran rather than only what was requested (issue
+        # #3582). Best-effort at spawn: the ACP session/new response already
+        # carries the served id (readable now, even on the backend default),
+        # while the raw CC path only knows it after the first turn — so this is
+        # refreshed authoritatively at completion below. Only overwrite a prior
+        # non-empty value with another non-empty one, so a spawn-time read that
+        # succeeded is never clobbered back to "" by a transient later miss.
+        _spawn_model = _resolved_model_of(client)
+        if _spawn_model:
+            info.resolved_model = _spawn_model
+        # Persist provenance to disk BEFORE the spawn event so a gateway restart
+        # in the window between the event and the later session_id state write
+        # cannot lose it — orphan recovery reads these from disk (GPT review on
+        # #3582). Off-loop (to_thread): update_state does a synchronous fsync, so
+        # a slow FS must not freeze the gateway/heartbeat. Best-effort — a
+        # persistence hiccup must not block the spawn.
+        try:
+            await asyncio.to_thread(
+                update_state,
+                info.id,
+                requested_model=info.requested_model,
+                resolved_model=info.resolved_model,
+            )
+        except Exception:
+            logger.debug("Failed to persist model provenance for %s", info.id, exc_info=True)
         await self._fire_event(
-            "subagent_spawn", info, {"task": _redact(info.task), "agent": agent or ""}
+            "subagent_spawn",
+            info,
+            {
+                "task": _redact(info.task),
+                "agent": agent or "",
+                "model": info.resolved_model,
+            },
         )
         # Stream results to disk for orchestrated chat.
 
@@ -5516,6 +5605,11 @@ class SubagentManager:
             state_update: dict[str, object] = {
                 "session_id": session_id,
                 "provider": provider_type,
+                # Persist the resolved/requested models so orphan-recovery
+                # completions (which rebuild the record from disk, not memory)
+                # can still show provenance (Design suggestion on #3582).
+                "resolved_model": info.resolved_model,
+                "requested_model": info.requested_model,
                 # keep marks this run's session files as resume material: the
                 # orphan reconciler and tombstone pruner skip file deletion
                 # for keep runs (restart-safe — read from disk, not memory).
@@ -5572,6 +5666,13 @@ class SubagentManager:
             # intentionally identical semantics — a fix to either's activity
             # predicate or budget rules must be mirrored in the other.
             post_activity_attempts = 0
+            # Throttle-exhaustion fallback chain (agent.fallback_model):
+            # engaged only once the zero-activity budget above is spent, same
+            # trigger as stream_and_collect's Case 2.75 and the dashboard's
+            # fallback branch. State is per-run (this closure), matching
+            # "a slot/session-scoped equivalent" — the sticky marker for the
+            # session lives on the provider via TURN_FALLBACK_ATTR.
+            _fb_state = FallbackState(configured_fallback_chain())
             msg = full_message
             while True:
                 try:
@@ -5595,7 +5696,74 @@ class SubagentManager:
                             raise
                         post_activity_attempts += 1
                     elif attempts >= TRANSIENT_RETRIES:
-                        raise
+                        # ── Throttle-exhaustion fallback chain ──
+                        # Zero-activity budget spent: walk agent.fallback_model
+                        # before surfacing (empty chain ⇒ raise exactly as
+                        # before this feature). Two attempts per candidate
+                        # (FALLBACK_CANDIDATE_ATTEMPTS), ~2s backoff each —
+                        # NOT the exponential same-model curve; see
+                        # llm_helpers Case 2.75 for the rationale.
+                        if not _fb_state.chain:
+                            raise
+                        if (
+                            _fb_state.active is not None
+                            and _fb_state.attempts < FALLBACK_CANDIDATE_ATTEMPTS
+                        ):
+                            _fb_state.attempts += 1
+                        else:
+                            _cand = await advance_fallback_candidate(
+                                client,
+                                _fb_state,
+                                surface="subagent",
+                                log_suffix=f", id={info.id}",
+                            )
+                            if _cand is None:
+                                if _fb_state.walked:
+                                    _story = (
+                                        f"{_fb_state.primary or 'the selected model'} "
+                                        f"throttled; fallbacks "
+                                        f"{', '.join(_fb_state.walked)} also unavailable"
+                                    )
+                                    logger.warning(
+                                        "model fallback: chain exhausted (%s) for "
+                                        "subagent %s; surfacing original error",
+                                        _story,
+                                        info.id,
+                                    )
+                                    try:
+                                        exc._kc_fallback_story = _story  # type: ignore[attr-defined]
+                                    except Exception:
+                                        pass
+                                raise
+                        _fb_delay = transient_retry_delay(1)
+                        await self._fire_event(
+                            "subagent_retrying",
+                            info,
+                            {
+                                "attempt": _fb_state.attempts,
+                                "max": FALLBACK_CANDIDATE_ATTEMPTS,
+                                "fallback_model": _fb_state.active or "",
+                            },
+                        )
+                        try:
+                            sel().log_api_access(
+                                caller=info.parent_session_key or f"subagent:{info.id}",
+                                operation="subagent.model_fallback_retry",
+                                outcome="retrying",
+                                source="subagent",
+                                resources=(
+                                    f"subagent_id={info.id},"
+                                    f"model={_fb_state.active or ''},"
+                                    f"attempt={_fb_state.attempts}"
+                                ),
+                            )
+                        except Exception:
+                            logger.debug("SEL audit for fallback retry failed", exc_info=True)
+                        await asyncio.sleep(_fb_delay)
+                        # Zero activity by construction on this arm — replay
+                        # the original prompt, never a continuation.
+                        msg = full_message
+                        continue
                     attempts += 1
                     delay = transient_retry_delay(attempts)
                     logger.warning(
@@ -5669,6 +5837,29 @@ class SubagentManager:
             if not event.runtime_global:
                 await self._touch_activity(info)
             if event.kind == EVENT_TEXT_CHUNK:
+                # The CC/raw provider only learns its served model once the
+                # backend answers the first turn — by the first text chunk that
+                # has happened, so refresh here. Runs once (guarded on a still-
+                # empty value) and stays cheap: covers every downstream exit
+                # path (normal, turn_limit, child-escalation, cancel) without
+                # threading the live client through each. Never overwrites a good
+                # spawn-time read with "".
+                if not info.resolved_model:
+                    _live_model = _resolved_model_of(client)
+                    if _live_model:
+                        info.resolved_model = _live_model
+                        # Persist the CC-path refinement so a restart after the
+                        # first turn still recovers the served model. Off-loop
+                        # (to_thread): synchronous fsync must not block the loop
+                        # (GPT review on #3582).
+                        try:
+                            await asyncio.to_thread(
+                                update_state, info.id, resolved_model=_live_model
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to persist refined model for %s", info.id, exc_info=True
+                            )
                 result_text += event.text
                 write_result_chunk(info.id, event.text)
                 redacted = _redact(event.text)
@@ -5721,9 +5912,7 @@ class SubagentManager:
                                 error="child_escalation_limit",
                             )
                         except Exception:
-                            logger.exception(
-                                "failed to reject escalation-limit trigger request"
-                            )
+                            logger.exception("failed to reject escalation-limit trigger request")
                         info.result = result_text or "_Partial output._"
                         info.error = f"child_escalation_limit:{child_escalation_limit}"
                         info.done = True
@@ -5826,9 +6015,7 @@ class SubagentManager:
                                 approved = bool(await approve_cb(event))
                             elif _child_fallback is not None:
                                 approved = bool(
-                                    await _child_fallback(
-                                        event, info.parent_session_key
-                                    )
+                                    await _child_fallback(event, info.parent_session_key)
                                 )
                         except Exception:
                             logger.exception("child approval callback failed")
@@ -6021,6 +6208,24 @@ class SubagentManager:
 
             cleaned, _ = redact_exfiltration_urls(cleaned)
             cleaned, _ = redact_credentials(cleaned)
+        # Model-fallback visibility (agent.fallback_model): a run served by a
+        # fallback model must say so in the delivered result — same contract as
+        # the cron/heartbeat annotation and the dashboard notice card. Model
+        # ids come from config (LLM-reachable via MCP), so they pass the same
+        # redaction as the result body.
+        _fb_marker = getattr(client, TURN_FALLBACK_ATTR, None)
+        if _fb_marker:
+            try:
+                _fb_primary, _fb_candidate = _fb_marker
+                _fb_line = (
+                    f"⚠️ Model '{_fb_primary}' throttled; this run was served by "
+                    f"fallback '{_fb_candidate}'."
+                )
+                _fb_line, _ = redact_exfiltration_urls(_fb_line)
+                _fb_line, _ = redact_credentials(_fb_line)
+                cleaned = f"{_fb_line}\n\n{cleaned}" if cleaned else _fb_line
+            except Exception:
+                logger.debug("fallback annotation failed", exc_info=True)
         info.result = cleaned or "_No response._"
         # Cap disk file and trim memory — gateway decides how much to show based on mode.
         if info.result_path:
@@ -6061,10 +6266,17 @@ class SubagentManager:
             _used, _window = read_context_tokens(client)
             await persist_token_record_async(
                 session_key,
-                info.model or "",
+                # Blank while a fallback serves this run: the explicit pin
+                # would bill the fallback's spend to a model that never
+                # executed; model_source reports what actually ran.
+                ("" if provider_fallback_active(client) else (info.model or "")),
                 _complete_event,
                 provider="claude_code" if is_cc else "acp",
                 surface="subagent",
+                # Ownership stamp (see _build_token_record): an app-dispatched
+                # subagent's spend must be readable by that app's audit — the
+                # illustrator lane of an app is exactly this path.
+                app=info.app or "",
                 # Explicit/inherited `agent` FIRST here — unlike every other
                 # surface. Under session sharing this subagent reuses the
                 # PARENT's runtime, so read_effective_agent() would report the

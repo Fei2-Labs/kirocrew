@@ -630,6 +630,34 @@ class TestGitCheckoutStillWorks:
         assert info["check_status"] == "failed"
         assert info["managed_by"] == "git"
 
+    @pytest.mark.parametrize(
+        "rev_list_result",
+        [
+            (128, b""),  # rev-list itself failed
+            (0, b"garbage\n"),  # output that is not two integer counts
+        ],
+        ids=["git_failed", "unparseable"],
+    )
+    def test_an_unreadable_commit_distance_fails_the_check(
+        self, _git_install, monkeypatch, rev_list_result
+    ):
+        """A check that could not count must not answer "up to date".
+
+        The unattended auto-apply reads this verdict, so an unreadable
+        distance surfacing as ``update_available: False`` with a clean status
+        would be a silently wrong answer, and one surfacing as available
+        would offer a pull the guard never validated.
+        """
+        self._git_script(
+            monkeypatch,
+            [(0, b""), (0, b"aaaa\n"), (0, b"bbbb\n"), rev_list_result],
+        )
+        asyncio.run(updates._do_update_check())
+        info = updates.get_update_info()
+        assert info["check_status"] == "failed"
+        assert info["error_code"] == "git_read_failed"
+        assert not info["update_available"]
+
     def test_missing_upstream_is_reported_not_up_to_date(self, _git_install, monkeypatch):
         self._git_script(
             monkeypatch,

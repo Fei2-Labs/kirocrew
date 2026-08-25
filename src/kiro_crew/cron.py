@@ -53,7 +53,7 @@ from kiro_crew.constants import env_flag_enabled
 from kiro_crew.cron_history import CronHistoryStore, CronRunRecord
 from kiro_crew.executors import _CRON_QUEUE_WAIT_SECS, cron_gate_budget, subprocess_executor
 from kiro_crew.resource_status import admission_check
-from kiro_crew.validation import MAX_CRON_MESSAGE
+from kiro_crew.validation import MAX_CRON_MESSAGE, MAX_SHORT_STRING
 
 logger = logging.getLogger(__name__)
 
@@ -784,10 +784,21 @@ def _record_is_enabled(j: dict[str, Any]) -> bool:
 def _job_from_record(j: dict[str, Any]) -> CronJob:
     """Build one :class:`CronJob` from its serialized record.
 
-    Raises ``KeyError``/``TypeError``/``AttributeError`` when the record is
-    malformed (missing required keys, or not shaped like a job object at all).
-    The caller (:meth:`CronService._load`) isolates that failure to THIS entry
-    — one bad record must never discard the rest of the store (#4664).
+    Raises ``KeyError``/``TypeError`` when the record is malformed (missing
+    required keys, or not shaped like a job object at all). The caller
+    (:meth:`CronService._load`) isolates that failure to THIS entry — one bad
+    record must never discard the rest of the store (#4664).
+
+    It does NOT raise ``AttributeError`` for any record ``json.loads`` can
+    produce: every ``.get()`` below is dominated by a ``[...]`` subscript on the
+    same object, and only a ``dict`` survives a string subscript. An
+    ``AttributeError`` from this function therefore signals a defect in this
+    code, not bad data, so :meth:`CronService._load` deliberately lets it
+    propagate rather than catching it: catching it there would reclassify a
+    valid job as malformed, and because ``_save`` rewrites ``jobs[]`` from
+    ``self._jobs`` the next write would erase that job from disk permanently —
+    turning a code defect into silent, unrecoverable data loss. Letting it
+    propagate trades a loud failure at load for that silent loss.
     """
     return CronJob(
         id=j["id"],
@@ -1609,6 +1620,17 @@ class CronService:
             raise ValueError("message must be a string")
         if len(message) > MAX_CRON_MESSAGE:
             raise ValueError(f"message exceeds max length {MAX_CRON_MESSAGE}")
+        # Same chokepoint argument for the name. The dashboard POST handler
+        # caps it at MAX_SHORT_STRING via validate_string_field, but the other
+        # create surfaces (MCP cron_add, the apps SDK, the CLI) reach this
+        # constructor directly, so the cap has to live here to actually bind
+        # them. Type first: len() succeeds on a list, which would then be
+        # persisted into crons.json and only surface as a render/log failure
+        # somewhere far from the request that wrote it.
+        if not isinstance(name, str):
+            raise ValueError("name must be a string")
+        if len(name) > MAX_SHORT_STRING:
+            raise ValueError(f"name exceeds max length {MAX_SHORT_STRING}")
         if timeout_secs and not 1 <= int(timeout_secs) <= 86400:
             raise ValueError(f"timeout_secs must be within 1..86400, got {timeout_secs}")
         if timeout_secs and (command or script):
@@ -1821,6 +1843,15 @@ class CronService:
                     if kwargs["approval_mode"] not in valid_approval_modes:
                         raise ValueError(f"Invalid approval_mode: {kwargs['approval_mode']!r}")
                 # Validate before any mutations
+                if "name" in kwargs and kwargs["name"]:
+                    # Mirrors the message check below and _build_job's create-side
+                    # cap: PATCH /api/crons/{id} copied `name` into kwargs raw, so
+                    # a non-string or oversize name was persisted verbatim while
+                    # POST rejected the identical value (#3831).
+                    if not isinstance(kwargs["name"], str):
+                        raise ValueError("name must be a string")
+                    if len(kwargs["name"]) > MAX_SHORT_STRING:
+                        raise ValueError(f"name exceeds max length {MAX_SHORT_STRING}")
                 if "message" in kwargs and kwargs["message"]:
                     # Same chokepoint rationale as _build_job: every update
                     # surface (MCP, dashboard PATCH, CLI) funnels here. Type
@@ -3523,11 +3554,17 @@ class CronService:
             # well-formed job survives. The whole-store reset below is reserved
             # for a genuinely unparseable file (json.JSONDecodeError), where
             # there is nothing to salvage.
+            #
+            # The caught tuple is deliberately NARROWER than the exceptions
+            # _job_from_record can raise: KeyError and TypeError are its two
+            # bad-data signals, and AttributeError is not reachable from JSON.
+            # See _job_from_record's docstring for why, and for what catching it
+            # would cost.
             jobs: list[CronJob] = []
             for j in records:
                 try:
                     jobs.append(_job_from_record(j))
-                except (KeyError, TypeError, AttributeError) as entry_exc:
+                except (KeyError, TypeError) as entry_exc:
                     entry_id = (
                         j.get("id", "<missing id>") if isinstance(j, dict) else "<not an object>"
                     )

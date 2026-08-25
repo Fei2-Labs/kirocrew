@@ -29,6 +29,11 @@ from kiro_crew.config.loader import (
 from kiro_crew.dashboard.handlers._shared import read_capped_response
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.git_divergence import (
+    UNREADABLE_TIMEOUT,
+    DivergenceUnreadable,
+    count_divergence,
+)
 from kiro_crew.platform.update_capability import (
     CHECK_DEFERRED,
     CHECK_FAILED,
@@ -59,6 +64,7 @@ from kiro_crew.platform.update_layout import detect_install_layout
 from kiro_crew.platform.update_layout import release_channel as _release_channel
 from kiro_crew.platform.update_layout import set_release_channel, wheel_update_command
 from kiro_crew.platform.update_provider import CommandProvider, resolve_provider
+from kiro_crew.platform_compat import reexec_python_module
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -218,6 +224,12 @@ def status_update_fields() -> dict[str, object]:
         "update_can_apply": bool(_update_info.get("can_apply")),
         "update_check_status": str(_update_info.get("check_status") or CHECK_UNCHECKED),
         "update_command": remediation_command(_update_info),
+        # The candidate release's version string, so the proactive update popup
+        # can key its per-version snooze/skip without calling the check
+        # endpoint (which runs a full check per request). Empty until a check
+        # has found a newer build. The changelog text stays OFF this hot-path
+        # subset — consumers fetch it on demand.
+        "update_latest_version": str(_update_info.get("latest_version") or ""),
         "update_channel": str(_update_info.get("channel") or ""),
         # The panel needs WHO manages the update to speak honestly: a
         # command-managed host must not render the self-managed installer
@@ -653,40 +665,14 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
     # and the second is precisely the case with commits to lose. Only a checkout
     # that is behind and NOT ahead can be fast-forwarded, so only that one is
     # offered an update.
-    ahead = behind = 0
-    count = await asyncio.create_subprocess_exec(
-        "git",
-        "rev-list",
-        "--count",
-        "--left-right",
-        "HEAD...@{u}",
-        cwd=proj,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        count_out, _ = await asyncio.wait_for(count.communicate(), timeout=10)
-    except asyncio.TimeoutError:
-        try:
-            count.kill()
-        except ProcessLookupError:
-            pass
-        await count.communicate()
+    counts = await count_divergence(proj, "@{u}")
+    if isinstance(counts, DivergenceUnreadable):
+        # A check that could not count must not answer "you are on the latest
+        # version" — the unattended auto-apply reads this verdict.
+        logger.warning("Could not count commits against upstream in %s (%s)", proj, counts.reason)
         _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
         return
-    if count.returncode != 0:
-        logger.warning("Could not count commits against upstream in %s", proj)
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
-        return
-    # ``--left-right`` with the three-dot range prints "<ahead>\t<behind>": left
-    # is reachable from HEAD only, right from the upstream only.
-    try:
-        ahead_text, behind_text = count_out.decode(errors="replace").split()
-        ahead, behind = int(ahead_text), int(behind_text)
-    except ValueError:
-        logger.warning("Unparseable rev-list count in %s", proj)
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
-        return
+    ahead, behind = counts.ahead, counts.behind
     # Fast-forwardable: behind, and carrying nothing of its own to lose.
     can_fast_forward = behind > 0 and ahead == 0
 
@@ -1210,7 +1196,7 @@ async def _restart_gateway(state: DashboardState) -> None:
     sys.stdout.flush()
     sys.stderr.flush()
     await asyncio.sleep(0.5)
-    os.execv(exe, [exe, "-m", "kiro_crew"] + sys.argv[1:])
+    reexec_python_module("kiro_crew", sys.argv[1:])
 
 
 async def api_update_apply(request: web.Request) -> web.Response:
@@ -1337,32 +1323,15 @@ async def api_update_apply(request: web.Request) -> web.Response:
             },
             status=409,
         )
-    count = await asyncio.create_subprocess_exec(
-        "git",
-        "rev-list",
-        "--count",
-        "--left-right",
-        "HEAD...@{u}",
-        cwd=proj,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    try:
-        count_out, _ = await asyncio.wait_for(count.communicate(), timeout=10)
-    except asyncio.TimeoutError:
-        try:
-            count.kill()
-        except ProcessLookupError:
-            pass
-        await count.communicate()
-        return web.json_response(
-            {"error": "Timed out checking upstream distance", "code": "git_read_failed"},
-            status=500,
-        )
-    try:
-        ahead_text, behind_text = count_out.decode(errors="replace").split()
-        ahead, behind = int(ahead_text), int(behind_text)
-    except ValueError:
+    counts = await count_divergence(proj, "@{u}")
+    if isinstance(counts, DivergenceUnreadable):
+        if counts.reason == UNREADABLE_TIMEOUT:
+            return web.json_response(
+                {"error": "Timed out checking upstream distance", "code": "git_read_failed"},
+                status=500,
+            )
+        # A failed or unparseable count alike: the guard cannot read the
+        # distance, so it refuses rather than waving the pull through.
         logger.warning("Update refused: could not count commits against upstream in %s", proj)
         return web.json_response(
             {
@@ -1371,6 +1340,7 @@ async def api_update_apply(request: web.Request) -> web.Response:
             },
             status=409,
         )
+    ahead, behind = counts.ahead, counts.behind
     if ahead > 0 and behind > 0:
         logger.warning(
             "Update refused: checkout diverged from upstream (%d ahead, %d behind)", ahead, behind

@@ -156,8 +156,8 @@ def binding_key_for(session_key: str) -> str | None:
     session is not nudge-able.
 
     ``dashboard:chat-N-TS`` → bare slot key ``chat-N-TS`` (the autonudge layer
-    keys dashboard loops on the bare slot key); ``slack:``/``discord:`` session
-    keys pass through unchanged (channel-bound loops). Anything else
+    keys dashboard loops on the bare slot key); ``slack:``/``discord:``/``webex:``
+    session keys pass through unchanged (channel-bound loops). Anything else
     (``cron:``, ``hook:``, ``subagent:`` ...) is not a nudge-able session.
 
     Single source of truth shared by the ``monitor_start`` MCP tool and the
@@ -167,8 +167,8 @@ def binding_key_for(session_key: str) -> str | None:
     reason than that tuple's own exclusions. ``is_channel_key`` classifies a key's
     SHAPE; this function answers whether an arm request can be honoured, which
     additionally requires an ownership check in ``autonudge_authz`` and a fire
-    route in the gateway's ``_fire`` dispatcher — both implemented for ``slack:``
-    and ``discord:`` only. Passing a namespace through ahead of those two would
+    route in the gateway's ``_fire`` dispatcher — implemented for ``slack:``,
+    ``discord:`` and ``webex:`` only. Passing a namespace through ahead of those two would
     arm a loop that is denied at the chokepoint (or removed on its first fire
     with "unsupported channel key"), which is strictly worse than refusing it
     here: a clean "not supported from this session type" instead of a loop that
@@ -179,7 +179,7 @@ def binding_key_for(session_key: str) -> str | None:
         return None
     if session_key.startswith("dashboard:"):
         return session_key.split(":", 1)[1]
-    if session_key.startswith(("slack:", "discord:")):
+    if session_key.startswith(("slack:", "discord:", "webex:")):
         return session_key
     return None
 

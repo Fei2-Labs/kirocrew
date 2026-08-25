@@ -1770,9 +1770,7 @@ class TestDrainProviders:
         assert providers == []
 
     @pytest.mark.asyncio
-    async def test_drain_all_providers_unlinks_temp_files_from_every_queue(
-        self, cfg, tmp_path
-    ):
+    async def test_drain_all_providers_unlinks_temp_files_from_every_queue(self, cfg, tmp_path):
         img1 = tmp_path / "img1.png"
         img2 = tmp_path / "img2.png"
         img1.write_bytes(b"fake")
@@ -1836,7 +1834,9 @@ class TestRelease:
         mgr.release("nonexistent")  # should not raise
 
     @pytest.mark.asyncio
-    async def test_stray_release_after_reset_does_not_over_permit_the_replacement(self, cfg, caplog):
+    async def test_stray_release_after_reset_does_not_over_permit_the_replacement(
+        self, cfg, caplog
+    ):
         """A failure-handling caller that still holds session A's semaphore may
         call ``reset(key)`` (as ``record_failure`` does) before its own
         ``finally`` reaches ``release(key)``. ``reset`` pops the session object
@@ -1857,7 +1857,9 @@ class TestRelease:
         await mgr.reset("A")  # e.g. record_failure's circuit-breaker path
         assert "A" not in mgr._sessions  # session-1 discarded; semaphore never released
 
-        await mgr.get_or_create("A")  # a concurrent caller 2: registers session-2, holds ITS semaphore
+        await mgr.get_or_create(
+            "A"
+        )  # a concurrent caller 2: registers session-2, holds ITS semaphore
         session_2 = mgr._sessions["A"]
         assert session_2.semaphore.locked()
         mgr.release("A")  # caller 2's OWN legitimate finally, already run
@@ -2208,6 +2210,71 @@ class TestDestroy:
                 await mgr.destroy("k1")
         # finally block still runs
         mock_delete.assert_called_once_with("k1", reason="session_destroyed")
+
+
+class TestReplaySuppression:
+    """``replay=False`` is what makes discarding a conversation actually stick.
+
+    Clearing the sid stops the provider resuming its own conversation — and "the
+    provider has no history" is exactly the condition that makes the next cold
+    start rebuild one from ``conversation_log``. So the two mechanisms work
+    against each other, and the caller who wanted a fresh conversation is handed
+    a reconstruction of the old one. Measured on one app-owned session, that
+    replay was 80,359 characters, 76% of the first turn's injected context.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_does_not_suppress(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1")
+        assert (
+            mgr.consume_replay_suppression("k1") is False
+        ), "the default must leave every existing caller's behaviour alone"
+
+    @pytest.mark.asyncio
+    async def test_replay_false_suppresses_exactly_once(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1", replay=False)
+
+        assert mgr.consume_replay_suppression("k1") is True
+        assert mgr.consume_replay_suppression("k1") is False, (
+            "one-shot: a later cold start (idle expiry, gateway restart) must "
+            "re-anchor rather than stay silently amnesiac"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_later_replay_true_reset_clears_a_pending_suppression(self, cfg):
+        """Two resets in a row must not leave the first one's intent standing."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1", replay=False)
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1")
+
+        assert mgr.consume_replay_suppression("k1") is False
+
+    @pytest.mark.asyncio
+    async def test_teardown_does_not_leave_a_suppression_for_a_reused_key(self, cfg):
+        """A slot key outlives the slot that held it, and keys ARE reused.
+
+        A leaked flag would starve the NEXT holder of that key of its re-anchor —
+        so the teardown paths clear it alongside the compaction cooldown they
+        already clear, rather than leaving it to age out.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        await mgr.discard_conversation("k1", replay=False)
+
+        await mgr.remove("k1")
+
+        assert mgr.consume_replay_suppression("k1") is False
 
 
 class TestDiscardConversation:
@@ -3126,7 +3193,7 @@ class TestClaudeBackendCompaction:
         healthy REPLACEMENT for a key whose OLD session is still being torn
         down, get_or_create must reuse the replacement — not exile it and
         cold-start a duplicate provider that would overwrite and leak it."""
-        from kiro_crew.session import _Session
+        from kiro_crew.session import FirstTurnState, _Session
 
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         old_provider, _, _ = await mgr.get_or_create("k1")
@@ -3137,7 +3204,9 @@ class TestClaudeBackendCompaction:
         # already registered a fresh replacement under the same key.
         replacement_provider = AsyncMock()
         replacement_provider.shutdown = AsyncMock()
-        replacement = _Session(provider=replacement_provider, is_new=False)
+        replacement = _Session(
+            provider=replacement_provider, first_turn=FirstTurnState.NOTHING_ARMED
+        )
         mgr._sessions["k1"] = replacement
         mgr._recycling["k1"] = old_sess
         try:
@@ -3462,7 +3531,7 @@ class TestKiroInPlaceCompaction:
         """If a racing cold-start replaced the entry while the in-place
         compact was still running, the failure recycle kills only the OLD
         session; the fresh replacement (and its session_map entry) survives."""
-        from kiro_crew.session import _Session
+        from kiro_crew.session import FirstTurnState, _Session
 
         gate = asyncio.Event()
 
@@ -3498,7 +3567,9 @@ class TestKiroInPlaceCompaction:
         # A racing cold-start replaces the entry with a fresh session.
         new_provider = AsyncMock()
         new_provider.shutdown = AsyncMock()
-        mgr._sessions["k1"] = _Session(provider=new_provider, is_new=False)
+        mgr._sessions["k1"] = _Session(
+            provider=new_provider, first_turn=FirstTurnState.NOTHING_ARMED
+        )
 
         gate.set()  # compact fails -> recycle pops by identity
         await asyncio.wait_for(task, timeout=2)

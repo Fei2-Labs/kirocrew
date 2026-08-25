@@ -27,6 +27,12 @@ export interface FolderSuggestionCardProps {
  * backend offers at most one card per slot for that slot's lifetime, so
  * declining cannot be re-asked and accepting is a plain folder move the user can
  * undo from the sidebar.
+ *
+ * Answering is not the only way out: an untouched card ages out after
+ * FOLDER_SUGGESTION_MAX_TURNS of the user's own confirmed sends made while this
+ * card was on screen (chatSlice's `ageFolderSuggestion`, dispatched by the
+ * ChatPage render site), so a wrong guess costs the composer band a few turns rather
+ * than the whole session.
  */
 export default function FolderSuggestionCard({ folderName, breadcrumb, onAccept, onDecline }: FolderSuggestionCardProps) {
   // Show the breadcrumb only when it adds ancestry: for a root folder it is just

@@ -23,6 +23,7 @@ import pytest
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 _ROUTES = _APP_ROOT / "backend" / "routes.py"
@@ -759,6 +760,7 @@ class TestAdoptionRefusesAPlantedLink:
     link across, and must not leave one behind to retry.
     """
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_symlink_is_refused_and_removed(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -993,6 +995,7 @@ class TestPublishRefusesAPlantedDestinationLink:
             "counts": {"red": 0, "yellow": 1},
         }
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_link_is_replaced_not_followed(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -1126,6 +1129,7 @@ class TestPublishRefusesAPlantedSourceLink:
     direction.
     """
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_symlinked_record_is_not_published(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -1184,6 +1188,7 @@ class TestReportWritesRefusePlantedLinks:
             "generated_at": "2026-01-01T00:00:00Z",
         }
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     @pytest.mark.parametrize("name", [
         "focus-report.html", "rows.json", "report.json", "index.json",
     ])
@@ -1216,7 +1221,11 @@ class TestReportWritesRefusePlantedLinks:
             assert p.is_file(), f"{name} was not written"
             # The temp file is chmod'ed before it takes the real name, so the
             # mode must hold on the final path with no separate chmod step.
-            assert oct(p.stat().st_mode)[-3:] == "600", f"{name} is not 0600"
+            # Windows expresses the same owner-only lockdown as a DACL, which
+            # st_mode never reflects (it always reports 0o666), so the mode
+            # bits are only observable on POSIX.
+            if platform_compat.IS_POSIX:
+                assert oct(p.stat().st_mode)[-3:] == "600", f"{name} is not 0600"
         assert list(rd.glob("*.tmp")) == [], "a staging temp file survived"
 
 
@@ -1462,6 +1471,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         (rd / name).symlink_to(secret)
         return rd / name
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_html_link_is_not_read(self, tmp_path):
         from sage_lib import report
 
@@ -1469,6 +1479,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         assert link.is_file()          # the link resolves — it just must not be read
         assert report.read_within_reports(link, tmp_path, "run-r1") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_index_link_is_not_read(self, tmp_path):
         from sage_lib import report
 
@@ -1485,6 +1496,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         got = report.read_within_reports(rd / "index.json", tmp_path, "run-r2")
         assert json.loads(got or "{}")["report_slug"] == "ok"
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_read_report_refuses_a_planted_report_json(self, tmp_path):
         """The consumer, not just the helper: a plant renders as no report."""
         from sage_lib import report
@@ -1492,6 +1504,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         self._plant(tmp_path, "report.json", json.dumps({"rows": ["leak"]}))
         assert report.read_report(tmp_path, "run-r1") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_set_report_slug_does_not_merge_a_planted_index(self, tmp_path):
         from sage_lib import report
 
@@ -1647,12 +1660,14 @@ class TestResultReadsDoNotFollowAPlantedLink:
         (rd / f"{results.safe_change_id(change_id)}.json").symlink_to(target)
         return rd
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_read_result_refuses_a_planted_record(self, tmp_path):
         from sage_lib import results
 
         self._plant(tmp_path, "victim", "CR-1", {"change_id": "ATTACKER"})
         assert results.read_result("CR-1", tmp_path, "victim") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_list_results_skips_a_planted_record(self, tmp_path):
         from sage_lib import results
 
@@ -1695,6 +1710,7 @@ class TestResultReadsDoNotFollowAPlantedLink:
         store.ensure_layout(tmp_path)
         assert results.read_result("CR-NONE", tmp_path, "empty") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_the_reviewed_index_is_guarded_too(self, tmp_path):
         """It decides which PRs count as reviewed, so a swap suppresses reviews."""
         from sage_lib import results, store

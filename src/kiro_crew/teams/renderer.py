@@ -44,7 +44,6 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import OPTIONS_RE_TRAILER
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
     OutboundFile,
@@ -56,6 +55,7 @@ from kiro_crew.messaging.renderer import (
     _default_redactor,
     apply_options_cap,
     new_approval_nonce,
+    split_options_trailer,
 )
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.tables import TABLE_POLICY_CARDS
@@ -139,11 +139,6 @@ def _persisted_upload_root(session_key: str) -> str:
     return root if root and os.path.isabs(root) else ""
 
 
-# Trailing "[OPTIONS: a | b | c]" chip trailer. Defined once in constants.py
-# (shared across surfaces) so the ReDoS-hardened grammar can't drift.
-_OPTIONS_RE = OPTIONS_RE_TRAILER
-
-
 def _display_safe(text: str) -> str:
     """Redact *text* against the form Teams will RENDER (blocking; offloaded).
 
@@ -160,17 +155,11 @@ def _extract_options(text: str) -> tuple[str, list[str]]:
     """Split text into ``(body, options)`` for a trailing ``[OPTIONS:]`` chip list.
 
     Teams renders the choices as Adaptive Card actions, so the trailer is parsed
-    rather than dropped. A partial ``[OPTIONS…`` fragment (no closing ``]``) is
-    held back so it never lands as raw text.
+    rather than dropped. ``hide_partial=True`` because this renderer STREAMS a
+    progress bubble: a partial ``[OPTIONS…`` fragment is held back so reserved
+    protocol never lands as raw text, and the next frame re-renders it anyway.
     """
-    m = _OPTIONS_RE.search(text)
-    if m:
-        body = text[: m.start()].rstrip()
-        return body, [o.strip() for o in m.group(1).split("|") if o.strip()]
-    idx = text.rfind("[OPTIONS")
-    if idx != -1 and "]" not in text[idx:]:
-        return text[:idx].rstrip(), []
-    return text, []
+    return split_options_trailer(text, hide_partial=True)
 
 
 def _strip_options(text: str) -> str:
@@ -314,8 +303,13 @@ class TeamsRenderer(Renderer):
         request_id: str | int,
         tool_title: str = "",
         tool_purpose: str = "",
+        tool_input: str = "",
     ) -> None:
         """Post the Approve / Trust session / Deny card for one tool request.
+
+        ``tool_input`` is accepted and not rendered: the card already carries the
+        tool's title and purpose, and adding its arguments is a card-layout change
+        rather than something this signature widening should decide.
 
         The nonce is armed on the decider BEFORE the card is posted: a click can
         arrive as soon as the card renders, and a resolve against an un-armed

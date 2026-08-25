@@ -11,15 +11,13 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import aws_consent, platform_compat
+from kiro_crew import aws_consent, dep_sync, platform_compat
 from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES
-from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # Transcribe-path deps are an OPTIONAL 'aws' extra (amazon-transcribe + boto3).
 # The module MUST stay importable when they're absent (default install, partial
@@ -123,15 +121,16 @@ def _python3_bin_dir() -> str:
         py = platform_compat.find_python_interpreter()
         if not py:
             return ""
-        out = subprocess.check_output(
-            [py, "-c", "import sysconfig; print(sysconfig.get_path('scripts'))"],
-            timeout=5,
-            # The child re-encodes its stdout with the console code page when piped
-            # on Windows unless pinned; the decode side alone cannot fix that.
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-            **UTF8_TEXT,
-        ).strip()
-        return out
+        # Through dep_sync._probe_interpreter (-I -X utf8, neutral cwd): the
+        # probe imports sysconfig by name, so a decoy module on the caller's
+        # PYTHONPATH or CWD would otherwise shadow the stdlib and answer with
+        # whatever path it likes — steering the Whisper script search there.
+        proc = dep_sync._probe_interpreter(
+            Path(py), "import sysconfig; print(sysconfig.get_path('scripts'))", timeout=5
+        )
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.strip()
     except Exception:
         return ""
 
@@ -308,9 +307,10 @@ def _find_parakeet_mlx() -> str | None:
     # installed via `pipx` (see `_build_stt_install_script`), which always
     # puts its shim on PATH or in one of `_PARAKEET_MLX_SEARCH_PATHS` below —
     # so the probe would never find anything here, while still paying its
-    # cost: it shells out to a system Python synchronously (`subprocess.
-    # check_output`, 5s timeout) on the event loop this function runs on
-    # (dashboard GET/PUT /api/config/stt), which can stall the gateway.
+    # cost: it shells out to a system Python synchronously
+    # (`dep_sync._probe_interpreter`, 5s timeout) on the event loop this
+    # function runs on (dashboard GET/PUT /api/config/stt), which can stall
+    # the gateway.
     for p in _PARAKEET_MLX_SEARCH_PATHS:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p

@@ -85,6 +85,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: The single ceiling on live slots, owned by the module that owns the slot
+#: table (see :meth:`DashboardState.live_slot_count`). Every path that allocates
+#: a slot -- session create, chat fork, session import -- tests ``live_slot_count()``
+#: against this one number, so raising the ceiling is a single edit and no entry
+#: point can silently drift to a different limit.
+MAX_LIVE_SLOTS = 500
+
 #: Return type of a mutate_folders callback.
 _T = TypeVar("_T")
 
@@ -1479,6 +1486,101 @@ def _side_effect_reason(segment: str) -> str:
     return ""
 
 
+def _elided_shell_construct(cmd: str) -> str:
+    """Reason *cmd* carries a construct bash REMOVES but ``shlex`` keeps.
+
+    Every operand rule in this module reads `shlex.split`'s token list and
+    assumes it is the argv the program receives. Two shell constructs break that
+    assumption by DELETING words rather than rewriting them, and `shlex` has no
+    concept of either — it hands them back as ordinary tokens:
+
+        git branch injected # --list      shlex: [… 'injected', '#', '--list']
+                                          bash:  git branch injected
+        git branch injected <<< --list    shlex: [… 'injected', '<<<', '--list']
+                                          bash:  git branch injected
+
+    In both, the `--list` this module reads never reaches git. It flips
+    `_GIT_REF_LIST_FLAGS` on, the bare `injected` is reclassified from "creates a
+    ref" to "a pattern", and the segment auto-approves — while bash creates the
+    ref. Measured against real git: `git branch injected # --list`,
+    `git tag forged # --list` and `git branch injected <<< --list` each created
+    the ref, so this is a live auto-approval bypass rather than a parse curiosity.
+
+    Refused as a CLASS rather than repaired. Repairing it means deciding what
+    bash would have deleted — i.e. reimplementing shell word removal on top of
+    the quoting rules `shlex` already models differently — and an earlier
+    revision of this fix tried exactly that and reopened the bypass it closed:
+    reproducing the comment made this scanner keep going after the `#`, and a
+    lone `'` inside comment TEXT (`echo x # don't`) then leaked quote state
+    across the newline, so the next line's forged `# --list` was never removed
+    and `git branch evil # --list` auto-approved again. Refusing on the FIRST
+    hit has no "afterwards" to get wrong. A read-only command needs neither
+    construct, and a refused command falls through to the human approval prompt.
+
+    Every way this scanner can disagree with bash therefore costs a prompt
+    rather than an approval. It is deliberately wider than bash in places —
+    `str.isspace()` accepts separators bash does not (U+00A0), and ANSI-C
+    `$'…\''` quoting is not modelled — and in this direction that is a false
+    refusal, never a false approval.
+
+    Quote-aware on purpose, so it costs no ordinary read. Both constructs are
+    shell syntax only when unquoted, and the common false positives are exactly
+    the quoted and non-word-initial spellings:
+
+        grep '#include' file        `#` inside quotes is data
+        git log --grep=#123         `#` mid-word is not a comment to bash
+        grep "<div>" file           `<` inside quotes is data
+
+    A backslash escape is honoured for the same reason (`grep \\# file`).
+
+    Two costs, stated rather than hidden, and asserted in the tests:
+
+    * An ordinary trailing comment is refused (`git status # note`,
+      `ls -la # list files`). Agent-emitted bash carries one often, so this is
+      the larger everyday cost of the two — a real auto-approve-rate loss, taken
+      knowingly because the alternative above is a live bypass.
+    * An unquoted input redirect is refused even where it is genuinely harmless
+      (`wc -l < file`, `grep pattern < file`), since what makes it dangerous is
+      the token-list divergence, not the direction of the data.
+    """
+    quote: str | None = None
+    # Start-of-string counts as a word boundary: bash reads a leading `#` as a
+    # comment, so `# git status` is an empty command rather than a read.
+    at_word_start = True
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if quote is not None:
+            # Inside double quotes a backslash still escapes; inside single
+            # quotes it is literal, exactly as a shell reads it.
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            at_word_start = False
+            continue
+        if ch == "\\" and i + 1 < n:
+            # An escaped character is data, including an escaped `#` or `<`.
+            i += 2
+            at_word_start = False
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            at_word_start = False
+            continue
+        if ch == "#" and at_word_start:
+            return "a comment deletes the rest of the line, which `shlex` keeps"
+        if ch == "<":
+            return "an input redirect removes words that `shlex` keeps"
+        at_word_start = ch.isspace()
+        i += 1
+    return ""
+
+
 def _classify_bash(cmd: str) -> str:
     """Single source of truth for read-only bash classification.
 
@@ -1490,6 +1592,13 @@ def _classify_bash(cmd: str) -> str:
     """
     if not cmd.strip():
         return "empty command"
+    # Runs on the RAW command, before any splitting: a comment elides to the end
+    # of the line regardless of the `&&` / `;` boundaries the regex split below
+    # believes in, so `git status && git branch injected # --list` has to be
+    # caught here rather than per-segment.
+    elided = _elided_shell_construct(cmd)
+    if elided:
+        return f"unsafe shell pattern: {elided}"
     # Strip discard-only redirects (output sinks / stderr-merge) before the
     # unsafe-shell check; they are read-only but contain '>' / '&'.
     scrubbed = _DEVNULL_REDIR_RE.sub(" ", cmd)
@@ -2562,6 +2671,13 @@ class _ChatSlot:
         "_tool_stall_retries",
         "_tool_stall_exhausted_emitted",
         "_transient_5xx_retries",
+        "_fallback_candidate_idx",
+        "_fallback_walked",
+        "_active_fallback_model",
+        "_fallback_primary_model",
+        "_fallback_slot_model",
+        "_model_pick_gen",
+        "_fallback_pick_gen",
         "_posttoken_retry_used",
         "_prestream_exhausted_cycles",
         "_poisoned_reset_used",
@@ -2587,6 +2703,7 @@ class _ChatSlot:
         "_lock",
         "forked_from",
         "_fork_lock",
+        "_model_pick_lock",
         "_tab_id",
         "_channel_window_mtime",
         "_disk_older_count",
@@ -2877,6 +2994,33 @@ class _ChatSlot:
         # ConnectionReset) retries on the interactive stream path. Distinct
         # budget from prompt-busy / pipe-death; reset on a completed turn.
         self._transient_5xx_retries: int = 0
+        # Throttle-exhaustion model-fallback walk state (agent.fallback_model).
+        # _fallback_candidate_idx / _fallback_walked are PER-CYCLE (next chain
+        # position to try + candidates already tried this logical turn, for the
+        # chain-exhausted error story); both reset with the other retry budgets
+        # on a landed turn. _active_fallback_model / _fallback_primary_model are
+        # STICKY session state: set when a fallback swap lands, kept across
+        # turns until the start-of-turn restore probe moves the session back to
+        # the primary (deliberately NOT reset on turn completion).
+        self._fallback_candidate_idx: int = 0
+        self._fallback_walked: list[str] = []
+        self._active_fallback_model: str = ""
+        self._fallback_primary_model: str = ""
+        # Snapshot of slot.model taken when the fallback activated, used to heal
+        # slot.model if the automatic provider backfill wrote the fallback id
+        # into an empty slot while the fallback was active (slot.model is
+        # re-sent as a set_model override on resume, so leaving the fallback
+        # there would re-pin it after the primary recovered).
+        self._fallback_slot_model: str = ""
+        # Explicit model-pick generation. Bumped ONLY by the explicit set-model
+        # surfaces (single-slot pick, bulk switch, provider-switch clear) —
+        # never by the automatic provider backfill — so the fallback restore
+        # probe can tell a genuine user pick (drop sticky state, never
+        # override) from the backfill writing the served fallback into an
+        # unpinned slot (heal and restore). _fallback_pick_gen is the value
+        # snapshotted when the fallback activated.
+        self._model_pick_gen: int = 0
+        self._fallback_pick_gen: int = 0
         # One-shot guard for the post-token (text-only) transient retry: a turn
         # that has already streamed answer tokens may be re-prompted at most
         # ONCE on a transient 5xx (and only when no tool call fired). Reset on a
@@ -2969,6 +3113,12 @@ class _ChatSlot:
         self._lock = asyncio.Lock()
         self.forked_from: str | None = None  # parent slot key if this is a fork
         self._fork_lock: asyncio.Lock = asyncio.Lock()  # serialises concurrent forks on this slot
+        # Serialises explicit model-pick transactions (check → mutate → live
+        # switch → rollback) on this slot: picks interleaving at the set_model
+        # await could otherwise roll back each other's state. Deliberately NOT
+        # slot._lock, which guards message-window edits and must not be held
+        # across a multi-second network await.
+        self._model_pick_lock: asyncio.Lock = asyncio.Lock()
         self._tab_id: str = ""  # permanent tab identity for cross-restart session chaining
         # Transcript mtime the in-memory window was last brought up to date
         # against. Only meaningful for a slot bound to a channel session, whose
@@ -3650,7 +3800,7 @@ class _ChatSlot:
         self._deferred_notes.clear()
         live_session = effective_session_key(self)
         written = 0
-        for note in held:
+        for _idx, note in enumerate(held):
             # A held note carries the session it was authorized against. An
             # unbound slot can acquire a foreign binding while the note waits
             # (a cron result or workflow injection claims an empty
@@ -3680,17 +3830,30 @@ class _ChatSlot:
             # drain runs inside the turn: an entry queued while that turn was
             # starting is consumed by it, so the note shapes the request it was
             # written after and the next turn never sees it at all.
-            ctx = note.get("context")
-            if ctx is not None:
-                ctx["noteSession"] = live_session
-                self.append_pending_context(ctx)
-            self.append(
-                role="inject",
-                content=note["content"],
-                cls=note["cls"],
-                broadcast=True,
-                meta={"noteSession": live_session},
-            )
+            # Popped rather than read: the two halves are written in sequence, so
+            # if the visible line below raises after this succeeded, the retry
+            # this note is restored for must not queue the context a second time.
+            ctx = note.pop("context", None)
+            try:
+                if ctx is not None:
+                    ctx["noteSession"] = live_session
+                    self.append_pending_context(ctx)
+                self.append(
+                    role="inject",
+                    content=note["content"],
+                    cls=note["cls"],
+                    broadcast=True,
+                    meta={"noteSession": live_session},
+                )
+            except Exception:
+                # The list was cleared above, and ``held`` is a local -- so an
+                # unwritten note dies with this frame unless it is put back.
+                # Restore this note and everything after it, AHEAD of anything
+                # queued since (they are older), then let the raise reach the
+                # caller's guard: every seam logs it and carries on, and the next
+                # seam retries these. Delivery is delayed, never lost.
+                self._deferred_notes[:0] = held[_idx:]
+                raise
             written += 1
         return written
 
@@ -4655,6 +4818,10 @@ class DashboardState:
         self._context_snapshots_flush_lock = threading.Lock()
         self._folders: list[dict[str, Any]] = []  # project folder definitions
         self._cron_folders: list[dict[str, Any]] = []  # cron job folder groupings
+        # Malformed cron_folders.json entries dropped at load time, kept verbatim
+        # so save_cron_folders round-trips them back instead of erasing bytes it
+        # could not parse (mirrors the hooks store's unparsed-entry preservation).
+        self._unparsed_cron_folder_entries: list[Any] = []
         self._chat_pins: list[dict[str, Any]] = []  # pinned chat messages
         # Serializes pin mutation + persistence so concurrent requests cannot
         # interleave snapshots and replace chat_pins.json out of order.
@@ -4766,6 +4933,40 @@ class DashboardState:
     def get_channel_transport(self, channel_type: str) -> "MessagingTransport | None":
         """Return the registered transport for *channel_type*, or None."""
         return self.channel_transports.get(channel_type)
+
+    def channel_status(self) -> dict[str, dict[str, Any]]:
+        """Per-channel ``{connected, error}``, keyed by ``channel_type``.
+
+        Read off the same ``<channel>_connected`` / ``<channel>_connect_error``
+        attributes each channel's own settings endpoint reports, so one page cannot
+        disagree with another about whether a channel came up. A channel with no
+        attributes yet reads as not connected with no reason, which is the honest
+        answer for one that never started.
+
+        The error string is bounded here as well as at each settings endpoint: this
+        payload is polled, and a channel that reconnects in a loop would otherwise
+        publish an unbounded reason on every tick.
+        """
+        # Imported here rather than at module scope: `channels` imports every
+        # channel package, and those import this module through the gateway.
+        try:
+            from kiro_crew.channels import builtin_channel_descriptors
+
+            names = [d.channel_type for d in builtin_channel_descriptors()]
+        except Exception:
+            logger.debug("channel status: roster unavailable", exc_info=True)
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for name in names:
+            if name == "slack":
+                connected = self.slack_client is not None and self.slack_socket_connected
+            else:
+                connected = bool(getattr(self, f"{name}_connected", False))
+            out[name] = {
+                "connected": connected,
+                "error": str(getattr(self, f"{name}_connect_error", ""))[:120],
+            }
+        return out
 
     def wire_session_compact_callback(self) -> None:
         """Register the dashboard's compaction callback on the session manager."""
@@ -5033,6 +5234,7 @@ class DashboardState:
         update_can_apply: bool = False,
         update_check_status: str = "unchecked",
         update_command: str = "",
+        update_latest_version: str = "",
         update_channel: str = "",
         update_managed_by: str = "",
         update_commits_ahead: int = 0,
@@ -5069,6 +5271,11 @@ class DashboardState:
             # user on something actionable. Deriving it only from a manual check
             # left the badge pointing at an Update button that 409s.
             "update_command": update_command,
+            # The candidate release's version string ("" until a check finds a
+            # newer build). The proactive update popup keys its per-version
+            # snooze/skip on this, so it rides the hot-path subset; the
+            # changelog text deliberately does not.
+            "update_latest_version": update_latest_version,
             # The release channel this INSTALL follows (the ``channel`` file
             # cli.sh wrote), empty when the layout has no channel at all (a git
             # checkout tracks a remote; a desktop bundle or container is updated
@@ -5112,6 +5319,13 @@ class DashboardState:
             # gateway records after _connect_slack. This is the same field
             # /api/slack/config already reports to the settings badge.
             "slack_connected": (self.slack_client is not None and self.slack_socket_connected),
+            # Every OTHER channel's live state, from the same flags each channel's
+            # settings badge reads. Only `slack_connected` reached this payload
+            # before, so System > Services was silent about a Telegram or Discord
+            # channel that failed to start — the operator saw a healthy page and a
+            # bot that never answered. Derived by roster loop, so the next channel
+            # is covered without touching this dict.
+            "channels": self.channel_status(),
             # Governance enforcement health: "active" (enforcing),
             # "disabled" (permissive default / not restricting), "degraded" (a
             # fail-closed trip, integrity mismatch, or unverified policy this
@@ -6796,10 +7010,13 @@ class DashboardState:
         """Load cron folder definitions from disk.
 
         Validates the loaded shape: the file must contain a JSON array of
-        folder objects. Anything else (a hand-edited ``{}``, a string, or
-        malformed entries) is discarded with a warning instead of being
-        assigned verbatim — a non-list value would flow to the frontend
-        and crash grouping (``folders.map is not a function``).
+        folder objects. A non-list root (a hand-edited ``{}``, a string) is
+        ignored wholesale — it would crash frontend grouping
+        (``folders.map is not a function``). Individual malformed entries are
+        dropped from the active list but kept verbatim in
+        ``_unparsed_cron_folder_entries`` so the next ``save_cron_folders``
+        round-trips them back to disk rather than silently erasing a user's
+        hand-edited-but-typo'd folder (mirrors the hooks store's contract).
         """
         path = config_dir() / self._CRON_FOLDERS_FILE
         try:
@@ -6812,35 +7029,45 @@ class DashboardState:
                         type(loaded).__name__,
                     )
                     return
-                valid = [
-                    f
-                    for f in loaded
-                    if isinstance(f, dict)
-                    and isinstance(f.get("id"), str)
-                    and f.get("id")
-                    and isinstance(f.get("name"), str)
-                    and f.get("name")
-                    and isinstance(f.get("order"), (int, float))
-                    and not isinstance(f.get("order"), bool)
-                ]
-                if len(valid) != len(loaded):
+
+                def _is_valid(f: Any) -> bool:
+                    return (
+                        isinstance(f, dict)
+                        and isinstance(f.get("id"), str)
+                        and bool(f.get("id"))
+                        and isinstance(f.get("name"), str)
+                        and bool(f.get("name"))
+                        and isinstance(f.get("order"), (int, float))
+                        and not isinstance(f.get("order"), bool)
+                    )
+
+                valid = [f for f in loaded if _is_valid(f)]
+                unparsed = [f for f in loaded if not _is_valid(f)]
+                if unparsed:
                     logger.warning(
-                        "Dropped %d malformed entr(ies) while loading %s",
-                        len(loaded) - len(valid),
+                        "Preserving %d malformed entr(ies) while loading %s "
+                        "(kept verbatim, not active)",
+                        len(unparsed),
                         self._CRON_FOLDERS_FILE,
                     )
                 self._cron_folders = valid
+                self._unparsed_cron_folder_entries = unparsed
         except Exception:
             logger.warning("Failed to load cron folders", exc_info=True)
 
     def save_cron_folders(self) -> None:
         """Persist cron folder definitions to disk (atomic write).
 
-        Raises on I/O failure so callers can surface a 500 to the client
-        rather than silently losing the write.
+        Writes the active folders plus any malformed entries preserved at load
+        time (``_unparsed_cron_folder_entries``), so a save triggered by an
+        unrelated folder operation cannot erase bytes a hand-edit left in a
+        shape this loader could not validate. Raises on I/O failure so callers
+        can surface a 500 to the client rather than silently losing the write.
         """
         path = config_dir() / self._CRON_FOLDERS_FILE
-        self._atomic_write_json_strict(path, self._cron_folders)
+        unparsed = getattr(self, "_unparsed_cron_folder_entries", [])
+        payload: list[Any] = [*self._cron_folders, *unparsed]
+        self._atomic_write_json_strict(path, payload)
 
     def create_cron_folder(self, name: str, folder_id: str) -> dict:
         """Create a new cron folder and persist.

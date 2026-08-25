@@ -630,7 +630,7 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().folderSuggestions[ACTIVE]).toEqual({
-      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12,
+      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12, turns: 0,
     })
 
     act(() => {

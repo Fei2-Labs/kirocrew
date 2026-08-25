@@ -8,6 +8,7 @@ import logging
 import threading
 from collections import defaultdict
 from datetime import datetime
+from typing import Any
 from uuid import uuid4
 
 try:
@@ -16,6 +17,71 @@ except ImportError:
     import sqlite3
 
 logger = logging.getLogger(__name__)
+
+
+class KnowledgeBundleError(ValueError):
+    """A bundle value would commit a corrupt JSON column.
+
+    Raised by :meth:`KnowledgeStore.import_bundle` before any INSERT binds a
+    ``sources.properties`` / ``entities.aliases`` value that is not the JSON
+    text every reader ``json.loads()`` back.  The dashboard import handler is
+    the store's only production caller today; the invariant lives here, with
+    the writer, so any future caller (an MCP tool, a CLI import, an app
+    backend) is safe by construction instead of depending on one HTTP path's
+    pre-validation.
+    """
+
+
+def _validated_json_column(value: object, *, field: str, default: str,
+                           shape: type, shape_name: str) -> tuple[str, Any]:
+    """Return ``(text, parsed)`` to bind for a store JSON column, or raise.
+
+    ``None`` (and an absent key, which callers pass as ``None``) falls back
+    to ``default`` -- the same value the column's schema DEFAULT would
+    supply.  Anything present must be JSON text whose parsed value is a
+    ``shape`` instance: several readers parse the raw column with
+    ``json.loads()`` and no shape guard (source detail handlers index the
+    parsed dict; ``find_entity()`` calls ``.lower()`` on each parsed alias),
+    so a non-string, an empty string, or the wrong parsed shape commits a
+    row that crashes a later, unrelated read.  ``json.loads`` raises
+    ``RecursionError`` (not ``ValueError``) on deeply nested input, so it
+    is caught alongside.  A lone-surrogate escape (``"\\ud800"``) in the
+    outer request JSON decodes to text that ``json.loads`` accepts but the
+    SQLite driver cannot UTF-8-encode at bind time, so encodability is
+    checked here too -- otherwise the bind raises ``UnicodeEncodeError``
+    past the typed-error contract.
+    """
+    if value is None:
+        return default, shape()
+    if not isinstance(value, str):
+        raise KnowledgeBundleError(f"'{field}' must be a JSON {shape_name} string or null")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise KnowledgeBundleError(f"'{field}' must be valid UTF-8 text") from None
+    try:
+        parsed = json.loads(value)
+    except (ValueError, RecursionError):
+        raise KnowledgeBundleError(f"'{field}' must be valid JSON") from None
+    if not isinstance(parsed, shape):
+        raise KnowledgeBundleError(f"'{field}' must be a JSON {shape_name}")
+    return value, parsed
+
+
+def _validated_properties(value: object) -> str:
+    """``sources.properties``: JSON text parsing to an object, or NULL."""
+    text, _ = _validated_json_column(
+        value, field="sources.properties", default="{}", shape=dict, shape_name="object")
+    return text
+
+
+def _validated_aliases(value: object) -> str:
+    """``entities.aliases``: JSON text parsing to an array of strings, or NULL."""
+    text, parsed = _validated_json_column(
+        value, field="entities.aliases", default="[]", shape=list, shape_name="array")
+    if not all(isinstance(alias, str) for alias in parsed):
+        raise KnowledgeBundleError("'entities.aliases' must be a JSON array of strings")
+    return text
 
 
 class _NodeView:
@@ -1420,6 +1486,7 @@ class KnowledgeStore:
             return {}
         mentions = self.db.execute("SELECT entity_id FROM mentions WHERE item_id = ?", (item_id,)).fetchall()
         entity_ids = [m["entity_id"] for m in mentions]
+        entity_id_set = set(entity_ids)
         entities = []
         for eid in entity_ids:
             row = self.db.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
@@ -1431,12 +1498,38 @@ class KnowledgeStore:
             for row in self.db.execute(
                     "SELECT * FROM entity_relations WHERE source_id = ? OR target_id = ?", (eid, eid)):
                 r = dict(row)
-                if r["id"] not in seen_ids:
-                    seen_ids.add(r["id"])
-                    relations.append(r)
+                if r["id"] in seen_ids:
+                    continue
+                # A relation whose OTHER endpoint isn't among this item's
+                # mentioned entities, or that was recorded under a different
+                # item's observation (source_item_id), would re-import
+                # referencing an entity/item this single-item bundle never
+                # carries -- an FK violation on the receiving end. Only keep
+                # relations fully contained in what this bundle exports.
+                if r["source_id"] not in entity_id_set or r["target_id"] not in entity_id_set:
+                    continue
+                if r["source_item_id"] not in (None, item_id):
+                    continue
+                seen_ids.add(r["id"])
+                relations.append(r)
         locations = [dict(r) for r in self.db.execute(
             "SELECT * FROM source_locations WHERE item_id = ?", (item_id,))]
-        return {"item": item, "entities": entities, "relations": relations, "source_locations": locations}
+        mentions = [dict(r) for r in self.db.execute(
+            "SELECT * FROM mentions WHERE item_id = ?", (item_id,))]
+        source_ids = {sid for sid in (item.get("source_id"), *(loc["source_id"] for loc in locations)) if sid}
+        sources = []
+        for sid in source_ids:
+            row = self.db.execute("SELECT * FROM sources WHERE id = ?", (sid,)).fetchone()
+            if row:
+                sources.append(dict(row))
+        return {
+            "items": [item],
+            "sources": sources,
+            "entities": entities,
+            "relations": relations,
+            "source_locations": locations,
+            "mentions": mentions,
+        }
 
     def export_all(self, namespace: str | None = None) -> dict:
         if namespace:
@@ -1482,7 +1575,8 @@ class KnowledgeStore:
                     "INSERT OR IGNORE INTO sources (id, name, source_type, uri, properties, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (src["id"], src["name"], src["source_type"], src["uri"],
-                     src.get("properties", "{}"), src.get("created_at", now), now))
+                     _validated_properties(src.get("properties")),
+                     src.get("created_at", now), now))
             for item in bundle.get("items", []):
                 raw_emb = item.get("embedding")
                 if isinstance(raw_emb, str) and raw_emb:
@@ -1509,7 +1603,8 @@ class KnowledgeStore:
                     "INSERT OR IGNORE INTO entities (id, name, entity_type, description, aliases, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (ent["id"], ent["name"], ent["entity_type"], ent.get("description"),
-                     ent.get("aliases", "[]"), ent.get("created_at", now), now))
+                     _validated_aliases(ent.get("aliases")),
+                     ent.get("created_at", now), now))
                 if cursor.rowcount > 0:
                     entities_created += 1
             for rel in bundle.get("relations", []):

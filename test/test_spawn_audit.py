@@ -699,6 +699,11 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # fixed-argv helper, _probe_interpreter, which is where their single
         # spawn now lives: `<target python> -I -X utf8 -c <fixed probe>` with a
         # neutral cwd, so the answer describes the venv instead of the caller.
+        # The doctor's venv deps check (cli_doctor._venv_deps_ok) and the STT
+        # scripts-dir probe (transcribe._python3_bin_dir) route through the
+        # same helper for the same reason: their argv is equally fixed, and an
+        # unisolated `python -c` would let a decoy on the caller's
+        # PYTHONPATH/CWD answer for the interpreter under test.
         "dep_sync.py::_probe_interpreter",
         "dep_sync.py::sync",
         "dep_sync.py::sync_or_reinstall",
@@ -769,13 +774,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # classification as ``cli_doctor.py::_doctor`` above.
         "cli_doctor.py::_discord_intent_grants",
         "cli_doctor.py::_doctor_mcp_tools",
-        # Read-only diagnostic for the KAS backend section: ``<kiro-cli> acp
-        # --help`` with a fully constant argv tail — the binary comes from
-        # ``shutil.which(KIRO_CLI_BIN)`` (a fixed name, never agent-supplied)
-        # and the two trailing tokens are module constants. Operator-invoked
-        # doctor, 15s-capped, help text only — no session, no mutation. Same
-        # classification as the other fixed-argv doctor probes.
-        "cli_doctor.py::_kas_engine_flag_supported",
         # Read-only diagnostic for the Source Checkout section: ``git -C <repo>
         # rev-parse/rev-list`` with a hardcoded argv whose only variable is the
         # install's own source directory (derived from the package's module
@@ -808,15 +806,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli_server.py::_logs_cmd",
         "cli_server.py::_spawn_detached_gateway",
         "cli_server.py::_update",
-        # Nested helper inside ``_update``, keyed separately because the audit
-        # keys by function name. Same class as its enclosing function, already
-        # allowlisted above: a read-only ``git rev-list --count --left-right
-        # HEAD...origin/<branch>`` on the install's own checkout, run on the
-        # one-shot ``kirocrew update`` path. Fixed argv with no shell; the only
-        # interpolated value is the branch name ``git rev-parse --abbrev-ref
-        # HEAD`` just reported, and it sits after the ``origin/`` prefix so it
-        # cannot become an option. Nothing agent-supplied, nothing written.
-        "cli_server.py::_divergence_verdict",
+        # The agent-only config refresh extracted from _update: a fixed argv
+        # (`<this interpreter> -m kiro_crew setup --agent-only`) built from
+        # sys.executable plus literals, cwd from the detected install layout —
+        # no shell, no PATH lookup, nothing agent-influenced. stdin=DEVNULL
+        # and TimeoutExpired handling are pinned by
+        # test_update_agent_refresh.py.
+        "cli_server.py::_refresh_agent_config",
+        # (_divergence_verdict removed — its counting now delegates to the
+        # git_divergence module, allowlisted below, and spawns nothing itself.)
         "cli_server.py::_update_wheel",
         "cli_setup.py::_setup_electron",
         # Cursor Motion overlay renderer: `<this interpreter> -m
@@ -950,6 +948,20 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "frontend.py::_npm_build_and_stage_locked",
         "frontend.py::build_frontend_async",
         "frontend.py::build_frontend_sync",
+        # The shared ahead/behind divergence count: a read-only ``git rev-list
+        # --count --left-right HEAD...<upstream>`` fixed list-argv (no shell)
+        # run against the install's own checkout. Callers pass the repo path
+        # (KIROCREW_PROJECT_DIR, an operator environment value) and the
+        # upstream spelling — a literal ``@{u}`` or ``origin/<branch>`` where
+        # <branch> is git's own ``rev-parse --abbrev-ref HEAD`` output sitting
+        # after the ``origin/`` prefix so it cannot become an option. Nothing
+        # agent-supplied, nothing written; same trust profile as the update
+        # surfaces it serves (``_check_git_checkout`` / ``api_update_apply`` /
+        # ``_update`` above). The papyrus status caller does NOT spawn through
+        # these: it reuses only the argv/parse primitives and keeps its own
+        # sandbox-routed runner.
+        "git_divergence.py::count_divergence",
+        "git_divergence.py::count_divergence_sync",
         "instances/diagnostics.py::_run_ok",
         "instances/diagnostics.py::_run_stdout",
         "instances/ssh_tunnel_manager.py::start",
@@ -969,13 +981,16 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",
         "mcp_gateway/stub.py::main",
-        # Read-only `git config` / `git ls-remote --get-url` resolving which
-        # remote the update would fetch from, for the `updates.source` pin. Fixed
-        # list-argv (no shell=True), no agent input: the branch lands mid-key
+        # The update seam's one read-only git chokepoint: `git config` (the
+        # `updates.source` pin's remote, the repo-driver probe, and which remote a
+        # branch tracks) and `git ls-remote --get-url`. Fixed list-argv (no
+        # shell=True), no agent input: the branch lands mid-key
         # (`branch.<x>.remote`) so it cannot lead with a dash, and the remote
         # name — which is read out of git config and COULD — is passed after
         # `--`. Must NOT be sandboxed: it reads the real checkout's git metadata.
-        "platform/update_governance.py::_git",
+        # It does carry `git_neutralizer_env()`, so repo config cannot make these
+        # reads exec a program (`core.fsmonitor` and friends are pinned).
+        "platform/update_governance.py::_git_probe",
         # Read-only `git rev-parse --show-toplevel` deciding whether the install
         # root IS a working tree. Fixed list-argv (no shell=True); the only
         # variable is the path, which comes from KIROCREW_PROJECT_DIR — an
@@ -1040,7 +1055,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "pod/provision.py::_run",
         "pod/runtime.py::_git_worktrees",
         "pod/runtime.py::_run",
-        "pod/runtime.py::derive_port",
         "pod/runtime.py::recent_journal",
         "sandbox.py::_probe_sandbox_exec",
         "sandbox.py::_ssh_supports_accept_new",
@@ -1136,7 +1150,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apple_speech/__init__.py::inventory",
         "apple_speech/__init__.py::start",
         "apple_speech/__init__.py::transcribe",
-        "transcribe.py::_python3_bin_dir",
+        # (`transcribe.py::_python3_bin_dir` is absent: its scripts-dir probe
+        # routes through `dep_sync.py::_probe_interpreter`, so an entry here
+        # would be stale.)
         "transcribe.py::_run_whisper_cli",
         "transcribe.py::_transcribe_aws",
         # JSON-Schema ``pattern`` validation for MCP app→gateway tool-call args

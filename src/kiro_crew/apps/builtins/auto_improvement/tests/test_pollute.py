@@ -287,7 +287,9 @@ class TestTheGateFailsLoudlyRatherThanSilently:
             after = pollute.snapshot([watched])
             assert pollute.diff(before, after) == [str(watched)]
         finally:
-            secret.chmod(0o600)  # so tmp_path cleanup can remove it
+            # lockdown-ok: not a lockdown -- WIDENS 0o000 back so tmp_path cleanup can
+            # unlink it, and the payload is a fake b"leaked" literal, not a secret.
+            secret.chmod(0o600)  # lockdown-ok: widens for cleanup; see above
 
     def test_diff_is_order_independent_and_reports_both_directions(self) -> None:
         """Keyed by path, so a reordered path list cannot change the verdict; and a key

@@ -337,6 +337,31 @@ def coerce_role_efforts(raw: object) -> dict[str, str]:
     return out
 
 
+def coerce_fallback_model(raw: object) -> str:
+    """Normalize the throttle-fallback model (agent.fallback_model).
+
+    Single value with three shapes: ``"auto"`` (the default — defer to the
+    backend's availability-aware routing when the active model stays
+    throttled), ``""`` (feature explicitly disabled: fail loudly, pre-feature
+    behavior), or a concrete model id normalized through
+    :func:`model_registry.to_provider_id` for the ``acp`` provider (registry
+    canonical keys and aliases land as the kiro-cli id the wire needs;
+    unregistered ids pass through unchanged — existing registry behavior).
+    Absent/junk input (``None``, non-string) collapses to the ``"auto"``
+    default. ``"auto"`` is matched case-insensitively; an unregistered id that
+    the registry maps to ``""`` also collapses to ``"auto"`` rather than
+    silently disabling the feature.
+    """
+    if raw is None or not isinstance(raw, str):
+        return "auto"
+    s = raw.strip()
+    if not s:
+        return ""
+    if s.lower() == "auto":
+        return "auto"
+    return model_registry.to_provider_id(s, "acp") or "auto"
+
+
 _DEFAULT_PORT = 5476
 
 # KIROCREW_PORT is validated at CLI entry (cli.py main()).
@@ -899,10 +924,12 @@ def update_config_locked(
 
     The locked primitive for the converted config.json writers and the required
     path for new config.json mutations.  Legacy writers that pre-date this
-    function (dashboard agents endpoint, updates.py, memory.py, security.py,
+    function (dashboard agents endpoint, updates.py, security.py,
     messaging.py, mcp.py, core.py STT) still use
     :func:`write_config_atomically` directly and rely on the in-process asyncio
-    ``_get_config_lock()`` only.
+    ``_get_config_lock()`` only.  ``memory.py`` was in that list and has been
+    converted; it now reaches this function through
+    ``dashboard/chat_utils.run_config_write``.
 
     Contract:
 
@@ -1364,6 +1391,21 @@ class AgentConfig:
             "(keys: 'background', 'subagent'). Empty for a role inherits the chat "
             "default (agent.reasoning_effort) and then the provider/model default. "
             "Only applies on reasoning-capable models.",
+        ),
+    )
+    fallback_model: str = field(
+        default="auto",
+        metadata=_meta(
+            "Fallback model",
+            "Model tried when the active model's transient-retry budget is "
+            "exhausted (throttle/capacity). Default 'auto' defers to the "
+            "backend's availability-aware routing; a concrete model id (as "
+            "advertised by the provider, e.g. 'claude-opus-4.8') is tried "
+            "first with 'auto' as the final fallthrough; empty ('') disables "
+            "fallback entirely (fail loudly, pre-feature behavior). A fallback "
+            "swap is announced in chat, sticks until the primary recovers, and "
+            "the serving model is recorded in every turn's stats — never "
+            "silent.",
         ),
     )
     reasoning_effort: str = field(
@@ -1870,6 +1912,9 @@ class AgentConfig:
         # feeds coerced input.
         self.role_models = coerce_role_models(self.role_models)
         self.role_efforts = coerce_role_efforts(self.role_efforts)
+        # Same defensive coercion for the throttle-fallback model: normalize to
+        # ""/"auto"/acp id, so consumers can trust the stored shape.
+        self.fallback_model = coerce_fallback_model(self.fallback_model)
 
     def resolve_model(self, role: str) -> str:
         """Effective model id for a task ``role`` — INDEPENDENT of the chat model.
@@ -2681,6 +2726,18 @@ class TailscaleConfig:
             "effect on the next gateway start.",
         ),
     )
+    keep_awake: bool = field(
+        default=True,
+        metadata=_meta(
+            "Keep Awake While Published",
+            "Keep this machine's SYSTEM awake while the dashboard is published "
+            "on the tailnet, so a phone does not lose the dashboard when the "
+            "laptop idles. The display is still allowed to sleep. Publishing is "
+            "the opt-in — this exists to opt back OUT of the awake half without "
+            "unpublishing. Independent of dashboard.prevent_sleep, which keeps "
+            "the host awake only while a turn is in flight.",
+        ),
+    )
 
 
 def _tailscale_config_from(raw: object) -> TailscaleConfig:
@@ -2724,6 +2781,7 @@ def _tailscale_config_from(raw: object) -> TailscaleConfig:
         trust_identity=trust_identity,
         allowed_logins=allowed_logins,
         pin_scope=pin_scope,
+        keep_awake=_safe_bool(data.get("keep_awake"), True),
     )
 
 
@@ -2775,6 +2833,22 @@ class DashboardConfig:
         metadata=_meta(
             "Restore Sessions",
             "Re-open recently active sessions on startup.",
+        ),
+    )
+    qr_session_until_restart: bool = field(
+        default=True,
+        metadata=_meta(
+            "Phone Sign-In Lasts Until Restart",
+            "Keep a phone signed in for as long as this gateway process runs. "
+            "The QR code still has to be scanned within its short window; after "
+            "that the phone is not signed out for being idle in ordinary use, "
+            "and a gateway restart signs it out. The one remaining idle limit is "
+            "the refresh credential's own 30-day lifetime, which each visit "
+            "renews, so a phone that goes untouched for 30 days re-scans. Turn "
+            "this OFF to go back to a timed session that expires on a clock "
+            "whether or not the gateway is still running. Either way `kirocrew "
+            "logout` ends the session immediately, and the session stays pinned "
+            "to the peer it was established from.",
         ),
     )
     restore_window_minutes: int = field(
@@ -3045,6 +3119,17 @@ class DashboardConfig:
             "Recent Session Tint Count",
             "Number of most-recently-active sessions to highlight in the sidebar with a "
             "graded accent stripe (0-10; 0 = off).",
+        ),
+    )
+    update_nudge: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Update Nudge",
+            "Per-version state for the proactive update popup. Written by the "
+            "dashboard when the user snoozes or skips a release; a record only "
+            "suppresses the popup for the version it names. Validated as one "
+            "atomic record by the PATCH allowlist (dashboard.update_nudge); "
+            "no Settings control reads it, so it carries no schema properties.",
         ),
     )
     onboarded: bool = field(
@@ -4313,6 +4398,48 @@ def _normalize_acp_backend(value: object) -> str:
 def _validate_activation(value: str) -> str:
     """Return *value* if it is a valid activation mode, else ``mention`` (deny-by-default)."""
     return value if value in _VALID_ACTIVATIONS else ACTIVATION_MENTION
+
+
+#: The activation modes a Telegram forum Topic can express. A subset of
+#: ``_VALID_ACTIVATIONS`` on purpose, and the subset is the point rather than an
+#: omission: ``observe`` needs a channel-history buffer only Slack populates, and
+#: feeding it would put non-owner prose into the prompt unfenced; ``review`` is a
+#: whole second rendering mode built on Slack Block Kit ephemerals, which Telegram
+#: has no equivalent for. Declaring either here would advertise a mode that
+#: silently behaves like a different one.
+TELEGRAM_ACTIVATIONS = frozenset({ACTIVATION_ALWAYS, ACTIVATION_MENTION, ACTIVATION_OFF})
+
+
+def _validate_telegram_activation(value: str) -> str:
+    """*value* if Telegram can express it, else ``mention``.
+
+    Degrades to the NARROWER mode, matching ``WeixinTransport.authorize``'s
+    treatment of an unrecognized ``dm_policy``: a malformed value must not resolve
+    to the most permissive reading of itself. ``always`` starts a turn for every
+    message in an allow-listed Topic, and a Topic is a SHARED space, so agent
+    output lands in front of everyone in it. Widening that because a value failed
+    to parse would make a typo grant participation the operator never asked for,
+    and it fails silently in the direction nobody audits.
+
+    ``mention`` rather than ``off`` because it is fail-safe without being
+    fail-dead: an explicit ``@handle`` is an unambiguous request, so the operator
+    can still reach the bot while it is refusing to answer unaddressed messages.
+
+    Reached ONLY for a value that was present and unparseable. An ABSENT key is
+    resolved to ``always`` by the caller before this runs, and that stays: taking
+    the documented default is not the same act as asking for something specific
+    and being misunderstood.
+    """
+    if value in TELEGRAM_ACTIVATIONS:
+        return value
+    logger.warning(
+        "telegram.forum_activation=%r is not one of %s; using %r (the narrower mode, "
+        "so an unreadable value cannot widen who the bot answers).",
+        value,
+        ", ".join(repr(a) for a in sorted(TELEGRAM_ACTIVATIONS)),
+        ACTIVATION_MENTION,
+    )
+    return ACTIVATION_MENTION
 
 
 def _validate_tracking_channels(raw: list) -> list[dict]:
@@ -5608,6 +5735,17 @@ class TelegramConfig:
             tags=["telegram"],
         ),
     )
+    show_thinking: bool = field(
+        default=False,
+        metadata=_meta(
+            "Show Thinking",
+            "Post the model's reasoning after each answer as a collapsed, "
+            "expandable quote. Off by default: Telegram's rate limit is per chat "
+            "and shared with the streaming edits the answer already spends, so "
+            "reasoning costs an extra message per turn.",
+            tags=["telegram"],
+        ),
+    )
     allow_forum: bool = field(
         default=False,
         metadata=_meta(
@@ -5624,6 +5762,31 @@ class TelegramConfig:
             "Allowed Forum Chat IDs",
             "Numeric supergroup chat_ids permitted to run forum-topic sessions. "
             "Empty = deny all groups (fail closed).",
+            tags=["telegram"],
+        ),
+    )
+    voice_replies: bool = field(
+        default=False,
+        metadata=_meta(
+            "Voice Replies",
+            "Speak each answer as a voice/audio message in addition to the text, "
+            "using the global voice_reply provider settings. Off by default: it "
+            "costs a second message per turn against Telegram's per-chat rate "
+            "budget, and TTS may not be configured. Toggle per conversation with "
+            "/voice on|off; this is the default for a new conversation.",
+            tags=["telegram"],
+        ),
+    )
+    forum_activation: str = field(
+        default=ACTIVATION_ALWAYS,
+        metadata=_meta(
+            "Forum Activation",
+            "When the bot answers inside an allow-listed forum Topic: 'always' "
+            "(every message), 'mention' (only when its @handle is used or one of "
+            "its own messages is replied to), or 'off' (never). Slack's channel "
+            "equivalent defaults to 'mention'; this defaults to 'always' so an "
+            "existing forum keeps working after an upgrade instead of going quiet. "
+            "Does not apply to a 1:1 DM, which is always served.",
             tags=["telegram"],
         ),
     )
@@ -6002,6 +6165,52 @@ class WebexConfig:
             "Allowed Emails",
             "Webex account emails permitted to DM the bot. Empty = deny all "
             "(fail closed): anyone in the org can message a Webex bot.",
+            tags=["webex"],
+        ),
+    )
+    allow_group_rooms: bool = field(
+        default=False,
+        metadata=_meta(
+            "Allow Group Spaces",
+            "Answer in group spaces as well as direct messages. Off by default: a "
+            "reply in a space is visible to every member, including people who are "
+            "not on the allow-list, so tool output would leave the DM. A Webex bot "
+            "only ever sees messages that @mention it in a space.",
+            tags=["webex"],
+        ),
+    )
+    allowed_room_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Room IDs",
+            "Webex space IDs the bot may answer in when group spaces are enabled. "
+            "Empty = deny all (fail closed), so turning the switch on alone grants "
+            "nothing; the sender must ALSO be on the email allow-list.",
+            tags=["webex"],
+        ),
+    )
+    reply_in_thread: bool = field(
+        default=True,
+        metadata=_meta(
+            "Reply in Thread",
+            "Reply under the message's own thread when it has one, keeping a space "
+            "readable. Webex threads are flat, so a reply always attaches to the "
+            "thread root.",
+            tags=["webex"],
+        ),
+    )
+    wdm_base: str = field(
+        default="",
+        metadata=_meta(
+            "Device Manager Base URL",
+            "Override the Webex Device Manager host used for the inbound "
+            "WebSocket. Empty (the default) discovers the org's own regional host "
+            "per token, which is what a non-US-resident org needs; set this only "
+            "to pin a REGIONAL WEBEX host for a network that reaches it but not "
+            "the service catalog. Must be an https Webex host (*.wbx2.com, "
+            "*.webex.com, *.ciscospark.com) — the bot token rides device "
+            "registration, so anything else is refused and discovery is used "
+            "instead. An outbound proxy belongs in HTTPS_PROXY, not here.",
             tags=["webex"],
         ),
     )
@@ -6822,6 +7031,7 @@ class KiroCrewConfig:
                 model=agent_data.get("model", DEFAULT_MODEL),
                 role_models=coerce_role_models(agent_data.get("role_models")),
                 role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
+                fallback_model=coerce_fallback_model(agent_data.get("fallback_model", "auto")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
                 provider=agent_data.get("provider", "acp"),
                 mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
@@ -7117,7 +7327,12 @@ class KiroCrewConfig:
                 bot_token=str(telegram_data.get("bot_token", "")),
                 allowed_user_ids=_coerce_int_ids(telegram_data.get("allowed_user_ids")),
                 soft_threshold_pct=_threshold_pct(telegram_data.get("soft_threshold_pct"), 80),
+                show_thinking=bool(telegram_data.get("show_thinking", False)),
                 allow_forum=bool(telegram_data.get("allow_forum", False)),
+                voice_replies=bool(telegram_data.get("voice_replies", False)),
+                forum_activation=_validate_telegram_activation(
+                    str(telegram_data.get("forum_activation", "") or ACTIVATION_ALWAYS)
+                ),
                 allowed_forum_chat_ids=_coerce_int_ids(telegram_data.get("allowed_forum_chat_ids")),
                 accounts=_parse_telegram_accounts(telegram_data.get("accounts")),
             ),
@@ -7166,6 +7381,20 @@ class KiroCrewConfig:
                     if isinstance(webex_data.get("allowed_emails", []), list)
                     else []
                 ),
+                # Group spaces are a SECURITY decision, so the read is as explicit
+                # as the write: a field the loader forgets is not merely lost, it
+                # silently reverts to the safe default on the next restart while
+                # the settings panel keeps showing the saved value it read from
+                # config.json — the operator sees an enabled space allow-list and
+                # the gateway answers nobody.
+                allow_group_rooms=bool(webex_data.get("allow_group_rooms", False)),
+                allowed_room_ids=[
+                    r
+                    for r in _safe_list(webex_data.get("allowed_room_ids"))
+                    if isinstance(r, str) and r
+                ],
+                reply_in_thread=bool(webex_data.get("reply_in_thread", True)),
+                wdm_base=str(webex_data.get("wdm_base", "") or ""),
                 soft_threshold_pct=_threshold_pct(webex_data.get("soft_threshold_pct"), 80),
                 hard_threshold_pct=_threshold_pct(webex_data.get("hard_threshold_pct"), 95),
             ),
@@ -7281,6 +7510,9 @@ class KiroCrewConfig:
                 url=dashboard_data.get("url", ""),
                 tailscale=_tailscale_config_from(dashboard_data.get("tailscale")),
                 restore_sessions=dashboard_data.get("restore_sessions", False),
+                qr_session_until_restart=_safe_bool(
+                    dashboard_data.get("qr_session_until_restart"), True
+                ),
                 restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),
                 surface_channel_sessions=dashboard_data.get("surface_channel_sessions", True),
                 bot_name=dashboard_data.get("bot_name", ""),
@@ -7317,6 +7549,11 @@ class KiroCrewConfig:
                 theme_color=dashboard_data.get("theme_color", ""),
                 language=str(dashboard_data.get("language", "")),
                 recent_tint_count=_safe_int(dashboard_data.get("recent_tint_count", 0), 0),
+                update_nudge=(
+                    dashboard_data.get("update_nudge", {})
+                    if isinstance(dashboard_data.get("update_nudge"), dict)
+                    else {}
+                ),
                 onboarded=bool(dashboard_data.get("onboarded", False)),
                 import_onboarded=_safe_bool(
                     dashboard_data.get("import_onboarded"),
@@ -7804,23 +8041,29 @@ class KiroCrewConfig:
 
     @staticmethod
     def _resolve_agent_model() -> str:
-        """Read model from installed agent config, falling back to bundled defaults."""
-        # Installed agent config (generated by kirocrew setup)
+        """Read model from installed agent config, falling back to bundled defaults.
+
+        The installed spec is read through
+        ``agent_discovery._read_agent_spec`` — the one hardened reader for
+        agent configs — not a bare ``read_text``: the agents directory is
+        user-writable and shared with other tools, so an oversized file must
+        be refused at the read cap instead of slurped onto whatever surface
+        asked for its effective model, and a symlink resolving into a
+        sensitive path must not donate its target's JSON here.
+        """
         agent_json = kiro_agents_dir() / "kirocrew.json"
         if agent_json.is_file():
-            try:
-                data = json.loads(agent_json.read_text(encoding="utf-8"))
+            data = _read_hardened_agent_spec(agent_json)
+            if data:
                 model = data.get("model", "")
                 if model:
                     return model
-            except (json.JSONDecodeError, OSError):
-                pass
         # Bundled defaults.json
         bundled = config_package_dir() / "defaults.json"
         if bundled.is_file():
             try:
-                data = json.loads(bundled.read_text(encoding="utf-8"))
-                model = data.get("model", "")
+                bundled_data = json.loads(bundled.read_text(encoding="utf-8"))
+                model = bundled_data.get("model", "")
                 if model:
                     return model
             except (json.JSONDecodeError, OSError):
@@ -7842,9 +8085,8 @@ class KiroCrewConfig:
             return ""
         base = agents_dir if agents_dir is not None else kiro_agents_dir()
         for af in base.glob("*.json"):
-            try:
-                ad = json.loads(af.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
+            ad = _read_hardened_agent_spec(af)
+            if ad is None:
                 continue
             # Skip stray non-object JSON a user may have dropped in the dir.
             if isinstance(ad, dict) and (ad.get("name") == agent or af.stem == agent):
@@ -8383,6 +8625,26 @@ def _materialized_kiro_agent(agent_name: str | None, project_dir: str | None = N
     if project_dir and _project_declares_agent(agent_name, project_dir):
         return agent_name
     return ""
+
+
+def _read_hardened_agent_spec(path: Path) -> dict | None:
+    """Read one agent spec through ``agent_discovery``'s hardened reader.
+
+    Thin wrapper so the model resolvers get the size cap, sensitive-symlink
+    rejection, and non-object filtering without each re-deriving them.
+
+    Deferred import so this module keeps its leaf-level import graph —
+    ``agent_discovery`` imports ``kiro_crew.hooks``, whose closure reaches
+    back into this module (see :func:`_project_declares_agent`). Any failure
+    to import or parse means "no usable spec here", never an exception into
+    model resolution.
+    """
+    try:
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        return _read_agent_spec(path)
+    except Exception:
+        return None
 
 
 def _project_declares_agent(agent_name: str, project_dir: str) -> bool:

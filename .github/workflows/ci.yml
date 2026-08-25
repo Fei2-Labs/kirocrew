@@ -436,6 +436,16 @@ jobs:
           python3 scripts/check_subprocess_encoding.py --test
           python3 scripts/check_subprocess_encoding.py
 
+      # A secret-bearing file must be locked down BEFORE any content reaches it:
+      # a post-publish lockdown leaves the payload at its final path under the
+      # inherited DACL, which on Windows is not covered by atomic_write's POSIX
+      # mode at all. #5307 converted the last seven such writers; this keeps a
+      # new one from reintroducing the shape. Known-unconverted sites live in
+      # KNOWN_UNCONVERTED in the script, keyed to an open issue, and that list is
+      # shrink-only -- a paid-off entry fails the gate until it is deleted.
+      - name: Check lockdown-before-publish (secret writers)
+        run: python3 scripts/check_lockdown_before_publish.py
+
       # isort/flake8/mypy below are BLOCKING (config in pyproject.toml + setup.cfg).
       #
       # The two repo-root modules are named explicitly: `src/kiro_crew test` misses
@@ -1217,7 +1227,7 @@ jobs:
         # unrecognised flag makes those scripts refuse to run rather than fall through to
         # their destructive conversion path.
         #
-        # ONLY TWO KINDS OF CHECK CAN FAIL THIS STEP.
+        # ONLY THREE KINDS OF CHECK CAN FAIL THIS STEP.
         #
         #   DIFF-SCOPED, zero tolerance — a finding on a line you wrote is yours and there
         #   is no number to raise:
@@ -1233,8 +1243,16 @@ jobs:
         #                       reference and its catalog entry are edited independently, so
         #                       a catalog-only rename dangles references in files the PR
         #                       never opens. Needs no base ref, so it cannot skip itself.
-        #     [plurals]         a `{n} {t('item')}s` concatenation.
+        #     [plurals]         an i18nT-adjacent `{n} {t('item')}s` concatenation.
         #     [pseudolocale]    `en-XA.json` stale against its generator.
+        #
+        #   WHOLE-REPO CEILING — fails only when the class GROWS:
+        #     [plurals-hardcoded] the same plural-glue defect with NO i18nT in it, e.g.
+        #                       a fully hardcoded aria-label gluing `?'s':''` onto a
+        #                       noun. The frozen sites are pinned at HARDCODED_CEILING
+        #                       in i18n-plural-codemod.mjs and ratchet DOWN as they are
+        #                       converted; a failure lists every site with file:line so
+        #                       the added one is findable.
         #
         # EVERYTHING ELSE IS REPORT ONLY — [untranslated], [allcaps], [extractable] and
         # [dynamic-keys]. Each is a stored whole-repo total, written by whichever branch

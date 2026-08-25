@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 from windows_sim import replace_sharing_violation
 
+from conftest import requires_symlinks
 from kiro_crew import agent_state
 from kiro_crew import atomic_write as aw
 from kiro_crew.agent import install_agent, migrate_agent_specs
@@ -538,6 +539,7 @@ class TestAtomicJsonWrite:
 class TestAllSkillPathsLocalSymlinks:
     """Test symlink resolution in _all_skill_paths for ~/.aim/skills/local/."""
 
+    @requires_symlinks
     def test_resolves_local_symlink_with_skills_parent(self, tmp_path: Path):
         """Symlink target whose parent is named 'skills' is added."""
         from kiro_crew.agent import _all_skill_paths
@@ -559,6 +561,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(target_parent) in paths
 
+    @requires_symlinks
     def test_skips_symlink_with_non_skills_parent(self, tmp_path: Path):
         """Symlink target whose parent is NOT named 'skills' is excluded."""
         from kiro_crew.agent import _all_skill_paths
@@ -577,6 +580,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(tmp_path / "project" / "other") not in paths
 
+    @requires_symlinks
     def test_skips_sensitive_parent_path(self, tmp_path: Path):
         """Symlink resolving into a sensitive directory is excluded."""
         from kiro_crew.agent import _all_skill_paths
@@ -596,6 +600,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(sensitive_skills) not in paths
 
+    @requires_symlinks
     def test_skips_broken_symlink(self, tmp_path: Path):
         """Broken symlink raises OSError with strict=True and is logged."""
         from kiro_crew.agent import _all_skill_paths
@@ -635,6 +640,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(local_dir / "not-a-symlink" / "skills") not in paths
 
+    @requires_symlinks
     def test_ignores_symlink_to_file(self, tmp_path: Path):
         """Symlink pointing to a file (not directory) is skipped."""
         from kiro_crew.agent import _all_skill_paths
@@ -1501,6 +1507,7 @@ class TestKiroHooksMerge:
         result = _merge_kiro_hooks({}, user)
         assert result["preToolUse"] == [{"command": hook, "matcher": "*"}]
 
+    @requires_symlinks
     def test_validate_rejects_symlink_to_sensitive(self, tmp_path: Path):
         """Symlinks resolving to sensitive paths are rejected."""
         from kiro_crew.agent import _validate_hook_command
@@ -2721,6 +2728,7 @@ class TestKiroHooksAutoimport:
         assert result["preToolUse"][0]["command"].endswith("/ok.sh")
         assert any("not executable" in rec.message for rec in caplog.records)
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_skips_sensitive_path(self, tmp_path: Path, monkeypatch):
         """Scripts resolving into a sensitive path (~/.ssh) are rejected."""
         from kiro_crew.agent import _autoimport_kiro_hooks
@@ -3598,6 +3606,7 @@ class TestKiroHooksAutoimport:
             for rec in caplog.records
         )
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_rejects_symlink_escaping_dir(self, tmp_path: Path, caplog):
         """A symlink inside hooks_dir pointing at an outside script is rejected.
 
@@ -3706,6 +3715,7 @@ class TestKiroHooksAutoimport:
         assert command == str(script)
         assert "failed validation" in reason
 
+    @requires_symlinks
     def test_kiro_hooks_dir_stored_as_resolved_path(self, tmp_path: Path, monkeypatch):
         """Regression: ``_autoimport_kiro_hooks`` receives the *resolved* hooks dir.
 
@@ -3902,6 +3912,7 @@ class TestKiroHooksAutoimport:
             f"(nothing was rejected); got: {sel_calls!r}"
         )
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_rejects_dir_equal_to_symlinked_home(
         self, tmp_path: Path, monkeypatch, caplog
     ):
@@ -4174,7 +4185,9 @@ class TestRefreshDynamicFieldsStripsStaleUrl:
             assert "url" not in entry, f"{name} still has stale url"
             assert "headers" not in entry, f"{name} still has stale headers"
             assert entry["command"]
-            assert entry["args"] == args
+            # Windows uses the interpreter-module fallback, which prepends
+            # ``-m kiro_crew.__main__`` before the same managed subcommand.
+            assert entry["args"][-len(args) :] == args
 
     def test_non_managed_server_url_preserved(self):
         from kiro_crew.agent import _refresh_dynamic_fields
@@ -4941,6 +4954,7 @@ class TestSpecPathRefusesSymlinks:
     readable location (#4911 review).
     """
 
+    @requires_symlinks
     def test_a_symlinked_spec_is_refused_and_the_target_is_not_copied(
         self, tmp_path: Path, monkeypatch
     ):
@@ -4961,6 +4975,7 @@ class TestSpecPathRefusesSymlinks:
         assert link.is_symlink()
         assert json.loads(secret.read_text(encoding="utf-8"))["secret"] == "s"
 
+    @requires_symlinks
     def test_the_name_scan_also_skips_a_symlink(self, tmp_path: Path, monkeypatch):
         import kiro_crew.agent as agent_mod
 

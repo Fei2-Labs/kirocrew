@@ -2375,10 +2375,88 @@ FILE_WRITE_SCHEMA = ToolSchema(
     ],
 )
 
+# Non-Slack channel routing for send_message. `validate_tool_args` REJECTS an
+# unknown field, so a property advertised in the MCP inputSchema but missing here
+# is not merely unvalidated — the whole call fails, and the capability is 0%
+# reachable over MCP. The two must be added together.
+#
+# The channel is matched by SHAPE, not against an enumeration: the authoritative
+# set is which transports are registered and what channels governance permits,
+# both checked at send time, and a literal list here would be a second copy that
+# goes stale the moment a channel is added. The pattern itself lives on the
+# ``channel_type`` FieldSpec below, so there is exactly one of it.
+#
+# A configured-destination id is opaque and channel-defined — a Webex room id is
+# a ~90-char base64 Hydra blob — so this bounds length and excludes control
+# characters and whitespace rather than pretending to know the grammar. The id is
+# re-resolved against the channel's own configured targets before any send, which
+# is what actually authorizes it.
+_TARGET_ID_RE = re.compile(r"^[\x21-\x7e]{1,512}$")
+
+
+# Fields that select or shape a SLACK delivery. Combined with the
+# ``channel_type``/``target_id`` pair — which addresses a non-Slack destination
+# directly — they have no destination, so the pair's handler drops them before
+# any Slack-shaped validation runs. Refused here at the boundary rather than
+# dropped, because the caller (including the model) cannot observe a drop and
+# would read a private channel DM as a threaded post to a named Slack channel.
+_CHANNEL_TARGET_INCOMPATIBLE = (
+    "channel",
+    "user",
+    "blocks",
+    "thread_ts",
+    "reply_broadcast",
+    "unfurl_links",
+    "unfurl_media",
+    "session",
+)
+
+
+def _validate_channel_routing(cleaned: dict[str, Any]) -> None:
+    """``target_id`` is meaningful only ALONGSIDE ``channel_type``.
+
+    ``channel_type`` alone is complete on its own: it means the non-Slack
+    conversation this session already belongs to. Adding ``target_id`` narrows that
+    transport to one explicit configured destination on it. So the only
+    under-specified combination is a ``target_id`` with no transport to resolve it
+    against, and it is rejected at the boundary rather than ignored downstream,
+    where it would silently fall back to the default Slack/dashboard destination.
+
+    A Slack-routing field travelling with ``channel_type`` is likewise refused, not
+    dropped: the channel wins the routing, so the field would reach nothing.
+    """
+    has_channel = bool(cleaned.get("channel_type"))
+    if bool(cleaned.get("target_id")) and not has_channel:
+        raise ValidationError("channel_type", "target_id requires channel_type")
+    if has_channel:
+        stray = [f for f in _CHANNEL_TARGET_INCOMPATIBLE if cleaned.get(f) is not None]
+        if stray:
+            raise ValidationError(
+                stray[0],
+                "channel_type/target_id addresses the destination directly and cannot be "
+                f"combined with the Slack-routing field(s): {', '.join(stray)}",
+            )
+
+
 SEND_MESSAGE_SCHEMA = ToolSchema(
     tool_name="send_message",
     fields=[
         FieldSpec("text", str, required=True, max_len=MAX_MEDIUM_STRING),
+        # Non-Slack transport name. Shape-only here (the cheap first gate, same
+        # role as SEND_NOTIFICATION's `url` pattern); the authoritative closed set
+        # is `_SEND_MESSAGE_CHANNEL_TYPES` in dashboard/handlers/messaging.py,
+        # derived from `CHANNEL_SESSION_NAMESPACES`. Enumerating it here too would
+        # be a second copy that goes stale when a transport is added.
+        #
+        # A BARE transport name, so no digits and no separator: that is what keeps a
+        # session key or a namespaced value (`telegram:99887766`) from arriving where
+        # a transport is expected. Declared ONCE, beside the ``target_id`` it pairs
+        # with -- ``validate_tool_args`` ITERATES this list rather than indexing it,
+        # so a second ``channel_type`` spec is not an alternative: a value would have
+        # to satisfy both and the later one would overwrite ``cleaned``, silently
+        # making the first pattern dead.
+        FieldSpec("channel_type", str, max_len=16, pattern=re.compile(r"^[a-z]+$")),
+        FieldSpec("target_id", str, max_len=512, pattern=_TARGET_ID_RE),
         FieldSpec("title", str, max_len=MAX_SHORT_STRING),
         FieldSpec("blocks", list, item_type=dict, max_items=50),
         FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
@@ -2400,6 +2478,7 @@ SEND_MESSAGE_SCHEMA = ToolSchema(
         ),
         FieldSpec("caller_session", str, max_len=MAX_SHORT_STRING, pattern=CRON_SESSION_RE),
     ],
+    custom_validator=_validate_channel_routing,
 )
 
 SEND_NOTIFICATION_SCHEMA = ToolSchema(

@@ -26,7 +26,7 @@ except ImportError:
     _resource = None  # type: ignore[assignment]  # Windows/non-POSIX
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
 from kiro_crew.executors import maintenance_executor
@@ -4853,6 +4853,13 @@ _SENSITIVE_HOME_DIRS: list[str] = [
 _CREW_HOME_PREFIXES: tuple[str, ...] = (".kiro/crew", ".kirocrew")
 _CREW_SECRET_LEAVES: list[str] = [
     ".env",
+    # Bring-your-own-key store (acp.byok): the operator's own model-provider API
+    # keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...), injected into a BYOK backend's
+    # child environment at spawn. Live bearer credentials, so the agent's own file
+    # and bash tools must neither read them (exfiltration) nor rewrite them
+    # (repoint a backend at an attacker's key). The BYOK module and CLI open it
+    # directly rather than through this gate, so management still works.
+    "byok.json",
     # The Notes builtin stores a GitHub Personal Access Token here so it can
     # push a vault. Owner-only mode (0600) does not isolate another process
     # running as the same UID, and the token is a live bearer credential for the
@@ -5047,10 +5054,15 @@ _CREW_SECRET_LEAVES: list[str] = [
     "token_signing.key",
     "refresh_chains.json",
     ".local_secret",
-    # Durable channel routing state (currently Teams' conversation -> serviceUrl and
-    # identity -> conversation maps). Same class of control as
-    # ``workspace/md-notebook/vaults.json`` above: it is not a secret, it is
-    # DELIVERY ADDRESSING. ``teams/transport.py`` resolves an explicit
+    # Durable channel transport state: Teams' conversation -> serviceUrl and
+    # identity -> conversation maps, and Telegram's getUpdates cursor. Two shapes of
+    # the same control -- where a message GOES, and which messages are SEEN. Calling
+    # getUpdates with an offset is also the ack for everything below it, so an agent
+    # that could write that cursor would make the gateway skip every queued and
+    # future message, durably, past the restart that would otherwise clear it.
+    #
+    # Same class of control as ``workspace/md-notebook/vaults.json`` above: neither
+    # is a secret, both are PLUMBING. ``teams/transport.py`` resolves an explicit
     # ``user:<upn>`` send target through the identity map, so an agent that could
     # write it could point one operator's UPN at a different person's conversation
     # and have the next cron result, subagent notice or ``send_message`` delivered
@@ -5069,7 +5081,8 @@ _CREW_SECRET_LEAVES: list[str] = [
     # have the rename publish its own routing. A directory entry covers every
     # child, random temp names included. (``trust``, ``profiles`` and
     # ``cron-history`` above are directories for the same reason among others.)
-    # ``ServiceUrlStore`` opens its path directly, not through this gate, so
+    # ``ServiceUrlStore`` and ``TelegramClient`` open their paths directly, not
+    # through this gate, so
     # proactive routing across a restart is unaffected.
     "routing",
     # Inbound-webhook credential store directory. It holds the bearer HASHES and
@@ -6219,6 +6232,11 @@ def is_sensitive_bash_command(command: str) -> str | None:
     if normalizer_result:
         return normalizer_result
 
+    # ── Pass 3: native-shell entry-then-relative-read scan ──
+    native_result = _check_native_home_entry_then_fenced_read(command)
+    if native_result:
+        return native_result
+
     # IMDS access via any IP encoding (decimal, hex, octal, IPv6-mapped)
     imds_result = _check_imds_access(command)
     if imds_result:
@@ -7000,6 +7018,12 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
     # the line prompts. The taint pass already denies that shape, so this widens
     # nothing in practice.
     seen_bases: list[str] = []
+    # Classifying a base resolves symlinks and sensitive-home roots. A chained
+    # parameter expansion revisits the same bases many times, so repeating that
+    # filesystem work made this synchronous gate exceed its latency ceiling
+    # under normal test load. The filesystem cannot change while this one
+    # command is being inspected; keep the classification only for this call.
+    base_sensitivity: dict[str, bool] = {}
     # The directories `cd -` goes back to.
     prev_bases: list[str] = []
     # Saved (base_dirs, prev_bases, assignments) per open subshell.
@@ -7210,7 +7234,7 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
             if not raw_targets:
                 # A bare `cd` goes to the home directory.
                 base_dirs = [os.path.expanduser("~")]
-                _remember_bases(seen_bases, base_dirs)
+                _remember_bases(seen_bases, base_dirs, base_sensitivity)
                 continue
             # A Windows home anchor becomes `~` BEFORE anything else looks at the
             # token: the hypothesis below reads `$env:USERPROFILE` as the variable
@@ -7256,7 +7280,7 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
             base_dirs = next_bases
             if len(base_dirs) > _MAX_TRACKED_BASES:
                 del base_dirs[: len(base_dirs) - _MAX_TRACKED_BASES]
-            _remember_bases(seen_bases, next_bases)
+            _remember_bases(seen_bases, next_bases, base_sensitivity)
             continue
 
         # No read-verb requirement: the operands of this segment are checked
@@ -7305,7 +7329,9 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
     return _check_sensitive_cd_taint(command)
 
 
-def _remember_bases(seen: list[str], bases: list[str]) -> None:
+def _remember_bases(
+    seen: list[str], bases: list[str], sensitivity: dict[str, bool]
+) -> None:
     """Add *bases* to the never-pruned *seen* list, keeping order and uniqueness.
 
     Bounded so a long chain of `cd`s cannot grow it without limit; the cap is far
@@ -7320,11 +7346,10 @@ def _remember_bases(seen: list[str], bases: list[str]) -> None:
         # Never evict sensitive bases -- an attacker could flood with dummy cd
         # targets to push a real sensitive base out of the tracked set.
         excess = len(seen) - _MAX_TRACKED_BASES
-        evictable = [
-            i
-            for i, b in enumerate(seen)
-            if not is_sensitive_path(b) and not _dir_holds_sensitive_leaf(b)
-        ]
+        for base in seen:
+            if base not in sensitivity:
+                sensitivity[base] = is_sensitive_path(base) or _dir_holds_sensitive_leaf(base)
+        evictable = [i for i, base in enumerate(seen) if not sensitivity[base]]
         to_remove = set(evictable[:excess])
         seen[:] = [b for i, b in enumerate(seen) if i not in to_remove]
 
@@ -7337,6 +7362,415 @@ def _strip_grouping(token: str) -> str:
     punctuation that opened the group.
     """
     return token.lstrip("$(`{ ")
+
+
+#: ---------------------------------------------------------------------------
+#: Native-shell path reading: cut into words, NORMALIZE, compare.
+#:
+#: The first six review rounds of this pass were spent matching SPELLINGS, and the
+#: boundary half of that converged -- one lookaround on "what a path is" replaced a
+#: growing list of punctuation. The PATH half never converged, for a reason worth
+#: writing down rather than rediscovering: ``%USERPROFILE%\.``, ``~/``, ``C:.aws``,
+#: ``C:/`` versus ``C:\``, ``a\..\``, ``a\b\..\..\`` and ``.aw^s`` all name ONE
+#: file. Path identity is a COMPUTATION -- collapse ``.``, net ``..`` against
+#: depth, unify separators, apply the shell's escape -- and a pattern can only
+#: enumerate the spellings someone thought to write down, so every round supplied
+#: one more.
+#:
+#: So this scan no longer matches path spellings. It cuts the command into words,
+#: normalizes each word as a path, and compares the RESULT. An unbounded family of
+#: patterns becomes one bounded function, and the shells' escape characters stop
+#: being special cases -- see `_native_words`, which owns quoting and escaping so
+#: path shaping never has to.
+#:
+#: It stays grammar-free, which is the property that made this pass worth having: a
+#: word ends at an operator, but WHICH operator -- sequencer, background, pipe,
+#: redirect -- is never asked. Only target selection stays inside one
+#: operator-delimited run; the fenced-path search deliberately crosses every
+#: boundary, because a monotone scan may only ever widen.
+_WORD_SPACE = frozenset(" \t")
+_WORD_QUOTE = frozenset("\"'")
+#: The two shells' escape characters: cmd.exe uses ``^``, PowerShell uses a
+#: backtick. Both protect exactly the next character, INCLUDING a space, so they
+#: belong to the word layer rather than to path normalization. The backtick is
+#: therefore not an operator here even though bash reads it as command
+#: substitution -- this is the native-Windows pass, and bash's substitution is
+#: handled by the segment splitter the earlier passes use.
+_WORD_ESCAPE = frozenset("^`")
+#: Braces are deliberately NOT boundaries: PowerShell spells an environment
+#: variable ``${env:USERPROFILE}``, so splitting on ``{`` would cut a home anchor
+#: in half. A brace-delimited block (``ForEach-Object { ... }``) is already broken
+#: by the ``|`` or ``;`` in front of it, so nothing needs them to end a run.
+_WORD_OPERATOR = frozenset(";&|()<>\r\n")
+
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+#: A flag carrying its value in the same word (``-Path:~``, ``--path=~``, ``/D:x``).
+#: The payload after the first ``:`` or ``=`` is what names the directory.
+_BOUND_PAYLOAD_RE = re.compile(r"^[-/][A-Za-z][\w-]*[:=](?P<value>.+)$")
+_SWITCH_WORD_RE = re.compile(r"^[-/][A-Za-z][\w-]*(?:[:=]\S*)?$")
+_GLUED_SWITCH_RE = re.compile(r"^[A-Za-z]$")
+
+#: One path SEGMENT naming the home directory, in every spelling these shells
+#: accept -- including cmd.exe delayed expansion (``!USERPROFILE!``) and the
+#: optional substring/substitution payload after the first delimiter. Anchor
+#: spellings ARE a closed set, because the shells define them; that is why an
+#: alternation is the right tool for this part and the wrong one for path identity.
+_HOME_SEGMENT_RE = re.compile(
+    r"^(?:"
+    r"~"
+    r"|\$HOME|\$\{HOME\}"
+    r"|%USERPROFILE(?::[^%]*)?%"
+    r"|!USERPROFILE(?::[^!]*)?!"
+    r"|(?:%HOMEDRIVE(?::[^%]*)?%|!HOMEDRIVE(?::[^!]*)?!)"
+    r"(?:%HOMEPATH(?::[^%]*)?%|!HOMEPATH(?::[^!]*)?!)"
+    r"|\$\{env:USERPROFILE\}|\$env:USERPROFILE"
+    r"|\$\{env:HOMEDRIVE\}\$\{env:HOMEPATH\}|\$env:HOMEDRIVE\$env:HOMEPATH"
+    r")$",
+    re.IGNORECASE,
+)
+
+_CHDIR_VERBS_LOWER = frozenset(verb.lower() for verb in _CHDIR_VERBS)
+
+
+class _PathShape(NamedTuple):
+    """What one word means as a path, after normalization."""
+
+    segments: tuple[str, ...]
+    home_anchored: bool
+    absolute: bool
+    #: A ``..`` climbed above the directory the path was spelled from, so it names
+    #: something OUTSIDE that directory. This scan has no claim on those: denying
+    #: ``project\..\..\.aws`` would deny a different file than the fenced one.
+    escaped: bool
+
+
+def _strip_windows_component_padding(segment: str) -> str:
+    """Windows drops trailing dots and spaces from every path component.
+
+    So ``.aws.`` and ``.aws`` are the SAME directory, and ``type .aws.\\credentials``
+    after entering home genuinely reads the credential -- a whole-segment
+    comparison would otherwise let the trailing dot walk past every entry in
+    `_SENSITIVE_HOME_DIRS` at once.
+
+    A segment made only of dots is left alone: ``.`` and ``..`` are navigation
+    rather than a name carrying padding, and stripping them would erase the very
+    netting that decides whether a path escapes its directory.
+    """
+    if not segment.strip("."):
+        return segment
+    return segment.rstrip(". ")
+
+
+def _native_words(command: str) -> list[tuple[int, str, bool]]:
+    """Cut the command into ``(offset, word, starts_new_run)`` triples.
+
+    This layer implements the shells' QUOTING and ESCAPING, and nothing else. It
+    used to approximate them -- quotes were skipped and escapes were removed later,
+    during path shaping -- and each approximation cost a review round: a quoted
+    ``C:\\Users\\John Doe`` was split at the space, a fenced entry with a space of
+    its own was too, and PowerShell's backtick escape went unread while cmd.exe's
+    caret was handled. All three are the same omission, so they are fixed in the
+    same place.
+
+    The rules, both closed sets the shells define:
+
+    * An escape (``^`` in cmd.exe, a backtick in PowerShell) protects exactly the
+      next character, which reaches the word while the escape does not. A doubled
+      escape therefore yields one literal escape character, so ``.a^^ws`` stays the
+      distinct file ``.a^ws``.
+    * A quote does not reach the word. Whitespace inside one is AMBIGUOUS in a way
+      no amount of lexing settles: ``"C:\\Users\\John Doe"`` is one path, while
+      ``cmd /C "cd ~ & type .aws\\credentials"`` is a whole command line that must
+      still be cut apart. So both readings are emitted -- the whitespace-separated
+      parts AND, when a quoted region holds whitespace, the joined region as one
+      extra word. Taking both is sound precisely because this scan is monotone:
+      an extra reading can only add a denial, never remove one.
+
+    ``starts_new_run`` is True when an operator (or the start of the command)
+    preceded the word -- the only structural fact this scan needs, since a chdir's
+    target cannot live across an operator while the fenced-path search ignores
+    operators entirely.
+    """
+    words: list[tuple[int, str, bool]] = []
+    buffer: list[str] = []
+    start = -1
+    word_new_run = True
+    next_new_run = True
+    quote = ""
+    region: list[str] = []
+    region_start = -1
+    index = 0
+    length = len(command)
+
+    def begin(at: int) -> None:
+        nonlocal start, word_new_run, next_new_run
+        if not buffer:
+            start = at
+            word_new_run = next_new_run
+            next_new_run = False
+
+    def flush() -> None:
+        nonlocal buffer
+        if buffer:
+            words.append((start, "".join(buffer), word_new_run))
+            buffer = []
+
+    while index < length:
+        char = command[index]
+        if char in _WORD_ESCAPE:
+            index += 1
+            if index < length:
+                begin(index)
+                buffer.append(command[index])
+                if quote:
+                    region.append(command[index])
+                index += 1
+            continue
+        if char in _WORD_QUOTE:
+            if quote == char:
+                joined = "".join(region)
+                if any(space in joined for space in _WORD_SPACE):
+                    words.append((region_start, joined, False))
+                quote = ""
+                region = []
+            elif not quote:
+                quote = char
+                region = []
+                region_start = index + 1
+            else:
+                begin(index)
+                buffer.append(char)
+                region.append(char)
+            index += 1
+            continue
+        if char in _WORD_SPACE or char in _WORD_OPERATOR:
+            flush()
+            if char in _WORD_OPERATOR:
+                next_new_run = True
+            if quote:
+                region.append(char)
+            index += 1
+            continue
+        begin(index)
+        buffer.append(char)
+        if quote:
+            region.append(char)
+        index += 1
+    flush()
+    if quote:
+        joined = "".join(region)
+        if any(space in joined for space in _WORD_SPACE):
+            words.append((region_start, joined, False))
+    return words
+
+
+def _shape_path_token(word: str) -> _PathShape:
+    """Normalize one word as a path and report what it names.
+
+    Every equivalence that cost a review round is decided here, once: a bound flag
+    payload, a drive-relative prefix, either separator, a no-op ``.``, the trailing
+    dots Windows itself drops, and ``..`` netted against depth so
+    ``a\\b\\..\\..\\.aws`` and ``a\\..\\.aws`` and ``.aws`` all arrive as the same
+    segments.
+
+    Escapes and quoting are deliberately NOT handled here -- `_native_words` owns
+    them. Keeping the two layers separate is what makes the split safe: an escape
+    removed twice would turn ``.a^^ws`` (a real file named ``.a^ws``) into the
+    fenced ``.aws`` and deny a command that touches nothing.
+    """
+    text = word
+    bound = _BOUND_PAYLOAD_RE.match(text)
+    if bound:
+        text = bound.group("value")
+    absolute = False
+    if _DRIVE_PREFIX_RE.match(text):
+        # A drive letter FOLLOWED by a separator is absolute on that drive. With
+        # nothing after it, it means "the current directory there" -- which is
+        # precisely the relative form this scan exists for, so the prefix is
+        # dropped rather than treated as evidence the path is not relative.
+        absolute = text[2:3] in ("/", "\\")
+        text = text[2:]
+    text = text.replace("\\", "/")
+    if text.startswith("/"):
+        absolute = True
+    raw = [
+        _strip_windows_component_padding(segment)
+        for segment in text.split("/")
+    ]
+    raw = [segment for segment in raw if segment not in ("", ".")]
+    home_anchored = False
+    if raw and _HOME_SEGMENT_RE.match(raw[0]):
+        home_anchored = True
+        raw = raw[1:]
+    stack: list[str] = []
+    escaped = False
+    for segment in raw:
+        if segment == "..":
+            if stack:
+                stack.pop()
+            else:
+                escaped = True
+        else:
+            stack.append(segment)
+    return _PathShape(tuple(stack), home_anchored, absolute, escaped)
+
+
+def _names_home_directory(word: str) -> bool:
+    """Does this word name the home directory ITSELF, not something under it?
+
+    ``cd ~/project`` is deliberately False: entering a subdirectory of home is not
+    entering home, and a later ``.aws`` there resolves to ``~/project/.aws``, which
+    is not fenced. That distinction used to be a lookahead refusing a path
+    continuation; it is now just "no segments left after the anchor".
+
+    The resolved home is read PER CALL. Binding it at import time freezes it for
+    the life of the process, which `test_host_isolation_floor`'s shared-path
+    ratchet forbids and which would make a repointed home invisible here.
+    """
+    shape = _shape_path_token(word)
+    if shape.escaped:
+        return False
+    if shape.home_anchored:
+        return not shape.segments
+    if shape.absolute:
+        # Windows paths are case-insensitive, so `c:\users\u` is the same entry as
+        # `C:\Users\u`. `_fenced_relative_prefix` and `_HOME_SEGMENT_RE` already
+        # fold; this was the one comparison in the pass that did not, which made
+        # a case-varied spelling of the resolved home invisible.
+        home = _shape_path_token(str(Path.home()))
+        return (
+            shape.absolute == home.absolute
+            and shape.home_anchored == home.home_anchored
+            and tuple(segment.lower() for segment in shape.segments)
+            == tuple(segment.lower() for segment in home.segments)
+        )
+    return False
+
+
+def _fenced_relative_prefix(shape: _PathShape) -> str | None:
+    """Which fenced directory a RELATIVE path names, if any.
+
+    Read from `_SENSITIVE_HOME_DIRS` at call time, not folded into a pattern at
+    import, so leaves appended to that list later (the crew data-home secrets) are
+    covered with no second edit. Segments are compared whole, which is what keeps
+    ``x.aws/credentials`` and ``.npmrcnotes`` out.
+    """
+    if shape.absolute or shape.home_anchored or shape.escaped or not shape.segments:
+        return None
+    lowered = tuple(segment.lower() for segment in shape.segments)
+    for fenced in _SENSITIVE_HOME_DIRS:
+        parts = tuple(part.lower() for part in fenced.split("/") if part)
+        if parts and lowered[: len(parts)] == parts:
+            return fenced
+    return None
+
+
+def _is_chdir_verb_word(word: str) -> bool:
+    """A change-directory verb, including cmd.exe's glued ``cd/d``.
+
+    Sourced from the same `_CHDIR_VERBS` the walk reads, so a spelling added there
+    reaches this scan with no second edit.
+    """
+    base, slash, glued = word.partition("/")
+    if base.lower() not in _CHDIR_VERBS_LOWER:
+        return False
+    return not slash or bool(_GLUED_SWITCH_RE.match(glued))
+
+
+def _chdir_target_is_home(words: list[tuple[int, str, bool]], verb_index: int) -> bool:
+    """Within the verb's own run, does any word name the home directory?
+
+    The whole run is scanned rather than a bounded window of candidates. A window
+    was wrong for a nameable reason: a PowerShell parameter can take its value as a
+    separate word, so an arbitrary number of words can sit between the verb and its
+    positional target (``Set-Location -ErrorAction Stop -WarningAction Stop ~``),
+    and any cap stops short of some legitimate spelling. Scanning the run cannot
+    over-reach, because an operator ends the run and the fenced-path search -- which
+    is the half that actually decides a denial -- is monotone anyway.
+
+    The order of the two checks below is LOAD-BEARING and easy to invert by
+    accident. ``-Path:~`` satisfies both predicates -- it looks like a switch AND it
+    names home, because the shape reads the payload after the colon. The home check
+    therefore has to run FIRST; skipping switches first would silently stop
+    detecting a parameter-bound target.
+
+    The running JOIN exists for one cmd.exe quirk: ``cd`` takes the rest of the line
+    as its path, so ``cd /d C:\\Users\\John Doe`` is a valid entry with no quotes at
+    all. Switch-shaped words are left out of the join so a leading ``/d`` does not
+    poison it.
+    """
+    parts: list[str] = []
+    for _offset, word, new_run in words[verb_index + 1 :]:
+        if new_run:
+            return False
+        if _names_home_directory(word):
+            return True
+        if _SWITCH_WORD_RE.match(word):
+            continue
+        parts.append(word)
+        if len(parts) > 1 and _names_home_directory(" ".join(parts)):
+            return True
+    return False
+
+
+def _check_native_home_entry_then_fenced_read(command: str) -> str | None:
+    """Did the command enter the home directory, then name a fenced path relative to it?
+
+    Pass 2 answers "where is the shell now" by WALKING the command: split into
+    segments, track the chdir target, join relative operands onto it. That walk
+    must agree with the shell's grammar, and for a NATIVE WINDOWS command line it
+    does not. ``normalize_shell_command`` tokenizes in POSIX mode, where a
+    backslash is an escape rather than a separator and a single ``&`` backgrounds
+    rather than sequences; ``_split_shell_segments`` rightly declines to break on
+    ``|`` because in bash the ``cd`` would run in a subshell, while a PowerShell
+    pipeline does move the directory; and cmd.exe's ``^`` escape and glued ``/D``
+    switch are two more spellings the tokenizer reads as something else.
+
+    Closing those one at a time is the direction `_check_sensitive_via_normalizer`
+    warns is unbounded, and four consecutive review rounds each named one more
+    element. So this pass asks the question that needs NO grammar, the same move
+    `_check_sensitive_cd_taint` makes for a sensitive target: was an entry into
+    the home directory seen ANYWHERE, and does a fenced path spelled relative to
+    it appear AFTER that? Both halves are read off the raw text::
+
+        cd ~ & type .aws\\credentials                    sequencer + separator
+        Set-Location ~ | ForEach-Object { cat .aws/x }   pipeline
+        cd/d %USERPROFILE% && type .aws^\\credentials     glued switch + caret
+
+    Monotone and position-ordered: once the entry is seen no later token can
+    clear it, which is exactly the property a positional tracker lacks.
+
+    Cost, stated plainly: naming a fenced RELATIVE path after entering the home
+    directory is denied even when the command would not have read it (a
+    ``grep`` for that text in a note). That is the posture the absolute-path pass
+    already takes -- naming a fenced path is itself the signal -- extended to the
+    spelling that only makes sense once the shell is in the home directory.
+
+    Returns a denial reason, or None when clean.
+    """
+    words = _native_words(command)
+    entry_offset: int | None = None
+    for index, (offset, word, _new_run) in enumerate(words):
+        if not _is_chdir_verb_word(word):
+            continue
+        # A bare chdir -- nothing after it in its own run -- lands in the home
+        # directory in every shell this pass covers.
+        bare = index + 1 >= len(words) or words[index + 1][2]
+        if bare or _chdir_target_is_home(words, index):
+            entry_offset = offset
+            break
+    if entry_offset is None:
+        return None
+    for offset, word, _new_run in words:
+        if offset <= entry_offset:
+            continue
+        fenced = _fenced_relative_prefix(_shape_path_token(word))
+        if fenced is not None:
+            return (
+                "Blocked: command enters the home directory and then names a "
+                f"sensitive credential path relative to it ({fenced})"
+            )
+    return None
 
 
 def _check_sensitive_cd_taint(command: str) -> str | None:

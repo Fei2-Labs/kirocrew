@@ -1110,6 +1110,59 @@ class TestUpdateGitPath:
         assert "Already up to date" in capsys.readouterr().out
         assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
 
+    def test_ahead_only_checkout_is_never_reset(self, monkeypatch, git_checkout, capsys) -> None:
+        """The CLI is the strictest surface: ahead-only has nothing to pull.
+
+        ``origin/<branch>`` is an ancestor of HEAD here, so a reset could only
+        REMOVE the local commits — refused even though the tree content
+        differs from the upstream.
+        """
+        stub = _GitStub()
+        stub.rev_list_out = "2\t0\n"  # 2 ahead, 0 behind
+        monkeypatch.setattr(subprocess, "run", stub)
+        cli_server._update()
+        out = capsys.readouterr().out
+        assert "Already up to date!" in out
+        assert "2 local commit(s) ahead" in out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_diverged_checkout_refuses_without_force(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        stub = _GitStub()
+        stub.rev_list_out = "3\t2\n"  # 3 ahead, 2 behind — diverged
+        monkeypatch.setattr(subprocess, "run", stub)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "diverged" in out
+        assert "kirocrew update --force" in out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_diverged_checkout_resets_under_force(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        stub = _GitStub()
+        stub.rev_list_out = "3\t2\n"  # 3 ahead, 2 behind — diverged
+        monkeypatch.setattr(subprocess, "run", stub)
+        cli_server._update(force=True)
+        out = capsys.readouterr().out
+        assert "--force: discarding 3 local commit(s)" in out
+        assert any(c[:2] == ["git", "reset"] for c in stub.calls)
+
+    def test_unreadable_divergence_refuses_the_reset(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """Fail closed: a guard that cannot count must not wave the reset through."""
+        stub = _GitStub(rev_list=128)
+        monkeypatch.setattr(subprocess, "run", stub)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update()
+        assert exc.value.code == 1
+        assert "Could not compare HEAD against origin/main" in capsys.readouterr().out
+        assert not any(c[:2] == ["git", "reset"] for c in stub.calls)
+
     def test_local_changes_prompt_and_abort_leaves_tree_alone(
         self, monkeypatch, git_checkout, capsys
     ) -> None:

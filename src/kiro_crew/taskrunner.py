@@ -42,7 +42,6 @@ from kiro_crew.task_models import (  # noqa: F401
     SESSION_PREFIX,
     STALL_CANCEL_TIMEOUT,
     STALL_TIMEOUT,
-    NotifyCallback,
     Project,
     Task,
     TaskStatus,
@@ -60,7 +59,8 @@ from kiro_crew.task_planner import plan_to_chat_context as _planner_plan_to_chat
 from kiro_crew.task_planner import (
     update_plan_tasks,
 )
-from kiro_crew.task_reporter import (
+from kiro_crew.task_reporter import (  # noqa: F401  (NotifyCallback re-exported)
+    NotifyCallback,
     build_resume_context,
     build_status,
     format_completion_summary,
@@ -256,6 +256,13 @@ class TaskRunner:
         self._plan_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._on_tool_approval: Callable[[LLMEvent], Awaitable[bool]] | None = None
         self._stall_cancelled_ids: set[str] = set()
+        # task_id -> the conversation the run was started FROM, so a notification
+        # can be routed back to the surface the operator is actually watching.
+        # Deliberately in memory only and deliberately not on ``Project``: it is
+        # a routing hint for the lifetime of one process, and a persisted channel
+        # key would outlive the binding it names and send a restart's first
+        # notice into a conversation that may no longer resolve.
+        self._run_session_keys: dict[str, str] = {}
         self._agent: str = ""
         self._load_runs()
 
@@ -325,8 +332,17 @@ class TaskRunner:
         task_id = f"plan_{int(time.time())}"
         _override = _resolve_workspace_dir(workspace_dir)
         _effective_ws = _override or self._workspace_dir
+        owns_task_dir = not _effective_ws
         task_dir = Path(_effective_ws) if _effective_ws else self._work_dir / f"plan_{task_id}"
-        task_dir.mkdir(parents=True, exist_ok=True)
+        created_task_dir = False
+        if owns_task_dir:
+            try:
+                task_dir.mkdir(parents=True, exist_ok=False)
+                created_task_dir = True
+            except FileExistsError:
+                pass
+        else:
+            task_dir.mkdir(parents=True, exist_ok=True)
         run = Project(
             spec_path=spec_path or "",
             spec_content=spec_content,
@@ -337,20 +353,30 @@ class TaskRunner:
             work_dir=str(task_dir),
             name=auto_name(spec_content or original_input, spec_path),
         )
-        if source == "yaml":
-            run.tasks = _decompose_yaml_with_audit(decompose_input, task_id)
-        else:
-            try:
-                run.tasks = await asyncio.wait_for(
-                    self._decompose(decompose_input, run.work_dir, task_id),
-                    timeout=180,
-                )
-            except asyncio.TimeoutError:
-                raise ValueError("Planning timed out. Try simplifying.")
-            except asyncio.CancelledError:
-                raise ValueError("Planning was cancelled.")
-        if not run.tasks:
-            raise ValueError("Could not generate a plan. Try rephrasing.")
+        try:
+            if source == "yaml":
+                run.tasks = _decompose_yaml_with_audit(decompose_input, task_id)
+            else:
+                try:
+                    run.tasks = await asyncio.wait_for(
+                        self._decompose(decompose_input, run.work_dir, task_id),
+                        timeout=180,
+                    )
+                except asyncio.TimeoutError:
+                    raise ValueError("Planning timed out. Try simplifying.")
+                except asyncio.CancelledError:
+                    raise ValueError("Planning was cancelled.")
+            if not run.tasks:
+                raise ValueError("Could not generate a plan. Try rephrasing.")
+        except Exception:
+            # Only the default plan directory belongs to this attempt. A caller's
+            # workspace is an input and must survive a rejected plan unchanged.
+            if created_task_dir:
+                try:
+                    task_dir.rmdir()
+                except OSError:
+                    logger.warning("Failed to remove rejected plan directory %s", task_dir)
+            raise
         self._runs[task_id] = run
         await self._apersist_runs()
         return run
@@ -864,7 +890,16 @@ class TaskRunner:
     async def start_background(
         self, spec_path: str | Path, agent: str = "", name: str = "", source: str = "",
         workspace_dir: str = "", auto_approve: bool = False,
+        *, session_key: str = "",
     ) -> str:
+        """Plan and execute *spec_path* in the background; returns the task id.
+
+        ``session_key`` is keyword-only and optional so every existing caller is
+        unchanged. It names the conversation this run was started FROM and is
+        handed to the notify sink, which is what lets a stall-worthy notice (an
+        approval request, a denial) reach the surface the operator started the
+        task on rather than one hard-wired destination.
+        """
         # Validate the per-run workspace override before entering the admission
         # lock so a bad/sensitive path fails without blocking other starts.
         _resolve_workspace_dir(workspace_dir)
@@ -908,10 +943,12 @@ class TaskRunner:
             for task_id in cron_done:
                 self._runs.pop(task_id, None)
                 self._stall_cancelled_ids.discard(task_id)
+                self._run_session_keys.pop(task_id, None)
             other_done = [task_id for task_id in completed if task_id in self._runs]
             for task_id in other_done[:-10]:
                 self._runs.pop(task_id, None)
                 self._stall_cancelled_ids.discard(task_id)
+                self._run_session_keys.pop(task_id, None)
 
             # Nanosecond IDs avoid routine same-second collisions. The guarded
             # increment is a deterministic fallback if a clock/platform returns
@@ -932,10 +969,13 @@ class TaskRunner:
                 source=source,
                 auto_approve=bool(auto_approve),
             )
+            if session_key:
+                self._run_session_keys[task_id] = session_key
             try:
                 await self._apersist_runs()  # durable before background execution
             except BaseException:
                 self._runs.pop(task_id, None)
+                self._run_session_keys.pop(task_id, None)
                 raise
 
             async def _wrapped() -> None:
@@ -1052,6 +1092,7 @@ class TaskRunner:
             bg_task.cancel()
         self._runs.pop(task_id, None)
         self._stall_cancelled_ids.discard(task_id)
+        self._run_session_keys.pop(task_id, None)
         await self._apersist_runs()
         try:
             # Resolved from ``kiro_crew.sel`` at call time, not through the
@@ -1188,7 +1229,12 @@ class TaskRunner:
     # ── Notifications ──
 
     async def _notify(self, title: str, body: str, run: Project | None = None) -> None:
-        await notify(title, body, run=run, callback=self._on_notify)
+        # The originating conversation is per-run, so it is resolved from the run
+        # rather than passed at each of the ~20 call sites. A notification with no
+        # run attached (a lesson learned, say) carries no conversation and falls
+        # back to the sink's own default destination.
+        session_key = self._run_session_keys.get(run.task_id, "") if run else ""
+        await notify(title, body, run=run, callback=self._on_notify, session_key=session_key)
 
     # ── History Integration ──
 

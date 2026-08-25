@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
+import sysconfig
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew import dep_sync
 from kiro_crew import platform_compat as _pc
+from kiro_crew import transcribe
 from kiro_crew.config.loader import SttConfig
 from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES
 from kiro_crew.transcribe import (
@@ -1426,3 +1431,63 @@ class TestProfileCredentialResolver:
         with patch.dict("sys.modules", {"amazon_transcribe": MagicMock(), "amazon_transcribe.auth": mock_creds_module}):
             with pytest.raises(RuntimeError, match="No AWS credentials found"):
                 await resolver.get_credentials()
+
+# ---------------------------------------------------------------------------
+# _python3_bin_dir isolation
+# ---------------------------------------------------------------------------
+
+
+class TestPython3BinDirIsolation:
+    """The scripts-dir probe asks the stdlib, never the caller's environment.
+
+    The probe imports ``sysconfig`` by name in a child ``python -c``, which
+    unisolated resolves imports from the caller's CWD (``sys.path[0]``) and
+    ``PYTHONPATH`` ahead of the stdlib -- so a decoy ``sysconfig.py`` on
+    either route could answer with any path it likes and steer the Whisper
+    script search there. Routed through ``dep_sync._probe_interpreter``
+    (``-I``), both routes are closed.
+    """
+
+    def _plant_decoy_sysconfig(self, root: Path) -> Path:
+        decoy = root / "decoy-path"
+        decoy.mkdir()
+        (decoy / "sysconfig.py").write_text(
+            "def get_path(name):\n    return '/decoy-scripts'\n", encoding="utf-8"
+        )
+        return decoy
+
+    def test_decoy_sysconfig_on_pythonpath_is_ignored(self, tmp_path, monkeypatch) -> None:
+        decoy = self._plant_decoy_sysconfig(tmp_path)
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        monkeypatch.setattr(_pc, "find_python_interpreter", lambda: sys.executable)
+
+        out = transcribe._python3_bin_dir()
+
+        # Same interpreter as this process, so the stdlib's own answer is the
+        # expected value; the decoy's constant must never be it.
+        assert out == sysconfig.get_path("scripts")
+        assert out != "/decoy-scripts"
+
+    def test_decoy_sysconfig_in_the_callers_cwd_is_ignored(self, tmp_path, monkeypatch) -> None:
+        decoy = self._plant_decoy_sysconfig(tmp_path)
+        monkeypatch.chdir(decoy)
+        monkeypatch.setattr(_pc, "find_python_interpreter", lambda: sys.executable)
+
+        out = transcribe._python3_bin_dir()
+
+        assert out == sysconfig.get_path("scripts")
+        assert out != "/decoy-scripts"
+
+    def test_a_failing_probe_answers_empty(self, monkeypatch) -> None:
+        """A broken system python degrades to "" (search continues elsewhere),
+        never a traceback out of the toolchain scan."""
+        monkeypatch.setattr(_pc, "find_python_interpreter", lambda: sys.executable)
+        monkeypatch.setattr(
+            dep_sync,
+            "_probe_interpreter",
+            lambda *a, **k: subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr=""
+            ),
+        )
+
+        assert transcribe._python3_bin_dir() == ""

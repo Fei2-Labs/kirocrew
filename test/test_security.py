@@ -8,7 +8,9 @@ import os
 import random
 import string
 import sys
+import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from oauth_url_corpus import OPERATOR_EXTENSION_OAUTH_URLS
@@ -4694,6 +4696,727 @@ class TestChdirVerbSpellings:
         assert security._is_chdir_verb("Set-Location")
         assert security._is_chdir_verb("/usr/bin/chdir")
         assert not security._is_chdir_verb("cat")
+
+
+class TestNativeHomeEntryThenFencedRead:
+    """The grammar-free scan for native Windows working-directory spellings.
+
+    Pass 2 resolves the working directory by walking the command, which needs the
+    walk to agree with the shell's grammar. For a native Windows command line it
+    does not, and #5226 showed that closing the divergences one at a time does
+    not terminate (four rounds, four elements, with a fifth visible). This scan
+    answers a question that needs no grammar: was an entry into the home
+    directory seen anywhere, and does a fenced path spelled relative to it appear
+    after that?
+    """
+
+    BS = chr(92)
+    AMP = chr(38)
+    CARET = chr(94)
+    DQ = chr(34)
+    BT = chr(96)
+
+    def test_backslash_as_separator(self) -> None:
+        """POSIX tokenizing reads `\\` as an escape, so the fenced dir vanished."""
+        assert security.is_sensitive_bash_command("cd ~; cat .aws" + self.BS + "credentials")
+        assert security.is_sensitive_bash_command(
+            "cd ~; cat .kiro" + self.BS + "crew" + self.BS + "token_signing.key"
+        )
+
+    def test_single_ampersand_as_sequencer(self) -> None:
+        """cmd.exe's `&` means "then"; in bash it backgrounds, so the walk is right
+        to keep no boundary there and this belongs to a grammar-free scan."""
+        assert security.is_sensitive_bash_command("cd ~ " + self.AMP + " cat .aws/credentials")
+        assert security.is_sensitive_bash_command(
+            "cd /d %USERPROFILE% " + self.AMP + " type .aws" + self.BS + "credentials"
+        )
+
+    def test_caret_escape(self) -> None:
+        """cmd.exe's `^` escape, tolerated INSIDE the fenced pattern only.
+
+        Two distinct positions, and they are accepted by two different parts of
+        the pattern: after the LAST segment (the trailing separator group) and
+        BETWEEN segments (the join). A single-segment entry like `.aws` only
+        exercises the first, so the keystone path is covered explicitly.
+        """
+        assert security.is_sensitive_bash_command(
+            "cd ~ " + self.AMP + " type .aws" + self.CARET + self.BS + "credentials"
+        )
+        assert security.is_sensitive_bash_command(
+            "cd ~ "
+            + self.AMP
+            + " type .kiro"
+            + self.CARET
+            + self.BS
+            + "crew"
+            + self.CARET
+            + self.BS
+            + "token_signing.key"
+        )
+
+    def test_glued_drive_switch(self) -> None:
+        """`cd/d` needs no space, and `os.path.basename('cd/d')` is `'d'`."""
+        assert security.is_sensitive_bash_command(
+            "cd/d %USERPROFILE% " + self.AMP + " type .aws" + self.BS + "credentials"
+        )
+        assert security.is_sensitive_bash_command("chdir/d ~ && cat .aws/credentials")
+
+    def test_powershell_pipeline(self) -> None:
+        """A PowerShell pipeline does not fork the directory; a bash one does."""
+        assert security.is_sensitive_bash_command(
+            "Set-Location ~ -PassThru | ForEach-Object { Get-Content .aws/credentials }"
+        )
+        assert security.is_sensitive_bash_command("Set-Location ~ | Get-Content .aws/credentials")
+
+    def test_bare_chdir_lands_in_the_home_directory(self) -> None:
+        assert security.is_sensitive_bash_command("cd; cat .aws/credentials")
+        assert security.is_sensitive_bash_command(
+            "cd " + self.AMP + self.AMP + " cat .kiro/crew/token_signing.key"
+        )
+
+    def test_caret_does_not_eat_a_regex_anchor(self) -> None:
+        """The reason `^` is NOT stripped globally.
+
+        A global strip would turn `grep '^.aws/credentials'` into a path and deny
+        a file the command never opens. Tolerating the caret only between fenced
+        SEGMENTS cannot reach an anchor elsewhere in the command.
+        """
+        assert (
+            security.is_sensitive_bash_command("cd ~; grep '" + self.CARET + "foo' notes.txt")
+            is None
+        )
+        assert (
+            security.is_sensitive_bash_command("cd ~; grep -n '" + self.CARET + "def ' main.py")
+            is None
+        )
+
+    def test_no_home_entry_means_no_denial(self) -> None:
+        """The scan is ordered: the entry must be seen BEFORE the relative name."""
+        assert security.is_sensitive_bash_command("cd /tmp; cat build/out.log") is None
+        assert security.is_sensitive_bash_command("cd /tmp " + self.AMP + " cat notes.txt") is None
+        assert security.is_sensitive_bash_command("cat notes.txt") is None
+
+    def test_benign_relative_reads_after_entering_home(self) -> None:
+        assert security.is_sensitive_bash_command("cd ~; cat notes.txt") is None
+        assert security.is_sensitive_bash_command("cd ~; cat project/main.py") is None
+        assert security.is_sensitive_bash_command("Set-Location ~ | Get-Content notes.txt") is None
+        assert security.is_sensitive_bash_command("cd ~; cat my" + self.BS + " notes.txt") is None
+
+    def test_lookalike_directory_names_are_not_fenced(self) -> None:
+        """A name that merely STARTS like a fenced dir is a different directory."""
+        assert security.is_sensitive_bash_command("cd ~; cat .awsome/config") is None
+        assert security.is_sensitive_bash_command("cd ~; cat .kirocrewnotes") is None
+
+    def test_quoted_home_target(self) -> None:
+        """cmd.exe and PowerShell both accept a quoted chdir target.
+
+        `cd /d "%USERPROFILE%"` puts a quote between the whitespace and the
+        anchor, so a pattern that required the anchor to start immediately after
+        whitespace saw no entry at all.
+        """
+        assert security.is_sensitive_bash_command(
+            'cd /d "%USERPROFILE%" ' + self.AMP + " more .aws" + self.BS + "credentials"
+        )
+        assert security.is_sensitive_bash_command(
+            'cd "~" ' + self.AMP + " cat .aws/credentials"
+        )
+        assert security.is_sensitive_bash_command("cd '~' " + self.AMP + " cat .aws/credentials")
+        assert security.is_sensitive_bash_command(
+            'cd "%USERPROFILE%"; type .aws' + self.BS + "credentials"
+        )
+
+    def test_redirection_boundary_before_the_fenced_tail(self) -> None:
+        """A redirection operator starts a path just as whitespace does.
+
+        `more<.aws\\credentials` has no space before the name. The boundary is now
+        defined by what a path IS -- the name must not be preceded by a path
+        character -- rather than by an enumerated list of the punctuation that may
+        precede it, so every operator is covered at once instead of one per round.
+        """
+        assert security.is_sensitive_bash_command(
+            "cd %USERPROFILE% " + self.AMP + " more<.aws" + self.BS + "credentials"
+        )
+        assert security.is_sensitive_bash_command(
+            "cd ~ " + self.AMP + " more<.aws/credentials"
+        )
+        assert security.is_sensitive_bash_command("cd ~; cat >.aws/credentials")
+        assert security.is_sensitive_bash_command("cd ~; {cat .aws/credentials;}")
+
+    def test_entering_a_home_SUBdirectory_is_not_entering_home(self) -> None:
+        """The trailing lookaround refuses a path continuation, not just a terminator.
+
+        `cd ~/project` moves somewhere whose `.aws` tail resolves to
+        `~/project/.aws`, which is not fenced -- so this must NOT count as an
+        entry, quoted or not.
+        """
+        assert security.is_sensitive_bash_command('cd "~/project"; cat main.py') is None
+        assert security.is_sensitive_bash_command("cd ~/project; cat .aws/credentials") is None
+        assert security.is_sensitive_bash_command("cd ~/project " + self.AMP + " cat x.py") is None
+
+    def test_longer_filename_ending_in_a_fenced_name(self) -> None:
+        """The leading lookaround also rejects a name that merely ENDS this way."""
+        assert security.is_sensitive_bash_command("cd ~; cat x.aws/credentials") is None
+        assert security.is_sensitive_bash_command("cd ~; cat my.kiro/crew/x") is None
+
+    def test_home_target_bound_to_a_parameter(self) -> None:
+        """`Set-Location -Path:~` binds the target to the flag with `:` or `=`.
+
+        The switch group would otherwise consume `-Path:~` whole and the entry
+        would never be seen. Same class as the bound-payload finding on #5226,
+        which the walk solved in `_chdir_candidates`; this raw-text scan needs its
+        own form of it.
+        """
+        assert security.is_sensitive_bash_command("Set-Location -Path:~ | Get-Content .npmrc")
+        assert security.is_sensitive_bash_command(
+            "Set-Location -Path=~ | Get-Content .aws/credentials"
+        )
+        assert security.is_sensitive_bash_command(
+            "cd -LiteralPath:%USERPROFILE% " + self.AMP + " type .aws" + self.BS + "credentials"
+        )
+
+    def test_operator_directly_after_the_fenced_name(self) -> None:
+        """The TRAILING boundary is the same non-path rule as the leading one.
+
+        Round 1 generalised only the leading side, so `type .npmrc&echo ok` stayed
+        outside the scan because `&` was not in the enumerated terminator list.
+        Stating the rule once as "a separator, or not path-adjacent" covers every
+        operator, brace and quote at once.
+        """
+        assert security.is_sensitive_bash_command(
+            "cd ~ " + self.AMP + " type .npmrc" + self.AMP + "echo ok"
+        )
+        assert security.is_sensitive_bash_command("cd ~; cat .aws/credentials|wc -l")
+        assert security.is_sensitive_bash_command("cd ~; cat .npmrc>out.txt")
+        assert security.is_sensitive_bash_command("cd ~; {cat .npmrc;}")
+        # The same boundary must still reject a longer name that only ends this way.
+        assert security.is_sensitive_bash_command("cd ~; cat .npmrcnotes") is None
+
+    def test_the_resolved_home_is_not_bound_at_import_time(self) -> None:
+        """The home is resolved per call, not once per process.
+
+        A module-level `Path.home()` freezes the answer for the life of the
+        process, which `test_host_isolation_floor`'s shared-path ratchet forbids
+        and which would make a repointed home invisible to this scan. There is no
+        longer a cached pattern to freeze it in -- `_names_home_directory` shapes
+        `Path.home()` on each call -- so this is now assertable by BEHAVIOUR
+        rather than by inspecting a constant.
+        """
+        assert "USERPROFILE" in security._HOME_SEGMENT_RE.pattern
+        assert str(Path.home()) not in security._HOME_SEGMENT_RE.pattern
+        # Repoint the home and the same command changes verdict, with no cache to
+        # invalidate and no reload.
+        elsewhere = "/nonexistent-home-" + "for-this-test"
+        assert security._names_home_directory(elsewhere) is False
+        with mock.patch.object(security.Path, "home", staticmethod(lambda: Path(elsewhere))):
+            assert security._names_home_directory(elsewhere) is True
+
+    def test_trailing_separator_on_the_home_target(self) -> None:
+        """`cd %USERPROFILE%\\` and `cd ~/` still land in the home directory.
+
+        A trailing separator with nothing after it names the same directory, so it
+        is consumed -- but only when nothing path-like follows, which is what keeps
+        `cd ~/project` out.
+        """
+        assert security.is_sensitive_bash_command(
+            "cd %USERPROFILE%" + self.BS + " " + self.AMP + " type .aws" + self.BS + "credentials"
+        )
+        assert security.is_sensitive_bash_command("cd ~/ " + self.AMP + " cat .aws/credentials")
+        assert security.is_sensitive_bash_command("cd ~/ ; cat .aws/credentials")
+        # The subdirectory rule must survive the trailing-separator allowance.
+        assert security.is_sensitive_bash_command("cd ~/project; cat .aws/credentials") is None
+        assert security.is_sensitive_bash_command("cd ~/project/ ; cat .aws/credentials") is None
+
+    def test_the_caret_escape_is_closed_at_every_position(self) -> None:
+        """cmd.exe's `^` escapes the next character anywhere, and now all of it is read.
+
+        Six review rounds treated this as unreachable by a pattern, and that was
+        true of a pattern: `^` can sit between ANY two characters of ANY token, so
+        a raw-text scan would need an optional caret interleaved everywhere. It is
+        trivial for a NORMALIZER, because a word is stripped once before it is
+        interpreted -- which is why closing the caret fell out of the rewrite
+        rather than needing its own mechanism.
+        """
+        for spelling in (
+            "cd ~ " + self.AMP + " type .aw" + self.CARET + "s" + self.BS + "credentials",
+            "cd ~ " + self.AMP + " type " + self.CARET + ".aws" + self.BS + "credentials",
+            "c" + self.CARET + "d ~ " + self.AMP + " type .aws" + self.BS + "credentials",
+            "cd %USER"
+            + self.CARET
+            + "PROFILE% "
+            + self.AMP
+            + " type .aws"
+            + self.BS
+            + "credentials",
+        ):
+            assert security.is_sensitive_bash_command(spelling) is not None, spelling
+
+    def test_a_doubled_caret_is_a_literal_caret_not_a_deletion(self) -> None:
+        """`.a^^ws` is a file NAMED `.a^ws`, so it is not the fenced directory.
+
+        This is the case that separates applying cmd.exe's escape from merely
+        deleting every caret. A naive strip yields `.aws` and denies a command
+        that never touches the credential store; the real rule -- `^^` collapses
+        to one literal caret -- keeps them distinct.
+        """
+        assert (
+            security.is_sensitive_bash_command(
+                "cd ~ " + self.AMP + " type .a" + self.CARET * 2 + "ws" + self.BS + "credentials"
+            )
+            is None
+        )
+        # And the odd-numbered sibling IS the fenced path, so the rule is not just
+        # "give up whenever a caret appears".
+        assert (
+            security.is_sensitive_bash_command(
+                "cd ~ " + self.AMP + " type .aw" + self.CARET + "s" + self.BS + "credentials"
+            )
+            is not None
+        )
+
+    def test_a_regex_anchor_naming_no_fenced_path_stays_allowed(self) -> None:
+        """The invariant the caret work actually had to protect.
+
+        Stripping carets was long argued to be unacceptable because it would deny
+        `grep '^.aws/credentials' notes.txt`. That was not a principle: the
+        byte-identical command WITHOUT the caret is already denied, by this pass
+        and by the absolute-path pass, because naming a fenced path is itself the
+        signal. The caret was granting an exemption its own sibling never had.
+
+        What genuinely must keep working is a regex that names no fenced path.
+        """
+        for benign in (
+            "cd ~; grep '" + self.CARET + "def ' main.py",
+            "cd ~; grep -n '" + self.CARET + "import' main.py",
+            "cd ~; grep '" + self.CARET + "$' blank_lines.txt",
+        ):
+            assert security.is_sensitive_bash_command(benign) is None, benign
+        # The consistency this buys: caret or no caret, naming the fenced path
+        # reads the same way.
+        with_caret = "cd ~; grep '" + self.CARET + ".aws/credentials' notes.txt"
+        without = "cd ~; grep '.aws/credentials' notes.txt"
+        assert (security.is_sensitive_bash_command(with_caret) is None) == (
+            security.is_sensitive_bash_command(without) is None
+        )
+
+    def test_delayed_expansion_home_anchor_is_an_entry(self) -> None:
+        """`!USERPROFILE!` names the home directory as surely as `%USERPROFILE%`.
+
+        cmd.exe expands `!NAME!` under `/V:ON` (or `setlocal
+        EnableDelayedExpansion`). Reading only the `%` delimiter meant an
+        identical command written the delayed way was a different string to the
+        scan. Both delimiters are now generated from one variable name, so the
+        delimiter is a parameter rather than a per-spelling entry -- which is why
+        the mixed form below is covered without its own rule.
+        """
+        for target in (
+            "!USERPROFILE!",
+            "!HOMEDRIVE!!HOMEPATH!",
+            "%HOMEDRIVE%!HOMEPATH!",
+        ):
+            assert (
+                security.is_sensitive_bash_command(
+                    "cd /d " + target + " " + self.AMP + " type .aws" + self.BS + "credentials"
+                )
+                is not None
+            ), target
+
+    def test_delayed_expansion_inside_a_cmd_wrapper(self) -> None:
+        """The reported spelling verbatim: the whole command is one `cmd /V:ON /C` string."""
+        assert (
+            security.is_sensitive_bash_command(
+                'cmd /V:ON /C "cd /d !USERPROFILE! '
+                + self.AMP
+                + " type .aws"
+                + self.BS
+                + 'credentials"'
+            )
+            is not None
+        )
+
+    def test_drive_relative_fenced_tail_is_a_read(self) -> None:
+        """A drive letter with no separator means "current dir on that drive".
+
+        So `C:.aws\\credentials` is precisely the relative-tail shape this scan
+        exists for. It was previously refused by the leading boundary itself,
+        because `:` is path-adjacent -- the prefix is now part of the match rather
+        than something excluded before it.
+        """
+        for tail in ("C:.aws" + self.BS + "credentials", "C:.ssh/id_rsa"):
+            assert (
+                security.is_sensitive_bash_command("cd ~ " + self.AMP + " type " + tail)
+                is not None
+            ), tail
+
+    def test_drive_relative_benign_target_still_allowed(self) -> None:
+        """The drive prefix widens the boundary, not the fenced set."""
+        assert (
+            security.is_sensitive_bash_command(
+                "cd ~ " + self.AMP + " type C:src" + self.BS + "main.py"
+            )
+            is None
+        )
+
+    def test_delayed_expansion_needs_the_fenced_target(self) -> None:
+        """Naming the home variable is not itself the signal -- the read is."""
+        for benign in (
+            "cd ~ " + self.AMP + " echo !USERPROFILE!",
+            "cd !USERPROFILE! " + self.AMP + " type README.md",
+        ):
+            assert security.is_sensitive_bash_command(benign) is None, benign
+
+    def test_drive_relative_tail_still_needs_the_home_entry(self) -> None:
+        """`cd ~/project` is not home, and the drive prefix does not change that."""
+        assert (
+            security.is_sensitive_bash_command(
+                "cd ~/project " + self.AMP + " type C:.aws" + self.BS + "credentials"
+            )
+            is None
+        )
+
+    def test_switch_with_a_separate_value_still_finds_the_target(self) -> None:
+        """`Set-Location -ErrorAction Stop ~` -- the switch value is its own token.
+
+        A PowerShell parameter can take its value space-separated, so the flag has
+        to be allowed to carry a following word. The risk that creates is the
+        opposite one: the value group swallowing the target. It cannot, because a
+        successful match still requires the target and the optional group
+        backtracks out of the way -- which is what the no-value case below pins.
+        """
+        for entry in (
+            "Set-Location -ErrorAction Stop ~",
+            "Set-Location -ErrorAction:Stop ~",
+            "Set-Location -Force ~",
+            "Set-Location ~",
+        ):
+            assert (
+                security.is_sensitive_bash_command(entry + " | Get-Content .aws/credentials")
+                is not None
+            ), entry
+
+    def test_switch_value_does_not_invent_a_home_entry(self) -> None:
+        """A non-home target stays a non-home target however many switches precede it."""
+        assert (
+            security.is_sensitive_bash_command(
+                "Set-Location -ErrorAction Stop /tmp | Get-Content .aws/credentials"
+            )
+            is None
+        )
+
+    def test_resolved_home_separators_are_interchangeable(self) -> None:
+        """`C:/Users/u` and `C:\\Users\\u` are the same directory to every Windows shell.
+
+        This used to need a helper that rewrote separators inside an escaped
+        pattern. Normalization makes it structural: both spellings shape to the
+        same segments, so there is nothing left to keep in sync.
+        """
+        assert security._shape_path_token("C:" + self.BS + "Users" + self.BS + "u") == (
+            security._shape_path_token("C:/Users/u")
+        )
+        # A separator is still a separator, not a wildcard: a different character
+        # there is a different path.
+        assert security._shape_path_token("C:xUsersxu") != (
+            security._shape_path_token("C:/Users/u")
+        )
+
+    def test_noop_traversal_chain_is_the_same_file(self) -> None:
+        """`project\\..\\.aws\\credentials` names exactly `.aws\\credentials`."""
+        for tail in (
+            "project" + self.BS + ".." + self.BS + ".aws" + self.BS + "credentials",
+            "project/../.aws/credentials",
+            "a" + self.BS + ".." + self.BS + "b" + self.BS + ".." + self.BS + ".aws/credentials",
+            "./project" + self.BS + ".." + self.BS + ".ssh/id_" + "rsa",
+        ):
+            assert (
+                security.is_sensitive_bash_command("cd ~ " + self.AMP + " type " + tail)
+                is not None
+            ), tail
+
+    def test_traversal_that_leaves_the_directory_is_not_this_scan(self) -> None:
+        """A chain is consumed only when it provably returns where it started.
+
+        `project\\..\\..\\.aws` resolves ABOVE the shell's directory, so it is a
+        different file and denying it would be denying something this scan has no
+        claim on. The cancelled segment may therefore not itself be `..`.
+        """
+        assert (
+            security.is_sensitive_bash_command(
+                "cd ~ "
+                + self.AMP
+                + " type project"
+                + self.BS
+                + ".."
+                + self.BS
+                + ".."
+                + self.BS
+                + ".aws"
+                + self.BS
+                + "credentials"
+            )
+            is None
+        )
+
+    def test_noop_traversal_needs_a_fenced_target(self) -> None:
+        """The chain widens the prefix, not the fenced set."""
+        assert (
+            security.is_sensitive_bash_command(
+                "cd ~ " + self.AMP + " type project" + self.BS + ".." + self.BS + "notes.txt"
+            )
+            is None
+        )
+
+    def test_traversal_prefix_does_not_backtrack_catastrophically(self) -> None:
+        """A `+` nested in a `*` is where a regex denial-of-service would live.
+
+        Each iteration is rigidly delimited -- one greedy run bounded by
+        separators, then a literal `\\..\\` -- so there is only one way to split
+        it and the near-miss below cannot blow up.
+        """
+        near_miss = "cd ~ " + self.AMP + " type " + ("a" + self.BS + ".." + self.BS) * 60 + "x"
+        started = time.perf_counter()
+        assert security.is_sensitive_bash_command(near_miss) is None
+        assert time.perf_counter() - started < 1.0
+
+    def test_bare_parent_is_not_a_cancelling_chain(self) -> None:
+        """A `..` that climbs above the starting directory names a different file.
+
+        Under the old pattern this was a guard nothing could observe, because an
+        earlier pass already denied the same string. Normalization makes it a
+        property of the shape itself: the path is marked as having ESCAPED, which
+        is why it can be excluded on principle rather than by pattern.
+        """
+        for spelling in (
+            ".." + self.BS + ".." + self.BS + ".aws" + self.BS + "credentials",
+            "../../.aws/credentials",
+            "project" + self.BS + ".." + self.BS + ".." + self.BS + ".aws",
+        ):
+            assert security._shape_path_token(spelling).escaped is True, spelling
+        # The cancelling forms return to where they started, so they are NOT
+        # escaped and DO name the fenced path -- one function, both answers.
+        for cancelling in (
+            "project" + self.BS + ".." + self.BS + ".aws" + self.BS + "credentials",
+            "a" + self.BS + "b" + self.BS + ".." + self.BS + ".." + self.BS + ".aws",
+            "a/b/c/../../../.aws/credentials",
+            "." + self.BS + ".aws" + self.BS + "credentials",
+        ):
+            shape = security._shape_path_token(cancelling)
+            assert shape.escaped is False, cancelling
+            assert security._fenced_relative_prefix(shape) == ".aws", cancelling
+
+    def test_trailing_dot_on_a_fenced_component_is_the_same_directory(self) -> None:
+        """Windows drops trailing dots and spaces from every path component.
+
+        So `.aws.` and `.aws` are one directory, and `type .aws.\\credentials` after
+        entering home really does read the credential. A whole-segment comparison
+        without this rule lets one trailing dot walk past EVERY fenced entry at
+        once, which is why it is normalized rather than enumerated.
+
+        Found by an adversarial review of the rewrite, not by a reviewer bot.
+        """
+        for tail in (
+            ".aws." + self.BS + "credentials",
+            ".aws..." + self.BS + "credentials",
+            ".ssh." + self.BS + "id_" + "rsa",
+            ".npmrc.",
+            ".config" + self.BS + "gcloud." + self.BS + "x",
+        ):
+            assert (
+                security.is_sensitive_bash_command("cd ~ " + self.AMP + " type " + tail)
+                is not None
+            ), tail
+
+    def test_dot_only_segments_keep_their_meaning(self) -> None:
+        """Stripping padding must not eat `.` or `..`, which are navigation.
+
+        If the padding rule applied to a dot-only segment it would erase the
+        netting that decides whether a path escapes its directory -- and that would
+        silently turn every escaping traversal back into a fenced match.
+        """
+        assert security._strip_windows_component_padding("..") == ".."
+        assert security._strip_windows_component_padding(".") == "."
+        assert security._strip_windows_component_padding(".aws.") == ".aws"
+        assert security._strip_windows_component_padding(".aws ") == ".aws"
+        # And the invariant it protects still holds end to end.
+        assert (
+            security._shape_path_token(
+                "project" + self.BS + ".." + self.BS + ".." + self.BS + ".aws"
+            ).escaped
+            is True
+        )
+
+    def test_a_name_split_across_a_quote_is_rejoined(self) -> None:
+        """`.aw"s\\credentials"` is ONE argument to cmd.exe, so it must read as one.
+
+        Quotes are skipped rather than treated as word boundaries. A boundary tore
+        the fenced name into `.aw` and `s\\credentials`, neither of which matches
+        anything -- while the shell would hand the program the joined path.
+        """
+        for spelling in (
+            "type .aw" + self.DQ + "s" + self.BS + "credentials" + self.DQ,
+            "type " + self.DQ + ".aws" + self.DQ + self.BS + "credentials",
+            "type .aws" + self.DQ + self.BS + "credentials" + self.DQ,
+            "type '.aw's" + self.BS + "credentials",
+        ):
+            assert (
+                security.is_sensitive_bash_command("cd ~ " + self.AMP + " " + spelling)
+                is not None
+            ), spelling
+
+    def test_skipping_quotes_does_not_fuse_separate_arguments(self) -> None:
+        """Whitespace still ends a word, so quoted arguments stay separate."""
+        assert [w for _o, w, _n in security._native_words('echo "a" "b"')] == [
+            "echo",
+            "a",
+            "b",
+        ]
+        assert [w for _o, w, _n in security._native_words('cd /d "%USERPROFILE%"')] == [
+            "cd",
+            "/d",
+            "%USERPROFILE%",
+        ]
+
+    def test_powershell_backtick_escape_is_read_like_the_caret(self) -> None:
+        """PowerShell escapes with a backtick, cmd.exe with a caret.
+
+        The rewrite closed the caret and left this one open -- the same omission,
+        one shell over, and the reason both now live in the word layer instead of
+        being handled per-shell. The backtick is deliberately not an operator here
+        even though bash reads it as command substitution: this is the
+        native-Windows pass, and bash's substitution is the segment splitter's job.
+        """
+        for spelling in (
+            "cd ~ " + self.AMP + " type .aw" + self.BT + "s" + self.BS + "credentials",
+            "c" + self.BT + "d ~ " + self.AMP + " type .aws" + self.BS + "credentials",
+            "cd %USER"
+            + self.BT
+            + "PROFILE% "
+            + self.AMP
+            + " type .aws"
+            + self.BS
+            + "credentials",
+        ):
+            assert security.is_sensitive_bash_command(spelling) is not None, spelling
+
+    def test_a_home_directory_containing_a_space(self) -> None:
+        """`C:\\Users\\John Doe` is an ordinary Windows home, quoted or not.
+
+        Quoted, the space belongs to the path. UNQUOTED it still does, because
+        cmd.exe's `cd` takes the rest of the line as its argument -- which is why
+        the target search also tries the running join of the words it has seen.
+        """
+        home = "C:" + self.BS + "Users" + self.BS + "John Doe"
+        with mock.patch.object(security.Path, "home", staticmethod(lambda: Path(home))):
+            for entry in (
+                'cd /d "' + home + '"',
+                "cd /d " + home,
+                'cd /d "c:' + self.BS + "users" + self.BS + 'john doe"',
+            ):
+                assert (
+                    security.is_sensitive_bash_command(
+                        entry + " " + self.AMP + " type .aws" + self.BS + "credentials"
+                    )
+                    is not None
+                ), entry
+
+    def test_the_resolved_home_comparison_is_case_insensitive(self) -> None:
+        """Windows paths are case-insensitive, and this was the one compare that was not.
+
+        The fenced-segment compare and the anchor pattern already fold, so a
+        case-varied spelling of the resolved home was the single remaining way to
+        miss an entry by capitalisation alone.
+        """
+        home = "C:" + self.BS + "Users" + self.BS + "U"
+        with mock.patch.object(security.Path, "home", staticmethod(lambda: Path(home))):
+            for spelling in ("c:/users/u", "C:" + self.BS + "uSeRs" + self.BS + "U"):
+                assert security._names_home_directory(spelling) is True, spelling
+            assert security._names_home_directory("C:" + self.BS + "Users" + self.BS + "V") is False
+
+    def test_any_number_of_parameters_may_precede_the_target(self) -> None:
+        """A bounded window on target candidates was wrong for a nameable reason.
+
+        A PowerShell parameter can take its value as a separate word, so an
+        arbitrary number of words can sit between the verb and its positional
+        target. Any cap stops short of some legitimate spelling, so the whole
+        operator-delimited run is scanned instead.
+        """
+        assert (
+            security.is_sensitive_bash_command(
+                "Set-Location -ErrorAction Stop -WarningAction Stop -Verbose ~"
+                " | Get-Content .aws/credentials"
+            )
+            is not None
+        )
+        # An operator still ends the run, which is what stops the scan reaching a
+        # `~` that belongs to a different command. Here the shell is in /tmp, so
+        # `.aws/credentials` resolves under /tmp and is not the fenced store.
+        assert (
+            security.is_sensitive_bash_command("cd /tmp ; echo ~ ; cat .aws/credentials")
+            is None
+        )
+
+    def test_a_fenced_entry_containing_a_space(self) -> None:
+        """Two fenced entries have a space in them, so a word cannot end at one."""
+        assert (
+            security.is_sensitive_bash_command(
+                "cd ~ " + self.AMP + ' type "Library/Application Support/kiro-cli/x"'
+            )
+            is not None
+        )
+
+    def test_a_quoted_region_yields_both_readings(self) -> None:
+        """Quoted whitespace is ambiguous, so the scan takes the path AND the parts.
+
+        `"C:\\Users\\John Doe"` is one path; `cmd /C "cd ~ & type .aws\\credentials"`
+        is a command line that must still be cut apart. Nothing in the text says
+        which, so both readings are emitted -- sound only because the scan is
+        monotone, where an extra reading can add a denial but never remove one.
+        """
+        words = [w for _o, w, _n in security._native_words('a "b c" d')]
+        assert "b" in words and "c" in words and "b c" in words
+        # The nested-command reading is what the joined-only form would have lost.
+        assert (
+            security.is_sensitive_bash_command(
+                'cmd /V:ON /C "cd /d !USERPROFILE! '
+                + self.AMP
+                + " type .aws"
+                + self.BS
+                + 'credentials"'
+            )
+            is not None
+        )
+
+    def test_verb_alternation_tracks_the_shared_set(self) -> None:
+        """The scan reads `_CHDIR_VERBS`, so a new spelling needs one edit not two."""
+        for verb in security._CHDIR_VERBS:
+            assert security.is_sensitive_bash_command(
+                verb + " ~ " + self.AMP + " cat .aws/credentials"
+            ), verb
+
+    def test_home_target_spellings_match_the_absolute_pass(self) -> None:
+        """Drift guard: every anchor the absolute pass accepts also anchors an entry.
+
+        `_HOME_TARGET_ALT`, `_WINDOWS_HOME_ANCHOR_RE` and the `userprofile` group
+        inside `_build_sensitive_regex` are three lists of the same thing; pin
+        them to one set so a spelling added to one is not missing from another.
+        """
+        anchors = (
+            "~",
+            "$HOME",
+            "%USERPROFILE%",
+            "%HOMEDRIVE%%HOMEPATH%",
+            "$env:USERPROFILE",
+            "${env:USERPROFILE}",
+            "$env:HOMEDRIVE$env:HOMEPATH",
+            "${env:HOMEDRIVE}${env:HOMEPATH}",
+        )
+        for anchor in anchors:
+            # Absolute spelling: the anchor names the fenced path outright.
+            assert security.is_sensitive_bash_command(
+                "type " + anchor + "/.aws/credentials"
+            ), anchor
+            # Entry spelling: the anchor is the chdir target, the tail relative.
+            assert security.is_sensitive_bash_command(
+                "cd " + anchor + " " + self.AMP + " type .aws/credentials"
+            ), anchor
 
 
 class TestWindowsPathShapes:

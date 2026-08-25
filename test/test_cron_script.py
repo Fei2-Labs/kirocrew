@@ -123,7 +123,7 @@ class TestRunCommandSandboxed:
     """Tests for run_command_sandboxed shell execution."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, posix_test_shell):
         """Run commands directly, bypassing the OS-sandbox wrap.
 
         These tests exercise the run_command_sandboxed output/exit-code plumbing,
@@ -137,8 +137,9 @@ class TestRunCommandSandboxed:
         )
         # Bypass the runtime shell probe (which itself spawns a child): these
         # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
-        # Return "sh" so Popen mocks that assert on argv[0] still see it.
-        monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: "sh")
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
+        )
 
     def test_basic_echo(self):
         result = run_command_sandboxed("echo hello")
@@ -166,6 +167,57 @@ class TestRunCommandSandboxed:
         result = run_command_sandboxed("head -c 70000 /dev/zero | tr '\\0' 'x'")
         assert "truncated" in result["output"]
         assert len(result["output"]) <= 70000
+
+    def test_nonzero_exit_reports_stderr_tail_not_head(self):
+        """A leading startup warning must not displace the terminal error."""
+        leading_warning = "startup warning: " + ("x" * 1000)
+        terminal_error = "sh: fatal: actual cause"
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate.return_value = ("", leading_warning + "\n" + terminal_error)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            result = run_command_sandboxed("boom")
+        assert result["status"] == "error"
+        assert "actual cause" in result["output"]
+        assert "startup warning" not in result["output"]
+
+    def test_nonzero_exit_redacts_stderr_before_truncating(self):
+        """A credential straddling the 1000-char boundary must not leak its tail.
+
+        Redaction must run on the WHOLE stderr before the tail slice: slicing
+        first can cut off a secret's detectable prefix, so the pattern no
+        longer matches and the raw tail reaches the cron result.
+        """
+        # Built at runtime so no credential-shaped literal lands in the repo.
+        fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+        # Sized so the 1000-char tail window starts 2 chars into the credential:
+        # a slice-then-redact order keeps "IA" + all 16 B's but drops the
+        # "AK" prefix, so the pattern no longer matches and the tail leaks.
+        padding = "p" * 100
+        trailing = "e" * 982
+        stderr_text = padding + fake_key + trailing
+        assert len(stderr_text) - 1000 == len(padding) + 2
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate.return_value = ("", stderr_text)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            result = run_command_sandboxed("boom")
+        assert result["status"] == "error"
+        assert "B" * 16 not in result["output"]
+        assert fake_key not in result["output"]
+        # Positive proof the payload flowed through redaction (not a vacuous
+        # pass on an empty result): the marker's tail survives the tail slice.
+        assert "credential]" in result["output"]
+        assert "e" * 50 in result["output"]
+
+    def test_nonzero_exit_short_stderr_stays_whole(self):
+        """A stderr already shorter than the 1000-char bound is kept whole."""
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.communicate.return_value = ("", "short failure\n")
+        with patch("subprocess.Popen", return_value=mock_proc):
+            result = run_command_sandboxed("boom")
+        assert result["output"].endswith("stderr:\nshort failure")
 
 
 class TestCronSandboxUnavailableIsStructuredNotRaised:
@@ -326,7 +378,7 @@ class TestRunScriptSandboxed:
     """Tests for run_script_sandboxed Python function execution."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, posix_test_shell):
         """Bypass OS-sandbox wrap and ensure subprocess can import kiro_crew.
 
         wrap_argv fails closed when no sandbox backend is available (e.g. macOS 26
@@ -345,8 +397,9 @@ class TestRunScriptSandboxed:
         )
         # Bypass the runtime shell probe (which itself spawns a child): these
         # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
-        # Return "sh" so Popen mocks that assert on argv[0] still see it.
-        monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: "sh")
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
+        )
 
     def _write_script(self, tmp_path, code):
         crons_dir = tmp_path / ".kirocrew" / "crons"
@@ -354,6 +407,140 @@ class TestRunScriptSandboxed:
         script = crons_dir / "test_script.py"
         script.write_text(code)
         return str(script)
+
+    # ── Terminal stderr context on a hard failure ──
+    # These five drive the real ``proc.returncode != 0 and not stdout.strip()``
+    # branch through a real subprocess. The launcher ``exec``s the user module
+    # OUTSIDE its try/except, so a module-level raise is exactly the shape that
+    # reaches that branch: unhandled traceback on stderr, non-zero exit, and no
+    # structured stdout to parse.
+
+    TERMINAL_SENTINEL = "REAL_TERMINAL_FAILURE_9f3a"
+
+    def test_a_terminal_failure_survives_leading_stderr_noise(self, tmp_path):
+        """The reported error must name why the script died, not what it warned about.
+
+        A process that dies hard leaves its diagnosis at the END of stderr — the
+        traceback is the last thing written. Anything a startup path logged
+        first (a migration warning, a deprecation notice, an import-time banner)
+        sits in front of it, so reporting the HEAD of stderr reports the noise
+        and truncates the cause. The operator then reads a cron failure whose
+        message describes something that did not kill the job.
+
+        900 characters of leading noise is deliberately past the 500-byte bound,
+        so a head-anchored report cannot contain the sentinel by accident.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            'import sys\n'
+            'sys.stderr.write("W" * 900 + "\\n")\n'
+            'sys.stderr.flush()\n'
+            f'raise RuntimeError("{self.TERMINAL_SENTINEL}")\n',
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert self.TERMINAL_SENTINEL in result["error"], (
+            "the reported error is the head of stderr, so the terminal failure "
+            f"was truncated away: {result['error'][:120]!r}"
+        )
+
+    def test_a_short_stderr_is_reported_whole(self, tmp_path):
+        """Bounding must not start cutting output that already fits.
+
+        The bound exists to cap a runaway stderr, not to reshape the ordinary
+        case, so a diagnosis shorter than the cap keeps both ends. This one is a
+        CONTROL: it must pass identically before and after the change, which is
+        why the child exits WITHOUT a traceback -- an interpreter traceback
+        carries two absolute temp paths, and on Windows those alone push even a
+        one-line diagnosis past the bound, which would quietly turn this control
+        into a second copy of the case above.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            'import os, sys\n'
+            'sys.stderr.write("LEADING_CONTEXT\\n")\n'
+            f'sys.stderr.write("{self.TERMINAL_SENTINEL}\\n")\n'
+            'sys.stderr.flush()\n'
+            'os._exit(2)\n',
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert "LEADING_CONTEXT" in result["error"]
+        assert self.TERMINAL_SENTINEL in result["error"]
+
+    def test_a_silent_hard_exit_still_reports_the_exit_code(self, tmp_path):
+        """With nothing on either stream, the exit code is the only diagnosis.
+
+        ``os._exit`` skips the launcher's handlers entirely, which is what a
+        killed or self-terminating child looks like. The fallback must survive
+        the change, or those failures become an empty error string.
+        """
+        script_path = self._write_script(tmp_path, 'import os\nos._exit(3)\n')
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert result["error"] == "exit 3"
+
+    def test_a_credential_in_the_terminal_stderr_is_redacted(self, tmp_path):
+        """The reported text still leaves the box, so redaction still applies.
+
+        Moving WHICH slice of stderr is reported must not move it out from
+        behind ``redact`` — a traceback can carry a key in a repr just as a
+        startup warning can.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            'import sys\n'
+            'sys.stderr.write("W" * 900 + "\\n")\n'
+            'sys.stderr.flush()\n'
+            'raise RuntimeError("boom AKIAIOSFODNN7EXAMPLE")\n',
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert "AKIAIOSFODNN7EXAMPLE" not in result["error"]
+        assert "[REDACTED" in result["error"]
+
+    def test_a_credential_straddling_the_bound_does_not_leak_a_fragment(
+        self, tmp_path
+    ):
+        """Redaction must see the WHOLE stream before the 500-char bound cuts it.
+
+        If the suffix is sliced first, a credential that straddles the cut
+        point loses its leading characters before ``redact`` runs — and the
+        surviving fragment no longer matches any credential pattern, so it
+        reaches logs and the persisted ``last_error`` unmasked.
+
+        Byte layout (written verbatim, ``os._exit`` so no traceback shifts
+        it): 300 noise + a 20-char AWS key + 481 trailing chars = 801 total.
+        The -500 cut lands ONE character into the key, so slice-then-redact
+        leaks the 19-char fragment ``KIAIOSFODNN7EXAMPLE``; redact-then-slice
+        replaces the whole key with the tag, whose tail stays in the report.
+        """
+        script_path = self._write_script(
+            tmp_path,
+            'import os, sys\n'
+            'sys.stderr.write("W" * 300)\n'
+            'sys.stderr.write("AKIAIOSFODNN7EXAMPLE")\n'
+            'sys.stderr.write("X" * 481)\n'
+            'sys.stderr.flush()\n'
+            'os._exit(2)\n',
+        )
+        with patch("pathlib.Path.home", return_value=tmp_path):
+            result = run_script_sandboxed(script_path + ":run", "test-job-id")
+
+        assert result["status"] == "error"
+        assert "AKIAIOSFODNN7EXAMPLE" not in result["error"]
+        # The discriminator: the exact fragment the slice-then-redact order
+        # leaves behind. Absent under redact-then-slice; present under the bug.
+        assert "KIAIOSFODNN7EXAMPLE" not in result["error"]
+        assert "credential]" in result["error"]
 
     def test_ok_status(self, tmp_path):
         script_path = self._write_script(
@@ -656,7 +843,7 @@ class TestRunCommandSandboxedEdgeCases:
     """Additional edge case tests for run_command_sandboxed."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, posix_test_shell):
         """Bypass the OS-sandbox wrap so these plumbing tests run without a
         sandbox backend (see TestRunCommandSandboxed._passthrough_sandbox)."""
         monkeypatch.setattr(
@@ -664,8 +851,9 @@ class TestRunCommandSandboxedEdgeCases:
         )
         # Bypass the runtime shell probe (which itself spawns a child): these
         # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
-        # Return "sh" so Popen mocks that assert on argv[0] still see it.
-        monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: "sh")
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
+        )
 
     def test_command_with_env_vars(self):
         result = run_command_sandboxed("echo $HOME")
@@ -1032,15 +1220,16 @@ class TestRunCommandSandboxedExceptions:
     """Tests for run_command_sandboxed timeout and exception paths."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, posix_test_shell):
         """See TestRunCommandSandboxed._passthrough_sandbox."""
         monkeypatch.setattr(
             "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (list(argv), None)
         )
         # Bypass the runtime shell probe (which itself spawns a child): these
         # tests exercise the run_command_sandboxed plumbing, not shell fingerprinting.
-        # Return "sh" so Popen mocks that assert on argv[0] still see it.
-        monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: "sh")
+        monkeypatch.setattr(
+            "kiro_crew.cron_script._resolve_command_shell", lambda: posix_test_shell
+        )
 
     def test_timeout_returns_error(self):
         # Real subprocess: communicate(timeout=1) fires and the child is killed.
@@ -1154,6 +1343,38 @@ class TestRunScriptSandboxedErrorPaths:
             result = run_script_sandboxed("/f.py:run", "j1", "")
         assert result["status"] == "error"
         assert "Bad output" in result.get("error", "")
+
+    def test_bad_json_output_redacts_before_truncating(self, tmp_path):
+        """A credential straddling the 200-char boundary must not leak its head.
+
+        Redaction must run on the WHOLE stdout before the head slice: slicing
+        first can cut a secret mid-pattern, so redaction no longer matches and
+        the raw head reaches the diagnostic.
+        """
+        # Built at runtime so no credential-shaped literal lands in the repo.
+        fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+        # Sized so the 200-char head window ends 10 chars into the credential:
+        # a slice-then-redact order keeps "AKIA" + 6 B's — too short for the
+        # pattern to match, so the raw head leaks into the diagnostic.
+        padding = "p" * 190
+        stdout_text = padding + fake_key + "e" * 50
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate.return_value = (stdout_text, "")
+        with patch(
+            "kiro_crew.cron_script.resolve_script_path", return_value=("/f.py", "run")
+        ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
+            "subprocess.Popen", return_value=mock_proc
+        ):
+            result = run_script_sandboxed("/f.py:run", "j1", "")
+        assert result["status"] == "error"
+        assert "AKIA" not in result["error"]
+        assert fake_key not in result["error"]
+        # Positive proof the payload flowed through redaction (not a vacuous
+        # pass on an empty diagnostic): the 200-char head window ends 10 chars
+        # into the replacement marker, so its head survives the slice.
+        assert "[REDACTED:" in result["error"]
+        assert padding in result["error"]
 
 
 class TestMcpCronHandlerPaths:
@@ -1525,3 +1746,74 @@ class TestResolveInternalSecret:
         ):
             run_script_sandboxed("/f.py:run", "j1", "", timeout=30)
         assert captured["secret"] == "realsecret"
+
+
+class TestPostKillDrainTimeoutHardening:
+    """The post-kill drain must not leak pipes or mislabel the kill-path result.
+
+    ``Popen.communicate`` does not kill the child on timeout, so both spawners
+    SIGKILL the process group and then reap it with a bounded
+    ``communicate(timeout=5)``. That second drain can ITSELF raise
+    ``TimeoutExpired`` when the pipes never reach EOF — the child outlived the
+    group kill, or another process still holds the write end open. Two
+    invariants have to survive that:
+
+    - the ``PIPE`` fds get closed rather than left open for the life of the
+      gateway. ``Popen._communicate`` closes them as a side effect of reaching
+      EOF, which is exactly the path it does not reach here.
+    - the kill path still reports a *timeout*. In ``run_command_sandboxed`` a
+      ``TimeoutExpired`` raised inside the ``except`` block bypasses that
+      block's own handler list, so the timed-out ``return`` is skipped and the
+      broad ``except Exception`` reports "Command failed" instead.
+    """
+
+    def test_script_drain_timeout_closes_pipes_and_keeps_contract(self):
+        import subprocess as sp
+
+        mock_proc = MagicMock()
+        # A bare MagicMock pid coerces to 1 via __index__, and os.killpg(1, sig)
+        # is kill(-1, sig) — see TestKillBroadcastGuard.
+        mock_proc.pid = 2**22 + 12345  # > PID_MAX default, never a real pid
+        # BOTH the initial read and the post-kill drain time out.
+        mock_proc.communicate.side_effect = sp.TimeoutExpired("cmd", 30)
+        with patch(
+            "kiro_crew.cron_script.resolve_script_path", return_value=("/f.py", "run")
+        ), patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)), patch(
+            "subprocess.Popen", return_value=mock_proc
+        ), patch(
+            # Stub the reap at the shim, NOT via the subprocess.Popen patch above:
+            # same reason as TestRunScriptSandboxedTimeout.
+            "kiro_crew.platform_compat.kill_process_tree",
+            return_value=True,
+        ):
+            result = run_script_sandboxed("/f.py:run", "j1", "", timeout=30)
+        # The drain's own timeout must neither escape nor alter the contract.
+        assert result == {"status": "error", "error": "Script timed out after 30s"}
+        # The fd-leak assertion: both pipes closed even though EOF never came.
+        mock_proc.stdout.close.assert_called_once()
+        mock_proc.stderr.close.assert_called_once()
+
+    def test_command_drain_timeout_closes_pipes_and_keeps_contract(self, monkeypatch):
+        import subprocess as sp
+
+        # See TestRunCommandSandboxed._passthrough_sandbox: bypass the OS-sandbox
+        # wrap and the runtime shell probe so this exercises only the kill path.
+        monkeypatch.setattr(
+            "kiro_crew.cron_script.wrap_argv", lambda argv, **k: (list(argv), None)
+        )
+        monkeypatch.setattr("kiro_crew.cron_script._resolve_command_shell", lambda: "sh")
+        mock_proc = MagicMock()
+        mock_proc.pid = 2**22 + 12345  # > PID_MAX default, never a real pid
+        mock_proc.communicate.side_effect = sp.TimeoutExpired("cmd", 30)
+        with patch("subprocess.Popen", return_value=mock_proc), patch(
+            "kiro_crew.platform_compat.kill_process_tree", return_value=True
+        ):
+            result = run_command_sandboxed("sleep 30", timeout=30)
+        # A timed-out command must report the timeout, not "Command failed".
+        assert result == {
+            "status": "error",
+            "output": "❌ Command timed out after 30s",
+            "exit_code": -1,
+        }
+        mock_proc.stdout.close.assert_called_once()
+        mock_proc.stderr.close.assert_called_once()

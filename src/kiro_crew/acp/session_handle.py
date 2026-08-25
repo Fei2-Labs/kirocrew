@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -47,6 +47,8 @@ from kiro_crew.acp.client import (
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
     _raise_acp_error,
+    format_command_result,
+    parse_slash_command,
     prompt_timeout_for_ceiling,
     resolve_usable_model,
 )
@@ -66,6 +68,7 @@ from kiro_crew.acp.liveness import (
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -313,6 +316,20 @@ def _watchdog_evidence_class(evidence: str) -> str:
 # AcpClient's _CANCEL_GRACE_SECS floor without the process-kill (which is
 # impossible on a multiplexed runtime).
 _CANCEL_GRACE_SECS = 10.0
+# Commands that must stay on the PROMPT transport even where native
+# commands/execute is available: kiro-cli 2.14.0 exits rc=0 WITHOUT a response
+# on commands/execute for these (live-probe recorded in compact()'s docstring;
+# the probe covered the string form, and no probe exists for their object
+# form), and session.py's compaction flow additionally depends on watching
+# compaction status mid-PROMPT-stream. Routing them natively would leave the
+# dispatch loop draining an unanswered request until its deadline.
+_PROMPT_TRANSPORT_COMMANDS = frozenset({"compact", "help"})
+# Native command turns are bounded like send_command's 60s RPC wait, not like
+# a chat turn: commands/execute answers in well under a second, and neither
+# turn watchdog arms on a command turn (no text chunk streamed, no tool
+# dispatched), so an unanswered request would otherwise drain silently for the
+# full chat-turn ceiling (hours) while holding the session's turn slot.
+_COMMAND_TURN_TIMEOUT_SECS = 60.0
 # Post-compaction metadata grace: kiro-cli emits fresh _kiro.dev/metadata with
 # the real post-compaction contextUsagePercentage ~1s after the completed
 # status (live-probe confirmed). Mirrors AcpClient's constant.
@@ -637,6 +654,120 @@ class AcpSessionHandle:
         ``agent.chat_turn_timeout_secs`` so the transport wait follows a raised
         turn ceiling instead of cutting the turn at the 2h default underneath it.
         """
+
+        async def _build() -> tuple[str, dict[str, Any]]:
+            # Offloaded: the builder stats and reads image files (up to
+            # MAX_IMAGE_BYTES each) and base64-encodes them. Inline, that
+            # blocking I/O runs on the gateway loop and pauses every other
+            # session's streaming for the duration.
+            prompt_blocks = await asyncio.to_thread(
+                build_prompt_blocks,
+                message,
+                allow_image=self._runtime.supports_image_prompt,
+            )
+            return METHOD_PROMPT, {
+                "sessionId": self._session_id,
+                # An image reaches the model ONLY as an image block. Sending a
+                # local image path as a single text block would ship a
+                # filesystem path as prose (Slack, dashboard) and the model
+                # would never see the picture. Gated on the agent's advertised
+                # capability; when it is absent the path stays in the text as a
+                # tool-openable reference rather than being dropped.
+                "prompt": prompt_blocks,
+            }
+
+        # Explicit aclose in a finally: abandoning THIS wrapper (gen.aclose()
+        # at any yield) must finalize the inner turn generator NOW — its
+        # finally is what unmarks the turn and re-sets _turn_done. Left to the
+        # event loop's async-generator GC hook, the handle would read as
+        # turn-active until some later collection pass.
+        turn = self._run_turn(_build, timeout)
+        try:
+            async for event in turn:
+                yield event
+        finally:
+            await turn.aclose()
+
+    async def stream_command(
+        self, command: str, timeout: float | None = None
+    ) -> AsyncIterator[AcpEvent]:
+        """Execute a slash command natively and yield AcpEvents until it completes.
+
+        Sends ``_kiro.dev/commands/execute`` with the TuiCommand OBJECT form
+        (``{command, args}``) — kiro-cli 2.14.0 exits without a response on the
+        STRING form (see :meth:`compact`), so the object form is load-bearing —
+        and drains ``session/update`` events with the same turn discipline as
+        :meth:`prompt`. The command's own output arrives in the RESPONSE result
+        (message/data), not as update chunks, so the dispatch loop
+        surfaces it as a text chunk (``extract_command_result=True``). Mirrors
+        AcpClient.stream_command for the shared runtime.
+
+        Two carve-outs keep the PROMPT transport (delegate to :meth:`prompt`):
+
+        - ``_PROMPT_TRANSPORT_COMMANDS`` (/compact, /help) — kiro-cli 2.14.0
+          returns no response for these over commands/execute, and the
+          compaction flow (session.py, Slack !compact) depends on watching
+          ``compaction/status`` on the prompt stream.
+        - a non-kiro backend (KAS) — ``_kiro.dev/commands/execute`` is
+          kiro-cli-specific; KAS sessions keep degrading softly through
+          session/prompt instead of erroring on an unimplemented method.
+
+        The native turn is bounded at ``_COMMAND_TURN_TIMEOUT_SECS`` (matching
+        send_command's RPC wait) because neither turn watchdog arms on a
+        command turn; an explicit ``timeout`` still wins.
+        """
+        cmd_name, cmd_args = parse_slash_command(command)
+        # Positive capability gate: only the kiro harness implements
+        # _kiro.dev/commands/execute, so native execution requires
+        # acp_backend == ACP_BACKEND_KIRO — every other harness (KAS today,
+        # any harness added later) fails CLOSED onto the prompt transport
+        # instead of inheriting a kiro-only RPC (harness parity H5/H6).
+        native = (
+            self._runtime.acp_backend == ACP_BACKEND_KIRO
+            and cmd_name not in _PROMPT_TRANSPORT_COMMANDS
+        )
+        if not native:
+            async for event in self.prompt(command, timeout=timeout):
+                yield event
+            return
+
+        async def _build() -> tuple[str, dict[str, Any]]:
+            return METHOD_COMMANDS_EXECUTE, {
+                "sessionId": self._session_id,
+                "command": {"command": cmd_name, "args": cmd_args},
+            }
+
+        # Same deterministic finalization as prompt(): see the comment there.
+        turn = self._run_turn(
+            _build,
+            timeout if timeout is not None else _COMMAND_TURN_TIMEOUT_SECS,
+            extract_command_result=True,
+        )
+        try:
+            async for event in turn:
+                yield event
+        finally:
+            await turn.aclose()
+
+    async def _run_turn(
+        self,
+        build_request: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
+        timeout: float | None,
+        *,
+        extract_command_result: bool = False,
+    ) -> AsyncGenerator[AcpEvent, None]:
+        """Shared turn lifecycle for :meth:`prompt` and :meth:`stream_command`.
+
+        Owns the concurrent-turn guard, the per-turn state resets, the pre-turn
+        stale-frame drain, the request send, event dispatch, and turn-done
+        bookkeeping. ``build_request`` returns the JSON-RPC ``(method, params)``
+        to send; it runs BEFORE the turn is marked active (see the comment at
+        the send site below).
+
+        ``timeout=None`` (every dashboard turn) resolves from
+        ``agent.chat_turn_timeout_secs`` so the transport wait follows a raised
+        turn ceiling instead of cutting the turn at the 2h default underneath it.
+        """
         timeout = await _effective_prompt_timeout_async(timeout)
         # Guard against concurrent prompts on the same handle: a second call
         # would clear _turn_done and race on the shared _queue, corrupting
@@ -789,40 +920,21 @@ class AcpSessionHandle:
         # exception hierarchy. Re-raised unchanged, so cancellation still
         # propagates.
         try:
-            # Build the prompt blocks FIRST (the slow, cancellable part), then
-            # mark the turn active immediately before the write: a child
-            # permission frame read by the runtime between the write and the
-            # mark would otherwise be auto-answered as "between turns" even
-            # though this owner's turn had begun. Marking pre-build instead
-            # would claim an active turn during a long image-encoding stint
-            # in which nothing consumes the queue. The BaseException guard
-            # unmarks on any failure so a dead write cannot leave the session
-            # permanently routed-to.
-            _prompt_blocks = await asyncio.to_thread(
-                build_prompt_blocks,
-                message,
-                allow_image=self._runtime.supports_image_prompt,
-            )
+            # Build the request FIRST (for prompts, the slow, cancellable
+            # image-encoding part — see prompt()'s _build), then mark the turn
+            # active immediately before the write: a child permission frame
+            # read by the runtime between the write and the mark would
+            # otherwise be auto-answered as "between turns" even though this
+            # owner's turn had begun. Marking pre-build instead would claim an
+            # active turn during a long image-encoding stint in which nothing
+            # consumes the queue. The BaseException guard unmarks on any
+            # failure so a dead write cannot leave the session permanently
+            # routed-to.
+            _method, _params = await build_request()
             _mark = getattr(self._runtime, "mark_turn_active", None)
             if _mark is not None:
                 _mark(self._session_id, True)
-            req_id = await self._runtime.send_request(
-                METHOD_PROMPT,
-                {
-                    "sessionId": self._session_id,
-                    # An image reaches the model ONLY as an image block. Sending a
-                    # local image path as a single text block would ship a
-                    # filesystem path as prose (Slack, dashboard) and the model
-                    # would never see the picture. Gated on the agent's advertised
-                    # capability; when it is absent the path stays in the text as a
-                    # tool-openable reference rather than being dropped.
-                    # Offloaded (above): the builder stats and reads image files
-                    # (up to MAX_IMAGE_BYTES each) and base64-encodes them.
-                    # Inline, that blocking I/O runs on the gateway loop and
-                    # pauses every other session's streaming for the duration.
-                    "prompt": _prompt_blocks,
-                },
-            )
+            req_id = await self._runtime.send_request(_method, _params)
         except BaseException:
             self._turn_done.set()
             _mark = getattr(self._runtime, "mark_turn_active", None)
@@ -852,7 +964,9 @@ class AcpSessionHandle:
                         f"{redact_text(str(_n_title)[:4096])[:120]}"
                     ),
                 )
-            async for event in self._dispatch_events(req_id, timeout):
+            async for event in self._dispatch_events(
+                req_id, timeout, extract_command_result=extract_command_result
+            ):
                 # Park accounting. The consumer holds this event from here until
                 # it comes back for the next one, and that interval is CONSUMER
                 # time, not backend silence: the dispatch loop is suspended at
@@ -1708,11 +1822,20 @@ class AcpSessionHandle:
                 self._queue.put_nowait(_m)
 
     async def _dispatch_events(
-        self, req_id: int, timeout: float
+        self, req_id: int, timeout: float, *, extract_command_result: bool = False
     ) -> AsyncIterator[AcpEvent]:
-        """Core event dispatch loop. Yields AcpEvent objects from the session queue."""
+        """Core event dispatch loop. Yields AcpEvent objects from the session queue.
+
+        ``extract_command_result`` (commands/execute turns): the command's
+        output arrives in the RESPONSE result rather than as session/update
+        chunks — surface it as a text chunk before the terminal event.
+        """
         deadline = time.monotonic() + timeout
         last_data_ts = time.monotonic()
+        # Whether a native agent-switch notification already reported the
+        # switch this turn; guards the result-extracted fallback below from
+        # double-emitting EVENT_AGENT_SWITCHED (mirrors AcpClient).
+        saw_agent_switch = False
         # Consumer time already accounted for at the moment `last_data_ts` was
         # taken. The idle clocks below measure BACKEND silence, so any park that
         # happens after this point must be subtracted from them.
@@ -2021,6 +2144,29 @@ class AcpSessionHandle:
                         # Single-shot: the flag is consumed here so a later genuine
                         # cancel can never be misattributed to a stale probe.
                         self._stale_probe = False
+                    if extract_command_result and isinstance(result, dict):
+                        # commands/execute returns its output in the RESPONSE
+                        # result (message/data), not via session/update
+                        # chunks — surface it as a text chunk. The helper
+                        # two-pass redacts (URLs + credentials) before
+                        # returning: command output is backend-echoed text
+                        # that reaches the dashboard.
+                        text = format_command_result(result)
+                        if text:
+                            yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=text)
+                        if not saw_agent_switch:
+                            data = result.get("data")
+                            if isinstance(data, dict) and data.get("agent"):
+                                agent_info = data["agent"]
+                                name = (
+                                    agent_info.get("name", "")
+                                    if isinstance(agent_info, dict)
+                                    else ""
+                                )
+                                if name:
+                                    yield AcpEvent(
+                                        kind=EVENT_AGENT_SWITCHED, text=name
+                                    )
                     self._last_stop_reason = reason
                     self._tool_dispatched = False
                     self._turn_done.set()
@@ -2150,6 +2296,7 @@ class AcpSessionHandle:
                 elif action == "clear":
                     yield AcpEvent(kind=EVENT_CLEAR_STATUS)
                 elif action == "agent_switched":
+                    saw_agent_switch = True
                     params = msg.params or {}
                     yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=params.get("agentName", ""))
                 elif action == "subagent_list":

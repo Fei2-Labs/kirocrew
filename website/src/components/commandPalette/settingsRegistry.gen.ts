@@ -15,6 +15,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "dashboard.use_builtin_browser"
   },
   {
+    "id": "channels.answer-in-group-spaces-webex",
+    "label": "Answer in group spaces (Webex)",
+    "labelKey": "pages.settings.webexPanel.allow_group_spaces",
+    "labelSuffix": "Webex",
+    "description": "Off by default. A reply in a space is visible to everyone in it, including people not on the allowed-emails list.",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
+  },
+  {
     "id": "channels.app-client-id-teams",
     "label": "App (Client) ID (Teams)",
     "labelKey": "pages.settings.teamsPanel.app_client_id",
@@ -293,6 +306,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "configKey": "teams.hard_threshold_pct"
   },
   {
+    "id": "channels.hard-context-threshold-webex",
+    "label": "Hard context threshold % (Webex)",
+    "labelKey": "pages.settings.webexPanel.hard_context_threshold",
+    "labelSuffix": "Webex",
+    "description": "Compact automatically at this point, even without a decision, so the context window never overflows.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
+    }
+  },
+  {
     "id": "channels.messages-database-path-imessage",
     "label": "Messages database path (iMessage)",
     "labelKey": "pages.settings.iMessagePanel.db_path",
@@ -329,6 +355,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1,
     "params": {
       "channel": "slack"
+    }
+  },
+  {
+    "id": "channels.reply-in-thread-webex",
+    "label": "Reply in thread (Webex)",
+    "labelKey": "pages.settings.webexPanel.reply_in_thread",
+    "labelSuffix": "Webex",
+    "description": "Reply under the message's own thread when it has one, which keeps a busy space readable.",
+    "tab": "channels",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
     }
   },
   {
@@ -405,6 +444,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1,
     "params": {
       "channel": "telegram"
+    }
+  },
+  {
+    "id": "channels.soft-context-threshold-webex",
+    "label": "Soft context threshold % (Webex)",
+    "labelKey": "pages.settings.webexPanel.soft_context_threshold",
+    "labelSuffix": "Webex",
+    "description": "When a conversation's context passes this, suggest /compact or /new instead of compacting automatically.",
+    "tab": "channels",
+    "type": "input",
+    "occurrence": 1,
+    "params": {
+      "channel": "webex"
     }
   },
   {
@@ -538,6 +590,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "chat",
     "type": "input",
     "occurrence": 1
+  },
+  {
+    "id": "chat.fallback-model",
+    "label": "Fallback model",
+    "labelKey": "pages.settings.chatPanel.fallback_model",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1,
+    "configKey": "agent.fallback_model"
   },
   {
     "id": "chat.feature-tips",
