@@ -13,9 +13,10 @@ authorizes nobody.
 SCAFFOLD NOTES / TODO:
   * Inbound media (image/voice/file) IS decrypted and ingested -- see
     ``weixin/media.py`` (CDN + AES-128-ECB) and ``weixin/attachments.py``
-    (shared ingest adapter). Inbound VIDEO is downloaded-then-rejected by the
-    shared pipeline with a visible note; outbound media is still unimplemented
-    (``getuploadurl`` + encrypted CDN PUT).
+    (shared ingest adapter). Inbound VIDEO is rejected with a visible note
+    BEFORE any download (``messaging/attachments.py`` classifies and refuses it
+    ahead of the fetch), so it costs no CDN round trip; outbound media is still
+    unimplemented (``getuploadurl`` + encrypted CDN PUT).
   * Outbound chunking uses a naive splitter; swap for ``renderer`` once the
     Markdown block splitter lands.
   * Group delivery is intentionally unsupported for now (iLink bot identities
@@ -31,6 +32,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+from kiro_crew.messaging.tables import TABLE_POLICY_NATIVE
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
     InboundMessage,
@@ -69,6 +71,10 @@ WEIXIN_CAPABILITIES = TransportCapabilities(
     files_outbound=False,
     rich_blocks=False,
     threads=False,
+    # iLink clients render Markdown natively, tables included -- which is why
+    # weixin/renderer.py preserves them instead of flattening.
+    table_mode=TABLE_POLICY_NATIVE,
+    native_tables=True,
     max_message_chars=WEIXIN_CHUNK_LIMIT,
     max_buttons=0,
     supports_proactive_send=True,
@@ -155,6 +161,30 @@ class WeixinTransport(MessagingTransport):
         if kind != "user" or not separator or value not in identities:
             return None
         return await self.resolve_conversation(value), None
+
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Re-decide a proactive send under the live ``dm_policy``. Fails closed.
+
+        The iLink conversation id IS the peer's user id, so this asks the same
+        question :meth:`authorize` asks and answers it the same way -- including
+        denying an unrecognized policy rather than falling through to ``open``.
+
+        Deliberately consults ``_allowed`` ALONE, unlike
+        ``resolve_configured_target``, which also accepts ``_known_users``. That
+        set is learned from inbound traffic, so honouring it here would let a peer
+        who spoke once keep receiving proactive messages after being taken off the
+        roster -- which is the exact revocation this check exists to enforce.
+        """
+        if not conversation_id:
+            return False
+        if self._dm_policy == "open":
+            return True
+        if self._dm_policy == "allowlist":
+            return conversation_id in self._allowed
+        return False
 
     # -- Lifecycle -------------------------------------------------------------
     async def connect(self) -> None:

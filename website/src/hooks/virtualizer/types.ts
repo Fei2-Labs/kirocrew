@@ -18,6 +18,37 @@ export interface UseVirtualChatOptions<T> {
    */
   followOutput?: boolean
   /**
+   * Where the list opens when there is no saved scroll anchor to restore.
+   * `'bottom'` (default) is the chat contract: slot entry pins to the tail
+   * and the initial mount window is the LAST items. `'top'` is the
+   * list/gallery contract: open at the head with the FIRST items mounted.
+   *
+   * `'top'` matters beyond the landing position: opening at the tail places
+   * every not-yet-measured row ABOVE the viewport, so each measurement that
+   * lands must compensate scrollTop, and with many estimate-to-real
+   * corrections in flight the repeated compensation writes read as flicker.
+   * At the head the unmeasured rows are all BELOW the viewport — a
+   * measurement only grows the bottom spacer, which is invisible.
+   */
+  initialPlacement?: 'top' | 'bottom'
+  /**
+   * Sync a row's FIRST measurement into the offset math immediately instead
+   * of through the debounced height-sync. Default: false (the chat contract —
+   * first-mount seeds ride the debounce, which keeps the upward-scroll anchor
+   * compensation's commit ordering exactly as it is).
+   *
+   * Turn this on for gallery/list content whose real heights vary widely
+   * around `estimatedHeight` (mixed HTML/GIF/image cards). Scrolling down
+   * mounts a new row every few dozen ms and each seed RESETS the debounce
+   * timer, so the offset tree starves — frozen at estimates for the whole
+   * gesture — and every row the window front hands from real DOM to the
+   * before-spacer shrinks the content above the viewport by (real − estimate),
+   * felt as a per-card bounce. A first measurement happens once per row, so
+   * syncing it eagerly cannot be the oscillation the debounce protects
+   * against; subsequent re-measures of the same row stay debounced.
+   */
+  eagerFirstMeasure?: boolean
+  /**
    * Threshold in pixels from the bottom below which `isAtBottom` becomes
    * true. Default: 100. The same threshold gates the follow-output
    * auto-pin so callers can tune sensitivity.
@@ -65,6 +96,12 @@ export interface UseVirtualChatOptions<T> {
    * keep resizing for the duration of the turn.
    */
   streamingIndex?: number
+  /**
+   * Called when the top sentinel comes into view, alongside the upward window
+   * expansion. Lets the caller fetch history that lies behind the loaded slice;
+   * the virtualizer itself only ever widens the window over `items`.
+   */
+  onTopReached?: () => void
 }
 
 export interface VirtualItem<T> {
@@ -106,10 +143,6 @@ export interface UseVirtualChatReturn<T> {
   isAtBottom: boolean
   /** Scroll the scroller so item `index` is visible. */
   scrollToIndex: (index: number, opts?: ScrollToIndexOptions) => void
-  /** "Human-like" smooth scroll to `index` without pre-mounting a window —
-   * animates scrollTop and lets the scroll listener mount rows progressively,
-   * keeping the window tight (avoids a wide always-mounted span). */
-  scrollToIndexSmooth: (index: number, opts?: { align?: 'start' | 'center'; offset?: number }) => void
   /** Scroll to the bottom (latest message). */
   scrollToBottom: (behavior?: ScrollBehavior) => void
   /** Ensure `index` is mounted (in the window) without scrolling — lets a

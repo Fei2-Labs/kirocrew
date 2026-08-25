@@ -50,7 +50,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote, urlparse
 
@@ -60,6 +59,7 @@ from kiro_crew.sel import sel
 
 from .errors import (
     ProviderCliError,
+    ProviderInvalidInputError,
     ProviderPermissionError,
     ProviderSetupError,
     PrSearchError,
@@ -241,11 +241,6 @@ def _glab_bin() -> str:
     global _glab_bin_cache
     if _glab_bin_cache:
         return _glab_bin_cache
-    if sys.platform == "win32":
-        raise ProviderCliError(
-            "Issue Radar requires a POSIX platform (macOS/Linux); "
-            "Windows is not supported — use WSL to run the Kiro Crew gateway"
-        )
 
     from kiro_crew.dashboard.handlers.source_providers import (
         _validate_provider_executable,
@@ -362,13 +357,17 @@ def _glab_run(
     glab = _glab_bin()
     operation = f"glab {' '.join(argv[1:3])}"  # e.g. "glab api projects/…" (bounded)
     try:
+        # Bytes, decoded below under our own control. See the long note in
+        # github_runner.run_gh: `text=True` follows the locale (the ANSI codepage
+        # on Windows) and crashes in subprocess's reader thread on non-ASCII
+        # output, while `errors="replace"` would let U+FFFD through into a JSON
+        # string value and on into stored issue records.
         proc = subprocess.run(
             [glab, *argv[1:]],
             capture_output=True,
-            text=True,
             timeout=timeout,
             check=False,
-            input=input_text,
+            input=input_text.encode("utf-8") if input_text is not None else None,
             env=_glab_env(resolved_host),
         )
     except FileNotFoundError as exc:  # pragma: no cover — _glab_bin guards first
@@ -379,11 +378,24 @@ def _glab_run(
     except subprocess.TimeoutExpired as exc:
         _audit("glab_run", operation, "failure", error=f"timeout after {timeout}s")
         raise ProviderCliError(f"`glab` timed out after {timeout}s") from exc
-    if proc.returncode != 0:
-        _audit("glab_run", operation, "failure", error=f"exit {proc.returncode}")
+    try:
+        decoded = subprocess.CompletedProcess(
+            proc.args,
+            proc.returncode,
+            stdout=proc.stdout.decode("utf-8") if proc.stdout is not None else None,
+            stderr=proc.stderr.decode("utf-8") if proc.stderr is not None else None,
+        )
+    except UnicodeDecodeError as exc:
+        # Stream offset only -- never the offending bytes, which are payload.
+        _audit("glab_run", operation, "failure", error="undecodable output")
+        raise ProviderCliError(
+            f"`glab` returned output that is not valid UTF-8 (at byte {exc.start})"
+        ) from exc
+    if decoded.returncode != 0:
+        _audit("glab_run", operation, "failure", error=f"exit {decoded.returncode}")
     else:
         _audit("glab_run", operation, "ok")
-    return proc
+    return decoded
 
 
 # Markers ``glab`` prints when the CLI itself has no usable credentials for the
@@ -1338,6 +1350,86 @@ def set_issue_state(
         )
     )
     return {"state": _norm_state(data.get("state")) or state, "state_reason": None}
+
+
+def _resolve_assignee_ids(
+    owner: str, repo: str, usernames: list[str], *, host: str, timeout: float
+) -> list[int]:
+    """Resolve project-member usernames to the numeric ids GitLab's issue-update
+    API requires (``assignee_ids``).
+
+    GitLab addresses assignees by numeric user id, not username, so the editor's
+    logins have to be translated. The project MEMBER roster is the right source:
+    GitLab refuses to assign a non-member and would silently drop an unknown id
+    while still answering 200, so an unassignable login is rejected HERE (as
+    :class:`ProviderInvalidInputError`) rather than vanishing from the write. One
+    roster read covers every username in the request.
+    """
+    if not usernames:
+        return []
+    members = _rows(
+        _glab_api(
+            f"projects/{project_path(owner, repo)}/members/all",
+            host=host, timeout=timeout, paginate=True,
+        )
+    )
+    by_name = {
+        str(m.get("username")).lower(): m.get("id")
+        for m in members
+        if m.get("username") and isinstance(m.get("id"), int)
+    }
+    ids: list[int] = []
+    missing: list[str] = []
+    for name in usernames:
+        uid = by_name.get(name.lower())
+        if isinstance(uid, int):
+            ids.append(uid)
+        else:
+            missing.append(name)
+    if missing:
+        raise ProviderInvalidInputError(
+            "GitLab will not assign: "
+            + ", ".join(missing)
+            + " -- an assignee must be a member of the project.",
+            values=missing,
+        )
+    return ids
+
+
+def set_issue_assignees(
+    owner: str, repo: str, number: int, assignees: list[str], *, host: str = "", timeout: float = GL_TIMEOUT_SEC
+) -> list[str]:
+    """REPLACE an issue's assignees with ``assignees`` (usernames).
+
+    Parity with github_client.set_issue_assignees: the set is REPLACED, not
+    merged, and an empty list clears every assignee. GitLab addresses assignees
+    by numeric ``assignee_ids``, so the usernames are resolved against the
+    project members first (an empty list stays empty and skips the lookup), and
+    an unresolvable username raises :class:`ProviderInvalidInputError` -- the same
+    class GitHub's 422 maps to -- so the route answers 400 either way.
+
+    Resolving BEFORE the write is what makes the two providers agree. GitLab does
+    not validate ``assignee_ids`` the way GitHub validates logins: it ignores an id
+    it will not honour and answers 200, so sending an unresolved name would report
+    success for an assignment that never happened.
+
+    GitLab Free caps an issue at ONE assignee and silently keeps only the first of
+    a longer list, so the returned set is read back from the response rather than
+    echoing the request.
+
+    Returns the issue's authoritative assignee usernames after the change."""
+    ids = _resolve_assignee_ids(owner, repo, assignees, host=host, timeout=timeout)
+    # ``assignee_ids: []`` is how GitLab clears assignees; send it explicitly.
+    data = _obj(
+        _glab_api(
+            f"projects/{project_path(owner, repo)}/issues/{int(number)}",
+            host=host,
+            timeout=timeout,
+            method="PUT",
+            body={"assignee_ids": ids},
+        )
+    )
+    return _usernames(data.get("assignees"))
 
 
 def create_label(

@@ -140,12 +140,12 @@ The gap is therefore a **KB-scoped golden set over the query classes above, plus
 ```
 '', '.md', '.txt', '.org', '.py', '.java', '.ts', '.js', '.rs', '.go',
 '.html', '.htm', '.docx', '.pdf',
-'.csv', '.log', '.json', '.yaml', '.yml', '.sh', '.rb', '.c', '.cpp', '.h'
+'.csv', '.log', '.json', '.jsonl', '.ndjson', '.yaml', '.yml', '.sh', '.rb', '.ps1', '.psm1', '.psd1', '.c', '.cpp', '.h'
 ```
 
 It includes markdown/plain-text (`.md`/`.txt`/`.org`), source-code extensions, and the two binary formats with declared optional deps (`.pdf` → pdfplumber, `.docx` → python-docx).
 
-**Dispatch (`_DISPATCH`, `readers.py`)** routes only `.pdf`/`.pptx`/`.docx`/`.html`/`.htm` to specialized readers. Anything else — including `.org`, `.txt`, `.md`, and every source-code extension — falls through to the generic `_read_text` path (UTF-8 with a latin-1 fallback) and into the generic chunker downstream. So `.org` is treated as plain text; there is no Org-mode-specific parser.
+**Dispatch (`_DISPATCH`, `readers.py`)** routes only `.pdf`/`.pptx`/`.docx`/`.html`/`.htm` to specialized readers. Anything else — including `.org`, `.txt`, `.md`, and every source-code extension — falls through to the generic `_read_text` path and into the generic chunker downstream. So `.org` is treated as plain text; there is no Org-mode-specific parser. Text decoding (shared by `_read_text` and `_read_html` via `_decode_text_bytes`) is a single-open buffer decode: BOM-sniffed UTF-16 LE/BE first, otherwise UTF-8 with a latin-1 fallback. The UTF-16 branch is extension-agnostic — any text format arriving as BOM'd UTF-16 decodes correctly, not only the PowerShell files (Windows tooling writes UTF-16LE) that motivated it.
 
 **`.pptx` is intentionally out of `SUPPORTED`** even though `_read_pptx` exists: python-pptx is not declared in `setup.cfg`, so the format is kept off the allowlist (the comment at `readers.py` documents this). Reachable only if `.pptx` were re-added to `SUPPORTED`.
 
@@ -179,6 +179,9 @@ Base metadata always carries `format`, `title` (file stem), `file_size`, `extens
 - Discovered files above `props["max_files"]` (default `DEFAULT_MAX_FILES` = 5000) are capped **newest-first** (sort by mtime desc); the surplus count is reported as `capped`.
 - Deletion detection uses the **full** discovered set (pre-cap) so capping never triggers false deletions; a vanished file's items are archived via `_handle_deleted` → `store.delete_items_batch`.
 - Change detection is mtime-then-content-hash: unchanged mtime → `last_seen` bump only; changed mtime but identical SHA-256 → state refresh, no re-ingest.
+- Batched `last_seen` flush/commit and stale-claim release run off the asyncio
+  event loop; each flush and its commit stay within one worker hop so they share
+  the thread-local SQLite connection.
 - Per-file state lives in the `folder_file_state` table with `status` ∈ `{done, scanning, skipped, failed, deduped}`. `scanning` is written **before** ingest so a crash mid-file is recoverable; `skipped`/`failed`/`deduped` files are not auto-retried (user must retry).
 - **TOCTOU defense**: `_ingest_file` re-resolves symlinks and re-checks `is_sensitive_path` at ingest time; a block writes `status='failed'` and emits an SEL `knowledge.source.file.ingest_denied` (`outcome="denied"`, `reason=sensitive_path_toctou`) audit event.
 - After a successful scan, each newly ingested/changed file gets a **targeted** cross-source dedup (`dedup_document(..., apply=True)`) — O(k·n) over the k changed files rather than a full O(n²) corpus sweep — so a folder copy collapses any matching one-shot upload.
@@ -356,7 +359,9 @@ Both entity extraction (`EntityExtractor`) and internal-URL fetch (`agent_fetch.
 The LLM reaches retrieval through the `kirocrew-core` MCP tool `local_knowledge_search`:
 - DB path: `config_dir()/workspace/knowledge/knowledge.db`; a missing DB returns "Knowledge Library is not configured…" (SEL `not_configured`).
 - `_get_knowledge_search` caches the `(KnowledgeStore, embedder)` pair across calls and rebuilds only when the knowledge DB (or its `-wal`) or `config.json` changes — avoiding the per-call schema DDL / migrate / graph-load and the Ollama availability probe.
-- Default `limit` is 3; results below `min_score = 0.012` are dropped. Output is run through `redact_exfiltration_urls()` + `redact_credentials()` before returning, and every call emits an SEL audit event (`success` / `no_results` / `not_configured`). Input is validated against `LOCAL_KNOWLEDGE_SEARCH_SCHEMA` (`validation.py`).
+- Default `limit` is 3; results below `min_score = 0.012` are dropped. Output is run through `redact_exfiltration_urls()` + `redact_credentials()` before returning, and every call emits an SEL audit event (`success` / `no_results` / `not_configured` / `unknown_source`). Input is validated against `LOCAL_KNOWLEDGE_SEARCH_SCHEMA` (`validation.py`).
+- Optional `source_id` scopes the SEED legs only (FTS5 keyword + vector similarity, via parameterized WHERE clauses in `HybridRetriever`); the graph leg stays unfiltered so cross-source entity connections still contribute traversal context. Scope membership is ownership OR location — `items.source_id` or a `source_locations` row, so an item surviving a cross-source dedup collapse still belongs to the losing source's scope (the same rule as `/api/knowledge/graph`'s filter). Omitting it keeps the unscoped behavior. A nonexistent id returns a guidance message naming `knowledge_list_sources` (SEL `unknown_source`), not an exception.
+- The companion tool `knowledge_list_sources` (no arguments; `KNOWLEDGE_LIST_SOURCES_SCHEMA`) returns one `name — id (N item(s))` line per source, counting **active** items only (superseded/deduped copies would overstate a source's coverage) — so agents discover valid `source_id` values instead of guessing.
 - **The response is written through a private stdout descriptor, not fd 1.** The first search's availability probe (`InProcessEmbedder.is_available` → `embed`) kicks the background GGUF load, and the vendored llama-cpp wraps that load in `suppress_stdout_stderr`, which `dup2`s **fd 1 process-wide to `/dev/null`** for the duration (~0.7s) *and* rebinds the `sys.stdout` object. Because the probe returns `None` immediately, the search answers keyword-only in milliseconds — so its JSON-RPC response raced that window and was silently destroyed: no exception, no short write, SEL still logging `success`, and the client hanging until the ACP tool-stall watchdog (`acp/client.py::_TOOL_STALL_TIMEOUT`, 600s) killed the turn. `mcp_shared.run_mcp_stdio_loop` now takes an `os.dup(1)` snapshot (`snapshot_stdout_fd`) at server startup before any tool can run, and `respond()` writes through it under a lock, so responses (and `ping` / `tools/list` replies, which were equally exposed) always reach the client. Falls back to `sys.stdout` when stdout is not fd-backed. Note that "has `sys.stdout` been swapped?" is *not* a usable guard — the suppressor swaps the object too, so it reads as swapped exactly inside the window that must be survived.
 
 The dashboard Knowledge tab uses the same store via a lazily-initialized `KnowledgeStore` on `DashboardState` (`dashboard/state.py`).
@@ -383,8 +388,9 @@ Scopes the page to a single source. Composes with the existing `type`, `status`,
   (`_search_until_exhausted`: `_SCOPED_SEARCH_START` doubling to
   `_SCOPED_SEARCH_MAX`) until the retriever short-reads, so the scoped total is
   exact rather than truncated by a fixed window. At the cap the total may
-  understate; pushing `source_id` into `HybridRetriever` is the tracked
-  follow-up. Unscoped searches keep the cheap `limit * 3` window.
+  understate. `HybridRetriever.search` now accepts `source_id` (seed-scoped —
+  see §4); adopting it in this branch is the remaining follow-up. Unscoped
+  searches keep the cheap `limit * 3` window.
 
 ### `GET /api/knowledge/source-counts`
 
@@ -403,6 +409,7 @@ Returns the item count per source **under the active filters**:
 
 ## Invariants
 
+- **`sources.properties` / `entities.aliases` well-formedness is enforced at the writer** — `store.import_bundle()` validates that any present value is UTF-8-encodable JSON text parsing to an object / array of strings (absent/`null` falls back to the schema defaults `'{}'`/`'[]'`), raising `KnowledgeBundleError` before the INSERT. The dashboard import handler is the store's only production caller today; enforcing at the writer makes any future caller (MCP tool, CLI import, app backend) safe by construction. Several readers parse the raw column with `json.loads()` and no shape guard (source detail handlers index the parsed dict; `find_entity()` calls `.lower()` on each parsed alias), so a corrupt committed row would crash a later, unrelated read. The dashboard import handler maps the typed error to a 400 (`code: malformed_knowledge_bundle`).
 - **Sensitive paths never ingested** — `FileReader.read`, `FolderWatcher._walk`, `_hash_file`, and `_ingest_file` all gate on `is_sensitive_path()` (with symlink re-resolution at ingest time for TOCTOU).
 - **`.org` and unknown-but-supported extensions are plain text** — only `_DISPATCH` extensions get specialized readers; everything else in `SUPPORTED` flows through `_read_text` → generic chunker.
 - **Pool workers are long-lived and must be sweep-shielded** — any direct `AcpClient` worker that outlives a chat turn (not tracked in `SessionMap`/warm pool) must register its PID via `register_protected_pid`, or the orphan sweep will kill it mid-task.

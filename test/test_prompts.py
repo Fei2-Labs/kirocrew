@@ -110,6 +110,7 @@ class _Slot:
         self.agent = "kirocrew"
         self.model = None
         self._queue = []
+        self._stop_generation = 0
         self.linked_session_key = ""
 
     def append(self, role, text, cls):

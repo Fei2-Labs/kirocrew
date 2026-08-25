@@ -172,6 +172,73 @@ describe('client transport', () => {
     await api.createArtifact({ name: 'Doc', content: '<p/>' })
     expect(call().headers['X-Session-Key']).toBe('dashboard:ui')
   })
+
+  // The steering verbs are the case the placeholder actively broke: the server
+  // resolves a `workspace/` key against the project of the slot named by this
+  // header, so `dashboard:ui` — which names no slot — made project steering
+  // unreachable as soon as two chats sat on different projects. All five verbs
+  // take the key, because a file created under one project must stay readable,
+  // editable and deletable from the same page load.
+  it('the steering reads send the caller\'s session key, on the GET as well as the POST family', async () => {
+    await api.steeringFiles('dashboard:chat-4')
+    expect(call().url).toBe('/api/steering')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.steeringFile('workspace/api.md', 'dashboard:chat-4')
+    expect(call(1).url).toBe('/api/steering/workspace/api.md')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('the steering writes send the caller\'s session key', async () => {
+    await api.createSteering('api.md', '# API', 'workspace', 'dashboard:chat-4')
+    expect(call().method).toBe('POST')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.updateSteering('workspace/api.md', '# API v2', 'dashboard:chat-4')
+    expect(call(1).method).toBe('PUT')
+    expect(call(1).url).toBe('/api/steering/workspace/api.md')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.deleteSteering('workspace/api.md', 'dashboard:chat-4')
+    expect(call(2).method).toBe('DELETE')
+    expect(call(2).headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('a workspace write states which project the caller was listed', async () => {
+    // The session key names a chat slot and that slot's project can be
+    // re-pointed, so the slot alone cannot say which project the user believed
+    // they were editing. The listing's `project_key` rides along and the server
+    // refuses (409) when it no longer resolves to the same one.
+    await api.createSteering('api.md', '# API', 'workspace', 'dashboard:chat-4', 'pk-abc')
+    expect(call().headers['X-Steering-Project']).toBe('pk-abc')
+
+    await api.updateSteering('workspace/api.md', '# v2', 'dashboard:chat-4', 'pk-abc')
+    expect(call(1).headers['X-Steering-Project']).toBe('pk-abc')
+
+    await api.deleteSteering('workspace/api.md', 'dashboard:chat-4', 'pk-abc')
+    expect(call(2).headers['X-Steering-Project']).toBe('pk-abc')
+  })
+
+  it('omits the project header when the caller has no project key', async () => {
+    // Absent is not "any project": the server fails a workspace write closed on
+    // a missing header, so sending nothing is the honest wire form.
+    await api.createSteering('api.md', '# API', 'user', 'dashboard:chat-4')
+    expect(call().headers['X-Steering-Project']).toBeUndefined()
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('every steering verb falls back to the placeholder when no session key is passed', async () => {
+    // The tab passes `undefined` when no chat is open rather than inventing a
+    // slot name, so the fallback is what a settings page with no chat sends.
+    await api.steeringFiles()
+    await api.steeringFile('workspace/api.md')
+    await api.createSteering('api.md', '# API', 'workspace')
+    await api.updateSteering('workspace/api.md', '# API v2')
+    await api.deleteSteering('workspace/api.md')
+    for (let i = 0; i < 5; i++) {
+      expect(call(i).headers['X-Session-Key']).toBe('dashboard:ui')
+    }
+  })
 })
 
 describe('client response handling', () => {
@@ -558,14 +625,16 @@ describe('query-string builders', () => {
     expect(call().url).toBe('/api/sessions?limit=30&offset=0')
     await api.sessions(10, 20, true)
     expect(call(1).url).toBe('/api/sessions?limit=10&offset=20&preview=1')
+    await api.sessions(30, 0, false, true)
+    expect(call(2).url).toBe('/api/sessions?limit=30&offset=0&exclude_open=1')
     await api.sessionsSearch('a b', 5)
-    expect(call(2).url).toBe('/api/sessions/search?q=a%20b&limit=5')
+    expect(call(3).url).toBe('/api/sessions/search?q=a%20b&limit=5')
     await api.vectorEpisodic(10, 5, 'promo,l6')
-    expect(call(3).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
+    expect(call(4).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
     await api.vectorEpisodic()
-    expect(call(4).url).toBe('/api/memory/episodic?limit=50&offset=0')
+    expect(call(5).url).toBe('/api/memory/episodic?limit=50&offset=0')
     await api.vectorEpisodicSearch('q', 'tag')
-    expect(call(5).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
+    expect(call(6).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
   })
 
   it('discovery endpoints append provider and limit only when set', async () => {
@@ -859,11 +928,11 @@ describe('request bodies with conditionally-omitted keys', () => {
     expect(call(3).body).toEqual({ steps: [{ title: 'a' }], task_id: '', original_input: '' })
   })
 
-  it('createWebhookToken requires a signature by default', async () => {
-    await api.createWebhookToken('ci')
-    expect(call().body).toEqual({ label: 'ci', require_signature: true })
+  it('createWebhookToken requires a signature by default and carries the destination', async () => {
+    await api.createWebhookToken('ci', undefined, 'code-reviewer')
+    expect(call().body).toEqual({ agent: 'code-reviewer', label: 'ci', require_signature: true })
     await api.createWebhookToken('legacy', false)
-    expect(call(1).body).toEqual({ label: 'legacy', require_signature: false })
+    expect(call(1).body).toEqual({ agent: '', label: 'legacy', require_signature: false })
   })
 
   it('addUserDeniedCommand defaults the operator note to empty', async () => {

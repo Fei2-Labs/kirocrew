@@ -18,8 +18,10 @@ Each test class reproduces one audited failure scenario:
 
 from __future__ import annotations
 
+import asyncio
 import multiprocessing
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -207,6 +209,202 @@ class TestCrossProcessLock:
         contents = {m["content"] for m in fresh._read_messages("k")}
         missing = [f"a-{i}" for i in range(n) if f"a-{i}" not in contents]
         assert not missing, f"cross-process rewrite lost {len(missing)} appends"
+
+
+class TestMessageCacheRewriteSerialization:
+    """The cache FILL is ordered against writers, but a warm read is not, and
+    an on-loop read never blocks on one."""
+
+    @staticmethod
+    def _hold(lock, acquired, release):  # type: ignore[no-untyped-def]
+        """Hold *lock* from a foreign thread until *release* (bounded)."""
+
+        def run() -> None:
+            with lock:
+                acquired.set()
+                # Bounded even if the test body raises before releasing, so a
+                # failure can never strand this thread holding the lock.
+                release.wait(5)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        assert acquired.wait(5)
+        return t
+
+    def test_cache_fill_holds_the_writer_lock(self, tmp_path: Path) -> None:
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("k", "user", "hello")
+        lock = log._file_lock("k")
+        log._invalidate_cache("k")
+
+        seen: list[bool] = []
+        real_locked = log._read_messages_locked
+
+        def observed(
+            key: str,
+            gen: int | None = None,
+            flock_witness: tuple[int, int] | None = None,
+        ) -> list[dict]:
+            # ``RLock`` exposes no owner query, and it is reentrant for THIS
+            # thread — so a FOREIGN thread failing a non-blocking acquire is the
+            # observable proof that the fill runs under the lock. Acquire and
+            # release both happen in that thread (releasing an RLock from
+            # another thread is an error).
+            box: list[bool] = []
+
+            def probe() -> None:
+                got = lock.acquire(blocking=False)
+                box.append(got)
+                if got:
+                    lock.release()
+
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join(5)
+            seen.append(not box[0])
+            return real_locked(key, gen=gen, flock_witness=flock_witness)
+
+        log._read_messages_locked = observed  # type: ignore[method-assign]
+        assert len(log._read_messages("k")) == 1
+        assert seen == [True], "cache fill must run under the per-session writer lock"
+
+    def test_warm_cache_hit_takes_no_lock(self, tmp_path: Path) -> None:
+        """A hit must not even try the lock: it is served on the event loop
+        while a writer can hold that RLock across a 10s flock wait."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("k", "user", "hello")
+        assert len(log._read_messages("k")) == 1  # warms the cache
+
+        acquired, release = threading.Event(), threading.Event()
+        t = self._hold(log._file_lock("k"), acquired, release)
+        try:
+            started = time.monotonic()
+            assert len(log._read_messages("k")) == 1
+            assert time.monotonic() - started < 1.0, "warm hit blocked on the writer lock"
+        finally:
+            release.set()
+            t.join(5)
+
+    def test_on_loop_miss_does_not_block_on_a_writer(self, tmp_path: Path) -> None:
+        """A cold read reached ON the loop degrades to an unlocked fill rather
+        than stalling behind a writer (LoopStallWatchdog hazard)."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("k", "user", "hello")
+        log._invalidate_cache("k")
+
+        acquired, release = threading.Event(), threading.Event()
+        t = self._hold(log._file_lock("k"), acquired, release)
+        try:
+
+            async def on_loop() -> list[dict]:
+                return log._read_messages("k")
+
+            started = time.monotonic()
+            assert len(asyncio.run(on_loop())) == 1
+            assert time.monotonic() - started < 1.0, "on-loop fill blocked on the writer"
+        finally:
+            release.set()
+            t.join(5)
+
+    def test_unlocked_fill_publishes_under_unmoved_generation(self, tmp_path: Path) -> None:
+        """An unlocked fill KEEPS its parse when no invalidation raced it.
+
+        It runs exactly while a writer holds the lock, so its parse may predate
+        a rewrite that restores the file's mtime. Two witnesses distinguish the
+        cases: the invalidation generation (unmoved across the fill window ⇒
+        no LOCAL preserved-mtime rewrite landed) and the cross-process
+        flock-hold witness (this process held the flock throughout ⇒ no
+        EXTERNAL writer could touch the file), so the holder here takes the
+        FULL writer lock the way a real local writer does. Publishing the
+        proven-valid parse spares the next reader a full re-parse. (The
+        moved-generation and no-flock discards are pinned in
+        test_history_cache_fill_race.py.)
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("k", "user", "hello")
+        log._invalidate_cache("k")
+
+        acquired, release = threading.Event(), threading.Event()
+
+        def hold_writer_lock() -> None:
+            with log._locked("k"):
+                acquired.set()
+                release.wait(5)
+
+        t = threading.Thread(target=hold_writer_lock, daemon=True)
+        t.start()
+        assert acquired.wait(5)
+        try:
+
+            async def on_loop() -> list[dict]:
+                return log._read_messages("k")
+
+            assert len(asyncio.run(on_loop())) == 1, "the unlocked fill must still serve the read"
+            assert log._msg_cache.get("k") is not None, (
+                "an invalidation-free unlocked fill was discarded; the generation "
+                "guard proves the parse valid, so dropping it re-pays the full "
+                "re-parse on every contended on-loop read"
+            )
+        finally:
+            release.set()
+            t.join(5)
+        # Once the writer is gone the next read is a warm hit on the kept fill.
+        assert len(log._read_messages("k")) == 1
+        assert log._msg_cache.get("k") is not None
+
+    def test_off_loop_miss_waits_for_the_writer(self, tmp_path: Path) -> None:
+        """Off the loop there is no watchdog to starve, so the fill waits and
+        the race stays closed."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("k", "user", "hello")
+        log._invalidate_cache("k")
+
+        acquired, release = threading.Event(), threading.Event()
+        entered_fill = threading.Event()
+        held_box: list[bool] = []
+        t = self._hold(log._file_lock("k"), acquired, release)
+
+        def fill() -> None:
+            with log._cache_fill_lock("k") as held:
+                held_box.append(held)
+                entered_fill.set()
+
+        try:
+            waiter = threading.Thread(target=fill, daemon=True)
+            waiter.start()
+            assert not entered_fill.wait(0.3), "off-loop fill did not wait for the writer"
+            release.set()
+            assert entered_fill.wait(5), "off-loop fill never acquired the released lock"
+            waiter.join(5)
+            assert held_box == [True]
+        finally:
+            release.set()
+            t.join(5)
+
+    def test_off_loop_miss_gives_up_rather_than_waiting_unbounded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wedged holder must not hang the reader: the off-loop acquire is
+        capped at the writer's own ceiling and then fills unlocked."""
+        import kiro_crew.history as history_mod
+
+        monkeypatch.setattr(history_mod, "_FLOCK_ACQUIRE_TIMEOUT_S", 0.1)
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("k", "user", "hello")
+        log._invalidate_cache("k")
+
+        acquired, release = threading.Event(), threading.Event()
+        t = self._hold(log._file_lock("k"), acquired, release)
+        try:
+            started = time.monotonic()
+            with log._cache_fill_lock("k") as held:
+                assert held is False, "reader claimed a lock the holder still owns"
+            elapsed = time.monotonic() - started
+            assert elapsed < 3.0, f"off-loop acquire was not bounded (waited {elapsed:.1f}s)"
+            assert len(log._read_messages("k")) == 1
+        finally:
+            release.set()
+            t.join(5)
 
 
 # ── On-loop offload discipline: structurally enforced, not convention-only ────
@@ -1367,21 +1565,29 @@ class TestDashboardSaveHoldsLock:
     def test_foreign_append_content_identity_dedup_semantics(
         self, tmp_path, monkeypatch
     ):
-        """Pin the narrowed, timestamp-first foreign-append identity (GPT 5.6
-        HIGH + arbiter long-term item 2).
+        """Pin the LEGACY id-less fallback: the narrowed, timestamp-first
+        foreign-append identity (GPT 5.6 HIGH + arbiter long-term item 2).
 
-        ``_frozen_prefix_and_foreign_appends`` classifies a disk window-region
-        line as "ours" (drops it — the window re-serializes it) when EITHER its
-        ``ts`` matches a window entry (in-place edit) OR — as a COUNT-BOUNDED
-        tiebreak — its ``(role, content)`` matches an as-yet-unconsumed window
-        entry (a same-process ``append_if_absent`` copy persisted with a fresh
-        ``ts``). Because the tiebreak is bounded, each window entry absorbs AT
-        MOST one disk copy: a second same-content line with a DISTINCT ts (a
-        genuinely distinct event from another process, e.g. a repeated identical
-        cron/workflow result) is PRESERVED as foreign rather than collapsed. This
-        verifies both no-loss (the distinct event survives) and no-duplication
-        (the append_if_absent fresh-ts copy is folded once, not re-appended).
-        See docs/system-specs/modules/history.md.
+        Since the ``meta.mid`` tier landed (#5152), this ladder is the fallback
+        for disk lines that carry NO stable id — pre-id transcripts and writers
+        that persist id-less durable copies. Every disk line and window entry
+        here is deliberately id-less, so the input must reproduce the pre-id
+        behaviour EXACTLY (pass 0 never fires; nothing about tiers a-c moved).
+
+        For id-less lines ``_frozen_prefix_and_foreign_appends`` classifies a
+        disk window-region line as "ours" (drops it — the window re-serializes
+        it) when EITHER its ``ts`` matches a window entry (in-place edit) OR —
+        as a COUNT-BOUNDED tiebreak — its ``(role, content)`` matches an
+        as-yet-unconsumed window entry (a same-process ``append_if_absent`` copy
+        persisted with a fresh ``ts``). Because the tiebreak is bounded, each
+        window entry absorbs AT MOST one disk copy: a second same-content line
+        with a DISTINCT ts (a genuinely distinct event from another process,
+        e.g. a repeated identical cron/workflow result) is PRESERVED as foreign
+        rather than collapsed. This verifies both no-loss (the distinct event
+        survives) and no-duplication (the append_if_absent fresh-ts copy is
+        folded once, not re-appended). Stamped lines resolve exactly in the id
+        tier instead — see ``TestForeignFoldMidIdentity`` and
+        docs/system-specs/modules/history.md.
         """
         import json
 
@@ -1457,6 +1663,346 @@ class TestDashboardSaveHoldsLock:
             "fresh-ts content-tiebreak drops must be surfaced for archiving "
             f"(got {dropped_contents!r})"
         )
+
+
+class TestForeignFoldMidIdentity:
+    """Pin the ``meta.mid`` tier (pass 0) of the save-side foreign-merge fold
+    (#5152, the save-side slice of the #381 successor identity).
+
+    Every window append mints a stable per-message id (``meta.mid``), a save
+    persists it, and the durable-copy writers (workflow/cron injectors, CLI)
+    carry the window row's id onto their copy — so since #5133 the id is on
+    BOTH sides of the fold's comparison. Pass 0 uses it: an id match IS the
+    same message (folded silently, never archived); an id-carrying disk line
+    whose id matches NO window entry is foreign regardless of body equality
+    (two genuinely distinct identical-content messages carry distinct ids);
+    id-less lines keep the legacy timestamp-first ladder byte-identically
+    (pinned by ``test_foreign_append_content_identity_dedup_semantics``).
+    """
+
+    def _make_state(self, tmp_path: Path):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kiro_crew.dashboard.state import DashboardState
+
+        sessions = MagicMock(count=0)
+        sessions.get_pid = MagicMock(return_value=None)
+        sessions.remove = AsyncMock()
+        return DashboardState(
+            sessions=sessions,
+            crons=MagicMock(
+                list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})
+            ),
+            lessons=MagicMock(load_all=MagicMock(return_value=[])),
+            start_time=0.0,
+            conversation_log=ConversationLog(base_dir=tmp_path),
+        )
+
+    def _fold(self, tmp_path, monkeypatch, slot_name, disk_entries, window_entries):
+        """Write *disk_entries* (after a metadata line) and run the fold."""
+        import json
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import (
+            _frozen_prefix_and_foreign_appends,
+        )
+        from kiro_crew.dashboard.chat_utils import _history_key_for
+
+        state = self._make_state(tmp_path)
+        slot = state.get_or_create_slot(slot_name)
+        history_key = _history_key_for(slot.key)
+        path = state.conversation_log._path(history_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps({"_type": "metadata", "created": "2026-01-01T00:00:00Z"})]
+        lines.extend(json.dumps(e) for e in disk_entries)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        slot._frozen_prefix_cache = None
+        return _frozen_prefix_and_foreign_appends(slot, path, 0, window_entries)
+
+    def test_id_matched_durable_copy_folds_without_archive_churn(
+        self, tmp_path, monkeypatch
+    ):
+        """An injector's durable copy (fresh ts, SAME ``meta.mid`` as its window
+        row) folds in pass 0 with an EMPTY ``dedup_dropped``: the ids matching
+        exactly makes it unambiguous, so it must not be routed to the
+        ``foreign-dedup`` archive the way the id-less fresh-ts tiebreak is
+        (issue #5152 consequence 1 — archive churn on every injection+save).
+        """
+        _prefix, foreign, dedup_dropped = self._fold(
+            tmp_path,
+            monkeypatch,
+            "midfold",
+            disk_entries=[
+                # Durable copy: fresh ts TY (window's in-memory ts is TZ), same id.
+                {
+                    "role": "assistant",
+                    "content": "inj",
+                    "ts": "TY",
+                    "meta": {"mid": "m-inj"},
+                }
+            ],
+            window_entries=[
+                {
+                    "role": "assistant",
+                    "content": "inj",
+                    "ts": "TZ",
+                    "meta": {"mid": "m-inj"},
+                }
+            ],
+        )
+        assert foreign == [], "id-matched durable copy must fold into the window"
+        assert dedup_dropped == [], (
+            "an id-matched fold is exact, not ambiguous — it must not churn "
+            f"the foreign-dedup archive (got {dedup_dropped!r})"
+        )
+
+    def test_distinct_ids_with_identical_content_stay_distinct(
+        self, tmp_path, monkeypatch
+    ):
+        """Two identical-content rows with DISTINCT ids resolve exactly: the
+        window row's copy (same id) folds silently, the genuinely distinct row
+        (different id) is preserved as foreign (issue #5152 consequence 2 — the
+        residual ambiguity the count-bounded tiebreak could only bound).
+        """
+        import json
+
+        _prefix, foreign, dedup_dropped = self._fold(
+            tmp_path,
+            monkeypatch,
+            "mid2",
+            disk_entries=[
+                # The window row's own durable copy (fresh ts, same id) → folded.
+                {
+                    "role": "assistant",
+                    "content": "status ok",
+                    "ts": "TA",
+                    "meta": {"mid": "m-ours"},
+                },
+                # A distinct cron result with the SAME text but its OWN id →
+                # foreign, even though the body tiebreak budget is exhausted
+                # only after the fold above.
+                {
+                    "role": "assistant",
+                    "content": "status ok",
+                    "ts": "TB",
+                    "meta": {"mid": "m-theirs"},
+                },
+            ],
+            window_entries=[
+                {
+                    "role": "assistant",
+                    "content": "status ok",
+                    "ts": "TW",
+                    "meta": {"mid": "m-ours"},
+                }
+            ],
+        )
+        foreign_mids = [json.loads(ln)["meta"]["mid"] for ln in foreign]
+        assert foreign_mids == ["m-theirs"], (
+            "the distinct-id row must be preserved as foreign and the same-id "
+            f"copy folded (got foreign mids {foreign_mids!r})"
+        )
+        assert dedup_dropped == [], "id-tier resolutions must not archive anything"
+
+    def test_unmatched_id_beats_body_tiebreak(self, tmp_path, monkeypatch):
+        """An id-carrying disk line whose id is absent from the window is
+        FOREIGN even though its body matches an unconsumed window entry — the
+        distinct id is authoritative, so the tier-(c) body tiebreak must not
+        absorb it (and must not archive it as an ambiguous drop).
+        """
+        import json
+
+        _prefix, foreign, dedup_dropped = self._fold(
+            tmp_path,
+            monkeypatch,
+            "midforeign",
+            disk_entries=[
+                {
+                    "role": "assistant",
+                    "content": "same text",
+                    "ts": "TB",
+                    "meta": {"mid": "m-other"},
+                }
+            ],
+            window_entries=[
+                # Unconsumed window entry with matching body but a different id:
+                # its (role, content) budget is AVAILABLE, and must still not
+                # absorb the distinct-id line.
+                {
+                    "role": "assistant",
+                    "content": "same text",
+                    "ts": "TW",
+                    "meta": {"mid": "m-mine"},
+                }
+            ],
+        )
+        assert [json.loads(ln)["meta"]["mid"] for ln in foreign] == ["m-other"], (
+            "a disk line whose id matches no window entry must be preserved as "
+            "foreign regardless of body equality"
+        )
+        assert dedup_dropped == [], (
+            "an id-settled foreign line is not an ambiguous drop"
+        )
+
+    def test_legacy_line_still_folds_into_id_carrying_window_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """A restored legacy transcript: the on-disk line is id-less, but the
+        restore minted the window row a fresh id. The exact (ts, role, content)
+        tier must still fold the line — an id-carrying window entry stays
+        indexed in the legacy tiers, or every save after a restart would
+        duplicate the whole pre-id transcript.
+        """
+        _prefix, foreign, dedup_dropped = self._fold(
+            tmp_path,
+            monkeypatch,
+            "midlegacy",
+            disk_entries=[
+                {"role": "assistant", "content": "old row", "ts": "T1"},
+            ],
+            window_entries=[
+                # The same row post-restore: identical triple, restore-minted id.
+                {
+                    "role": "assistant",
+                    "content": "old row",
+                    "ts": "T1",
+                    "meta": {"mid": "m-minted"},
+                }
+            ],
+        )
+        assert foreign == [], (
+            "an id-less legacy line must still exact-fold into its restored "
+            "window row (else every post-restart save duplicates the transcript)"
+        )
+        assert dedup_dropped == [], "an exact fold is silent"
+
+    def test_mixed_id_and_idless_lines_in_one_ts_group_lose_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """Opus 5 review HIGH: an id-foreign line must keep its ``ts`` group
+        AMBIGUOUS. If it were excluded from the disk-side counter, a group
+        holding an id-carrying foreign line PLUS an id-less foreign line and
+        exactly one unmatched window entry with the same ``ts`` (coarse-clock
+        collision) would read as an unambiguous 1:1, and the ts-only tier
+        would silently DROP the id-less acknowledged append — the exact
+        data-loss class the ambiguity gate exists to prevent. Both lines must
+        be preserved as foreign, matching the pre-id-tier behaviour.
+        """
+        import json
+
+        _prefix, foreign, dedup_dropped = self._fold(
+            tmp_path,
+            monkeypatch,
+            "midmixts",
+            disk_entries=[
+                # Id-carrying foreign line (unknown id) colliding on ts T.
+                {
+                    "role": "assistant",
+                    "content": "x",
+                    "ts": "T",
+                    "meta": {"mid": "m-2"},
+                },
+                # Id-less foreign line sharing the same coarse-clock ts T.
+                {"role": "assistant", "content": "y", "ts": "T"},
+            ],
+            window_entries=[
+                {
+                    "role": "assistant",
+                    "content": "a",
+                    "ts": "T",
+                    "meta": {"mid": "m-1"},
+                }
+            ],
+        )
+        foreign_contents = [json.loads(ln)["content"] for ln in foreign]
+        assert foreign_contents == ["x", "y"], (
+            "both foreign lines in the contested ts group must survive — the "
+            "id-foreign line may not convert the group into a silent 1:1 fold "
+            f"(got {foreign_contents!r})"
+        )
+        assert dedup_dropped == []
+
+    def test_reused_mid_with_distinct_body_falls_back_conservatively(
+        self, tmp_path, monkeypatch
+    ):
+        """GPT 5.6 review HIGH: ``meta.mid`` is caller-suppliable
+        (``_ChatSlot.append`` preserves a pre-existing id, and ``/api/chat``
+        meta rides through), so bare id equality may pair two genuinely
+        distinct messages. An id match corroborated by NEITHER body nor ``ts``
+        must not consume the window entry: the line falls back to the legacy
+        ladder (preserved as foreign here), and a later id-less exact copy of
+        the entry still folds — the outcome cannot depend on the reused-id
+        line stealing the entry's budget.
+        """
+        import json
+
+        _prefix, foreign, dedup_dropped = self._fold(
+            tmp_path,
+            monkeypatch,
+            "midreuse",
+            disk_entries=[
+                # Reused id, but different body AND different ts: a genuinely
+                # distinct message that happens to carry the window row's id.
+                {
+                    "role": "assistant",
+                    "content": "distinct msg",
+                    "ts": "T2",
+                    "meta": {"mid": "m-reused"},
+                },
+                # The window row's own id-less exact persisted copy — must
+                # still fold into the entry the reused-id line did not steal.
+                {"role": "assistant", "content": "a", "ts": "T1"},
+            ],
+            window_entries=[
+                {
+                    "role": "assistant",
+                    "content": "a",
+                    "ts": "T1",
+                    "meta": {"mid": "m-reused"},
+                }
+            ],
+        )
+        foreign_contents = [json.loads(ln)["content"] for ln in foreign]
+        assert foreign_contents == ["distinct msg"], (
+            "an uncorroborated id match must not silently drop a distinct "
+            f"message (got {foreign_contents!r})"
+        )
+        assert dedup_dropped == [], (
+            "the exact copy folds via the exact tier, not the archive tiebreak"
+        )
+
+    def test_id_match_corroborated_by_ts_folds_silently(
+        self, tmp_path, monkeypatch
+    ):
+        """The ``ts`` half of the corroboration rule: an id-matched line whose
+        ``ts`` equals the entry's (an in-place edit of a durably-copied row —
+        same id, same ts, superseded body) is the entry's own persisted copy
+        and folds silently, window version winning, no archive churn.
+        """
+        _prefix, foreign, dedup_dropped = self._fold(
+            tmp_path,
+            monkeypatch,
+            "midtscorr",
+            disk_entries=[
+                {
+                    "role": "assistant",
+                    "content": "OLD body",
+                    "ts": "T1",
+                    "meta": {"mid": "m-edit"},
+                }
+            ],
+            window_entries=[
+                # Same id, same ts, edited content: the window wins.
+                {
+                    "role": "assistant",
+                    "content": "NEW body",
+                    "ts": "T1",
+                    "meta": {"mid": "m-edit"},
+                }
+            ],
+        )
+        assert foreign == [], "the stale persisted copy must fold, window wins"
+        assert dedup_dropped == [], "an id+ts corroborated fold is silent"
 
 
 class TestBestEffortSaveMarksDirty:

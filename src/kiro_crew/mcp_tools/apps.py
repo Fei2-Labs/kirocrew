@@ -328,7 +328,7 @@ def _crew_session_key() -> tuple[str, str]:
             "Error: this tool needs a directly-identified dashboard session. "
             "A subagent resolves to its parent's session, which would read and "
             "write the parent crew's ledger. Run this from the crew's own "
-            "session."
+            "session." + mcp_core.strict_identity_diagnosis()
         )
     return _crew_sk, ""
 
@@ -391,7 +391,7 @@ def ops_mission_control_api(name: str, args: dict[str, Any]) -> str:
     if _omc_body_raw:
         try:
             _omc_parsed = json.loads(_omc_body_raw)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             return "Error: body_json is not valid JSON."
         if not isinstance(_omc_parsed, dict):
             return "Error: body_json must encode a JSON object."

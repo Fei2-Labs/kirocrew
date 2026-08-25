@@ -5,7 +5,7 @@ import { safeSetItem } from '../utils/safeStorage'
 import { secureRandomId } from '../utils/secureId'
 
 /** Singleton "view" tabs (opened from the + menu, one instance each). */
-export type ViewKind = 'changes' | 'issues' | 'files' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'context' | 'side' | 'browser' | 'git' | 'summary' | 'pins'
+export type ViewKind = 'changes' | 'issues' | 'links' | 'files' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'context' | 'side' | 'browser' | 'git' | 'summary' | 'pins'
 /** All tab kinds: singleton views + on-demand document/terminal tabs. */
 /** `app` hosts an MCP App (a sandboxed iframe with a live JSON-RPC bridge).
  *  It is deliberately a TabKind and NOT a ViewKind: SidePanel unmounts
@@ -20,7 +20,8 @@ export type TabKind = ViewKind | 'file' | 'diff' | 'artifact' | 'terminal' | 'fo
  *  `issues` is deliberately NOT pinned: most sessions never mention an issue,
  *  so a permanent Issues tab would be an always-empty tab for the majority.
  *  It is opened on demand (from the + menu, or automatically by ChatPage when
- *  an issue url is first seen).
+ *  an issue url is first seen). `links` is unpinned for the same reason — a
+ *  session that referenced no URL would otherwise carry an empty tab.
  *
  *  `pins` is NOT pinned either, and for a stronger reason than emptiness: this
  *  block is prime real estate — always visible, non-closable, ahead of every
@@ -29,7 +30,7 @@ export type TabKind = ViewKind | 'file' | 'diff' | 'artifact' | 'terminal' | 'fo
  *  ChatPage on a session's FIRST pin. A session pinned before the tab existed
  *  reaches it through the + menu, the same zero option Issues gives pre-existing
  *  issue links; that is what keeps this free of any reveal-claim mechanism. */
-export const PINNED_VIEWS: ViewKind[] = ['changes', 'files', 'artifacts']
+export const PINNED_VIEWS: ViewKind[] = ['changes', 'artifacts', 'files']
 
 export interface PanelTab {
   id: string
@@ -41,6 +42,15 @@ export interface PanelTab {
   // ── document fields ──
   path?: string
   content?: string
+  /** The on-disk bytes this buffer was last known to match — the dirty
+   *  baseline. `openFile` compares the live buffer against it to tell "the
+   *  user edited this tab" from "the file changed on disk", and only the
+   *  former survives a re-open of the same path; a successful save and every
+   *  disk-originated refresh (cold-tab hydration, file watch, panel Refresh,
+   *  error placeholder) restamp it. TRANSIENT — stripped in `serializeBucket`
+   *  alongside the body it mirrors, so persistence stays metadata-only and a
+   *  restored tab is dirty-by-default until hydration re-establishes both. */
+  savedContent?: string
   original?: string
   modified?: string
   /** Last selected working-tree diff view for file tabs. Persisted with the
@@ -98,6 +108,7 @@ const VIEW_TITLE_KEY: Record<ViewKind, string> = {
   changes: 'hooks.usePanelTabs.changes',
   issues: 'hooks.usePanelTabs.issues',
   files: 'hooks.usePanelTabs.files',
+  links: 'hooks.usePanelTabs.links',
   artifacts: 'hooks.usePanelTabs.artifacts',
   subagents: 'hooks.usePanelTabs.subagents',
   workflows: 'hooks.usePanelTabs.workflows',
@@ -354,7 +365,10 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
  *  can be MBs and blow the localStorage quota. Terminal + view tabs and all
  *  tab METADATA (path / slug / sessionId / cwd / order / focus) are kept, so
  *  document tabs restore as lightweight references and re-fetch their content
- *  on demand; artifact tabs self-hydrate by slug via ArtifactPanel's query. */
+ *  on demand; artifact tabs self-hydrate by slug via ArtifactPanel's query.
+ *  The saved baseline is stripped with the body: it is a second copy of the
+ *  same bytes, and a restored tab without one is treated as dirty until its
+ *  content is re-fetched, which restamps it. */
 /** Lean single-bucket projection for persistence. Diff and app tabs are
  *  transient — a restored diff can only re-fetch the CURRENT working-tree diff,
  *  never the original turn snapshot, so it renders a misleading/unreliable diff;
@@ -366,7 +380,7 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
 function serializeBucket(b: Bucket): string {
   const tabs = b.tabs
     .filter(t => t.kind !== 'diff' && t.kind !== 'app')
-    .map(t => { const copy = { ...t }; delete copy.content; delete copy.revealLine; return copy })
+    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.revealLine; return copy })
   // If the focused tab was a dropped diff/app tab, refocus a surviving tab.
   const activeId = tabs.some(t => t.id === b.activeId)
     ? b.activeId
@@ -509,16 +523,37 @@ export function usePanelTabs(slotKey: string | null = null) {
     })
   }, [update])
 
-  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number }) => {
+  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:
     // `upsert` merges onto an existing tab with a spread, which only overwrites
     // keys the incoming object HAS. Omitting it would leave a previous chip's
     // line on the tab, so a later plain click on the same file would re-jump to
     // a line the user did not ask for.
-    upsert({
-      id: `file:${path}`, kind: 'file', title: basename(path), path, content, slot,
-      revealLine: opts?.line != null ? { line: opts.line, endLine: opts.endLine, nonce: nextRevealNonce() } : undefined,
-    }, opts?.replaceId)
+    const reveal = opts?.line != null ? { line: opts.line, endLine: opts.endLine, nonce: nextRevealNonce() } : undefined
+    update(b => {
+      const prev = b.tabs.find(t => t.id === `file:${path}`)
+      if (prev && prev.content !== prev.savedContent) {
+        // The tab holds edits that were never saved (its buffer differs from
+        // its saved baseline; a baseline-less tab with a buffer — legacy or
+        // restored-but-not-yet-hydrated — counts the same way). Re-opening
+        // must FOCUS it, not revert it: the disk bytes in `content` here are
+        // not what the user was looking at, and silently replacing the buffer
+        // destroyed their work with no prompt and no undo. Everything EXCEPT
+        // the buffer and its baseline is refreshed (focus, reveal target,
+        // slot, diff-mode preference).
+        return upsertInBucket(b, {
+          id: `file:${path}`, kind: 'file', title: basename(path), path, slot,
+          revealLine: reveal,
+          ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
+        }, opts?.replaceId)
+      }
+      return upsertInBucket(b, {
+        id: `file:${path}`, kind: 'file', title: basename(path), path, content, slot,
+        savedContent: content,
+        revealLine: reveal,
+        ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
+      }, opts?.replaceId)
+    })
   }, [upsert])
 
   const openDiff = useCallback((path: string, modified: string, original = '') => {

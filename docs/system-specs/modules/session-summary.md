@@ -26,10 +26,11 @@ to pay for, so the whole subsystem is inert until `session_summary.enabled`.
 ## Storage: a sidecar, never the transcript
 
 Summaries live in `~/.kiro/crew/sessions/.intents/<safe_key>.json`, keyed by the
-session's **transcript** key, with the payload shape below plus a `sig` field.
+session's **transcript** key, with the payload shape below plus the `sig` and
+`gen` fields that together identify the transcript it describes.
 
 ```json
-{"sig": 1760000000.5, "generated_at": 1760000123.1, "user_turns": 7,
+{"sig": 1760000000.5, "gen": 3, "generated_at": 1760000123.1, "user_turns": 7,
  "last_activity": "2026-08-10T10:00:00+00:00",
  "intents": [ … ], "constraints": [ … ]}
 ```
@@ -45,9 +46,24 @@ mtime for the same reason — see `history.md`. `test_session_summary_storage.py
 pins that writing and reading a summary leaves the transcript's bytes and mtime
 untouched.
 
-**`sig` is the session file's mtime.** Any real append advances it and invalidates
-the cache; a metadata-only rewrite does not. This makes staleness exact and free
-to check — one `stat`, no content comparison.
+**Identity is `sig` + `gen`, and freshness requires BOTH to match.** `sig` is the
+session file's mtime: any real append advances it, so it catches the ordinary
+case for one `stat`, with no content comparison. `gen` is
+`rotation_generation` — the transcript's content-identity counter.
+
+The second half is not redundant, because the first half has a blind spot the
+paragraph above creates. Housekeeping that CHANGES the messages — a rotation,
+the dashboard rewrite save (regenerate / rewind / fork), a channel transcript
+merge — deliberately restores the previous mtime so it does not reorder
+`list_sessions`. Against mtime alone those rewrites are invisible, and a summary
+describing the pre-rewrite conversation stayed valid indefinitely: unlike the
+in-process caches, a sidecar is a FILE, so the staleness survived a restart. All
+of them advance the content generation, which is what `gen` reads.
+
+Metadata-only rewrites do NOT invalidate. `mark_consolidated` rewrites the
+metadata line and never touches a message, so it moves neither signal — an
+LLM-generated summary is not discarded for bookkeeping that did not change what
+it describes.
 
 **The pass flushes the slot before it captures `sig`.** `_ChatSlot.append` marks a
 slot dirty and leaves the disk write to the 5s `_flush_loop`, and this pass is
@@ -67,7 +83,9 @@ generation-compare bookkeeping that makes the clear safe lives in one place.
 
 **It is a different file from the one-line summary.** `.summaries/<key>.json`
 holds the on-demand one-line description shown in the sessions list, written by
-`set_cached_summary`, which overwrites the whole file. The two artifacts have
+`set_cached_summary`, which overwrites the whole file. It carries the same
+`sig` + `gen` identity and is validated the same way — the blind spot above is
+a property of the transcript, not of either consumer. The two artifacts have
 independent writers and independent triggers, so sharing a file would have them
 clobbering each other — exactly the read-modify-write race the sidecar design
 exists to avoid.
@@ -84,6 +102,18 @@ started from; otherwise it refuses (returns `False`) and the generator discards
 the payload without pushing a WS update or advancing its turn mark. The same
 check drops a summary a mid-generation append has already made stale, rather
 than storing it as the latest word.
+
+**Both halves of the identity are snapshotted by the CALLER, before the model
+call.** The generation is captured next to `sig`, never read at write time, for
+the same reason the guard above exists: a content rewrite landing mid-generation
+preserves the mtime while advancing the generation, so reading it at write time
+would stamp the NEW content's identity onto the OLD summary and bless it as
+fresh — and with the mtime preserved, nothing downstream could ever catch it.
+`set_cached_intent_summary` refuses a payload whose generation moved, exactly as
+it refuses one whose mtime moved; `set_cached_summary` records the snapshot, so
+the entry it writes is already invalid on the next read. This mirrors
+`mark_consolidated`, which likewise takes the generation its caller snapshotted
+rather than sampling it after the slow call.
 
 ### Keyed on the transcript key, not the slot key
 
@@ -360,8 +390,8 @@ losing the feature.
 | `enabled` | `false` | Top-level switch; the subsystem is inert while off |
 | `min_user_turns` | `2` | A one-exchange session has no intent structure |
 | `regenerate_after_turns` | `1` | Turns between rebuilds; raise to trade freshness for tokens |
-| `max_intents` | `8` | Oldest-touched are trimmed; the panel collapses them anyway |
-| `max_constraints` | `5` | Project notes; `0` suppresses the section |
+| `max_intents` | `50` | Safety ceiling, not a display limit; the oldest-touched tail is dropped from the record before the write |
+| `max_constraints` | `50` | Safety ceiling on project notes; `0` suppresses the section |
 | `assistant_excerpt_chars` | `400` | Head/tail kept per assistant message |
 
 Out-of-range values are clamped with a warning rather than raising, and a
@@ -370,12 +400,57 @@ prevent the gateway from starting.
 
 ## Scope in this release
 
-Dashboard sessions only. The generator hangs off the dashboard turn-end hub, so
-Slack, cron, webhook and task-runner turns do not produce summaries. Reaching
-them means threading the flag through the same four call sites
-`skills.auto_create_from_sessions` uses (`cli.py`, `cli_server.py`,
-`dashboard/server.py`, `slack/gateway.py`). This is a deliberate cut, not an
-oversight.
+**The boundary is the turn loop, not the surface.** `_should_summarize` contains
+no check on where a message came from — it gates on `enabled`, an in-flight pass,
+incognito mode, liveness, a clean `end_turn`, the turn count and the cadence, and
+nothing else. Coverage is decided instead by *where the generator is called from*:
+the automatic pass has exactly one dispatch site, `_finish_queue_cycle` at the
+tail of a `_ChatSlot` turn in `dashboard/chat_runner.py`, plus the explicit
+on-demand route in `dashboard/chat_handlers.py`. Only a turn that ran through
+`_run_chat` on a slot reaches the automatic pass — and reaching it is not the same
+as producing a summary, because the gates above still apply. The on-demand route
+is the one path that produces a summary with no turn at all.
+
+So the excluded set is every surface that owns its own turn loop, and it is wider
+than "not the dashboard":
+
+| Surface | Where its turn is driven instead |
+|---|---|
+| Slack | `slack/handler.py` (native ACP loop) or `messaging/driver.py` (`TurnDriver`) |
+| Discord, Telegram, Teams, Webex, WeCom, WeChat | `messaging/driver.py` (`TurnDriver`), one shared loop |
+| Task runner | `task_executor.py`, streaming an ACP client directly |
+| Cron wake | `slack/gateway.py`; the result is *appended* into a `cron-<id>` slot by `dashboard/cron_inject.py` — a bare append with no turn lifecycle |
+| Agent webhooks | `dashboard/handlers/hooks.py` |
+| Workflow phase calls | `workflows/agent_exec.py` |
+| Subagents | `subagent.py` — never a `_ChatSlot` at all, so a `.intents` sidecar is not reachable |
+| `kirocrew chat` | `cli_chat.py`, straight onto the provider |
+
+Two corollaries the "dashboard only" shorthand gets wrong in both directions.
+The OpenAI-compatible endpoint (`dashboard/openai_compat.py`) calls `_run_chat` on
+a real slot, so it **does** summarize — a single-shot ephemeral request still
+stops at `min_user_turns`, but a caller reusing an `id` does not. And the
+initiator is not the boundary: a Slack thread explicitly linked to a slot, an
+auto-nudge cycle **on a dashboard slot** (a nudge on a channel key uses a separate
+fire path and does not), a cron delivering with `session="origin"`, a workflow's
+post-run auto-turn, and the task runner's review handoff to chat all cross into
+`_run_chat`, and so reach the automatic pass on the dashboard session they drive —
+never on themselves, and still subject to every gate above.
+
+Excluding the channels is deliberate, and enforced rather than incidental:
+`DashboardState` refuses to index a channel-born session's self-referential
+`slack_thread_ts`, because binding it would make inbound Slack resolve to a
+"linked" slot and silently change the execution engine and approval semantics of
+all Slack traffic.
+
+Widening coverage is therefore not a matter of threading the config flag to more
+call sites — the flag is already global, and every excluded surface skips the
+generator by never reaching its dispatch site. It needs either a turn-end dispatch
+in each surface's own loop, or one shared post-turn boundary that all of them
+cross. Note also that reaching the dispatch site is not sufficient: an auto-nudge
+cycle does reach it, but a nudge row is persisted under role `nudge` and
+`extract_turns` reads only `user` and `assistant`, so a nudge cycle never advances
+`count_user_turns`. A nudge-only session therefore stays below `min_user_turns`
+until a person types.
 
 No governance capability scope. Nothing enforces one, and a scope is a data-only
 addition later; if one is ever added it must be registered inline in

@@ -28,26 +28,7 @@ from sage_lib import followup as FU  # noqa: N812
 from sage_lib import review_pool as RP  # noqa: N812
 from sage_lib import store
 
-
-def _symlinks_creatable() -> bool:
-    """Whether this platform lets an unprivileged process create a symlink.
-
-    Windows requires SeCreateSymbolicLinkPrivilege, which CI does not grant, so
-    the planted-symlink tests below cannot run there. The GUARD they cover is not
-    Windows-specific — ``read_text_nolink`` and the mkstemp write protect every
-    platform — but the attack can only be *staged* where symlinks can be made.
-    """
-    with tempfile.TemporaryDirectory() as d:
-        target = Path(d) / "t"
-        target.write_text("x", encoding="utf-8")
-        try:
-            (Path(d) / "l").symlink_to(target)
-        except (OSError, NotImplementedError):
-            return False
-    return True
-
-
-SYMLINKS_OK = _symlinks_creatable()
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
 
 
 def _ev(kind, **over):

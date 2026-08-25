@@ -369,11 +369,18 @@ class TestRealSigninHandleFailures:
 
 
 class TestRealEngineGatewayPort:
-    """The tunnel forces local_port == remote_port and hard-fails when that port is
-    busy, so registering every crew on the default 5476 produced a crew that could
-    never be connected — the operator's own gateway usually owns 5476."""
+    """A provisioned crew takes the stock port on BOTH ends.
 
-    def _engine(self, monkeypatch, used_ports):
+    The launch engine once allocated a bespoke gateway port because the tunnel
+    forced local_port == remote_port and hard-failed when that port was busy —
+    the operator's own gateway usually owns the default, so a crew registered on
+    it could never be connected. The hub now picks its local forward port
+    independently, so crews share the stock remote port: the stack binds its
+    DashboardPort default, the registry records its matching default, and no
+    allocation step exists to reintroduce.
+    """
+
+    def _engine(self, monkeypatch):
         from kiro_crew.cloud import launch_engine as le
 
         seen = {}
@@ -384,58 +391,49 @@ class TestRealEngineGatewayPort:
             le.connect_mod, "register_instance",
             lambda iid, **kw: seen.update({"reg": kw}) or "inst-1",
         )
-        # Deterministic allocation: the first free port at/after the base, minus
-        # whatever the registry already hands out.
-        monkeypatch.setattr(
-            le, "PortAllocator",
-            lambda *a, **k: SimpleNamespace(
-                allocate=lambda exclude=None: next(
-                    p for p in range(5600, 5700) if p not in set(exclude or ())
-                )
-            ),
-        )
         return le, seen
 
-    def test_the_same_allocated_port_reaches_the_stack_and_the_registry(self, monkeypatch):
-        le, seen = self._engine(monkeypatch, set())
+    def test_provision_and_register_leave_both_ports_at_their_defaults(self, monkeypatch):
+        le, seen = self._engine(monkeypatch)
         eng = le.RealLaunchEngine()
 
         eng.provision(tag="kc-1", size_key="balanced", profile="", region="us-east-1")
         eng.register(instance_id="i-0abc", tag="kc-1", profile="", region="us-east-1")
 
-        # One port, both ends — a mismatch would forward the tunnel at nothing.
-        assert seen["dashboard_port"] == 5600
-        assert seen["reg"]["remote_port"] == 5600
+        # Neither end may pass an override: the stack's DashboardPort default
+        # and register_instance's remote_port default name the SAME port (the
+        # stock dashboard port), which is what lets one crew reach the other.
+        assert "dashboard_port" not in seen
+        assert "remote_port" not in seen["reg"]
 
-    def test_it_skips_ports_the_registry_already_uses(self, monkeypatch):
-        le, seen = self._engine(monkeypatch, set())
+    def test_the_template_default_and_the_registry_default_name_the_same_port(self):
+        """The invariant behind the no-override contract above.
 
-        class _Reg:
-            def list(self):
-                return [SimpleNamespace(remote_port=5600, local_port=5601)]
+        Both ends resolve independently -- the stack binds the template's
+        ``DashboardPort`` Default, the registry records ``register_instance``'s
+        signature default -- so nothing at runtime checks they agree. A drift in
+        either literal ships crews whose tunnel forwards to a port nothing is
+        listening on, with every other test green. This is the one place the two
+        numbers are compared.
+        """
+        import re
 
-        # The import is module-scope now, so the name must be patched WHERE IT IS
-        # LOOKED UP — patching sys.modules would be a no-op.
-        monkeypatch.setattr(le, "InstancesRegistry", _Reg)
-        le.RealLaunchEngine().provision(
-            tag="kc-2", size_key="balanced", profile="", region="us-east-1"
+        from kiro_crew.cloud import ec2
+        from kiro_crew.cloud.connect import DEFAULT_REMOTE_DASHBOARD_PORT
+
+        text = ec2.load_template()
+        # The template carries CloudFormation short-form tags (!Sub), which a
+        # plain YAML load rejects, so read the parameter block textually. The
+        # match is anchored to the DashboardPort block's own indentation and
+        # guarded below so a template reshape fails loudly instead of matching
+        # some other parameter's Default.
+        m = re.search(
+            r"^  DashboardPort:\n(?:    \S.*\n)*?    Default: (\d+)\n",
+            text,
+            re.MULTILINE,
         )
-
-        assert seen["dashboard_port"] == 5602
-
-    def test_a_registry_read_failure_does_not_block_the_launch(self, monkeypatch):
-        le, seen = self._engine(monkeypatch, set())
-
-        class _Boom:
-            def __init__(self):
-                raise RuntimeError("registry unreadable")
-
-        monkeypatch.setattr(le, "InstancesRegistry", _Boom)
-        le.RealLaunchEngine().provision(
-            tag="kc-3", size_key="balanced", profile="", region="us-east-1"
-        )
-
-        assert seen["dashboard_port"] == 5600
+        assert m, "DashboardPort parameter with a Default not found in the template"
+        assert int(m.group(1)) == DEFAULT_REMOTE_DASHBOARD_PORT
 
 
 class TestRealEnginePreflight:

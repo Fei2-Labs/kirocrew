@@ -20,11 +20,12 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.dashboard.boot_id import current_boot_id
 from kiro_crew.dashboard.origin import (
     is_https_request,
     is_loopback,
@@ -415,7 +416,20 @@ _state: TokenStateManager = TokenStateManager(max_concurrent_nonces=MAX_CONCURRE
 # without the exemption the middleware 403s the runtime and every <mcwidget>
 # renders unstyled (Tailwind classes silently ignored, inline styles only).
 # Same exposure class as /assets/: static non-secret files.
-_BYPASS_PREFIXES = ("/assets/", "/static/", "/fonts/", "/vendor/", "/artifact-app/")
+# /sandbox-doc/ is the model-authored-HTML document channel: auth is the HMAC
+# path token minted by the authed POST /api/sandbox-doc endpoint. It exists
+# because a blob: URL is refused outright by some WebKit-based in-app browsers,
+# so artifact and widget frames load a real document instead. See
+# dashboard/handlers/sandbox_doc.py for the full security model.
+# Same exposure class as /assets/: static non-secret files.
+_BYPASS_PREFIXES = (
+    "/assets/",
+    "/static/",
+    "/fonts/",
+    "/vendor/",
+    "/artifact-app/",
+    "/sandbox-doc/",
+)
 _BYPASS_EXACT = {
     "/logo.png",
     "/manifest.json",
@@ -474,10 +488,75 @@ _BYPASS_EXACT = {
 # App-ID audience + signature) before processing. Only POST is routed today, so
 # the scope closes nothing yet — it is here so the shape a future entry gets
 # copied from is the safe one.
+
+#: The Bot Framework inbound webhook route. Named once because TWO independent
+#: middleware exemptions target it (the token gate below and the CSRF Origin
+#: check in ``server``), and a hand-copied second spelling is how one control
+#: ends up pointed at a route the other is not.
+TEAMS_WEBHOOK_PATH = "/api/messaging/teams"
+
+#: The inbound agent webhook route, named once for exactly the same reason
+#: :data:`TEAMS_WEBHOOK_PATH` is: the same two independent middleware exemptions
+#: target it, and one of them keying off a re-typed literal is how a route ends
+#: up exempt from one control and not the other.
+AGENT_HOOK_PATH = "/api/hooks/agent"
+
+#: Method scope shared by every self-authenticating external webhook entry: POST
+#: is the only method whose handler carries its own credential check.
+_SELF_AUTH_WEBHOOK_METHODS = frozenset({"POST"})
+
 _BYPASS_EXACT_METHODS: dict[str, frozenset[str]] = {
-    "/api/hooks/agent": frozenset({"POST"}),
-    "/api/messaging/teams": frozenset({"POST"}),
+    AGENT_HOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
+    TEAMS_WEBHOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
 }
+
+# Exact-path exemptions from the CSRF **Origin** check, path -> allowed methods.
+# A separate map from the token-auth bypass above, deliberately: skipping the
+# cookie gate and skipping the Origin check are two different grants, and a route
+# may need one without the other.
+#
+# ONE entry, and adding a second is a security review rather than a copy of this
+# line. `/api/hooks/agent` shares the shape -- self-authenticating, cookie-less,
+# server-to-server -- and is in the token-auth bypass above, but it is NOT here:
+# no reported failure named it, its own proxy topologies already work, and a
+# perimeter exemption is far harder to withdraw once a caller depends on it than
+# it is to add later with its own cause.
+#
+# WHY dropping the Origin check is sound for the Teams route: CSRF exists to stop
+# a BROWSER making a cross-origin state-changing request that the browser then
+# decorates with the victim's cookies. ``api_teams_activity`` reads no cookie at
+# all, so there is nothing for a cross-origin page to ride; it authenticates the
+# Bot Framework JWT instead (issuer, App-ID audience, RS256 signature over the
+# Bot Framework JWKS, expiry). A cross-origin page can neither obtain nor forge
+# one, so an Origin the check would have rejected buys an attacker nothing.
+#
+# WHY the exemption is REQUIRED and not a convenience: the Connector is
+# server-to-server and sends neither ``Origin`` nor ``Referer``.
+# ``origin.check_origin`` trusts a header-less request only from a loopback peer
+# or the dashboard's unix socket, so such a POST arriving straight at the gateway
+# is refused 403 before the credential is ever examined -- which is the "public
+# hostname on a VM/App Service" topology in ``docs/teams-integration.md``.
+# Nothing an operator can configure widens it: unlike the Host allowlist, which
+# ``dashboard.url`` feeds, there is no setting that admits an Origin-less
+# non-loopback POST.
+#
+# The METHOD scope is load-bearing: only POST is exempt, so the ``PUT``/``DELETE``
+# ``/api/hooks/{hook_id}`` CRUD routes -- whose handler authenticates by dashboard
+# token alone -- keep their Origin check even though the literal ``agent`` matches
+# their wildcard.
+CSRF_EXEMPT_EXACT_METHODS: dict[str, frozenset[str]] = {
+    TEAMS_WEBHOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
+}
+
+
+def is_csrf_exempt(path: str, method: str) -> bool:
+    """Whether *path* + *method* is a webhook exempt from the CSRF Origin check.
+
+    The single read point for :data:`CSRF_EXEMPT_EXACT_METHODS`, so both dashboard
+    middleware chains share one exemption rather than a literal list each.
+    """
+    return method in CSRF_EXEMPT_EXACT_METHODS.get(path, frozenset())
+
 
 # Anchored bypass for installed-app static UI bundles only (federated-app
 # design). Matches /apps/{name}/ui/<anything>, where {name} is the
@@ -514,6 +593,7 @@ SPA_FALLBACK_EXCLUDED_PREFIXES = (
     "/fonts/",
     "/app-assets/",
     "/artifact-app/",
+    "/sandbox-doc/",
 )
 
 # App window entries (`/app-windows/<app>/<name>.html`) are their own Vite bundles, served
@@ -778,6 +858,21 @@ def validate_token(token: str, *, use_session_exp: bool = False) -> tuple[bool, 
         return False, "", "revocation state unavailable"
     if int(data.get("gen", 0)) < current_gen:
         return False, "", "session revoked"
+    # Boot binding: a token minted with a ``boot`` claim is scoped to the
+    # gateway PROCESS that issued it, so a restart ends it. This is what makes
+    # an opt-in "the phone stays signed in until the gateway restarts" session
+    # honest — the alternative, a long wall-clock TTL, keeps working after a
+    # restart and after the operator has stopped thinking about that device.
+    #
+    # CLAIM-GATED on purpose: a token without the claim is not checked at all,
+    # so this cannot log out an existing session or change any default. The
+    # check is also deliberately unconditional in the other direction — it
+    # applies to the LINK path and the COOKIE path alike, because a boot-bound
+    # link that survived a restart in someone's history must not be redeemable
+    # either.
+    token_boot = str(data.get("boot", ""))
+    if token_boot and token_boot != current_boot_id():
+        return False, "", "session ended at gateway restart"
     # Nonce is a single-use guard for the one-time LINK click only. For an
     # established session cookie (use_session_exp=True), a valid HMAC signature
     # plus an unexpired session_exp is sufficient — requiring the in-memory
@@ -1273,12 +1368,14 @@ def _api_pattern_matches(pattern: str, path: str) -> bool:
 # (``useDashboardHealthProbe``), which runs on a dashboard-user token and never
 # reaches this list. An app that genuinely wants it declares it in
 # ``permissions.api`` — the shipped ``design_critique`` manifest does.
-_APP_TOKEN_IMPLICIT_ALLOW: frozenset[str] = frozenset({
-    # Connecting grants no events by itself: the socket records the caller's
-    # manifest declarations and every frame is filtered per socket, payload AND
-    # envelope, in ws_event_scope.py / DashboardState._serialize_for_client.
-    "/api/ws",
-})
+_APP_TOKEN_IMPLICIT_ALLOW: frozenset[str] = frozenset(
+    {
+        # Connecting grants no events by itself: the socket records the caller's
+        # manifest declarations and every frame is filtered per socket, payload AND
+        # envelope, in ws_event_scope.py / DashboardState._serialize_for_client.
+        "/api/ws",
+    }
+)
 
 
 def app_token_path_allowed(app_name: str, path: str) -> bool:
@@ -1495,6 +1592,317 @@ async def _verify_unix_peer(
     return None
 
 
+def derive_caller_app(
+    slots: object, session_key: str, jobs: object = None, subagents: object = None
+) -> str:
+    """The app that owns the CALLING session, or ``""`` for the dashboard user.
+
+    **Why this exists.** App-ownership checks gate on ``request["app"]``, which
+    the app-token branch publishes. The internal-secret branch (the managed MCP
+    set) carries no app claim at all: the secret proves the call came from
+    inside, not who made it. Every ownership check therefore became a no-op on
+    that transport, and an app agent granted ``@kirocrew-dashboard`` arrived
+    indistinguishable from the dashboard user (issue #3690).
+
+    The identity comes from the authenticated CALLING SESSION, resolved against
+    server-side registries in four steps -- one per way a session can be owned:
+    the slot the key names, the slot RUNNING under that key
+    (``linked_session_key``), for a cron key the job's ``created_by`` owner tag,
+    and for a subagent key the child record's spawning ``app``. The agent cannot
+    forge the key — it does not build the request; the in-process MCP broker sets
+    it from the calling session's own context and never from tool arguments
+    (``mcp_core`` ``_resolve_session_key_strict``), and on an AF_UNIX transport
+    ``_verify_unix_peer`` has already kernel-attested it against ``/proc``
+    ancestry before this runs.
+
+    ``""`` means "no app owns this caller" and is returned both when the person
+    is the caller and when the caller cannot be placed at all. The two are not
+    distinguished because no site acts differently on them; the one route that
+    needs the difference for a ``dashboard:`` key asks
+    :func:`caller_names_a_missing_slot` instead.
+
+    Deliberately PURE — every parameter is a server-side registry or the
+    caller's own key, never a request — so the middleware and the one route that
+    also re-derives for defense-in-depth share a single implementation that
+    cannot drift. Never derive from a request BODY or from tool arguments: a
+    caller that could name its own scope could name someone else's.
+    """
+    sk = (session_key or "").strip()
+    # No key at all: the gateway's own internal calls, the CLI, a loopback
+    # curl. Nothing to place and no app could have been attached — unscoped,
+    # exactly as before this derivation existed.
+    if not sk or sk == "dashboard:ui":
+        return ""
+    # Each registry below answers only "yes, THIS app owns the caller". An
+    # ownerless answer FALLS THROUGH to the next one rather than ending the
+    # search, because a session can be recorded in more than one place and only
+    # some of those records carry the owner. The case that forces this: an
+    # app-created cron with a cron-born tab is present in the slot registry with
+    # no ``_app`` (a channel/cron-born slot is created without one) AND in the
+    # cron registry WITH its ``created_by`` owner -- so short-circuiting on the
+    # slot would hand an app the dashboard user's reach. Returning "" only after
+    # every registry has been asked also makes the search monotonic: adding a
+    # registry can find an owner that was missed, never lose one.
+    lookup = getattr(slots, "get", None) if slots is not None else None
+    if lookup is not None:
+        slot = lookup(sk.split(":", 1)[-1] if ":" in sk else sk)
+        owner = str(getattr(slot, "_app", "") or "") if slot is not None else ""
+        if owner:
+            return owner
+        # Second lookup, by LINKED key. A slot bound to a channel or cron
+        # session runs its turns under ``linked_session_key`` rather than under
+        # its own name ("when set, _run_chat uses this as session key" --
+        # ``DashboardState``), so the caller presents that key and the lookup
+        # above cannot find it. Without this the slot's ``_app`` is invisible
+        # and the caller reads as the person: the very shape this fix exists to
+        # end, since the slot IS there and may carry an owner.
+        linked = _slot_by_linked_key(slots, sk)
+        owner = str(getattr(linked, "_app", "") or "") if linked is not None else ""
+        if owner:
+            return owner
+    # Third lookup, for a cron key, in the CRON registry. A cron created by an
+    # app is tagged ``created_by="app:<name>"`` (``CronSDK``), so the owner is a
+    # matter of record rather than a guess -- and a cron often has no dashboard
+    # slot at all, which is why the lookups above cannot see it. Resolving it
+    # POSITIVELY is what lets an app-owned cron be confined while the person's
+    # own crons keep working; refusing every unplaceable delegated caller
+    # instead would take cron and subagent tools from the person too.
+    if sk.startswith("cron:"):
+        owner = _cron_job_owner(jobs, _key_segment(sk))
+        if owner:
+            return owner
+    # Fourth lookup, for a subagent key, in the SUBAGENT registry. A child
+    # spawned by an app carries it in ``SubagentInfo.app``, persisted for exactly
+    # this purpose -- the field's own note says it is kept so "the child's
+    # per-tool-call gate can resolve the app's Level-2 profile", because
+    # otherwise "the child's ongoing tool calls run unconstrained by the app
+    # scope". A tool call arriving here IS one of those ongoing calls.
+    if sk.startswith("subagent:"):
+        owner = _subagent_owner(subagents, _key_segment(sk))
+        if owner:
+            return owner
+    # Every registry asked, none names an owner: the person, or a Slack thread
+    # or channel session that never had an app.
+    return ""
+
+
+def _key_segment(session_key: str) -> str:
+    """The id segment of a delegated caller key, ignoring anything after it.
+
+    A cron session key has TWO forms -- ``cron:<job_id>`` for a persistent job
+    and ``cron:<job_id>:<run_id>`` for a stateless one (``cron._build_prompt``).
+    Taking the whole remainder after the first colon yields ``<job_id>:<run_id>``
+    for the stateless form, which matches no job, so an app-owned stateless cron
+    would resolve to no owner and be handed the dashboard user's reach.
+    """
+    parts = session_key.split(":")
+    return parts[1] if len(parts) > 1 else ""
+
+
+def _subagent_owner(subagents: object, agent_id: str) -> str:
+    """The app that spawned a subagent, or ``""`` (person-spawned, or no record).
+
+    Reads the live registry mapping directly, which is a plain dict lookup -- no
+    lock and no I/O, so it is safe on the event loop for the same reason the slot
+    lookup is.
+    """
+    if subagents is None or not agent_id:
+        # An empty id identifies nothing (see ``_cron_job_owner``).
+        return ""
+    lookup = getattr(subagents, "get", None)
+    if lookup is None:
+        return ""
+    try:
+        info = lookup(agent_id)
+    except Exception:  # noqa: BLE001 - an auth path must never 500 on this
+        return ""
+    return str(getattr(info, "app", "") or "") if info is not None else ""
+
+
+def caller_record_is_missing(
+    session_key: str, jobs: object = None, subagents: object = None
+) -> bool:
+    """True when a DELEGATED key's own registry is present but holds no record.
+
+    A ``cron:`` or ``subagent:`` key is not like a Slack thread: the work it names
+    is recorded, and that record is where its owner lives. So absence here is not
+    "nothing to confine" -- it is "the record that would have told me who this
+    runs for is gone", which is the same thing
+    :func:`caller_names_a_missing_slot` says about a ``dashboard:`` key.
+
+    Reachable, and narrowly: a live subagent is always in the registry (only
+    ``done`` records are ever evicted, by ``evict_completed_agents``), and a cron
+    job stays until it is removed -- so this fires when a job is DELETED while its
+    run is still making calls, and the deleted job's app reach must not survive it.
+
+    Requires the registry to be PRESENT. A surface wired without one (the
+    ``--slack-only`` API server) must not have every delegated caller refused
+    because of a missing dependency, so an absent registry answers False.
+    """
+    sk = (session_key or "").strip()
+    if sk.startswith("cron:"):
+        registry: object = jobs
+    elif sk.startswith("subagent:"):
+        registry = subagents
+    else:
+        return False
+    if registry is None:
+        return False
+    ident = _key_segment(sk)
+    if not ident:
+        # A key with no id names nothing; it cannot be confirmed against a
+        # record either, so treat it as unresolvable rather than as present.
+        return True
+    if sk.startswith("cron:"):
+        return not _cron_job_exists(registry, ident)
+    return not _subagent_record_exists(registry, ident)
+
+
+def _cron_job_exists(jobs: object, job_id: str) -> bool:
+    """Whether a cron job id is in the registry (cache-only read, see ``_cron_job_owner``).
+
+    Fails CLOSED: an unreadable/erroring registry returns ``False`` ("does not
+    exist") so the ``_internal_caller_record_missing`` DENY branch fires and the
+    delegated caller is refused rather than admitted as the unscoped dashboard
+    user. Per SAX-04 outcome_3, an auth decision must fail closed when the source
+    it depends on is unavailable; the in-memory registry makes this rare, but the
+    branch must not silently escalate a delegated caller on a torn read.
+    """
+    try:
+        snapshot = list(cast("Iterable[Any]", jobs))
+    except Exception:  # noqa: BLE001 - an auth path must never 500 on this
+        return False
+    return any(str(getattr(j, "id", "") or "") == job_id for j in snapshot)
+
+
+def _subagent_record_exists(subagents: object, agent_id: str) -> bool:
+    """Whether a subagent id is in the registry (plain dict lookup).
+
+    Fails CLOSED on an unreadable registry (no ``get`` / lookup raises): returns
+    ``False`` so the delegated caller is denied rather than escalated. See
+    ``_cron_job_exists`` for the SAX-04 fail-closed rationale.
+    """
+    lookup = getattr(subagents, "get", None)
+    if lookup is None:
+        return False  # unreadable registry: fail closed, see ``_cron_job_exists``
+    try:
+        return lookup(agent_id) is not None
+    except Exception:  # noqa: BLE001 - an auth path must never 500 on this
+        return False
+
+
+def caller_names_a_missing_slot(slots: object, session_key: str) -> bool:
+    """True when the key NAMES a dashboard slot that is not in the registry.
+
+    Distinct from "no app owns this caller" (:func:`derive_caller_app` returning
+    ``""``), which covers callers that never had a slot at all -- a Slack thread,
+    a channel session, the CLI. A ``dashboard:`` key is different in kind: it
+    names a specific slot, so absence is not "nothing to confine" but "the slot
+    I would have been confined against is gone". That happens when a tab is
+    closed while one of its calls is still in flight (the slot is popped
+    synchronously, without draining in-flight MCP calls) or when the key is
+    simply wrong.
+
+    An app-owned session going through that race would otherwise reach a route
+    that refuses apps and be admitted, because the app it should have been
+    confined to is exactly what got popped. ``mcp_dashboard._caller_app_scope``
+    already refuses this class for its own tool set on that reasoning; this
+    predicate lets a route outside that set apply the same rule.
+
+    Deliberately NOT applied in the middleware: a popped slot no longer says
+    whose tab it was, so refusing there would also refuse the person's own
+    in-flight calls, on every internal route at once. Each route that publishes
+    something it could not attribute decides for itself.
+    """
+    sk = (session_key or "").strip()
+    if not sk.startswith("dashboard:") or sk == "dashboard:ui":
+        return False
+    lookup = getattr(slots, "get", None) if slots is not None else None
+    if lookup is None:
+        return False
+    if lookup(sk.split(":", 1)[1]) is not None:
+        return False
+    return _slot_by_linked_key(slots, sk) is None
+
+
+def _cron_job_owner(jobs: object, job_id: str) -> str:
+    """The app that created a cron job, or ``""`` (person-created, or no such job).
+
+    Reads the in-memory job list CACHE-ONLY: no store lock, no ``_sync``, no
+    disk I/O, because this runs ON the event loop and the cron store's
+    synchronous readers deliberately refuse to be called there. The list is
+    replaced by atomic reference assignment, so iterating one snapshot can never
+    see a half-rebuilt list -- the same rationale the cron reaper's own
+    lock-free read relies on.
+    """
+    if jobs is None or not job_id:
+        # An empty id identifies nothing; matching a record that also happens to
+        # carry an empty id would resolve a malformed key to somebody's app.
+        return ""
+    try:
+        snapshot = list(cast("Iterable[Any]", jobs))  # one coherent list; never torn
+    except Exception:  # noqa: BLE001 - an auth path must never 500 on this
+        return ""
+    for job in snapshot:
+        if str(getattr(job, "id", "") or "") != job_id:
+            continue
+        created_by = str(getattr(job, "created_by", "") or "")
+        if created_by.startswith("app:"):
+            return created_by[len("app:") :]
+        # A job the person created.
+        return ""
+    return ""
+
+
+def _slot_by_linked_key(slots: object, session_key: str) -> object | None:
+    """The slot whose ``linked_session_key`` is ``session_key``, or ``None``.
+
+    Scans rather than indexes because the registry is keyed by slot name; the
+    live slot count is small (one per open tab) and this runs only after the
+    direct lookup missed. Defensive against a registry that is not a mapping and
+    against a slot object without the attribute, because a raise here would turn
+    an authenticated request into a 500.
+    """
+    try:
+        candidates = list(getattr(slots, "values", lambda: [])())
+    except Exception:  # noqa: BLE001 - a hostile/partial registry must not 500
+        return None
+    for slot in candidates:
+        if str(getattr(slot, "linked_session_key", "") or "") == session_key:
+            return slot
+    return None
+
+
+def _derive_internal_caller_app(request: web.Request) -> str:
+    """:func:`derive_caller_app` bound to an aiohttp request's own context."""
+    state = request.app.get("state")
+    if state is None:
+        return derive_caller_app(None, request.headers.get("X-Session-Key", ""))
+    # ``_jobs`` / ``_agents`` directly, not store readers: this runs on the event
+    # loop and the cron store's sync readers refuse that on purpose (they would
+    # park the loop for the lock window). See ``_cron_job_owner``.
+    jobs = getattr(getattr(state, "crons", None), "_jobs", None)
+    subagents = getattr(getattr(state, "subagents", None), "_agents", None)
+    return derive_caller_app(
+        getattr(state, "_slots", None),
+        request.headers.get("X-Session-Key", ""),
+        jobs,
+        subagents,
+    )
+
+
+def _internal_caller_record_missing(request: web.Request) -> bool:
+    """:func:`caller_record_is_missing` bound to an aiohttp request's context."""
+    state = request.app.get("state")
+    if state is None:
+        return False
+    return caller_record_is_missing(
+        request.headers.get("X-Session-Key", ""),
+        getattr(getattr(state, "crons", None), "_jobs", None),
+        getattr(getattr(state, "subagents", None), "_agents", None),
+    )
+
+
 def token_auth_middleware(
     *,
     internal_paths: frozenset[str] = frozenset(),
@@ -1679,9 +2087,7 @@ def token_auth_middleware(
         # qualifies as "local" for the internal branch even though it has no
         # loopback peer IP (request.remote is empty for AF_UNIX transports).
         _unix_sock = _unix_request_socket(request) if _matches_internal else None
-        if _matches_internal and (
-            _unix_sock is not None or is_loopback(request.remote or "")
-        ):
+        if _matches_internal and (_unix_sock is not None or is_loopback(request.remote or "")):
             # Kernel-attested peer verification (AF_UNIX only): deny a caller
             # whose /proc ancestry resolves to a DIFFERENT session than the
             # one its X-Session-Key header declares. Runs before either auth
@@ -1720,11 +2126,51 @@ def token_auth_middleware(
                     _log_auth(request, "internal", "granted", "")
                     # Mark the grant so handlers can distinguish "the internal
                     # loopback caller (kiro-cli / MCP) authenticated" from "no
-                    # auth ran at all". This branch deliberately leaves
-                    # request["app"] unset — there is no app identity — so a
-                    # handler that fails closed on an absent app claim would
-                    # otherwise reject every MCP call.
+                    # auth ran at all".
                     request["internal_auth"] = True
+                    # Derive the app identity ONCE, here, so every ownership
+                    # check downstream sees it (issue #3690). The secret proves
+                    # the call came from inside, not who made it, so identity
+                    # comes from the authenticated calling session.
+                    #
+                    # Publishing is deliberately NARROWING-ONLY: the claim is
+                    # set only when an app is positively resolved. When the
+                    # caller is the person, ``request["app"]`` is left ABSENT
+                    # rather than set to ``""`` — several sites read a PRESENT
+                    # empty claim as positive proof of the dashboard user
+                    # (``"app" not in request or request["app"] != ""`` in
+                    # handlers/source_providers, and handlers/kiro_prerequisite),
+                    # so writing ``""`` here would turn their refusal of this
+                    # transport into an admission. Absence keeps those exactly
+                    # as they were; presence makes the app-ownership guards bite.
+                    _derived_app = _derive_internal_caller_app(request)
+                    if _derived_app:
+                        request["app"] = _derived_app
+                        # POSITIVE non-dashboard-user signal for the WS scope
+                        # gate, which must never infer trust from a falsy app
+                        # claim (CWE-269).
+                        request["is_dashboard_user"] = False
+                    elif _internal_caller_record_missing(request):
+                        # A delegated caller whose OWN record is gone. Absence of
+                        # an app claim is only trustworthy for a caller that
+                        # never had a record to carry one; a cron whose job was
+                        # deleted mid-run, or a subagent evicted from the
+                        # registry, would otherwise keep the app reach the
+                        # deleted record was the only proof of. Refused rather
+                        # than admitted as the person -- the narrow, positively
+                        # confirmed case, not every unplaceable caller (a Slack
+                        # thread has no record to be missing).
+                        _sel = _sel_fn()
+                        _sel.log_api_access(
+                            caller=_caller,
+                            operation="internal_auth",
+                            outcome="denied",
+                            source="token_auth",
+                            resources=path,
+                            error="delegated caller's own record is gone",
+                        )
+                        _log_auth(request, "internal", "denied", "delegated record missing")
+                        return _deny(request, "Forbidden", "caller_record_missing")
                     return await handler(request)  # type: ignore[operator]
                 # Wrong secret → deny (don't fall through)
                 _sel = _sel_fn()
@@ -1806,6 +2252,17 @@ def token_auth_middleware(
                     if not internal_secret or not hmac.compare_digest(
                         internal_secret, request.headers["X-Internal-Secret"]
                     ):
+                        # Same fingerprint detail and code as the loopback arm
+                        # above. This arm was left on the bare string, so a
+                        # denial here still could not say which side was wrong --
+                        # in particular an ABSENT credential (a caller that could
+                        # read no credential file at all) read identically to a
+                        # caller holding the wrong one, which is the exact
+                        # confusion the fingerprint exists to remove.
+                        _detail = (
+                            "wrong secret (non-loopback mixed, "
+                            f"{_credential_mismatch_detail(internal_secret, request.headers['X-Internal-Secret'])})"
+                        )
                         _sel = _sel_fn()
                         _sel.log_api_access(
                             caller=_caller,
@@ -1813,12 +2270,10 @@ def token_auth_middleware(
                             outcome="denied",
                             source="token_auth",
                             resources=path,
-                            error="wrong secret (non-loopback mixed)",
+                            error=_detail,
                         )
-                        _log_auth(
-                            request, "internal", "denied", "wrong secret (non-loopback mixed)"
-                        )
-                        return _deny(request, "Forbidden")
+                        _log_auth(request, "internal", "denied", _detail)
+                        return _deny(request, "Forbidden", "internal_auth_mismatch")
                 _valid, _uid, _reason, _app, _tok = _extract_and_validate_token(request, port)
                 if not _valid:
                     _sel = _sel_fn()
@@ -1984,6 +2439,7 @@ def token_auth_middleware(
         if not from_cookie:
             _link_nonce = ""
             _embed_parent_port = ""
+            _no_refresh = False
             try:
                 payload_bytes = _b64url_decode(token.split(".")[0])
                 data = json.loads(payload_bytes)
@@ -1998,6 +2454,15 @@ def token_auth_middleware(
                 _epp = data.get("embed_parent_port")
                 if isinstance(_epp, str) and _epp:
                     _embed_parent_port = _epp
+                # A link minted for a device this dashboard does not control (the
+                # tailnet phone-access QR) says so with this claim, and the
+                # promise it encodes is an EXPIRY: that session ends when its
+                # short session_exp does. Honoured by NOT issuing a refresh
+                # cookie below, rather than by a check in the refresh handler —
+                # a credential that was never minted cannot be replayed, whereas
+                # a guarded one relies on every future refresh entry point
+                # remembering the guard.
+                _no_refresh = str(data.get("no_refresh", "")) == "1"
             except Exception:
                 session_exp = 0.0
             # Expose the frame-ancestors parent-port claim to the response-header
@@ -2022,14 +2487,28 @@ def token_auth_middleware(
             # nonce (see RevokedNonceStore / api_auth_logout).
             _remaining = int(session_exp - time.time()) if session_exp else MAX_SESSION_TTL_SECS
             if _remaining > 0:
+                # Claims that must SURVIVE the exchange are copied explicitly.
+                # The session token is a fresh mint, so anything not named here
+                # is dropped — and silently dropping ``boot`` would be the worst
+                # possible failure: the link would be boot-bound, the cookie it
+                # became would not, and the phone session would quietly outlive
+                # the restart it was supposed to end at. The claim is carried,
+                # never re-derived from current_boot_id(), so a link minted by a
+                # PREVIOUS process cannot launder itself into a live session —
+                # validate_token has already rejected it by this point, and
+                # re-deriving would hide that.
+                _carried: dict[str, str] = {}
+                if _embed_parent_port:
+                    _carried["embed_parent_port"] = _embed_parent_port
+                _token_boot = str(data.get("boot", ""))
+                if _token_boot:
+                    _carried["boot"] = _token_boot
                 session_token = generate_token(
                     user_id,
                     ttl_seconds=_remaining,
                     app=app_name,
                     register_nonce=False,
-                    extra=(
-                        {"embed_parent_port": _embed_parent_port} if _embed_parent_port else None
-                    ),
+                    extra=_carried or None,
                 )
             # Kill the link token AS A COOKIE. Exchange alone is not enough: the
             # link token still carries the 20h ``session_exp``, so a captured
@@ -2157,42 +2636,89 @@ def token_auth_middleware(
             # here (rather than calling handlers.auth_refresh) to keep the
             # import top-level and the cycle direction one-way:
             # token_auth → refresh_tokens, never the reverse.
-            try:
-                refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(user_id)
-                refresh_remaining = int(refresh_exp - time.time())
-                if refresh_remaining > 0:
-                    resp.set_cookie(
-                        refresh_cookie_name(_cookie_port_from_host(request, port)),
-                        refresh_token,
-                        httponly=True,
-                        samesite="Lax",
-                        secure=is_https_request(request),
-                        path=REFRESH_COOKIE_PATH,
-                        max_age=min(refresh_remaining, MAX_REFRESH_TTL_SECS),
-                    )
-                    # Audit the initial-mint event so forensics can trace any
-                    # subsequent chain revocation back to the user it was issued to.
-                    try:
-                        _sel_fn().log_api_access(
-                            caller=user_id,
-                            operation="refresh_token_initial_mint",
-                            outcome="ok",
-                            source="refresh_tokens",
-                            resources=chain_id,
-                        )
-                    except Exception as exc:  # pragma: no cover
-                        # SEL must never block auth flows, but log the failure
-                        # so it's observable.
-                        logger.debug("token_auth: SEL audit failed: %s", exc)
-            except Exception as _refresh_err:
-                # Refresh cookie is best-effort. If something goes wrong
-                # here, the access cookie still works as before — the
-                # user just won't get the refresh upgrade until next mint.
-                logger.warning(
-                    "token_auth: failed to attach refresh cookie (%s); "
-                    "access cookie still set, user can re-mint as before",
-                    _refresh_err,
+            #
+            # SKIPPED ENTIRELY for a no-refresh session. Such a link was minted
+            # for a device this dashboard does not control (the tailnet
+            # phone-access QR), and its short ``session_exp`` is the whole reason
+            # handing that device a credential is acceptable. A refresh chain
+            # would defeat it: ``api_auth_refresh`` re-mints at
+            # MAX_SESSION_TTL_SECS without carrying the original ceiling forward,
+            # so one rotation silently promotes a ~1h session to the 20h cap.
+            # Enforced by never minting the chain rather than by a check inside
+            # the refresh handler — a credential that does not exist cannot be
+            # replayed, while a guarded one relies on every future refresh entry
+            # point remembering the guard.
+            if _no_refresh:
+                # Not minting one is only HALF the guarantee. The browser may
+                # ALREADY hold a refresh cookie for this port from an earlier
+                # full session (a prior `?token=` link, a Slack `!dashboard`
+                # link), and `api_auth_refresh` authenticates on the refresh
+                # cookie ALONE — it never checks that the access token beside it
+                # belongs to the same session. Left in place, that residual
+                # credential rotates into a 20-hour session and the QR's short
+                # window is bypassed by a path that never touched this branch.
+                #
+                # Every way a refresh credential can reach this session, and
+                # where each is closed:
+                #   1. minted here during the exchange   -> not minted (below)
+                #   2. already in the browser            -> expired here
+                #   3. rotated by api_auth_refresh       -> unreachable once 1+2
+                #      are closed, since rotation needs an existing chain
+                #
+                # Only THIS port's cookie is cleared. A `mc_refresh_<other>`
+                # belongs to a different gateway instance, cannot refresh this
+                # session, and is not ours to revoke.
+                resp.set_cookie(
+                    refresh_cookie_name(_cookie_port_from_host(request, port)),
+                    "",
+                    max_age=0,
+                    path=REFRESH_COOKIE_PATH,
                 )
+            else:
+                try:
+                    # The refresh chain inherits the boot binding. Without this
+                    # the chain is the escape hatch: the access cookie would die
+                    # at restart while a 30-day refresh credential beside it
+                    # re-minted a fresh session on the next visit, and "ends at
+                    # restart" would be false by one rotation.
+                    refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(
+                        user_id, boot=str(data.get("boot", ""))
+                    )
+                    refresh_remaining = int(refresh_exp - time.time())
+                    if refresh_remaining > 0:
+                        resp.set_cookie(
+                            refresh_cookie_name(_cookie_port_from_host(request, port)),
+                            refresh_token,
+                            httponly=True,
+                            samesite="Lax",
+                            secure=is_https_request(request),
+                            path=REFRESH_COOKIE_PATH,
+                            max_age=min(refresh_remaining, MAX_REFRESH_TTL_SECS),
+                        )
+                        # Audit the initial-mint event so forensics can trace any
+                        # subsequent chain revocation back to the user it was
+                        # issued to.
+                        try:
+                            _sel_fn().log_api_access(
+                                caller=user_id,
+                                operation="refresh_token_initial_mint",
+                                outcome="ok",
+                                source="refresh_tokens",
+                                resources=chain_id,
+                            )
+                        except Exception as exc:  # pragma: no cover
+                            # SEL must never block auth flows, but log the failure
+                            # so it's observable.
+                            logger.debug("token_auth: SEL audit failed: %s", exc)
+                except Exception as _refresh_err:
+                    # Refresh cookie is best-effort. If something goes wrong
+                    # here, the access cookie still works as before — the
+                    # user just won't get the refresh upgrade until next mint.
+                    logger.warning(
+                        "token_auth: failed to attach refresh cookie (%s); "
+                        "access cookie still set, user can re-mint as before",
+                        _refresh_err,
+                    )
 
         _log_auth(request, _audit_uid(user_id), "ok", "")
         return resp  # type: ignore[return-value]

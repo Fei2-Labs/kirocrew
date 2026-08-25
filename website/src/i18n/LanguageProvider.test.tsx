@@ -4,6 +4,10 @@ import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 
+// './all' for the zh-CN catalog: these cases switch language to exercise
+// resolution and persistence, and `changeLanguage` refuses in dev when the
+// target has no registered catalog.
+import './all'
 import { LanguageProvider, useLanguage } from './LanguageProvider'
 import { LANG_STORAGE_KEY } from './detect'
 import { api } from '../api/client'
@@ -134,8 +138,8 @@ describe('LanguageProvider', () => {
   })
 
   // A regional tag must land on the bare code, or the locale-specific font
-  // override keyed on it — `html:lang(ja)`, `html:lang(ko)` — never matches and the
-  // script silently renders through the Simplified Chinese alias.
+  // override keyed on it — `html:lang(ja)`, `html:lang(ko)` — never matches and
+  // Kana / Hangul fall through to the untagged OS cascade instead of their aliases.
   it.each([['ja-JP', 'ja'], ['ko-KR', 'ko']])(
     'normalizes the %s browser tag for the locale-specific font override',
     async (tag, expected) => {

@@ -1,7 +1,14 @@
 import { describe, it, expect } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render as rtlRender, screen } from '@testing-library/react'
+import type { ReactElement } from 'react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import McpOAuthBanner, { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import type { ChatMessage } from '../types'
+
+// The banner's relay affordance reads the query client (it invalidates
+// ['mcp-servers'] after a successful relay), so every render needs a provider.
+const render = (ui: ReactElement) =>
+  rtlRender(<QueryClientProvider client={new QueryClient()}>{ui}</QueryClientProvider>)
 
 describe('McpOAuthBanner', () => {
   describe('needs-auth state', () => {

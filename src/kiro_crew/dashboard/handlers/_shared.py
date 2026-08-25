@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
+import aiohttp
 from aiohttp import web
 
 from kiro_crew.agent_discovery import (
@@ -19,13 +20,13 @@ from kiro_crew.agent_discovery import (
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState
+from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.messaging.privacy_mode import hydrate as _hydrate_conv_flags
+from kiro_crew.messaging.privacy_mode import is_incognito as is_thread_incognito
+from kiro_crew.messaging.privacy_mode import is_temporary as is_thread_temporary
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.skill_trust import is_project_trusted as _is_project_trusted
 from kiro_crew.skills import skills_dir
-from kiro_crew.slack.handler import (
-    _hydrate_conv_flags,
-    is_thread_incognito,
-    is_thread_temporary,
-)
 
 if TYPE_CHECKING:
     from kiro_crew.platform.interfaces import CapabilityManager
@@ -100,6 +101,36 @@ async def read_bounded_json(
             {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
         )
     return body, None
+
+
+# Chunk size for draining an OUTBOUND HTTP response to EOF. Matches the
+# bounded-read shape in ``mcp_providers.official._fetch_json``: large enough
+# that a typical body arrives in a handful of iterations, small enough that
+# the over-cap check fires long before an oversized body is buffered whole.
+_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
+
+
+async def read_capped_response(resp: "aiohttp.ClientResponse", cap: int) -> bytes:
+    """Read *resp*'s body to EOF, returning at most ``cap + 1`` bytes.
+
+    A single ``StreamReader.read(n)`` resolves as soon as ANY bytes are
+    buffered -- on a chunked response (no Content-Length) that is the first
+    buffered chunk, so the caller silently works on a truncated body. This
+    drains ``iter_chunked`` chunks until EOF, enforcing the cap against the
+    ACCUMULATED total: reading stops as soon as the total exceeds *cap*, so a
+    hostile oversized body is refused mid-stream rather than buffered whole.
+    The return is clamped to ``cap + 1`` bytes so callers keep the established
+    over-cap sentinel (``len(body) > cap`` means "exceeded the cap"), while a
+    body of exactly *cap* bytes is still delivered complete.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(_RESPONSE_READ_CHUNK_BYTES):
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > cap:
+            break
+    return b"".join(chunks)[: cap + 1]
 
 
 def _audit_admission(surface: str, resource: str, allowed: bool, error: str = "") -> None:
@@ -327,9 +358,7 @@ def _canonical_skill_roots() -> list[Path]:
         # ``skill://`` URI would then resolve against whatever cwd the next
         # kiro-cli session starts in — silently loading a different skill, or
         # none. A skill root must be a stable absolute location.
-        out.extend(
-            Path(p).expanduser().resolve() for p in KiroCrewConfig.load().skills.extra_paths
-        )
+        out.extend(Path(p).expanduser().resolve() for p in KiroCrewConfig.load().skills.extra_paths)
     except Exception:
         logger.debug("failed to load extra skill paths from config", exc_info=True)
     return out
@@ -450,6 +479,45 @@ def _resolve_package_skill_path(name: str, canonical: set[Path] | None = None) -
     return None
 
 
+def active_project_state(state: DashboardState, session_key: str = "") -> tuple[Path | None, str]:
+    """Resolve the workspace project AND why it is absent when it is.
+
+    Returns ``(project, state)`` where *state* is one of:
+
+    * ``"set"`` — *project* is a real directory and workspace-scoped resources
+      resolve against it;
+    * ``"none"`` — no open chat slot names a project at all;
+    * ``"ambiguous"`` — two or more slots name DIFFERENT projects and
+      *session_key* did not single one out, so there is no defensible answer.
+
+    :func:`active_project_dir` collapses the last two to ``None``, which is the
+    right call for a resolver but not for a UI: "you have no project" and "your
+    open chats disagree" need different words and different remedies, and a
+    caller that cannot tell them apart has to guess. Callers that only need the
+    path should keep using :func:`active_project_dir`.
+    """
+    project = _resolve_active_project(state, session_key)
+    if project is not None:
+        return project, "set"
+    slots = getattr(state, "_slots", {}) or {}
+    distinct = {str(p) for p in (_slot_project(s) for s in slots.values()) if p is not None}
+    return None, "ambiguous" if len(distinct) > 1 else "none"
+
+
+def _slot_project(slot: Any) -> Path | None:
+    """The project a chat slot is bound to, if any.
+
+    ``project_dir`` is accepted alongside ``project`` for slot-like objects that
+    expose that name instead.
+    """
+    pd = getattr(slot, "project", None) or getattr(slot, "project_dir", None)
+    if isinstance(pd, Path):
+        return pd
+    if isinstance(pd, str) and pd:
+        return Path(pd)
+    return None
+
+
 def active_project_dir(state: DashboardState, session_key: str = "") -> Path | None:
     """Return the project directory that workspace-scoped resources resolve against.
 
@@ -470,28 +538,57 @@ def active_project_dir(state: DashboardState, session_key: str = "") -> Path | N
     there is no defensible "active" project for a settings page, and silently
     picking the first-inserted slot would create, overwrite or delete files in
     the wrong project.  Failing closed makes the caller surface the ambiguity
-    instead.
+    instead — :func:`active_project_state` reports which of the two "no answer"
+    cases produced the ``None``.
+
+    Step 2 is what makes this the WRONG helper for a per-chat resource. It
+    answers for a chat that has no project of its own, so a caller that must
+    agree with what one chat will actually load — the skills catalog, and the
+    consent grant that admits those skills — would resolve a directory that chat
+    is not bound to. Those callers use :func:`requesting_slot_project` instead.
+    Reach for this one only when the resource really is global.
+    """
+    return _resolve_active_project(state, session_key)
+
+
+def requesting_slot_project(state: DashboardState, session_key: str = "") -> Path | None:
+    """The project bound to THIS chat slot, with no cross-slot fallback.
+
+    :func:`active_project_dir` answers "which project should a global surface
+    act on", and falls back to the single project shared by the open slots.
+    This answers the narrower question the skills loader asks: "which project
+    is THIS chat bound to". ``SkillsLoader`` resolves project skills from
+    ``_ChatSlot.project`` verbatim, so a caller that must agree with what the
+    loader will actually load -- the catalog, and the consent grant that admits
+    it -- has to ask the same question, not the broader one.
+
+    Returns ``None`` when this slot has no project, which is a meaningful
+    answer: there is no directory for this chat to list, trust, or load from.
     """
     slots = getattr(state, "_slots", {}) or {}
-
-    def _project_of(slot: Any) -> Path | None:
-        pd = getattr(slot, "project", None) or getattr(slot, "project_dir", None)
-        if isinstance(pd, Path):
-            return pd
-        if isinstance(pd, str) and pd:
-            return Path(pd)
+    if not session_key:
         return None
+    slot_name = session_key.split(":", 1)[-1] if ":" in session_key else session_key
+    slot = slots.get(slot_name)
+    if slot is None:
+        return None
+    return _slot_project(slot)
+
+
+def _resolve_active_project(state: DashboardState, session_key: str) -> Path | None:
+    """The three-step resolution shared by the two public accessors."""
+    slots = getattr(state, "_slots", {}) or {}
 
     if session_key:
         slot_name = session_key.split(":", 1)[-1] if ":" in session_key else session_key
         slot = slots.get(slot_name)
         if slot is not None:
-            scoped = _project_of(slot)
+            scoped = _slot_project(slot)
             if scoped is not None:
                 return scoped
     distinct: dict[str, Path] = {}
     for slot in slots.values():
-        proj = _project_of(slot)
+        proj = _slot_project(slot)
         if proj is not None:
             distinct[str(proj)] = proj
     if len(distinct) == 1:
@@ -577,15 +674,17 @@ def list_kiro_skills(project_dir: Path | None = None) -> list[dict[str, Any]]:
             if not skill_md.is_file():
                 continue
             desc, always = _parse_skill_description(skill_md)
-            out.append({
-                "key": f"{source}/{entry.name}",
-                "name": entry.name,
-                "description": desc,
-                "path": str(skill_md),
-                "dir": str(entry),
-                "always": always,
-                "source": source,
-            })
+            out.append(
+                {
+                    "key": f"{source}/{entry.name}",
+                    "name": entry.name,
+                    "description": desc,
+                    "path": str(skill_md),
+                    "dir": str(entry),
+                    "always": always,
+                    "source": source,
+                }
+            )
     return out
 
 
@@ -670,9 +769,7 @@ def _agents_loading_skill(
     """Return names of agents whose pre-expanded globs match *skill_md*."""
     target = str(skill_md)
     return [
-        name
-        for name, globs in expanded_agents
-        if any(fnmatch.fnmatch(target, g) for g in globs)
+        name for name, globs in expanded_agents if any(fnmatch.fnmatch(target, g) for g in globs)
     ]
 
 
@@ -769,10 +866,10 @@ def collect_skills_blocking(
     This is the synchronous core behind ``GET /api/skills``. It performs
     every filesystem-heavy step in one call so the caller can offload the
     whole thing to a thread via ``run_in_executor``. ``list_skills()`` (os.walk +
-    per-file frontmatter reads) and ``list_kiro_skills()`` (per-skill resolve +
-    read) are filesystem-heavy enough to stall the event loop past the
-    loop-stall watchdog on large catalogs, so they run in the thread too rather
-    than inline.
+    per-file frontmatter reads), ``list_kiro_skills()`` (per-skill resolve +
+    read), and the confined project catalog are filesystem-heavy enough to
+    stall the event loop past the loop-stall watchdog on large catalogs, so
+    they run in the thread too rather than inline.
 
     Steps, in the same order the handler used inline:
 
@@ -780,7 +877,8 @@ def collect_skills_blocking(
     2. ``package_skills`` — edition/package skills already fetched (structured
        rows) from ``CapabilityManager.list_skills()``; the manager owns their
        parsing, so nothing is parsed here.
-    3. ``list_kiro_skills(project_dir)`` — open-standard kiro-cli skills.
+    3. Global open-standard kiro-cli skills plus project rows from the loader's
+       confined no-follow catalog.
     4. ``annotate_skills_with_agents(...)`` — ``loaded_by_agents`` per skill.
 
     The capability-manager fetch is intentionally NOT done here (it is async);
@@ -791,7 +889,34 @@ def collect_skills_blocking(
         s.setdefault("source", "kirocrew")
     _warn_skills_outside_roots(package_skills)
     result.extend(package_skills)
-    result.extend(list_kiro_skills(project_dir))
+    # The legacy scanner is valid for the operator-owned global Kiro directory,
+    # but it resolves and reads project link targets before containment can be
+    # checked. Never pass the project to it: pre-consent project rows must come
+    # from the loader's confined no-follow enumeration below.
+    workspace_rows = list_kiro_skills()
+    if project_dir is not None:
+        # A workspace row is LISTABLE without consent but only USABLE with it:
+        # $token expansion and context injection both resolve through
+        # SkillsLoader, which gates the project root on the operator's grant.
+        # Marking the row lets the picker offer that consent instead of handing
+        # back a token that silently expands to nothing.
+        trusted = _is_project_trusted(project_dir)
+
+        # The loader's containment-only catalog IS the definition of what
+        # consent could make loadable. It intentionally bypasses trust
+        # enforcement so genuine untrusted rows remain visible, while its
+        # confined no-follow read keeps linked targets untouched.
+        try:
+            project_rows = skills_loader.catalog_project_skills(project_dir)
+        except Exception:  # noqa: BLE001 — a listing must not die on enumeration
+            logger.warning("skills catalog: enumeration failed; listing no workspace rows")
+            project_rows = []
+        for row in project_rows:
+            row["key"] = f"kiro-workspace/{row.get('key', '')}"
+            row["source"] = "kiro-workspace"
+            row["trusted"] = trusted
+        workspace_rows.extend(project_rows)
+    result.extend(workspace_rows)
     annotate_skills_with_agents(result)
     return result
 
@@ -872,6 +997,13 @@ def _resolve_skill_root(name: str, state: DashboardState, session_key: str = "")
         root = Path.home() / ".kiro" / "skills"
     elif name.startswith("kiro-workspace/"):
         rel = name[len("kiro-workspace/") :]
+        # NOT trust-gated, deliberately: reading a SKILL.md is how the operator
+        # decides whether to grant trust in the first place, so requiring the
+        # grant to view the file would make the consent decision blind. The
+        # boundary that matters -- an unconsented project skill never reaching the
+        # agent's context -- is enforced in SkillsLoader. Uses the permissive
+        # resolver so the documented keyless single-project fallback and the
+        # #2457 two-project behaviour stay as they are.
         proj = active_project_dir(state, session_key)
         if proj is None:
             return None
@@ -1383,17 +1515,23 @@ def _is_restricted_session(state: DashboardState, request: "Any") -> bool:
     slot = state._slots.get(slot_name)
     if slot and slot.is_restricted:
         return True
-    if sk.startswith("slack:"):
-        # Restore the DURABLE flags before consulting the in-memory maps.
-        # ``_thread_incognito``/``_thread_temporary`` are process-local and are
-        # only populated by ``_hydrate_conv_flags`` on an INBOUND Slack message,
-        # so a turn that no inbound message drove — a cron with
-        # session="origin", a webhook-resumed session, a monitor/autonudge
-        # re-injection, a subagent — reaches this gate with empty maps after a
-        # gateway restart even though the user's !incognito is on disk. Calling
-        # the canonical restore (rather than reading the SessionMap directly)
-        # keeps one source of truth and self-heals the process-local view.
-        # Idempotent and allocation-free for unflagged keys.
+    if is_channel_session_key(sk):
+        # Restore the DURABLE flags before consulting the in-memory maps. The
+        # privacy trackers are process-local and are only populated by
+        # ``privacy_mode.hydrate`` on an INBOUND channel message, so a turn that
+        # no inbound message drove — a cron with session="origin", a
+        # webhook-resumed session, a monitor/autonudge re-injection, a subagent —
+        # reaches this gate with empty maps after a gateway restart even though
+        # the user's !incognito is on disk. Calling the canonical restore (rather
+        # than reading the SessionMap directly) keeps one source of truth and
+        # self-heals the process-local view. Idempotent and allocation-free for
+        # unflagged keys.
+        #
+        # Namespace-agnostic on purpose. A ``startswith("slack:")`` test made this
+        # branch structurally unreachable for every other channel, so a
+        # ``telegram:{agent}:direct:{user}`` session the user marked incognito
+        # could never enter it and the ~30 dashboard mutations gated on this
+        # predicate stayed open for it.
         _hydrate_conv_flags(state.sessions, sk)
         if is_thread_temporary(sk) or is_thread_incognito(sk):
             return True
@@ -1415,9 +1553,10 @@ def _blocks_reads_session(state: DashboardState, request: "Any") -> bool:
     slot = state._slots.get(slot_name)
     if slot and slot.blocks_reads:
         return True
-    if sk.startswith("slack:"):
-        # Same durable-flag restore as _is_restricted_session: a temporary
-        # thread whose flags this process never hydrated must not serve reads.
+    if is_channel_session_key(sk):
+        # Same durable-flag restore, and the same namespace-agnostic reach, as
+        # _is_restricted_session: a temporary conversation whose flags this
+        # process never hydrated must not serve reads, on any channel.
         _hydrate_conv_flags(state.sessions, sk)
         if is_thread_temporary(sk):
             return True
@@ -1585,7 +1724,7 @@ def _read_memory_mode(path: "Path") -> str | None:
     first, _sep, _rest = head.partition(b"\n")
     try:
         d = json.loads(first.decode("utf-8", "replace"))
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return None
     if not isinstance(d, dict) or d.get("_type") != "metadata":
         return None

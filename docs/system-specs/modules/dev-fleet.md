@@ -168,14 +168,30 @@ new-commits (unmerged follow-up work after the PR landed).
 `prune-run` accepts a batch of names and processes them **concurrently** rather than one
 at a time. The design separates the two cost classes:
 
-- **Expensive per-item phases run in parallel.** The fresh `_prunable` re-verdict (which
-  makes `gh`/`git` network calls) and pod shutdown run under an `asyncio.Semaphore(4)`, so
-  a batch is bounded by the slowest ~4 items at a time instead of the sum of all of them.
+- **Expensive per-item phases are concurrency-bounded.** The fresh `_prunable`
+  re-verdict (which makes `gh`/`git` network calls) runs under an
+  `asyncio.Semaphore(4)`, so a batch is bounded by the slowest ~4 items at a time
+  instead of the sum of all of them. Pod shutdown remains inside the make-live
+  exclusion window because removal must continuously protect the target from the
+  final live/staged re-check through deletion.
 - **Git mutations are serialized.** The `git worktree remove` + branch `update-ref -d` for
   every removal — including the single-worktree remove handler and the auto-prune reaper —
   run behind one shared `asyncio.Lock` (`_GIT_MUTATION_LOCK`), because they mutate the
   shared main-repo `.git` state (worktree admin dir + `packed-refs`). Concurrent git
   mutations would otherwise race on those lock files.
+- **Lock order: `_wt_lock(name)` → `_MAKE_LIVE_LOCK` → `_GIT_MUTATION_LOCK`.**
+  This order must never be reversed. Every removal first acquires the worktree lock,
+  then acquires the make-live lock before the live/staged protection re-check and holds
+  it through deletion. A concurrent rebase cannot claim the checkout after removal's
+  initial fail-fast check, and a concurrent `/make-live` cannot stage the target between
+  the protected re-check and `git worktree remove`. Forced prune delegates to the same
+  internal removal path rather than pre-acquiring either lock.
+- **Rebase gate.** `_worktree_remove` refuses immediately if `_wt_lock(name)` is already
+  held, then acquires and holds that lock through deletion. The unlocked check and
+  acquisition are adjacent with no intervening await, so acquiring a free `asyncio.Lock`
+  does not yield an interleaving point. Rebase holds the same lock across fetch, rebase,
+  and abort; deletion can therefore neither begin during a rebase nor race one that starts
+  after the initial check.
 
 **Failure isolation:** each item is driven to a terminal state independently — one item
 failing (a `gh` timeout, a stuck pod, or an unexpected exception) never aborts the rest of
@@ -530,7 +546,16 @@ busy flag is per-worktree; the hazard is process-wide).
 `POST /apps/dev-fleet/api/sync` is single-flight: a second concurrent request is
 refused with **HTTP 409** (`{"ok": false, "error": "sync already running",
 "run_id": …}`) rather than launching a second ~90s fetch → merge → pip install →
-npm ci → npm build + stage. The run script emits a
+npm ci → npm build + stage. That refusal is a **state to act on, not a failure
+to report**: the body names the run already in flight, and the client attaches
+its progress stepper to that run. A second press is a user who cannot see the
+sync, so reporting an error would leave them exactly where they started —
+without progress, and with the button still inviting a third press. Because the
+API client throws on any non-2xx, this path is reachable only through the
+error branch, and the `run_id` reaches it via the parsed body carried on the
+thrown error, never as a returned body.
+
+The run script emits a
 `::step::<idx>::<label>` marker per
 step; the run worker records BOTH the authoritative step index and its **label**
 onto the run entry (`step` / `step_label`), so `/run` can name the CURRENT step
@@ -538,6 +563,27 @@ even after the marker scrolls out of the 60-line output tail window. The
 frontend shows that label beside the "Syncing" spinner. This reuses the
 existing `_RUNS` / `::step::` / `/run` run-tracking mechanism — the same channel
 the provision log panel uses (#320) — rather than adding a second one.
+
+`sync_run_id` — the pointer a freshly-mounted page reattaches that stepper to —
+and each row's `provision_run_id` are read at **request time** and overlaid onto
+the fleet payload, not taken from the cached snapshot. `_FLEET_CACHE` is
+stale-while-revalidate, so a pointer baked into the snapshot made a run started
+after that build invisible for a full cache cycle plus a rebuild, which is the
+same "no progress, press it again" trap from the other end. Both are in-memory
+reads (a module global; a dict copy plus `_RUNS` lookups), so paying for them per
+request is cheap. `_build_fleet` deliberately does **not** write them: one owner,
+so no reader of `_FLEET_CACHE` can pick up a frozen id. The overlay is
+authoritative rather than a fill-in — a provision that finished after the
+snapshot has no reattachable run, so its pointer must read null instead of the id
+a build-time write would have frozen. It copies the snapshot and its rows rather
+than writing through them — the cached objects are shared with every other
+in-flight request.
+
+Note the two refusal conventions this leaves in place: sync refuses with 409 and
+a thrown body, provision refuses with 200 and `ok: false`. Only sync's needs a
+caller-side normalizer, because only a thrown error bypasses the returned-body
+branch. Unifying them is a separate change; nothing here adds a second
+normalizer.
 
 Sync progress is reported as **indeterminate** — a spinner, the current step
 label and elapsed time — and never as a percentage. The step index is a poor
@@ -872,7 +918,55 @@ The app bundles two skills declared in `app.json`:
   artifacts, kills the browser descendants, and reports a timeout as a distinct
   outcome. Per-phase results are appended to `verdict.jsonl` as they are decided
   so a killed run still yields a verdict.
-- `skills/feature-demo-recording` — headless Playwright video recording
+- `skills/feature-demo-recording` — records a demo of a web feature, in one of
+  two modes (see below).
+
+### Using `feature-demo-recording`
+
+Two modes, and picking the wrong one wastes a recording:
+
+- **Narrated film** — someone sits and watches it (a launch clip, a feature
+  intro). The VOICEOVER drives the timeline: narration is synthesised and
+  measured FIRST, and the recorder then paces the browser to those measured
+  times. This is the order that keeps sound and picture together; pacing the
+  recording first and fitting audio afterwards is what accumulates drift.
+- **Silent evidence clip** — proof that a feature works, for a PR or a review.
+  No narration, no measuring; `narrate.py --silent` writes a timeline from
+  durations you state. The QA + Video row action uses this mode.
+
+The five steps, each a script under the skill's `references/`:
+
+| Step | Script | Produces |
+| --- | --- | --- |
+| 0 | `deps.py` | a report of what is missing, and installs what it may |
+| 1 | `narrate.py script.json` | narration audio + `narr.json` (measured timeline) |
+| 2 | `record_template.py` (copy and adapt) | the screen capture + `events.json` |
+| 3 | `compose.py` | `index.html` — the composition, as a real web page |
+| 4 | `verify_align.py` | pass/fail on drift, audio, picture and streams |
+
+Two things about the shape of this that are easy to get wrong:
+
+- **The composition is generated.** Slides, subtitles and camera moves live in
+  `index.html`, which `compose.py` writes. Changing a word means re-composing,
+  not re-recording — but it also means a palette or layout fix belongs in the
+  generator. Editing the generated file alone gets silently overwritten by the
+  next compose.
+- **Delivery is decided by `verify_align.py`, not by eye.** It exits non-zero on
+  drift beyond budget, on a silent audio track, on a picture that is black or
+  blown out, on a render whose dimensions do not match the capture, and on
+  missing streams. A film that has not passed it is not finished.
+
+Speech providers are `piper` (local, nothing leaves the machine) and `polly`
+(the operator's own AWS account, so it costs them money); `--provider auto`
+prefers local and refuses rather than reaching for a third-party endpoint. Text
+sent to the cloud provider is scrubbed of credential-shaped content first.
+
+Rendering needs Node and pulls `hyperframes` plus GSAP from public registries,
+so the render step is not offline. `deps.py` reports every one of these and says
+which it can install without root.
+
+Prefer `browser-recording` instead when a short silent clip of a UI interaction
+is all that is wanted: it is a smaller tool and needs no narration script.
 
 `kirocrew-worktree-dev` carries no app-bridged copy: the canonical copy is
 owned by the `kirocrew-dev` development-skills suite under
@@ -882,10 +976,9 @@ against each other (PR #353 arbiter finding). That single-copy rule is what
 matters here; where the one copy lives is a packaging question, and it lives in
 the packaged tree so `_ensure_builtin_skills` reaches every distribution. The
 project-dir mechanism reaches only some: `_project_skills_dir()` reads
-`KIROCREW_PROJECT_DIR`, which a repo checkout and the desktop bundle both
-provide (`packaging/kirocrew-backend.spec` ships the top-level `skills/` tree
-and `website/electron/main.js` sets the variable), but a `pip install` from the
-wheel or sdist provides neither.
+`KIROCREW_PROJECT_DIR`, which a repo checkout provides, but a `pip install` from
+the wheel or sdist does not — and neither does the desktop bundle, whose builder
+stages no top-level `skills/` tree.
 
 Skills are registered as symlinks into `~/.kiro/crew/skills/` via the app bridge at
 two lifecycle points:

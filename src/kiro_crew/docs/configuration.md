@@ -125,7 +125,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
   },
   "session": {
     "timeout_secs": 3600,
-    "autocompact_pct": 90.0,
+    "autocompact_pct": 70.0,
     "pool_size": 0,
     "pool_agent": "",
     "pool_ttl_secs": 1800
@@ -134,6 +134,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
     "url": "",
     "restore_sessions": false,
     "restore_window_minutes": 30,
+    "qr_session_until_restart": true,
     "merge_queued_messages": false,
     "mcp_probe_timeout_secs": 15
   },
@@ -197,14 +198,14 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `agent.spawn_min_memory_gb` | Minimum available memory (GB) to spawn a subagent (0 disables the check) | `4.0` |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
 | `agent.completion_keep_chars` | Max characters retained in the completion event after applying `completion_keep`. `0` disables truncation. The full transcript stays on disk (see `subagent_result_ttl_secs`) | `3000` |
-| `agent.subagent_result_ttl_secs` | How long a delivered subagent's `result.txt` is retained before the reaper prunes it, so the parent can read the full transcript on demand instead of re-running the subagent | `3600` (1h) |
+| `agent.subagent_result_ttl_secs` | How long a delivered subagent's `result.txt` is retained before the reaper prunes it, so the parent can read the full transcript on demand instead of re-running the subagent. Measured from the moment the completion reaches the parent, not from when the run finished | `3600` (1h) |
 
 ### Session
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `session.timeout_secs` | Idle session timeout in seconds (0 disables the idle sweep) | `3600` (60 min) |
-| `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90) | `90.0` |
+| `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90). Lower compacts sooner and keeps per-turn cost down; higher retains more conversation before rewriting it. Applies to new installs: an existing `config.json` keeps its stored value | `70.0` |
 | `session.pool_size` | Number of pre-spawned kiro-cli processes kept ready for instant session start. 0 disables | `0` |
 | `session.pool_agent` | Agent for warm-pool processes. Empty uses `agent.default_agent` | `""` |
 | `session.pool_ttl_secs` | Max age in seconds for pooled processes, discarded at claim time. 0 disables | `1800` |
@@ -218,6 +219,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `dashboard.url` | Dashboard URL for remote access | `""` (localhost only) |
 | `dashboard.restore_sessions` | Restore sessions on restart | `false` |
 | `dashboard.restore_window_minutes` | Minutes after restart within which sessions can be restored | `30` |
+| `dashboard.qr_session_until_restart` | Keep a phone signed in for as long as the gateway process runs. Ordinary idling no longer signs it out; a gateway restart does, and so does going 30 days untouched (the refresh credential's lifetime, renewed on each visit). Turn off for a timed session that expires on a clock whether or not the gateway is still running. | `true` |
 | `dashboard.merge_queued_messages` | Concatenate follow-up messages while the agent is busy | `false` |
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
 
@@ -244,10 +246,44 @@ from the dashboard — see each channel's doc for keys and credentials.
 | Key | Description | Default |
 |-----|-------------|---------|
 | `stt.enabled` | Enable voice-memo transcription | `true` |
-| `stt.provider` | `"whisper"` (local), `"mlx"` (local, Apple silicon), or `"transcribe"` (AWS, needs the `voice` extra) | `"whisper"` |
+| `stt.provider` | `"whisper"` (local), `"mlx"` (local, Apple silicon), `"parakeet"` (local, Apple silicon, NVIDIA Parakeet), `"apple"` (local, macOS 26+), or `"transcribe"` (AWS, needs the `voice` extra) | `"whisper"` |
+| `stt.parakeet_model` | Hugging Face repo for the parakeet-mlx model (parakeet provider only) | `"mlx-community/parakeet-tdt-0.6b-v3"` |
 | `stt.streaming` | Stream partial transcripts live into the dashboard input. Transcribe provider only | `false` |
 | `stt.transcribe_region` | AWS region for the Transcribe API (transcribe provider only) | `"us-east-1"` |
 | `stt.language_code` | Language for speech recognition, e.g. `en-US`, `fr-FR` | `"en-US"` |
+
+### Paid AWS services need an explicit confirmation
+
+Two providers reach a **paid** AWS service: `voice_reply.provider: "polly"`
+(text-to-speech) and `stt.provider: "transcribe"` (speech-to-text). Selecting
+one is not enough to start spending — neither sends a request until you confirm
+it in **Settings > Voice**, and the confirmation names the AWS account it
+resolves to first.
+
+Three things worth knowing:
+
+- **An empty profile is not "no account".** With `aws_profile` /
+  `transcribe_profile` unset, nothing is passed to the provider and its own
+  default credential chain resolves — environment variables, the shared config's
+  `default` profile, or container/instance metadata. The confirmation shows you
+  which account that turns out to be.
+- **A confirmation is tied to the profile, region and account it was given for.**
+  Changing the profile or region asks again, and the live account is re-checked
+  before each call: if the profile is later repointed at a different AWS account,
+  the call is refused and the confirmation withdrawn.
+- **The check needs to be able to run.** If the account cannot be resolved, the
+  call is refused rather than allowed, so an outage withholds a paid request
+  instead of risking an unconfirmed charge.
+
+The record lives in `aws_service_consent.json` in the data home rather than in
+`config.json`, because it is an authorization rather than a preference: it is on
+the read+write keystone floor, so an agent can neither read it nor grant itself
+permission to spend. The authenticated dashboard is the only writer — there is
+deliberately no CLI verb, because a terminal command that records a grant on
+request is a grant an automated caller can take.
+
+Both local defaults (`piper` for TTS, `whisper` for STT) need no AWS account and
+no confirmation.
 
 ### Memory and embeddings
 
@@ -265,6 +301,7 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `memory.semantic_confidence_threshold` | Minimum similarity score for a semantic search result | `0.8` |
 | `memory.episodic_max_results` | Max episodic memories injected per session | `8` |
 | `memory.episodic_max_count` | Max total episodic memories stored | `10000` |
+| `memory.decay_rates` | Per-tag episodic recency decay rates, per day (score factor `exp(-rate * days_old)`). Keys are memory tags (case-insensitive); the reserved `default` key replaces the built-in `0.03` for memories matching no configured tag. A memory carrying several configured tags uses the slowest (smallest) rate, so a broad tag can never age out a long-retention one. `0` never ages out of retrieval ranking; `1` falls out of retrieval within about a day. Ranking only: `episodic_max_count` cap eviction (lowest importance, then oldest) still applies regardless of decay rate. Values are clamped to `0..10`; non-numeric values are ignored with a logged warning. Example: `{"legal_precedents": 0.0, "trading_data": 1.0}` | `{}` |
 | `memory.history_idle_hours` | Hours of inactivity before history consolidation | `3.0` |
 | `memory.history_max_days` | Days of history to retain before pruning | `365` |
 

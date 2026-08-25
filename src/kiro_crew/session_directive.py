@@ -9,11 +9,17 @@ refused because a session-sharing subagent would misattribute to its parent).
 Rather than invent a per-process identity source, these tools stay STATELESS:
 the tool VALIDATES its arguments and returns a *directive* — a human-readable
 confirmation line plus a machine-readable marker carrying the validated payload
-(and NO session key). The session-aware consumer that processes the tool result
-(:func:`dashboard.chat_runner._run_chat`'s ``EVENT_TOOL_RESULT`` handler, which
-runs for every interactive surface and owns ``slot.key``) decodes the marker and
-applies the effect against ITS OWN session, then strips the marker from the
-stored transcript.
+(and NO session key). A session-aware consumer that processes the tool result
+decodes the marker and applies the effect against ITS OWN session, then keeps
+the marker out of what it stores or renders. There are TWO consumers, one per
+turn loop: :func:`dashboard.chat_runner._run_chat`'s ``EVENT_TOOL_RESULT``
+handler (the dashboard-driven surfaces, which own ``slot.key``), and
+:class:`messaging.driver.TurnDriver` (the standalone channel transports —
+Telegram, Discord, standalone Slack, iMessage, Teams, Webex, WeCom, Weixin —
+whose dispatchers inject a consumer bound to the turn's session key via
+``messaging.dispatch.build_directive_consumer``). Both funnel into
+``dashboard.session_directive_apply.apply_session_directive``, so the security
+boundaries live in one place.
 
 Subagent isolation is therefore STRUCTURAL, not cryptographic: a subagent's
 tool result flows through the subagent's own runner, so it can only ever bind to
@@ -176,6 +182,29 @@ def match_tool(raw: str) -> str:
         if tail in DIRECTIVE_TOOLS:
             return tail
     return ""
+
+
+def directive_tool_for(mcp_server_name: str, tool_name: str) -> str:
+    """Return the directive-tool name for a recorded tool CALL, or ``""``.
+
+    THE forgery-gate identity predicate, spelled once: a directive-tool name is
+    honoured ONLY when the call's trusted ``_meta.kiro`` identity says it was
+    served by Kiro Crew's OWN core MCP server (:data:`CORE_MCP_SERVER`) AND its
+    CANONICAL tool name resolves to a :data:`DIRECTIVE_TOOLS` member via
+    :func:`match_tool`. Both ``EVENT_TOOL_CALL`` consumers (the dashboard's
+    ``chat_runner`` and ``messaging.driver.TurnDriver``) MUST call this instead
+    of inlining the two checks, so the boundary cannot silently diverge.
+
+    Both arguments MUST come from the out-of-band ``_meta.kiro`` channel
+    (``mcpServerName`` / ``toolName``) — never the LLM-authored title. A shell
+    tool has no MCP server name and a canonical tool name like
+    ``execute_bash``, so it resolves to ``""``; so does a third-party MCP
+    server that merely exposes a tool named e.g. ``monitor_start``. Absent
+    identity (empty server name) fails closed.
+    """
+    if mcp_server_name != CORE_MCP_SERVER:
+        return ""
+    return match_tool(tool_name or "")
 
 
 def strip_marker(text: str) -> str:

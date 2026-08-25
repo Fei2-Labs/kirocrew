@@ -149,12 +149,14 @@ describe('PullRequestPanel', () => {
     expect(screen.getByText('Github', { exact: false })).toBeInTheDocument()
     expect(screen.getByText('src/panel.tsx')).toBeInTheDocument()
     expect(screen.getByText('1 File Changed')).toBeInTheDocument()
-    // Diffs stay unmounted until explicitly expanded, then parse after the
-    // drawer animation deferral.
-    expect(screen.queryByText('new')).not.toBeInTheDocument()
+    // Diffs stay unmounted until explicitly expanded, then mount after the
+    // drawer animation deferral. Row CONTENT is not asserted here: Pierre
+    // renders it inside a shadow root, which Testing Library cannot query — the
+    // loading placeholder giving way to the diff surface is the observable
+    // contract from the light DOM.
+    expect(screen.queryByTestId('pr-diff-surface')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /src\/panel\.tsx/i }))
-    expect(await screen.findByText('new')).toBeInTheDocument()
-    expect(screen.getByText('old')).toBeInTheDocument()
+    expect(await screen.findByTestId('pr-diff-surface')).toBeInTheDocument()
     expect(screen.getByRole('tab', { name: /All checks passed/i })).toBeInTheDocument()
     const githubTab = screen.getByRole('tab', { name: /PR #12/i })
     const gitlabTab = screen.getByRole('tab', { name: /MR !7/i })
@@ -214,6 +216,56 @@ describe('PullRequestPanel', () => {
     const gitlabTab = screen.getByRole('tab', { name: /MR !7/i })
     expect(within(gitlabTab).queryByLabelText('Merged')).not.toBeInTheDocument()
     expect(within(gitlabTab).queryByLabelText('Open')).not.toBeInTheDocument()
+  })
+
+  it('keeps the cached CI glyph when a degraded payload flags checks as partial', async () => {
+    // The provider's checks read failed: the full payload carries an EMPTY
+    // checks list flagged in partialSections, while the backend's keep-known
+    // rule preserved the last CI value in the chip cache.
+    mockApi.pullRequestSource.mockImplementation((url: string) => Promise.resolve(
+      new URL(url).hostname === 'gitlab.com'
+        ? gitlab
+        : { ...github, checks: [], partialSections: ['checks'] },
+    ))
+    mockApi.pullRequestStatuses.mockResolvedValue({
+      statuses: { [github.url]: { state: 'open', ci: 'failed' } },
+    })
+
+    renderPanel()
+    await screen.findByText('Add source tabs')
+
+    const githubTab = screen.getByRole('tab', { name: /PR #12/i })
+    // The kept value survives the selected tab's own full-payload projection.
+    expect(await within(githubTab).findByLabelText('Checks failed')).toBeInTheDocument()
+  })
+
+  it('clears the CI glyph on a clean empty-checks payload despite a stale cached one', async () => {
+    // No partial flag: the checks section is authoritatively empty (no CI
+    // configured), so a stale cached glyph must NOT be resurrected.
+    mockApi.pullRequestSource.mockImplementation((url: string) => Promise.resolve(
+      new URL(url).hostname === 'gitlab.com'
+        ? gitlab
+        : { ...github, checks: [] },
+    ))
+    mockApi.pullRequestStatuses.mockResolvedValue({
+      statuses: {
+        [github.url]: { state: 'open', ci: 'failed' },
+        [gitlab.url]: { state: 'open', ci: 'failed' },
+      },
+    })
+
+    renderPanel()
+    await screen.findByText('Add source tabs')
+
+    // The unselected tab renders the cached glyph — proof the status batch
+    // has landed before the absence below is asserted.
+    const gitlabTab = screen.getByRole('tab', { name: /MR !7/i })
+    expect(await within(gitlabTab).findByLabelText('Checks failed')).toBeInTheDocument()
+
+    const githubTab = screen.getByRole('tab', { name: /PR #12/i })
+    expect(within(githubTab).queryByLabelText('Checks failed')).not.toBeInTheDocument()
+    expect(within(githubTab).queryByLabelText('Checks passed')).not.toBeInTheDocument()
+    expect(within(githubTab).queryByLabelText('Checks running')).not.toBeInTheDocument()
   })
 
   it('paces the strip poll by the server TTL, with a bounded fast follow-up', () => {

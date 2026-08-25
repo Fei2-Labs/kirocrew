@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import _DEFAULT_PORT, config_dir
 from kiro_crew.instances.constants import TTL_PATTERN
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,20 @@ _SSM_RUN_AS_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 _TTL_RE = re.compile(TTL_PATTERN)
 _DEFAULT_SSM_RUN_AS = "ec2-user"
 
-_DEFAULT_REMOTE_PORT = 7777
+# The port a stock gateway binds, so "add a remote that has not been
+# reconfigured" needs no edit. NOT a second definition of the number:
+# ``config/loader.py`` owns it per docs/system-specs/common/code-style.md, which
+# names that module as the single owner of the dashboard port and cites
+# ``dashboard/origin.py`` importing it rather than restating it. This is the same
+# re-export seam, giving the value a name that says what it means HERE (the
+# REMOTE's port, not ours).
+#
+# It was previously 7777 -- an earlier default dashboard port -- which left the
+# Add form pre-filling a port no stock remote listens on (#1972). Correcting it
+# was only safe once the local forward stopped mirroring this value: while it
+# mirrored, filling in the port a stock remote actually binds landed the user on
+# a guaranteed local-port collision.
+DEFAULT_REMOTE_PORT = _DEFAULT_PORT
 _DEFAULT_TTL = "20h"
 
 # Supported connection transports. "ssh" is the original/default transport
@@ -92,6 +105,12 @@ _DEFAULT_CONNECTION_METHOD = "ssh"
 # ``local_port == 0`` is the sentinel for "not yet allocated" — the port
 # allocator (Stage 3) assigns a real port at connect time.
 _UNALLOCATED_PORT = 0
+
+# ``forwarder_pid == 0`` is the sentinel for "no forwarder child recorded".
+# Connect records the spawned tunnel child's pid so a forwarder orphaned by a
+# gateway hard-kill can later be reclaimed by identity (its own pid) instead of
+# a process-table match; disconnect resets it together with ``local_port``.
+_NO_FORWARDER_PID = 0
 
 
 class InstancesError(Exception):
@@ -150,7 +169,7 @@ class Instance:
     id: str
     name: str
     ssh_host: str = ""
-    remote_port: int = _DEFAULT_REMOTE_PORT
+    remote_port: int = DEFAULT_REMOTE_PORT
     local_port: int = _UNALLOCATED_PORT
     ttl: str = _DEFAULT_TTL
     remote_bin: str = ""
@@ -174,6 +193,22 @@ class Instance:
     # (showing an error / click-to-reconnect state) instead of dropping it.
     # Startup uses it to decide which instances to auto-reconnect.
     was_connected: bool = False
+    # Pid of the tunnel forwarder child this manager spawned for the recorded
+    # ``local_port`` (0 = none recorded), paired with the opaque start-time
+    # identity ``platform_compat.process_start_time`` reported for it ("" =
+    # unknown). Persisted so a forwarder orphaned by a gateway hard-kill can be
+    # reclaimed by its OWN identity — pid + start time + exact argv — never by
+    # matching the process table, which cannot distinguish our child from an
+    # operator's own forward (#1972). Either half missing means the identity
+    # cannot be confirmed and no reclaim happens (fail closed).
+    forwarder_pid: int = _NO_FORWARDER_PID
+    forwarder_start: str = ""
+    # HMAC over (id, forwarder_pid, forwarder_start, local_port) under a
+    # gateway-held key ("" = unsigned). The registry file is agent-writable, so
+    # the identity above gates but cannot authorize by itself; the signature is
+    # what makes it the GATEWAY's own claim — a record an agent wrote or
+    # redirected fails verification and is never reclaimed (fail closed).
+    forwarder_sig: str = ""
 
     def validate(self) -> None:
         """Raise :class:`InvalidInstanceError` if any field is malformed."""
@@ -222,6 +257,21 @@ class Instance:
                     f"invalid {label} {port!r}: must be an int in "
                     f"[{lo}, 65535]" + (" (0 = unallocated)" if allow_zero else "")
                 )
+        if not isinstance(self.forwarder_pid, int) or self.forwarder_pid < 0:
+            raise InvalidInstanceError(
+                f"invalid forwarder_pid {self.forwarder_pid!r}: must be an int "
+                f">= 0 (0 = no forwarder recorded)"
+            )
+        if not isinstance(self.forwarder_start, str):
+            raise InvalidInstanceError(
+                f"invalid forwarder_start {self.forwarder_start!r}: must be a "
+                f"string ('' = unknown)"
+            )
+        if not isinstance(self.forwarder_sig, str):
+            raise InvalidInstanceError(
+                f"invalid forwarder_sig {self.forwarder_sig!r}: must be a "
+                f"string ('' = unsigned)"
+            )
 
     def to_dict(self) -> dict:
         """Serialize to the JSON shape stored in ``instances.json``."""
@@ -239,6 +289,9 @@ class Instance:
             "aws_region": self.aws_region,
             "ssm_run_as": self.ssm_run_as,
             "was_connected": self.was_connected,
+            "forwarder_pid": self.forwarder_pid,
+            "forwarder_start": self.forwarder_start,
+            "forwarder_sig": self.forwarder_sig,
         }
 
     @classmethod
@@ -259,7 +312,7 @@ class Instance:
             id=str(data.get("id", "")),
             name=str(data.get("name", "")),
             ssh_host=str(data.get("ssh_host", "")),
-            remote_port=_as_int(data.get("remote_port"), _DEFAULT_REMOTE_PORT),
+            remote_port=_as_int(data.get("remote_port"), DEFAULT_REMOTE_PORT),
             local_port=_as_int(data.get("local_port"), _UNALLOCATED_PORT),
             ttl=str(data.get("ttl", _DEFAULT_TTL)),
             remote_bin=str(data.get("remote_bin", "")),
@@ -272,6 +325,12 @@ class Instance:
             # empty string would fail validation — both mean "use the default".
             ssm_run_as=str(data.get("ssm_run_as", "") or _DEFAULT_SSM_RUN_AS),
             was_connected=bool(data.get("was_connected", False)),
+            # max(): a hand-edited negative pid normalizes to the sentinel
+            # rather than poisoning every later update() with a validate error
+            # — matching this loader's documented key tolerance.
+            forwarder_pid=max(_NO_FORWARDER_PID, _as_int(data.get("forwarder_pid"), 0)),
+            forwarder_start=str(data.get("forwarder_start", "") or ""),
+            forwarder_sig=str(data.get("forwarder_sig", "") or ""),
         )
 
 
@@ -281,6 +340,18 @@ class _RegistryDoc:
 
     instances: list[Instance] = field(default_factory=list)
     last_active_id: str = ""
+
+
+def _find(doc: _RegistryDoc, instance_id: str) -> Instance | None:
+    """Return the record in *doc* with *instance_id*, or ``None`` if absent.
+
+    Hands back the live object out of ``doc.instances`` (not a copy), so a caller
+    holding the lock can mutate it in place and persist *doc*.
+    """
+    for inst in doc.instances:
+        if inst.id == instance_id:
+            return inst
+    return None
 
 
 class InstancesRegistry:
@@ -349,10 +420,7 @@ class InstancesRegistry:
     def get(self, instance_id: str) -> Instance | None:
         """Return the instance with *instance_id*, or ``None`` if absent."""
         with self._lock:
-            for inst in self._read().instances:
-                if inst.id == instance_id:
-                    return inst
-            return None
+            return _find(self._read(), instance_id)
 
     def get_last_active(self) -> Instance | None:
         """Return the last-active instance to auto-revive on startup."""
@@ -360,10 +428,7 @@ class InstancesRegistry:
             doc = self._read()
             if not doc.last_active_id:
                 return None
-            for inst in doc.instances:
-                if inst.id == doc.last_active_id:
-                    return inst
-            return None
+            return _find(doc, doc.last_active_id)
 
     # ── write API ────────────────────────────────────────────────────────
 
@@ -372,7 +437,7 @@ class InstancesRegistry:
         *,
         name: str,
         ssh_host: str = "",
-        remote_port: int = _DEFAULT_REMOTE_PORT,
+        remote_port: int = DEFAULT_REMOTE_PORT,
         local_port: int = _UNALLOCATED_PORT,
         ttl: str = _DEFAULT_TTL,
         remote_bin: str = "",
@@ -443,7 +508,9 @@ class InstancesRegistry:
         Accepts any of: ``name``, ``ssh_host``, ``remote_port``, ``local_port``,
         ``ttl``, ``remote_bin``, ``connection_method``, ``ssm_target``,
         ``ssm_run_as``,
-        ``aws_profile``, ``aws_region``, ``was_connected``. The ``id`` is
+        ``aws_profile``, ``aws_region``, ``was_connected``, ``forwarder_pid``,
+        ``forwarder_start``, ``forwarder_sig``.
+        The ``id`` is
         immutable. ``mark_last_active=True`` additionally records the instance
         as the auto-revive target in the SAME read-modify-write, so callers that
         need both (a connect persisting its hints) get one atomic file rewrite
@@ -463,6 +530,9 @@ class InstancesRegistry:
             "aws_profile",
             "aws_region",
             "was_connected",
+            "forwarder_pid",
+            "forwarder_start",
+            "forwarder_sig",
         }
         unknown = set(changes) - allowed
         if unknown:
@@ -471,11 +541,7 @@ class InstancesRegistry:
             validate_ttl(str(changes["ttl"]))
         with self._lock:
             doc = self._read()
-            target: Instance | None = None
-            for inst in doc.instances:
-                if inst.id == instance_id:
-                    target = inst
-                    break
+            target = _find(doc, instance_id)
             if target is None:
                 raise InstanceNotFoundError(f"no instance with id {instance_id!r}")
             for key, value in changes.items():
@@ -501,19 +567,6 @@ class InstancesRegistry:
             logger.info("Removed instance %s", instance_id)
             return True
 
-    def set_was_connected(self, instance_id: str, value: bool) -> None:
-        """Set the ``was_connected`` hint (no-op if the instance is gone)."""
-        with self._lock:
-            doc = self._read()
-            changed = False
-            for inst in doc.instances:
-                if inst.id == instance_id:
-                    inst.was_connected = bool(value)
-                    changed = True
-                    break
-            if changed:
-                self._write(doc)
-
     def set_last_active(self, instance_id: str) -> None:
         """Mark *instance_id* as the one to auto-revive on next startup.
 
@@ -522,7 +575,7 @@ class InstancesRegistry:
         """
         with self._lock:
             doc = self._read()
-            if not any(i.id == instance_id for i in doc.instances):
+            if _find(doc, instance_id) is None:
                 raise InstanceNotFoundError(f"no instance with id {instance_id!r}")
             doc.last_active_id = instance_id
             self._write(doc)

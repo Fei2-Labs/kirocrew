@@ -672,7 +672,7 @@ class TestSlotColor:
         slot = _ChatSlot("s1")
         state = _state(slot)
         status, body = await self._patch(state, "s1", {"color_index": 3})
-        assert (status, body) == (200, {"ok": True, "color_index": 3})
+        assert (status, body) == (200, {"ok": True, "color_index": 3, "color_hex": None})
         assert slot.color_index == 3
         assert slot._dirty is True
         state.push_slots_update.assert_called_once()
@@ -682,7 +682,7 @@ class TestSlotColor:
         slot = _ChatSlot("s1")
         slot.color_index = 5
         status, body = await self._patch(_state(slot), "s1", {"color_index": None})
-        assert (status, body) == (200, {"ok": True, "color_index": None})
+        assert (status, body) == (200, {"ok": True, "color_index": None, "color_hex": None})
         assert slot.color_index is None
 
 
@@ -705,7 +705,9 @@ class TestSlotContextInject:
     async def test_unknown_slot_is_404(self, _sel):
         status, body = await self._post(_state(), "missing", {"content": "x"})
         assert status == 404
-        assert body["error"] == "slot not found"
+        # Must match the ownership denial exactly, or the pair becomes an oracle
+        # an app token can use to enumerate foreign slot names.
+        assert body == {"error": "not found", "code": "slot_not_found"}
 
     @pytest.mark.asyncio
     async def test_app_token_cannot_reach_an_unscoped_slot(self, _sel):

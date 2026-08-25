@@ -8,6 +8,13 @@
 //
 // Split out from the Vite plugin so the arithmetic and formatting are testable
 // without running a build.
+//
+// One deliberate exception to side-effect-free: `loadBundleSummary` reads the
+// report file from disk. It lives here because it is the single shared
+// implementation of the report's on-disk contract (existence, JSON shape,
+// version) for every consumer -- it returns errors rather than exiting, so each
+// caller keeps its own exit-code mapping.
+import { readFileSync, existsSync } from 'fs'
 
 /** Bytes-to-human, fixed-width friendly. */
 export function formatBytes(bytes) {
@@ -164,6 +171,66 @@ export function renderReport(summary, options = {}) {
 }
 
 /**
+ * Strip the output prefix and content hash from a chunk file name, leaving the
+ * chunk's logical name.
+ *
+ * Budgets must be keyed by something stable across builds, and the emitted file
+ * name is not: `assets/main-CZ3WY91T.js` carries a content hash that changes on
+ * every edit. The logical name (`main`) is what Rollup derived from the entry,
+ * the dynamic-import source, or a `manualChunks` label, and only changes when
+ * the chunk graph itself changes.
+ */
+export function logicalChunkName(fileName) {
+  if (typeof fileName !== 'string' || !fileName) return ''
+  const base = fileName.replace(/\\/g, '/').split('/').pop() || ''
+  // Vite/Rollup content hashes are 8 chars of [A-Za-z0-9_-] before the
+  // extension. An unhashed build (or a name whose tail is not a hash) falls
+  // through to the plain basename, so the helper never returns a surprise.
+  const m = base.match(/^(.+)-[A-Za-z0-9_-]{8}\.js$/)
+  if (m) return m[1]
+  return base.replace(/\.js$/, '')
+}
+
+/**
+ * Check every JS chunk in a summary against a per-chunk byte budget.
+ *
+ * `budgets` maps a LOGICAL chunk name (see `logicalChunkName`) to an explicit
+ * byte ceiling; every chunk without an entry gets `defaultBudget`. Assets
+ * (css, images, the report itself) are not gated: the regression class this
+ * catches is "a new eager JS chunk slipped past the global warning limit", and
+ * assets have different, format-specific size stories.
+ *
+ * Returns the verdict as data rather than printing or exiting, so the
+ * arithmetic is testable without spawning a process:
+ *   - `breaches`: chunks over their budget, largest overage first, each with
+ *     the resolved budget and the overage in bytes.
+ *   - `unusedBudgets`: allowlist entries no emitted chunk matched. Not a
+ *     failure -- a renamed chunk already fails against the default budget --
+ *     but reported so stale entries get cleaned up rather than accreting.
+ */
+export function checkChunkBudgets(summary, { budgets = {}, defaultBudget } = {}) {
+  const chunks = summary && Array.isArray(summary.chunks) ? summary.chunks : []
+  const seen = new Set()
+  const breaches = []
+  for (const chunk of chunks) {
+    if (!chunk || typeof chunk.fileName !== 'string') continue
+    const logicalName = logicalChunkName(chunk.fileName)
+    const hasOverride = Object.prototype.hasOwnProperty.call(budgets, logicalName)
+    if (hasOverride) seen.add(logicalName)
+    const budget = hasOverride ? budgets[logicalName] : defaultBudget
+    const size = typeof chunk.size === 'number' && Number.isFinite(chunk.size) ? chunk.size : 0
+    if (size > budget) {
+      breaches.push({ fileName: chunk.fileName, logicalName, size, budget, overage: size - budget })
+    }
+  }
+  breaches.sort(
+    (a, b) => b.overage - a.overage || (a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0)
+  )
+  const unusedBudgets = Object.keys(budgets).filter((name) => !seen.has(name)).sort()
+  return { breaches, unusedBudgets, checkedCount: chunks.length }
+}
+
+/**
  * Compare two summaries. Used to answer "did my change make it bigger", which is
  * the question a report is usually opened to settle.
  */
@@ -188,4 +255,45 @@ export function diffSummaries(before, after) {
     assetBytesDelta: (a.assetBytes || 0) - (b.assetBytes || 0),
     owners: changed,
   }
+}
+
+/**
+ * Load and validate a bundle-report.json written by the analyze-mode build.
+ *
+ * The single implementation of the report's on-disk contract, shared by the
+ * bundle-size gate (check-bundle-size.mjs) and the report renderer
+ * (bundle-report.mjs) so a report-format change (e.g. a version bump) is made
+ * in exactly one place. Returns `{ summary }` on success or
+ * `{ error: { code, message } }` -- it never exits or prints, so each caller
+ * maps codes to its own exit behavior. Codes: 'missing' (no file at `file`),
+ * 'invalid' (unparseable / not a report object / unsupported version).
+ *
+ * `hint` is appended to the missing-file message so each caller can name the
+ * command that produces the report in ITS context (`npm run analyze` for the
+ * renderer, the CI analyze build for the gate).
+ */
+export function loadBundleSummary(file, { hint = '' } = {}) {
+  if (!existsSync(file)) {
+    const suffix = hint ? `\n${hint}` : ''
+    return { error: { code: 'missing', message: `No bundle report at ${file}.${suffix}` } }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf-8'))
+  } catch (e) {
+    return { error: { code: 'invalid', message: `${file} is not valid JSON: ${e && e.message}` } }
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { error: { code: 'invalid', message: `${file} does not contain a report object.` } }
+  }
+  if (parsed.version !== 1) {
+    // Refuse rather than misread a future shape as v1.
+    return {
+      error: {
+        code: 'invalid',
+        message: `${file} has version ${JSON.stringify(parsed.version)}; this reader understands 1.`,
+      },
+    }
+  }
+  return { summary: parsed }
 }

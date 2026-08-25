@@ -1,6 +1,6 @@
-import { safeSetItem } from '../utils/safeStorage'
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
-import { Maximize2, Minimize2, ExternalLink, Download, Star } from 'lucide-react'
+import { widgetHeightKey, getWidgetHeight, setWidgetHeight, estimateWidgetHeight } from '../utils/widgetHeights'
+import { Maximize2, Minimize2, ExternalLink, Download, Star, RotateCw } from 'lucide-react'
 import { IconButton, IconButtonGroup } from './ui'
 import { useTheme } from '../hooks/useTheme'
 import { sanitizeCssValue } from '../lib/cssSanitize'
@@ -11,6 +11,8 @@ import { api, ApiError } from '../api/client'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { i18nT } from '../i18n/t'
+import { useSandboxDoc } from '../hooks/useSandboxDoc'
+import { useNearViewport } from '../hooks/useNearViewport'
 const MIN_HEIGHT = 80
 
 // Upper bound on the text a single widget action may pre-fill into the
@@ -79,70 +81,6 @@ export function staggeredBuildWait(baseWait: number, slot: number): number {
 }
 let jumpBuildSlot = 0
 let jumpBuildResetAt = 0
-
-// Height cache is theme-independent: every entry in THEME_VAR_NAMES is a
-// color var, never a size. If a length/size var is ever added to the list,
-// include it in the cache key so heights don't get reused across themes.
-// Persisted to localStorage so widgets don't jump on page reload.
-const CACHE_KEY = 'mc-widget-heights'
-const heightCache: Map<string, number> = (() => {
-  try {
-    const stored = localStorage.getItem(CACHE_KEY)
-    return stored ? new Map(JSON.parse(stored)) : new Map()
-  } catch { return new Map() }
-})()
-
-// Fallback height for a widget we've never measured. The first reveal of any
-// widget must reserve SOME height before its iframe builds and reports the real
-// one; if that reserve is wrong the row visibly corrects once (skeleton →
-// iframe). Using the median of heights we've already cached (this session or a
-// prior one, via localStorage) makes a brand-new widget reserve a typical
-// height, so the one-time correction is small. A truly first-ever widget (empty
-// cache) falls back to the fixed default. NOTE: this is why the correction only
-// showed on a cache-cold browser (fresh Firefox/Safari) and went away after one
-// view or a refresh — localStorage warms the cache.
-const DEFAULT_WIDGET_HEIGHT = 200
-function defaultWidgetHeight(): number {
-  if (heightCache.size === 0) return DEFAULT_WIDGET_HEIGHT
-  const vals = [...heightCache.values()].sort((a, b) => a - b)
-  return vals[Math.floor(vals.length / 2)]
-}
-
-function persistHeightCache() {
-  try {
-    // Keep only last 200 entries to bound storage
-    const entries = [...heightCache.entries()].slice(-200)
-    safeSetItem(CACHE_KEY, JSON.stringify(entries))
-  } catch (e) {
-    // Best-effort persistence (quota / private-mode / serialize failures).
-    // Surface it in dev so a persistent failure isn't completely invisible;
-    // there's no recovery to attempt, the next update retries the write.
-    // eslint-disable-next-line no-console -- intentional dev-only diagnostic
-    if (import.meta.env.DEV) console.warn('widget height cache persist failed', e)
-  }
-}
-
-// localStorage.setItem is synchronous and JSON.stringify'ing up to 200 entries
-// is not free; writing it on every height update stalls the main thread. Batch
-// writes so a burst of resizes (a widget settling, or several widgets mounting
-// at once) persists at most once per window.
-const HEIGHT_PERSIST_DEBOUNCE_MS = 1000
-let persistTimer: ReturnType<typeof setTimeout> | null = null
-function schedulePersistHeightCache() {
-  if (persistTimer) return
-  persistTimer = setTimeout(() => {
-    persistTimer = null
-    persistHeightCache()
-  }, HEIGHT_PERSIST_DEBOUNCE_MS)
-}
-
-function contentHash(html: string): string {
-  let h = 0
-  for (let i = 0; i < html.length; i++) {
-    h = ((h << 5) - h + html.charCodeAt(i)) | 0
-  }
-  return String(h)
-}
 
 function readThemeVars(): Record<string, string> {
   if (typeof window === 'undefined' || typeof document === 'undefined') return {}
@@ -227,27 +165,8 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   // build in the same frame. `visible` is one-way false→true; the chat
   // virtualizer unmounts the whole row to actually free the iframe.
   const [visible, setVisible] = useState(false)
-  const [near, setNear] = useState(false)
 
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
-    // SSR / environments without IO: render eagerly.
-    if (typeof IntersectionObserver === 'undefined') { setNear(true); return }
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setNear(true)
-          io.disconnect()
-        }
-      },
-      // Mark as near a bit before it scrolls into view so a scroll pause has a
-      // head start on building.
-      { rootMargin: '400px 0px' },
-    )
-    io.observe(el)
-    return () => io.disconnect()
-  }, [])
+  const near = useNearViewport(containerRef)
 
   useEffect(() => {
     if (visible || !near) return
@@ -269,8 +188,14 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
     const id = setTimeout(() => setVisible(true), wait)
     return () => clearTimeout(id)
   }, [near, visible])
-  const key = useMemo(() => contentHash(html), [html])
-  const [height, setHeight] = useState(() => heightCache.get(key) ?? defaultWidgetHeight())
+  // Measured heights live in `utils/widgetHeights` — ONE map, one debounce timer,
+  // one persist. Two modules each holding their own map and each persisting a
+  // whole-map overwrite of the same storage key would erase each other's fresh
+  // entries, whichever flushed last. This frame lays out at its container's
+  // width, so it takes the default key space; a caller measuring at a different
+  // width takes its own.
+  const key = useMemo(() => widgetHeightKey(html), [html])
+  const [height, setHeight] = useState(() => getWidgetHeight(key) ?? estimateWidgetHeight())
   // Mirror of `height` so the message handler (wired once per `key`) can
   // compare against the live value, plus a timer used to defer shrinks.
   const heightRef = useRef(height)
@@ -299,7 +224,12 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   )
 
   // Blob URL — only created when visible
-  const [blobUrl, setBlobUrl] = useState<string | null>(null)
+  // See hooks/useSandboxDoc.ts: the frame loads a gateway-served document
+  // rather than a `blob:` URL, and the previous document survives both an
+  // in-flight and a failed re-mint.
+  const { url: blobUrl, failed: mintFailed, retry: retryMint } = useSandboxDoc(
+    visible ? srcdoc : null,
+  )
   // Fade the iframe in once its document loads, so the reveal is a soft fade
   // instead of an abrupt blink-then-appear. Reset to false whenever a new blob
   // is built (first reveal, theme change, content rebuild) so each fresh render
@@ -309,10 +239,6 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   useEffect(() => {
     if (!visible || !srcdoc) return
     setIframeLoaded(false)
-    const blob = new Blob([srcdoc], { type: 'text/html;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    setBlobUrl(url)
-    return () => URL.revokeObjectURL(url)
   }, [srcdoc, visible])
 
   useEffect(() => {
@@ -331,8 +257,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
         const applyHeight = (next: number) => {
           heightRef.current = next
           setHeight(next)
-          heightCache.set(key, next)
-          schedulePersistHeightCache()
+          setWidgetHeight(key, next)
         }
         // A pending shrink is always superseded by the newest reading.
         if (shrinkTimerRef.current) { clearTimeout(shrinkTimerRef.current); shrinkTimerRef.current = null }
@@ -376,7 +301,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
       window.removeEventListener('message', handler)
       // The virtualizer can unmount this widget row (it leaves the window)
       // while a deferred shrink is still pending; clear it so it can't fire
-      // applyHeight → setHeight / heightCache.set / persist after unmount.
+      // applyHeight → setHeight / setWidgetHeight / persist after unmount.
       if (shrinkTimerRef.current) { clearTimeout(shrinkTimerRef.current); shrinkTimerRef.current = null }
     }
   }, [key])
@@ -634,6 +559,25 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
           </IconButton>
         </IconButtonGroup>
       </div>
+
+      {mintFailed && <div className="px-3 py-2 flex items-center gap-3 text-text">
+        <span>{i18nT('components.widgetFrame.could_not_render')}</span>
+        <button
+          type="button"
+          className="btn btn-sm"
+          onClick={retryMint}
+        >
+          <RotateCw className="lucide-inline" />
+          {i18nT('components.widgetFrame.retry')}
+        </button>
+      </div>}
+
+      {/* While the document URL is in flight the row must keep the height the
+          skeleton reserved. Rendering nothing here collapsed the row to its
+          header for a full round trip and then regrew it — the exact scroll
+          jump the skeleton above was built to prevent, now reachable on every
+          widget because the url arrives over the network instead of instantly. */}
+      {!blobUrl && !mintFailed && <div aria-hidden style={{ height: expanded ? '100%' : height }} />}
 
       {blobUrl && <div className={expanded ? 'relative flex-1 min-h-0 bg-card' : 'relative'}>
         {/* Parent-side progress indicator. REQUIRED in addition to the in-iframe

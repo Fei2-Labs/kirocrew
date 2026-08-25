@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
@@ -31,6 +32,7 @@ from kiro_crew.hooks import (
 from kiro_crew.learn import LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.metrics.provider import get_recorder
+from kiro_crew.quick_prompts import expand_quick_prompt
 from kiro_crew.security import (
     audit_injection_dropped,
     contains_injection,
@@ -52,6 +54,11 @@ logger = logging.getLogger(__name__)
 _memory_stores: dict[str, MemoryStore] = {}
 # Lazy cache of LessonStore instances keyed by workspace name.
 _lesson_stores: dict[str, LessonStore] = {}
+
+# Message roles included in session replay, thread-history compression, and the
+# context-builder recent-message path. "inject" is included so cron results and
+# /note breadcrumbs survive a session boundary and can still be recalled.
+RECALL_ROLES: frozenset[str] = frozenset({"user", "assistant", "inject"})
 # Serializes lazy store creation: build_message runs on worker threads
 # (run_in_embed_pool at every async call site), so two threads can race the
 # check-then-insert for the same workspace key. Double-checked with the lock.
@@ -633,13 +640,16 @@ _RUNTIME_DISPLAY = {
     "telegram": "Telegram",
     "wecom": "WeCom",
     "weixin": "Weixin",
+    "whatsapp": "WhatsApp",
+    "feishu": "Feishu",
     "webex": "Webex",
     "teams": "Microsoft Teams",
+    "imessage": "iMessage",
 }
 
 
-def _runtime_display_name(session_key: str, runtime_source: str | None = None) -> str:
-    """Map a session_key to a human-readable runtime name.
+def _resolve_runtime_source(session_key: str, runtime_source: str | None = None) -> str:
+    """Resolve the canonical runtime source key for a session.
 
     ``runtime_source`` is the authoritative transport for the current turn.
     It is intentionally separate from ``session_key``: a dashboard session can
@@ -652,7 +662,7 @@ def _runtime_display_name(session_key: str, runtime_source: str | None = None) -
     """
     source = (runtime_source or "").strip().lower()
     if source:
-        return _RUNTIME_DISPLAY.get(source, source)
+        return source
 
     if session_key.startswith("dashboard:") or session_key.startswith("dashboard_"):
         source = "dashboard"
@@ -676,14 +686,30 @@ def _runtime_display_name(session_key: str, runtime_source: str | None = None) -
             "telegram",
             "wecom",
             "weixin",
+            "whatsapp",
+            "feishu",
             "webex",
             "teams",
+            "imessage",
             "slack",
         ):
             if lowered_key.startswith((f"{namespace}:", f"{namespace}_")):
                 source = namespace
                 break
-    return _RUNTIME_DISPLAY.get(source, source)
+    return source
+
+
+def _runtime_display_name(session_key: str, runtime_source: str | None = None) -> str:
+    """Map a session_key to a human-readable runtime name.
+
+    Display mapping over :func:`_resolve_runtime_source` — resolution
+    semantics live there so the [RUNTIME] line and every source-keyed
+    decision (e.g. the diff-block rule selection) can never disagree.
+    """
+    return _RUNTIME_DISPLAY.get(
+        _resolve_runtime_source(session_key, runtime_source),
+        _resolve_runtime_source(session_key, runtime_source),
+    )
 
 
 # ── Switchable context groups ──
@@ -1059,18 +1085,42 @@ def _load_steering_resources() -> str:
         return ""
 
 
-# Critical rules reinforced every session (supplements the system prompt)
-_CRITICAL_RULES = (
-    "[CRITICAL RULES — always follow these]\n"
+# Critical rules reinforced every session (supplements the system prompt).
+# The diff-block rule is RUNTIME-SELECTED server-side (_critical_rules_for):
+# the trusted runtime resolution already exists for the [RUNTIME] line, so
+# whether tool cards render is decided at injection time instead of asking the
+# model to evaluate a runtime clause every turn — a misjudged clause on a
+# messaging channel would silently leave the user with no record of what
+# changed. Only the tool-vs-shell distinction stays with the model (clause (a)
+# below): the runtime cannot see HOW a file was changed.
+_DIFF_RULE_DASHBOARD = (
+    "File changes and diff blocks: edits made through the BUILT-IN "
+    "file-editing tools already render as structured diff cards in this "
+    "dashboard's transcript — do NOT repeat them as ```diff code blocks. For "
+    "a file changed any OTHER way — shell commands like sed, scripted bulk "
+    "edits, git apply, or an MCP tool that writes files — emit a ```diff "
+    "code block (standard unified diff format with `--- old_path` / "
+    "`+++ new_path` headers and an `@@` hunk line; use /dev/null for new "
+    "files / deletions — the headers let the dashboard's diff viewer link to "
+    "the file), because no card is rendered for those.\n"
+)
+_DIFF_RULE_CHANNEL = (
     "After ANY file change (create, edit, append, delete), you MUST show a "
     "```diff code block with the change using standard unified diff format "
     "including `--- old_path` / `+++ new_path` headers and an `@@` hunk line "
-    "(use /dev/null for new files / deletions). The headers are required so "
-    "the dashboard's diff viewer can link to the file. No exceptions — even "
-    "single-line changes MUST get a diff block.\n"
+    "(use /dev/null for new files / deletions). This surface renders no tool "
+    "cards, so your message text is the only place the user can see what "
+    "changed. No exceptions — even single-line changes MUST get a diff "
+    "block.\n"
+)
+_CRITICAL_RULES_HEAD = "[CRITICAL RULES — always follow these]\n"
+_CRITICAL_RULES_TAIL = (
     "When referencing file paths in your response, ALWAYS use the absolute path "
     "inside inline `code` backticks (e.g. `/home/user/project/src/main.py`). "
     "Never use relative paths or bare filenames. This enables the UI file viewer panel.\n"
+    "Backtick file PATHS only -- NEVER a URL. A backticked URL renders as a "
+    "click-to-copy chip, not a link, so the user cannot click through to it. "
+    "Write every URL as [text](url) instead.\n"
     "When presenting choices or options to the user, you MUST end your response "
     "with [OPTIONS: Choice A | Choice B | Choice C] as the very last line. "
     "This renders interactive buttons in the UI. Users can select multiple options before submitting.\n"
@@ -1089,6 +1139,112 @@ _CRITICAL_RULES = (
     'first"), and never phrase it as a question back to the user.\n'
     "[END CRITICAL RULES]\n\n"
 )
+# The dashboard variant is the module's canonical block: tests and the
+# marker-neutralization prefix check treat "a critical-rules block" as one of
+# these two fixed strings, so both stay module constants (never templated).
+_CRITICAL_RULES = _CRITICAL_RULES_HEAD + _DIFF_RULE_DASHBOARD + _CRITICAL_RULES_TAIL
+_CRITICAL_RULES_CHANNEL = _CRITICAL_RULES_HEAD + _DIFF_RULE_CHANNEL + _CRITICAL_RULES_TAIL
+
+# Runtime sources whose transcript renders tool-call cards (and therefore the
+# inline diff card). Everything else — messaging channels, cron, subagent,
+# background, CLI — gets the hard diff-block mandate: their only file-change
+# display is the message text itself.
+
+
+def _critical_rules_for(session_key: str | None, runtime_source: str | None) -> str:
+    """Select the critical-rules block for this session's runtime.
+
+    Compares the RAW source key from the same trusted resolution that
+    produces the [RUNTIME] line — never the localized display string — so the
+    diff-block contract and the runtime the model is told about can never
+    disagree, and a display-name change cannot flip the rule. Unknown or
+    unresolvable runtimes get the channel variant: the hard mandate is the
+    safe default (worst case a dashboard user sees a duplicate diff; the
+    inverse failure leaves a channel user with no record at all).
+    """
+    source = _resolve_runtime_source(session_key or "", runtime_source)
+    return _CRITICAL_RULES if source == "dashboard" else _CRITICAL_RULES_CHANNEL
+
+
+# Per-agent opt-out cache for the dashboard-contract context (``_CRITICAL_RULES``
+# + the dashboard tool nudges). ``build_message`` reads the flag on EVERY turn, so
+# a cold JSON scan there would be a per-turn cost; memoize by agent name. Staleness
+# within a process is acceptable — the same trade the un-cached ``_load_agent_prompt``
+# read already makes (an agent's spec is not edited mid-process in practice).
+_INCLUDE_CREW_CONTEXT_CACHE: dict[str, bool] = {}
+
+
+def _read_include_crew_context(agent: str) -> bool:
+    """Read ``includeCrewContext`` from *agent*'s materialized JSON. True on any miss.
+
+    Reuses ``_load_agent_prompt``'s sensitive-path-gated scan: skip ``._`` macOS
+    sidecars, ``resolve(strict=True)``, refuse a sensitive resolved target, tolerate
+    ``ValueError``/``OSError``, and match on the declared ``name`` (or the filename
+    stem). Returns ``True`` unless the matched spec carries an explicit boolean
+    ``false`` — an absent flag, a non-boolean value, a missing/unreadable spec, or a
+    directory error all default to injecting, reproducing the pre-opt-out behavior.
+    """
+    try:
+        candidates = kiro_agents_dir().glob("*.json")
+    except OSError:
+        return True
+    for f in candidates:
+        if f.name.startswith("._"):
+            continue
+        try:
+            resolved = f.resolve(strict=True)
+        except OSError:
+            continue
+        if is_sensitive_path(str(resolved)):
+            continue
+        try:
+            # Read through the guarded reader (not resolved.read_text): it
+            # re-resolves, refuses a sensitive target, and opens O_NOFOLLOW —
+            # closing the TOCTOU where the final path component is swapped to a
+            # symlink into ~/.aws etc. AFTER the is_sensitive_path check above.
+            data = json.loads(safe_read_file(str(f)))
+            if not isinstance(data, dict):
+                continue
+            if data.get("name") == agent or f.stem == agent:
+                val = data.get("includeCrewContext", True)
+                # Honor only an explicit boolean; anything else defaults to inject.
+                return val if isinstance(val, bool) else True
+        except (OSError, ValueError):
+            continue
+    return True
+
+
+def _agent_includes_crew_context(agent: str | None) -> bool:
+    """Whether to inject the Crew's dashboard-contract context for *agent*.
+
+    Opt-out, defaulting to inject. The built-in ``kirocrew`` agent and an empty
+    agent always return ``True`` (never a custom agent, so nothing to opt out of).
+    A CUSTOM agent injects unless its materialized JSON explicitly sets
+    ``includeCrewContext: false`` — so a plain custom agent with no flag still gets
+    the critical rules, exactly as it did before the opt-out existed. Memoized by
+    agent name to keep the per-turn ``build_message`` read off the JSON scan path.
+    """
+    if not agent or agent == "kirocrew":
+        return True
+    cached = _INCLUDE_CREW_CONTEXT_CACHE.get(agent)
+    if cached is None:
+        cached = _read_include_crew_context(agent)
+        _INCLUDE_CREW_CONTEXT_CACHE[agent] = cached
+    return cached
+
+
+def invalidate_include_crew_context_cache() -> None:
+    """Drop the memoized ``includeCrewContext`` reads.
+
+    Called when the materialized-agent snapshot is rescanned
+    (``refresh_materialized_agents``): an app install/upgrade rewrites an agent's
+    JSON mid-process via ``_register_agents``, so a value cached before that write
+    — including a default ``True`` cached on a first read that raced ahead of the
+    not-yet-written spec — would otherwise stay wrong until a gateway restart, the
+    exact restart-heals failure class this fix exists to remove. Clearing forces
+    the next ``build_session_context`` / ``build_message`` to re-read the flag.
+    """
+    _INCLUDE_CREW_CONTEXT_CACHE.clear()
 
 
 # Regex patterns for noise compression in assistant messages
@@ -1205,7 +1361,10 @@ def build_cancelled_turn_preamble(
     lines = [
         "[PREVIOUS TURN WAS CANCELLED BY THE USER — context restore]",
         "The following user request was interrupted mid-response. "
-        "Acknowledge it only if the current request refers to it.",
+        "Do not emit any standalone acknowledgment of the cancellation. "
+        "Use this restored context silently and respond only to the current "
+        "user request, referencing the interrupted work only when the "
+        "current request depends on it.",
         "",
         f"Cancelled user request:\n{user_text}",
     ]
@@ -1244,15 +1403,20 @@ async def compress_thread_history(
     *exclude_last_n* is forwarded to ``conversation_log.recent`` to drop
     the just-flushed current-turn user message from history.
     """
-    from kiro_crew.llm_helpers import stream_and_collect  # circular import
-    from kiro_crew.session import BACKGROUND_KEY  # circular import
+    from kiro_crew.llm_helpers import (  # circular import
+        background_turn,
+        stream_and_collect,
+    )
 
     compressed_cap = _resolve_caps(model_window).compressed_history
 
-    recent = conversation_log.recent(
+    # Off-thread because the per-role quota needs the WHOLE file: a tail slice
+    # cannot bound each role, so this read cannot be the cheap one.
+    recent = await asyncio.to_thread(
+        _recall_rows,
+        conversation_log,
         session_key,
-        max_messages=_COMPRESSION_MAX_MESSAGES,
-        roles={"user", "assistant"},
+        conv_max=_COMPRESSION_MAX_MESSAGES,
         exclude_last_n=exclude_last_n,
     )
     if not recent:
@@ -1283,33 +1447,27 @@ async def compress_thread_history(
         + transcript
     )
 
-    acquired = False
     try:
-        client, _is_new, _resumed = await sessions.get_or_create(
-            BACKGROUND_KEY, agent="kirocrew-lite"
-        )
-        acquired = True
-        result = await stream_and_collect(client, prompt)
-        if not result:
-            return None
+        async with background_turn(
+            sessions, task="thread_compress", agent="kirocrew-lite"
+        ) as client:
+            result = await stream_and_collect(client, prompt)
+            if not result:
+                return None
 
-        parts: list[str] = []
-        if head_lines:
-            parts.append("## Thread start (verbatim)\n" + "\n".join(head_lines))
-        parts.append("## Compressed history\n" + result[:compressed_cap])
-        if tail_lines:
-            parts.append("## Recent exchanges (verbatim)\n" + "\n".join(tail_lines))
-        final = "\n\n".join(parts)
-        final, _ = redact_exfiltration_urls(final)
-        final, _ = redact_credentials(final)
-        return final.translate(_MULTIBYTE_TABLE)
+            parts: list[str] = []
+            if head_lines:
+                parts.append("## Thread start (verbatim)\n" + "\n".join(head_lines))
+            parts.append("## Compressed history\n" + result[:compressed_cap])
+            if tail_lines:
+                parts.append("## Recent exchanges (verbatim)\n" + "\n".join(tail_lines))
+            final = "\n\n".join(parts)
+            final, _ = redact_exfiltration_urls(final)
+            final, _ = redact_credentials(final)
+            return final.translate(_MULTIBYTE_TABLE)
     except Exception:
         logger.warning("Thread history compression failed", exc_info=True)
         return None
-    finally:
-        if acquired:
-            sessions.release(BACKGROUND_KEY)
-            await sessions.recycle_background()
 
 
 # ── Provider-Agnostic Session Replay ──
@@ -1318,6 +1476,112 @@ async def compress_thread_history(
 _REPLAY_BUDGET_CHARS = (
     80_000  # 80K chars ≈ 20K tokens — fits alongside system context in 200K window
 )
+
+# Per-row ceiling for ``inject`` content inside a replay. Conversation rows are
+# uncapped here: they are the signal the replay exists to carry. An inject row
+# only has to say that a cron ran or a note was left, so a breadcrumb is enough,
+# and without a ceiling one chatty producer spends the whole tail-heavy budget on
+# itself and evicts real history. Sized above the p75 real inject row so typical
+# breadcrumbs pass through whole and only the outsized dumps are clipped.
+_REPLAY_INJECT_CAP_CHARS = 2_000
+
+# Share of the replay budget ``inject`` rows may spend between them. Conversation
+# keeps the rest, which the per-row ceiling above cannot guarantee: it clips one
+# row's content while leaving the total unbounded, so a tail of capped inject rows
+# could spend the whole budget and leave no room for a single user turn.
+_REPLAY_INJECT_BUDGET_DIVISOR = 4
+
+# Row quota for ``inject`` rows, kept SEPARATE from the conversation quota because
+# the row bound is applied by the query before any budgeting runs. Derived from the
+# share above: at the per-row ceiling this many rows exactly fill it, so admitting
+# more could never surface additional content.
+_REPLAY_INJECT_MAX_ROWS = (
+    _REPLAY_BUDGET_CHARS // _REPLAY_INJECT_BUDGET_DIVISOR
+) // _REPLAY_INJECT_CAP_CHARS
+
+_REPLAY_CONVERSATION_MAX_ROWS = 500
+
+
+def _replay_rows(
+    conversation_log: "ConversationLog",
+    session_key: str,
+    *,
+    exclude_last_n: int = 0,
+) -> list[dict]:
+    """Tail of the chain under per-role quotas, in chronological order.
+
+    Conversation rows get the full quota whatever the inject volume, which a
+    single bounded query cannot guarantee.
+    """
+    messages = conversation_log.read_messages_chained(session_key)
+    if exclude_last_n > 0:
+        messages = messages[:-exclude_last_n]
+    kept: list[dict] = []
+    conv = inj = 0
+    for m in reversed(messages):
+        role = m["role"]
+        if role == "inject":
+            if inj >= _REPLAY_INJECT_MAX_ROWS:
+                continue
+            inj += 1
+        elif role in RECALL_ROLES:
+            if conv >= _REPLAY_CONVERSATION_MAX_ROWS:
+                if inj >= _REPLAY_INJECT_MAX_ROWS:
+                    break
+                continue
+            conv += 1
+        else:
+            continue
+        kept.append({"role": role, "content": m["content"]})
+    kept.reverse()
+    return kept
+
+
+# Conversation rows admitted by the bounded recall sites. Mirrors ``recent()``'s
+# own ``max_messages`` default so the fallback keeps the window it always had.
+_RECALL_FALLBACK_MAX_ROWS = 20
+
+
+def _recall_rows(
+    conversation_log: "ConversationLog",
+    session_key: str,
+    *,
+    conv_max: int,
+    inject_max: int = _REPLAY_INJECT_MAX_ROWS,
+    exclude_last_n: int = 0,
+) -> list[dict]:
+    """Bounded recall under per-role quotas, in chronological order.
+
+    ``recent()`` role-filters and then takes a plain tail slice, so a run of
+    ``inject`` rows longer than the bound is the entire read and conversation
+    disappears. Quotas are counted separately here, so notes reach the model
+    without competing with user/assistant turns for the same slots.
+
+    ``exclude_last_n`` drops trailing raw entries BEFORE role filtering, matching
+    ``recent()``.
+    """
+    messages = conversation_log.read_messages(session_key)
+    if exclude_last_n > 0:
+        messages = messages[:-exclude_last_n]
+    kept: list[dict] = []
+    conv = inj = 0
+    for m in reversed(messages):
+        role = m["role"]
+        if role == "inject":
+            if inj >= inject_max:
+                continue
+            inj += 1
+        elif role in RECALL_ROLES:
+            if conv >= conv_max:
+                if inj >= inject_max:
+                    break
+                continue
+            conv += 1
+        else:
+            continue
+        kept.append({"role": role, "content": m["content"]})
+    kept.reverse()
+    return kept
 
 
 def build_session_replay(
@@ -1345,30 +1609,42 @@ def build_session_replay(
     window). ``None`` ⇒ the 1M reference (unchanged default). The budget is
     scaled by the same factor as the section caps and floored to one message.
     """
-    messages = conversation_log.recent_chained(
-        session_key,
-        max_messages=500,
-        roles={"user", "assistant"},
-        exclude_last_n=exclude_last_n,
-    )
+    messages = _replay_rows(conversation_log, session_key, exclude_last_n=exclude_last_n)
     if not messages:
         return None
 
     # Scale the replay budget by the resolved window factor (base/reference).
     caps = _resolve_caps(model_window)
     replay_budget = round(_REPLAY_BUDGET_CHARS * caps.base / _CONTEXT_BUDGET_BASE)
+    # Scaled by the same factor, and bounded by the budget so a tiny window still
+    # admits one row rather than clipping every inject row to nothing.
+    inject_cap = max(
+        1, min(replay_budget, round(_REPLAY_INJECT_CAP_CHARS * caps.base / _CONTEXT_BUDGET_BASE))
+    )
+
+    # Reserved so conversation cannot be starved by breadcrumbs: inject rows spend
+    # their own share and older ones are skipped, while the scan keeps looking for
+    # user/assistant rows rather than stopping at the first inject row that spills.
+    inject_budget = max(1, replay_budget // _REPLAY_INJECT_BUDGET_DIVISOR)
 
     # Build lines from most recent to oldest, stop when budget exhausted
     lines: list[str] = []
     total = 0
+    inject_total = 0
     for m in reversed(messages):
         role = m["role"].title()
         content = m.get("content", "")
+        if m["role"] == "inject" and len(content) > inject_cap:
+            content = content[:inject_cap] + "…[truncated]"
         line = f"{role}: {content}"
+        if m["role"] == "inject" and inject_total + len(line) > inject_budget and lines:
+            continue
         if total + len(line) > replay_budget and lines:
             break
         lines.append(line)
         total += len(line) + 2  # +2 for separator
+        if m["role"] == "inject":
+            inject_total += len(line) + 2
 
     lines.reverse()
     replay = "\n\n".join(lines)
@@ -1711,6 +1987,7 @@ class ContextBuilder:
         model_window: int | None = None,
         context_groups: frozenset[str] | None = None,
         query_text: str = "",
+        project: str | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -1752,9 +2029,12 @@ class ContextBuilder:
         (``_build_context_scope_section``) so it reports the gap instead of
         guessing.
 
-        For custom agents (non-kirocrew), skills and workspace identity
-        are skipped — the agent loads its own via kiro-cli. Memory,
-        lessons, critical rules, and hooks are injected for all agents.
+        For custom agents (non-kirocrew), skills and workspace identity are
+        skipped — the agent loads its own prompt via kiro-cli. The dashboard
+        critical-rules contract is injected by DEFAULT for every agent, but a
+        custom agent can opt out of it (and the dashboard tool nudges) by setting
+        ``includeCrewContext: false`` in its materialized JSON. Memory, lessons,
+        and hooks are injected for all agents.
         """
         is_custom = agent and agent != "kirocrew"
         is_cc = provider_type == "claude_code"
@@ -1804,12 +2084,27 @@ class ContextBuilder:
             _marks.append((label, time.monotonic()))
 
         # Critical rules (diff rendering, OPTIONS buttons, absolute-path file
-        # links). These are dashboard/Slack UI contracts and apply to ALL
-        # providers — including Claude Code. The dashboard renders clickable
-        # input-box options only from the [OPTIONS: ...] text tag (see
-        # dashboard/state.py and the frontend AssistantMessage), so CC must be
-        # told to emit it too or the options never render.
-        parts.append(_CRITICAL_RULES)
+        # links). These are the built-in kirocrew assistant's dashboard/Slack UI
+        # contracts and apply to ALL providers — including Claude Code. The
+        # dashboard renders clickable input-box options only from the
+        # [OPTIONS: ...] text tag (see dashboard/state.py and the frontend
+        # AssistantMessage), so CC must be told to emit it too or the options
+        # never render.
+        #
+        # A CUSTOM app agent can OPT OUT: it ships its own system prompt that
+        # defines its own output contract (e.g. an agent that writes prose
+        # through its own MCP tools, with no diff block or [OPTIONS:] footer),
+        # and injecting the kirocrew assistant's mandates on top both
+        # conflicts with that contract and — on a safety-tuned model — reads as
+        # an attempt to override the agent's identity, which the model then
+        # refuses as prompt injection. The opt-out is per-agent via
+        # ``includeCrewContext: false``; DEFAULT is to inject (a plain custom
+        # agent with no flag still gets the rules, same as the built-in). The
+        # tags still RENDER for any agent that emits them (the dashboard parses
+        # them regardless); this only stops the host from MANDATING them where an
+        # agent has declared it does not want them.
+        if _agent_includes_crew_context(agent):
+            parts.append(_critical_rules_for(session_key, runtime_source))
 
         # Current date/time — inject for ALL agents so the LLM knows "today".
         # Honour KiroCrewConfig.timezone (e.g. "Asia/Tokyo") so the LLM sees
@@ -1940,8 +2235,11 @@ class ContextBuilder:
                 )
                 parts.append(_history_header + compressed_history + "\n[End of thread history]\n\n")
             else:
-                recent = self.conversation_log.recent(
-                    session_key, roles={"user", "assistant"}, exclude_last_n=exclude_last_n
+                recent = _recall_rows(
+                    self.conversation_log,
+                    session_key,
+                    conv_max=_RECALL_FALLBACK_MAX_ROWS,
+                    exclude_last_n=exclude_last_n,
                 )
                 logger.info(
                     "🔍 build_session_context: session_key=%s resumed=%s "
@@ -1958,18 +2256,36 @@ class ContextBuilder:
                     # scaled history budget and drop ALL history. Bounding it at
                     # the budget guarantees at least the newest message fits.
                     per_message_cap = min(caps.per_message, budget)
+                    # The row quota alone cannot protect conversation here: this
+                    # loop spends the budget newest-first, and notes are the newest
+                    # rows, so a few large ones exhaust it before any user or
+                    # assistant turn is reached. Reserve a share for notes and skip
+                    # the ones that spill, exactly as the replay path does, so the
+                    # scan keeps looking for conversation instead of stopping.
+                    inject_cap = max(1, min(budget, _REPLAY_INJECT_CAP_CHARS))
+                    inject_budget = max(1, budget // _REPLAY_INJECT_BUDGET_DIVISOR)
+                    inject_spent = 0
                     history_lines: list[str] = []
                     for m in reversed(recent):
                         content = _MODE_IDENTITY_RE.sub("", m["content"])
                         if m["role"] == "assistant":
                             content = _compress_assistant_message(content)
-                        if len(content) > per_message_cap:
-                            content = content[:per_message_cap] + "…[truncated]"
+                        row_cap = inject_cap if m["role"] == "inject" else per_message_cap
+                        if len(content) > row_cap:
+                            content = content[:row_cap] + "…[truncated]"
                         line = f"{m['role'].title()}: {content}"
+                        if (
+                            m["role"] == "inject"
+                            and inject_spent + len(line) > inject_budget
+                            and history_lines
+                        ):
+                            continue
                         if budget - len(line) < 0:
                             break
                         history_lines.append(line)
                         budget -= len(line)
+                        if m["role"] == "inject":
+                            inject_spent += len(line)
                     if history_lines:
                         history_lines.reverse()
                         history_block = "\n".join(history_lines)
@@ -2046,6 +2362,8 @@ class ContextBuilder:
             skills_ctx = self.skills.get_context(
                 budget=caps.skills if lazy_skills else None,
                 only=skill_globs or None,
+                project_dir=project,
+                project_body_budget=caps.skills,
             )
             if skills_ctx:
                 if lazy_skills and len(skills_ctx) > caps.skills:
@@ -2053,35 +2371,40 @@ class ContextBuilder:
                 parts.append(skills_ctx)
         _mark("skills")
 
-        # Lessons: global only — injected for ALL agents (skipped for temporary
-        # sessions).
+        # Lessons: injected for ALL agents (skipped for temporary sessions), gated
+        # by the same project scope the skill loader applies. A lesson with no
+        # ``repo_scope`` applies everywhere, so this changes nothing for an
+        # existing store; a scoped one reaches only sessions whose active project
+        # is inside the named tree.
         #
-        # Workspace-scoped lessons are deliberately NOT merged here. The scope
-        # dates from when a workspace WAS a project, so "workspace lessons" meant
-        # "this project's rules"; project identity now lives on the session
-        # (``slot.project``), leaving the scope with nothing to anchor to. The
-        # merge it replaced was also unreachable in practice: it required
-        # ``workspace != "default"`` while every member resolves to ``default``,
-        # so a lesson saved with ``scope="workspace"`` reported success and then
-        # never reached a prompt. Removing the read keeps that silent failure
-        # from looking like a working feature.
+        # The legacy ``scope="workspace"`` tier is NOT merged here. It dates from
+        # when a workspace WAS a project, and its read was removed because a
+        # workspace no longer identifies one -- project identity lives on the
+        # session (``slot.project``), which is what ``repo_scope`` keys on instead.
         #
         # ``LessonStore`` and ``get_lessons_for`` are intentionally left intact:
         # the per-member memory work re-targets the write side onto them, so the
         # store is dormant here, not dead.
         lessons_ctx = ""
         if not blocks_reads and _group_included(context_groups, CONTEXT_GROUP_LESSONS):
-            # One query, not two: get_lessons_context() already returns "" when the
-            # store holds no lessons, so a separate get_lessons() existence probe
-            # would be a duplicate SELECT * over the same rows (embedding blobs
-            # included) whose only use is an emptiness check.
-            lessons_ctx = (
-                memory.vector_store.get_lessons_context(query_text=query_text, cap=caps.lessons)
-                if memory.vector_store
-                else ""
-            )
-            if not lessons_ctx:
-                lessons_ctx = self.lessons.get_context()
+            # The JSONL store answers when the vector store is absent OR not yet
+            # populated, and stays silent once it holds lessons.
+            #
+            # Two real failures pull in opposite directions here and both are
+            # avoided by keying on POPULATION rather than on the rendered result.
+            # Keying on "the render came back empty" lets the JSONL store speak for
+            # a live store whose rows were simply all out of scope, re-injecting
+            # rows deleted from it. Keying on "a store object exists" instead
+            # silences saved corrections while a first-boot migration is still
+            # filling that store. Population tells the two apart: no rows at all
+            # means the JSONL store is still the authority, rows-but-none-in-scope
+            # means this store already answered.
+            if memory.vector_store and memory.vector_store.has_any_lesson():
+                lessons_ctx = memory.vector_store.get_lessons_context(
+                    query_text=query_text, cap=caps.lessons, project_dir=project
+                )
+            else:
+                lessons_ctx = self.lessons.get_context(project_dir=project)
             if lessons_ctx:
                 if len(lessons_ctx) > caps.lessons:
                     over = len(lessons_ctx) - caps.lessons
@@ -2280,20 +2603,30 @@ class ContextBuilder:
                 model_window=model_window,
                 context_groups=context_groups,
                 query_text=text,
+                project=project,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
                 # session context (memory / lessons / prior-session history /
-                # provenance) WITHOUT touching the trusted _CRITICAL_RULES block
+                # provenance) WITHOUT touching the trusted critical-rules block
                 # that build_session_context prepends as parts[0] — that block
                 # legitimately carries [CRITICAL RULES]/[END CRITICAL RULES] and
-                # must survive intact. _CRITICAL_RULES is always the prefix (only
-                # tail-truncation ever trims the string), and none of the other
-                # trusted framing uses these markers, so scrubbing everything
-                # after the block is safe.
-                if session_ctx.startswith(_CRITICAL_RULES):
-                    session_ctx = _CRITICAL_RULES + _neutralize_structural_markers(
-                        session_ctx[len(_CRITICAL_RULES) :]
+                # must survive intact. The block is one of two fixed module
+                # constants (runtime-selected, never templated) and is always
+                # the prefix (only tail-truncation ever trims the string), and
+                # none of the other trusted framing uses these markers, so
+                # scrubbing everything after the block is safe.
+                _rules_prefix = next(
+                    (
+                        rb
+                        for rb in (_CRITICAL_RULES, _CRITICAL_RULES_CHANNEL)
+                        if session_ctx.startswith(rb)
+                    ),
+                    None,
+                )
+                if _rules_prefix is not None:
+                    session_ctx = _rules_prefix + _neutralize_structural_markers(
+                        session_ctx[len(_rules_prefix) :]
                     )
                 else:
                     session_ctx = _neutralize_structural_markers(session_ctx)
@@ -2330,6 +2663,21 @@ class ContextBuilder:
                 "authoritative for this turn, even if the session originated on "
                 "another interface.\n\n"
             )
+            # A session that started on the dashboard carries the relaxed
+            # diff-block rule from session start, but this turn may arrive
+            # from a surface that renders no tool cards. Re-assert the hard
+            # mandate for THIS turn. Deliberately asymmetric: only the
+            # channel mandate is ever injected mid-session (a dashboard turn
+            # in a channel-started session at worst duplicates a diff, which
+            # is cosmetic; the inverse — a channel turn under the relaxed
+            # rule — leaves the user with no record of what changed).
+            if _resolve_runtime_source(session_key or "", runtime_source) != "dashboard":
+                parts.append(
+                    "For THIS turn: this surface renders no tool cards, so "
+                    "after ANY file change you MUST include a ```diff code "
+                    "block in your message text — it is the only place the "
+                    "user can see what changed.\n\n"
+                )
 
         # Post-compaction re-injection: the skills index was lost when the
         # session-start context was compacted. Re-inject it so the model can
@@ -2348,6 +2696,8 @@ class ContextBuilder:
                 skills_ctx = self.skills.get_context(
                     budget=caps.skills if lazy_skills else None,
                     only=_globs or None,
+                    project_dir=project,
+                    project_body_budget=caps.skills,
                 )
                 if skills_ctx:
                     if lazy_skills and len(skills_ctx) > caps.skills:
@@ -2556,16 +2906,18 @@ class ContextBuilder:
 
         # Triggered skills (on-demand, any message) — skip for custom agents.
         # A match injects the skill's full body by DEFAULT, unchanged. A skill
-        # that declares itself an offer rather than a mandate opts out with
-        # `inject_on_trigger: false` and contributes a pointer line instead:
-        # word-overlap matching pulls in large unrelated skills often enough
-        # that body price per match is the largest single block of assembled
-        # context, and ACP replays native history so a body already sent earlier
-        # in the conversation is still in the window.
+        # unconfined skill that declares itself an offer rather than a mandate
+        # opts out with `inject_on_trigger: false` and contributes a pointer line
+        # instead. Confined project skills always take the body path so every
+        # read stays behind descriptor confinement. Word-overlap matching pulls
+        # in large unrelated skills often enough that body price per match is
+        # the largest single block of assembled context, and ACP replays native
+        # history so a body already sent earlier in the conversation is still
+        # in the window.
         if not is_custom and not minimal_context:
-            triggered = self.skills.get_triggered_skills(text)
+            triggered = self.skills.get_triggered_skills(text, project_dir=project)
             if triggered:
-                enforced, pointer_only = self.skills.split_triggered(triggered)
+                enforced, pointer_only = self.skills.split_triggered(triggered, project)
                 # Log the split, not just the match: a pointed-at skill the
                 # agent declines to read leaves no other trace, so without this
                 # "the skill stopped being followed" is indistinguishable from
@@ -2577,7 +2929,13 @@ class ContextBuilder:
                     ", ".join(pointer_only) or "-",
                 )
                 for name in enforced:
-                    content = self.skills.load_skill(name)
+                    # project_dir, not project-blind: get_triggered_skills and
+                    # split_triggered above are both project-aware, so a trusted
+                    # project's skill can reach here -- and loading it blind
+                    # returned None, making a matched skill contribute nothing at
+                    # all. The project branch reads through the containment-checked
+                    # reader, so this is confined like every other project read.
+                    content = self.skills.load_skill(name, project)
                     if content:
                         stripped = self.skills.strip_frontmatter(content)
                         parts.append(f"[Skill: {name}]\n{stripped}\n[End of skill]\n\n")
@@ -2586,7 +2944,7 @@ class ContextBuilder:
                         # positive, pointer-only, or undelivered) must not earn
                         # ranking weight in the lazy-load hotness ledger.
                         self.skills._record_use(name)
-                hint = self.skills.trigger_hint(pointer_only)
+                hint = self.skills.trigger_hint(pointer_only, project)
                 if hint:
                     parts.append(hint)
 
@@ -2626,6 +2984,39 @@ class ContextBuilder:
         # forge a second boundary after the request header above. This covers the
         # HOOK_MODIFY path too — a transform hook may re-emit untrusted input.
         turn_text = hook_result.text if hook_result.action == HOOK_MODIFY else text
+        # Quick prompts (``/plain``) are macros, not commands: the token the user
+        # opened with is replaced by the instruction it stands for. It happens
+        # HERE, in the one function every inbound surface funnels through, so a
+        # single registry row works from the dashboard composer, Telegram, Slack,
+        # Discord, a subagent and a cron turn — rather than once per dispatcher.
+        # After the hook layer, so a transform hook still sees what the user
+        # actually typed, and a hook that rewrites a turn INTO a quick prompt is
+        # honoured too. Before marker neutralization, so the spliced instruction
+        # is scrubbed on the same terms as any other turn text.
+        #
+        # The token has to be matched against the USER'S OWN SLICE, not the whole
+        # turn. A dashboard turn can arrive with an envelope PREFIXED to it — a
+        # drained memory block, a compaction notice — which is exactly what
+        # ``user_text_range`` describes. Anchoring on the whole turn would miss a
+        # prefixed ``/plain`` and silently send the literal token to the model, so
+        # the match runs on ``text[start:end]`` and the expansion is spliced back
+        # into that slice's place. Where no range is given (channels, cron, a
+        # subagent) the whole turn IS the user's text, and a rewriting hook's
+        # output is likewise the turn in full.
+        _quick_prompt: str | None = None
+        _quick_at = 0
+        if hook_result.action == HOOK_MODIFY or user_text_range is None:
+            _quick_prompt = expand_quick_prompt(turn_text)
+            if _quick_prompt is not None:
+                turn_text = _quick_prompt
+        else:
+            _q0, _q1 = user_text_range
+            _q0 = max(0, min(_q0, len(turn_text)))
+            _q1 = max(_q0, min(_q1, len(turn_text)))
+            _quick_prompt = expand_quick_prompt(turn_text[_q0:_q1])
+            if _quick_prompt is not None:
+                turn_text = turn_text[:_q0] + _quick_prompt + turn_text[_q1:]
+                _quick_at = _q0
         _marker_spans = _structural_marker_spans(turn_text)
         _turn_neutralized = _apply_marker_spans(turn_text, _marker_spans)
         # Where the user's own text lands is resolved HERE rather than
@@ -2635,10 +3026,22 @@ class ContextBuilder:
         # text), and the final _MULTIBYTE_TABLE fold. A caller measuring the
         # pre-transform message cannot know the post-transform offsets.
         if user_text_range is not None:
-            if hook_result.action == HOOK_MODIFY:
-                # A transform hook replaced the whole turn, so the caller's
-                # bounds describe text that no longer exists. The hook's output
-                # IS the user's turn now, so attribute all of it.
+            if _quick_prompt is not None:
+                # A quick prompt REPLACED the user's slice with injected
+                # instruction text. None of it is their typing — they typed a
+                # token that no longer exists in the turn — so their span is
+                # EMPTY, anchored where that slice began. This is the rule
+                # attributable_user_chars() already states for the sibling
+                # @prompt replacement (credit 0). Claiming the whole replacement,
+                # as a rewriting hook legitimately does, would report generated
+                # instructions as the user's own words and underreport Crew-added
+                # context in the per-turn breakdown.
+                _u0, _u1 = _quick_at, _quick_at
+            elif hook_result.action == HOOK_MODIFY:
+                # A transform hook replaced the whole turn, so the caller's bounds
+                # describe text that no longer exists. The hook's output IS the
+                # user's turn now, so attribute all of it rather than clamping
+                # stale offsets into the middle of it.
                 _u0, _u1 = 0, len(turn_text)
             else:
                 _u0, _u1 = user_text_range
@@ -2666,10 +3069,14 @@ class ContextBuilder:
             # Situational nudges for tools that may otherwise never surface with
             # MCP Tool Search. Gated on having a dashboard tab open, because
             # both tools need a card surface to render into — which a
-            # channel-born session has whenever its tab is open.
+            # channel-born session has whenever its tab is open. Also gated on
+            # the agent's opt-out: a custom agent that set includeCrewContext=false
+            # wants none of the Crew's dashboard-tool nudges (it drives its own
+            # UI through its MCP tools), so honor that here too, not just for
+            # _CRITICAL_RULES.
             # ask_question is a MID-turn blocking decision; [OPTIONS:] remains
             # the cheaper END-turn choice mechanism on every interactive surface.
-            if has_dashboard_surface(session_key or ""):
+            if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
                 parts.append(
                     "\n\n(If you need the user's answer to a blocking question BEFORE "
                     "you can continue the current turn, use the ask_question tool — it "

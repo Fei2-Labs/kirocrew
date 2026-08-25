@@ -3,7 +3,7 @@ import { fireEvent, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from './helpers'
 import SessionStorageScreen from '../pages/system/SessionStorageScreen'
-import type { SessionInventoryList, SessionInventoryDetail, SessionStorageCleanup, SessionTrashResult } from '../types'
+import type { SessionInventoryList, SessionInventoryDetail, SessionStorageCleanup, SessionStorageEmptyJob, SessionTrashResult } from '../types'
 
 globalThis.ResizeObserver = class {
   observe() {}
@@ -17,6 +17,22 @@ const restoreFn = vi.fn()
 const cleanupFn = vi.fn<(days: number, dryRun: boolean) => Promise<SessionStorageCleanup>>()
 let inventory: SessionInventoryList
 let detail: SessionInventoryDetail
+/** What GET /empty reports. A test sets it to stage a running or finished job. */
+let emptyJob: SessionStorageEmptyJob | null = null
+/** When true, POST /empty rejects — a network failure or a refused request. */
+let emptyFails = false
+
+function job(over: Partial<SessionStorageEmptyJob> = {}): SessionStorageEmptyJob {
+  return {
+    job_id: 'empty-1',
+    running: true,
+    total_bytes: 1_920_000_000,
+    freed_bytes: 0,
+    error: '',
+    skipped: [],
+    ...over,
+  }
+}
 
 vi.mock('../api/client', () => ({
   api: {
@@ -25,7 +41,14 @@ vi.mock('../api/client', () => ({
     sessionInventoryTrash: (...args: unknown[]) => trashFn(...(args as [string[]])),
     sessionStorageCleanup: (...args: unknown[]) => cleanupFn(...(args as [number, boolean])),
     sessionStorageRestore: (...args: unknown[]) => { restoreFn(...args); return Promise.resolve({ restored: 1 }) },
-    sessionStorageEmpty: (...args: unknown[]) => { emptyFn(...args); return Promise.resolve({ freed_bytes: 100 }) },
+    // 202: the delete is only ACCEPTED here. Progress arrives on the status read.
+    sessionStorageEmpty: (...args: unknown[]) => {
+      emptyFn(...args)
+      if (emptyFails) return Promise.reject(new Error('could not start'))
+      emptyJob = emptyJob ?? job()
+      return Promise.resolve(emptyJob)
+    },
+    sessionStorageEmptyStatus: () => Promise.resolve({ job: emptyJob }),
   },
 }))
 
@@ -70,6 +93,8 @@ function withTrash(): SessionInventoryList {
 describe('SessionStorageScreen (inventory)', () => {
   beforeEach(() => {
     trashFn.mockClear(); emptyFn.mockClear(); restoreFn.mockClear()
+    emptyJob = null
+    emptyFails = false
     // mockReset, not mockClear: one test installs a never-resolving implementation
     // to hold a request in flight, and mockClear would leave it in place for the
     // next test (whose select would then stay disabled).
@@ -461,6 +486,387 @@ describe('SessionStorageScreen (inventory)', () => {
     const held = boxes.find(b => b.disabled)
     expect(held).toBeTruthy()
     expect(held!.title).toMatch(/storage cleanup is unavailable/i)
+  })
+
+  /* ─────────────────── Pagination ─────────────────── */
+
+  /**
+   * Builds `count` conversation rows, biggest first, so the default sort puts
+   * `FG 001` at the top and `FG <count>` at the bottom. That makes "which page am
+   * I on" assertable by title alone.
+   */
+  function manyForeground(count: number): SessionInventoryList {
+    const rows = Array.from({ length: count }, (_, i) => ({
+      uid: `dashboard_chat-${i}`,
+      title: `FG ${String(i + 1).padStart(3, '0')}`,
+      origin: `dashboard · chat-${i}`,
+      bytes: (count - i) * 1_000_000,
+      mtime: 1752000000 - i,
+      active: false,
+      live: false,
+      background: false,
+    }))
+    return baseInventory({
+      sessions: rows,
+      total_sessions: count,
+      background: { sessions: 0, bytes: 0, listed: 0 },
+    })
+  }
+
+  /**
+   * The reported symptom: with a full inventory on one page the Trash section —
+   * the only place a staged delete is undone or confirmed — sat below every row in
+   * the store, so the screen's own controls were unreachable.
+   */
+  it('shows one page of rows, not the whole inventory', async () => {
+    inventory = manyForeground(45)
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('FG 001')).toBeTruthy())
+
+    expect(screen.getByText('FG 020')).toBeTruthy()
+    expect(screen.queryByText('FG 021')).toBeNull()
+    expect(screen.getByText('Page 1 of 3')).toBeTruthy()
+    expect(screen.getByText('Showing 1–20 of 45')).toBeTruthy()
+  })
+
+  it('moves to the next page and back', async () => {
+    inventory = manyForeground(45)
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('FG 001')).toBeTruthy())
+
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByText('FG 021')).toBeTruthy()
+    expect(screen.queryByText('FG 001')).toBeNull()
+    expect(screen.getByText('Page 2 of 3')).toBeTruthy()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Previous' }))
+    expect(screen.getByText('FG 001')).toBeTruthy()
+    expect(screen.getByText('Page 1 of 3')).toBeTruthy()
+  })
+
+  it('stops at the last page, which may be short', async () => {
+    inventory = manyForeground(45)
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('FG 001')).toBeTruthy())
+
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByText('Showing 41–45 of 45')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Next' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  /**
+   * Page 3 of a one-page result is an empty screen, which is what a kept cursor
+   * produces the moment a search narrows the list.
+   */
+  it('returns to the first page when the search changes', async () => {
+    inventory = manyForeground(45)
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('FG 001')).toBeTruthy())
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByText('Page 2 of 3')).toBeTruthy()
+
+    fireEvent.change(screen.getByPlaceholderText('Search sessions'), { target: { value: 'FG' } })
+    await waitFor(() => expect(screen.getByText('Page 1 of 3')).toBeTruthy())
+    expect(screen.getByText('FG 001')).toBeTruthy()
+    expect(screen.queryByText('FG 021')).toBeNull()
+  })
+
+  it('offers no pager when the whole list fits on one page', async () => {
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('Refactor the ACP adapter')).toBeTruthy())
+
+    expect(screen.queryByRole('button', { name: 'Next' })).toBeNull()
+    expect(screen.queryByText(/^Page /)).toBeNull()
+  })
+
+  /**
+   * A filtered-to-nothing list used to render as a blank gap, which reads as a
+   * screen that failed to load rather than a query with no hits.
+   */
+  it('says a search matched nothing instead of showing a blank gap', async () => {
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('Refactor the ACP adapter')).toBeTruthy())
+
+    fireEvent.change(screen.getByPlaceholderText('Search sessions'), { target: { value: 'zzzz' } })
+    await waitFor(() => expect(screen.getByText('No conversations match that search.')).toBeTruthy())
+    expect(screen.queryByText('Refactor the ACP adapter')).toBeNull()
+  })
+
+  /** The replay-only group is capped at 200 rows server-side, so it pages too. */
+  it('pages the background group as well', async () => {
+    const bg = Array.from({ length: 30 }, (_, i) => ({
+      uid: `subagent_${i}`,
+      title: '',
+      origin: `subagent · ${String(i + 1).padStart(3, '0')}`,
+      bytes: (30 - i) * 1_000,
+      mtime: 1752000000,
+      active: false,
+      live: false,
+      background: true,
+    }))
+    inventory = baseInventory({
+      sessions: bg,
+      total_sessions: 30,
+      background: { sessions: 30, bytes: 465_000, listed: 30 },
+    })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/Background agents/)).toBeTruthy())
+    await userEvent.click(screen.getByText(/Background agents/))
+
+    expect(screen.getByText('subagent · 020')).toBeTruthy()
+    expect(screen.queryByText('subagent · 021')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }))
+    expect(screen.getByText('subagent · 021')).toBeTruthy()
+  })
+
+  /* ─────────────────── Emptying, while it happens ─────────────────── */
+
+  /**
+   * The reported symptom: the three buttons greyed out and nothing else changed,
+   * so a delete of tens of thousands of sessions was indistinguishable from a
+   * stuck screen. Ten seconds later the batch was gone, which is how the user
+   * found out it had worked.
+   */
+  it('reports a running empty with a partial figure', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 480_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText('Emptying Trash')).toBeTruthy())
+    expect(screen.getByText('480MB of 1.9GB freed')).toBeTruthy()
+  })
+
+  /**
+   * Load-bearing copy, not reassurance: the job runs in the gateway and outlives
+   * the request, so leaving really is safe - and a user who does not know that
+   * sits and waits, which is what happened.
+   */
+  it('says the delete survives leaving the page', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 1 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(
+      screen.getByText('This keeps running if you leave this page.'),
+    ).toBeTruthy())
+  })
+
+  /**
+   * A job already running when the screen mounts belongs to a run the user started
+   * before navigating away. Picking it up is the whole reason the progress lives on
+   * the server rather than in this component's mutation state.
+   */
+  it('picks up a delete that was already running before this screen opened', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 960_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText('960MB of 1.9GB freed')).toBeTruthy())
+    // Nothing was clicked in this session: the run is the server's, not this
+    // component's.
+    expect(emptyFn).not.toHaveBeenCalled()
+  })
+
+  it('says what a finished empty freed', async () => {
+    inventory = withTrash()
+    emptyJob = job({ running: false, freed_bytes: 1_920_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText('Freed 1.9GB.')).toBeTruthy())
+    expect(screen.queryByText('Emptying Trash')).toBeNull()
+  })
+
+  /**
+   * The request is answered before the delete runs, so a refusal has nowhere else
+   * to surface. Silence here is the old behaviour: the batch simply stayed.
+   */
+  it('says so when a delete stopped instead of leaving the batch unexplained', async () => {
+    inventory = withTrash()
+    emptyJob = job({ running: false, freed_bytes: 4_100_000_000, error: 'the trash root moved' })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText(/the trash root moved/)).toBeTruthy())
+    // The raw gateway sentence is its own line now, so the block holds both halves:
+    // a translated sentence that stands alone, and the technical detail under it.
+    const block = screen.getByText(/the trash root moved/).closest('[role="status"]')
+    expect(block?.textContent).toMatch(/Stopped after freeing 4.1GB\./)
+  })
+
+  /**
+   * `onSettled` disarms the confirm on any outcome, which is what lets a 409 tab pick
+   * up the running job - and it left a FAILED post with a cleared button and nothing
+   * on screen, so the click read as accepted while nothing ran.
+   */
+  it('says so when the delete could not even be started', async () => {
+    inventory = withTrash()
+    emptyFails = true
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/Delete forever/)).toBeTruthy())
+
+    await userEvent.click(screen.getByText(/Delete forever/))
+    vi.setSystemTime(Date.now() + 1000)
+    await userEvent.click(screen.getByRole('button', { name: /Delete forever/ }))
+
+    await waitFor(() => expect(
+      screen.getByText("Couldn't start emptying the Trash. Try again."),
+    ).toBeTruthy())
+  })
+
+  /**
+   * react-query keeps `isError` until the next mutate, so a 409 (a second tab) left
+   * the error latched while the poll picked up the REAL job - and the moment that job
+   * settled the screen said the delete never ran directly above what it freed. On the
+   * one surface whose job is answering "did the irreversible thing happen", the answer
+   * has to be the job.
+   */
+  it('lets a picked-up job win over a latched start error', async () => {
+    inventory = withTrash()
+    emptyFails = true
+    // The server already has a settled job, as a second tab would find after its 409.
+    emptyJob = job({ running: false, freed_bytes: 1_920_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/Delete forever/)).toBeTruthy())
+
+    await userEvent.click(screen.getByText(/Delete forever/))
+    vi.setSystemTime(Date.now() + 1000)
+    await userEvent.click(screen.getByRole('button', { name: /Delete forever/ }))
+
+    await waitFor(() => expect(emptyFn).toHaveBeenCalled())
+    expect(screen.getByText('Freed 1.9GB.')).toBeTruthy()
+    expect(screen.queryByText("Couldn't start emptying the Trash. Try again.")).toBeNull()
+  })
+
+  /**
+   * The run disables controls at the TOP of a long list while its progress line sits
+   * in the Trash section far below, so the reason has to be visible where the dead
+   * controls are.
+   */
+  it('says why the controls are paused, at the controls', async () => {
+    inventory = withTrash()
+    emptyJob = job({ running: true, freed_bytes: 1_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() =>
+      expect(
+        screen.getByText('Emptying the Trash. Some actions are paused until it finishes.')
+      ).toBeTruthy()
+    )
+  })
+
+  /** A half-finished irreversible delete must not explain itself only in English. */
+  it('offers a translated next step when the delete crashes', async () => {
+    inventory = withTrash()
+    emptyJob = job({ running: false, freed_bytes: 512, error: 'OSError: disk went away' })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() =>
+      expect(
+        screen.getByText('Try Delete forever again. Details are in the gateway log.')
+      ).toBeTruthy()
+    )
+    // The gateway's own words stay, as the detail rather than the explanation.
+    expect(screen.getByText('OSError: disk went away')).toBeTruthy()
+  })
+
+  /** The log only names a file for the unlisted-file case, so the hint is gated. */  it('offers the log hint only for the reason that has a file to name', async () => {
+    inventory = withTrash()
+    emptyJob = job({ running: false, freed_bytes: 10, skipped: ['unreadable_batch'] })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText(/not everything could be deleted/)).toBeTruthy())
+    const line = screen.getByText(/not everything could be deleted/).textContent ?? ''
+    expect(line).toMatch(/could not be read in full/)
+    expect(line).not.toMatch(/gateway log/)
+  })
+
+  /**
+   * A kept batch raises nothing: `_empty_trash_locked` logs and moves on, because
+   * the files it holds are the only copy. Read only from the error, the job settled
+   * clean and this rendered the success line "Freed 0 B." directly above a batch
+   * that was still listed.
+   */
+  it('does not call a kept batch a success', async () => {
+    inventory = withTrash()
+    emptyJob = job({ running: false, freed_bytes: 0, skipped: ['unlisted_files'] })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(
+      screen.getByText(/not everything could be deleted/),
+    ).toBeTruthy())
+    expect(screen.getByText(/manifest does not list/)).toBeTruthy()
+    expect(screen.queryByText('Freed 0B.')).toBeNull()
+  })
+
+  /**
+   * An explanation with no next step is still a dead end: the row offers the same
+   * Delete forever, which refuses again, so the notice has to end with something
+   * the user can actually do.
+   */
+  it('ends a kept-batch refusal with a next step', async () => {
+    inventory = withTrash()
+    emptyJob = job({ running: false, freed_bytes: 0, skipped: ['unlisted_files'] })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText(/not everything could be deleted/)).toBeTruthy())
+    const notice = screen.getByText(/not everything could be deleted/).textContent ?? ''
+    expect(notice).toMatch(/Restore what you can/)
+    expect(notice).toMatch(/gateway log/)
+  })
+
+  /**
+   * The byte figure changes on every poll, so a live region containing it makes a
+   * screen reader speak about once a second for a job that runs for minutes. The
+   * STATE is announced; the counter is readable but not read out.
+   */
+  it('announces the state, not the counter', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 480_000_000 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('Emptying Trash')).toBeTruthy())
+
+    expect(screen.getByText('Emptying Trash').getAttribute('role')).toBe('status')
+    const counter = screen.getByText('480MB of 1.9GB freed')
+    expect(counter.getAttribute('aria-live')).toBe('off')
+    expect(counter.closest('[role="status"]')).toBeNull()
+  })
+
+  /** Two batches kept for the same reason is the same sentence, once. */
+  it('states a repeated keep reason once', async () => {
+    inventory = withTrash()
+    emptyJob = job({
+      running: false,
+      freed_bytes: 10,
+      skipped: ['unlisted_files', 'unlisted_files'],
+    })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+
+    await waitFor(() => expect(screen.getByText(/not everything could be deleted/)).toBeTruthy())
+    const line = screen.getByText(/not everything could be deleted/).textContent ?? ''
+    expect(line.match(/manifest does not list/g)?.length).toBe(1)
+  })
+
+  it('holds the other actions while a delete is running', async () => {
+    inventory = withTrash()
+    emptyJob = job({ freed_bytes: 1 })
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('Emptying Trash')).toBeTruthy())
+
+    const restore = screen.getByRole('button', { name: 'Restore' }) as HTMLButtonElement
+    expect(restore.disabled).toBe(true)
+  })
+
+  /** The confirm is disarmed by acceptance, not by the delete finishing. */
+  it('disarms the confirm as soon as the empty is accepted', async () => {
+    inventory = withTrash()
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/Trash/)).toBeTruthy())
+
+    await userEvent.click(screen.getByText(/Delete forever/))
+    // Past the arm window, so this is consent and not a double-click.
+    vi.setSystemTime(Date.now() + 1000)
+    await userEvent.click(screen.getByRole('button', { name: /Delete forever/ }))
+
+    await waitFor(() => expect(emptyFn).toHaveBeenCalledWith(['20260808T041500-ab12cd34']))
+    await waitFor(() => expect(screen.getByText('Emptying Trash')).toBeTruthy())
   })
 
 })

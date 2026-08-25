@@ -26,22 +26,24 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection, Mapping
 
 from kiro_crew import __version__, platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
-from kiro_crew.env import spec_env_path, spec_path_key
+from kiro_crew.env import mcp_search_path, spec_path_key
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.mcp_gateway.hashing import hash_command, is_secret_env_key
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
 from kiro_crew.mcp_utils import mcp_server_alias
+from kiro_crew.sandbox import scrub_agent_denied_env
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,16 @@ class _RewritePassNotes:
     cache-hit path re-runs exactly these probes and compares — a disagreement
     in either direction forces the full rewrite.
 
+    ``env_placeholder_seen`` records that a declared env contained a
+    ``${VAR}``/``${env:VAR}`` reference. The resolved VALUE lands in the
+    sidecar, so it is an input the stat-based fingerprint cannot see — an
+    exported variable changing between boots would otherwise keep serving a
+    sidecar expanded against the old environment (a rotated credential would
+    silently keep flowing the old value for as long as no file changed).
+    Rather than fingerprint the environment, such a pass is simply not cached:
+    the placeholder case re-resolves on every boot and cannot go stale, while
+    every spec without a placeholder keeps the cache untouched.
+
     ``sidecar_write_failed`` and ``source_read_failed`` mark transient I/O
     faults: the produced output set is incomplete for reasons that can clear
     without any fingerprinted input changing, so the run must not be cached
@@ -81,6 +93,7 @@ class _RewritePassNotes:
     """
 
     which_results: dict[str, str] = field(default_factory=dict)
+    env_placeholder_seen: bool = False
     sidecar_write_failed: bool = False
     source_read_failed: bool = False
 
@@ -138,7 +151,7 @@ def _resolve_target_command(
     ``PATH`` lacks the toolbox / user-local bin dirs a login shell has — so a
     bare command that resolves fine for the SESSION's own exec ENOENTs on
     every pooled spawn: 79% of all measured fallbacks. The search is
-    :func:`kiro_crew.env.spec_env_path` — literally the same composition the
+    :func:`kiro_crew.env.mcp_search_path` — literally the same composition the
     MCP probe and the agent-config resolver use (spec ``env.PATH`` first, then
     the augmented host PATH) — so a server that probes healthy on the
     dashboard can never ENOENT in gatewayd.
@@ -169,12 +182,12 @@ def _resolve_target_command(
     # legitimately spell it "Path" and the child's loader honours it.
     path_key = spec_path_key(env_pairs) if isinstance(env_pairs, dict) else None
     env_path = env_pairs.get(path_key, "") if path_key else ""
-    # spec_env_path is the canonical composition the MCP probe and the
-    # agent-config resolver also use: the spec's own env.PATH entries FIRST
-    # (an operator pin must win), then the augmented host PATH. It also
-    # degrades a non-string PATH and dedups, so one malformed hand-edited
-    # spec cannot abort the rewrite pass.
-    search_path = spec_env_path(env_path)
+    # mcp_search_path is the canonical RESOLUTION composition the MCP probe and
+    # the agent-config resolver also use: the spec's own env.PATH entries FIRST
+    # (an operator pin must win), then the contributed MCP directories, then the
+    # augmented host PATH. It also degrades a non-string PATH and dedups, so one
+    # malformed hand-edited spec cannot abort the rewrite pass.
+    search_path = mcp_search_path(env_path)
     resolved = shutil.which(target_command, path=search_path)
     if notes is not None:
         notes.which_results[
@@ -204,7 +217,11 @@ def _normalized_env(entry: dict[str, Any], *, context: str = "") -> dict[str, An
     return {}
 
 
-def _withheld_env_count(entry_env: dict[str, Any], forward_env: bool) -> int:
+def _withheld_env_count(
+    entry_env: dict[str, Any],
+    forward_env: bool,
+    identity_keys: Collection[str] = (),
+) -> int:
     """How many declared env keys a shared pooled backend would NOT receive.
 
     The pooling bargain is "the backend starts with your declared env"; any
@@ -215,14 +232,116 @@ def _withheld_env_count(entry_env: dict[str, Any], forward_env: bool) -> int:
     disagree on their values) and the daemon's own credential-scrub set —
     mirroring ``gatewayd._declared_non_secret_env`` exactly, so this
     classifier never promises an env the forwarder will refuse to apply.
+
+    ``identity_keys`` is :func:`pool_identity_env_keys`, and a named key stops
+    being withheld here for the same reason the forwarder starts applying it: it
+    is now inside ``effective_env_hash``. The two sides consult ONE resolved set
+    so they cannot disagree, and because that helper already drops
+    credential-scrub names, a name can never be un-withheld here while the
+    forwarder still refuses it.
+
+    That mirror is load-bearing BECAUSE of the default flip: with forwarding off
+    this function short-circuits on ``len(entry_env)`` and the forwarder is never
+    consulted, so the two could not disagree. With forwarding on they must agree
+    key for key, which ``test_the_eligibility_count_matches_the_forwarder``
+    pins by construction.
     """
     if not forward_env:
         return len(entry_env)
+    identity = frozenset(identity_keys)
     return sum(
         1
         for k in entry_env
-        if is_secret_env_key(k) or is_credential_env_key(k)
+        if (is_secret_env_key(k) and k not in identity) or is_credential_env_key(k)
     )
+
+
+# Expand ${VAR}/${env:VAR} in a brokered server's declared env, matching
+# kiro-cli's expander (crates/agent/src/agent/util/mod.rs). Needed because the
+# broker spawns the stub, not the real server, so kiro-cli never expands the
+# declared env; gatewayd/the stub spawn the backend from the sidecar written
+# below. Resolving once at write time keeps that sidecar the single hash source
+# both the stub's effective_env_hash and gatewayd's coherence re-hash read, so
+# the PoolKey gate holds.
+_ENV_VAR_PLACEHOLDER = re.compile(r"\$\{(?:env:)?([^}]+)\}")
+
+
+def _placeholder_source_env() -> dict[str, str]:
+    """The environment view a placeholder may dereference.
+
+    The rewrite pass runs in the gateway parent process, whose ``os.environ``
+    holds the channel tokens ``load_credentials()`` seeds plus the operator's
+    raw shell env — and agent specs are agent-writable, so an unfiltered lookup
+    lets ``{"TOKEN": "${env:AWS_SECRET_ACCESS_KEY}"}`` smuggle a credential
+    VALUE past the key-name forwarding filters into a pooled backend.
+
+    Dropping :func:`is_secret_env_key` + :func:`is_credential_env_key` names
+    mirrors the declared-KEY double filter (``gatewayd._declared_non_secret_env``),
+    so a value the forwarder would refuse under its own name cannot ride in
+    under another. Dropping :func:`scrub_agent_denied_env` keys matches what
+    kiro-cli's own expander sees: the ACP spawn scrubs those before kiro-cli
+    starts, so they are misses there and must be misses here too.
+    """
+    return scrub_agent_denied_env(
+        {
+            k: v
+            for k, v in os.environ.items()
+            if not (is_secret_env_key(k) or is_credential_env_key(k))
+        }
+    )
+
+
+def _expand_env_placeholders(
+    value: str,
+    *,
+    notes: _RewritePassNotes | None = None,
+    source: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve ``${VAR}`` / ``${env:VAR}`` from *source* (default: the filtered
+    :func:`_placeholder_source_env` view), leaving an unresolved reference as a
+    literal ``${VAR}`` (kiro-cli parity, including dropping the ``env:`` prefix
+    on a miss). A reference to a credential-filtered name is the same miss,
+    logged so the operator can tell a refusal from a typo.
+
+    Encountering any reference marks the pass uncacheable via *notes* (see
+    ``_RewritePassNotes.env_placeholder_seen``) — the environment is not a
+    fingerprinted input, so a resolved value must never be served from cache.
+    """
+    env_view = _placeholder_source_env() if source is None else source
+
+    def _sub(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        if notes is not None:
+            notes.env_placeholder_seen = True
+        resolved = env_view.get(name)
+        if resolved is None:
+            if name in os.environ:
+                logger.warning(
+                    "declared env placeholder ${%s} names a credential-filtered "
+                    "variable; left as a literal",
+                    name,
+                )
+            return f"${{{name}}}"
+        return resolved
+
+    return _ENV_VAR_PLACEHOLDER.sub(_sub, value)
+
+
+def _expand_env_map(
+    env_pairs: dict[str, Any], *, notes: _RewritePassNotes | None = None
+) -> dict[str, Any]:
+    """Expand placeholders in string values only; non-str values pass through
+    (both readers ``str()``-coerce them identically, keeping the PoolKey hash
+    coherent). The source view is built once for the whole map."""
+    source = _placeholder_source_env()
+    return {
+        k: (
+            _expand_env_placeholders(v, notes=notes, source=source)
+            if isinstance(v, str)
+            else v
+        )
+        for k, v in env_pairs.items()
+    }
 
 
 def _build_stub_entry(
@@ -239,6 +358,7 @@ def _build_stub_entry(
     approval_mode: str,
     sidecars_written: set[str] | None = None,
     poolable: bool = False,
+    identity_keys: Collection[str] = (),
     notes: _RewritePassNotes | None = None,
 ) -> dict[str, Any]:
     """Return the rewritten ``mcpServers[name]`` entry.
@@ -274,6 +394,17 @@ def _build_stub_entry(
     ]
     if poolable:
         stub_args.append("--poolable")
+    # Names only, never values — so this is safe on argv, which is
+    # world-readable via /proc/<pid>/cmdline (the reason the env itself goes to a
+    # 0600 sidecar instead). Only the names the ENTRY actually declares are
+    # passed: the flag exists solely so the stub reproduces gatewayd's hash for
+    # THIS server, and a fleet-wide list on every stub's argv would be noise that
+    # also leaks which variables other servers care about. Sorted for a stable
+    # argv, which keeps the overlay byte-identical across passes and so keeps the
+    # rewrite fingerprint's skip path effective.
+    entry_identity_keys = sorted(k for k in frozenset(identity_keys) if k in env_pairs)
+    if entry_identity_keys:
+        stub_args.extend(["--pool-identity-env", _TARGET_ARGS_SEP.join(entry_identity_keys)])
     if env_pairs:
         # JSON-encode env so values containing ',' or '=' round-trip
         # intact. A prior CSV serialisation ``K=V,K2=V2`` silently
@@ -329,7 +460,13 @@ def _build_stub_entry(
                     # double-close (and does close it when an earlier step
                     # raised).
                     fd_owned = False
-                    fh.write(json.dumps(env_pairs, sort_keys=True))
+                    # Resolve placeholders here (see _expand_env_map): the backend
+                    # is spawned from this sidecar, not by kiro-cli.
+                    fh.write(
+                        json.dumps(
+                            _expand_env_map(env_pairs, notes=notes), sort_keys=True
+                        )
+                    )
                 os.replace(tmp, env_file)
                 wrote_sidecar = True
             finally:
@@ -423,6 +560,7 @@ def _rewrite_single_spec(
     stub_servers: frozenset[str],
     pooling_enabled: bool = True,
     forward_env: bool = False,
+    identity_keys: Collection[str] = (),
     inject_servers: dict[str, Any] | None = None,
     target_env: dict[str, str] | None = None,
     sidecars_written: set[str] | None = None,
@@ -528,7 +666,11 @@ def _rewrite_single_spec(
             )
             new_servers[name] = {k: v for k, v in entry.items() if k != "poolable"}
             continue
-        withheld = _withheld_env_count(entry_env, forward_env) if pooling_enabled else 0
+        withheld = (
+            _withheld_env_count(entry_env, forward_env, identity_keys)
+            if pooling_enabled
+            else 0
+        )
         if withheld:
             # Fix for issue #3495 cause B: a pooled backend is spawned WITHOUT
             # part (or, with forwarding off, all) of the env this spec
@@ -569,6 +711,7 @@ def _rewrite_single_spec(
             # Sharing is global over the stub set: being stubbed is the only
             # per-server decision, so there is nothing further to consult here.
             poolable=pooling_enabled,
+            identity_keys=identity_keys,
             notes=notes,
         )
         wrapped += 1
@@ -670,6 +813,7 @@ def _rewrite_single_spec(
             approval_mode=approval_mode,
             sidecars_written=sidecars_written,
             poolable=pooling_enabled,
+            identity_keys=identity_keys,
             notes=notes,
         )
         wrapped += 1
@@ -686,6 +830,7 @@ def _injectable_settings_servers(
     *,
     pooling_enabled: bool = True,
     forward_env: bool = False,
+    identity_keys: Collection[str] = (),
     notes: _RewritePassNotes | None = None,
 ) -> dict[str, Any]:
     """Return ``{raw_name: raw_entry}`` of stdio servers in the global
@@ -751,7 +896,11 @@ def _injectable_settings_servers(
                 entry.get("command", ""), name,
             )
             continue
-        withheld = _withheld_env_count(entry_env, forward_env) if pooling_enabled else 0
+        withheld = (
+            _withheld_env_count(entry_env, forward_env, identity_keys)
+            if pooling_enabled
+            else 0
+        )
         if withheld:
             # Issue #3495 cause B, settings edition: pooling would withhold
             # part or all of this server's declared env and crash-loop it.
@@ -802,6 +951,7 @@ def _rewrite_inputs_fingerprint(
     stub_set: frozenset[str],
     pooling_enabled: bool,
     forward_env: bool,
+    identity_keys: Collection[str],
 ) -> dict[str, Any]:
     """Return a JSON-serializable snapshot of every input that can change
     :func:`rewrite_agents`'s output.
@@ -816,9 +966,11 @@ def _rewrite_inputs_fingerprint(
       so a moved/upgraded interpreter must regenerate the overlays.
     * ``path_env`` / ``pathext`` / ``path_augment`` — feed the
       ``shutil.which`` resolution of bare command names (``path_augment`` is
-      :func:`kiro_crew.env.spec_env_path` over an empty spec PATH — the
+      :func:`kiro_crew.env.mcp_search_path` over an empty spec PATH — the
       augmentation-and-dedup half of the search, which depends on ambient
-      state like ``MISE_DATA_DIR`` that ``path_env`` cannot see). The
+      state like ``MISE_DATA_DIR`` and on ``mcp.extra_path_dirs`` that
+      ``path_env`` cannot see, so editing that setting invalidates the
+      cache instead of reusing a stale resolution). The
       other half of which()'s input — the CONTENTS of the searched
       directories — is not stat-able here; it is covered by the stored
       per-probe results, which the cache-hit path re-runs and compares (see
@@ -826,6 +978,12 @@ def _rewrite_inputs_fingerprint(
     * ``forward_declared_env`` — decides whether an env-declaring server is
       pooled at all (issue #3495 cause B pre-classification), so flipping the
       config flag must regenerate the overlays.
+    * ``pool_identity_env`` — decides which secret-prefixed keys are hashed into
+      the PoolKey and passed on stub argv, so editing the list must regenerate
+      the overlays. Without this, naming a key would take effect only once some
+      unrelated input changed, and until then the stub would keep hashing the old
+      set while gatewayd hashed the new one — the coherence gate would refuse to
+      forward, so the feature would silently not work.
     * ``schema`` / ``package`` — invalidate on rewriter logic changes.
     """
     sources: dict[str, list[Any] | None] = {
@@ -837,8 +995,9 @@ def _rewrite_inputs_fingerprint(
         "python": sys.executable,
         "path_env": os.environ.get("PATH", ""),
         "pathext": os.environ.get("PATHEXT", ""),
-        "path_augment": spec_env_path(""),
+        "path_augment": mcp_search_path(""),
         "forward_declared_env": bool(forward_env),
+        "pool_identity_env": sorted(frozenset(identity_keys)),
         "source_dir": str(source_dir),
         "overlay_dir": str(overlay_dir),
         "socket_path": str(socket_path),
@@ -1207,6 +1366,10 @@ def rewrite_agents(
     # consumer in this pass must see the same value, and the fingerprint must
     # record it (a flip regenerates the overlays).
     forward_env = forward_declared_env_enabled()
+    # Same contract for the identity set: ONE resolved value per pass, recorded in
+    # the fingerprint, handed to every consumer in it. gatewayd re-reads the same
+    # helper at spawn rather than taking the stub's word for it.
+    identity_keys = pool_identity_env_keys()
     current_inputs = _rewrite_inputs_fingerprint(
         source_dir=source_dir,
         settings_path=kiro_settings_json,
@@ -1218,6 +1381,7 @@ def rewrite_agents(
         stub_set=stub_set,
         pooling_enabled=pooling_enabled,
         forward_env=forward_env,
+        identity_keys=identity_keys,
     )
     stored = _load_fingerprint(fingerprint_path)
     if stored is not None and stored.get("inputs") == current_inputs:
@@ -1251,6 +1415,7 @@ def rewrite_agents(
     # both overlays. Non-poolable / HTTP settings servers stay raw in settings.
     settings_src_spec: dict[str, Any] | None = None
     settings_poolable: dict[str, Any] = {}
+    settings_read_transient = False
     if kiro_settings_json.is_file():
         try:
             loaded = json.loads(kiro_settings_json.read_text())
@@ -1260,17 +1425,30 @@ def rewrite_agents(
                     loaded, stub_set,
                     pooling_enabled=pooling_enabled,
                     forward_env=forward_env,
+                    identity_keys=identity_keys,
                     notes=notes,
                 )
         except OSError as exc:
             # Transient read failure: same reasoning as the per-agent site —
             # do not cache a pass that treated an existing settings file as
-            # absent (it would also have pruned the settings overlay).
+            # absent, and keep the previous settings overlay (#5328).
             notes.source_read_failed = True
+            settings_read_transient = True
             logger.warning("failed to read global mcp.json: %s", exc)
         except json.JSONDecodeError as exc:
             # Content problem — cacheable; a fix changes the stat signature.
             logger.warning("failed to read global mcp.json: %s", exc)
+
+    # Names of agents whose overlay could not be refreshed THIS PASS for a
+    # TRANSIENT reason (source read failure, overlay write failure). The prune
+    # keep-set is ``written | transient_keep``: a transient victim keeps its
+    # previous, healthy overlay (stale-but-working beats no overlay at all,
+    # #5328), while a deterministic skip (bad JSON, non-dict spec) prunes
+    # exactly as a deleted source does — those passes are cacheable, and the
+    # cached path's prune would sweep a kept-stale overlay one boot later
+    # anyway, so keeping it here would make two boots over identical inputs
+    # behave differently.
+    transient_keep: set[str] = set()
 
     for path in sorted(source_dir.glob("*.json")):
         try:
@@ -1279,9 +1457,16 @@ def rewrite_agents(
             # Transient: the file stat'ed fine for the fingerprint but could
             # not be read. Readability can return without size/mtime changing,
             # so caching this incomplete pass would serve overlays missing
-            # this agent forever. Mark the pass uncacheable.
+            # this agent forever. Mark the pass uncacheable, and keep the
+            # agent's previous overlay (#5328).
             notes.source_read_failed = True
-            logger.warning("skipping agent %s: %s", path.name, exc)
+            transient_keep.add(path.name)
+            logger.warning(
+                "skipping agent %s: %s (previous overlay, if any, stays in "
+                "effect until a later pass succeeds)",
+                path.name,
+                exc,
+            )
             continue
         except json.JSONDecodeError as exc:
             # Deterministic: the CONTENT is bad, and fixing it changes the
@@ -1311,6 +1496,7 @@ def rewrite_agents(
             stub_servers=stub_set,
             pooling_enabled=pooling_enabled,
             forward_env=forward_env,
+            identity_keys=identity_keys,
             inject_servers=settings_poolable,
             target_env=target_env,
             sidecars_written=written_sidecars,
@@ -1319,35 +1505,84 @@ def rewrite_agents(
         _collect_target_env(new_spec.get("mcpServers", {}), target_env)
         target = overlay_dir / path.name
         try:
-            # Atomic + 0600: temp-file + os.replace (via atomic_write) so a
+            # Atomic + owner-only: temp-file + os.replace (via atomic_write) so a
             # live session reading this overlay through the bind-mount never
             # sees a truncated spec (which would make the agent's MCP servers
-            # vanish mid-run), and the passed-through non-poolable / HTTP-SSE
-            # env blocks (tokens / API keys) are never world-readable. Matches
-            # the env sidecar and settings overlay.
-            atomic_write(target, json.dumps(new_spec, indent=2) + "\n", mode=0o600)
-            if not platform_compat.IS_POSIX:
-                platform_compat.restrict_to_owner(target)
+            # vanish mid-run). ``restrict_to_owner=True`` locks the temp file
+            # down BEFORE the passed-through non-poolable / HTTP-SSE env blocks
+            # (tokens / API keys) reach it — POSIX mode bits are a no-op against
+            # NTFS ACLs, and the previous Windows-only post-rename lockdown left
+            # them readable under the inherited DACL for the write window
+            # (issue #5285). It implies 0o600 on POSIX. A lockdown failure now
+            # happens before the rename, so the OSError handler below skips the
+            # overlay without ever publishing an unprotected copy. Matches the
+            # env sidecar and settings overlay.
+            atomic_write(target, json.dumps(new_spec, indent=2) + "\n", restrict_to_owner=True)
         except OSError as exc:
-            logger.warning("failed to write overlay %s: %s", target, exc)
+            logger.warning(
+                "failed to write overlay %s: %s (previous overlay, if any, "
+                "stays in effect until a later pass succeeds)",
+                target,
+                exc,
+            )
             overlay_write_failed = True
+            transient_keep.add(path.name)
             continue
         written.add(path.name)
         if wrapped:
             results[path.name] = wrapped
 
-    # Prune stale overlay entries (user deleted or renamed an agent).
+    # Prune stale overlay entries (user deleted or renamed an agent). The
+    # keep-set answers "does this overlay's source still exist and did we
+    # either refresh it or fail TRANSIENTLY?" — never bare write success,
+    # which conflated a transient failure with a deleted source and unlinked
+    # the previous, healthy overlay (#5328). Deterministic skips (bad JSON,
+    # non-dict) stay OUT of the keep-set: their pass is cacheable, and the
+    # cached-path prune keys on the stored outputs, so keeping them here
+    # would let two boots over identical inputs disagree.
     for stale in overlay_dir.glob("*.json"):
-        if stale.name not in written:
+        if stale.name not in written and stale.name not in transient_keep:
             try:
                 stale.unlink()
             except OSError:
                 pass
 
+    # Every overlay that SURVIVES the prune must have its target mappings
+    # published, or a kept overlay's stub resolves through the bare
+    # server-name fallback — which, when two agents declare the same server
+    # name with different args, is another agent's command. Harvest the kept
+    # overlays' wrapped entries into ``target_env`` exactly as the cached
+    # path does (``_cached_rewrite_result`` reconstructs from overlay files),
+    # via ``setdefault`` inside ``_collect_target_env`` so entries from the
+    # freshly-rewritten specs always win and the kept overlay only fills the
+    # hash-keyed slots nothing else claimed. Unreadable/corrupt kept overlays
+    # are skipped — the stub then degrades to the same fallback as before.
+    for name in sorted(transient_keep):
+        kept = overlay_dir / name
+        try:
+            kept_spec = json.loads(kept.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(kept_spec, dict):
+            servers = kept_spec.get("mcpServers", {})
+            if isinstance(servers, dict):
+                _collect_target_env(servers, target_env)
+
     # Prune stale env sidecars (server removed / renamed / flipped
     # non-poolable) so old credential files don't accumulate on disk.
+    # ``written_sidecars`` is enumeration-keyed, not write-success-keyed:
+    # ``_build_stub_entry`` adds the sidecar name BEFORE attempting the write,
+    # so a transient sidecar write failure keeps the previous sidecar on disk
+    # (and ``notes.sidecar_write_failed`` makes the pass uncacheable). But on
+    # any pass that KEPT a previous overlay (source read failure — the
+    # victim's sidecar names are unknowable; overlay write failure — the kept
+    # overlay may reference sidecars of servers the new spec renamed away),
+    # the kept overlay still points ``--env-file`` at old names, and pruning
+    # them would spawn its backends credential-less for the rest of this
+    # gateway's lifetime. Skip the sidecar prune on such a pass: it is
+    # already uncacheable, so the next boot re-enumerates and sweeps.
     env_dir = env_sidecar_dir_for_stubs(stubs_dir)
-    if env_dir.is_dir():
+    if env_dir.is_dir() and not (notes.source_read_failed or overlay_write_failed):
         for stale in env_dir.glob("*.json"):
             if stale.name not in written_sidecars:
                 try:
@@ -1391,19 +1626,20 @@ def rewrite_agents(
                 # Malformed source (mcpServers not a dict): normalize rather
                 # than propagate the broken shape into a freshly-written overlay.
                 new_settings["mcpServers"] = {}
-            # Atomic + 0600: temp-file + os.replace (via atomic_write) so a
+            # Atomic + owner-only: temp-file + os.replace (via atomic_write) so a
             # live session reading this overlay through the bind-mount never
             # sees a truncated mcp.json (which would make its MCP servers
-            # vanish mid-run), and the passed-through non-poolable / HTTP-SSE
-            # env blocks (tokens / API keys) are never world-readable. Matches
-            # the env sidecar and per-agent overlay.
+            # vanish mid-run). ``restrict_to_owner=True`` locks the temp file
+            # down BEFORE the passed-through non-poolable / HTTP-SSE env blocks
+            # (tokens / API keys) reach it — the previous Windows-only
+            # post-rename lockdown left them readable under the inherited DACL
+            # for the write window (issue #5285). It implies 0o600 on POSIX.
+            # Matches the env sidecar and per-agent overlay.
             atomic_write(
                 settings_overlay_path,
                 json.dumps(new_settings, indent=2) + "\n",
-                mode=0o600,
+                restrict_to_owner=True,
             )
-            if not platform_compat.IS_POSIX:
-                platform_compat.restrict_to_owner(settings_overlay_path)
             logger.info(
                 "mcp-gateway rewriter: global mcp.json overlay written, "
                 "%d poolable server(s) relocated to per-agent overlays (overlay=%s)",
@@ -1414,10 +1650,26 @@ def rewrite_agents(
             settings_overlay_path = None
             overlay_write_failed = True
     else:
-        # Source settings/mcp.json absent (deleted between runs): prune any
-        # previously-written settings overlay, mirroring the per-agent
-        # stale-prune above so the overlay tree doesn't accumulate cruft.
-        if settings_overlay_file.is_file():
+        # ``settings_src_spec`` is None: the source is absent, was unreadable
+        # this pass, or carried bad content. Only CONFIRMED absence and
+        # deterministic bad content prune the previous overlay (matching the
+        # per-agent rule and the cached path's keying); a transient read
+        # failure keeps it (#5328). Classify with an explicit ``stat()``
+        # rather than ``is_file()``, which folds a stat fault (ACL hiccup,
+        # transient I/O error) into "absent" and would delete a healthy
+        # overlay — treat a stat fault as transient: keep, and mark the pass
+        # uncacheable so the next boot retries.
+        prune_settings = False
+        if not settings_read_transient:
+            try:
+                kiro_settings_json.stat()
+            except FileNotFoundError:
+                prune_settings = True  # confirmed absent: deleted between runs
+            except OSError:
+                notes.source_read_failed = True  # unknown: keep and retry
+            else:
+                prune_settings = True  # present but bad content: deterministic
+        if prune_settings and settings_overlay_file.is_file():
             try:
                 settings_overlay_file.unlink()
             except OSError:
@@ -1445,6 +1697,14 @@ def rewrite_agents(
         uncacheable = "env sidecar write failure(s)"
     elif overlay_write_failed:
         uncacheable = "overlay write failure(s)"
+    elif notes.env_placeholder_seen:
+        # Not a fault: a declared env carried a ${VAR}/${env:VAR} reference, so
+        # a sidecar's contents depend on the ENVIRONMENT as well as the spec
+        # files. The environment is not a fingerprinted input, so caching this
+        # pass would serve a sidecar expanded against a since-changed variable
+        # (a rotated credential silently kept flowing the old value). Re-resolve
+        # on every boot instead; specs with no placeholder still cache normally.
+        uncacheable = "declared env contains ${VAR} placeholder(s)"
     if uncacheable:
         logger.debug("rewriter: %s; not caching this rewrite", uncacheable)
         # Remove any fingerprint from an earlier successful run: it could
@@ -1644,12 +1904,13 @@ def env_sidecar_name(agent_name: str, server_name: str) -> str:
 
 
 def forward_declared_env_enabled() -> bool:
-    """Return ``mcp_gateway.forward_declared_env`` (default ``False``).
+    """Return ``mcp_gateway.forward_declared_env`` (default ``True``).
 
     Function-local config import: ``config.loader`` imports THIS module at its
     own module top level, so a top-level import here would be circular. Mirrors
     ``backend._mcp_apps_enabled``. Fails CLOSED — an unreadable config means the
-    declared env is not forwarded.
+    declared env is not forwarded, which also leaves the server unwrapped rather
+    than pooling it without the env it declares.
     """
     try:
         # circular import: config.loader imports THIS module at its own top level
@@ -1661,6 +1922,55 @@ def forward_declared_env_enabled() -> bool:
     except Exception:
         logger.debug("rewriter: config unreadable; declared-env forwarding off", exc_info=True)
         return False
+
+
+def pool_identity_env_keys() -> frozenset[str]:
+    """Return ``mcp_gateway.pool_identity_env`` as an effective key set.
+
+    The AUTHORITATIVE source for which env variables an operator has declared
+    pool-identity-relevant. Every consumer that must agree on this set reads it
+    HERE: the rewriter (to hash and to count withheld keys) and ``gatewayd`` (to
+    re-hash the sidecar and to decide what to forward). The stub is handed the
+    resolved set on its command line instead of reading config itself, and its
+    copy carries no authority — ``hash_effective_env`` explains how the coherence
+    gate turns a disagreeing stub into a refusal to forward.
+
+    Names matched by :func:`manager.is_credential_env_key` are DROPPED. That
+    scrub is a separate and broader guard — it keeps one session's credentials
+    out of another session's backend in the per-session topology too — and this
+    setting is not a way to lift it. Filtering here rather than at each consumer
+    is what stops a half-state where a name is folded into the hash but still
+    refused by the forwarder, which would leave the entry unpoolable anyway while
+    silently re-partitioning it on every rotation.
+
+    Fails CLOSED to the empty set: an unreadable config means nothing is opted
+    in, which is exactly today's behaviour.
+    """
+    try:
+        # circular import: config.loader imports THIS module at its own top level
+        # (for default_overlay_dir / default_socket_path), so a module-scope
+        # import here would be a cycle. Mirrors forward_declared_env_enabled.
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        declared = KiroCrewConfig.load().mcp_gateway.pool_identity_env or []
+    except Exception:
+        logger.debug("rewriter: config unreadable; no pool-identity env keys", exc_info=True)
+        return frozenset()
+    kept: set[str] = set()
+    for name in declared:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip()
+        if is_credential_env_key(name):
+            logger.warning(
+                "mcp_gateway.pool_identity_env names %r, which the daemon's own "
+                "credential scrub removes; ignoring it (that scrub is not lifted "
+                "by this setting)",
+                name,
+            )
+            continue
+        kept.add(name)
+    return frozenset(kept)
 
 
 def runtime_dir() -> Path:

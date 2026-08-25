@@ -9,6 +9,7 @@ import { openActivityPanel, sseSubagentQueued } from '../store/chatSlice'
 import SegmentedControl from '../components/SegmentedControl'
 import { ApiError } from '../api/client'
 import { safeSetItem } from '../utils/safeStorage'
+import { FEATURE_REQUEST_PROMPT_FALLBACK } from '../prompts/featureRequest'
 
 /** A failure `POST /api/chat/slots/{slot}/agent` really can return today. */
 const REAL_FAILURE = 'invalid agent name'
@@ -97,6 +98,9 @@ vi.mock('../api/client', () => ({
       env_var: 'KIROCREW_TELEMETRY_DISABLED',
     }),
     patchConfig: vi.fn().mockResolvedValue({}),
+    createChatSlot: vi.fn().mockResolvedValue({ key: 'feature-slot', title: 'feature-slot', messages: 0, running: false }),
+    chatSlotContext: vi.fn().mockResolvedValue({ ok: true }),
+    sendChat: vi.fn().mockResolvedValue({ ok: true }),
   },
   // Default to "no auth banner showing" so existing App tests render the
   // normal connected/offline pill paths. The dedicated auth-banner
@@ -138,6 +142,25 @@ describe('App routing', () => {
       color: '',
       onboarded: false,
       import_onboarded: false,
+    } as never)
+    // Keep the import chapter open after its scan. An empty scan deliberately
+    // auto-completes the chapter, so asserting on the transient dialog races
+    // that completion under a loaded test shard.
+    vi.mocked(api.onboardingImportScan).mockResolvedValueOnce({
+      sources: [{
+        id: 'codex',
+        name: 'Codex',
+        detected: true,
+        detail: '~/.codex',
+        categories: [{
+          id: 'instructions',
+          label: 'Instructions',
+          count: 1,
+          description: 'Agent instructions',
+        }],
+      }],
+      skipped: [],
+      merge_only: true,
     } as never)
 
     renderWithProviders(<App />, { route: '/chat' })
@@ -628,6 +651,45 @@ describe('App routing', () => {
     }
   })
 
+  it('invalidates the registry query on mc:apps-changed so install state refreshes', async () => {
+    // The Explore shelf renders Get vs Installed from the server-computed
+    // `installed` flag on the `['registry']` rows, cached with a multi-minute
+    // staleTime. Install/uninstall surfaces announce themselves via
+    // mc:apps-changed; the handler must drop that cache or a just-installed
+    // registry app keeps showing a "Get" button until the cache expires.
+    const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+    queryClient.setQueryData(['registry'], { apps: [] })
+    expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(false)
+    act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+    await waitFor(() => {
+      expect(queryClient.getQueryState(['registry'])?.isInvalidated).toBe(true)
+    })
+  })
+
+  it('marks the apps cache stale on mc:apps-changed even when the refetch fails', async () => {
+    // Dispatch sites do not invalidate ['apps'] themselves; this listener
+    // owns that cache. refreshAppNav publishes fresh data only on fetch
+    // SUCCESS, so the handler must invalidate the cache up front — otherwise
+    // a retry-exhausted refetch chain would leave stale ['apps'] rows marked
+    // fresh.
+    const { api } = await import('../api/client')
+    const listApps = api.listApps as ReturnType<typeof vi.fn>
+    listApps.mockReset()
+    listApps.mockRejectedValue(new Error('gateway down'))
+    try {
+      const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
+      queryClient.setQueryData(['apps'], [])
+      expect(queryClient.getQueryState(['apps'])?.isInvalidated).toBe(false)
+      act(() => { window.dispatchEvent(new Event('mc:apps-changed')) })
+      await waitFor(() => {
+        expect(queryClient.getQueryState(['apps'])?.isInvalidated).toBe(true)
+      })
+    } finally {
+      listApps.mockReset()
+      listApps.mockResolvedValue([])
+    }
+  })
+
   it('shows a portaled hover label for a collapsed (icon-only) nav item', async () => {
     // Covers useNavTip: in collapsed mode nav rows hide their text label and
     // instead show it via a portal to <body> on hover (so the rail's vertical
@@ -665,9 +727,15 @@ describe('App routing', () => {
   it('keeps the sub-agent bot and count in the expanded Sessions rail item', async () => {
     localStorage.removeItem('mc-nav')
     const store = createTestStore()
-    store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 }))
 
     renderWithProviders(<App />, { route: '/chat', store })
+
+    // Seed AFTER the mount fetch settles. `fetchSlots.fulfilled` is an
+    // authoritative slot-list writer, so queued-subagent state for a slot the
+    // fetched list does not name is residue and is evicted — seeding before the
+    // fetch would have this test depend on that eviction not happening.
+    expect(await screen.findByLabelText('Sessions')).toBeInTheDocument()
+    act(() => { store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 })) })
 
     expect(await screen.findByLabelText('2 subagents in flight')).toBeInTheDocument()
   })
@@ -756,22 +824,33 @@ describe('App routing', () => {
   it('renders the search trigger in the header centre track, not as a positioned overlay', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const trigger = screen.getByRole('button', { name: 'Search sessions, files, and commands' })
-    // The trigger is a flow item now: it fills its grid track (`w-full`) and
-    // carries no positioning of its own. The previous implementation centred it
-    // on `50vw` with a JS-measured inline width, which is what forced it to
-    // reserve `max(left, right)` on BOTH sides and drop itself once that
-    // mirrored gutter fell under a floor.
-    expect(trigger).toHaveClass('w-full')
+    // The trigger is a flow item now: it fills its grid track and carries no
+    // positioning of its own. The previous implementation centred it on `50vw`
+    // with a JS-measured inline width, which is what forced it to reserve
+    // `max(left, right)` on BOTH sides and drop itself once that mirrored gutter
+    // fell under a floor.
+    //
+    // It shares the centre CELL with the focus-mode toggle, so it fills that
+    // cell (`flex-1`) rather than the track directly — the cell is what fills
+    // the track. Both halves of the original assertion still hold: nothing here
+    // is positioned, and the header keeps exactly three in-flow children.
+    expect(trigger).toHaveClass('flex-1')
     expect(trigger).not.toHaveClass('absolute')
     expect(trigger.style.left).toBe('')
     expect(trigger.style.width).toBe('')
-    // Header children, in order: left group · trigger · actions group. The
+    // Header children, in order: left group · centre cell · actions group. The
     // three-track grid depends on that being exactly three in-flow children.
-    const header = trigger.parentElement!
+    const centre = trigger.parentElement!
+    const header = centre.parentElement!
     const flow = [...header.children].filter(el => !el.className.includes('absolute'))
     expect(flow[0]).toHaveClass('tb-left')
-    expect(flow[1]).toBe(trigger)
+    expect(flow[1]).toBe(centre)
     expect(flow[2]).toHaveClass('tb-right')
+    // The centre cell holds the trigger and the focus-mode toggle, and nothing
+    // else: a third control there is what website/AUTOSDE.yaml's
+    // max-two-buttons-per-row rule forbids.
+    expect([...centre.children]).toHaveLength(2)
+    expect(centre.children[1]).toBe(screen.getByTestId('focus-mode-toggle'))
   })
 
   it('sizes the top-bar search from the window alone, with equal side tracks', () => {
@@ -958,42 +1037,42 @@ describe('App routing', () => {
     localStorage.removeItem('mc-nav')
   })
 
-  it('lets the brand toggle expand the rail while preview focus mode is active', () => {
+  it('lets the brand toggle expand the rail while preview expand mode is active', () => {
     localStorage.removeItem('mc-nav')
     renderWithProviders(<App />, { route: '/chat' })
     const nav = screen.getByRole('navigation', { name: 'Main navigation' })
 
     // Entering the Web Preview's expand mode collapses the rail.
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: true } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: true } }))
     })
     expect(within(nav).getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument()
 
-    // The logo keeps its standard behavior inside focus mode: it expands.
+    // The logo keeps its standard behavior inside expand mode: it expands.
     fireEvent.click(within(nav).getByRole('button', { name: 'Expand sidebar' }))
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
 
-    // Leaving focus mode must not undo that explicit choice.
+    // Leaving expand mode must not undo that explicit choice.
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: false } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: false } }))
     })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
     localStorage.removeItem('mc-nav')
   })
 
-  it('restores the pre-focus rail state when preview focus mode ends untouched', () => {
+  it('restores the pre-expand rail state when preview expand mode ends untouched', () => {
     localStorage.removeItem('mc-nav') // start expanded
     renderWithProviders(<App />, { route: '/chat' })
     const nav = screen.getByRole('navigation', { name: 'Main navigation' })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
 
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: true } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: true } }))
     })
     expect(within(nav).getByRole('button', { name: 'Expand sidebar' })).toBeInTheDocument()
 
     act(() => {
-      window.dispatchEvent(new CustomEvent('kirocrew-preview-focus', { detail: { focused: false } }))
+      window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded: false } }))
     })
     expect(within(nav).getByRole('button', { name: 'Collapse sidebar' })).toBeInTheDocument()
     // The auto-collapse is transient: it never writes the persisted preference.
@@ -1029,6 +1108,36 @@ describe('App routing', () => {
     expect(screen.getByRole('button', { name: 'Request a Feature' })).toBeInTheDocument()
     expect(localStorage.getItem('mc-nav')).toBe('0')
     localStorage.removeItem('mc-nav')
+  })
+
+  it('keeps feature-request instructions hidden from the persisted user message', async () => {
+    const { api } = await import('../api/client')
+    vi.mocked(api.createChatSlot).mockClear()
+    vi.mocked(api.chatSlotContext).mockClear()
+    vi.mocked(api.sendChat).mockClear()
+    renderWithProviders(<App />, { route: '/chat' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Request a Feature' }))
+
+    await waitFor(() => {
+      expect(api.chatSlotContext).toHaveBeenCalledWith(
+        'feature-slot',
+        FEATURE_REQUEST_PROMPT_FALLBACK,
+        // maxAge bounds the hidden seed's lifetime so a failed visible send
+        // cannot leave it queued for a later, unrelated message.
+        { source: 'feature-request', maxAge: 60 },
+      )
+      expect(api.sendChat).toHaveBeenCalledWith(
+        'I’d like to request a feature!',
+        'feature-slot',
+        expect.any(String),
+      )
+    })
+    expect(api.sendChat).not.toHaveBeenCalledWith(
+      FEATURE_REQUEST_PROMPT_FALLBACK,
+      expect.anything(),
+      expect.anything(),
+    )
   })
 
   it('renders connection status', () => {
@@ -1087,13 +1196,19 @@ describe('mobile nav drawer insets', () => {
   })
 
   it('spans the viewport height so both margins resolve', () => {
-    // `top-0 bottom-0` with a margin on each end resolves the height to
+    // An anchor on BOTH ends plus a margin on each resolves the height to
     // viewport-16px. Dropping either anchor would make the margins inert (auto
     // height) and re-open the flush-top defect from the other direction.
+    //
+    // The safe-area variants satisfy this the same way the plain ones do: they
+    // set top/bottom to env(safe-area-inset-*), a definite length that is 0 on
+    // hardware without a notch. So accept either form per end, but keep
+    // requiring that BOTH ends are anchored -- that is the actual invariant,
+    // and the literal class name is not.
     const classes = mobileDrawerClasses()
     expect(classes).toContain('fixed')
-    expect(classes).toContain('top-0')
-    expect(classes).toContain('bottom-0')
+    expect(classes.some(c => c === 'top-0' || c === 'top-safe'), `expected a top anchor, got: ${classes.join(' ')}`).toBe(true)
+    expect(classes.some(c => c === 'bottom-0' || c === 'bottom-safe'), `expected a bottom anchor, got: ${classes.join(' ')}`).toBe(true)
   })
 })
 
@@ -1122,6 +1237,55 @@ describe('TopbarMetrics widget', () => {
     localStorage.setItem('mc-topbar-metrics', '1')
     renderWithProviders(<App />, { route: '/chat' })
     expect(await screen.findByText(/MEM —/)).toBeInTheDocument()
+    expect(screen.getByText(/DSK —/)).toBeInTheDocument()
+    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
+    localStorage.removeItem('mc-topbar-metrics')
+  })
+
+  it('renders "MEM —" instead of crashing when mem_used_gb is missing but mem_total_gb is present', async () => {
+    const { api } = await import('../api/client')
+    const sysMock = vi.mocked(api.system)
+    // The shape that crashed the root app-shell boundary with
+    // "Cannot read properties of undefined (reading 'toFixed')":
+    // `_collect_system_metrics` seeds the frame from the CACHED static system
+    // info (which carries mem_total_gb) and then computes mem_used_gb/
+    // mem_free_gb under `try/except: pass`, so a failed memory probe yields a
+    // total with no used. A `memTotal > 0` gate admits that frame and then
+    // formats `undefined.toFixed(1)`.
+    sysMock.mockResolvedValueOnce({ mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
+    localStorage.setItem('mc-topbar-metrics', '1')
+    renderWithProviders(<App />, { route: '/chat' })
+    expect(await screen.findByText(/MEM —/)).toBeInTheDocument()
+    // The rest of the same frame still renders — one absent probe must not
+    // blank the whole capsule, let alone unmount the app.
+    expect(screen.getByText(/CPU 25%/)).toBeInTheDocument()
+    expect(screen.getByText(/DSK 40%/)).toBeInTheDocument()
+    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
+    localStorage.removeItem('mc-topbar-metrics')
+  })
+
+  it('renders "DSK —" instead of NaN when disk_free_gb is missing but disk_total_gb is present', async () => {
+    const { api } = await import('../api/client')
+    const sysMock = vi.mocked(api.system)
+    sysMock.mockResolvedValueOnce({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0 } as never)
+    localStorage.setItem('mc-topbar-metrics', '1')
+    renderWithProviders(<App />, { route: '/chat' })
+    expect(await screen.findByText(/DSK —/)).toBeInTheDocument()
+    expect(screen.getByText(/MEM 25%/)).toBeInTheDocument()
+    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
+    localStorage.removeItem('mc-topbar-metrics')
+  })
+
+  it('renders every readout as "—" instead of crashing when the frame carries non-finite numbers', async () => {
+    const { api } = await import('../api/client')
+    const sysMock = vi.mocked(api.system)
+    // NaN/Infinity reach the frame when a probe divides by an unmeasured total;
+    // they must take the placeholder path, not render "NaN%".
+    sysMock.mockResolvedValueOnce({ mem_used_gb: NaN, mem_total_gb: 16.0, cpu_pct: NaN, disk_total_gb: Infinity, disk_free_gb: 60.0 } as never)
+    localStorage.setItem('mc-topbar-metrics', '1')
+    renderWithProviders(<App />, { route: '/chat' })
+    expect(await screen.findByText(/CPU —/)).toBeInTheDocument()
+    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
     expect(screen.getByText(/DSK —/)).toBeInTheDocument()
     sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
     localStorage.removeItem('mc-topbar-metrics')
@@ -1161,10 +1325,18 @@ describe('onCycleAgent keyboard shortcut', () => {
     store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew' }] })
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
+    // The switch now rides performSlotSwitch (#5120), so the API call lands a
+    // microtask after the keydown — flush with an async act.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'reviewer')
+    // The pick must land in the store WITHOUT a slots round trip (#5120):
+    // no websocket exists in this harness, so only the optimistic write can
+    // move the row. The mock resolves {} — the requested-name fallback path.
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.agent,
+    ).toBe('reviewer'))
   })
 
   it('does not call api.chatSlotAgent when no active slot', async () => {
@@ -1192,7 +1364,9 @@ describe('onCycleAgent keyboard shortcut', () => {
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
 
-    act(() => {
+    // The switch now rides performSlotSwitch (#5120): flush the microtask
+    // chain so both the API call and the failure notice land.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key, code, altKey: true, shiftKey: true, bubbles: true }))
     })
 
@@ -1258,6 +1432,51 @@ describe('onCycleAgent edge cases', () => {
     })
     expect(api.chatSlotAgent).not.toHaveBeenCalled()
     useAgentsMock.mockReturnValue({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }, { name: 'oracle' }], defaultAgent: 'kirocrew' })
+  })
+})
+
+describe('onCycleReasoningEffort keyboard shortcut (#5120)', () => {
+  it('steps a burst from the in-flight target and writes the adjudicated level', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'max' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+    // Two presses in one synchronous batch: the first pick is still in
+    // flight when the second press computes its base. From 'max' the first
+    // press targets '' (clear the override — a REAL target), so the second
+    // press's base MUST come from pendingSlotSwitchTarget: reading the store
+    // (still 'max', nothing settled) would issue '' twice, and the ''-falsy
+    // accessor would misread the in-flight '' the same way.
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
+    })
+    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(1, 'slot-1', '')
+    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(2, 'slot-1', 'low')
+    // The adjudicated survivor (the newest pick) lands in the store without
+    // a slots round trip — no websocket exists in this harness.
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
+    ).toBe('low'))
+  })
+
+  it('cycles backward on Alt+Shift+C and writes the store', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'low' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', altKey: true, shiftKey: true, bubbles: true }))
+    })
+    // 'low' is index 1; backward reaches '' (provider default).
+    expect(api.chatSlotReasoningEffort).toHaveBeenCalledWith('slot-1', '')
+    await waitFor(() => expect(
+      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
+    ).toBe(''))
   })
 })
 
@@ -1364,7 +1583,9 @@ describe('onCycleApprovalMode and onCyclePrevAgent shortcuts', () => {
     store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'reviewer' }] })
     store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
     renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
+    // Async act: the switch protocol (#5120) chains the wire call on a
+    // microtask, so the mock is invoked a tick after the keydown.
+    await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Z', code: 'KeyZ', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'kirocrew')

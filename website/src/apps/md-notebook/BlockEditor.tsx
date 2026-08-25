@@ -3,8 +3,16 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import Clickable from '../../components/Clickable'
 import { i18nT } from '../../i18n/t'
-import { ACCENT_BG, FONT_BODY } from './constants'
+import {
+  ACCENT_BG,
+  DOC_BODY_LINE_HEIGHT,
+  DOC_BODY_PX,
+  DOC_H1_PX,
+  DOC_HEADING_WEIGHTS,
+  FONT_BODY,
+} from './constants'
 import { carriedMarker, isEmptyListItem, shiftListItem } from './utils'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 export interface BlockEditorProps {
   initial: string
@@ -37,6 +45,7 @@ export function BlockEditor({
   textStyle,
   caret,
 }: BlockEditorProps) {
+  const ime = useImeGuard()
   const [text, setText] = useState(initial)
   const ref = useRef<HTMLTextAreaElement>(null)
   // Set once we hand off to a new block, so the blur that follows unmounting
@@ -90,14 +99,20 @@ export function BlockEditor({
         onDirty?.()
         autoSize()
       }}
-      onBlur={() => {
-        if (!handedOff.current) onCommit(text)
-      }}
+      {...ime.bindComposition<HTMLTextAreaElement>({
+        onBlur: () => {
+          if (!handedOff.current) onCommit(text)
+        },
+      })}
       onKeyDown={e => {
         if (e.key === 'Escape') {
           e.stopPropagation()
           onCancel()
         } else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+          // Claim BEFORE the blur: a committing IME Enter must not commit the
+          // block, and on a textarea the declined key must ALSO be consumed or
+          // the browser inserts a literal newline into the draft (R3).
+          if (!ime.claimEnter(e)) return
           e.currentTarget.blur()
         } else if (e.key === 'Tab') {
           // Tab nests a list item, Shift+Tab lifts it out. On anything that is
@@ -110,7 +125,7 @@ export function BlockEditor({
           rewrite(ta, next.text, next.pos)
         } else if (e.key === 'Enter' && !e.shiftKey && onSplit) {
           // Shift+Enter falls through to the browser: a soft break in this block.
-          e.preventDefault()
+          if (!ime.claimEnter(e)) return
           const ta = e.currentTarget
           const before = text.slice(0, ta.selectionStart)
           const after = text.slice(ta.selectionEnd)
@@ -140,9 +155,9 @@ export function BlockEditor({
         overflow: 'hidden',
         // Typography defaults to body text so an edited paragraph keeps its
         // rendered look; blocks with their own scale override it.
-        fontSize: '13px',
+        fontSize: `${DOC_BODY_PX}px`,
         fontFamily: FONT_BODY,
-        lineHeight: 1.55,
+        lineHeight: DOC_BODY_LINE_HEIGHT,
         ...textStyle,
       }}
     />
@@ -166,6 +181,7 @@ export function InlineTitle({
   onRename: (next: string) => void
   mb?: string
 }) {
+  const ime = useImeGuard()
   const name = (path.split('/').pop() ?? path).replace(/\.md$/i, '')
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(name)
@@ -191,11 +207,13 @@ export function InlineTitle({
     ref.current.select()
   }, [editing, autoSize])
 
-  // Explicit px rather than the em heading ramp: this renders in the chrome
-  // header, which has no 13px reading-column base for em to resolve against.
+  // Absolute px rather than the em heading ramp: this renders in the chrome
+  // header, which sets no reading-column font-size for em to resolve against.
+  // The VALUE is derived from that ramp (`DOC_H1_PX`), so the title tracks h1
+  // instead of drifting from it the next time the reading base moves.
   const shared: CSSProperties = {
-    fontSize: '23px',
-    fontWeight: 700,
+    fontSize: `${DOC_H1_PX}px`,
+    fontWeight: DOC_HEADING_WEIGHTS[0],
     lineHeight: 1.25,
     fontFamily: FONT_BODY,
   }
@@ -235,17 +253,19 @@ export function InlineTitle({
         setValue(e.target.value.replace(/\n/g, ''))
         autoSize()
       }}
-      onBlur={() => {
-        setEditing(false)
-        if (value.trim() && value.trim() !== name) onRename(value)
-      }}
+      {...ime.bindComposition<HTMLTextAreaElement>({
+        onBlur: () => {
+          setEditing(false)
+          if (value.trim() && value.trim() !== name) onRename(value)
+        },
+      })}
       onKeyDown={e => {
         if (e.key === 'Escape') {
           e.stopPropagation()
           setValue(name)
           setEditing(false)
         } else if (e.key === 'Enter') {
-          e.preventDefault()
+          if (!ime.claimEnter(e)) return
           e.currentTarget.blur()
         }
       }}

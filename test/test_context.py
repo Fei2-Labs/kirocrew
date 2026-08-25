@@ -94,6 +94,52 @@ class TestContextBuilder:
         # backwards once clicked.
         assert "in the USER's voice" in ctx
 
+    def test_url_backtick_carve_out_follows_the_path_rule(self, tmp_path):
+        """A backticked URL is a click-to-copy chip, not a link.
+
+        `InlineCode` upgrades a backticked span to a click-to-open chip only for
+        a backend-confirmed path; everything else -- a URL included -- becomes a
+        `CopyableCode` chip whose click copies. So the always-backtick-paths rule
+        needs an explicit URL exclusion, and it must come AFTER the rule it
+        qualifies or it reads as a standalone contradiction.
+        """
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        ctx = builder.build_session_context()
+        assert "Backtick file PATHS only" in ctx
+        assert "NEVER a URL" in ctx
+        assert ctx.index("inside inline `code` backticks") < ctx.index("Backtick file PATHS only")
+
+    def test_diff_rule_is_runtime_selected(self, tmp_path):
+        """The diff-block rule is selected server-side from the trusted runtime
+        resolution: a dashboard session (tool cards render) gets the
+        don't-repeat rule, every other surface (messaging channels, cron, CLI —
+        no tool cards) keeps the hard mandate. Deciding this at injection time
+        removes the per-turn model judgment a messaging channel's only
+        file-change display would otherwise ride on."""
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        dash = builder.build_session_context(session_key="dashboard_chat-1-1")
+        assert "do NOT repeat them as ```diff" in dash
+        assert "No exceptions" not in dash
+        for key, src in (
+            ("slack-thread-123", None),
+            ("discord:456", None),
+            ("cron_abc", None),
+            ("cli_chat", None),
+            # An explicit runtime_source overrides the key-derived guess.
+            ("dashboard_chat-1-1", "slack"),
+        ):
+            ctx = builder.build_session_context(session_key=key, runtime_source=src)
+            assert "No exceptions" in ctx, f"channel mandate missing for {key}/{src}"
+            assert "do NOT repeat them as ```diff" not in ctx
+
     def test_cc_provider_has_full_parity_with_kiro(self, tmp_path):
         """Full parity: anything injected for kiro ACP must also be injected for
         the Claude Code provider. The original bug — CC's clickable input-box
@@ -835,6 +881,31 @@ class TestRuntimeDisplayName:
         assert "authoritative for this turn" in msg
         assert msg.index("[RUNTIME] Discord") < msg.index("[CURRENT USER REQUEST")
 
+    def test_channel_turn_reasserts_diff_mandate_mid_session(self, tmp_path):
+        """A dashboard-started session resumed from a channel carries the
+        relaxed diff rule from session start, but a channel renders no tool
+        cards — the per-turn refresh re-asserts the hard mandate for THIS
+        turn. Asymmetric by design: a dashboard turn never injects anything
+        (worst case there is a cosmetic duplicate diff, never a missing one)."""
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        msg, _ = builder.build_message(
+            "edit the file",
+            is_new_session=False,
+            session_key="dashboard:chat-1",
+            runtime_source="discord",
+        )
+        assert "this surface renders no tool cards" in msg
+        dash_msg, _ = builder.build_message(
+            "edit the file",
+            is_new_session=False,
+            session_key="dashboard:chat-1",
+            runtime_source="dashboard",
+        )
+        assert "this surface renders no tool cards" not in dash_msg
+
 
 class TestMultibyteSanitization:
     """Tests for multi-byte UTF-8 sanitization (kiro-cli panic workaround)."""
@@ -1209,6 +1280,46 @@ class TestMemoryGetContextQueryWiring:
         kwargs = fake_memory.get_context.call_args.kwargs
         assert kwargs["query"] == "what did we decide about paris"
 
+    def test_an_empty_scoped_lesson_result_does_not_fall_back_to_jsonl(self, tmp_path):
+        # A POPULATED vector store whose rows are all out of scope has already
+        # answered. Falling through would let the JSONL store speak for it and
+        # re-inject rows deleted from it.
+        from types import SimpleNamespace
+
+        from kiro_crew.learn import Lesson
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store._vector_store = SimpleNamespace(
+            get_episodic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None: "",
+            has_any_lesson=lambda: True,
+        )
+        builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
+        msg, _ = builder.build_message("q", True, "s1")
+        assert "JSONL-SENTINEL" not in msg
+
+    def test_an_unpopulated_vector_store_still_yields_jsonl_lessons(self, tmp_path):
+        # The opposite failure: while a first-boot migration is still filling the
+        # vector store it exists but holds nothing, and saved corrections must not
+        # vanish from the prompt in the meantime.
+        from types import SimpleNamespace
+
+        from kiro_crew.learn import Lesson
+
+        builder = self._builder(tmp_path)
+        store = builder.get_memory_for(None)
+        store._vector_store = SimpleNamespace(
+            get_episodic_context=lambda query_text, cap: "",
+            get_semantic_context=lambda query_text, cap: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None: "",
+            has_any_lesson=lambda: False,
+        )
+        builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
+        msg, _ = builder.build_message("q", True, "s1")
+        assert "JSONL-SENTINEL" in msg
+
     def test_episodic_injected_exactly_once(self, tmp_path):
         from types import SimpleNamespace
 
@@ -1217,7 +1328,8 @@ class TestMemoryGetContextQueryWiring:
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
             get_semantic_context=lambda query_text, cap: "",
-            get_lessons_context=lambda query_text, cap: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None: "",
+            has_any_lesson=lambda: True,
         )
         msg, _ = builder.build_message("q", True, "s1")
         assert msg.count("[EPISODIC-SENTINEL]") == 1
@@ -1236,7 +1348,8 @@ class TestMemoryGetContextQueryWiring:
         store._vector_store = SimpleNamespace(
             get_episodic_context=_episodic,
             get_semantic_context=lambda query_text, cap: "",
-            get_lessons_context=lambda query_text, cap: "",
+            get_lessons_context=lambda query_text, cap, project_dir=None: "",
+            has_any_lesson=lambda: True,
         )
         builder.build_message("find my tokyo notes", True, "s2")
         assert seen == ["find my tokyo notes"]

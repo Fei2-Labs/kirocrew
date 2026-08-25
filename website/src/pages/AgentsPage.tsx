@@ -2,7 +2,6 @@ import { useState, useEffect, useLayoutEffect, useMemo, useRef, type ReactNode }
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { Star, Brain, Plug, Pin, Package, Lock, Hourglass, Bot, ChevronDown, LayoutTemplate, X } from 'lucide-react'
 import { createPortal } from 'react-dom'
-import { useAppSelector } from '../store'
 import { api } from '../api/client'
 import type { SubagentInfo } from '../types'
 import Clickable from '../components/Clickable'
@@ -37,6 +36,51 @@ function barGlow(pct: number): string {
   if (pct >= 90) return 'shadow-[0_0_8px_var(--danger)]'
   if (pct >= 70) return 'shadow-[0_0_8px_var(--warn)]'
   return 'shadow-[0_0_8px_var(--accent-glow)]'
+}
+
+/** Text colour for the part of a label that lands ON `barColor`'s fill.
+ *
+ * Same thresholds as `barColor`, resolved to the fill's paired foreground token.
+ * `themeFillForeground.test.ts` holds every BUILT-IN theme's pair to a 4.5:1
+ * floor, and to being no worse than `--text-strong` on the same fill. An
+ * installed theme pack can still declare a low-contrast `--accent-fg` and these
+ * labels inherit it — the same exposure every `text-<tier>-fg` consumer has, not
+ * a guarantee this component can make on its own.
+ */
+function barFg(pct: number): string {
+  if (pct >= 90) return 'text-danger-fg'
+  if (pct >= 70) return 'text-warn-fg'
+  return 'text-accent-fg'
+}
+
+/** The percentage / amount labels drawn on top of a meter bar.
+ *
+ * A single static colour cannot work here: the labels overlap both the
+ * saturated fill and the empty track, and which one is under a given glyph
+ * moves with the value. `text-text-strong` alone is near-black in every light
+ * theme, so at 62% the percentage read as dark-on-purple.
+ *
+ * So the row is painted twice with complementary clips — off-fill colour on
+ * the track side, `barFg` on the fill side — cut at exactly the fill's edge.
+ * A glyph straddling that edge is split down the middle, which keeps contrast
+ * at every value with no measuring, no resize observer, and no threshold to
+ * guess. `className` carries the bar's own transition duration so the cut
+ * travels WITH the fill instead of jumping ahead of it.
+ */
+function BarLabels({ pct, left, right, className = '' }: { pct: number; left: React.ReactNode; right: React.ReactNode; className?: string }) {
+  // Match the fill's own `Math.max(pct, 1)` floor so the two edges coincide,
+  // and clamp the top end: `inset()` past 100% (or NaN from a malformed
+  // context_pct) drops the clip entirely, which would paint BOTH layers over
+  // each other and lose the split.
+  const edge = Number.isFinite(pct) ? Math.min(Math.max(pct, 1), 100) : 1
+  const row = `absolute inset-0 flex items-center justify-between ${className}`
+  const labels = <><span className="drop-shadow-sm">{left}</span><span className="drop-shadow-sm">{right}</span></>
+  return (
+    <>
+      <div className={`${row} text-text-strong`} style={{ clipPath: `inset(0 0 0 ${edge}%)` }}>{labels}</div>
+      <div className={`${row} ${barFg(pct)}`} style={{ clipPath: `inset(0 ${100 - edge}% 0 0)` }} aria-hidden="true">{labels}</div>
+    </>
+  )
 }
 
 /** Strip the provider prefix and version suffix a model id carries. */
@@ -170,10 +214,12 @@ function ContextUsageCard({ ctx, installed }: { ctx: CtxSession[]; installed: In
                       className={`absolute inset-y-0 left-0 rounded-full transition-all duration-700 ease-out ${barColor(pct)} ${pct > 5 ? barGlow(pct) : ''}`}
                       style={{ width: `${Math.max(pct, 1)}%` }}
                     />
-                    <div className="absolute inset-0 flex items-center justify-between px-2.5 text-[12px] font-mono font-medium">
-                      <span className="text-text-strong drop-shadow-sm">{fmtPercent(pct / 100, { maximumFractionDigits: 1, minimumFractionDigits: 1 })}</span>
-                      <span className="text-text-strong drop-shadow-sm">{fmtTokens(usedTokens)} / {fmtTokens(maxTokens)}</span>
-                    </div>
+                    <BarLabels
+                      pct={pct}
+                      className="px-2.5 text-[12px] font-mono font-medium transition-[clip-path,color] duration-700 ease-out"
+                      left={fmtPercent(pct / 100, { maximumFractionDigits: 1, minimumFractionDigits: 1 })}
+                      right={<>{fmtTokens(usedTokens)} / {fmtTokens(maxTokens)}</>}
+                    />
                   </>)}
                 </div>
                 <div className="flex justify-between mt-1 text-[12px] text-muted">
@@ -327,10 +373,12 @@ function ProviderUsageCard({ usage }: { usage: SessionsUsage }) {
             <div className="text-[13px] text-muted mb-1.5">{i18nT('pages.agentsPage.plan_credits')}</div>
             <div className="relative h-6 bg-bg-elevated rounded-full overflow-hidden border border-border mb-3">
               <div className={`absolute inset-y-0 left-0 rounded-full transition-all duration-1000 ease-out ${color} ${pct > 5 ? glow : ''}`} style={{ width: `${Math.max(pct, 1)}%` }} />
-              <div className="absolute inset-0 flex items-center justify-between px-3 text-[13px] font-mono font-bold">
-                <span className="text-text-strong drop-shadow-sm">{fmtPercent(pctRaw / 100, { maximumFractionDigits: 0 })}</span>
-                <span className="text-text-strong drop-shadow-sm">{creditsUsed.toFixed(0)} / {creditsPlan.toFixed(0)}</span>
-              </div>
+              <BarLabels
+                pct={pct}
+                className="px-3 text-[13px] font-mono font-bold transition-[clip-path,color] duration-1000 ease-out"
+                left={fmtPercent(pctRaw / 100, { maximumFractionDigits: 0 })}
+                right={<>{creditsUsed.toFixed(0)} / {creditsPlan.toFixed(0)}</>}
+              />
             </div>
             <div className="flex justify-between text-[13px]">
               <div>
@@ -364,27 +412,25 @@ function SubagentsCard({ agents, onClear, onDelete }: { agents: SubagentInfo[]; 
 }
 
 export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
-  const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
-
   const { data: spawnData, refetch: refetchSpawn } = useQuery({
-    queryKey: ['spawn-list', refreshTrigger],
+    queryKey: ['spawn-list'],
     queryFn: () => api.spawnList(),
   })
   const agents: SubagentInfo[] = spawnData?.agents || []
 
   const { data: ctx = [] } = useQuery<CtxSession[]>({
-    queryKey: ['sessions-context', refreshTrigger],
+    queryKey: ['sessions-context'],
     queryFn: () => api.sessionsContext().then(d => d.sessions || []),
     refetchInterval: 15000,
   })
 
   const { data: usage = null } = useQuery({
-    queryKey: ['sessions-usage', refreshTrigger],
+    queryKey: ['sessions-usage'],
     queryFn: () => api.sessionsUsage().then(d => (d.usage && Number.isFinite(d.usage.credits_plan)) ? d.usage : null).catch(() => null),
   })
 
   const { data: installed = [], isPending: installedLoading, refetch: refetchInstalled } = useQuery({
-    queryKey: ['agents-installed', refreshTrigger],
+    queryKey: ['agents-installed'],
     queryFn: async () => {
       const a = await api.agentsInstalled()
       if (!Array.isArray(a)) return []
@@ -398,7 +444,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   })
 
   const { data: mcpTools = {} } = useQuery({
-    queryKey: ['mcp-tools', refreshTrigger],
+    queryKey: ['mcp-tools'],
     queryFn: async () => {
       const probed = await api.mcpProbeCache()
       if (!Array.isArray(probed)) return {}
@@ -418,13 +464,13 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
    *  this one (`crews.filter` on an object throws during render). Storing the
    *  response verbatim and selecting from it also dedupes the fetch. */
   const { data: crewsData, isError: crewsFailed, refetch: refetchCrews } = useQuery<{ agents?: KiroCrewAgent[]; default_agent?: string }>({
-    queryKey: ['kirocrew-agents', refreshTrigger],
+    queryKey: ['kirocrew-agents'],
     queryFn: () => api.kirocrewAgents(),
   })
   const crews = useMemo(() => crewsData?.agents ?? [], [crewsData])
 
   const { data: defaultAgentData, isError: defaultFailed, refetch: refetchDefault } = useQuery({
-    queryKey: ['default-agent', refreshTrigger],
+    queryKey: ['default-agent'],
     queryFn: () => api.defaultAgent().then(d => d.default_agent || ''),
   })
   const defaultAgent = defaultAgentData ?? ''

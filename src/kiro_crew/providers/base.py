@@ -240,9 +240,40 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the last steer this provider handed to its backend,
+        0.0 when it has never steered one.
+
+        Part of the steer capability rather than an optional extra to it. The
+        dashboard's keepalive route compares this against the reading taken when
+        a sleeping ``wait`` began, because a sleep is one of the few places a
+        steer cannot be injected: the backend needs a model-inference boundary
+        and an in-flight tool call is the absence of one. So a provider that
+        returns True from :attr:`supports_steer` and leaves this at the default
+        steers perfectly well and silently never interrupts a wait — a failure
+        with no error to notice. ``test_harness_parity`` ratchets the two
+        together for that reason; the route's own defensive default is a
+        backstop, not the guarantee.
+        """
+        return 0.0
+
+    @property
     def is_session_sharing_eligible(self) -> bool:
         """True when the provider can host multiplexed sub-agent sessions on one
         process. Default False — session sharing is opt-in, never inherited."""
+        return False
+
+    @property
+    def uses_kiro_identity_store(self) -> bool:
+        """True when this provider's child authenticates from kiro-cli's own
+        identity store, so an external ``kiro-cli logout`` invalidates a process
+        that is already running and it must be retired.
+
+        Default False — a provider authenticated some other way must not be
+        recycled on a store it never reads, and a harness that has not stated
+        that it reads that store does not inherit the claim (harness-parity
+        H5/H14). Declared here rather than probed off the instance so the session
+        layer never has to guess from private attributes."""
         return False
 
     def available_models(self) -> list[dict[str, str]]:

@@ -2,6 +2,7 @@ import { Fragment, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Plus, X, Zap } from 'lucide-react'
 import type { ChatTag } from '../types'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { api } from '../api/client'
 import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 
@@ -38,6 +39,7 @@ export interface TagManagerListProps {
  */
 export default function TagManagerList({ mode, selectedIds = [], onToggleTag, createTestId = 'tag-create' }: TagManagerListProps) {
   const queryClient = useQueryClient()
+  const ime = useImeGuard()
   const { data: tags = [] } = useQuery<ChatTag[]>({ queryKey: ['chat-tags'], queryFn: () => api.chatTags() })
   /** Tag id whose inline colour palette is expanded (manage mode only). */
   const [openColorId, setOpenColorId] = useState<string | null>(null)
@@ -104,13 +106,21 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
                 data-testid={`tag-name-${t.id}`}
                 aria-label={i18nT('components.tagManagerList.rename_tag', { name: t.name })}
                 defaultValue={t.name}
-                className="flex-1 min-w-0 bg-transparent border-none outline-none text-[12px] text-text py-0 px-0.5 rounded focus:bg-bg-elevated focus:border focus:border-accent/50"
-                onBlur={e => { const v = e.target.value.trim(); if (!v) { e.target.value = t.name; return } if (v !== t.name) updateTagMutation.mutate({ id: t.id, body: { name: v } }) }}
+                className="flex-1 min-w-0 bg-transparent border-none outline-none text-[12px] text-text py-0 px-0.5 rounded focus-visible:bg-bg-elevated focus-visible:border focus-visible:border-accent/50"
+                {...ime.bindComposition<HTMLInputElement>({
+                  onBlur: e => { const v = e.target.value.trim(); if (!v) { e.target.value = t.name; return } if (v !== t.name) updateTagMutation.mutate({ id: t.id, body: { name: v } }) },
+                })}
                 onKeyDown={e => {
                   const el = e.currentTarget as HTMLInputElement
                   if (e.key !== 'Enter' && e.key !== 'Escape') return
-                  e.stopPropagation()
+                  // Escape restores the canonical name first, so its path can never
+                  // persist a draft. Enter commits through the focus move below (it
+                  // fires this input's onBlur), so a committing IME Enter — whose
+                  // candidate text is still intermediate — must not reach it. Rule 1:
+                  // single-line input, so the declined key is left unconsumed.
                   if (e.key === 'Escape') el.value = t.name
+                  else if (ime.isComposing(e)) return
+                  e.stopPropagation()
                   // Move focus to the row's first button (swatch in column-filter mode,
                   // status ⚡ in manage mode) instead of blur()ing to <body>. This still
                   // fires the input's onBlur (commit) but keeps focus inside the owning
@@ -189,14 +199,16 @@ export default function TagManagerList({ mode, selectedIds = [], onToggleTag, cr
           data-testid={createTestId}
           placeholder={i18nT('components.tagManagerList.new_tag')}
           className="flex-1 min-w-0 bg-transparent border-none outline-none text-[12px] text-text py-0 px-0.5 placeholder:text-muted/60"
+          {...ime.bindComposition()}
           onKeyDown={e => {
-            if (e.key === 'Enter') {
-              const el = e.currentTarget as HTMLInputElement
-              const v = el.value.trim()
-              if (!v) return
-              createTagMutation.mutate({ name: v })
-              el.value = ''
-            }
+            if (e.key !== 'Enter') return
+            // Rule 1: single-line input — the guard alone; emptiness stays outside.
+            if (ime.isComposing(e)) return
+            const el = e.currentTarget as HTMLInputElement
+            const v = el.value.trim()
+            if (!v) return
+            createTagMutation.mutate({ name: v })
+            el.value = ''
           }}
           onClick={e => e.stopPropagation()}
         />

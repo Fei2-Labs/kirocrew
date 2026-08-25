@@ -645,6 +645,45 @@ describe('ordering and triage', () => {
     expect(screen.queryByText('step 4')).toBeNull()
   })
 
+  it('expands the block to every open item when the overflow row is clicked', async () => {
+    // The overflow row reads as an affordance, so it has to be one: as inert
+    // text it told the reader four items existed and gave them no way to see
+    // them.
+    sessionSummary.mockResolvedValue(
+      payload({
+        intents: [1, 2, 3, 4, 5].map(n =>
+          intent({
+            title: `goal ${n}`,
+            state: 'needs-you',
+            progress: [`gist ${n}`],
+            ranges: [[n, n]],
+            last_touched_turn: 100 - n,
+            next_steps: [{ what: `step ${n}`, why: '', expect: '' }],
+          }),
+        ),
+      }),
+    )
+    mount()
+
+    const more = await screen.findByText('+2 more')
+    expect(screen.queryByText('step 5')).toBeNull()
+
+    fireEvent.click(more)
+
+    // Every item now rendered, and the row offers the way back.
+    await waitFor(() => expect(screen.getByText('step 5')).toBeTruthy())
+    expect(screen.getByText('step 4')).toBeTruthy()
+    expect(screen.queryByText('+2 more')).toBeNull()
+
+    // The choice is persisted, matching the panel's other disclosures.
+    expect(localStorage.getItem('mc-summary-triage-all:chat-1')).toBe('1')
+
+    fireEvent.click(screen.getByText('Show less'))
+    await waitFor(() => expect(screen.queryByText('step 5')).toBeNull())
+    expect(screen.getByText('+2 more')).toBeTruthy()
+    expect(localStorage.getItem('mc-summary-triage-all:chat-1')).toBe('0')
+  })
+
   it('renders when storage is denied instead of taking the panel down', async () => {
     // Safari private mode and blocked third-party storage make getItem throw
     // SecurityError. Inside a useState initializer an unguarded throw unmounts
@@ -811,6 +850,34 @@ describe('project notes', () => {
     mount('chat-9')
     await screen.findByText(/how this project works/i)
     expect(screen.getByText('a durable fact')).toBeTruthy()
+  })
+
+  it('the bounded notes list is reachable by keyboard', async () => {
+    sessionSummary.mockResolvedValue(
+      payload({ intents: [intent()], constraints: ['a durable fact'] }),
+    )
+    mount('chat-kbd')
+    fireEvent.click(await screen.findByText(/how this project works/i))
+    await waitFor(() => expect(screen.getByText('a durable fact')).toBeTruthy())
+
+    // Bounding this list at 33vh turned it into a scroll region, and its items
+    // are plain text — so without a tab stop everything past the fold is
+    // reachable by pointer only. The named region is what makes arrow-key
+    // scrolling possible and tells a screen reader what it landed in.
+    const region = screen.getByRole('region', { name: /how this project works/i })
+    expect(region.getAttribute('tabindex')).toBe('0')
+    region.focus()
+    expect(document.activeElement).toBe(region)
+
+    // And the tab stop must NOT be the <ul> itself: an explicit role replaces an
+    // element's implicit one, so `role="region"` on the list would stop its items
+    // being exposed as listitems — losing "list, N items" for the same cohort the
+    // tab stop is for. The region is the scroller wrapping the list.
+    expect(region.tagName).toBe('DIV')
+    const list = screen.getByRole('list')
+    expect(list.tagName).toBe('UL')
+    expect(region.contains(list)).toBe(true)
+    expect(screen.getAllByRole('listitem').length).toBe(1)
   })
 })
 

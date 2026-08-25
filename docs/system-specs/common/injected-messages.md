@@ -84,6 +84,13 @@ Sub-agent synthesis:'`. Its visible reply is the consolidated, user-facing summa
 so treat it as the deliverable: restate the goal, synthesize across the agents
 rather than repeating each in turn, and give concrete next actions.
 
+The prompt itself is appended to the slot as an `inject` row carrying
+`meta.injectKind = "synthesis"`, and the turn is dispatched with
+`_synthetic_payload=True`. Both matter: the row is what stops the prompt reaching
+the conversation log unattributed (it previously replayed as though the user had
+typed it), and the flag is what keeps a synthetic turn out of the
+time-to-first-token distribution.
+
 ## Sub-agent delivery failure
 
 The sub-agent completed but injecting its result into the parent session timed out.
@@ -113,6 +120,30 @@ than N pings.
 
 ## Automatic recovery continuations
 
+## How an `inject` row is rendered
+
+Role `inject` covers several unrelated things, so the render side does not guess
+from the text. Every `inject` row carries `meta.injectKind`, stamped at the append
+site, and `meta` (unlike an `inject` row's `cls`) survives the persistence
+boundary:
+
+| `injectKind` | Row is | Renders as |
+|---|---|---|
+| `synthesis` | The post-fan-out consolidation prompt | Collapsed one-line note |
+| `recovery` | A runner-authored continuation | Its own recovery card, or a generic note if the marker is unrecognised |
+| `cron` | A scheduled job's output — the user's own | Labelled bubble (also carries `cronLabel`) |
+| `user_replay` | The user's original message, replayed because the turn emitted nothing | Ordinary bubble; it is speech |
+
+`resolveInjectCard` in `website/src/pages/chat/RecoveryCard.tsx` is the single
+decision point, shared by `ChatPage` and the `transcriptRenderers` registry so the
+surfaces cannot disagree. It prefers a recognised content marker (durable, and
+carrying per-kind copy no tag reproduces), then applies a POSITIVE allowlist:
+only `recovery` and `synthesis` become a note. Everything else — including a row
+with no stamp, written by a gateway older than the field — keeps whatever the
+surface drew before, so no history changes rendering underneath the user.
+
+## Turn-recovery continuations
+
 The runner injects a synthetic continuation when a turn ended for a system reason
 rather than because the model was done. Each has its own prefix in
 `dashboard/state.py`, each renders as an `inject` message (not a user bubble), and
@@ -120,11 +151,32 @@ none is mirrored to a linked Slack or Telegram thread as though the user typed i
 
 | Prefix | Fired when |
 |---|---|
-| `[Tool refusal — automatic recovery]` | A tool call was refused for a recoverable system reason (a host-gate policy deny, or the read-only bash gate) and the turn ended early. Carries the reason back so the model can adapt instead of stalling for the user. |
+| `[Tool refusal — automatic recovery]` | A tool call was refused for a recoverable system reason (a host-gate policy deny, the read-only bash gate, or a PreToolUse hook block) and the in-band notice below could not carry the reason. **Fallback only** — see the in-band note under the table. |
 | `[Stalled turn — automatic recovery]` | A genuinely wedged turn was detected and reset. Tells the model the interruption was a system stall, NOT the user, and to resume from its last committed step rather than restart. |
 | `[Tool stall — automatic recovery]` | The per-session watchdog judged an in-flight tool dead and cancelled the session. Hands over the stall context so the model can check partial results and continue. |
 | `[Interrupted turn — automatic recovery]` | A transient backend 5xx cut a turn short after tokens or tool calls had already streamed. |
 | `[Empty response — automatic recovery]` | The model returned no output twice. Continue the pending request; do not restart from scratch or re-run steps that already succeeded. |
+| `[Unfinished action — automatic recovery]` | The turn ended right after announcing an immediate action ("I'll do that now") without making the tool call, so nothing actually happened yet a billed turn was recorded. Instructs the model to carry out the announced action now — unless it was actually deferred pending the user's approval or an unmet condition, in which case it is told to hold and say what it is waiting for (a semantic consent backstop, since the terminal-promise detector's approval-gate deny-list cannot enumerate every conditional phrasing). Bounded to one attempt per turn; a second consecutive promise-only ending falls through and lands normally with a give-up notice. |
+
+**A tool deny is explained IN-BAND first, and the injection above is the
+fallback.** ACP's permission response carries only `outcome`/`optionId`, so the
+host cannot attach a reason to a rejection — kiro-cli hands the model the fixed
+tool result `"User denied tool execution"`, which reads as the person having
+clicked No. `chat_runner._steer_policy_notice` therefore steers
+`state.build_refusal_steer_notice`'s body into the turn **before** answering the
+permission request. Holding the unanswered request is what makes that race-free:
+the turn is provably in flight, so the notice is queued and folded in at the next
+model-inference boundary — the one right after the rejected tool resolves — and
+the model adapts inside the SAME turn. It is opt-in by positive capability
+(`supports_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
+steer is unchanged.
+
+`should_queue_refusal_recovery` then suppresses the extra turn only when every
+refusal got a notice AND a `steering_consumed` echo accounted for all of them. An
+unconfirmed notice counts as undelivered: skipping wrongly leaves the model with
+kiro-cli's wrong attribution and no correction, while queueing wrongly costs one
+turn the model is told twice — which is what this path cost before in-band
+delivery existed.
 
 The recovery classification for the last two is **structural**: the queue entry
 carries `kind == "synthetic_recovery"` (`SYNTHETIC_RECOVERY_KIND`), set at insert
@@ -134,6 +186,73 @@ in, which must classify as a plain user message.
 
 There is deliberately no retry cap on refusal recovery: the model decides when to
 stop, and the user's Stop button remains the hard breaker.
+
+## Stop-hook continuation
+
+A Stop hook that exits 0 and prints a block decision on stdout asks the harness to
+keep the session going instead of ending the turn
+([contract](https://kiro.dev/docs/hooks/types#agent-stop)):
+
+```json
+{"decision": "block", "reason": "<the instruction to continue with>"}
+```
+
+`reason` IS the message. The runner parses the hook outputs collected for the Stop
+event — exit-0 stdout, plus the `BLOCKED:` marker `_fire` synthesises for any
+exit-2 hook — and each well-formed decision is queued as the next turn behind
+`HOOK_CONTINUATION_RECOVERY_PREFIX = '[Hook continuation — automatic]'`. This
+lets a hook judge a finished turn and push it further — a gate that checks tests
+pass, or one that auto-continues a trivial read — with no round-trip to the user.
+
+- **Nothing failed.** Unlike the recovery continuations above, the turn ran to
+  completion; a hook simply asked for another. The card's copy names the hook as
+  the cause rather than reporting an interruption. The constant is named into the
+  `*_RECOVERY_PREFIX` family only so `test_recovery_card_prefixes.py` covers it —
+  a marker outside that family renders as a full-width bubble instead of a card.
+- **Only a block decision with a non-blank `reason` continues.** Plain logging
+  output, non-JSON, a non-block decision, a block with no reason, and the
+  `BLOCKED:` markers an exit-2 hook contributes are all ignored, so an ordinary
+  Stop hook stops the turn as before.
+- **A continuation is not queued once a stop is pending.** Injection is suppressed
+  when a stop is already in progress as the hook output is processed, when a
+  session reset is already re-queuing, and when the turn was cancelled by the
+  user. A soft stop arriving AFTER the entry is queued does not remove it: the
+  first Stop press deliberately preserves the queue, so the entry still drains on
+  the next dispatch (behind the session-reset notice). The second press clears the
+  queue outright, which is the hard breaker.
+- Several hooks' instructions keep firing order: each is inserted at the queue
+  front in reverse.
+- Entries carry `kind == "synthetic_recovery"` as well as the prefix, so the
+  dequeue path classifies them structurally and the flattened message still
+  classifies once the metadata is gone — which is what keeps the continuation out
+  of a linked Slack thread's user-message mirror.
+- **A backstop cap bounds a runaway loop.** `agent.max_stop_hook_nudges` (default 100)
+  limits how many consecutive hook continuations a run may take. When the depth reaches the
+  cap, the next block decision is refused: no turn is dispatched, and a halt card
+  (`[Stop-hook nudge cap reached] #N`) is surfaced instead so the transcript shows the loop
+  was force-stopped at depth N. `0` disables the cap — the opt-in for a genuinely unbounded
+  feedback loop, where terminating is the hook's own responsibility and Stop stays the
+  breaker. The cap exists because the model cannot end a hook loop (even a "nothing left to
+  do" turn re-fires the hook); only the hook or this backstop can.
+- **The Stop stdin payload carries `hook_continuation_count`**, the depth of the current
+  unbroken continuation run (`0` on a normal turn, one deeper per consecutive hook
+  continuation), plus `stop_hook_active` as its boolean shorthand (`count > 0`). The Kiro
+  contract defines no cap and neither field, so these are additive: a hook may self-limit
+  (`if not stop_hook_active: block` continues at most once), threshold on the count, or
+  surface it to the model, while a real gate hook checks its own condition and ignores them.
+  The depth is tracked on the slot and reset by any non-continuation turn; both keys ride
+  beside `assistant_text`, stamped on every Stop fire.
+- **Fail-closed by construction**, so no separate guard is needed: with no hook
+  store the Stop event produces no stdout, which parses to no instructions and
+  queues nothing — and that same branch returns a `BLOCKED:` marker for every
+  `PreToolUse` call, so no tool runs at all. A session that cannot govern its tool
+  calls cannot produce a continuation either.
+- The `reason` is external process output, and it is redacted (exfiltration URLs,
+  then credentials) on the dequeue path shared by every queued turn, before the
+  continuation is classified or dispatched.
+
+**How to treat it:** it is an instruction from an automation the operator
+configured, not a question from a person. Do the work it asks for and continue.
 
 ## Auto-nudge cycle
 

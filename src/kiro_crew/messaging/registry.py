@@ -4,7 +4,8 @@ One registry entry per channel carries the host's per-channel LIFECYCLE seams �
 the members tuple, the start call, the shutdown gather. The other per-channel
 seams (the ``orch._<channel>_*`` hoist in ``slack/gateway.py``, the ``loader.py``
 config dataclass, the ``sandbox.py`` credential denylist, the
-``dashboard/state.py`` connected fields) are still hand-edited.
+``dashboard/state.py`` connected fields, the uncredentialed-skip probe table in
+``_start_channel_transports``) are still hand-edited.
 
 This module owns the TYPES and the LOOPS
 only — it must not import any channel package (``dispatch.py`` pins the
@@ -63,6 +64,30 @@ class ChannelDescriptor:
 
     start: Optional[StartFactory] = None
     """Boot factory, or ``None`` for a host-managed lifecycle (Slack)."""
+
+    credentials: tuple[str, ...] = ()
+    #: ``credential key -> config attribute`` for the channels that accept the
+    #: secret from ``config.json`` as well as the environment. Readiness has to
+    #: consult BOTH, or it reports a missing credential for a channel the gateway
+    #: starts fine — the env var is the RECOMMENDED home, not the only one.
+    #: Absent means env-only by design (Teams' ``app_password`` is deliberately
+    #: never read from a file the agent can see).
+    credential_fallbacks: tuple[tuple[str, str], ...] = ()
+    #: Config attributes that must be non-empty for the channel to START, beyond
+    #: its credentials. Deliberately separate from ``credentials``: these are not
+    #: secrets and have no credential-store key, so folding them in would make
+    #: ``missing_credentials`` name something that is not a credential and send the
+    #: operator looking in the wrong place. WeCom/WeChat's ``account_id`` is the
+    #: case — its gateway refuses to start without one.
+    required_config: tuple[str, ...] = ()
+    """Credential keys this channel needs ALL of before it can connect.
+
+    Data rather than a per-channel branch, so a diagnostic can report every
+    channel's readiness from one loop. Empty means the channel needs no
+    credential at all — iMessage is the real case: its transport is the
+    operator's own Messages.app, so there is nothing to store or rotate, and an
+    empty tuple must read as "nothing missing" rather than "not configured".
+    """
 
 
 def governed_members(descriptors: tuple[ChannelDescriptor, ...]) -> tuple[str, ...]:

@@ -37,6 +37,12 @@ from kiro_crew.apps.builtins.meetings.backend.routes import _common
 
 BASE = k.API_BASE
 
+# Repo-root anchor for tests that read a checked-in source file. A relative
+# literal resolves against the process CWD, which no test owns: another test
+# chdir-ing away makes the read fail, and under `-n auto` the loser is decided
+# by worker scheduling rather than by anything in this file.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 async def _start(client, meeting_id: str = "standup", **body) -> dict:
     await client.post(f"{BASE}/meetings/{meeting_id}/init", json={"title": "Standup"})
@@ -405,6 +411,30 @@ class TestMeetingLifecycleRoutes:
             body = await resp.json()
             assert body["meta"]["title"] == "One"
             assert body["live"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_meeting_reports_dispatch_admission(self, app, fake_sessions):
+        """The poll payload carries the same admission flag dispatch checks.
+
+        The frontend opens the microphone off this field, so it must track the
+        holder's ``accepting_dispatches`` — not merely whether a session is
+        installed. A completed start reports it open; suspending ingress (the
+        state the whole ~46s initialization window is in, and what reviewing
+        does) reports it closed while ``live`` itself is still present.
+        """
+        async with client_for(app) as client:
+            await _start(client)
+            body = await (await client.get(f"{BASE}/meetings/standup")).json()
+            assert body["live"] is not None
+            assert body["live"]["accepting_dispatches"] is True
+
+            # Ingress closed but session installed — what a poll observes while
+            # a start is mid-initialization, here reached via the same holder
+            # call the start handler uses.
+            _common.ACTIVE.suspend_dispatches(_common.ACTIVE.get("standup"))
+            body = await (await client.get(f"{BASE}/meetings/standup")).json()
+            assert body["live"] is not None
+            assert body["live"]["accepting_dispatches"] is False
 
     @pytest.mark.asyncio
     async def test_delete_removes_the_meeting_and_all_outputs(self, app, root: Path):
@@ -913,9 +943,10 @@ class TestAgentRoutes:
         assertion breaks when either side changes alone.
         """
         import re
-        from pathlib import Path as _Path
 
-        source = _Path("website/src/apps/meetings/hooks/useMeetingSession.ts").read_text()
+        source = (
+            _REPO_ROOT / "website/src/apps/meetings/hooks/useMeetingSession.ts"
+        ).read_text()
         block = re.search(
             r"ALLOWED_TRANSITIONS: Record<MeetingStatus, MeetingStatus\[\]> = \{(.*?)\n\}",
             source,
@@ -1570,6 +1601,23 @@ class TestCalendarRoutes:
                 "provider": k.CALENDAR_PROVIDER_NONE,
                 "configured": False,
             }
+
+    @pytest.mark.asyncio
+    async def test_get_calendar_normalizes_all_day_on_legacy_cache_rows(self, app, root):
+        """A cache written before `all_day` existed must still satisfy the wire type.
+
+        The frontend declares `all_day: boolean` required, and the GET route
+        serves the cache verbatim otherwise — so a pre-upgrade row must be
+        normalized to `false` here, not left keyless for JSON.parse to pass
+        through as `undefined`.
+        """
+        store.write_calendar_cache(
+            [{"event_id": "legacy-1", "title": "Legacy", "start": "2026-08-20T00:00:00Z"}],
+            root,
+        )
+        async with client_for(app) as client:
+            body = await (await client.get(f"{BASE}/calendar")).json()
+            assert body["events"][0]["all_day"] is False
 
     @pytest.mark.asyncio
     async def test_providers_endpoint(self, app):

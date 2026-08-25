@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.apps import routes
 from kiro_crew.apps.routes import (
     _blob_cache_key,
     _is_safe_repo_identifier,
@@ -245,6 +247,83 @@ class TestPutRegistries:
             assert saved["registries"][0]["repo"] == "NewRepo"
 
     @pytest.mark.asyncio
+    async def test_a_case_variant_of_a_pinned_name_is_refused(self, tmp_path, monkeypatch):
+        """The guard keys on the cache file, like the merge does.
+
+        Comparing raw names would let `Official` past a pinned `official`, persist
+        it, and then have the merge drop BOTH as contested — the inert-registry
+        outcome this guard exists to prevent, with the operator's row lost too.
+        """
+        _setup_env(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            routes,
+            "_pinned_registries",
+            lambda: [
+                SimpleNamespace(
+                    name="official", repo="https://forge.example/o/r.git", branch="main"
+                )
+            ],
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.put(
+                "/api/apps/registries",
+                json={"registries": [{"name": "Official", "repo": "SomeRepo"}]},
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert "registry this build provides" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_refuses_an_owner_tier_from_an_api_client(self, tmp_path, monkeypatch):
+        """`owner` is a build claim; the API declines it rather than storing a no-op.
+
+        `registry._registry_trust_tier` resolves `owner` only from
+        `default_registries()`, because `config.json` is agent-writable. Persisting
+        it here would report a grant the runtime ignores.
+        """
+        _setup_env(tmp_path, monkeypatch)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.put(
+                "/api/apps/registries",
+                json={"registries": [{"name": "mine", "repo": "SomeRepo", "trust": "owner"}]},
+            )
+            assert resp.status == 400
+            body = await resp.json()
+            assert "supplied by this build" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_operator_row_persists_the_index_tier(self, tmp_path, monkeypatch):
+        home, cfg = _setup_env(tmp_path, monkeypatch)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.put(
+                "/api/apps/registries",
+                json={"registries": [{"name": "mine", "repo": "SomeRepo"}]},
+            )
+            assert resp.status == 200
+            saved = json.loads(cfg.read_text(encoding="utf-8"))
+            assert saved["registries"][0]["trust"] == "index"
+
+    @pytest.mark.asyncio
+    async def test_get_reports_the_tier_in_force_not_the_stored_one(self, tmp_path, monkeypatch):
+        """A hand-edited `owner` in config.json is inert, so GET must not echo it."""
+        home, cfg = _setup_env(tmp_path, monkeypatch)
+        cfg.write_text(
+            json.dumps(
+                {
+                    "registries": [
+                        {"name": "mine", "repo": "MyRepo", "branch": "main", "trust": "owner"}
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/apps/registries")
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["registries"][0]["trust"] == "index"
+
+    @pytest.mark.asyncio
     async def test_empty_list_clears_registries(self, tmp_path, monkeypatch):
         home, cfg = _setup_env(tmp_path, monkeypatch)
         cfg.write_text(
@@ -300,7 +379,22 @@ class TestPutRegistriesValidation:
                 json={"registries": [{"repo": "../evil"}]},
             )
             assert resp.status == 400
-            assert "invalid repo name" in (await resp.json())["error"]
+            # The rejection covers full ssh/https URLs too, so the wording says
+            # "URL or name" rather than the misleading name-only phrasing.
+            assert "invalid repo URL or name" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_repo_url(self, tmp_path, monkeypatch):
+        """A malformed full URL is rejected with the URL-or-name wording (the
+        input is a URL, so a bare "invalid repo name" banner would read wrong)."""
+        _setup_env(tmp_path, monkeypatch)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.put(
+                "/api/apps/registries",
+                json={"registries": [{"repo": "ssh://git@evil host/repo.git"}]},
+            )
+            assert resp.status == 400
+            assert "invalid repo URL or name" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_rejects_repo_with_spaces(self, tmp_path, monkeypatch):
@@ -485,7 +579,7 @@ class TestPutRegistriesUrls:
                 json={"registries": [{"repo": "acme/apps"}]},
             )
             assert resp.status == 400
-            assert "invalid repo name" in (await resp.json())["error"]
+            assert "invalid repo URL or name" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_rejects_shell_metachar_junk(self, tmp_path, monkeypatch):
@@ -496,7 +590,7 @@ class TestPutRegistriesUrls:
                 json={"registries": [{"repo": "https://github.com/a/b;rm -rf /"}]},
             )
             assert resp.status == 400
-            assert "invalid repo name" in (await resp.json())["error"]
+            assert "invalid repo URL or name" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_rejects_plaintext_http_url(self, tmp_path, monkeypatch):
@@ -510,7 +604,7 @@ class TestPutRegistriesUrls:
                 json={"registries": [{"repo": "http://github.com/acme/apps"}]},
             )
             assert resp.status == 400
-            assert "invalid repo name" in (await resp.json())["error"]
+            assert "invalid repo URL or name" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
     async def test_blocked_repo_still_blocked(self, tmp_path, monkeypatch):

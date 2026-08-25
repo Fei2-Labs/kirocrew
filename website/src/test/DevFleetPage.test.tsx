@@ -3,7 +3,7 @@
  * verifies loading state, fleet table, and empty state.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { screen, waitFor, fireEvent, within } from '@testing-library/react'
+import { screen, waitFor, fireEvent, within, act } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 
 import DevFleetPage, { mergeLogWindow, LOG_GAP_MARKER, pruneVerdictLabel, gatewayRecovered } from '../pages/DevFleetPage'
@@ -225,9 +225,12 @@ describe('DevFleetPage', () => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
-      // POST /sync returns "already running" with the in-flight run_id
+      // POST /sync refuses a second concurrent run with HTTP 409, naming the
+      // in-flight run. Mocking this as a 200 made the test vacuous: the client
+      // throws on any non-2xx, so a 200 exercised a branch the backend can
+      // never produce while the real 409 path surfaced a raw JSON error toast.
       if (u.includes('/sync') && opts?.method?.toUpperCase() === 'POST') {
-        return Promise.resolve(new Response(JSON.stringify({ ok: false, error: 'sync already running', run_id: 'run-inflight-99' }), { status: 200 }))
+        return Promise.resolve(new Response(JSON.stringify({ ok: false, error: 'sync already running', run_id: 'run-inflight-99' }), { status: 409 }))
       }
       if (u.includes('/run?id=run-inflight-99')) {
         runPolls++
@@ -730,6 +733,25 @@ describe('DevFleetPage', () => {
     expect(screen.queryByTestId('serving-install-warning')).toBeNull()
   })
 
+  // The notices share the content column with the stat cards and the Worktrees
+  // card below them, and neither of those is width-capped. A cap on the notices
+  // alone leaves them hugging the left edge of a wide window while everything
+  // under them runs full width, which reads as a half-rendered page.
+  it('lets the notices fill the content column instead of capping their width', async () => {
+    mockFleet({
+      serving_install_reason: 'served by an install outside the managed checkout.',
+      main_repo_inferred: true,
+      main_repo: '/Users/dev/kirocrew',
+      worktrees: [{ name: 'main', is_main: true, running: false, has_dist: true, behind: 0 }],
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('serving-install-warning')).toBeInTheDocument())
+    for (const id of ['serving-install-warning', 'inferred-main-checkout']) {
+      const capped = Array.from(screen.getByTestId(id).classList).filter((c) => c.startsWith('max-w-'))
+      expect(capped).toEqual([])
+    }
+  })
+
   it('explains WHY pods are unavailable instead of failing silently', async () => {
     mockFleet(FLEET_NO_PODS)
     renderPage()
@@ -1061,6 +1083,59 @@ describe('DevFleetPage', () => {
     expect(trigger).toHaveFocus()
   })
 
+  it('declines a boundary Tab that belongs to an IME composition', async () => {
+    // On WebKit the keydown that commits a candidate arrives AFTER
+    // compositionend with `isComposing` already false — unguarded, the trap
+    // would yank focus and abort the composition. Both ring boundaries are
+    // buttons today, so no composition can start on them; this pins that the
+    // trap stays safe if the popover ever grows a text field.
+    const { pop } = await openPullBuildConfirm()
+    const cancel = within(pop).getByText('Cancel')
+    const start = within(pop).getByText('Start')
+    expect(cancel).toHaveFocus()
+
+    fireEvent.compositionStart(cancel)
+    fireEvent.compositionEnd(cancel)
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+
+    // Declined: focus stays where it was instead of wrapping to Start.
+    expect(cancel).toHaveFocus()
+    expect(start).not.toHaveFocus()
+  })
+
+  it('declines the forward-boundary Tab too — each branch carries its own claim', async () => {
+    // The scan requires the claim BETWEEN a branch and its focus move, but a
+    // behavioural pin per boundary is what proves the claim actually runs:
+    // one guarded branch must not stand in for its sibling.
+    const { pop } = await openPullBuildConfirm()
+    const start = within(pop).getByText('Start')
+    start.focus()
+    expect(start).toHaveFocus()
+
+    fireEvent.compositionStart(start)
+    fireEvent.compositionEnd(start)
+    fireEvent.keyDown(document, { key: 'Tab' })
+
+    // Declined: no wrap back to Cancel.
+    expect(start).toHaveFocus()
+  })
+
+  it('declines an Escape that belongs to an IME composition (popover stays open)', async () => {
+    // Escape on the same document-capture listener closes the popover AND
+    // yanks focus back to the trigger — the same harm as the Tab wrap, so
+    // the same claim guards it.
+    const { pop } = await openPullBuildConfirm()
+    const cancel = within(pop).getByText('Cancel')
+
+    fireEvent.compositionStart(cancel)
+    fireEvent.compositionEnd(cancel)
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    // Declined: the popover is still there and focus did not move.
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(cancel).toHaveFocus()
+  })
+
   it('confirm popover opens downward when there is room below', async () => {
     mockFleet(FLEET_MENU)
     renderPage()
@@ -1270,6 +1345,59 @@ describe('DevFleetPage', () => {
     expect(screen.getByTestId('prune-item-wt-b')).toHaveAttribute('data-status', 'failed')
     expect(screen.getByText('pod still active after shutdown')).toBeInTheDocument()
     expect(screen.getByText('Prune complete')).toBeInTheDocument()
+  }, 15000)
+
+  it('force-only prune counts the forced worktree and reports success (issue #4128)', async () => {
+    // Force-overriding a KEPT worktree sends it in force_names, disjoint from
+    // the regular candidate names. The counter and success tally must cover it
+    // — otherwise the denominator drops to 0 (the impossible "1/0") and the
+    // toast turns red ("Prune 0: failed") on a removal that actually succeeded.
+    let runBody: unknown = null
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, init) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/prune-candidates')) return Promise.resolve(new Response(JSON.stringify({
+        // No regular candidates — only a kept worktree offered for force-override.
+        ok: true, candidates: [], kept: [{ name: 'wt-kept', code: 'merged_new_commits' }], scanned: 1,
+      }), { status: 200 }))
+      if (u.includes('/prune-run')) {
+        runBody = init?.body ? JSON.parse(String(init.body)) : null
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, total: 1 }), { status: 200 }))
+      }
+      if (u.includes('/prune-status')) {
+        // Backend tracks the forced item: it is in total/items and done bumps.
+        return Promise.resolve(new Response(JSON.stringify({
+          running: false, total: 1, done: 1, current: null,
+          results: [{ name: 'wt-kept', ok: true }],
+          items: { 'wt-kept': { status: 'done', error: null } },
+        }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('Prune merged'))
+    await waitFor(() => expect(screen.getByText('Prune worktrees')).toBeInTheDocument())
+    // Check the force-override box on the kept row, then remove + confirm.
+    // The dialog opens from an async handler. Drain that commit before changing
+    // the controlled checkbox, then observe its checked state before submitting.
+    await act(async () => {})
+    const forceCheckbox = screen.getByLabelText('Force remove wt-kept') as HTMLInputElement
+    fireEvent.click(forceCheckbox)
+    await waitFor(() => expect(forceCheckbox).toBeChecked())
+    fireEvent.click(screen.getByText('Remove selected'))
+    fireEvent.click(await screen.findByText('Delete anyway'))
+    // The forced worktree is tracked as its own checklist row and finishes done.
+    await waitFor(() => expect(screen.getByTestId('prune-item-wt-kept')).toHaveAttribute('data-status', 'done'), { timeout: 8000 })
+    // Counter reads 1/1 (not 1/0) and completion is the success state.
+    expect(screen.getByText((_, el) => el?.textContent === 'Finished 1/1')).toBeInTheDocument()
+    expect(screen.getByText('Prune complete')).toBeInTheDocument()
+    // Success toast (green), not the red "Prune: 0 failed".
+    expect(screen.getByText('Pruned 1 worktree(s)')).toBeInTheDocument()
+    expect(screen.queryByText(/Prune: \d+ failed/)).not.toBeInTheDocument()
+    // The forced name went out in force_names, not the regular names list.
+    expect(runBody).toEqual({ names: [], force_names: ['wt-kept'] })
   }, 15000)
 
   it('refetches the fleet with fresh=1 once a prune finishes', async () => {
@@ -1658,4 +1786,126 @@ describe('DevFleetPage restart handshake', () => {
       Object.defineProperty(window.location, 'reload', { configurable: true, value: origReload })
     }
   }, 12000)
+})
+
+// ─── Issue #5294: synchronous per-worktree in-flight guard ────────────────────
+// The Provision button's busy state lives in React prov[] state.  setState is
+// async: the button only becomes disabled after the next render commit.  A rapid
+// double-click fires BOTH onClick handlers in the same render turn, so the second
+// click sees prov.status===undefined (unchanged) and fires a second POST.
+//
+// The fix: provInFlightRef is checked and set SYNCHRONOUSLY before the first
+// await, so the second invocation is blocked regardless of React render timing.
+//
+// These tests verify the invariants at the component level by invoking the
+// handler twice in one render turn (fireEvent × 2 with no await between them).
+describe('provision singleflight guard (issue #5294)', () => {
+  beforeEach(() => { vi.restoreAllMocks() })
+
+  const FLEET_UNPROV = {
+    worktrees: [
+      { name: 'main', is_main: true, running: false, has_dist: true, behind: 0 },
+      { name: 'unprov', is_main: false, running: false, has_dist: false, behind: 0 },
+    ],
+  }
+
+  it('regression: only one POST is sent for two rapid clicks (proves guard works)', async () => {
+    // Two fireEvent.click calls with no render between them (same render turn)
+    // simulate the rapid double-click scenario described in issue #5294.
+    // The synchronous guard in provInFlightRef blocks the second invocation
+    // before the first async handler's `await` returns — only ONE POST reaches
+    // the backend regardless of how fast the user clicks.
+    // IMPORTANT: this test proves the fix is effective; see the comment in the
+    // production code for why React setState alone cannot block the second click.
+    let provisionPosts = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_UNPROV), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision')) {
+        provisionPosts++
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-sf-' + provisionPosts }), { status: 200 }))
+      }
+      // run poll stays running forever so the first provision is still in-flight
+      if (u.includes('/run?id=')) return Promise.resolve(new Response(JSON.stringify({ status: 'running', output: [] }), { status: 200 }))
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    const btn = screen.getByText('Provision')
+    // Rapid double-click: both clicks in the same render turn (no await between).
+    fireEvent.click(btn)
+    fireEvent.click(btn)
+    // Wait for async work to settle.
+    await waitFor(() => expect(provisionPosts).toBeGreaterThan(0), { timeout: 4000 })
+    // The synchronous guard blocks the second click — exactly one POST sent.
+    expect(provisionPosts).toBe(1)
+  }, 10000)
+
+  it('guard is released after a failure so the user can retry provisioning', async () => {
+    // After a failed provision the user dismisses the error and clicks Provision
+    // again.  The guard must be cleared in the finally block so this retry can
+    // proceed rather than being silently blocked.
+    let posts = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_UNPROV), { status: 200 }))
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision')) {
+        posts++
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-retry-' + posts }), { status: 200 }))
+      }
+      if (u.includes('/run?id=run-retry-1')) {
+        // First run fails immediately.
+        return Promise.resolve(new Response(JSON.stringify({ status: 'done', exit_code: 1, output: ['npm ERR! failed'] }), { status: 200 }))
+      }
+      if (u.includes('/run?id=run-retry-2')) {
+        // Second run stays running (we only care that the POST went out).
+        return Promise.resolve(new Response(JSON.stringify({ status: 'running', output: [] }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    // First click — provision fails.
+    fireEvent.click(screen.getByText('Provision'))
+    await waitFor(() => expect(screen.getByLabelText('Dismiss provision status')).toBeInTheDocument(), { timeout: 6000 })
+    // Dismiss the failure stepper.
+    fireEvent.click(screen.getByLabelText('Dismiss provision status'))
+    await waitFor(() => expect(screen.getByText('Provision')).toBeInTheDocument(), { timeout: 3000 })
+    // Retry — must succeed (guard was released in finally).
+    fireEvent.click(screen.getByText('Provision'))
+    await waitFor(() => expect(posts).toBe(2), { timeout: 4000 })
+  }, 20000)
+
+  it('guard cleans up cleanly after a successful provision so a subsequent provision can be started', async () => {
+    // After a successful run the stepper auto-clears and the row shows Provision
+    // again.  A click on that restored button must not be silently blocked by a
+    // stale guard entry.
+    let posts = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) {
+        // After success, fleet still shows has_dist:false so Provision is re-shown.
+        return Promise.resolve(new Response(JSON.stringify(FLEET_UNPROV), { status: 200 }))
+      }
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision')) {
+        posts++
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-ok-' + posts }), { status: 200 }))
+      }
+      if (u.includes('/run?id=')) {
+        return Promise.resolve(new Response(JSON.stringify({ status: 'done', exit_code: 0, output: ['done'] }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    renderWithProviders(<DevFleetPage />, { route: '/dev-fleet' })
+    await waitFor(() => expect(screen.getByText('unprov')).toBeInTheDocument())
+    // First provision succeeds and clears.
+    fireEvent.click(screen.getByText('Provision'))
+    await waitFor(() => expect(screen.getByText('Provision')).toBeInTheDocument(), { timeout: 6000 })
+    // Second provision — must not be silently swallowed.
+    fireEvent.click(screen.getByText('Provision'))
+    await waitFor(() => expect(posts).toBe(2), { timeout: 4000 })
+  }, 20000)
 })

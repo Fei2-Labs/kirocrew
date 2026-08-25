@@ -35,13 +35,14 @@ from kiro_crew.dashboard.chat_runner import _resolve_channel_target, _resolve_mi
 from kiro_crew.dashboard.chat_slack import list_slack_channels
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import (
     SLACK_NAMESPACE,
     UNBIND_REASON_DASHBOARD_UNLINK,
     ChannelLink,
     is_channel_session_key,
 )
-from kiro_crew.messaging.renderer import chunk_text
+from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform.governance_profiles import vet_and_audit
 from kiro_crew.sel import sel
@@ -111,9 +112,7 @@ def _resumes_inbound(transport: Any) -> bool:
     ``getattr`` chain is the conservative branch: a transport with no capability
     object at all degrades to outbound-only.
     """
-    return bool(
-        getattr(getattr(transport, "capabilities", None), "supports_session_resume", False)
-    )
+    return bool(getattr(getattr(transport, "capabilities", None), "supports_session_resume", False))
 
 
 async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
@@ -126,8 +125,15 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     conversation id is never accepted as a send target, so a session's transcript
     can only be anchored into a channel the user has actually configured. The
     target channel's transport must be registered at boot AND
-    ``supports_proactive_send`` — Telegram qualifies; WeCom, whose replies are
-    bound to an inbound token, does not.
+    ``supports_proactive_send``, which every shipped channel declares except
+    Feishu, whose v1 renderer can only reply to an inbound ``message_id``. WeCom
+    shows why that flag is necessary but not sufficient — its
+    availability is per-TARGET rather than blanket: ``aibot_send_msg`` needs no
+    token, but the platform only delivers into a conversation the user has already
+    written to, so ``configured_targets`` lists an allow-listed userid that has
+    never messaged the bot with a reason instead of offering it. What
+    ``resolve_configured_target`` rechecks here is MEMBERSHIP; deliverability is
+    WeCom's to answer, and it comes back on the send ACK.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info.get("name") or request.match_info.get("slot", "")
@@ -177,7 +183,13 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         if target is None:
             existing = state.sessions.get_mirror_link(session_key)
             if existing is None:
-                return web.json_response({"error": "channel_type required"}, status=400)
+                # Same condition, and so the same code, as the explicit-body
+                # check below: nothing names a channel. Two sites emitting one
+                # sentence must not carry two different machine contracts.
+                return web.json_response(
+                    {"error": "channel_type required", "code": "channel_type_required"},
+                    status=400,
+                )
             return web.json_response({"error": "mirror channel is not live"}, status=503)
         link, transport = target
         try:
@@ -201,9 +213,13 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         )
 
     if not channel_type:
-        return web.json_response({"error": "channel_type required"}, status=400)
+        return web.json_response(
+            {"error": "channel_type required", "code": "channel_type_required"}, status=400
+        )
     if channel_type == SLACK_NAMESPACE:
-        return web.json_response({"error": "use /slack-link for Slack"}, status=400)
+        return web.json_response(
+            {"error": "use /slack-link for Slack", "code": "use_slack_link"}, status=400
+        )
     if not target_id:
         return web.json_response(
             {"error": "target_id required", "code": "target_id_required"}, status=400
@@ -215,8 +231,14 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             status=503,
         )
     if not transport.capabilities.supports_proactive_send:
+        # The channel type stays in the advisory prose only. ``code`` is the
+        # stable contract, so it names the CONDITION and never interpolates a
+        # request value a client would have to parse back out.
         return web.json_response(
-            {"error": f"channel '{channel_type}' cannot mirror (no proactive send)"},
+            {
+                "error": f"channel '{channel_type}' cannot mirror (no proactive send)",
+                "code": "channel_not_proactive",
+            },
             status=400,
         )
     session_key = effective_session_key(slot)
@@ -350,13 +372,17 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     def _units_for(row: dict) -> list[str]:
         # redact_via_context is the canonical egress shim (a loaded companion's
         # extra credential regexes apply, not just the OSS baseline) and it never
-        # truncates. chunk_text at the transport's own limit matches how a normal
+        # truncates. Splitting at the transport's own limit matches how a normal
         # mirrored turn is delivered in _deliver_cross_surface_reply, so a long
         # message arrives in full instead of being cut at 2,000 chars. No Slack
         # mrkdwn conversion here: this path targets Telegram/Discord/Teams.
         speaker = "You" if row.get("role") == "user" else "Kiro Crew"
-        text = redact_via_context(backfill_content(row))
-        return chunk_text(f"{speaker}: {text}", max_chars)
+        # DISPLAY form, not just the byte scan: a catch-up row reaches the channel
+        # without passing a renderer, so a markdown-collapse credential would be
+        # reassembled whole by the client. Same floor and same context-aware
+        # redactor as the live legs in ``chat_runner``.
+        text, _ = redact_for_display(backfill_content(row), redact_via_context)
+        return split_markdown_safe(f"{speaker}: {text}", max_chars)
 
     # Bound the INLINE delivery. Unlike the Slack drain this cannot be
     # backgrounded -- the per-unit governance re-check below has to be able to
@@ -388,7 +414,7 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         every unit fits, but the reservation pushed the oldest turn out and then
         spent the reserved slot announcing the omission it had just caused.
         """
-        tail = recent_turn_units[total_turns - keep:] if keep else []
+        tail = recent_turn_units[total_turns - keep :] if keep else []
         dropped = total_turns - keep
         marker = 1 if (selection.skipped_turns or dropped) else 0
         head = len(head_units) if with_head else 0
@@ -412,7 +438,7 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     if not keep_turns and total_turns:
         keep_turns, include_head = 1, False
 
-    kept = recent_turn_units[total_turns - keep_turns:] if keep_turns else []
+    kept = recent_turn_units[total_turns - keep_turns :] if keep_turns else []
     skipped_total = (
         selection.skipped_turns
         + (total_turns - keep_turns)
@@ -642,9 +668,7 @@ async def api_chat_slot_mirror_unlink(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
 
     session_key = effective_session_key(slot)
-    cleared = state.sessions.clear_mirror_link(
-        session_key, reason=UNBIND_REASON_DASHBOARD_UNLINK
-    )
+    cleared = state.sessions.clear_mirror_link(session_key, reason=UNBIND_REASON_DASHBOARD_UNLINK)
     state.push_slots_update()
     sel().log_api_access(
         caller="dashboard",

@@ -115,13 +115,25 @@ class TestScreenshotEvidenceBodyLogic:
         gh.chmod(0o755)
         summary = tmp_path / "summary.md"
         summary.touch()
+        # HERMETIC env, not `**os.environ`. The step's outcome is decided entirely
+        # by environment variables, and inheriting the ambient one made that
+        # outcome depend on whatever else the process had been doing: `BASH_ENV`
+        # would make `bash -c` source a file before the script runs, and a stray
+        # `PATH`, `EXEMPT`, `LC_*` or `GH_*` value reaches the same branches the
+        # assertions read. Enumerating what the script needs is also self-documenting
+        # -- anything absent here is something the step must not depend on.
         env = {
-            **os.environ,
-            "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}",
+            # tmp_path first so the `gh` stub wins; the system dirs follow because
+            # the script needs printf/grep/cat and the stub's shell.
+            "PATH": f"{tmp_path}{os.pathsep}/usr/local/bin{os.pathsep}/usr/bin{os.pathsep}/bin",
             # Starve any real gh of credentials so a stub-resolution failure
             # can never turn into a live API call.
             "GH_TOKEN": "",
             "GITHUB_TOKEN": "",
+            # The patterns are ASCII and every fixture body is ASCII, so pin the
+            # collation rather than inheriting a locale that changes what `grep -i`
+            # and the `[[:space:]]` class match.
+            "LC_ALL": "C",
             "EXEMPT": exempt,
             "REPO": "example/repo",
             "PR": "1",
@@ -217,10 +229,7 @@ class TestCrossPlatform:
         wf = _read("cross-platform.yml")
         assert "deliberately NO" in wf, "the absence must stay documented"
         # No rule may actually grep for the encoding kwarg.
-        rule_lines = [
-            ln for ln in wf.splitlines()
-            if ln.lstrip().startswith("hits=")
-        ]
+        rule_lines = [ln for ln in wf.splitlines() if ln.lstrip().startswith("hits=")]
         assert rule_lines, "expected at least one scan rule"
         for ln in rule_lines:
             assert "encoding" not in ln, f"encoding rule reintroduced: {ln.strip()[:80]}"
@@ -246,7 +255,7 @@ class TestPrScope:
         # combination reviews badly.
         wf = _read("pr-scope.yml")
         assert '-gt "$MAX_AREAS" ] && [' in wf
-        assert 'MAX_LINES' in wf
+        assert "MAX_LINES" in wf
 
     def test_excludes_vendor_and_screenshots(self):
         wf = _read("pr-scope.yml")
@@ -255,23 +264,33 @@ class TestPrScope:
 
 
 class TestDesignReviewBlocks:
-    """A BLOCK verdict must reach the required `PR Readiness` status."""
+    """A BLOCK verdict must reach the required `PR Readiness` status.
 
-    def test_readiness_no_longer_force_passes_design_review(self):
-        # This is the whole point of the change: previously BOTH lanes did
-        # `passed+=("$label (advisory)")` for Design Review, so a red Design
-        # Review check still produced a green PR Readiness.
+    Design, UX and First Principles all gate now: a real BLOCK on any of the
+    three fails its own check, which `pr-readiness.yml` folds into the required
+    `PR Readiness` status. None may be force-passed into the advisory bucket.
+    """
+
+    def test_readiness_blocks_every_opinion_lane(self):
+        # The whole point of the promotion: the advisory bucket that used to
+        # force-pass UX and First Principles (and once Design too) is gone, so
+        # a red opinion lane now produces a red PR Readiness.
         wf = _read("pr-readiness.yml")
-        assert '"$label" = "Design Review" ] || [ "$label" = "UX Review"' not in wf, (
-            "Design Review must no longer share the UX advisory branch"
-        )
+        assert (
+            'passed+=("$label (advisory)")' not in wf
+        ), "no opinion lane may be force-passed; a BLOCK must reach readiness"
         assert 'failed+=("$label (BLOCK)")' in wf
 
-    def test_ux_review_stays_advisory(self):
-        # Only Design Review was promoted; UX keeps its advisory contract.
+    def test_all_three_lanes_share_the_one_blocking_branch(self):
+        # Both readers -- the fork check-run reader and the same-repo
+        # workflow-run reader -- must route all three lanes through the
+        # BLOCK-only failing branch, so the wiring cannot drift for one lane.
         wf = _read("pr-readiness.yml")
-        assert 'passed+=("$label (advisory)")' in wf
-        assert '[ "$label" = "UX Review" ]' in wf
+        branch = (
+            '[ "$label" = "Design Review" ] || [ "$label" = "UX Review" ] '
+            '|| [ "$label" = "First Principles Review" ]'
+        )
+        assert wf.count(branch) == 2, "both readiness readers must block all three lanes"
 
     @pytest.mark.parametrize("name", ["design-review.yml", "fork-design-review.yml"])
     def test_prompt_no_longer_claims_block_is_advisory(self, name):
@@ -320,14 +339,12 @@ def _flat(text: str) -> str:
 class TestAdvisoryLanesStateTheirRealAuthority:
     """A lane told its verdict is inert calibrates every borderline case down.
 
-    Each of these prompts opened by disclaiming authority the workflow does in
-    fact grant: a BLOCK verdict turns the lane's own check red, and for Design
-    it also fails `PR Readiness`. A reviewer that believes a BLOCK changes
-    nothing has no reason to spend one, so decidable defects settle on
-    CONCERNS -- the tier nothing gates on. The two families differ and the
-    prompts must not be levelled: Design blocks readiness, UX and First
-    Principles only redden their own check (`pr-readiness.yml` buckets both as
-    `passed (advisory)`), so claiming otherwise would swap one lie for another.
+    Each of these prompts once opened by disclaiming authority the workflow
+    does in fact grant. A reviewer that believes a BLOCK changes nothing has no
+    reason to spend one, so decidable defects settle on CONCERNS -- the tier
+    nothing gates on. Design, UX and First Principles now ALL fail `PR
+    Readiness` on a BLOCK, so every one of these prompts must state that
+    authority plainly rather than disclaim it.
     """
 
     @pytest.mark.parametrize("name", UX_LANES + DESIGN_LANES)
@@ -348,15 +365,18 @@ class TestAdvisoryLanesStateTheirRealAuthority:
         assert "blocks PR readiness" in _flat(_read(name))
 
     @pytest.mark.parametrize("name", UX_LANES)
-    def test_ux_prompt_claims_a_red_check_but_not_a_readiness_gate(self, name):
+    def test_ux_prompt_says_a_block_reaches_readiness(self, name):
+        # UX was promoted: the prompt must state the real authority a BLOCK now
+        # carries, and must not keep the old "does not gate" disclaimer that
+        # calibrated borderline calls down to CONCERNS.
         wf = _flat(_read(name))
-        assert "does not by itself gate PR readiness" in wf
-        assert "blocks PR readiness" not in wf
+        assert "blocks PR readiness" in wf
+        assert "does not by itself gate PR readiness" not in wf
 
-    def test_first_principles_claims_a_red_check_but_not_a_readiness_gate(self):
+    def test_first_principles_says_a_block_reaches_readiness(self):
         contract = _flat(_read_prompt(FP_CONTRACT))
-        assert "does not by itself gate PR readiness" in contract
-        assert "blocks PR readiness" not in contract
+        assert "blocks PR readiness" in contract
+        assert "does not by itself gate PR readiness" not in contract
 
     def test_first_principles_routes_a_block_grade_subtraction_to_blockers(self):
         # The observed failure: a conclusion meeting this lane's own strongest

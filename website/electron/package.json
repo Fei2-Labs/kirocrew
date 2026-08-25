@@ -1,6 +1,6 @@
 {
-  "name": "kirocrew-electron-mac",
-  "version": "0.3.0",
+  "name": "kirocrew-desktop",
+  "version": "0.5.0",
   "description": "Kiro Crew \u2014 AI agent desktop app",
   "homepage": "https://github.com/kirodotdev/KiroCrew",
   "desktopName": "kirocrew-desktop.desktop",
@@ -19,7 +19,7 @@
   "devDependencies": {
     "@electron/notarize": "^3.1.1",
     "electron": "^43.2.0",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "26.15.3"
   },
   "overrides": {
     "fast-uri": "3.1.5",
@@ -30,7 +30,7 @@
     "productName": "KiroCrew",
     "mac": {
       "category": "public.app-category.developer-tools",
-      "icon": "icon.png",
+      "icon": "icon.icns",
       "target": [
         "dmg",
         "zip"
@@ -43,7 +43,8 @@
       "x64ArchFiles": "{**/backend-dist/**,**/backend-dist/**/.*/**}",
       "extendInfo": {
         "CFBundleDisplayName": "Kiro Crew",
-        "NSMicrophoneUsageDescription": "Kiro Crew uses the microphone for voice input and dictation in chat. Audio is captured only while you hold or toggle the mic button."
+        "NSMicrophoneUsageDescription": "Kiro Crew uses the microphone for voice input and dictation in chat. Audio is captured only while you hold or toggle the mic button.",
+        "NSLocalNetworkUsageDescription": "Kiro Crew connects to devices on your local network so agent commands can reach your own servers, NAS, containers, and dev machines. Only the addresses a command names are contacted."
       }
     },
     "afterSign": "scripts/notarize.js",
@@ -107,6 +108,24 @@
       ]
     },
     "dmg": {
+      "background": "../../packaging/installer-assets/dmg-background.tiff",
+      "iconSize": 96,
+      "iconTextSize": 13,
+      "title": "${productName}",
+      "filesystem": "HFS+",
+      "contents": [
+        {
+          "x": 170,
+          "y": 246,
+          "type": "file"
+        },
+        {
+          "x": 490,
+          "y": 246,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ],
       "writeUpdateInfo": false
     },
     "files": [
@@ -120,30 +139,41 @@
       "instance-guard.js",
       "context-menu.js",
       "find-bin.js",
+      "mac-env.js",
+      "bundle-integrity.js",
       "data-home.js",
       "auto-update.js",
       "update-logger.js",
       "bundle-location.js",
       "gateway-auth-hint.js",
       "blocking-prompt.js",
+      "splash-history.js",
+      "hide-to-tray.js",
+      "html-fullscreen.js",
       "gateway-stop.js",
       "gateway-wait.js",
       "sandbox-profile.js",
+      "windows-port.js",
       "home-dir.js",
       "local-token.js",
       "local-gateway.js",
+      "mochi-session-token.js",
       "window-state.js",
       "linux-frame.js",
       "global-hotkey.js",
       "gateway-liveness.js",
       "gateway-recovery.js",
+      "renderer-recovery.js",
+    "pierre-perf-log.js",
       "pyspy-dump.js",
       "perf-metrics.js",
       "host-config.js",
+      "store-rename.js",
       "remote-token.js",
       "token-acquire.js",
       "token-retry.js",
       "display-media.js",
+      "focus-chrome.js",
       "permission-handler.js",
       "browser-view.js",
       "browser-control.js",
@@ -216,7 +246,9 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": false,
       "deleteAppDataOnUninstall": false,
-      "runAfterFinish": true
+      "runAfterFinish": true,
+      "installerSidebar": "../../packaging/installer-assets/windows-installer-sidebar.bmp",
+      "installerHeader": "../../packaging/installer-assets/windows-installer-header.bmp"
     }
   },
   "author": "Kiro Crew"

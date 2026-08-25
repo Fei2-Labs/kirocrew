@@ -4,7 +4,8 @@ vi.mock("@radix-ui/react-dropdown-menu", async () => await import("./__mocks__/@
 
 import { render, screen, fireEvent } from '@testing-library/react'
 import TrustDropdown from '../components/TrustDropdown'
-import { i18next } from '../i18n/index'
+// `/all` for the ja/ko/de/zh-CN catalogs: `../i18n` registers English only.
+import { i18next } from '../i18n/all'
 
 const btnClass = 'px-2 py-1 rounded text-sm'
 
@@ -33,6 +34,40 @@ describe('TrustDropdown', () => {
     expect(texts.some(t => t?.includes('ls /tmp'))).toBe(true)
     expect(texts.some(t => t?.includes('ls') && t?.includes('commands'))).toBe(true)
     expect(screen.getByText('Trust all tools')).toBeInTheDocument()
+  })
+
+  // The exact-command option is the one the user is most likely to misread: it
+  // grants an exact-string match, so a label that renders two different commands
+  // identically asks for consent to something unreadable.
+  it('does not render two long commands with the same label', () => {
+    const shot = (cmd: string) => {
+      const { unmount } = render(
+        <TrustDropdown fullCommand={cmd} baseCommand="gh" isShell className={btnClass} onAction={() => {}} />,
+      )
+      fireEvent.click(screen.getByText('Trust'))
+      const label = screen.getAllByRole('menuitem')[0].textContent ?? ''
+      unmount()
+      return label
+    }
+    const config = shot('gh api repos/owner/some-repository/contents/config.json --jq .sha')
+    const secrets = shot('gh api repos/owner/some-repository/contents/secrets.json --jq .sha')
+    expect(config).not.toBe(secrets)
+  })
+
+  it('carries the untruncated command as a tooltip so nothing is hidden', () => {
+    const cmd = 'gh api repos/owner/some-repository/contents/a/very/long/path/to/a/file.json'
+    render(<TrustDropdown fullCommand={cmd} baseCommand="gh" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    expect(screen.getAllByRole('menuitem')[0].querySelector(`[title="${cmd}"]`)).not.toBeNull()
+  })
+
+  it('grants the untruncated command, never the shortened label', () => {
+    const cmd = 'gh pr view 42 --repo owner/some-repository --json title,body,comments'
+    const onAction = vi.fn()
+    render(<TrustDropdown fullCommand={cmd} baseCommand="gh" isShell className={btnClass} onAction={onAction} />)
+    fireEvent.click(screen.getByText('Trust'))
+    fireEvent.click(screen.getAllByRole('menuitem')[0])
+    expect(onAction).toHaveBeenCalledWith('trust_command', cmd)
   })
 
   // Each locale orders the sentence around the operand differently — Japanese
@@ -93,14 +128,77 @@ describe('TrustDropdown', () => {
     expect(onAction).toHaveBeenCalledWith('trust')
   })
 
+  // The channels surface's `trust` decision is channel-wide and persisted, so
+  // it overrides the session-scoped default label with one naming the real
+  // grant. These pin both sides: the override renders, and the default is
+  // untouched when the prop is absent.
+  describe('trustAllLabelKey override', () => {
+    const channelKey = 'components.trustDropdown.trust_all_tools_channel'
+    const channelLabel = 'Trust all tools in this channel — persists across restarts'
+
+    it('renders the channel-scoped label instead of the default', () => {
+      render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell trustAllLabelKey={channelKey} className={btnClass} onAction={() => {}} />)
+      fireEvent.click(screen.getByText('Trust'))
+      expect(screen.getByText(channelLabel)).toBeInTheDocument()
+      // Exact-string match: the default label must not render alongside.
+      expect(screen.queryByText('Trust all tools')).not.toBeInTheDocument()
+    })
+
+    it('keeps the default label when the prop is absent', () => {
+      render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell className={btnClass} onAction={() => {}} />)
+      fireEvent.click(screen.getByText('Trust'))
+      expect(screen.getByText('Trust all tools')).toBeInTheDocument()
+      expect(screen.queryByText(channelLabel)).not.toBeInTheDocument()
+    })
+
+    it('still emits the plain trust action under the override', () => {
+      const onAction = vi.fn()
+      render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell trustAllLabelKey={channelKey} className={btnClass} onAction={onAction} />)
+      fireEvent.click(screen.getByText('Trust'))
+      fireEvent.click(screen.getByText(channelLabel))
+      expect(onAction).toHaveBeenCalledWith('trust')
+    })
+
+    it('resolves the override key through the active locale', async () => {
+      await i18next.changeLanguage('zh-CN')
+      render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell trustAllLabelKey={channelKey} className={btnClass} onAction={() => {}} />)
+      fireEvent.click(screen.getByRole('button'))
+      expect(screen.getByText('信任此频道中的所有工具 — 重启后仍然有效')).toBeInTheDocument()
+    })
+
+    // The shipped channels surface passes both props: no command tiers, and the
+    // remaining tier labelled with its real scope. Pinning the combination
+    // catches either prop silently disabling the other.
+    it('labels the sole remaining tier when the surface has no command', () => {
+      const onAction = vi.fn()
+      render(<TrustDropdown fullCommand="Researcher" baseCommand="Researcher" isShell={false} hasCommand={false} trustAllLabelKey={channelKey} className={btnClass} onAction={onAction} />)
+      fireEvent.click(screen.getByText('Trust'))
+      const items = screen.getAllByRole('menuitem')
+      expect(items).toHaveLength(1)
+      expect(items[0]).toHaveTextContent(channelLabel)
+      fireEvent.click(items[0])
+      expect(onAction).toHaveBeenCalledWith('trust')
+    })
+  })
+
   it('disables button when disabled prop is true', () => {
     render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell disabled className={btnClass} onAction={() => {}} />)
     expect(screen.getByText('Trust').closest('button')).toBeDisabled()
   })
 
-  it('truncates long command labels', () => {
-    const longCmd = 'find /very/long/path/to/directory -name "*.tsx" -exec grep -l something'
-    render(<TrustDropdown fullCommand={longCmd} baseCommand="find" isShell className={btnClass} onAction={() => {}} />)
+  it('truncates only PATHOLOGICAL command labels — ordinary long ones render whole', () => {
+    // The 256 ceiling only guards the menu layout against pathological input
+    // (a base64 blob, a megabyte one-liner); a realistic long command renders
+    // in full so the user can read exactly what they are trusting.
+    const ordinary = 'find /very/long/path/to/directory -name "*.tsx" -exec grep -l something'
+    const { unmount } = render(<TrustDropdown fullCommand={ordinary} baseCommand="find" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    expect(screen.queryByText(/…/)).not.toBeInTheDocument()
+    unmount()
+
+    const pathological = `find ${'/very/long/path/segment'.repeat(12)} -name "*.tsx" -exec grep -l something`
+    expect(pathological.length).toBeGreaterThan(256)
+    render(<TrustDropdown fullCommand={pathological} baseCommand="find" isShell className={btnClass} onAction={() => {}} />)
     fireEvent.click(screen.getByText('Trust'))
     expect(screen.getByText(/…/)).toBeInTheDocument()
   })
@@ -170,6 +268,45 @@ describe('TrustDropdown', () => {
     const cmdBtn = buttons.find(b => b.textContent?.includes('grep'))!
     fireEvent.click(cmdBtn)
     expect(onAction).toHaveBeenCalledWith('trust_command', "grep -r 'search term' /path/to/dir")
+  })
+})
+
+describe('TrustDropdown without a command (hasCommand=false)', () => {
+  // The channels surface titles its approval with an agent ROLE, not a
+  // command, and its backend accepts only approved/rejected/trust — so the
+  // command-scoped tiers must disappear entirely there.
+  it('offers only the plain session-trust action', () => {
+    render(<TrustDropdown fullCommand="Researcher" baseCommand="Researcher" isShell={false} hasCommand={false} className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0].textContent).toContain('Trust all tools')
+  })
+
+  it('hides trust_base even when the title happens to look like a shell command', () => {
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell hasCommand={false} className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0].textContent).not.toContain('commands')
+    expect(items[0].textContent).toContain('Trust all tools')
+  })
+
+  it('emits the plain trust decision with no pattern', () => {
+    const onAction = vi.fn()
+    render(<TrustDropdown fullCommand="Researcher" baseCommand="Researcher" isShell={false} hasCommand={false} className={btnClass} onAction={onAction} />)
+    fireEvent.click(screen.getByText('Trust'))
+    fireEvent.click(screen.getByText('Trust all tools'))
+    expect(onAction).toHaveBeenCalledTimes(1)
+    expect(onAction).toHaveBeenCalledWith('trust')
+  })
+
+  it('keeps every tier when hasCommand is not passed (command-bearing surfaces)', () => {
+    // Regression guard for the chat surface, which omits the prop: the
+    // default must stay true so all tiers keep rendering there.
+    render(<TrustDropdown fullCommand="ls /tmp" baseCommand="ls" isShell className={btnClass} onAction={() => {}} />)
+    fireEvent.click(screen.getByText('Trust'))
+    expect(screen.getAllByRole('menuitem')).toHaveLength(3)
   })
 })
 

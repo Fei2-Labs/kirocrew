@@ -35,6 +35,10 @@ from kiro_crew.subagent_persistence import (
     write_tombstone,
 )
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 # ── Fixtures ──────────────────────────────────────────────────────────
 
 
@@ -43,12 +47,6 @@ def agent_root(tmp_path, monkeypatch):
     """Point subagent persistence at a temp directory."""
     monkeypatch.setattr("kiro_crew.subagent_persistence._SUBAGENTS_DIR", tmp_path)
     return tmp_path
-
-
-@pytest.fixture(autouse=True)
-def _mock_memory_ok(monkeypatch):
-    """Prevent memory guard from refusing spawns on low-RAM build machines."""
-    monkeypatch.setattr("kiro_crew.subagent.check_memory_available", lambda **_kw: (True, 8.0))
 
 
 # ══════════════════════════════════════════════════════════════════════

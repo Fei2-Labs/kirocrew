@@ -33,6 +33,7 @@ Paths below are relative to `src/kiro_crew/`.
 | Usage cache TTLs | `dashboard/handlers/usage.py` | `_CACHE_TTL`, `_TOKEN_CACHE_TTL`, `_CONTEXT_CACHE_TTL`, `_TOKEN_HISTORY_DAYS`, `_CONTEXT_TOP_SESSIONS`. |
 | Webhook hook limits | `dashboard/handlers/hooks.py` | `_HOOK_MAX_CONCURRENT` (semaphore-backed, 429 past it), `_HOOK_MESSAGE_MAX_LEN`, `_HOOK_TIMEOUT_DEFAULT` / `_HOOK_TIMEOUT_MAX` (both prime, to avoid a thundering herd with cron intervals). |
 | Embed cache | `embeddings.py` | `_EMBED_CACHE_MAX` (128 entries, keyed by text plus model id; the comment there carries the memory arithmetic). |
+| Bytecode-cache GC limits | `pycache_gc.py` | `PYCACHE_MAX_AGE_DAYS`, `PYCACHE_MAX_TOTAL_BYTES`, `PYCACHE_GC_INTERVAL_SECS` (the `<data home>/cache/pycache` TTL, size cap, and periodic-sweep cadence). |
 | Slack UX strings and pacing | `slack/handler.py` | `_THINKING`, `_CURSOR`, `_NO_RESPONSE`, `_STATUS_WORKING`, `_TRUNCATION_MARKER`, plus `_EDIT_INTERVAL`, `_APPROVAL_TIMEOUT`, `_SLACK_SECTION_TEXT_LIMIT`, the stall thresholds and the phase debounce. |
 | Cross-cutting shared constants | `constants.py` | `KIROCREW_SPAWNED_ENV`, `ENV_TRUTHY`, `CHAT_TURN_TIMEOUT`, `COMPACT_WAIT_TIMEOUT_SECS` (one budget, shared by manual and automatic compaction), the `[OPTIONS:]` parse regexes, `DATA_WARNING`, `BANNER`. |
 | Gateway shutdown budget | `gateway_shutdown_budget.py` | Gateway cooperative timeout, service-manager signal margin, and the derived systemd/launchd stop deadline. |
@@ -49,6 +50,7 @@ Other style rules:
 | Python version | >= 3.10; `from __future__ import annotations` for type hints |
 | Imports | `import logging` plus `logger = logging.getLogger(__name__)` |
 | Async | `asyncio` throughout; `async def` for all I/O |
+| Module-global asyncio primitives | Never a bare `asyncio.Lock()`/`Event()`/`Queue()` at module scope — it binds to the import-time (or first-use) loop and raises `RuntimeError` from any other loop (Python 3.10+). Use `kiro_crew.loop_lock.LoopBoundLock` for locks, or create the primitive inside the coroutine. CI enforces this (`loop-bound-locks` gate). |
 | Dataclasses | `@dataclass` for data containers |
 | Errors | Custom exceptions in `acp/client.py`; return error strings at tool boundaries. See [error-handling](error-handling.md). |
 
@@ -73,14 +75,21 @@ Keep them concise. `_vendor/` (vendored third-party code) and pragma comments
 
 ## The lint pitfalls
 
-The blocking gates are isort, flake8 and mypy (`black --check` is not yet
-enabled). Run them before committing:
+The blocking gates are black (baselined), the subprocess-encoding gate (baselined), isort, flake8 and mypy. Run them before
+committing:
 
 ```bash
-black src/kiro_crew test && isort src/kiro_crew test
+python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py && isort src/kiro_crew test
 flake8 src/kiro_crew test && mypy src/kiro_crew
 python -m pytest
 ```
+
+`black --check` cannot be run bare: 1,420 files under `src/` and `test/` predate
+any enforcement, so a repo-wide run reformats ~95,800 lines. Those files are
+recorded in `.github/black-baseline.txt` and exempted; every other file must be
+clean, and a file that *becomes* clean must be pruned from the list, so it only
+ever shrinks. Format what you touched with
+`black --target-version py310 <paths>`, never the whole tree.
 
 | Gate | Rule | Detail |
 |---|---|---|
@@ -100,6 +109,30 @@ The formatter, linter and type-checker are pinned to exact versions in both
 `setup.cfg`'s `dev` extra and `pyproject.toml`'s `dependency-groups`, because
 black and mypy change their output across minor releases and a floating range
 makes a local venv disagree with CI. Bump them in lockstep.
+
+## Subprocess output is decoded explicitly
+
+A text-mode subprocess call (`text=True` / `universal_newlines=True`) without an
+explicit `encoding=` decodes the child's output with the locale's code page —
+UTF-8 on POSIX, the legacy ANSI code page on Windows, where any non-ASCII byte
+becomes mojibake (#3219). CI gates this with
+`scripts/check_subprocess_encoding.py` (AST-based, so multi-line calls are
+judged as one call), behind the shrink-only
+`.github/subprocess-encoding-baseline.txt`.
+
+For a child whose output encoding is knowable — `git`, `gh`, a Python
+interpreter we spawn running our own code — pin the decode with the shared
+definition in `kiro_crew.subprocess_utf8`: splat `**UTF8_TEXT` into the call
+(this keeps the call going through the module's own `subprocess` attribute, so
+tests that patch it by name keep intercepting — and it adds no new spawn
+primitive for `test_spawn_audit` to police). For a Python child, also pin the
+EMIT side with `env={**os.environ, "PYTHONIOENCODING": "utf-8"}`: piped stdout
+on Windows otherwise re-encodes with the ANSI code page before the decode ever
+sees it. Standalone scripts that cannot
+import the package write `encoding="utf-8", errors="replace"` inline. A child
+that genuinely writes in the console encoding (`ps`, `systeminfo`, user shells)
+keeps locale decoding and says so with an inline `# subprocess-encoding: locale`
+marker — an audit trail, not an escape hatch.
 
 ## Frontend
 

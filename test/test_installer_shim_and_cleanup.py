@@ -1,34 +1,36 @@
-"""Red->green harness for the KiroCrew installer fixes.
+"""Regression gates for the packaged-install path of the Kiro Crew installer.
 
-These tests pin down the two defects that silently degrade the *packaged*
-(PyInstaller / Electron) install — the dev/source tree masks both:
+Two properties only a *packaged* install can violate — a dev or source tree
+satisfies both by accident, which is why these gates exist:
 
-Defect A — frozen-app binary resolution
-    ``_resolve_kirocrew_bin()`` walks the source tree for ``bin/kirocrew`` and
-    consults ``PATH``, but never looks at ``sys.executable``.  In the shipped
-    app the package lives at ``.../kirocrew-backend/_internal/kiro_crew`` and
-    the executable is ``kirocrew-backend`` (not ``bin/kirocrew``), so every
-    step misses and it falls back to the bare string ``"kirocrew"``.  Because
-    that bare command is not on ``PATH``, ``build_agent_config`` /
-    ``rebuild_agent_config`` then DROP ``kirocrew-core`` and ``kirocrew-cron``
-    — taking ``spawn_run``, ``cron_add``, ``learn_add`` … offline.
+Property A — the packaged launcher must resolve
+    ``_resolve_kirocrew_bin()`` reaches the desktop bundle's launcher by walking
+    up from ``kiro_crew.__file__``: the bundle is a python-build-standalone
+    interpreter tree carrying the package under ``lib/*/site-packages`` and
+    exposing a launcher at its root. When that walk misses, the resolver falls
+    back to the bare string ``"kirocrew"`` — which is not on ``PATH`` inside a
+    bundle — and ``build_agent_config`` / ``rebuild_agent_config`` then DROP
+    ``kirocrew-core`` and ``kirocrew-cron``, taking ``spawn_run``, ``cron_add``,
+    ``learn_add`` … offline.
 
-    NOTE: a live ``kirocrew mcp-core`` stdio handshake would PASS even with the
-    bug present (the server code is healthy — it just never gets launched).
-    The real regression gate is at the *resolution / wiring* level, which is
-    what these tests assert: the managed-server command must be an absolute,
-    existing, executable path so the validation loop keeps it.
+    NOTE: a live ``kirocrew mcp-core`` stdio handshake PASSES even when this is
+    broken — the server code is healthy, it just never gets launched. The gate
+    is at the *resolution / wiring* level, which is what these tests assert: the
+    managed-server command must be an absolute, existing, executable path so the
+    validation loop keeps it.
 
 Defect B — stale predecessor MCP entries
-    ``clean_stale_managed_mcp()`` only removes ``kirocrew-*`` entries, so the
-    MeshClaw predecessor's ``meshclaw-core`` / ``meshclaw-cron`` entries (left
-    in ``~/.kiro/settings/mcp.json`` by the rename) are never purged.
+    ``clean_stale_managed_mcp()`` only removes ``kirocrew-*`` entries unless an
+    edition registers a superseded agent through the import-source seam — those
+    entries point at a runtime that no longer exists and are purgeable by the
+    edition that replaced them.
 
 Both tests FAIL against the pre-fix code, proving they catch the real bug.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -38,8 +40,13 @@ from unittest.mock import patch
 
 import pytest
 
+import kiro_crew
 import kiro_crew.agent as agent
 import kiro_crew.mcp_cleanup as mcp_cleanup
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.platform.bootstrap import build_default_context
+from kiro_crew.platform.context import reset_context, set_context
+from kiro_crew.platform.interfaces import ImportSource
 
 # The ~/.local/bin symlink shim is POSIX-only: ensure_kirocrew_on_path returns
 # early on Windows (pip's Scripts\kirocrew.exe is the launcher there, and a
@@ -53,14 +60,56 @@ _posix_shim_only = pytest.mark.skipif(
 
 
 # --------------------------------------------------------------------------
+# import-source seam — register a superseded predecessor in tests
+# --------------------------------------------------------------------------
+def _install_superseded(
+    managed_mcp_names: tuple[str, ...] = (),
+    stale_mcp_binaries: tuple[str, ...] = (),
+) -> None:
+    """Register a superseded predecessor through the import-source seam."""
+
+    class _Provider:
+        def import_sources(self) -> list[ImportSource]:
+            return [
+                ImportSource(
+                    id="predecessor",
+                    display_name="Predecessor",
+                    env_vars=("PREDECESSOR_HOME",),
+                    home_dir=".predecessor",
+                    managed_mcp_names=managed_mcp_names,
+                    stale_mcp_binaries=stale_mcp_binaries,
+                    superseded=True,
+                )
+            ]
+
+    base = build_default_context(KiroCrewConfig())
+    set_context(dataclasses.replace(base, import_sources=_Provider()))
+
+
+@pytest.fixture(autouse=True)
+def _clean_context():
+    """Reset the platform context after every test so registrations don't leak."""
+    yield
+    reset_context()
+
+
+# --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-def _fake_frozen_exe(tmp_path: Path) -> Path:
-    """A real, executable stand-in for the bundled ``kirocrew-backend``."""
-    exe = tmp_path / "kirocrew-backend"
-    exe.write_text("#!/bin/sh\nexit 0\n")
-    exe.chmod(0o755)
-    return exe
+def _fake_bundle_launcher(tmp_path: Path) -> Path:
+    """The desktop bundle's launcher, at the root of a python-build-standalone tree.
+
+    The path comes from :func:`agent._kirocrew_bin_subpath`, the same helper the
+    resolver uses, so the fixture cannot drift from the layout under test (or from
+    the per-OS naming: ``bin/kirocrew`` on POSIX, ``Scripts\\kirocrew.exe`` on
+    Windows).
+    """
+    root = tmp_path / "backend-dist" / "kirocrew-backend"
+    launcher = agent._kirocrew_bin_subpath(root)
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    return launcher
 
 
 def _bundled_defaults(tmp_path: Path) -> Path:
@@ -80,16 +129,23 @@ def _bundled_defaults(tmp_path: Path) -> Path:
     return cfg_dir
 
 
-def _simulate_frozen_app(monkeypatch, exe: Path) -> None:
-    """Make the running process look like the shipped PyInstaller app:
-    a real ``sys.executable``, nothing usable in the source tree, and no
-    ``kirocrew`` on PATH."""
+def _simulate_bundled_app(monkeypatch, launcher: Path) -> None:
+    """Make the running process look like the shipped desktop app.
+
+    Nothing marks the bundle at runtime — it is an ordinary python-build-standalone
+    interpreter — so what distinguishes it is WHERE the package sits: the
+    resolver's walk-up from ``kiro_crew.__file__`` is what reaches the bundle's
+    launcher. Point the package at the bundle's ``site-packages`` so that walk runs
+    against the shipped layout, reject every other candidate so the test does not
+    depend on the tree it runs in, and leave nothing named ``kirocrew`` on PATH.
+    """
+    root = launcher.parent.parent
+    pkg_init = root / "lib" / "python3.12" / "site-packages" / "kiro_crew" / "__init__.py"
+    pkg_init.parent.mkdir(parents=True, exist_ok=True)
+    pkg_init.touch()
     monkeypatch.setattr(agent, "_KIROCREW_BIN", "", raising=False)
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", str(exe))
-    # No `bin/kirocrew` / `.venv/bin/kirocrew` is usable (force the dev tree
-    # candidates to be rejected so the test is independent of where it runs).
-    monkeypatch.setattr(agent, "_bin_is_usable", lambda p: str(p) == str(exe))
+    monkeypatch.setattr(kiro_crew, "__file__", str(pkg_init))
+    monkeypatch.setattr(agent, "_bin_is_usable", lambda p: str(p) == str(launcher))
     # `kirocrew` is not on PATH; only absolute paths resolve.
     monkeypatch.setattr(
         agent.shutil, "which", lambda c, **kw: c if str(c).startswith("/") else None
@@ -99,29 +155,30 @@ def _simulate_frozen_app(monkeypatch, exe: Path) -> None:
 # --------------------------------------------------------------------------
 # Defect A — resolver
 # --------------------------------------------------------------------------
-def test_resolver_prefers_frozen_executable(tmp_path, monkeypatch):
-    """In a frozen app, the resolver must return ``sys.executable`` (the
-    bundled ``kirocrew-backend``) instead of the bare ``"kirocrew"``."""
-    exe = _fake_frozen_exe(tmp_path)
-    _simulate_frozen_app(monkeypatch, exe)
+def test_resolver_finds_the_bundled_launcher(tmp_path, monkeypatch):
+    """In the desktop bundle, the walk-up from the package must reach the
+    bundle's own launcher instead of the bare ``"kirocrew"`` sentinel."""
+    launcher = _fake_bundle_launcher(tmp_path)
+    _simulate_bundled_app(monkeypatch, launcher)
 
     resolved = agent._resolve_kirocrew_bin()
 
-    assert resolved == str(exe), (
-        "frozen app must resolve to sys.executable, not bare 'kirocrew' " f"(got {resolved!r})"
+    assert resolved == str(launcher), (
+        "bundled app must resolve to its own launcher, not bare 'kirocrew' "
+        f"(got {resolved!r})"
     )
 
 
 # --------------------------------------------------------------------------
 # Defect A — managed servers survive (no longer dropped)
 # --------------------------------------------------------------------------
-def test_managed_servers_survive_in_frozen_app(tmp_path, monkeypatch):
+def test_managed_servers_survive_in_the_desktop_bundle(tmp_path, monkeypatch):
     """build_agent_config() must give kirocrew-core/kirocrew-cron an absolute,
     existing, executable command — the exact predicate the rebuild validation
     loop uses to KEEP (vs. drop) a server."""
-    exe = _fake_frozen_exe(tmp_path)
+    launcher = _fake_bundle_launcher(tmp_path)
     cfg_dir = _bundled_defaults(tmp_path)
-    _simulate_frozen_app(monkeypatch, exe)
+    _simulate_bundled_app(monkeypatch, launcher)
 
     with ExitStack() as stack:
         stack.enter_context(
@@ -144,57 +201,12 @@ def test_managed_servers_survive_in_frozen_app(tmp_path, monkeypatch):
     for name in ("kirocrew-core", "kirocrew-cron"):
         assert name in servers, f"{name} missing from generated config"
         cmd = servers[name]["command"]
-        assert cmd == str(exe), f"{name} command should be the frozen exe, got {cmd!r}"
+        assert cmd == str(launcher), f"{name} command should be the bundle launcher, got {cmd!r}"
         # This is the literal keep-condition from rebuild_agent_config's
         # validation loop; if it fails the server would be DROPPED.
         assert (
             os.path.isabs(cmd) and os.path.isfile(cmd) and os.access(cmd, os.X_OK)
-        ), f"{name} command {cmd!r} would be DROPPED by validation in the frozen app"
-
-
-# --------------------------------------------------------------------------
-# Defect B — stale meshclaw-* purge
-# --------------------------------------------------------------------------
-def test_cleanup_purges_meshclaw_predecessor_entries(tmp_path, monkeypatch):
-    """clean_stale_managed_mcp() must remove the predecessor's meshclaw-core /
-    meshclaw-cron entries (and the kirocrew-* ones) while preserving genuine
-    user-installed servers."""
-    mcp_path = tmp_path / "mcp.json"
-    mcp_path.write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "kirocrew-core": {"command": "kirocrew", "args": ["mcp-core"]},
-                    "kirocrew-cron": {"command": "kirocrew", "args": ["mcp-cron"]},
-                    "meshclaw-core": {
-                        "command": "/old/MeshClaw/bin/meshclaw",
-                        "args": ["mcp-core"],
-                    },
-                    "meshclaw-cron": {
-                        "command": "/old/MeshClaw/bin/meshclaw",
-                        "args": ["mcp-cron"],
-                    },
-                    "ai-community-slack-mcp": {
-                        "command": "ai-community-slack-mcp",
-                        "args": [],
-                    },
-                }
-            },
-            indent=2,
-        )
-    )
-    monkeypatch.setattr(mcp_cleanup, "_KIRO_MCP_JSON", mcp_path)
-
-    removed = mcp_cleanup.clean_stale_managed_mcp()
-    remaining = set(json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"])
-
-    assert "meshclaw-core" not in remaining, "stale meshclaw-core not purged"
-    assert "meshclaw-cron" not in remaining, "stale meshclaw-cron not purged"
-    assert "kirocrew-core" not in remaining
-    assert "kirocrew-cron" not in remaining
-    # genuine user-installed server must be preserved
-    assert "ai-community-slack-mcp" in remaining, "purge must not touch user servers"
-    assert {"meshclaw-core", "meshclaw-cron"} <= set(removed)
+        ), f"{name} command {cmd!r} would be DROPPED by validation in the bundle"
 
 
 # --------------------------------------------------------------------------
@@ -202,10 +214,10 @@ def test_cleanup_purges_meshclaw_predecessor_entries(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 @_posix_shim_only
 def test_ensure_kirocrew_on_path_creates_shim(tmp_path, monkeypatch):
-    """A frozen app with no `kirocrew` on PATH must get a shim pointing at the
-    bundled binary."""
-    exe = _fake_frozen_exe(tmp_path)
-    _simulate_frozen_app(monkeypatch, exe)
+    """A bundled app with no `kirocrew` on PATH must get a shim pointing at the
+    bundle's launcher."""
+    exe = _fake_bundle_launcher(tmp_path)
+    _simulate_bundled_app(monkeypatch, exe)
     bin_dir = tmp_path / "localbin"
 
     created = agent.ensure_kirocrew_on_path(bin_dir=bin_dir)
@@ -220,8 +232,8 @@ def test_ensure_kirocrew_on_path_creates_shim(tmp_path, monkeypatch):
 @_posix_shim_only
 def test_ensure_kirocrew_on_path_idempotent(tmp_path, monkeypatch):
     """Re-running setup when the shim is already correct is a no-op."""
-    exe = _fake_frozen_exe(tmp_path)
-    _simulate_frozen_app(monkeypatch, exe)
+    exe = _fake_bundle_launcher(tmp_path)
+    _simulate_bundled_app(monkeypatch, exe)
     bin_dir = tmp_path / "localbin"
 
     assert agent.ensure_kirocrew_on_path(bin_dir=bin_dir) is not None
@@ -249,6 +261,7 @@ def test_ensure_kirocrew_on_path_is_noop_on_windows(tmp_path, monkeypatch):
 # run_first_run_setup() delivers both automatically.
 # --------------------------------------------------------------------------
 def _seed_global_mcp(path: Path) -> None:
+    """Write a global mcp.json with stale predecessor entries for first-run tests."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
@@ -256,12 +269,12 @@ def _seed_global_mcp(path: Path) -> None:
                 "mcpServers": {
                     "kirocrew-core": {"command": "kirocrew", "args": ["mcp-core"]},
                     "kirocrew-cron": {"command": "kirocrew", "args": ["mcp-cron"]},
-                    "meshclaw-core": {
-                        "command": "/old/MeshClaw/bin/meshclaw",
+                    "predecessor-core": {
+                        "command": "/old/Predecessor/bin/predecessor",
                         "args": ["mcp-core"],
                     },
-                    "meshclaw-cron": {
-                        "command": "/old/MeshClaw/bin/meshclaw",
+                    "predecessor-cron": {
+                        "command": "/old/Predecessor/bin/predecessor",
                         "args": ["mcp-cron"],
                     },
                     "ai-community-slack-mcp": {"command": "ai-community-slack-mcp", "args": []},
@@ -281,14 +294,19 @@ def _sandbox_first_run(tmp_path, monkeypatch, exe):
     monkeypatch.setattr(agent, "_migrations_dir", lambda: mig)
     monkeypatch.setattr(agent, "_stale_mcp_purge_marker", lambda: marker)
     monkeypatch.setattr(mcp_cleanup, "_KIRO_MCP_JSON", mcp)
-    _simulate_frozen_app(monkeypatch, exe)
+    _simulate_bundled_app(monkeypatch, exe)
     return marker, mcp
 
 
 def test_first_run_delivers_shim_and_purge(tmp_path, monkeypatch):
-    exe = _fake_frozen_exe(tmp_path)
+    exe = _fake_bundle_launcher(tmp_path)
     marker, mcp = _sandbox_first_run(tmp_path, monkeypatch, exe)
     _seed_global_mcp(mcp)
+    # Register a superseded predecessor so its entries are purgeable.
+    _install_superseded(
+        managed_mcp_names=("predecessor-core", "predecessor-cron"),
+        stale_mcp_binaries=("predecessor",),
+    )
 
     agent.run_first_run_setup()
 
@@ -297,7 +315,7 @@ def test_first_run_delivers_shim_and_purge(tmp_path, monkeypatch):
     assert link.is_symlink() and os.path.realpath(link) == os.path.realpath(exe)
     # stale managed entries purged, genuine user server preserved
     remaining = set(json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"])
-    assert {"meshclaw-core", "meshclaw-cron", "kirocrew-core", "kirocrew-cron"}.isdisjoint(
+    assert {"predecessor-core", "predecessor-cron", "kirocrew-core", "kirocrew-cron"}.isdisjoint(
         remaining
     )
     assert "ai-community-slack-mcp" in remaining
@@ -306,26 +324,32 @@ def test_first_run_delivers_shim_and_purge(tmp_path, monkeypatch):
 
 
 def test_first_run_purge_is_one_time(tmp_path, monkeypatch):
-    exe = _fake_frozen_exe(tmp_path)
+    exe = _fake_bundle_launcher(tmp_path)
     marker, mcp = _sandbox_first_run(tmp_path, monkeypatch, exe)
     # Already migrated: marker present.
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("done\n")
     # A stale entry reappears after migration (e.g. user re-imports old config).
     _seed_global_mcp(mcp)
+    # Register the predecessor so entries would be purgeable if the marker
+    # were absent — proves the marker blocks the purge, not the lack of a source.
+    _install_superseded(
+        managed_mcp_names=("predecessor-core", "predecessor-cron"),
+        stale_mcp_binaries=("predecessor",),
+    )
     before = mcp.read_text(encoding="utf-8")
 
     agent.run_first_run_setup()
 
     # purge must NOT run again — global mcp.json untouched, stale entries stay
     assert mcp.read_text(encoding="utf-8") == before
-    assert "meshclaw-core" in set(json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"])
+    assert "predecessor-core" in set(json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"])
     # but the shim is still ensured on every start
     assert (tmp_path / ".local" / "bin" / "kirocrew").is_symlink()
 
 
 def test_first_run_is_best_effort(tmp_path, monkeypatch):
-    exe = _fake_frozen_exe(tmp_path)
+    exe = _fake_bundle_launcher(tmp_path)
     marker, mcp = _sandbox_first_run(tmp_path, monkeypatch, exe)
     _seed_global_mcp(mcp)
 
@@ -343,17 +367,19 @@ def test_first_run_is_best_effort(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Resolver: the frozen branch must NOT hijack non-frozen (source/dev) installs
+# Resolver: the running interpreter is never the answer
 # --------------------------------------------------------------------------
-def test_resolver_nonfrozen_ignores_sys_executable(tmp_path, monkeypatch):
+def test_resolver_never_returns_the_interpreter(tmp_path, monkeypatch):
+    """The resolver must return a ``kirocrew`` launcher, never whatever
+    interpreter happens to be running — a source install with the launcher only
+    on PATH must resolve through PATH."""
     path_bin = tmp_path / "kirocrew"
     path_bin.write_text("#!/bin/sh\n")
     path_bin.chmod(0o755)
-    interp = tmp_path / "python-interp"  # sys.executable when NOT frozen
+    interp = tmp_path / "python-interp"  # the running interpreter
     interp.write_text("x")
     interp.chmod(0o755)
     monkeypatch.setattr(agent, "_KIROCREW_BIN", "", raising=False)
-    monkeypatch.setattr(sys, "frozen", False, raising=False)
     monkeypatch.setattr(sys, "executable", str(interp))
     # venv + bin-walk find nothing usable; only PATH resolves to path_bin.
     monkeypatch.setattr(agent, "_bin_is_usable", lambda p: str(p) == str(path_bin))
@@ -363,7 +389,7 @@ def test_resolver_nonfrozen_ignores_sys_executable(tmp_path, monkeypatch):
 
     resolved = agent._resolve_kirocrew_bin()
     assert resolved == str(path_bin)
-    assert resolved != str(interp), "frozen branch must not fire when not frozen"
+    assert resolved != str(interp), "the resolver must not return sys.executable"
 
 
 # --------------------------------------------------------------------------
@@ -371,7 +397,6 @@ def test_resolver_nonfrozen_ignores_sys_executable(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 def test_ensure_shim_noop_when_no_binary(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "_KIROCREW_BIN", "", raising=False)
-    monkeypatch.setattr(sys, "frozen", False, raising=False)
     monkeypatch.setattr(agent, "_bin_is_usable", lambda p: False)
     monkeypatch.setattr(agent.shutil, "which", lambda c, **kw: None)
     bin_dir = tmp_path / "localbin"
@@ -381,8 +406,8 @@ def test_ensure_shim_noop_when_no_binary(tmp_path, monkeypatch):
 
 @_posix_shim_only
 def test_ensure_shim_refreshes_stale_symlink(tmp_path, monkeypatch):
-    exe = _fake_frozen_exe(tmp_path)
-    _simulate_frozen_app(monkeypatch, exe)
+    exe = _fake_bundle_launcher(tmp_path)
+    _simulate_bundled_app(monkeypatch, exe)
     bin_dir = tmp_path / "localbin"
     bin_dir.mkdir()
     stale = tmp_path / "old-binary"
@@ -396,10 +421,8 @@ def test_ensure_shim_refreshes_stale_symlink(tmp_path, monkeypatch):
 
 
 def test_ensure_shim_noop_when_already_on_path(tmp_path, monkeypatch):
-    exe = _fake_frozen_exe(tmp_path)
+    exe = _fake_bundle_launcher(tmp_path)
     monkeypatch.setattr(agent, "_KIROCREW_BIN", "", raising=False)
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", str(exe))
     monkeypatch.setattr(agent, "_bin_is_usable", lambda p: str(p) == str(exe))
     # `kirocrew` already resolves on PATH to the SAME binary.
     monkeypatch.setattr(
@@ -442,7 +465,6 @@ def _checkout_with_kirocrew(root: Path, *, linked_worktree: bool, bare_parent: b
 def _resolve_to(monkeypatch, binary: Path) -> None:
     """Make resolution land on *binary* and leave nothing else on PATH."""
     monkeypatch.setattr(agent, "_KIROCREW_BIN", "", raising=False)
-    monkeypatch.setattr(sys, "frozen", False, raising=False)
     monkeypatch.setattr(agent, "_resolve_kirocrew_bin", lambda: str(binary))
     monkeypatch.setattr(agent.shutil, "which", lambda c, **kw: None)
 
@@ -587,20 +609,14 @@ def test_clean_stale_no_stale_leaves_file_untouched(tmp_path, monkeypatch):
     assert p.read_text(encoding="utf-8") == content  # not rewritten when nothing to remove
 
 
-def test_clean_stale_purges_meshclaw_command_playwright(tmp_path, monkeypatch):
+def test_clean_stale_purges_deleted_playwright_proxy(tmp_path, monkeypatch):
+    """The deleted mcp-playwright-proxy verb is matched by argv, not by server
+    name — so an operator's own playwright server (launched via npx) survives."""
     p = tmp_path / "mcp.json"
     p.write_text(
         json.dumps(
             {
                 "mcpServers": {
-                    "npm:@playwright/mcp": {
-                        "command": "/Users/x/workspace/MeshClaw/env/MeshClaw-1.0/runtime/bin/meshclaw",
-                        "args": [
-                            "mcp-playwright-proxy",
-                            "--config",
-                            "/Users/x/.meshclaw/playwright-config.json",
-                        ],
-                    },
                     "@playwright/mcp": {"command": "kirocrew", "args": ["mcp-playwright-proxy"]},
                     # Launched by kirocrew but with a verb that still EXISTS,
                     # and deliberately NOT one of KIROCREW_BIN_MCP_SERVERS (those
@@ -619,50 +635,15 @@ def test_clean_stale_purges_meshclaw_command_playwright(tmp_path, monkeypatch):
     removed = mcp_cleanup.clean_stale_managed_mcp()
     remaining = set(json.loads(p.read_text(encoding="utf-8"))["mcpServers"])
 
-    assert "npm:@playwright/mcp" not in remaining  # stale meshclaw-command entry purged
-    assert "npm:@playwright/mcp" in removed
-    # Was "the live kirocrew proxy kept". It is no longer live: the
-    # `mcp-playwright-proxy` verb was deleted with the proxy, so this entry now
-    # launches a command that does not exist and takes every kiro-cli session
-    # down with a ModuleNotFoundError. Purging it IS the upgrade path.
+    # The deleted playwright proxy entry is purged by argv token.
     assert "@playwright/mcp" not in remaining
     assert "@playwright/mcp" in removed
     assert "operator-own-server" in remaining  # other kirocrew-launched verb kept
     assert "ai-community-slack-mcp" in remaining  # user server kept
 
 
-def test_clean_stale_purges_windows_exe_predecessor_command(tmp_path, monkeypatch):
-    """On Windows the predecessor console script is ``meshclaw.exe``; the
-    by-command purge must match after stripping the launcher suffix, or a stale
-    proxy pointing at a Windows predecessor binary survives on a supported
-    platform."""
-    p = tmp_path / "mcp.json"
-    p.write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "npm:@playwright/mcp": {
-                        "command": r"C:\Users\x\MeshClaw\.venv\Scripts\meshclaw.exe",
-                        "args": ["mcp-playwright-proxy"],
-                    },
-                    "ai-community-slack-mcp": {"command": "ai-community-slack-mcp", "args": []},
-                }
-            },
-            indent=2,
-        )
-    )
-    monkeypatch.setattr(mcp_cleanup, "_KIRO_MCP_JSON", p)
-
-    removed = mcp_cleanup.clean_stale_managed_mcp()
-    remaining = set(json.loads(p.read_text(encoding="utf-8"))["mcpServers"])
-
-    assert "npm:@playwright/mcp" not in remaining  # meshclaw.exe command matched by stem
-    assert "npm:@playwright/mcp" in removed
-    assert "ai-community-slack-mcp" in remaining  # user server kept
-
-
 def test_first_run_no_global_mcp(tmp_path, monkeypatch):
-    exe = _fake_frozen_exe(tmp_path)
+    exe = _fake_bundle_launcher(tmp_path)
     marker, mcp = _sandbox_first_run(tmp_path, monkeypatch, exe)
     # No global mcp.json at all (clean fresh install).
     agent.run_first_run_setup()
@@ -886,11 +867,11 @@ def test_launcher_naming_no_interpreter_stays_usable(tmp_path):
 # desktop shell) puts a wheel launcher and a package launcher on ONE machine,
 # and `ensure_kirocrew_on_path` runs on every gateway start.
 # --------------------------------------------------------------------------
-def _simulate_frozen_app_honest(monkeypatch, tmp_path, exe):
-    """``_simulate_frozen_app``, but launchers under *tmp_path* are judged for real.
+def _simulate_bundled_app_honest(monkeypatch, tmp_path, exe):
+    """``_simulate_bundled_app``, but launchers under *tmp_path* are judged for real.
 
-    The shared helper stubs ``_bin_is_usable`` to accept ONLY the frozen exe. That
-    is right for the resolver tests -- it makes them independent of whatever dev
+    The shared helper stubs ``_bin_is_usable`` to accept ONLY the bundle launcher.
+    That is right for the resolver tests -- it makes them independent of whatever dev
     tree they run in -- but wrong for these, which turn entirely on whether
     ANOTHER install's launcher is judged alive or dead. A stub that calls every
     foreign launcher dead would report ownership working while the product still
@@ -898,7 +879,7 @@ def _simulate_frozen_app_honest(monkeypatch, tmp_path, exe):
     from the real predicate.
     """
     real_usable = agent._bin_is_usable
-    _simulate_frozen_app(monkeypatch, exe)
+    _simulate_bundled_app(monkeypatch, exe)
     monkeypatch.setattr(
         agent,
         "_bin_is_usable",
@@ -927,8 +908,8 @@ def test_gateway_start_leaves_another_installs_working_launcher(tmp_path, monkey
     so claiming the name would make the last install to boot win -- and the other
     installer's upgrades would then land on a path nothing points at.
     """
-    exe = _fake_frozen_exe(tmp_path)
-    _simulate_frozen_app_honest(monkeypatch, tmp_path, exe)
+    exe = _fake_bundle_launcher(tmp_path)
+    _simulate_bundled_app_honest(monkeypatch, tmp_path, exe)
     foreign = _foreign_working_launcher(tmp_path)
     bin_dir = tmp_path / "localbin"
     bin_dir.mkdir()
@@ -942,8 +923,8 @@ def test_gateway_start_leaves_another_installs_working_launcher(tmp_path, monkey
 @_posix_shim_only
 def test_explicit_setup_claims_the_name(tmp_path, monkeypatch):
     """`kirocrew setup` names an install deliberately, so it MAY take over."""
-    exe = _fake_frozen_exe(tmp_path)
-    _simulate_frozen_app_honest(monkeypatch, tmp_path, exe)
+    exe = _fake_bundle_launcher(tmp_path)
+    _simulate_bundled_app_honest(monkeypatch, tmp_path, exe)
     foreign = _foreign_working_launcher(tmp_path)
     bin_dir = tmp_path / "localbin"
     bin_dir.mkdir()
@@ -959,8 +940,8 @@ def test_explicit_setup_claims_the_name(tmp_path, monkeypatch):
 @_posix_shim_only
 def test_gateway_start_repairs_a_dangling_launcher(tmp_path, monkeypatch):
     """Filling a BROKEN slot is the whole point -- ownership must not block it."""
-    exe = _fake_frozen_exe(tmp_path)
-    _simulate_frozen_app_honest(monkeypatch, tmp_path, exe)
+    exe = _fake_bundle_launcher(tmp_path)
+    _simulate_bundled_app_honest(monkeypatch, tmp_path, exe)
     bin_dir = tmp_path / "localbin"
     bin_dir.mkdir()
     link = bin_dir / "kirocrew"
@@ -979,8 +960,8 @@ def test_gateway_start_replaces_launcher_whose_interpreter_vanished(tmp_path, mo
     This is the shape that made the live host's `kirocrew` fail -- a readable,
     executable console script whose interpreter no longer exists.
     """
-    exe = _fake_frozen_exe(tmp_path)
-    _simulate_frozen_app_honest(monkeypatch, tmp_path, exe)
+    exe = _fake_bundle_launcher(tmp_path)
+    _simulate_bundled_app_honest(monkeypatch, tmp_path, exe)
     stale_bin = tmp_path / "reaped-venv" / "bin"
     stale_bin.mkdir(parents=True)
     stale = stale_bin / "kirocrew"
@@ -1037,9 +1018,9 @@ def test_gateway_start_does_not_shadow_a_working_launcher_elsewhere_on_path(tmp_
     or be shadowed by it depending on PATH order -- not a choice an unattended
     gateway start gets to make.
     """
-    exe = _fake_frozen_exe(tmp_path)
+    exe = _fake_bundle_launcher(tmp_path)
     foreign = _foreign_working_launcher(tmp_path)
-    _simulate_frozen_app_honest(monkeypatch, tmp_path, exe)
+    _simulate_bundled_app_honest(monkeypatch, tmp_path, exe)
     # `kirocrew` resolves on PATH to the other install, and nothing is in bin_dir.
     monkeypatch.setattr(
         agent.shutil, "which", lambda c, **kw: str(foreign) if c == "kirocrew" else None
@@ -1053,9 +1034,9 @@ def test_gateway_start_does_not_shadow_a_working_launcher_elsewhere_on_path(tmp_
 @_posix_shim_only
 def test_explicit_setup_may_shadow_a_launcher_elsewhere_on_path(tmp_path, monkeypatch):
     """`kirocrew setup` names this install, so it may publish into bin_dir."""
-    exe = _fake_frozen_exe(tmp_path)
+    exe = _fake_bundle_launcher(tmp_path)
     foreign = _foreign_working_launcher(tmp_path)
-    _simulate_frozen_app_honest(monkeypatch, tmp_path, exe)
+    _simulate_bundled_app_honest(monkeypatch, tmp_path, exe)
     monkeypatch.setattr(
         agent.shutil, "which", lambda c, **kw: str(foreign) if c == "kirocrew" else None
     )

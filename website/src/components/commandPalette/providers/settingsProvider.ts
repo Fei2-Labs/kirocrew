@@ -4,11 +4,13 @@ import { useNavigate } from 'react-router-dom'
 import { Settings } from 'lucide-react'
 import type { NavigateFunction } from 'react-router-dom'
 
-import { fuzzyMatch, makeScoreThenNameComparator } from '../../../utils/fuzzyMatch'
+import { makeScoreThenNameComparator } from '../../../utils/fuzzyMatch'
 import { i18nT } from '../../../i18n/t'
 import type { ResourceProvider, Result } from '../types'
 import { SETTINGS_REGISTRY } from '../settingsRegistry.gen'
-import { SETTINGS_KEYWORDS } from '../settingsKeywords'
+import { localizedSettingLabel, scoreSettingEntry } from '../settingsSearchCore'
+import { settingsRoute } from '../settingsRoute'
+import { settingsTabLabel } from '../settingsTabLabel'
 import type { SettingEntry } from '../settingsTypes'
 
 /**
@@ -51,27 +53,6 @@ const compareResults = makeScoreThenNameComparator<Result>(
   (r) => r.title,
 )
 
-/** Build searchable corpus for a setting entry (includes tab for unfiltered search). */
-function buildCorpus(entry: SettingEntry): string {
-  const parts = [entry.label]
-  if (entry.description) parts.push(entry.description)
-  // Tab name as searchable context
-  parts.push(entry.tab)
-  // Keywords
-  const kws = SETTINGS_KEYWORDS[entry.id]
-  if (kws) parts.push(...kws)
-  return parts.join(' ')
-}
-
-/** Build corpus WITHOUT tab name — used for tab-filtered queries to avoid score distortion. */
-function buildFilteredCorpus(entry: SettingEntry): string {
-  const parts = [entry.label]
-  if (entry.description) parts.push(entry.description)
-  const kws = SETTINGS_KEYWORDS[entry.id]
-  if (kws) parts.push(...kws)
-  return parts.join(' ')
-}
-
 /** Tab-prefix filter regex: `tabname:` optionally followed by a query. */
 const TAB_FILTER_RE = /^([a-zA-Z]+):\s*(.*)$/
 
@@ -112,20 +93,28 @@ export function resolveTabPrefix(prefix: string, tabKeys: string[]): string | nu
   return null
 }
 
-function buildResult(entry: SettingEntry, score: number, indices: number[], navigate: NavigateFunction): Result {
-  const tabLabel = entry.tab.charAt(0).toUpperCase() + entry.tab.slice(1)
-  const subtitle = `${tabLabel} › ${entry.label}`
-  // Extra params (e.g. channel=slack for the Channels list-detail tab) must
-  // ride the deep link or the target panel never mounts and the highlight
-  // silently no-ops.
-  const extra = entry.params
-    ? Object.entries(entry.params).map(([k, v]) => `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('')
-    : ''
-  const route = `/settings?tab=${entry.tab}${extra}&highlight=${encodeURIComponent(entry.id)}`
+function buildResult(
+  entry: SettingEntry,
+  score: number,
+  indices: number[],
+  navigate: NavigateFunction,
+  displayLabel: string,
+): Result {
+  // Capitalizing the tab key produced "Computer-use" for `computer-use`, and in any
+  // non-English locale it rendered the English machine key for every tab. The shared
+  // resolver reads the same catalog label the settings page shows.
+  //
+  // `displayLabel` is the shared scorer's `localizedLabel` (fan-out suffix
+  // re-appended): the palette shows the SAME row text as the in-page box, and
+  // the score's highlight indices point into this string — rendering
+  // `entry.label` here would localize the corpus but display English with
+  // misaligned highlights for non-English users.
+  const subtitle = `${settingsTabLabel(entry.tab)} › ${displayLabel}`
+  const route = settingsRoute(entry)
   return {
     id: `${PROVIDER_ID}:${entry.id}`,
     providerId: PROVIDER_ID,
-    title: entry.label,
+    title: displayLabel,
     subtitle,
     icon: settingsIcon(),
     score,
@@ -179,24 +168,21 @@ function searchWithinTab(tab: string, remainder: string, navigate: NavigateFunct
   const tabEntries = SETTINGS_REGISTRY.filter((e) => e.tab === tab)
 
   if (remainder.length === 0) {
-    // List all entries in this tab, sorted alphabetically by label
+    // List all entries in this tab, sorted alphabetically by the DISPLAYED
+    // (localized) label so the order matches what the user reads.
     return tabEntries
-      .slice()
+      .map((entry) => ({ entry, label: localizedSettingLabel(entry) }))
       .sort((a, b) => a.label.localeCompare(b.label))
-      .map((entry) => buildResult(entry, 100, [], navigate))
+      .map(({ entry, label }) => buildResult(entry, 100, [], navigate, label))
   }
 
   const results: Result[] = []
   for (const entry of tabEntries) {
-    const corpus = buildFilteredCorpus(entry)
-    const corpusMatch = fuzzyMatch(remainder, corpus)
-    if (!corpusMatch) continue
-
-    const labelMatch = fuzzyMatch(remainder, entry.label)
-    const score = labelMatch ? labelMatch.score : Math.max(1, Math.round(corpusMatch.score * 0.6))
-    const indices = labelMatch ? labelMatch.indices : []
-
-    results.push(buildResult(entry, score, indices, navigate))
+    // Tab excluded from the corpus: within a tab-scoped query the (constant)
+    // tab name would only distort ranking.
+    const s = scoreSettingEntry(remainder, entry, { includeTab: false })
+    if (!s) continue
+    results.push(buildResult(entry, s.score, s.indices, navigate, s.localizedLabel))
   }
 
   results.sort(compareResults)
@@ -207,15 +193,9 @@ function searchWithinTab(tab: string, remainder: string, navigate: NavigateFunct
 function searchFullCorpus(q: string, navigate: NavigateFunction): Result[] {
   const results: Result[] = []
   for (const entry of SETTINGS_REGISTRY) {
-    const corpus = buildCorpus(entry)
-    const corpusMatch = fuzzyMatch(q, corpus)
-    if (!corpusMatch) continue
-
-    const labelMatch = fuzzyMatch(q, entry.label)
-    const score = labelMatch ? labelMatch.score : Math.max(1, Math.round(corpusMatch.score * 0.6))
-    const indices = labelMatch ? labelMatch.indices : []
-
-    results.push(buildResult(entry, score, indices, navigate))
+    const s = scoreSettingEntry(q, entry)
+    if (!s) continue
+    results.push(buildResult(entry, s.score, s.indices, navigate, s.localizedLabel))
   }
 
   results.sort(compareResults)

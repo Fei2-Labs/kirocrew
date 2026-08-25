@@ -5,7 +5,9 @@ Covers ``chat_runner._attach_turn_stats``: the helper that mirrors
 message of a completed turn, so the dashboard footer can show the same
 end-of-turn elapsed/credits line kiro-cli prints natively.
 """
+from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat_runner import _attach_turn_stats
+from kiro_crew.dashboard.handlers import usage
 from kiro_crew.dashboard.state import _ChatSlot
 
 
@@ -13,6 +15,17 @@ def _make_slot_with_assistant_message() -> _ChatSlot:
     slot = _ChatSlot("test-turn-stats")
     slot.append("assistant", "done.", "msg msg-a", broadcast=False)
     return slot
+
+
+def test_footer_reads_the_auto_aware_model_helper():
+    """The footer must use ``read_turn_model``, not ``read_effective_model``.
+
+    Both readers exist and differ only on the Auto path: the latter reports ""
+    there, which the footer renders as nothing — indistinguishable from a turn
+    with no model information at all. Binding the footer to the wrong one is a
+    silent regression, since every pinned-model assertion still passes.
+    """
+    assert chat_runner.read_turn_model is usage.read_turn_model
 
 
 class TestAttachTurnStats:
@@ -70,15 +83,23 @@ class TestAttachTurnStats:
         assert slot.messages[-1]["meta"]["turn_stats"]["credits"] == 0.1235
 
     def test_model_included_when_resolved(self):
-        # The served model id (read_effective_model at EVENT_COMPLETE) rides
-        # along so the footer can disclose what an "auto" session ran on.
+        # The served model id (read_turn_model at EVENT_COMPLETE) rides along so
+        # the footer can confirm what a pinned session actually ran on.
         slot = _make_slot_with_assistant_message()
         _attach_turn_stats(slot, 3000, 1.0, 0.0, model="claude-sonnet-4.6")
         stats = slot.messages[-1]["meta"]["turn_stats"]
         assert stats["model"] == "claude-sonnet-4.6"
 
-    def test_model_omitted_when_unresolved(self):
-        # An unresolved auto turn yields "" — the key must be absent, not
+    def test_auto_sentinel_is_carried_like_any_other_value(self):
+        # An Auto turn arrives as the literal "auto" — not a model id, but the
+        # only true answer available, and it must reach the footer rather than
+        # being filtered back into the omitted-key case below.
+        slot = _make_slot_with_assistant_message()
+        _attach_turn_stats(slot, 3000, 1.0, 0.0, model="auto")
+        assert slot.messages[-1]["meta"]["turn_stats"]["model"] == "auto"
+
+    def test_model_omitted_when_unattributable(self):
+        # No model information at all yields "" — the key must be absent, not
         # empty, so the frontend renders nothing rather than a blank chip.
         slot = _make_slot_with_assistant_message()
         _attach_turn_stats(slot, 3000, 1.0, 0.0, model="")

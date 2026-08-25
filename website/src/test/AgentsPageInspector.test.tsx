@@ -237,7 +237,7 @@ describe('agent templates inspector — shared crews cache', () => {
      Crews roster. Both directions are asserted. */
   it('reads and leaves the cache in the shape the Crews tab stores', async () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    qc.setQueryData(['kirocrew-agents', 0], {
+    qc.setQueryData(['kirocrew-agents'], {
       agents: [{ name: 'default', kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'default', description: '', source: 'user' }],
       default_agent: 'default',
     })
@@ -247,7 +247,7 @@ describe('agent templates inspector — shared crews cache', () => {
 
     expect(await screen.findByText('Used By')).toBeInTheDocument()
     expect(screen.getByText('default')).toBeInTheDocument()
-    const cached = qc.getQueryData(['kirocrew-agents', 0])
+    const cached = qc.getQueryData(['kirocrew-agents'])
     expect(Array.isArray(cached)).toBe(false)
     expect(cached).toMatchObject({ default_agent: 'default' })
   })
@@ -438,14 +438,14 @@ describe('agent templates inspector — delete', () => {
     // settles and `crewsData` stays defined — an undefined-check alone would
     // keep comparing against a roster the server may no longer agree with.
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    qc.setQueryData(['kirocrew-agents', 0], { agents: [], default_agent: '' })
+    qc.setQueryData(['kirocrew-agents'], { agents: [], default_agent: '' })
 
     renderPage(qc)
     await open('scratch')
     expect(await screen.findByTestId('delete-template')).toBeInTheDocument()
 
     mockApi.kirocrewAgents.mockRejectedValue(new Error('network'))
-    await qc.refetchQueries({ queryKey: ['kirocrew-agents', 0] })
+    await qc.refetchQueries({ queryKey: ['kirocrew-agents'] })
 
     await waitFor(() => expect(screen.queryByTestId('delete-template')).not.toBeInTheDocument())
   })

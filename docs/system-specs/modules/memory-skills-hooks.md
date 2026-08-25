@@ -219,7 +219,7 @@ Context injection: formatted as `key: value` pairs in `[Semantic Memory]` block.
 SQLite table `episodic_memories` — conversation fragments with optional embeddings:
 - **Write**: text validation (10-2000 chars), **prompt-injection screening** (`_contains_injection`, same pattern set as the semantic-KV path), tag sanitization, importance clamping (0-1), FAISS dedup (cosine > 0.88). The dedup scan **skips tombstoned ("ghost") matches**: tombstone paths (merge, dashboard delete, cap eviction, stale retirement) set `is_deleted=1` but leave the vector in `_faiss_index`/`_faiss_id_map`, so a high-similarity hit may map to a deleted row. `_get_episodic()` filters `is_deleted=0` and returns `None` for those; the write loop `continue`s past a `None` match (mirroring `search_episodic`'s `if not mem or mem["is_deleted"]: continue`) instead of treating it as a conflict — otherwise a new memory matching a deleted one was silently rejected (data loss).
 - **Injection screening (XPIA defense-in-depth)**: episodic text is derived from conversation transcripts, so a poisoned turn could persist steering instructions that get re-injected into future contexts. `write_episodic()` runs `_contains_injection()` (before the embed call) and, on match, drops the entry and emits an auditable `injection_blocked` event with `memory_type='episodic'`. The stored audit snippet is scrubbed with `redact_exfiltration_urls()` + `redact_credentials()` first, since `/api/memory/events` surfaces it verbatim on the dashboard. This mirrors the semantic-KV screen at `validate_semantic()`. **Residual (accepted risk)**: this is a best-effort regex screen: a determined owner can still steer their own long-term memory with phrasing that evades the patterns; long-term memory poisoning is an accepted residual. The screen raises the bar against accidental/opportunistic XPIA persistence, not against a motivated self-owner.
-- **Search**: FAISS vector similarity with decay scoring: `cosine_sim × (0.7 + 0.3×importance) × exp(-0.03×days_old)`, then MMR diversity reranking (Jaccard-based, `_MMR_LAMBDA` = 0.6)
+- **Search**: FAISS vector similarity with decay scoring: `cosine_sim × (0.7 + 0.3×importance) × exp(-rate×days_old)`, then MMR diversity reranking (Jaccard-based, `_MMR_LAMBDA` = 0.6). The decay rate is `_DEFAULT_DECAY_RATE` = 0.03/day, configurable per tag via `memory.decay_rates` (`_decay_rate_for`): keys are tags (case-insensitive, matching `_matches_tags`), the reserved `default` key replaces the built-in fallback, a multi-tag row uses the SLOWEST matching rate (smallest = maximum retention, so a broad tag can never age out a long-retention one), values are clamped to [0, 10] and non-numeric entries are dropped with a warning at store construction (`_sanitize_decay_rates`). Both vector rungs (FAISS and the stdlib fallback) resolve the rate through the same helper; the keyword rung does no decay scoring at all.
 - **MMR reranking**: Maximal Marginal Relevance balances relevance with diversity. Greedy iterative selection penalizes candidates similar to already-selected results. Prevents redundant episodic fragments from consuming the context budget. Configurable via `mmr=False` parameter to disable. The candidate pool is deliberately NOT truncated toward `limit` (that tail pick is the point of MMR); the only bound is the recall-safe `_MMR_MAX_POOL` = 1000 ceiling for pathological inputs.
 - **Relevance threshold**: `_EPISODIC_RELEVANCE_THRESHOLD` = 0.55 cosine required for context injection (empirically determined from a 100-query benchmark: 50 relevant + 50 irrelevant, F1=0.980), relaxed to `_EPISODIC_LONG_TEXT_THRESHOLD` = 0.42 for entries longer than `_EPISODIC_LONG_TEXT_CHARS` = 300 chars, because long texts dilute cosine scores. The threshold reads the RAW `cosine_sim`, not the decay-adjusted score, so age and importance affect ordering but never admission. Admission runs BEFORE the decay ranking, MMR, and the `limit` cut: `get_episodic_context()` calls `search_episodic(relevance_filter=True)`, which drops sub-threshold candidates first, so a highly relevant but old memory cannot be ordered past `limit` by a cluster of recent-but-irrelevant rows that the gate would then remove — a case that otherwise returned empty context while an exact match sat in the store. `search_episodic()` defaults to `relevance_filter=False` and returns the full ranked set for dashboard/API/CLI use. The keyword fallback is unaffected because those rows carry no `cosine_sim` key at all.
 - **Fallback ladder**: FAISS (needs faiss + numpy) → `_sqlite_vector_search`, stdlib cosine over the stored blobs → FTS5/LIKE keyword search (OR logic on text + tags) when there is no query embedding at all. The middle rung matters: faiss is an optional accelerator, not a declared dependency, so a stock install still gets vector recall from the stored vectors.
@@ -235,7 +235,10 @@ not coordinate, so reason about them separately:
 1. **History decay (time tiers)**: `memory.py` `read_recent_history()`, table
    above. Cheap, deterministic, no scoring.
 2. **Episodic decay (exponential, at query time)**: the score formula above.
-   `exp(-0.03 × days_old)` halves at ~23 days and reaches ~10% at ~77 days;
+   At the default rate, `exp(-0.03 × days_old)` halves at ~23 days and reaches
+   ~10% at ~77 days; a per-tag rate from `memory.decay_rates` shifts that curve
+   per memory (0 = never ages out of retrieval ranking, 1 = out of retrieval
+   within about a day — ranking only: cap eviction below still applies);
    `(0.7 + 0.3 × importance)` scales the whole score by importance, so a
    high-importance entry decays from a higher starting point rather than more
    slowly. Ranking and filtering are two separate stages in two separate
@@ -257,8 +260,8 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - **Non-blocking model load**: the GGUF load runs on a background daemon thread (`_kick_background_load()`, thread name `kc-embed-load`) — `embed()`/`embed_batch()` NEVER block on the load. When the model isn't in memory yet, the call kicks the background load and returns `None` immediately; memory degrades to keyword search until the load lands. The gateway/dashboard event loop is never stalled by embedding work. `wait_ready(timeout)` exists for sync contexts (tests, one-shot CLI flows) that legitimately want to block — never call it from an event-loop thread
 - The underlying `Llama` object is NOT thread-safe — inference on a loaded model is serialized behind a lock (tens of ms per short text)
 - `get_shared_embedder()` — process-wide singleton (~700MB RSS when loaded), shared by vector memory AND the knowledge library; `close()` unloads the model to free RSS
-- Per-platform native libs live in `_vendor/llama_cpp_libs/{linux_x86_64,linux_aarch64,macos_arm64,macos_x86_64,win_amd64}`, selected at import time via `LLAMA_CPP_LIB_PATH` (upstream-supported override; an operator-set value wins, enabling e.g. a GPU build). Unsupported platforms and import failures degrade to keyword-only memory search. See `_vendor/README.md`
-- **The shipped closure is declared, not inferred.** `_REQUIRED_VENDORED_LIBS` names the exact files each platform must carry, and `verify_vendored_libs(root=None)` returns `{platform: [missing…]}` (empty when complete) against a source tree, an unpacked sdist, or an installed wheel. `_load_llama_class()` consults it before importing, so an incomplete install is reported as a **packaging defect naming the absent files** rather than surfacing as ctypes' `Shared library with base name 'llama' not found` — which reads as an unsupported architecture and misdirected the real-world diagnosis of this bug. `kirocrew doctor` prints the same detail. The check is **skipped when `LLAMA_CPP_LIB_PATH` is set**: the libs then load from the operator's directory, so the bundled tree's contents no longer determine whether the runtime works, and refusing on them would disable the documented override for exactly the users an incomplete wheel stranded (the warning names the env var as a remedy for that reason). Each packaging lane selects these files by a different mechanism (MANIFEST.in for the sdist, `package_data` for the wheel, the PyInstaller spec for the desktop bundle), so each is guarded independently in `test/test_vendored_llama_payload.py`, and both `build.yml` (every PR) and `build-wheel.yml` (release/nightly) re-check the built wheel **and** sdist against the same declaration via the shared `scripts/verify_vendored_payload.py` (one script for both lanes, so they cannot drift into a gate that stops guarding without failing) — the sdist explicitly, because `python -m build --wheel` never evaluates `MANIFEST.in` and so cannot see an sdist regression at all. Linux ships no BLAS backend by design: upstream publishes none in its Linux CPU wheels (macOS gets `libggml-blas` only via the system Accelerate framework), and the Linux `libggml-cpu` carries the optimized GEMM kernels instead
+- Per-platform native libs live in `_vendor/llama_cpp_libs/{linux_x86_64,linux_aarch64,macos_arm64,macos_x86_64,win_amd64}`, selected at import time via `LLAMA_CPP_LIB_PATH` (upstream-supported override; an operator-set value wins, enabling e.g. a GPU build). Before loading the bundled Linux x86_64 runtime, `_load_llama_class()` intersects the `flags` reported for every visible processor in `/proc/cpuinfo` and requires the baseline compiled into the shipped upstream wheel (AVX, AVX2, BMI2, F16C, FMA, SSE3, SSSE3). A missing or unreadable feature list refuses the native runtime before it can raise an uncatchable SIGILL; memory stays available through keyword search. The gate does not apply to an operator-set `LLAMA_CPP_LIB_PATH`, because that directory may contain a lower-baseline build. Unsupported platforms, incompatible bundled CPUs, and import failures all degrade to keyword-only memory search. See `_vendor/README.md`
+- **The shipped closure is declared, not inferred.** `_REQUIRED_VENDORED_LIBS` names the exact files each platform must carry, and `verify_vendored_libs(root=None)` returns `{platform: [missing…]}` (empty when complete) against a source tree, an unpacked sdist, or an installed wheel. `_load_llama_class()` consults it before importing, so an incomplete install is reported as a **packaging defect naming the absent files** rather than surfacing as ctypes' `Shared library with base name 'llama' not found` — which reads as an unsupported architecture and misdirected the real-world diagnosis of this bug. `kirocrew doctor` prints the same detail. The check is **skipped when `LLAMA_CPP_LIB_PATH` is set**: the libs then load from the operator's directory, so the bundled tree's contents no longer determine whether the runtime works, and refusing on them would disable the documented override for exactly the users an incomplete wheel stranded (the warning names the env var as a remedy for that reason). Each packaging lane selects these files by a different mechanism (MANIFEST.in for the sdist, `package_data` for the wheel — which the desktop bundle inherits, since it pip-installs the project into its bundled interpreter), so each is guarded independently in `test/test_vendored_llama_payload.py`, and both `build.yml` (every PR) and `build-wheel.yml` (release/nightly) re-check the built wheel **and** sdist against the same declaration via the shared `scripts/verify_vendored_payload.py` (one script for both lanes, so they cannot drift into a gate that stops guarding without failing) — the sdist explicitly, because `python -m build --wheel` never evaluates `MANIFEST.in` and so cannot see an sdist regression at all. Linux ships no BLAS backend by design: upstream publishes none in its Linux CPU wheels (macOS gets `libggml-blas` only via the system Accelerate framework), and the Linux `libggml-cpu` carries the optimized GEMM kernels instead
 - Failed model loads (corrupt file, bad native libs) are retried only after a 300s cooldown so a broken state can't spawn a loader thread per embed call
 
 **Embedding backend abstraction** (`EmbeddingBackend` ABC): the public swap seam for future runtimes (Ollama again, remote endpoints, ONNX) and user-defined models. Surface: `model_id`, `dim`, `is_ready()`, `embed()`, `embed_batch()`, `close()`. Consumers (vector memory, knowledge library) depend only on this interface; everything llama.cpp-specific lives in `LlamaCppEmbedder`. Swap flow: `register_embedding_backend(factory)` + `reset_shared_embedder()` replaces the singleton (pass `None` to restore the default). A backend with a different `model_id`/`dim` produces incomparable vectors — the knowledge library's `embed_signature` folds `model_id` in, so a swap automatically triggers the sig-gated knowledge re-embed; vector memory re-embeds via `migrate`.
@@ -316,8 +319,14 @@ TEI (Text Embeddings Inference) uses the candle Rust framework with a Metal back
 ### Lessons in Vector Memory
 
 When vector memory is active, lessons are stored as semantic entries:
-- Key: `lesson.<md5_of_rule>` (dedup via hash)
+- Key: `lesson.<md5_of_rule>` when the lesson is global (dedup via hash). A lesson
+  carrying `repo_scope` folds the scope into the hash, so the same rule scoped to two
+  repositories is two rows and an unscoped row keeps its historical key byte-for-byte.
 - Value: a mapping `{"rule": ..., "category": ..., "negative": ...}` — the NOT-clause
+  — plus `"repo_scope": ...` when the lesson is restricted to one repository. The key
+  is absent for a global lesson, so no migration was needed. A `repo_scope` that is
+  present but not a usable string is withheld from injection rather than read as
+  global, and is refused at every write surface.
   is its own field, so a rule containing the separator literal round-trips. Legacy
   rows written as `"rule text"` or `"rule text — NOT: negative text"` stay readable
   (read-time fallback, no migration); they upgrade to the mapping shape only when a
@@ -359,7 +368,9 @@ Model: `Qwen/Qwen3-Embedding-0.6B` Q8_0 GGUF (610MB). Apache-2.0 licensed. Serve
 
 ### CLI
 
-`kirocrew memory {list,search,stats,audit,export,migrate,import}` — manage vector memory from command line:
+`kirocrew memory {list,search,show,stats,audit,export,migrate,import}` — manage memory from the command line:
+- `show [preferences|projects|history]` — read the markdown layer through `MemoryStore` (all three targets when none given); `--format md|json` (json entries carry `path`, `updated_at` mtime in UTC ISO-8601, `content`), `--since YYYY-MM-DD` filters history days. Missing/empty files print as empty rather than erroring
+- `export` — vector-store collections; `--include-markdown` opts in a `markdown` collection (`preferences`/`projects` entries + per-day `history` list from `MemoryStore.markdown_snapshot()`) without changing the default payload shape
 - `migrate` — one-time markdown → structured migration (preferences.md → semantic, history/*.md → episodic)
 - `import <file>` — restore from JSON export with full validation
 - `kirocrew security audit` also scans vector memory for injection patterns
@@ -375,7 +386,9 @@ Parses legacy markdown files into structured memory:
 
 **Automatic migration (boot-time, `GatewayOrchestrator._auto_migrate_memory`)**: migration is fully automatic — there is **no dashboard "Migrate" button**. Right after `_start_embeddings()`, the gateway schedules a fire-and-forget background task (retained in `_background_tasks`, cancelled on shutdown) that runs two idempotent phases, all blocking work offloaded to the maintenance executor so boot is never blocked:
 1. **Migrate** (gated on `memory.migrated == False`): detects legacy content via the shared `memory.legacy_memory_present()` helper (also used by `/api/memory/stats`), runs `migrate_from_markdown()`, then flips `memory.migrated=True` for **everyone** — fresh installs with zero legacy entries included, so all users land in vector-only mode. Syncs the live `consolidator._migrated`, and **acknowledges** with a `migration` audit event (`memory_events`, visible in the dashboard Audit tab, `source="auto"`, counts in `new_value`) plus a `logger.info` line. On error: logs and leaves `migrated=False` so the next boot retries.
-2. **Re-embed sweep** (gated on model readiness, independent of the migrated flag): once the model file is present (awaits the background download task if still in flight — safe, we are our own task), `VectorMemory.backfill_missing_embeddings()` embeds any episodic rows written with a NULL vector and rebuilds the FAISS index. Self-healing across boots and across a download that failed then later succeeded.
+2. **Re-embed sweep** (independent of the migrated flag): awaits the background model download if one is still in flight (safe — we are our own task), then `VectorMemory.backfill_missing_embeddings()` embeds any episodic rows written with a NULL vector and rebuilds the FAISS index. Self-healing across boots and across a download that failed then later succeeded.
+   - **The sweep probes before it loads.** `wait_ready()` kicks the GGUF load, so asking the model to be ready is not a free question — it costs ~1GB of RSS for the process's lifetime (measured: `VmRSS` +1069 MiB, of which `RssAnon` +455 MiB is private KV/compute buffers and `RssFile` +614 MiB is the mmap'd weights). A steady-state boot has nothing to embed, so the sweep asks two **non-loading** questions first and returns 0 when both say no: `store.has_pending_embeddings()` (three `SELECT 1 … LIMIT 1` reads over the same predicates the three sub-sweeps use) and `store_embedding_space_is_stale(store)` (a signature comparison over `model_id`/`dim`, which are set when the backend is *constructed*). Only when there IS work does it wait on readiness, reconcile, and sweep — so a stale vector space still reconciles and re-embeds, and rows deferred with `defer_embedding=True` are still picked up on a later boot. The non-mutating probe is used deliberately rather than `reconcile_store_embedding_space()`, which is destructive and refuses to clear against an unready backend. A store that does not implement the probe keeps the old always-load behaviour rather than silently losing its sweep.
+   - **The model still loads lazily on the first real embedding need.** `_start_embeddings()` binds `embed_fn`/`embed_fn_factory` without loading anything: `make_sync_embed_fn()` returns a closure, and the load is kicked inside `embed_batch()` the first time it finds `_llm is None` (returning `None` so that caller degrades to keyword search).
    - **Two producers of NULL-vector rows**, not just one: rows migrated before the model landed, and rows written by a bulk writer that passed `write_episodic(defer_embedding=True)` — the foreign-agent importer does this so its apply request is not held for minutes by per-chunk inference (see `docs/system-specs/modules/onboarding-import.md`). Import schedules its own sweep, so this boot sweep is the standing retry, not the only path.
    - The sweep needs **numpy only, not faiss**. Faiss is an optional accelerator and not a declared dependency, so requiring it made the sweep a silent no-op on a stock install. Only the index rebuild is faiss-gated; `search_episodic` falls back to `_sqlite_vector_search` (stdlib cosine over the stored blobs), so the vectors are useful either way.
 
@@ -472,9 +485,9 @@ the main file and present `-wal`/`-shm` sidecars must all be regular non-symlink
 files, must not have multiple hard links, and their aggregate size must not
 exceed 64 MiB. The importer reads a descriptor-pinned private snapshot of the
 database and sidecars, so a source-file replacement after validation cannot
-change the inode being queried. MeshClaw's 10,000-row scan limit applies to the
-aggregate active rows across its supported semantic and episodic tables and is
-checked before either table contributes an item. Episodic text deduplication is
+change the inode being queried. The lineage scanner's 10,000-row scan limit applies
+to the aggregate active rows across its supported semantic and episodic tables and
+is checked before either table contributes an item. Episodic text deduplication is
 rechecked under the native store write lock before insertion, preventing a
 concurrent native write from being duplicated.
 
@@ -482,15 +495,50 @@ concurrent native write from being duplicated.
 
 User-taught corrections ("always do X", "never do Y"). Single write path through `vector_memory.write_lesson()`:
 
-1. **Vector memory** (primary): stored as `lesson.<md5hash>` semantic entries with `confidence=1.0, source=user_explicit`. The value is a mapping `{"rule", "category", "negative"}` — the NOT-clause is a separate field; legacy in-band `"rule — NOT: negative"` rows stay readable without migration. Injected via `get_lessons_context()` — separate from `[Semantic Memory]` block.
+1. **Vector memory** (primary): stored as `lesson.<md5hash>` semantic entries with `confidence=1.0, source=user_explicit`. The value is a mapping `{"rule", "category", "negative"}`, plus `"repo_scope"` when the lesson is restricted to one repository — the NOT-clause is a separate field; legacy in-band `"rule — NOT: negative"` rows stay readable without migration. Injected via `get_lessons_context()` — separate from `[Semantic Memory]` block. A scoped lesson is gated by `project_scope.project_scope_satisfied` against the session's active project BEFORE the shown/omitted counts are computed, using the same rule as a skill's `repo_scope`.
 2. **JSONL fallback** (`~/.kiro/crew/lessons.jsonl`): only used when vector memory is not initialized. Read-only migration source once vector memory is active.
 
-**Priority**: vector lessons override JSONL. If `vector_store.get_lessons()` returns entries, JSONL is skipped entirely.
+**Priority**: vector lessons override JSONL. The fallback is keyed on whether the
+vector store holds any renderable lesson at all (`has_any_lesson()`), NOT on whether
+the rendered block came back empty. The two are different: no rows means the JSONL
+store is still the authority (the first-boot migration window), while rows that exist
+but are all out of scope for this project means the vector store already answered, so
+falling back would resurrect lessons the user deleted and ignore the scope gate. A row
+whose `repo_scope` is present but unusable counts as neither.
 
 **Single write path** — all lesson writes go through `write_lesson()` which provides:
 - Substring dedup: "use dark mode" won't duplicate "always use dark mode"
 - Topic-overlap dedup: "use light mode" replaces "use dark mode" (>50% keyword overlap → newer wins)
 - Allowlist validation, injection scanning, audit logging
+
+**What a write reports.** `write_lesson()` returns a `LessonWriteResult` naming WHICH
+outcome occurred: `inserted` / `enriched` / `unchanged` / `deduped` / `refused`, plus a
+short reason code (a `SemanticRejectCode` value for a refusal, the dedup rule's name for
+a dedup, `kept_stored_clause` for the one `unchanged` case that is not a byte-identical
+re-submit). The vocabulary is shared with `LessonStore.save_or_enrich()`, which already
+returned the first three words, so both stores describe the same events the same way.
+The distinction matters because two outcomes mean "your lesson did not land"
+(`refused`, `deduped`) while two mean "your lesson is fine, there was nothing to do"
+(`unchanged`, and the kept-clause variant) — a caller reading only a bool cannot tell
+them apart, and the `learn add` CLI guessed wrong, writing a second `lessons.jsonl`
+record on every one of them.
+
+**The result's truth value is the old bool, deliberately.** `bool(result)` is `wrote`,
+byte-for-byte the predicate the previous `-> bool` return answered, so the three callers
+that only branch on success (`history.py` consolidation counting, the
+`vector_memory` migration loop, the task runner discarding it) and ~55 bare
+`assert store.write_lesson(...)` assertions are semantically unchanged. That is what
+allowed the bool to be REPLACED rather than kept beside a second reporting method:
+without `__bool__`, an ordinary return object is truthy by default, so every positive
+bare assertion would keep passing while asserting nothing — a silent hazard mypy cannot
+flag, since a bare `if` on any object is legal. `stored` is the separate property for
+"is my lesson in the store" (true for a no-op re-submit, which is NOT a write). Surfaces
+that report to a human or a model — the `learn add` CLI, the `POST /api/lessons` response
+(`ok` / `outcome` / `reason`), the `learn_add` tool result — read `outcome` and `reason`.
+The dashboard Memory tab clears its draft and refreshes the list only for `inserted`
+or `enriched`; `unchanged` clears the draft but reports that it was already stored,
+while `deduped` and `refused` preserve the draft and surface the reason so it can be
+reworded instead of presenting a rejected write as success.
 
 **Write sources**:
 1. **`learn_add` MCP tool** (immediate): user says "remember X" → LLM calls tool → `POST /api/lessons` → `write_lesson()`
@@ -610,6 +658,220 @@ Supports nested directories (e.g. `skills/utils/tiny-url/SKILL.md`). The skill n
 
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
+**Project skills (`<project>/.kiro/skills`) — a different source from the one above.**
+`$KIROCREW_PROJECT_DIR/skills/` is a *sync* source: its contents are copied into
+`~/.kiro/crew/skills/` and thereafter are ordinary local skills. `<project>/.kiro/skills`
+is *discovered in place* for the session whose slot is bound to that project, and is
+never copied. A skill found there is reported with source `kiro-workspace`.
+
+The project reaches the loader through its public entry points (`_iter`,
+`get_triggered_skills`, `get_context`, `load_skill`, `resolve_dollar_skills`,
+`list_skills`), not through `SkillsLoader.__init__`. There are a dozen construction
+sites, none of which knows a session's project; threading the constructor would have
+required every one of them to learn about a concept only the chat paths have. A caller
+that wants project skills passes `project_dir`; every other caller is unchanged and
+sees exactly the previous behaviour. The `_iter` cache is keyed per project, so two
+chats on different projects cannot serve each other's skills from a shared entry.
+
+**Consent (`skill_trust.py`).** A SKILL.md is prose, but it enters the agent's context
+and can instruct the agent to run anything, so loading one out of whatever repository
+happens to be open is an execution-adjacent decision. Project skills are therefore
+gated on an explicit per-directory grant, recorded at
+`<data home>/trust/project-skills.json` (mode `0o600`). That directory is a
+whole-directory entry on the keystone deny list, so the agent's own file tools can
+neither read the store nor forge a grant; like every other keystone reader, the module
+opens the path directly rather than through the agent file gate. Creating the trust
+directory is followed by a fail-loud owner-only lockdown; a platform ACL or permission
+failure refuses store access rather than leaving a permissive directory usable.
+
+Grants are keyed on the **canonical** directory (`os.path.realpath`), because the
+directory *is* the resource. Keying on a softer identity would leave the unkeyed
+component forgeable: a second name aliasing one directory would carry its own trust,
+and a rename would orphan the record. A symlink therefore resolves to the same grant as
+its target, and cannot manufacture a new one.
+
+The grant store is bounded. An idempotent grant for an existing directory still
+succeeds at the bound, but a new directory is refused rather than evicting an older
+consent silently; the operator must revoke a stored grant first. The API reports this
+as HTTP 409 with `code: "skill_trust_store_full"`.
+
+Every unknown resolves toward untrusted: an unreadable store, a malformed store, a
+schema version newer than this build, a relative path, a path that does not exist, and a
+path naming a file all yield no grant. Refusing to load a skill costs a click; loading
+one the operator never consented to cannot be undone. The enforcement memo keys on
+content time, metadata-change time, size, inode, and mode, so a permission or ACL change
+invalidates cached grants and exercises the unreadable-store path again.
+
+Grant and revoke writes normalize filesystem, atomic-replace, and owner-lockdown failures
+to the same unreadable-store error as lock and read failures. The dashboard therefore
+returns HTTP 409 with `code: "skill_trust_store_unreadable"` instead of an unstructured
+500 when the trust volume is full, read-only, or cannot enforce its owner-only ACL.
+
+`skills.project_skills_enabled` (`SkillsConfig`, default true) is the operator's hard off
+switch — independent of any grant, so a directory carrying one still loads nothing when
+it is false. Only a missing value or the boolean `true` enables the feature; malformed
+truthy values such as the string `"false"`, and a malformed `skills` section itself,
+fail closed to disabled. A present `config.json` or `config.local.json` that cannot be
+read, parsed, or interpreted as an object also disables project skills: an unreadable
+source may contain the operator's hard-off switch and cannot be treated as absent.
+
+**Trust verbs.** `GET/POST/DELETE /api/skills/-/trust`, registered before the
+`/api/skills/{name}` catch-all. All three require the configured dashboard owner: the
+read reveals consented filesystem paths, while grant and revoke are human security
+decisions that authenticated non-owners and app tokens cannot make. A successful owner
+authorization emits an allowed dashboard API-access event to the SEL. A refusal is HTTP
+403 with `code: "dashboard_owner_required"` and emits the corresponding denied event.
+The grant derives its directory from the
+requesting chat slot, never from a client-supplied path, so no caller can consent on
+behalf of a directory the operator never opened. `DELETE` accepts an explicit `path` so
+a grant whose directory has since disappeared stays revocable —
+`list_trusted_projects` reports stored rows rather than the enforced set for the same
+reason, since an invisible grant could not be withdrawn. The consent snapshot returns
+both the readable project path and its canonical `project_key`. The dialog displays the
+former and must echo the latter as `expected_key`; grant canonicalizes the current slot
+project once inside the grant primitive, requires an exact match, and persists that same
+resolution without resolving even the canonical name again. Missing keys fail closed.
+Client-supplied text is never resolved, so a UNC/device key cannot trigger a Windows
+network probe, while a project symlink retargeted between GET and POST — or a canonical
+directory name replaced after comparison — cannot redirect consent to an unreviewed
+directory. Revoke first matches
+the supplied text against stored keys, so a vanished network grant remains removable;
+an unmatched UNC/device path is rejected before any filesystem resolution.
+
+**One project-resolution rule, and it is the strict one.** The catalog
+(`GET /api/skills`), the trust read and the grant all resolve their directory with
+`requesting_slot_project()` — the project bound to *that* chat slot, with no
+cross-slot fallback — because that is what `SkillsLoader` resolves from
+(`slot.project` verbatim). The neighbouring `active_project_dir()` additionally falls
+back to "the single project some open slot has", which is right for a global settings
+page and wrong here in two ways: a grant issued from a chat with no project would
+record consent against *another* chat's project, and the catalog would advertise a
+skill whose `$token` expands to nothing because the loader sees no project. Revoke
+keeps the permissive helper, since revoking only ever narrows what loads. The loader
+is deliberately the strict side: teaching it the fallback would inject one project's
+skills into a chat not bound to it.
+
+**Consent is confined to the consented directory.** A grant names one directory, and
+the project walk never resolves a descendant by path. On platforms with POSIX
+directory-descriptor support, the canonical project root and every component down
+through `.kiro/skills` are opened one at a time with `O_DIRECTORY | O_NOFOLLOW`, each
+relative to the prior handle. Descendants are scanned by directory descriptor and
+opened relative to that same pinned handle, so a directory swapped for a link between
+enumeration and descent fails the open without resolving its target. Linked directories
+and linked `SKILL.md` files are excluded even when their targets remain inside the
+project. Traversal stops after 64 directories below `.kiro/skills`; files at that depth
+remain eligible, while deeper paths are ignored so hostile nesting cannot exhaust the
+Python call stack for a chat turn. Global provider trees retain link traversal for app
+registration.
+
+Python does not expose an equivalent handle-relative no-reparse traversal on Windows.
+Project skills therefore fail closed as unsupported there: canonicalization returns no
+project key before touching the supplied path, so catalog, consent, and loading cannot
+initiate SMB authentication through a raced UNC junction. This is intentionally a
+capability check, not a best-effort `lstat` sequence; a pre-check followed by a path-based
+scan leaves the same swap window. Project skills remain available on macOS and Linux,
+where every traversed component stays pinned to a no-follow directory descriptor.
+
+**One enforcement point for every enumerated read.** Enumeration is TTL-cached, so a
+path vetted while genuine can be replaced by a link out of the granted directory before
+anything reads it — and the root that made it acceptable is only known at enumeration
+time. So `_iter_uncached` records, per path, the root it was vetted against, and
+`SkillsLoader._read_enumerated_skill_bytes` is the only place an enumerated skill file is
+read: it re-checks that root on the *descriptor it opened* (`O_NOFOLLOW` + `fstat`), not
+on the path string. Both the body read and the frontmatter/metadata read go through it,
+and a guard test fails if either stops doing so.
+
+That guard exists because the two drifted apart once: the body read was hardened while
+the metadata read of the same cached paths stayed unchecked, which is not a cosmetic gap
+— frontmatter `description` is rendered verbatim into the injected skills index, and
+`triggers` / `always` / `inject_on_trigger` decide what loads on every turn. A path with
+no recorded root (the global skills dir, `extra_paths`, edition roots) is read
+unconfined, which is what keeps an app's registered symlink into its own tree working;
+confinement applies to project paths only. An oversized file is skipped with a warning
+rather than raised, because the global path applies no cap at all and a chat turn must
+not die on a checked-out file. A confined refusal is never reopened: replacement or
+removal after enumeration also degrades to no metadata/body rather than propagating an
+open error into a chat turn. Confined read-only metadata uses replacement decoding for
+malformed UTF-8 so one project skill cannot abort context assembly. Unconfined metadata
+reads remain strict because they also serve writers that must never overwrite metadata
+they could not decode.
+
+No confined project path is rendered into agent-facing context. Both the legacy and
+budgeted initial skills blocks inject admitted project skills as bodies through
+`load_skill(..., project_dir)` and reserve path summaries for unconfined skills. The
+trigger split and pointer-hint renderer enforce the same rule later in a turn. This
+prevents a checkout from replacing an already-enumerated `SKILL.md` with an escaping link
+and persuading the agent to reopen it directly after the descriptor-confined read. Session
+start and post-compaction callers also pass the skills section cap as a confined-body
+budget even when lazy loading is off. Bodies that fit are injected whole; bodies that do
+not fit are omitted rather than exposed as unsafe paths. The loader checks the enumerated
+size before opening and passes the remaining budget into the descriptor-pinned read, so a
+replacement race or many large project skills cannot materialize more body text than the
+section can retain.
+
+The mutable trust-store reader likewise refuses a non-object grant row instead of
+filtering it: grant and revoke must never rewrite a partially unknown store and silently
+destroy rows a future or hand-edited schema may understand. Read-only enforcement may
+still ignore malformed rows because it never writes them back and fails toward no trust.
+
+The dashboard's skill *browse* endpoints are deliberately **not** trust-gated: reading a
+`SKILL.md` is how the operator decides whether to grant trust, so requiring the grant to
+view the file would make that decision blind. The boundary that matters — an unconsented
+project skill never reaching the agent's context — is enforced in `SkillsLoader`.
+This does not widen App Kit visibility: an app caller that asks the catalog for a
+session-scoped project, or browses a `kiro-workspace` skill, must positively own the slot
+named by `X-Session-Key`, and that owned slot must itself name a project. Foreign,
+unscoped, projectless, missing, and absent slot identities all return the same 404 and
+emit a denied `app_isolation` API-access record. A successful ownership and project-binding
+decision emits an allowed `app_isolation` record naming the selected slot. This prevents
+the shared-project fallback used by owner dashboard browsing from lending another slot's
+project to an app-owned, projectless slot.
+
+**Enforcement is audited, on first use rather than per message.** Granting and revoking
+consent are audited `critical=True` where the operator acts. The decision that *uses* that
+authority — admitting a project's skills into a session — is audited too, or the log would
+show who consented but never that it took effect. It is recorded once per (canonical
+directory, outcome) per process, because `_trusted_project_key` runs on every message: one
+governance event per message would bury the events that matter and put an SEL write on the
+per-message path. A new directory, or the same directory after `project_skills_enabled` is
+flipped, is recorded again. Refusals are recorded on the same basis, because "this project's
+skills were not loaded" is what an operator debugging a dead `$token` needs. `critical=False`
+deliberately: this is a record of an outcome, not an audit-or-deny gate, so an unwritable SEL
+must not fail a chat turn — the authority it refers to was already written synchronously when
+consent was given. A failed SEL write is not entered into the per-process de-duplication set;
+the next enforcement retries it, and only a successful write suppresses later duplicates.
+
+**Untrusted skills are listed, not hidden.** Catalog rows for `kiro-workspace` carry
+`trusted: bool`. A silently absent skill is indistinguishable from one that does not
+exist, so the picker shows an untrusted project skill with a "needs trust" marker and
+choosing it opens the consent dialog instead of inserting a `$token` the loader would
+refuse to resolve. The pre-consent catalog asks the loader for a containment-only set
+of project-origin names: it does not exercise or audit trust, but it does retain the
+normal path validation and first-wins precedence. It also builds the rows and reads
+their metadata through the loader's descriptor-pinned confined reader; the legacy
+workspace scanner is used only for global Kiro skills, so a linked project target is
+never touched merely to construct a row. Genuine untrusted rows therefore remain
+visible while escaped paths and project rows shadowed by global skills stay hidden.
+Because the description and repository scope are checked-out, untrusted text rendered by
+the dashboard, both are passed through the exfiltration-URL and credential redactors before
+leaving the backend.
+Audit records may retain the canonical path, but a failed audit write never
+copies that path into the ordinary application log.
+The dialog snapshots the requesting chat slot, current project, and a monotonic request
+identity with the selected skill. If the operator switches chats or projects, closes the
+dialog, or starts another consent request while a grant is pending, the grant may finish
+for its original slot but its stale completion cannot close the newer prompt or insert a
+token into the current draft.
+The picker and its focus prefetch cache by both slot key and current project, because a
+slot may change projects without changing identity; a project switch therefore cannot
+serve the prior project's fresh catalog for the cache TTL. Both production composers
+provide that project identity. A caller that cannot provide it gets a zero-staleness
+fallback, so closing and reopening the picker revalidates the ambiguous cache key.
+
+**`search_skills` stays project-blind.** Only a session key reaches that boundary and
+resolving a project from it needs a seam that does not exist yet, so the MCP tool
+continues to search locally installed skills only.
+
 The bundled `session-summaries` skill is on-demand, guidance-only: it explains the
 chat session summary panel (see [session-summary](session-summary.md)) — what it
 shows, its token cost, and how to make a session summarize well — so the agent can
@@ -624,7 +886,7 @@ re-synced by `rmtree` + `copytree` on upgrade.
 Skills with auxiliary files (scripts, assets) include `dir` path so the LLM can `cd` and run them.
 
 **Lazy-load (`skills.lazy_load`, default false — loader `SkillsConfig`):** controls how `get_context(budget)` (`skills.py`) injects the on-demand set.
-- **OFF** (`get_context(budget=None)`): the byte-for-byte legacy full dump — every on-demand skill summarized, unranked and untruncated, under the flat 165k `_CONTEXT_BUDGET_BASE`.
+- **OFF** (`get_context(budget=None)`): the legacy global-skill dump — every unconfined on-demand skill summarized, unranked and untruncated, under the flat 165k `_CONTEXT_BUDGET_BASE`; confined project bodies retain their independent skills-section cap.
 - **ON** (`get_context(budget)`): `always: true` pinned skills are injected in full, plus a usage-ranked **top-K** of on-demand skills filled up to `budget`. Ranking is by `_rank_key` (`skills.py`) — `(usage_hits, effective_recency)` from the `SkillUsageLedger`, with a recency boost so freshly-added skills escape cold start. The long tail is left discoverable via the `skill_search` tool, the `$skillname` inline token, `cat`, and the per-message trigger auto-loader.
 
 **Usage ledger (`skill_usage.py`, `SkillUsageLedger`):** in-memory per-skill hit tally with debounced, atomic persistence to `skill-usage.json` (`SKILL_USAGE_FILENAME`, co-located with the Kiro Crew home). Entries older than a 30-day TTL (`_MAX_AGE_SECS`) are dropped on load/flush so a stale skill stops occupying a top-K slot. Hits are recorded in two places: the **body-delivery loop** in `context.py` (`_record_use`, called only after `load_skill` succeeds and the body is appended to the prompt) and in `resolve_dollar_skills`. However, since `max_triggered` defaults to 0 the body-delivery recorder is inactive in stock config — `$skillname` is the only source of hits, so lazy-load ranking is effectively recency-only unless the trigger matcher is re-enabled (`max_triggered > 0`). A trigger match alone does NOT earn a hit — only actual delivery does, so pointer-only skills and false-positive matches do not inflate the ranking. Best-effort: ledger init failure falls back to recency-only / unweighted ranking without breaking skill loading.
@@ -762,6 +1024,14 @@ name, truncated description, `SKILL.md` path, containing dir — rendered by
 affordance `## Available Skills` already directs it to. `split_triggered()`
 partitions one match into bodies and pointers, so a mixed match emits both.
 
+That opt-out applies only to unconfined installed and provider skills. A project skill
+always goes through full-body injection even if its frontmatter says
+`inject_on_trigger: false`, and the catalog reports that effective behavior. Otherwise
+the pointer would invite the agent to reopen a mutable checkout path directly after the
+descriptor-confined metadata read, letting a link swap bypass the confined reader.
+`split_triggered()` therefore forces every row with a confinement root into the body
+partition, and `trigger_hint()` independently refuses to render confined paths.
+
 Why the knob is worth having: a body is 8k–34k chars, and word-overlap matching
 pulls in large unrelated skills often enough that body price per match makes
 `loaded_skill` the largest single block of assembled context — ~48% of it on a
@@ -827,8 +1097,12 @@ the event loop; the authoritative resolved check stays at the write boundary in
 `set_inject_on_trigger`. A path differing only by a symlink therefore reads as
 owned in the listing and is still refused on write — the failure mode is a toggle
 that reports an error, never a foreign file being rewritten. For the same reason
-`size_bytes` reuses the stat the frontmatter cache already needed for its mtime,
-so the listing costs the same one stat per skill it did before the field existed.
+`size_bytes` reuses the stat the frontmatter cache already needed for an unconfined
+skill's mtime, so those rows still cost one stat. A confined project row never stats
+its cached path: a checkout can replace that name with a Windows UNC link after
+enumeration, and a stat would initiate the outbound connection before confinement ran.
+Its size and content-digest cache token instead come from bytes admitted by the
+descriptor-pinned no-link reader.
 
 The dashboard's structured skill editor rebuilds the frontmatter block from its
 own fields, so it must carry every key it does not model. It re-emits those keys'
@@ -915,11 +1189,11 @@ On Windows, reparse points (including directory junctions) are link-like for
 both source traversal and destination ancestry checks and are rejected by the
 same boundary.
 
-Claude includes global skills and `<workspace>/.claude/skills`; MeshClaw uses
-workspaces resolved from both `workspace_dir` and `project_dir` pointer files
-and scans `<workspace>/skills`, while `~/.meshclaw/skills` remains excluded
-because its user-authored provenance is not reliable. Re-import deduplicates
-through provenance instead of overwriting the destination. A package with
+Claude includes global skills and `<workspace>/.claude/skills`; a lineage source
+uses workspaces resolved from both `workspace_dir` and `project_dir` pointer files
+and scans `<workspace>/skills`, while the source root's own `skills` tree remains
+excluded because its user-authored provenance is not reliable. Re-import
+deduplicates through provenance instead of overwriting the destination. A package with
 `always: true` or `triggers` frontmatter is rejected so imported content cannot
 gain automatic prompt activation.
 
@@ -1211,11 +1485,11 @@ Merge rules (implemented in `_merge_kiro_hooks()` in `agent.py`):
 ## Context Builder (`context.py`)
 
 Assembles all sources into prompts:
-- New session: `_CRITICAL_RULES` (diff blocks + OPTIONS buttons) + agent prompt + memory (with citations) + skills + lessons + conversation history (last 20 messages, thread history at TOP with explicit framing)
+- New session: `_CRITICAL_RULES` (runtime-conditional diff blocks + OPTIONS buttons) + agent prompt + memory (with citations) + skills + lessons + conversation history (last 20 messages, thread history at TOP with explicit framing)
 - Every message: channel history, episodic memory, hook transforms, triggered skills, context rules, OPTIONS hint (interactive sessions only)
 - Runtime identity is turn-aware rather than key-only. Channel and dashboard dispatchers pass trusted `runtime_source` metadata to `build_message()`. New sessions use it for `[RUNTIME]`; follow-up turns refresh `[RUNTIME]` outside the one-time session context. This is required because a stable `dashboard:*` session can be resumed from Discord and `messaging.dm_scope="unified"` intentionally removes the originating channel from the session key. When trusted metadata is absent, namespaced keys (`discord:*`, `telegram:*`, `wecom:*`, `weixin:*`, `webex:*`, `teams:*`, `slack:*`) are recognized directly; bare unknown keys keep the legacy Slack fallback.
 - Thread history is injected only at session start (via `build_session_context`). Within the same ACP session, kiro-cli manages conversation history natively — duplicate injection wastes context window and accelerates compaction.
-- `_CRITICAL_RULES` injected for ALL agents (including custom) at session start — ensures diff rendering and OPTIONS buttons work universally
+- `_CRITICAL_RULES` injected by DEFAULT for every agent (built-in `kirocrew` and custom alike) — it is the dashboard/Slack assistant's own output contract (runtime-conditional diff blocks — tool-made edits render as structured diff cards on the dashboard, so ```diff blocks are required only for non-tool edits or non-dashboard runtimes — `[OPTIONS:]` footer, absolute-path rule with a URL exclusion — a backticked URL renders as a click-to-copy chip rather than a link, so URLs must use markdown link syntax instead), so diff rendering and OPTIONS buttons work universally. A **custom** agent can OPT OUT by setting `includeCrewContext: false` in its materialized `~/.kiro/agents/<...>.json`: a custom app agent ships its own system prompt and output contract, so injecting this on top both conflicts with it and, on a safety-tuned model, reads as an identity override the model refuses as prompt injection. The flag is read through the same sensitive-path-gated scan as the agent prompt (matched by declared `name` or filename stem) and memoized by agent name; an absent/non-boolean flag, an unreadable/missing spec, and the built-in `kirocrew` agent all default to injecting (only an explicit boolean `false` on a custom agent suppresses it). The same opt-out also suppresses the dashboard tool nudges (`ask_question` / `suggest_followup`) that `build_message` adds on dashboard sessions, but NOT the provider-agnostic `[OPTIONS:]` reminder. The `[OPTIONS:]`/diff tags still RENDER for any agent that emits them (the dashboard parses them regardless); the gate only stops the host from MANDATING them where an agent has declared it does not want them.
 - Switchable context groups (see below) let a spawning parent drop whole sections for one sub-agent.
 - Cap: `_CONTEXT_BUDGET_BASE` = 165,000 chars (~55k tokens). Which ceiling applies depends on `skills.lazy_load`: OFF (the default) uses `caps.base` as one flat shared pool; ON uses `caps.max_context`, the SUM of the independent per-section caps (190,575 chars at the reference window), so skills/steering can never eat into memory/lessons space. Note the per-section caps are computed and passed to every section either way; `lazy_load` changes the *global* ceiling and the skills block's shape (full dump vs usage-ranked top-K), not whether sections have caps.
 

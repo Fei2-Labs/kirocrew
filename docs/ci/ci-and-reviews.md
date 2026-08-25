@@ -88,14 +88,15 @@ Every job here is blocking.
 |---|---|
 | `scrub-lint` | `scripts/scrub-lint.sh --no-history`. Fails on any internal marker in this public tree, so a sync cannot reintroduce a coupling |
 | `vendor-manifest` | `scripts/verify_vendor_manifest.py`. Hashes every file under `src/kiro_crew/_vendor` against the committed `scripts/vendor_manifest.sha256` — the tree is excluded from semgrep and the AI reviewers' diff, so this checksum is its only content review. Always-on (not behind the `changes` path filter) |
-| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12. `black --check` is commented out pending a bulk format pass |
+| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
+| `loop-bound-locks` | `scripts/check_loop_bound_locks.py`, self-test first. Fails on any module-global `asyncio.Lock()`/`Event()`/`Queue()` declaration — those bind to the import-time (or first-use) event loop and raise `RuntimeError` when acquired from another loop (Python 3.10+). #4800 converted the tree to `kiro_crew.loop_lock.LoopBoundLock`; whole-tree, since the backlog is zero |
 | `backend-test` | 2 Python versions x 4 duration-balanced pytest-split shards (8 jobs), `-n auto` within each. Coverage only on 3.12 (3.10 passes `--no-cov` for a trace-free run) |
 | `backend-test-windows` | windows-latest, 4 shards, `--no-cov`, 180s per-test timeout. The backend supports Windows natively via `platform_compat`, and nothing else in CI holds that line |
 | `backend-test-macos` | macos-14, deliberately SCOPED (gateway, socketsec, platform-compat, pod and MCP-apps suites via a glob). A full macOS run needs its own exclusion burn-down first, and a job that is red on arrival trains people to ignore it |
-| `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs `test_script_hooks` and `test_cron_script`. The shards collect the same files — nothing is deselected any more — but there the sandbox-guarded tests skip, so only here do those assertions actually run |
+| `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those 85 assertions (the `~/.kiro/crew` keystone among them) actually execute |
 | `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces the project line-rate floors, plus a per-file floor with a shrink-only baseline (all floors live in the job's `env:` block) |
-| `frontend-lint` | `tsc -b`, `eslint --max-warnings 1116`, `jscpd`, and `npm run i18n:check` |
+| `frontend-lint` | `tsc -b`, `eslint --max-warnings <measured count>`, `jscpd`, and `npm run i18n:check` |
 | `electron-test` | The Electron shell's own node:test suite (`website/electron`) |
 | `frontend-test` | `vitest run --coverage` |
 | `cfn-lint` | Lints the artifact-deploy templates with a pinned `cfn-lint` |
@@ -117,7 +118,7 @@ Details worth knowing:
 - **`coverage-gate` is fail-closed.** It runs `if: always()` and its first step
   converts any non-success upstream result into an explicit failure, because GitHub
   treats a **skipped** required check as satisfied. It also compares the raw
-  line-rate and rounds only for display, so 79.95% cannot pass an 80% floor.
+  line-rate and rounds only for display, so 89.95% cannot pass a 90% floor.
 - **`coverage-gate` enforces two different shapes.** The project floors
   (`BACKEND_MIN`, `FRONTEND_MIN`) compare one lane-wide average; the per-file floor
   (`PER_FILE_MIN`, `scripts/check_per_file_coverage.py`) requires *every measured
@@ -135,8 +136,11 @@ Details worth knowing:
   places. Per-file enforcement is skipped for a lane whose suite ran as a
   coverage-free subset, because subset rates are not comparable to a baseline
   recorded on the full suite.
-- **`eslint --max-warnings 1116` is a ratchet baseline.** Burn it down, never raise
-  it.
+- **`eslint --max-warnings <n>` is a ratchet baseline, and `<n>` is the measured
+  count.** Burn it down, never raise it, and never leave it above what
+  `npx eslint src/` reports: the difference is a budget new warnings land inside
+  without anyone seeing them. `test_eslint_warning_ceiling.py` keeps the number in one place so a
+  burn-down cannot leave a stale copy behind.
 - **The i18n gates split into three tiers,** and only two can fail: diff-scoped
   zero-tolerance checks (a user-visible literal on a line this branch wrote, a
   file holding more than it did at the base, new English key shape, changed catalog
@@ -170,16 +174,17 @@ PR-time proof only, no publishing.
 - **`build-desktop`** builds the Electron app unsigned on macos-15 and
   ubuntu-22.04 via `make desktop`, and uploads the artifacts.
 
-**Neither desktop lane ever RUNS the frozen binary.** `build-desktop` here and
-`build-desktop.yml` in the release lane both build the real PyInstaller
-`kirocrew-backend` (via `packaging/kirocrew-backend.spec`) and then only upload the
-artifact. The wheel lane at least runs `kirocrew --version`. So a packaging change
-that breaks the frozen app (a PyInstaller layout change, an executable rename, a
-missing hidden import that stops the binary from booting) passes every gate: the
-tests that cover frozen behavior monkeypatch `sys.frozen` and `sys.executable`, so
-they stay green against a simulated environment. The cheap fix is to run the
-already-built binary once in `build-desktop`, the frozen analogue of the wheel
-lane's `--version`.
+**Neither desktop lane ever RUNS the bundled backend.** `build-desktop` here and
+`build-desktop.yml` in the release lane both build the real `kirocrew-backend`
+tree via `packaging/build-desktop.sh` — which provisions a
+python-build-standalone interpreter and pip-installs the project into it — and
+then only upload the artifact. The wheel lane at least runs `kirocrew --version`.
+So a packaging change that breaks the packaged app (a layout change, a launcher
+rename, a dependency that fails to install into the bundled interpreter) passes
+every gate: the tests that cover packaged-app behavior monkeypatch `sys.frozen`
+and `sys.executable`, so they stay green against a simulated environment. The
+cheap fix is to run the already-built launcher once in `build-desktop`, the
+packaged analogue of the wheel lane's `--version`.
 
 ## `code-review.yml`: the deterministic pre-gate
 
@@ -200,15 +205,24 @@ of the AUTOSDE rules; the semantic half is delegated to the line reviewers.
 - **`inclusive-language`** runs a SHA-pinned `woke` over added lines only and fails
   on `(error)` severity. Legacy violations are burned down separately; this stops
   new ones.
-- **`sast`** runs Semgrep in a pinned container, diff-only against the base,
-  `p/python p/typescript p/security-audit p/secrets`, with `--error`. Blocking.
+- **`sast`** runs Semgrep in a pinned container: first `semgrep --test` over the
+  custom rules in `semgrep/` against the annotated fixtures in `semgrep-tests/`
+  (both directions — a `ruleid:` line must match, an `ok:` line must not — so a
+  rule regression goes red here, not on a later unrelated PR; the rules dir is
+  non-hidden because semgrep 1.78's test mode cannot discover tests under a
+  hidden directory), then the scan itself, diff-only against the base,
+  community packs plus `semgrep/`, with `--error`. The fixtures are listed in
+  `.semgrepignore` so the deliberately vulnerable fixture code is never read by
+  the scan. Blocking.
 - **`dep-audit`** calls the reusable `dependency-vulnerability.yml`, which runs
   `scripts/check_npm_audit.py` over every lockfile-backed Node project and fails
   closed on **high or critical production** vulnerabilities. Time-boxed exceptions
   live in `.vulnerability-exceptions.json`.
 - **`pr-hygiene`** enforces a Conventional-Commits PR title (it becomes the
-  squash-merge message) and exactly one commit (`git rev-list --count == 1`). Both
-  blocking.
+  squash-merge message) and at most two commits (`git rev-list --count <= 2`).
+  One commit stays the norm; the second is there so a mechanical follow-up (a
+  regenerated artifact, a formatting sweep) can stay separable from the change
+  it accompanies. Both blocking.
 
 Separately, **`dependency-review.yml`** fails a PR that adds or changes a
 dependency whose license is off the curated allowlist in

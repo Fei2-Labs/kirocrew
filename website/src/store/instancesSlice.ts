@@ -52,6 +52,15 @@ export interface HostModel {
   /** True when the parent is a macOS Electron window not in fullscreen, so the
    *  embedded header must inset its content clear of the native traffic lights. */
   macInset: boolean
+  /** The parent window's focus mode, relayed so the pane hides its own chrome to
+   *  match instead of landing fully-framed inside a focused window. `null` means
+   *  the host SENT NO OPINION — an older host whose model predates the field —
+   *  and the pane must keep its own state: coercing absence to `false` would
+   *  snap a user-toggled pane back off on every host re-broadcast, since an old
+   *  host also ignores the pane's echoed `mc-set-focus-mode`. The pane's OWN
+   *  `mc-focus-mode` setting is left untouched either way — this is the host's
+   *  view preference, and the pane has its own localStorage (cross-origin iframe). */
+  focusMode: boolean | null
   /** True when the parent shell is Electron. Gates the embedded ⌘/Ctrl+digit
    *  instance-switch chord: in a plain browser those chords are reserved for
    *  browser tab switching, so the pane must not bind (or advertise) them. */
@@ -63,6 +72,18 @@ export interface HostModel {
    *  `mc-set-crew-pin` back up so the set stays one shared value across every
    *  pane. A plain array because postMessage cannot carry a Set. */
   pinnedCrews: string[]
+  /** The parent's "keep tab order fixed" preference, relayed so the embedded bar
+   *  applies the same ordering as the local bar instead of always reshuffling on
+   *  switch (its own cross-origin-iframe localStorage the parent can never
+   *  reach). An embedded toggle posts `mc-set-stable-order` back up so the value
+   *  stays one shared preference across every pane.
+   *
+   *  Tri-state on purpose, exactly like `focusMode` above: `null` means the host
+   *  SENT NO OPINION — an older parent whose model predates this field, and which
+   *  therefore also has no `mc-set-stable-order` handler. Coercing that absence
+   *  to `false` would leave the pane offering a toggle the host can never honor,
+   *  so `null` orders by the pre-relay default AND hides the control instead. */
+  stableOrder: boolean | null
 }
 
 interface InstancesState {

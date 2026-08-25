@@ -10,7 +10,7 @@ is present in a dev environment but missing from ``setup.cfg``
 Hermetic — no network, no package installation, pure AST + configparser.
 
 Scope: only core kiro_crew modules (excludes apps/builtins/, knowledge/,
-workflows/, aidlc/ sub-trees which have their own dependency management).
+workflows/ sub-trees which have their own dependency management).
 
 The historical PyYAML gap and the opentelemetry
 gap both would have been caught by this gate on day one.
@@ -62,7 +62,6 @@ _EXCLUDED_SUBTREES: tuple[str, ...] = (
     "apps/builtins/",
     "knowledge/",
     "workflows/",
-    "aidlc/",
     # Fork-only artifact-deploy reaper Lambda payload; boto3/botocore come
     # from the AWS Lambda runtime, not core startup imports.
     "deploy/skills/",
@@ -167,7 +166,7 @@ def _pyproject_text() -> str:
 def test_pyproject_declares_optional_dependencies_dynamic():
     """``optional-dependencies`` MUST be in pyproject's ``[project] dynamic``.
 
-    The extras (voice/desktop/dev/otlp) live in setup.cfg
+    The extras (voice/dev/otlp) live in setup.cfg
     ``[options.extras_require]``. Once a ``[project]`` table exists, setuptools
     ignores setup.cfg metadata for any field not declared dynamic — so dropping
     this entry silently strips EVERY extra from the built metadata. pip then
@@ -195,12 +194,11 @@ def test_declared_extras_match_setup_cfg():
     cfg.read(_setup_cfg_path())
     assert cfg.has_section("options.extras_require")
     extras = set(cfg.options("options.extras_require"))
-    # These four are referenced by docs, CI, and the Makefile; losing any of
+    # These three are referenced by docs, CI, and the Makefile; losing any of
     # them breaks a documented install path.
     assert {
         "otlp",
         "voice",
-        "desktop",
         "dev",
     } <= extras, f"expected the documented extras to exist in setup.cfg; got {sorted(extras)}"
 

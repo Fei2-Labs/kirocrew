@@ -42,7 +42,6 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       })),
       isAtBottom: true,
       scrollToBottom: vi.fn(),
-      scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
@@ -107,6 +106,7 @@ import ChatPage from '../pages/ChatPage'
 
 const MSG = { role: 'assistant', content: 'newest', ts: '2026-06-23T20:00:00Z' }
 const INDICATOR = 'older-messages-loading'
+const BAR = 'load-earlier-messages'
 
 const renderChatPage = () => {
   const slot = { key: 'chat-1', title: 'chat-1', messages: 1, running: false, mode: '', created: '', last_ts: '' }
@@ -127,6 +127,9 @@ const renderChatPage = () => {
       lastChunkSeq: undefined, history: [], historyHasMore: false, historyOffset: 0,
       pendingInput: null, slotContextPct: {}, voicePlaying: false, voiceAudio: null,
       subagents: {}, toolLog: [], activityOpen: false, activityTab: 'tools', slotActivity: {}, slotHistory: [],
+      // switchSlot.pending caches the outgoing transcript here; the real initial state
+      // has it, so a fixture without it models a store that never exists.
+      slotMessages: {},
     } as never,
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -149,6 +152,12 @@ const renderChatPage = () => {
 // Driven at the reducer boundary: the thunk dispatches `pending` before its
 // creator reads `loadingOlder` as a guard, so it returns null and never fetches.
 const pending = { type: 'chat/loadOlder/pending', meta: { arg: 'chat-1', requestId: 'r1', requestStatus: 'pending' } }
+// The real producer of a has-more cursor: its reducer runs setPagingCursor, which
+// writes has-more, the offset and the cursor key as one unit.
+const olderPageLanded = { type: 'chat/loadOlder/fulfilled', payload: { slot: 'chat-1', nextBefore: 20, messages: [], hasMore: true, total: 50 }, meta: { requestId: 'r2', requestStatus: 'fulfilled' } }
+// The last page: has-more false, which is what removes the bar's mount condition.
+const finalPageLanded = { type: 'chat/loadOlder/fulfilled', payload: { slot: 'chat-1', nextBefore: 0, messages: [], hasMore: false, total: 50 }, meta: { requestId: 'r3', requestStatus: 'fulfilled' } }
+const sameKeySwitchPending = { type: 'chat/switchSlot/pending', meta: { arg: 'chat-1', requestId: 's1', requestStatus: 'pending' } }
 const rejected = { type: 'chat/loadOlder/rejected', meta: { arg: 'chat-1', requestId: 'r1', requestStatus: 'rejected' }, error: { message: 'offline' } }
 
 // The initial fetch replaces the store's messages after mount, and an empty
@@ -205,5 +214,58 @@ describe('ChatPage – older-messages loading indicator', () => {
     await waitFor(() => {
       expect(screen.queryByTestId(INDICATOR)).toBeNull()
     })
+  })
+
+  // Control for the case below: with has-more reported and the cursor keyed, it mounts.
+  it('mounts the earlier-messages bar once a page lands reporting more history', async () => {
+    const store = renderChatPage()
+    await seed(store)
+
+    act(() => { store.dispatch(olderPageLanded) })
+
+    await screen.findByTestId(BAR)
+    expect(store.getState().chat.slotCursorKey).toBe('chat-1')
+  })
+
+  it('unmounts the bar mid-switch, when the cursor still describes the outgoing chat', async () => {
+    const store = renderChatPage()
+    await seed(store)
+    act(() => { store.dispatch(olderPageLanded) })
+    await screen.findByTestId(BAR)
+
+    // A SAME-key switch: nulls the cursor without touching activeSlot or messages,
+    // so the cursor key is the only variable that moves.
+    act(() => { store.dispatch(sameKeySwitchPending) })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId(BAR)).toBeNull()
+    })
+    // The suppression must come from the cursor, not from has-more flipping:
+    // without these the test would pass for the wrong reason.
+    expect(store.getState().chat.slotHasMore).toBe(true)
+    expect(store.getState().chat.slotCursorKey).toBeNull()
+    expect(store.getState().chat.activeSlot).toBe('chat-1')
+  })
+
+  it('hands focus to the transcript when the final page unmounts the bar', async () => {
+    const store = renderChatPage()
+    const scroller = await seed(store)
+    act(() => { store.dispatch(olderPageLanded) })
+    const bar = await screen.findByTestId(BAR)
+    bar.focus()
+    expect(document.activeElement).toBe(bar)
+
+    act(() => { store.dispatch(finalPageLanded) })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId(BAR)).toBeNull()
+    })
+    // Without the hand-off this is <body> -- the stranding the bar's own
+    // aria-disabled choice exists to avoid.
+    expect(document.activeElement).toBe(scroller)
+    // Asserted directly because jsdom's focus() ignores focusability: a real browser
+    // needs the attribute, and the line above passes with or without it.
+    expect(scroller).toHaveAttribute('tabindex', '-1')
+    expect(store.getState().chat.slotHasMore).toBe(false)
   })
 })

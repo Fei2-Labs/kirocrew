@@ -1,4 +1,5 @@
 import type { DisplayItem } from '../pages/chat/types'
+import { TURN_OPENER_ROLES } from '../pages/chat/groupDisplayItems'
 import { mdImageDestToPath } from './fileTokens'
 
 /**
@@ -57,9 +58,19 @@ export function pinHandoffY(foldY: number, collapsedCardH: number): number {
   return foldY + ROW_PAD_Y * 2 + collapsedCardH
 }
 
-/** Only user-typed prompts pin. `nudge` opens a turn too but is machine-injected. */
+/**
+ * Rows that can take the pin: the ones that OPEN a turn.
+ *
+ * Derived from `TURN_OPENER_ROLES` rather than restated, because the two lists
+ * disagreeing is the defect this exists to prevent. A nudge and a subagent
+ * completion are machine-injected, but each IS the thing that started the turn
+ * being read, and a session made almost entirely of them (a babysit loop, a
+ * workflow fan-out) otherwise offers no pinnable row cycle after cycle — the walk
+ * upward skips every one and lands on the human's last typed message, dozens of
+ * turns and tens of thousands of pixels away.
+ */
 function isPrompt(item: DisplayItem | undefined): boolean {
-  return !!item && item.kind === 'single' && item.msg.role === 'user'
+  return !!item && item.kind === 'single' && TURN_OPENER_ROLES.has(item.msg.role)
 }
 
 /**
@@ -90,6 +101,56 @@ export function findNextPromptIdx(items: DisplayItem[], afterIdx: number): numbe
     if (isPrompt(items[i])) return i
   }
   return -1
+}
+
+/**
+ * Display index of the row the pinned-prompt jump should scroll to when the
+ * user asks for `target`.
+ *
+ * Normally that is `target` itself. But when the rows immediately BEFORE the
+ * target are also prompts (turn openers, per `isPrompt`), the jump anchors at
+ * the FIRST prompt of that consecutive run — the walk finds the top of the
+ * contextual block the target belongs to.
+ *
+ * Why not land on `target` directly: putting it at the jump chrome leaves the
+ * prompt above it straddling the hand-off line — it cannot pin (its bottom is
+ * still below the line) while its own top edge has already pushed the fallback
+ * banner fully out — so the banner unmounts and the jump chain dies on a
+ * landing the scan treats as a transient. Anchoring at the head of the run
+ * puts a non-prompt row (or the top of the list) on the line instead, so the
+ * previous turn's banner survives and the chain continues.
+ *
+ * The walk deliberately consumes MACHINE turn openers too (nudge and subagent
+ * rows — `isPrompt` derives from `TURN_OPENER_ROLES`), not only consecutive
+ * user rows like a steer following its prompt. The mechanism-backed case is a
+ * subagent fan-out whose synthesis is still pending: `groupDisplayItems`
+ * suppresses each per-completion reply under `synthesisPending`, so the
+ * completions lay out as one run of consecutive opener rows. Consecutive
+ * nudge rows arise only when nudged turns persist no reply (an errored or
+ * cancelled cycle — a normal cycle interposes its tool/assistant rows). In
+ * both shapes each row is pinnable, and each belongs to the same contextual
+ * block as the row directly above the run: jumping to any member lands at the
+ * block's top, where the exchange reads in order — stopping mid-run would
+ * drop the reader between two machine rows with the context that explains
+ * them still hidden above.
+ *
+ * Walking up lengthens the jump. The virtualizer's near/far decision
+ * (`mountIndex` in useVirtualChat) compares the anchor's jump window against
+ * the COMMITTED window with `NEAR_JUMP_OVERSCAN_MULT` overscan windows of
+ * slack (24 rows for the transcript, which passes `overscan: 6`) — a budget
+ * shared with the distance the jump already covers, so the walk consumes
+ * whatever slack a near jump has left over. In the common case (the pinned
+ * prompt is the previous turn) that leaves the glide untouched; a jump
+ * already sitting at the band's edge can be tipped onto the far path by the
+ * walk, and that is the right outcome there — the gap is unmounted spacer,
+ * and a glide across it would scrub blank.
+ *
+ * For a target with a non-prompt row above it this returns `target` unchanged.
+ */
+export function jumpAnchorIdx(items: DisplayItem[], target: number): number {
+  let anchor = target
+  while (anchor > 0 && isPrompt(items[anchor - 1])) anchor -= 1
+  return anchor
 }
 
 /**

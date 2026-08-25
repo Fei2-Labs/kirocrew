@@ -25,6 +25,7 @@ from kiro_crew.voice_reply import (
     _validate_rate,
     is_available,
     split_sentences,
+    stitch_mp3s,
     strip_markdown,
     synthesize_speech,
     text_to_ssml,
@@ -247,6 +248,11 @@ def _patch_aws_on_path(monkeypatch) -> None:
         "kiro_crew.voice_reply.shutil.which",
         lambda name, *a, **k: _FAKE_AWS_CLI if name == "aws" else None,
     )
+    # The which stub above is name-sensitive ("aws" only), but the shared
+    # deploy-engine resolver (#4770) would feed it a PATH-hit absolute path.
+    # Pin the resolver to the bare name so this fixture keeps meaning exactly
+    # "the aws CLI is present" regardless of the host.
+    monkeypatch.setattr("kiro_crew.voice_reply.resolve_aws_bin", lambda: "aws")
 
 
 @pytest.fixture(autouse=True)
@@ -343,6 +349,49 @@ class TestIsAvailable:
 
     def test_unknown_provider_returns_false(self, caplog) -> None:
         assert is_available("bogus") is False
+
+
+# ── resolve_polly_cli() (#4770) ─────────────────────────────────────────
+
+
+class TestResolvePollyCli:
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="fallback install dirs are POSIX literals; dead on Windows by design",
+    )
+    def test_resolved_absolutely_under_minimal_path(self, monkeypatch, tmp_path) -> None:
+        """A GUI-launched gateway's minimal PATH must still resolve the CLI
+        absolutely via the deploy engine's well-known-dirs resolver instead of
+        silently skipping TTS (#4770)."""
+        from kiro_crew import github_runner, voice_reply
+        from kiro_crew.deploy import engine
+
+        fake_aws = tmp_path / "aws"
+        fake_aws.write_text("#!/bin/sh\n")
+        fake_aws.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+
+        assert voice_reply.resolve_polly_cli() == str(fake_aws)
+        # The converted is_available() probe site sees the same resolution.
+        assert is_available(PROVIDER_POLLY) is True
+
+    def test_none_when_cli_absent_everywhere(self, monkeypatch, tmp_path) -> None:
+        """Bare-name fallback that is not invocable maps to None — the value
+        every probe site already treats as 'unavailable'."""
+        from kiro_crew import voice_reply
+        from kiro_crew.deploy import engine
+
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", ())
+
+        assert voice_reply.resolve_polly_cli() is None
+        assert is_available(PROVIDER_POLLY) is False
 
 
 # ── _resolve_piper_binary() ─────────────────────────────────────────────
@@ -680,9 +729,48 @@ class TestSynthesizePiper:
 # ── _synthesize_polly() ──────────────────────────────────────────────────
 
 
+def _matching_identity(consent_mod, account: str):
+    """An async ``probe_identity`` stand-in that resolves to ``account``."""
+
+    async def _probe(_profile: str, _region: str, *, use_cache: bool = True):
+        return consent_mod.Identity(ok=True, account=account)
+
+    return _probe
+
+
+@pytest.fixture()
+def _polly_consented(tmp_path_factory, monkeypatch):
+    """Record operator consent for Polly under the default profile+region.
+
+    ``_synthesize_polly`` now refuses without one, so every test that means to
+    exercise the SYNTHESIS path has to consent first. The grant is written into
+    a throwaway data home, never the real one. Tests that assert the refusal
+    itself deliberately do not use this fixture (see ``test_aws_consent.py``).
+    """
+    home = tmp_path_factory.mktemp("consent-home")
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    from kiro_crew import aws_consent
+    from kiro_crew.config.loader import config_dir
+
+    config_dir().mkdir(parents=True, exist_ok=True)
+    aws_consent.record_grant(
+        aws_consent.SERVICE_POLLY,
+        profile="",
+        region="",
+        account="111122223333",
+        arn="arn:aws:iam::111122223333:user/test",
+        granted_at="2026-08-21T00:00:00+00:00",
+    )
+    # The gate also verifies the LIVE account, which would spawn the AWS CLI.
+    # These cases are about synthesis, so return a matching identity instead.
+    monkeypatch.setattr(
+        aws_consent, "probe_identity", _matching_identity(aws_consent, "111122223333")
+    )
+
+
 class TestSynthesizePolly:
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, _polly_consented):
         # _synthesize_polly() calls wrap_argv before create_subprocess_exec.
         # wrap_argv fail-closes on any host with no OS sandbox backend (macOS 26,
         # every Windows host), which is caught and returns None. Patch to
@@ -717,6 +805,20 @@ class TestSynthesizePolly:
 
     @pytest.mark.asyncio
     async def test_profile_and_region_passed_through(self, tmp_path) -> None:
+        # The class fixture consents for the DEFAULT profile+region, and a grant
+        # is keyed on both -- so this case has to consent for the pair it
+        # actually uses. That is the gate working: consent for one account does
+        # not silently transfer to another profile or region.
+        from kiro_crew import aws_consent
+
+        aws_consent.record_grant(
+            aws_consent.SERVICE_POLLY,
+            profile="my-profile",
+            region="us-east-2",
+            account="111122223333",
+            arn="arn:aws:iam::111122223333:user/test",
+            granted_at="2026-08-21T00:00:00+00:00",
+        )
         proc = _mock_subprocess(returncode=0)
 
         captured: list[str] = []
@@ -1165,7 +1267,7 @@ class TestTextTypeAutoDetection:
     """Tests for --text-type dynamic selection (ssml vs text)."""
 
     @pytest.fixture(autouse=True)
-    def _passthrough_sandbox(self, monkeypatch):
+    def _passthrough_sandbox(self, monkeypatch, _polly_consented):
         # See TestSynthesizePolly._passthrough_sandbox.
         monkeypatch.setattr(
             "kiro_crew.voice_reply.wrap_argv", lambda argv, **k: (list(argv), None)
@@ -1222,3 +1324,174 @@ class TestTextTypeAutoDetection:
         result = text_to_ssml("Hello world", engine="standard")
         assert result.startswith("<speak")
         assert "</speak>" in result
+
+
+# ── stitch_mp3s() failure-path cleanup ──────────────────────────────────
+
+
+class TestStitchMp3s:
+    """Failure exits must not leak the internally allocated (mkstemp) output.
+
+    When the caller supplies no ``output``, ``stitch_mp3s`` allocates one via
+    ``mkstemp``. On any unsuccessful exit it returns ``None``, so no caller
+    ever receives that path — the file must be removed before returning. A
+    caller-supplied ``output`` is never owned by the function and must stay
+    untouched on failure.
+    """
+
+    @staticmethod
+    def _capture_mkstemp(monkeypatch) -> list[str]:
+        """Record every path the module allocates via ``tempfile.mkstemp``."""
+        allocated: list[str] = []
+        real_mkstemp = tempfile.mkstemp
+
+        def recording_mkstemp(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            allocated.append(path)
+            return fd, path
+
+        monkeypatch.setattr("kiro_crew.voice_reply.tempfile.mkstemp", recording_mkstemp)
+        return allocated
+
+    @staticmethod
+    def _two_inputs(tmp_path) -> list[str]:
+        """Two fake MP3 inputs — one path short-circuits before ffmpeg runs."""
+        paths = []
+        for name in ("a.mp3", "b.mp3"):
+            p = tmp_path / name
+            p.write_bytes(b"fake-mp3")
+            paths.append(str(p))
+        return paths
+
+    @pytest.mark.asyncio
+    async def test_spawn_failure_removes_owned_temp(self, tmp_path, monkeypatch) -> None:
+        allocated = self._capture_mkstemp(monkeypatch)
+
+        async def fake_exec(*cmd, **kwargs):
+            raise FileNotFoundError("ffmpeg not on PATH")
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            result = await stitch_mp3s(self._two_inputs(tmp_path))
+
+        assert result is None
+        assert len(allocated) == 1
+        assert not os.path.exists(allocated[0])
+
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_removes_owned_temp(self, tmp_path, monkeypatch) -> None:
+        allocated = self._capture_mkstemp(monkeypatch)
+        proc = _mock_subprocess(returncode=1, stderr=b"concat error")
+
+        async def fake_exec(*cmd, **kwargs):
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            result = await stitch_mp3s(self._two_inputs(tmp_path))
+
+        assert result is None
+        assert len(allocated) == 1
+        assert not os.path.exists(allocated[0])
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_child_and_removes_owned_temp(self, tmp_path, monkeypatch) -> None:
+        allocated = self._capture_mkstemp(monkeypatch)
+        proc = _mock_subprocess(returncode=0)
+        proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        async def fake_exec(*cmd, **kwargs):
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            result = await stitch_mp3s(self._two_inputs(tmp_path))
+
+        assert result is None
+        # wait_for cancels communicate() but does not terminate the child;
+        # the child must be killed and reaped BEFORE the unlink, or Windows
+        # refuses to remove the still-open output file.
+        proc.kill.assert_called_once()
+        proc.wait.assert_awaited()
+        assert len(allocated) == 1
+        assert not os.path.exists(allocated[0])
+
+    @pytest.mark.asyncio
+    async def test_cancellation_kills_child_and_removes_owned_temp(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # CancelledError is a BaseException: it bypasses ``except Exception``,
+        # so only a finally-based invariant discards the owned output here.
+        allocated = self._capture_mkstemp(monkeypatch)
+        proc = _mock_subprocess(returncode=0)
+        proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+
+        async def fake_exec(*cmd, **kwargs):
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            with pytest.raises(asyncio.CancelledError):
+                await stitch_mp3s(self._two_inputs(tmp_path))
+
+        proc.kill.assert_called_once()
+        proc.wait.assert_awaited()
+        assert len(allocated) == 1
+        assert not os.path.exists(allocated[0])
+
+    @pytest.mark.asyncio
+    async def test_empty_output_removes_owned_temp(self, tmp_path, monkeypatch) -> None:
+        # The mkstemp allocation always exists on disk, so "ffmpeg produced no
+        # output" manifests as a zero-byte file, never an absent one.
+        allocated = self._capture_mkstemp(monkeypatch)
+        proc = _mock_subprocess(returncode=0)
+
+        async def fake_exec(*cmd, **kwargs):
+            return proc  # exits 0 but writes nothing to the output path
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            result = await stitch_mp3s(self._two_inputs(tmp_path))
+
+        assert result is None
+        assert len(allocated) == 1
+        assert not os.path.exists(allocated[0])
+
+    @pytest.mark.asyncio
+    async def test_failure_leaves_caller_supplied_output_untouched(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        allocated = self._capture_mkstemp(monkeypatch)
+        caller_output = tmp_path / "caller.mp3"
+        caller_output.write_bytes(b"pre-existing caller data")
+        proc = _mock_subprocess(returncode=1)
+
+        async def fake_exec(*cmd, **kwargs):
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            result = await stitch_mp3s(self._two_inputs(tmp_path), output=str(caller_output))
+
+        assert result is None
+        assert allocated == []  # caller supplied the path; nothing was allocated
+        assert caller_output.exists()
+        assert caller_output.read_bytes() == b"pre-existing caller data"
+
+    @pytest.mark.asyncio
+    async def test_success_returns_owned_output_intact(self, tmp_path, monkeypatch) -> None:
+        allocated = self._capture_mkstemp(monkeypatch)
+        proc = _mock_subprocess(returncode=0)
+
+        async def fake_exec(*cmd, **kwargs):
+            with open(cmd[-1], "wb") as f:  # output path is the last argv entry
+                f.write(b"stitched-mp3-data")
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            result = await stitch_mp3s(self._two_inputs(tmp_path))
+
+        try:
+            assert len(allocated) == 1
+            assert result == allocated[0]
+            assert os.path.exists(result)
+            assert os.path.getsize(result) > 0
+        finally:
+            # Not on the happy path: a failing assert above must not leave
+            # the mkstemp file behind as test residue.
+            if allocated and os.path.exists(allocated[0]):
+                os.unlink(allocated[0])

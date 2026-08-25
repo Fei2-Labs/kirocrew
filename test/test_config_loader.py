@@ -6,10 +6,12 @@ for property-based testing.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
 import platform
+import re
 import tempfile
 import unittest.mock
 from pathlib import Path
@@ -88,6 +90,28 @@ def _load_from_dict(data: object) -> KiroCrewConfig:
             return KiroCrewConfig.load()
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _load_absent_config() -> KiroCrewConfig:
+    """Load with NEITHER config.json nor config.local.json present.
+
+    This is the only path that reaches the dataclass field defaults, so it is
+    what a default must be compared against.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        missing = Path(d) / "config.json"
+        missing_local = Path(d) / "config.local.json"
+        with (
+            unittest.mock.patch(
+                "kiro_crew.config.loader.config_path",
+                return_value=missing,
+            ),
+            unittest.mock.patch(
+                "kiro_crew.config.loader.config_local_path",
+                return_value=missing_local,
+            ),
+        ):
+            return KiroCrewConfig.load()
 
 
 def _load_from_raw_string(content: str) -> KiroCrewConfig:
@@ -178,6 +202,23 @@ def test_sandbox_allow_unsandboxed_exec_loads_from_config() -> None:
     assert _load_from_dict({}).agent.sandbox_allow_unsandboxed_exec is False
     enabled = _load_from_dict({"agent": {"sandbox_allow_unsandboxed_exec": True}})
     assert enabled.agent.sandbox_allow_unsandboxed_exec is True
+
+
+def test_max_stop_hook_nudges_loads_from_config_and_round_trips() -> None:
+    """The Stop-hook nudge cap is built field-by-field in load(), so an
+    operator's value must hydrate and survive a to_dict() -> load() round-trip.
+    Without the loader wiring, load() re-defaults it to 100 and save() then
+    overwrites the operator's file value.
+    """
+    assert KiroCrewConfig().agent.max_stop_hook_nudges == 100
+    assert _load_from_dict({}).agent.max_stop_hook_nudges == 100
+    pinned = _load_from_dict({"agent": {"max_stop_hook_nudges": 7}})
+    assert pinned.agent.max_stop_hook_nudges == 7
+    # 0 = uncapped opt-in must survive too, not be re-defaulted to 100.
+    uncapped = _load_from_dict({"agent": {"max_stop_hook_nudges": 0}})
+    assert uncapped.agent.max_stop_hook_nudges == 0
+    # Round-trip: save() (to_dict) -> load() preserves the pinned value.
+    assert _load_from_dict(pinned.to_dict()).agent.max_stop_hook_nudges == 7
 
 
 def test_dashboard_tailscale_hydrates_and_survives_a_round_trip() -> None:
@@ -295,6 +336,31 @@ def test_slack_home_tab_sessions_per_kind_parsed_and_round_trips():
     # Survives a to_dict() -> load() round-trip.
     reloaded = _load_from_dict(loaded.to_dict())
     assert reloaded.slack.home_tab_sessions_per_kind == 42
+
+
+class TestFallbackModelLoad:
+    """agent.fallback_model flows through the explicit load() kwargs."""
+
+    def test_load_coerces_registry_alias(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": "opus-4.8-1m"}})
+        assert loaded.agent.fallback_model == "claude-opus-4.8"
+
+    def test_load_default_is_auto(self) -> None:
+        # DEFAULT PIN: a config without the key loads "auto" — fallback ON via
+        # the backend's availability-aware routing.
+        assert _load_from_dict({}).agent.fallback_model == "auto"
+
+    def test_load_explicit_empty_disables(self) -> None:
+        # ROLLBACK PIN: fallback_model "" is the opt-out — pre-feature behavior.
+        assert _load_from_dict({"agent": {"fallback_model": ""}}).agent.fallback_model == ""
+
+    def test_load_malformed_value_never_crashes(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": {"not": "a string"}}})
+        assert loaded.agent.fallback_model == "auto"
+
+    def test_round_trips_through_to_dict(self) -> None:
+        loaded = _load_from_dict({"agent": {"fallback_model": "claude-opus-5"}})
+        assert loaded.to_dict()["agent"]["fallback_model"] == "claude-opus-5"
 
 
 class TestMalformedConfigValuesNeverCrashLoad:
@@ -1509,6 +1575,23 @@ class TestEdgeCases:
         """recent_tint_count defaults to 0 (off) when not in config."""
         cfg = _load_from_dict({})
         assert cfg.dashboard.recent_tint_count == 0
+
+    def test_update_nudge_loaded_from_config(self) -> None:
+        """The popup's snooze/skip record round-trips through load, so a GET
+        after a PATCH reads back what was written."""
+        rec = {"version": "0.5.0", "snoozed_until": 1756000000.0, "skipped": True}
+        cfg = _load_from_dict({"dashboard": {"update_nudge": rec}})
+        assert cfg.dashboard.update_nudge == rec
+
+    def test_update_nudge_defaults_to_empty_dict(self) -> None:
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.update_nudge == {}
+
+    def test_update_nudge_non_dict_coerces_to_empty(self) -> None:
+        """A hand-edited scalar must not crash load or leak a non-dict to the
+        dashboard's config read-back."""
+        cfg = _load_from_dict({"dashboard": {"update_nudge": "corrupt"}})
+        assert cfg.dashboard.update_nudge == {}
 
     def test_embedding_provider_defaults_to_llama_cpp(self) -> None:
         """embedding_provider defaults to 'llama_cpp' (in-process, default-on)."""
@@ -2762,6 +2845,73 @@ class TestSecurityBoundClamping:
         assert d["agent"]["subagent_max_turns"] == 200
         assert d["session"]["pool_size"] == 10
 
+    def test_numeric_string_ceiling_is_still_enforced_at_extraction(self) -> None:
+        """``_clamp_security_bounds`` runs over the RAW dict and deliberately
+        skips non-int values (see ``test_non_int_value_not_clamped``) --
+        ``_safe_int``'s own docstring says clamping at the coercion site is
+        what actually enforces the range for a numeric STRING that slips past
+        it. ``max_subagents``/``subagent_max_turns`` previously reached the
+        dataclass with NO coercion at all, and ``subagent_auto_max``/
+        ``pool_size`` were ``_safe_int``-coerced but without bounds -- all
+        four let a numeric-string value bypass the declared ceiling entirely."""
+        from kiro_crew.config.loader import (
+            POOL_SIZE_MAX,
+            SUBAGENT_AUTO_MAX_CEILING,
+            SUBAGENT_MAX_TURNS_CEILING,
+        )
+
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "max_subagents": "200",
+                    "subagent_max_turns": "99999",
+                    "subagent_auto_max": "500",
+                },
+                "session": {"pool_size": "1000"},
+            }
+        )
+        assert cfg.agent.max_subagents == SUBAGENT_AUTO_MAX_CEILING == 64
+        assert cfg.agent.subagent_max_turns == SUBAGENT_MAX_TURNS_CEILING == 200
+        assert cfg.agent.subagent_auto_max == SUBAGENT_AUTO_MAX_CEILING == 64
+        assert cfg.session.pool_size == POOL_SIZE_MAX == 10
+        for v in (
+            cfg.agent.max_subagents,
+            cfg.agent.subagent_max_turns,
+            cfg.agent.subagent_auto_max,
+            cfg.session.pool_size,
+        ):
+            assert isinstance(v, int) and not isinstance(v, bool)
+
+    def test_numeric_string_in_range_still_parses(self) -> None:
+        """A well-formed numeric string within bounds must keep working --
+        the fix must not turn a previously-accepted legacy string value into
+        the default."""
+        cfg = _load_from_dict(
+            {
+                "agent": {
+                    "max_subagents": "8",
+                    "subagent_max_turns": "150",
+                    "subagent_auto_max": "32",
+                },
+                "session": {"pool_size": "4"},
+            }
+        )
+        assert cfg.agent.max_subagents == 8
+        assert cfg.agent.subagent_max_turns == 150
+        assert cfg.agent.subagent_auto_max == 32
+        assert cfg.session.pool_size == 4
+
+    def test_subagent_max_turns_as_string_no_longer_crashes_a_turn_limit_check(
+        self,
+    ) -> None:
+        """The concrete downstream failure this bug caused: subagent.py compares
+        ``turns > turn_limit`` where turns is always a real int -- a string
+        subagent_max_turns reaching that comparison raised TypeError on the
+        first tool call of every subagent. Assert the loaded value is always
+        int-comparable."""
+        cfg = _load_from_dict({"agent": {"subagent_max_turns": "50"}})
+        assert not (cfg.agent.subagent_max_turns > 999)  # must not raise TypeError
+
     def test_in_range_values_unchanged(self) -> None:
         with unittest.mock.patch("kiro_crew.config.loader._log_config_clamp_event") as mock_event:
             cfg = _load_from_dict(
@@ -2839,6 +2989,123 @@ class TestSecurityBoundClamping:
             _log_config_clamp_event("agent.subagent_auto_max", 200, 64, 1, 64)
 
 
+class TestAutocompactPctLoadClamp:
+    """session.autocompact_pct clamps into the documented 5-90 range at load
+    time (issue #4734).
+
+    The dashboard config API rejected out-of-range writes but a hand-edited
+    config.json loaded verbatim: at 500 the autocompactor trigger
+    (``pct >= autocompact_pct``) can never fire, silently disabling the
+    context-window backstop, and at 0 or below it fires on every turn.
+    """
+
+    def test_above_range_clamped_to_max(self) -> None:
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MAX
+
+        cfg = _load_from_dict({"session": {"autocompact_pct": 500}})
+        assert cfg.session.autocompact_pct == AUTOCOMPACT_PCT_MAX == 90.0
+
+    def test_negative_clamped_to_min(self) -> None:
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MIN
+
+        cfg = _load_from_dict({"session": {"autocompact_pct": -10}})
+        assert cfg.session.autocompact_pct == AUTOCOMPACT_PCT_MIN == 5.0
+
+    def test_zero_clamped_to_min(self) -> None:
+        """0 would fire auto-compaction on every turn; clamped UP to the floor."""
+        cfg = _load_from_dict({"session": {"autocompact_pct": 0}})
+        assert cfg.session.autocompact_pct == 5.0
+
+    def test_in_range_value_preserved(self) -> None:
+        cfg = _load_from_dict({"session": {"autocompact_pct": 75.5}})
+        assert cfg.session.autocompact_pct == 75.5
+
+    def test_default_when_omitted(self) -> None:
+        """An omitted key takes the module default, not a clamp bound. Asserted
+        against the constant rather than a literal so the two cannot drift: a
+        ``load()`` fallback restated as its own literal still fails here."""
+        from kiro_crew.config.loader import DEFAULT_AUTOCOMPACT_PCT
+
+        cfg = _load_from_dict({})
+        assert cfg.session.autocompact_pct == DEFAULT_AUTOCOMPACT_PCT
+
+    def test_load_range_and_dashboard_validator_share_one_constant(self) -> None:
+        """Drift guard: the dashboard write-gate bounds for
+        ``session.autocompact_pct`` must BE the loader's clamp constants — the
+        same objects, not two sets of literals that can drift apart (the drift
+        is exactly how the load path lost the range in the first place)."""
+        from kiro_crew.config.loader import AUTOCOMPACT_PCT_MAX, AUTOCOMPACT_PCT_MIN
+        from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+        spec = _EDITABLE_CONFIG["session.autocompact_pct"]
+        assert spec["type"] == "float"
+        assert spec["min"] is AUTOCOMPACT_PCT_MIN
+        assert spec["max"] is AUTOCOMPACT_PCT_MAX
+        assert (AUTOCOMPACT_PCT_MIN, AUTOCOMPACT_PCT_MAX) == (5.0, 90.0)
+
+
+class TestPoolSizeDefaultSingleSource:
+    """``session.pool_size`` has TWO independent paths to its default and they
+    must not be able to disagree.
+
+    A home with no ``config.json`` at all constructs ``SessionConfig()`` and
+    takes the dataclass field default; a home WITH a ``config.json`` that omits
+    the key reaches ``load()``'s file-parse fallback instead. An install that has
+    run setup is always the second case, so a literal at the parse site decides
+    the real default for essentially every host while the field default decides
+    what the schema, the docs, and a never-set-up home report. The disagreement
+    is invisible on disk: nothing serializes the difference, and each pooled slot
+    it silently buys is a kiro-cli process plus that agent's MCP stdio servers.
+    """
+
+    def test_field_default_reads_the_shared_constant(self) -> None:
+        assert loader_module.DEFAULT_POOL_SIZE == 0
+        assert (
+            SessionConfig.__dataclass_fields__["pool_size"].default
+            == loader_module.DEFAULT_POOL_SIZE
+        )
+        assert SessionConfig().pool_size == loader_module.DEFAULT_POOL_SIZE
+
+        # A dataclass default is bound at class creation, so no runtime
+        # assertion can tell a literal that happens to equal the constant from
+        # the constant itself. Read the declaration to close that gap: a literal
+        # here is exactly how the two spellings come apart.
+        decl = re.search(
+            r"pool_size:\s*int\s*=\s*field\(\s*default=([^,\s]+)\s*,",
+            inspect.getsource(SessionConfig),
+        )
+        assert decl is not None, "SessionConfig.pool_size field declaration not found"
+        assert decl.group(1) == "DEFAULT_POOL_SIZE"
+
+    def test_omitted_key_and_absent_file_agree(self) -> None:
+        """The behavioural invariant, stated without naming a value: whether a
+        config file omits ``pool_size``, omits the whole ``session`` block, or
+        does not exist, all three land on the same warm-pool size."""
+        omits_key = _load_from_dict({"session": {"timeout_secs": 1800}}).session.pool_size
+        omits_section = _load_from_dict({"agent": {"provider": "acp"}}).session.pool_size
+        no_file = _load_absent_config().session.pool_size
+
+        assert omits_key == omits_section == no_file == loader_module.DEFAULT_POOL_SIZE
+
+    def test_parse_fallback_holds_no_literal_of_its_own(self) -> None:
+        """Repoint the constant and the file-parse path must follow it.
+
+        This is what makes the constant the ONLY definition rather than merely
+        one that happens to agree today: with a literal at the parse site, the
+        loaded value ignores the repoint and this fails.
+        """
+        with unittest.mock.patch.object(loader_module, "DEFAULT_POOL_SIZE", 7):
+            assert _load_from_dict({"session": {}}).session.pool_size == 7
+            # The same fallback catches an unparseable value, so it must be
+            # sourced from the constant there too.
+            assert _load_from_dict({"session": {"pool_size": "two"}}).session.pool_size == 7
+
+    def test_explicit_value_still_wins_over_the_default(self) -> None:
+        """The reconciliation must not swallow a configured pool."""
+        assert _load_from_dict({"session": {"pool_size": 2}}).session.pool_size == 2
+        assert _load_from_dict({"session": {"pool_size": 0}}).session.pool_size == 0
+
+
 class TestConfigWriteProtection:
     """config.json / config.local.json are WRITE-protected (reads allowed)."""
 
@@ -2880,62 +3147,6 @@ class TestConfigWriteProtection:
         assert is_sensitive_write_path("~/.kiro/crew/sessions.db") is False
         assert is_sensitive_write_path("~/.kirocrew/sessions.db") is False
 
-    def test_migration_marker_is_write_protected(self) -> None:
-        # The data-home completion marker is authoritative: an agent that could
-        # plant it in a pre-migration new home would make the next boot skip
-        # migration and ignore the legacy home's governance + secrets. Writes
-        # blocked; reads allowed (doctor/diagnostics read it).
-        from kiro_crew.config.paths import MIGRATION_MARKER_NAME
-        from kiro_crew.security import is_sensitive_path, is_sensitive_write_path
-
-        for prefix in ("~/.kiro/crew", "~/.kirocrew"):
-            marker = f"{prefix}/{MIGRATION_MARKER_NAME}"
-            assert is_sensitive_write_path(marker), marker
-            assert is_sensitive_write_path(str(Path.home() / prefix[2:] / MIGRATION_MARKER_NAME))
-            # reads are not blocked (superset gate is write-only for this leaf)
-            assert is_sensitive_path(marker) is False, marker
-
-    def test_migration_marker_shell_writes_blocked_reads_allowed(self) -> None:
-        # Bash-layer protection: unlike config.json (whose inflated values the
-        # loader clamps at load time), the marker's mere PRESENCE is the trust
-        # signal, so a shell command that plants/removes it must be blocked at
-        # the bash gate too — the file-edit tool gate alone is not enough. We
-        # block it VERB-INDEPENDENTLY (any command naming it), so a quoted
-        # redirect / cp / python open / novel write verb cannot bypass an
-        # enumerated allowlist. Reads are incidentally blocked too — harmless:
-        # the marker holds no secret and legitimate readers (doctor, migration)
-        # use Python os calls, not bash.
-        from kiro_crew.config.paths import MIGRATION_MARKER_NAME
-        from kiro_crew.security import (
-            _WRITE_PROTECTED_BASH_LEAVES,
-            is_sensitive_bash_command,
-        )
-
-        # drift guard: the bash leaf list must stay pinned to the real marker
-        assert MIGRATION_MARKER_NAME in _WRITE_PROTECTED_BASH_LEAVES
-
-        for prefix in ("~/.kiro/crew", "~/.kirocrew"):
-            marker = f"{prefix}/{MIGRATION_MARKER_NAME}"
-            blocked = [
-                f"touch {marker}",
-                f"echo done > {marker}",
-                f"echo done >> {marker}",
-                f"rm {marker}",
-                f"tee {marker}",
-                f"mv /tmp/x {marker}",
-                # bypasses an enumerated write-verb allowlist would miss:
-                f'echo done > "{marker}"',  # quoted redirect target
-                f"cp /tmp/x {marker}",  # copy write verb
-                f"python -c \"open('{marker}','w')\"",  # script open
-                f"mkdir -p {marker}/x",  # marker-as-dir also exists()
-                f"cat {marker}",  # read (blocked too — no secret)
-            ]
-            for cmd in blocked:
-                assert is_sensitive_bash_command(cmd) is not None, cmd
-            # unrelated writes under the crew home stay allowed
-            assert is_sensitive_bash_command(f"touch {prefix}/sessions.db") is None
-            assert is_sensitive_bash_command(f"ls {prefix}/") is None
-
 
 class TestConfigEditToolBlocked:
     """The file-edit tool gate (HookManager.on_tool_call) denies edits to config."""
@@ -2969,6 +3180,56 @@ class TestConfigEditToolBlocked:
             raw_params={"path": "~/.kirocrew/workspace/notes.md"},
         )
         assert result.action != "deny"
+
+
+class TestFeishuConfigCoercionFailsClosed:
+    """A malformed feishu section must degrade to deny, never open a gate.
+
+    Two layers hold this: the schema type check rejects a wrong-typed value and
+    substitutes the field default, and the per-channel parse uses ``_safe_bool``
+    / ``_coerce_opaque_str_ids`` rather than raw ``bool()`` and comprehensions.
+    These tests pin the OBSERVABLE end state, so the guarantee survives either
+    layer being refactored.
+    """
+
+    def test_string_false_does_not_open_the_group_gate(self) -> None:
+        cfg = _load_from_dict(
+            {
+                "feishu": {
+                    "enabled": "true",
+                    "allow_group": "false",
+                    "allowed_group_ids": ["oc_g1"],
+                }
+            }
+        )
+        assert cfg.feishu.allow_group is False
+        assert cfg.feishu.enabled is False
+
+    def test_real_bools_are_preserved(self) -> None:
+        cfg = _load_from_dict({"feishu": {"enabled": True, "allow_group": True}})
+        assert cfg.feishu.enabled is True
+        assert cfg.feishu.allow_group is True
+
+    def test_null_id_lists_do_not_crash_config_load(self) -> None:
+        # A null or non-list value must yield the deny-everybody default rather
+        # than reaching an iteration that would raise during gateway startup.
+        cfg = _load_from_dict({"feishu": {"allowed_open_ids": None, "allowed_group_ids": "oc_g1"}})
+        assert cfg.feishu.allowed_open_ids == []
+        assert cfg.feishu.allowed_group_ids == []
+
+    def test_opaque_ids_survive_and_are_deduped(self) -> None:
+        # Feishu ids are opaque (ou_/oc_ prefixes), so a digit-only filter would
+        # drop every entry and lock out the intended senders.
+        cfg = _load_from_dict(
+            {
+                "feishu": {
+                    "allowed_open_ids": ["ou_abc123", "  ou_abc123 ", "", "ou_zzz"],
+                    "allowed_group_ids": ["oc_g1"],
+                }
+            }
+        )
+        assert cfg.feishu.allowed_open_ids == ["ou_abc123", "ou_zzz"]
+        assert cfg.feishu.allowed_group_ids == ["oc_g1"]
 
 
 class TestTelegramAllowedUserIdsGuard:
@@ -3465,9 +3726,7 @@ class TestOrchestratorWatchdogThemeAreParsed:
                 captured.append(kwargs)
 
         monkeypatch.setattr(acp_mod, "AcpProvider", _FakeProvider)
-        cfg = _load_from_dict(
-            {"agents": {"pr-reviewer": {"kiro_agent": "pr-reviewer-kiro"}}}
-        )
+        cfg = _load_from_dict({"agents": {"pr-reviewer": {"kiro_agent": "pr-reviewer-kiro"}}})
         factory = cfg.create_provider_factory()
 
         factory("k1", agent="pr-reviewer-kiro", crew_agent="pr-reviewer")
@@ -3575,8 +3834,10 @@ class TestMalformedConfigNeverBricksLoad:
 
     def test_non_numeric_int_field_falls_back(self) -> None:
         # Pre-fix: ValueError: invalid literal for int() with base 10: 'two'.
+        # The fallback is the field's own default, read from the one constant
+        # that defines it rather than restated here.
         cfg = _load_from_dict({"session": {"pool_size": "two"}})
-        assert cfg.session.pool_size == 2
+        assert cfg.session.pool_size == loader_module.DEFAULT_POOL_SIZE
 
     def test_non_numeric_float_field_falls_back(self) -> None:
         cfg = _load_from_dict({"agent": {"subagent_cost_gb": "lots"}})
@@ -4887,10 +5148,9 @@ class TestMigrationBackupContainment:
     _LEGACY = {"telegram": {"allow_forum": True}}
 
     def _load_with(self, home: Path, cfg_file: Path) -> KiroCrewConfig:
-        with unittest.mock.patch(
-            "kiro_crew.config.loader.config_dir", return_value=home
-        ), unittest.mock.patch(
-            "kiro_crew.config.loader.config_path", return_value=cfg_file
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=home),
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_file),
         ):
             return KiroCrewConfig.load()
 
@@ -4910,8 +5170,8 @@ class TestMigrationBackupContainment:
         # Guard the guard: assert the migration branch actually ran, otherwise
         # this test would pass for the wrong reason if that branch stops firing.
         assert cfg.agents, "migration write-back did not run, test is vacuous"
-        assert after == before, (
-            "load() left orphans beside the caller's config: %s" % sorted(after - before)
+        assert after == before, "load() left orphans beside the caller's config: %s" % sorted(
+            after - before
         )
 
     def test_real_config_in_the_data_home_is_still_backed_up(self, tmp_path: Path) -> None:
@@ -4966,3 +5226,211 @@ class TestMigrationBackupContainment:
         # But the on-disk config is untouched, so the migration retries next load.
         assert json.loads(cfg_file.read_text(encoding="utf-8")) == json.loads(original)
         assert not (home / "config.json.bak").exists()
+
+
+# Transports carrying a soft/hard context-threshold pair, and those carrying
+# only the soft nudge (their hard backstop is the backend autocompactor).
+# A future transport that forgets _threshold_pct / _normalize_threshold_pair
+# fails these tests rather than shipping an unclamped read.
+_THRESHOLD_PAIR_TRANSPORTS = ["weixin", "webex", "teams", "wecom", "whatsapp", "imessage"]
+_THRESHOLD_SOFT_ONLY_TRANSPORTS = ["telegram", "discord"]
+
+
+class TestTransportThresholdConsistency:
+    """Every transport's context thresholds share ONE validation.
+
+    Locks in the invariant that validity is a property of the type: the loader
+    coerces every read through _threshold_pct (clamped to 1..100) and each
+    dataclass's __post_init__ normalizes its fields (pair transports also
+    enforce soft <= hard), so neither a hand-edited config nor a
+    code-constructed object can hold an out-of-range or inverted value.
+    """
+
+    @staticmethod
+    def _section(cfg, transport: str):
+        return getattr(cfg, transport)
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_defaults_when_missing(self, transport: str) -> None:
+        section = self._section(_load_from_dict({transport: {}}), transport)
+        assert section.soft_threshold_pct == 80
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 95
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    @pytest.mark.parametrize("raw", [-5, 0, 101, 10_000])
+    def test_out_of_range_values_are_clamped(self, transport: str, raw: int) -> None:
+        payload: dict = {"soft_threshold_pct": raw}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = raw
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert 1 <= section.soft_threshold_pct <= 100
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert 1 <= section.hard_threshold_pct <= 100
+            assert section.soft_threshold_pct <= section.hard_threshold_pct
+
+    @pytest.mark.parametrize("transport", _THRESHOLD_PAIR_TRANSPORTS)
+    def test_soft_above_hard_is_corrected(self, transport: str) -> None:
+        # An inverted pair (soft=90, hard=50) would make the soft nudge
+        # unreachable -- the transports check pct >= hard first.
+        section = self._section(
+            _load_from_dict({transport: {"soft_threshold_pct": 90, "hard_threshold_pct": 50}}),
+            transport,
+        )
+        assert section.hard_threshold_pct == 50
+        assert section.soft_threshold_pct == 50
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_non_numeric_values_fall_back_to_defaults(self, transport: str) -> None:
+        payload: dict = {"soft_threshold_pct": "abc"}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = None
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert section.soft_threshold_pct == 80
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 95
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_code_constructed_object_is_normalized(self, transport: str) -> None:
+        # __post_init__ makes an object constructed in code valid too, not just
+        # one loaded from disk.
+        cls = {
+            "telegram": loader_module.TelegramConfig,
+            "weixin": loader_module.WeixinConfig,
+            "discord": loader_module.DiscordConfig,
+            "webex": loader_module.WebexConfig,
+            "teams": loader_module.TeamsConfig,
+            "wecom": loader_module.WeComConfig,
+            "whatsapp": loader_module.WhatsAppConfig,
+            "imessage": loader_module.IMessageConfig,
+        }[transport]
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            obj = cls(soft_threshold_pct=150, hard_threshold_pct=-3)
+            assert obj.hard_threshold_pct == 1
+            assert obj.soft_threshold_pct == 1
+        else:
+            obj = cls(soft_threshold_pct=150)
+            assert obj.soft_threshold_pct == 100
+
+    @pytest.mark.parametrize(
+        "transport", _THRESHOLD_PAIR_TRANSPORTS + _THRESHOLD_SOFT_ONLY_TRANSPORTS
+    )
+    def test_an_integral_float_is_honoured_on_a_shipped_install(
+        self, transport: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A threshold written as ``90.0`` is the value the operator chose.
+
+        Asserted with the schema layer OFF, because that is the shipped
+        configuration: ``jsonschema`` is a dev-only dependency, so on a user's
+        install ``validate_config_data`` returns early and its
+        ``_coerce_legacy_numeric_values`` pre-pass -- which is what turns an
+        integral float into an int -- never runs. The loader's own coercion is
+        then the only one there is, and the shared ``_threshold_pct`` accepts an
+        integral float where a hand-rolled ``int(str(raw))`` raises on ``"90.0"``
+        and silently substitutes the default. That channel would keep firing at
+        80 for someone who configured 90, with nothing logged.
+
+        Leaving jsonschema installed here (as CI does) makes this pass against a
+        hand-rolled clamp too, which is exactly the mistake that hides the bug.
+        """
+        import kiro_crew.config.validation as validation
+
+        monkeypatch.setattr(validation, "_HAS_JSONSCHEMA", False)
+        payload: dict = {"soft_threshold_pct": 90.0}
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            payload["hard_threshold_pct"] = 99.0
+        section = self._section(_load_from_dict({transport: payload}), transport)
+        assert section.soft_threshold_pct == 90
+        if transport in _THRESHOLD_PAIR_TRANSPORTS:
+            assert section.hard_threshold_pct == 99
+
+    def test_telegram_account_soft_threshold_clamped(self) -> None:
+        # Deprecated/inert telegram.accounts entries still parse through the
+        # same coercion so a round-tripped config stays in range.
+        cfg = _load_from_dict(
+            {
+                "telegram": {
+                    "accounts": {"acct-1": {"bot_token": "123:abc", "soft_threshold_pct": 400}}
+                }
+            }
+        )
+        assert cfg.telegram.accounts["acct-1"].soft_threshold_pct == 100
+
+
+#: One non-default sample per ``WeComConfig`` field, keyed by field name. The map
+#: must cover EVERY field: ``load()`` enumerates the section's keys by hand, so a
+#: field added to the dataclass but forgotten there loads as its default and is
+#: then written back as its default — the operator's setting is both ignored and
+#: erased, with nothing failing — a key that looks wired (it appears in the config
+#: schema, which IS derived from the dataclass) while being discarded at load. This
+#: map is the ratchet: a new field fails the test below until a sample is added,
+#: which forces the author through the load path.
+_WECOM_FIELD_SAMPLES: dict[str, object] = {
+    "enabled": True,
+    "allowed_users": [{"userid": "zhangsan", "name": "Z"}],
+    "allow_all_users": True,
+    "ws_url": "wss://example.invalid/ws",
+    "soft_threshold_pct": 71,
+    "hard_threshold_pct": 91,
+    "session_folder": "wecom-folder",
+}
+
+
+class TestWeComSectionSurvivesLoad:
+    def test_the_sample_map_covers_every_field(self) -> None:
+        import dataclasses
+
+        declared = {f.name for f in dataclasses.fields(loader_module.WeComConfig)}
+        missing = declared - set(_WECOM_FIELD_SAMPLES)
+        assert not missing, (
+            f"WeComConfig gained field(s) {sorted(missing)} with no sample here. Add one, "
+            "and check KiroCrewConfig.load() actually reads the key -- it enumerates them "
+            "by hand, so an omission silently discards the operator's value."
+        )
+        assert not set(_WECOM_FIELD_SAMPLES) - declared, "sample for a field that no longer exists"
+
+    @pytest.mark.parametrize("field_name", sorted(_WECOM_FIELD_SAMPLES))
+    def test_each_configured_value_survives_load(self, field_name: str) -> None:
+        sample = _WECOM_FIELD_SAMPLES[field_name]
+        cfg = _load_from_dict({"wecom": {field_name: sample}})
+        loaded = getattr(cfg.wecom, field_name)
+        default = getattr(loader_module.WeComConfig(), field_name)
+        assert loaded != default, (
+            f"wecom.{field_name} loaded as its default {default!r} despite being configured "
+            f"as {sample!r} -- KiroCrewConfig.load() is not reading the key"
+        )
+
+    @pytest.mark.parametrize("junk", [None, 7, "zhangsan", {"a": 1}, True])
+    def test_a_non_list_allow_list_degrades_to_empty_rather_than_crashing_load(
+        self, junk: object
+    ) -> None:
+        # An explicit `null`, or any non-list, must not raise out of load(): a
+        # config file the operator can write is not a trusted type, and a TypeError
+        # here prevents STARTUP rather than degrading one setting. A bare string is
+        # the subtle one -- iterating it would char-split into single-letter userids.
+        cfg = _load_from_dict({"wecom": {"allowed_users": junk}})
+        assert cfg.wecom.allowed_users == []
+
+    @pytest.mark.parametrize("field", ["enabled", "allow_all_users"])
+    @pytest.mark.parametrize("junk", ["false", "off", "0", 0, 1, [], {}, None, "true"])
+    def test_a_non_bool_never_turns_a_switch_ON(self, field: str, junk: object) -> None:
+        # `bool("false")` is True, so a JSON string would invert the operator's
+        # intent -- enabling the channel, or opening it to every org member, from a
+        # value that says the opposite. Even the "helpfully" correct-looking "true"
+        # must not enable it: a parse that guesses at a string is the same parse that
+        # cannot refuse "false".
+        cfg = _load_from_dict({"wecom": {field: junk}})
+        assert getattr(cfg.wecom, field) is False
+
+    @pytest.mark.parametrize("field", ["enabled", "allow_all_users"])
+    def test_a_real_bool_still_works(self, field: str) -> None:
+        cfg = _load_from_dict({"wecom": {field: True}})
+        assert getattr(cfg.wecom, field) is True

@@ -318,6 +318,29 @@ async def authorize_and_add_nudge(
                 current_key = ""
             if slot_key != current_key:
                 return _deny("discord session key does not match the user's current session", 404)
+        elif slot_key.startswith("webex:"):
+            # Deny-by-default, mirroring the Discord branch and for the same
+            # reason: an authenticated caller must not be able to mint a loop that
+            # DMs an arbitrary Webex user through the agent. DM sessions of
+            # allow-listed people only, and only the user's CURRENT key exactly as
+            # the dispatcher derives it.
+            transports = getattr(state, "channel_transports", None) or {}
+            transport = transports.get("webex")
+            dispatcher = transport.dispatcher if transport is not None else None
+            if transport is None or dispatcher is None:
+                return _deny("webex transport not running", 404)
+            parts = slot_key.split(":")
+            if len(parts) < 4 or parts[2] != "direct":
+                return _deny(f"unsupported webex session {slot_key} (DM sessions only)", 400)
+            email = parts[3]
+            if not transport.is_authorized(email):
+                return _deny("webex user is not in the allowed_emails allowlist", 403)
+            try:
+                current_key = dispatcher.current_session_key(email)
+            except Exception:
+                current_key = ""
+            if slot_key != current_key:
+                return _deny("webex session key does not match the user's current session", 404)
         else:
             return _deny(f"unsupported channel session {slot_key}", 400)
     elif slot_key not in state._slots:

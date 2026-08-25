@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from kiro_crew.cron import (
     _MAX_SKIP_DATE_HORIZON_SECS,
     CronJob,
@@ -16,6 +18,16 @@ from kiro_crew.cron import (
     CronService,
     compute_next_run_ts,
 )
+
+
+@pytest.fixture(autouse=True)
+def _cron_caller_is_named(named_cron_caller):
+    """Every test in this module exercises cron field handling, not authorization.
+
+    ``mcp_cron`` refuses a write from a caller it cannot name, so this states the
+    precondition these tests always assumed. See the ``named_cron_caller``
+    fixture in ``test/conftest.py``.
+    """
 
 
 class TestIsDueSkipDates:

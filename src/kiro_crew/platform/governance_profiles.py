@@ -65,11 +65,19 @@ class _Snapshot:
     ``ungoverned`` default-permit — a fail-OPEN on a host that does have
     restrictive profiles. ``_ensure_fresh`` uses this to decide that the FIRST
     load may not be skipped.
+
+    ``fallback_profiles`` records file stems where the deny-all fallback was
+    substituted because the file could not be read or parsed. This is distinct
+    from ``unrecoverable`` (which tracks bind-unrecoverable files for boot-abort).
+    A profile in ``fallback_profiles`` is still governed (deny-all), so
+    enforcement is correct — but the operator cannot tell a deliberate lockdown
+    from a broken file without this signal.
     """
 
     by_name: Dict[str, Profile] = field(default_factory=dict)
     by_bind: Dict[Tuple[str, str], str] = field(default_factory=dict)
     unrecoverable: Tuple[str, ...] = ()
+    fallback_profiles: "frozenset[str]" = field(default_factory=frozenset)
     loaded: bool = False
 
 
@@ -280,6 +288,63 @@ def _dir_fingerprint(directory: Path) -> Tuple:
     return tuple(sig)
 
 
+def _fallback_profile(name: str) -> Profile:
+    """The profile substituted for a stem whose FILE is unusable.
+
+    Defaults to the most-restrictive :func:`deny_all_profile` (Validation rule 5):
+    an unreadable / unparseable / broken-``extends`` profile denies its surface
+    rather than silently widening to the ceiling.
+
+    An enterprise ceiling MAY declare a looser fallback via the policy's top-level
+    ``fallback`` key (``GovernanceCeiling.fallback_profile``). When present it is
+    used instead — e.g. deny only the ``channels`` and ``apps`` planes while
+    leaving the basic operational surfaces (subagent/cron/heartbeat/taskrunner,
+    tools, commands, filesystem, network) to the ceiling. That trades strict
+    fail-closed for keeping the background planes running when a profile file
+    cannot be loaded; the declared fallback is still intersected with the ceiling,
+    so it can only narrow it. Absent the declaration the public default is
+    unchanged (deny-all).
+
+    Read best-effort through ``current_context()``: if the context or ceiling is
+    not composed yet (early boot, tests), fall back to deny-all — the safe
+    direction. The lookup mirrors the runtime-unrecoverable escalation below,
+    which reads ``current_context().governance`` the same way.
+    """
+    try:
+        from kiro_crew.platform.context import current_context
+
+        ceiling = getattr(current_context(), "governance", None)
+        declared = getattr(ceiling, "fallback_profile", None) if ceiling is not None else None
+        if declared is not None:
+            return replace(declared, name=name)
+    except Exception:
+        logger.debug("fallback profile lookup unavailable; using deny-all", exc_info=True)
+    return deny_all_profile(name)
+
+
+def _fallback_token() -> bool:
+    """Whether a declared fallback profile is currently available on the ceiling.
+
+    Folded into the profile-store freshness key (:meth:`ProfileStore._ensure_fresh`)
+    so a snapshot baked BEFORE governance composed — when :func:`_fallback_profile`
+    could only return deny-all — is reloaded ONCE the declared fallback becomes
+    available. Without this, a store first-touched on the pre-governance boot path
+    would bake deny-all for an unusable profile and keep serving it until a file
+    mtime changed, silently ignoring the operator's declared fallback (a boot-order
+    race that reproduces the very background-plane outage the fallback prevents).
+    The ceiling is boot-frozen, so this transitions False→True at most once and
+    never thrashes; when no fallback is declared it stays False and deny-all (the
+    correct answer) needs no reload.
+    """
+    try:
+        from kiro_crew.platform.context import current_context
+
+        ceiling = getattr(current_context(), "governance", None)
+        return ceiling is not None and getattr(ceiling, "fallback_profile", None) is not None
+    except Exception:
+        return False
+
+
 class ProfileStore:
     """Loads + caches profiles from ``~/.kiro/crew/profiles`` with mtime hot-reload.
 
@@ -349,7 +414,7 @@ class ProfileStore:
         directory = _profiles_dir()
         fp: Optional[Tuple] = None
         if self._snap.loaded:
-            fp = _dir_fingerprint(directory)
+            fp = (_dir_fingerprint(directory), _fallback_token())
             if fp == self._fingerprint:
                 return True
         # NEVER block: this is reachable on the event loop (the synchronous PreToolUse
@@ -379,7 +444,7 @@ class ProfileStore:
             # used for the freshness test is the one committed below, so the committed
             # fingerprint always describes the snapshot actually published.
             if fp is None:
-                fp = _dir_fingerprint(directory)
+                fp = (_dir_fingerprint(directory), _fallback_token())
             if self._snap.loaded and fp == self._fingerprint:
                 return True  # already fresh (another thread reloaded, or unchanged)
             self._reload(directory)
@@ -403,6 +468,7 @@ class ProfileStore:
         by_name: Dict[str, Profile] = {}
         by_bind: Dict[Tuple[str, str], str] = {}
         unrecoverable: list[str] = []
+        fallback_stems: set[str] = set()
         try:
             files = [p for p in sorted(directory.iterdir()) if p.suffix == ".json"]
         except FileNotFoundError:
@@ -505,7 +571,7 @@ class ProfileStore:
                 #     fleet boot-aborts via assert_profiles_within_ceiling; a
                 #     standalone host tolerates it (lenient, no crash).
                 prior = prior_by_name.get(stem)
-                fallback = deny_all_profile(stem)
+                fallback = _fallback_profile(stem)
                 if prior is not None and prior.bind is not None:
                     logger.warning(
                         "profile %s is present but unreadable; denying its surface "
@@ -524,6 +590,7 @@ class ProfileStore:
                     )
                     by_name[stem] = fallback
                     unrecoverable.append(path.name)
+                fallback_stems.add(stem)
                 continue
             try:
                 data = json.loads(raw)
@@ -547,7 +614,7 @@ class ProfileStore:
                 # else the prior entry's bind. Only when NEITHER yields a bind is it an
                 # UNBOUND deny-all recorded as unrecoverable (governed fleet
                 # boot-aborts; standalone tolerates).
-                fallback = deny_all_profile(stem)
+                fallback = _fallback_profile(stem)
                 salvaged = _salvage_bind(data)
                 if salvaged is None:
                     prior = prior_by_name.get(stem)
@@ -557,6 +624,7 @@ class ProfileStore:
                 else:
                     by_name[stem] = fallback
                     unrecoverable.append(path.name)
+                fallback_stems.add(stem)
         # Pass 2: resolve ``extends`` (monotonic narrowing) now that all are parsed.
         # The "non-trivial chain" guard must read each parent's ORIGINAL ``extends``,
         # not the live dict: ``compose_profiles`` resets a composed profile's
@@ -587,10 +655,16 @@ class ProfileStore:
                     # the gate would fall through to the policy ceiling ALONE —
                     # bypassing the operator's narrowing (fail-OPEN).  Mirrors the
                     # Pass-1 parse-error branch's ``_salvage_bind`` invariant.
-                    fallback = deny_all_profile(name)
+                    fallback = _fallback_profile(name)
                     if profile.bind is not None:
                         fallback = replace(fallback, bind=profile.bind)
                     by_name[name] = fallback
+                    # Third substitution site, and the least obvious: the file
+                    # itself parsed fine, so only the broken ``extends`` chain
+                    # makes it deny-all. Recording it here is what stops a deleted
+                    # or mis-chained PARENT from rendering as a deliberate
+                    # lockdown, which is the same symptom as an unparseable file.
+                    fallback_stems.add(name)
                 else:
                     by_name[name] = compose_profiles(parent, profile)
         # Build the bind index.  Last writer wins on a duplicate bind, logged.
@@ -618,7 +692,13 @@ class ProfileStore:
         # governed fleet boot-aborts via ``assert_profiles_within_ceiling``; a
         # standalone host tolerates it. A directory that could not be enumerated
         # already returned early above, leaving the prior snapshot fully intact.
-        self._snap = _Snapshot(by_name=by_name, by_bind=by_bind, unrecoverable=unrec, loaded=True)
+        self._snap = _Snapshot(
+            by_name=by_name,
+            by_bind=by_bind,
+            unrecoverable=unrec,
+            fallback_profiles=frozenset(fallback_stems),
+            loaded=True,
+        )
         # Runtime observability for a POST-BOOT unrecoverable file. The boot floor
         # (``assert_profiles_within_ceiling``) only runs once; a governed RUNNING
         # host that hot-loads a NEW unreadable profile (no prior entry to preserve)
@@ -731,6 +811,55 @@ def bound_surfaces() -> Tuple[str, ...]:
     return tuple(
         sorted({bind_id for (bind_type, bind_id) in snap.by_bind if bind_type == "surface"})
     )
+
+
+def fallback_profile_names() -> "frozenset[str]":
+    """Profile stems currently substituted by the deny-all fallback.
+
+    A non-empty result means at least one profile is present on disk but could not
+    be USED by this build — it was unreadable, it failed to parse, or its
+    ``extends`` parent is missing or chained. Its surface is correctly denied
+    (enforcement is intact), but the operator cannot tell a deliberate lockdown
+    from a broken file. The Security page uses this to render a warning banner.
+
+    All three substitution sites in ``_reload`` record here, so "substituted" means
+    substituted for any reason rather than "failed to parse" specifically — the
+    caller must not narrate a cause it has not established.
+
+    Returns ``frozenset()`` when the store cannot be trusted yet (never-loaded,
+    mid first-load), matching the fail-quiet contract a display caller needs.
+    """
+    if not _STORE.resolved():
+        return frozenset()
+    return _STORE.snapshot().fallback_profiles
+
+
+def unknown_profile_scopes() -> "Dict[str, Tuple[str, ...]]":
+    """Per-profile capability scopes THIS build does not register, by file stem.
+
+    Mirrors :func:`fallback_profile_names` — same fail-quiet contract, same
+    names-only exposure. Populated by the asymmetric key-open tolerance in
+    ``governance._parse_controls``: a profile declaring an unregistered
+    ``capabilities.*`` child with ``enabled: true`` loads successfully and records
+    the key here instead of degrading to deny-all.
+
+    Enforcement is unaffected (the key governs nothing in this build), so this is
+    purely an operator signal: without it a tolerated key is only visible in a
+    startup log line. It distinguishes the benign cross-edition case (a data home
+    shared with an edition that registers extra rows) from a typo in a profile the
+    operator believes is in force.
+
+    Profiles with nothing unknown are omitted, so an empty mapping means clean.
+    Returns ``{}`` when the store cannot be trusted yet (never-loaded, mid
+    first-load).
+    """
+    if not _STORE.resolved():
+        return {}
+    out: Dict[str, Tuple[str, ...]] = {}
+    for stem, profile in _STORE.snapshot().by_name.items():
+        if profile.unknown_scopes:
+            out[stem] = tuple(profile.unknown_scopes)
+    return out
 
 
 def any_configured_profile_governs(ref: str) -> bool:

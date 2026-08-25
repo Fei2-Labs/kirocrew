@@ -27,22 +27,24 @@ const BASE = process.argv[2] || 'http://127.0.0.1:6807'
 const OUT = process.argv[3] || '../temp-screenshots/path-chips'
 mkdirSync(OUT, { recursive: true })
 
-const NOTES = '/Users/diwm/.kiro/crew/workspace/blue-angels-seattle-2026.md'
-const DISPATCH = '/Users/diwm/.kiro/crew/workspace/KiroCrew/src/kiro_crew/acp/_dispatch.py'
+const WORKSPACE = '/Demo Workspace'
+const PROJECT = `${WORKSPACE}/Product Guide`
+const NOTES = `${PROJECT}/release-notes.md`
+const DISPATCH = `${PROJECT}/src/overview.md`
 
 /**
  * The classification the chips scene MUST produce, in document order.
  * Anything actionable that should not be, or vice versa, fails the run.
  */
 const EXPECTED_KINDS = [
-  ['/Users/diwm/.kiro/crew/workspace/KiroCrew', 'dir'],
+  [PROJECT, 'dir'],
   ['HEAD', 'plain'],
   ['refs/heads/fix/investigation-record-403', 'plain'],
   ['4a72aec5f04d3f44ba8042931226db051242d48a', 'plain'],
   ['origin/main', 'plain'],
-  ['/Users/diwm/.kiro/crew', 'dir'],
-  ['/Users/diwm/.kiro/crew/workspace/KiroCrew/README.md', 'file'],
-  ['/Users/diwm/.kiro/crew/deleted-notes.md', 'plain'],
+  [WORKSPACE, 'dir'],
+  [`${PROJECT}/README.md`, 'file'],
+  [`${WORKSPACE}/deleted-notes.md`, 'plain'],
 ]
 
 /**
@@ -59,7 +61,7 @@ const EXPECTED_CITED = [
   [`${DISPATCH}:447`, 'file', DISPATCH, '447'],
   [':493', 'plain', undefined, undefined],
   [`${DISPATCH}:504:12`, 'file', DISPATCH, '504'],
-  [DISPATCH.replace('_dispatch.py', 'missing.py') + ':12', 'plain', undefined, undefined],
+  [DISPATCH.replace('overview.md', 'missing.md') + ':12', 'plain', undefined, undefined],
   [`${NOTES}:10-16`, 'file', NOTES, '10'],
 ]
 
@@ -73,10 +75,15 @@ const SCENES = [
   // the painted lines, which is what would catch a first-line-only reveal.
   { scene: 'range', marker: '.mc-line-reveal', note: 'panel revealed the whole 10-16 span' },
   { scene: 'folder', marker: 'text=website', note: 'folder tab body lists dirs then files' },
+  { scene: 'markdown-link', marker: 'a[href*="release-notes.md"]', note: 'Markdown file link opened the file panel' },
 ]
 
 const run = async () => {
-  const browser = await chromium.launch()
+  const browser = await chromium.launch(
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+      ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE }
+      : undefined,
+  )
   let failed = 0
   for (const theme of ['dark', 'light']) {
     for (const { scene, marker, note } of SCENES) {
@@ -110,6 +117,16 @@ const run = async () => {
         const painted = await page.$$eval('.mc-line-reveal', els => els.length)
         if (painted !== 7) {
           console.error(`  FAIL ${theme}/${scene}: expected 7 painted lines for :10-16, saw ${painted}`)
+          failed += 1
+          await ctx.close()
+          continue
+        }
+      }
+      if (scene === 'markdown-link') {
+        await page.locator('a[href*="release-notes.md"]').click()
+        await page.waitForSelector('.mc-line-reveal', { timeout: 10000 })
+        if (await page.getByLabel('Opened file panel').count() !== 1) {
+          console.error(`  FAIL ${theme}/${scene}: file panel did not open`)
           failed += 1
           await ctx.close()
           continue

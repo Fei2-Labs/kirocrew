@@ -24,6 +24,7 @@ import reducer, {
   sseSubagentChunk,
   sseSubagentTool,
   sseSubagentDone,
+  sseSubagentSnapshot,
   sseToolActivity,
   sseToolResult,
   sseActivityEvent,
@@ -44,9 +45,7 @@ import reducer, {
   selectSlotPendingSpawnApprovals,
   selectSlotPendingApproval,
   selectComposerBusy,
-  sweepStaleOptimistic,
   confirmOptimisticSend,
-  OPTIMISTIC_TIMEOUT_MS,
 } from '../store/chatSlice'
 import './mockApiClient'
 
@@ -1062,29 +1061,20 @@ describe('sseChatMessage — pipelined sends reconcile (#3898)', () => {
     expect(state.messages[0].meta?.mid).toBe('m-hello')
   })
 
-  it('sweepStaleOptimistic marks timed-out bubbles as stale', () => {
+  it('records no wall-clock timestamp on an optimistic bubble', () => {
+    // The bubble carries `optimistic` (the reconcile scan's marker, load-bearing
+    // for #3898) and nothing else. A per-send `optimisticTs` used to ride along
+    // to drive a 30s "may not have been delivered" notice: the send path already
+    // reports a real failure with its own error bubble and restores the
+    // composer, so that notice could only appear once the server had ACCEPTED
+    // the message, asserting as uncertain the one thing least likely to be true.
+    // It also persisted into the durable transcript and was never cleaned up.
     let state = withSlot
-    // Simulate an optimistic message with an old timestamp by using a custom
-    // appendMessage with a backdated optimisticTs (Immer freezes state, so
-    // we dispatch a raw action with the timestamp already set).
-    const oldTs = Date.now() - 35_000
-    state = reducer(state, appendMessage({ role: 'user', content: 'old msg', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-old', optimistic: true, optimisticTs: oldTs } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'pending', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-x' } }))
 
-    state = reducer(state, { type: 'chat/sweepStaleOptimistic' })
-
-    expect(state.messages[0].meta?.stale).toBe(true)
-    expect(state.messages[0].meta?.optimistic).toBe(true) // still optimistic, just stale
-  })
-
-  it('sweepStaleOptimistic does not mark fresh optimistic bubbles as stale', () => {
-    let state = withSlot
-    state = reducer(state, appendMessage({ role: 'user', content: 'fresh msg', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-fresh' } }))
-    // optimisticTs is Date.now() — fresh
-
-    state = reducer(state, { type: 'chat/sweepStaleOptimistic' })
-
-    expect(state.messages[0].meta?.stale).toBeUndefined()
     expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(state.messages[0].meta?.optimisticTs).toBeUndefined()
+    expect(state.messages[0].meta?.stale).toBeUndefined()
   })
 })
 
@@ -1092,43 +1082,26 @@ describe('sseChatMessage — pipelined sends reconcile (#3898)', () => {
  * HTTP response. `DashboardState.append` suppresses the `chat_message` user echo
  * for every dashboard send by design (`broadcast_user=False`, because the
  * composer already rendered the bubble), so a surface that waits for the echo
- * waits forever and the 30s sweep flags every message the user sends. */
+ * waits forever — which is why this reducer exists and why the 30s wall-clock
+ * sweep it replaced flagged every message the user sent, not just lost ones. */
 describe('confirmOptimisticSend — the send response retires the pending state', () => {
   const initial = reducer(undefined, { type: '@@INIT' })
   const withSlot = { ...initial, activeSlot: 'slot-1' }
 
-  it('clears the flags so a later sweep cannot flag an aged-out bubble', () => {
+  it('retires the pending flag on the matching send and KEEPS its sendId', () => {
     let state = reducer(withSlot, appendMessage({
       role: 'user', content: 'ship it', cls: '', ts: '2026-08-16T10:00:00.000Z',
-      // Backdated past the timeout: without the confirm below, the next sweep
-      // would mark this stale and render "may not have been delivered".
-      meta: { sendId: 's-confirm-1', optimistic: true, optimisticTs: Date.now() - (OPTIMISTIC_TIMEOUT_MS + 5_000) },
+      meta: { sendId: 's-confirm-1' },
     }))
+    expect(state.messages[0].meta?.optimistic).toBe(true)
 
     state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-confirm-1' }))
-    state = reducer(state, sweepStaleOptimistic())
 
     expect(state.messages[0].meta?.optimistic).toBeUndefined()
-    expect(state.messages[0].meta?.optimisticTs).toBeUndefined()
-    expect(state.messages[0].meta?.stale).toBeUndefined()
     // sendId SURVIVES: a channel-linked slot can still deliver a late echo, and
     // reconcileOptimisticEcho needs the id to update this row in place rather
     // than push a duplicate bubble.
     expect(state.messages[0].meta?.sendId).toBe('s-confirm-1')
-  })
-
-  it('un-warns a bubble the sweep already flagged (slow response, not a lost one)', () => {
-    let state = reducer(withSlot, appendMessage({
-      role: 'user', content: 'slow ack', cls: '', ts: '2026-08-16T10:00:00.000Z',
-      meta: { sendId: 's-confirm-2', optimistic: true, optimisticTs: Date.now() - (OPTIMISTIC_TIMEOUT_MS + 5_000) },
-    }))
-    state = reducer(state, sweepStaleOptimistic())
-    expect(state.messages[0].meta?.stale).toBe(true)
-
-    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-confirm-2' }))
-
-    expect(state.messages[0].meta?.stale).toBeUndefined()
-    expect(state.messages[0].meta?.optimistic).toBeUndefined()
   })
 
   it('confirms only the matching send, leaving a sibling in-flight bubble pending', () => {
@@ -1279,6 +1252,35 @@ describe('subagent reducers', () => {
     expect(state.subagents['a1'].task).toBe('search code')
   })
 
+  it('sseSubagentSpawn carries the resolved model, and later frames never blank a known model (#3582)', () => {
+    // Spawn stamps the served model.
+    let state = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 't', agent: 'kirocrew', model: 'claude-opus-4.8' }))
+    expect(state.subagents['a1'].model).toBe('claude-opus-4.8')
+    // A tool frame (no model field) must not clobber it.
+    state = reducer(state, sseSubagentTool({ slot: 'slot-1', id: 'a1', tool: 'grep' }))
+    expect(state.subagents['a1'].model).toBe('claude-opus-4.8')
+    // The done frame is authoritative and may refine it (CC path resolved late).
+    state = reducer(state, sseSubagentDone({ slot: 'slot-1', id: 'a1', elapsed: 1, outcome: 'completed', model: 'claude-opus-4.7' }))
+    expect(state.subagents['a1'].model).toBe('claude-opus-4.7')
+    // A done frame WITHOUT a model must not blank a known one.
+    let s2 = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a2', task: 't', agent: 'kirocrew', model: 'gpt-5.6-sol' }))
+    s2 = reducer(s2, sseSubagentDone({ slot: 'slot-1', id: 'a2', elapsed: 1, outcome: 'completed' }))
+    expect(s2.subagents['a2'].model).toBe('gpt-5.6-sol')
+  })
+
+  it('sseSubagentSpawn defaults model to empty when the frame omits it', () => {
+    const state = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 't', agent: '' }))
+    expect(state.subagents['a1'].model).toBe('')
+  })
+
+  it('sseSubagentSnapshot restores the model on reconnect', () => {
+    const state = reducer(withSlot, sseSubagentSnapshot({
+      id: 'a1', slot: 'slot-1', task: 't', agent: 'kirocrew', model: 'claude-opus-4.8',
+      streaming: '', last_tool: '', started: 1,
+    }))
+    expect(state.subagents['a1'].model).toBe('claude-opus-4.8')
+  })
+
   it('sseSubagentSpawn preserves existing streaming text from pending', () => {
     let state = reducer(withSlot, sseSubagentPending({ slot: 'slot-1', id: 'a1', task: 'task', approval_id: 'spawn:a1' }))
     state = reducer(state, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 'task', agent: 'kirocrew' }))
@@ -1393,7 +1395,7 @@ describe('activity viewer reducers', () => {
     expect(reducer(requested, openActivityToTab('subagents')).activityTabRequest).toBe(2)
 
     const switched = reducer(requested, switchSlot.pending('req-1', 'slot-2'))
-    expect(switched.activityTab).toBe('files')
+    expect(switched.activityTab).toBe('changes')
     expect(switched.activityTabRequest).toBe(1)
     // Opening the panel without naming a view is not a request either.
     expect(reducer(switched, openActivityPanel()).activityTabRequest).toBe(1)
@@ -1600,7 +1602,6 @@ describe('permission cls parsing and approval resolution', () => {
     expect(pending[0].meta?.approval_id).toBe('req-b')
   })
 })
-
 
 describe('forkSlot thunk', () => {
   it('calls api.forkChatSlot and dispatches addSlotOptimistic on ok response', async () => {
@@ -2257,13 +2258,15 @@ describe('thinking survives refreshSlot (client-only reasoning)', () => {
     expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(1)
   })
 
-  it('parks the extra bursts of a multi-tool turn at the tail (known limit, #4218)', () => {
+  it('rebuilds the burst order of a multi-tool turn from tool ids (#4218)', () => {
     // Reasoning is client-only, so the refresh rebuilds the array from server
-    // history that has never seen a thinking row — the position of burst 2+ is
-    // unreconstructible here and they land below the answer. Pinned so the
-    // follow-up that fixes it (producer-side segment boundary, or the
-    // append-only transcript) shows the improvement in its diff rather than
-    // silently changing an untested behaviour. NOT a desired end state.
+    // history that has never seen a thinking row. The position is recoverable
+    // anyway: each burst is followed by its own tool row, whose server-minted
+    // `tool_call_id` persists into history, so the post-refresh order must equal
+    // the live order exactly. Anchoring on answer CONTENT instead cannot do this
+    // — a reason-then-tool turn flushes no text at the tool boundary, so history
+    // holds one assistant row for every burst and all but one were parked below
+    // the answer.
     let state = reducer(base, setActiveSlot('chat-1'))
     state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'why t1' }))
     state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
@@ -2273,18 +2276,70 @@ describe('thinking survives refreshSlot (client-only reasoning)', () => {
     // live: each burst above the step it explains
     expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'assistant'])
 
+    const payload = refreshPayload('chat-1', [
+      { role: 'tool', content: '🔧 grep', cls: '', meta: { tool_call_id: 't1' } },
+      { role: 'assistant', content: 'The answer', cls: 'msg msg-a' },
+    ])
+    state = reducer(state, refreshSlot.fulfilled(payload, 'r1', 'chat-1'))
+
+    expect(state.messages.filter(m => m.role === 'thinking').map(m => m.content))
+      .toEqual(['why t1', 'why t2'])
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'assistant'])
+
+    // Idempotent: a second refresh must not re-park or duplicate a block.
+    state = reducer(state, refreshSlot.fulfilled(payload, 'r2', 'chat-1'))
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'assistant'])
+  })
+
+  it('keeps every burst in place as the tool count grows (#4218)', () => {
+    // Severity scaled with burst count before the fix: only one block could
+    // anchor, so a turn that reasons before each of 10 calls left 9 stacked
+    // below the answer. Drive the count that was reported in the wild.
+    const N = 10
+    let state = reducer(base, setActiveSlot('chat-1'))
+    for (let n = 1; n <= N; n++) {
+      state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: `why t${n}` }))
+      state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: `t${n}` } }))
+    }
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'Done', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: '_done', content: '' }))
+    const live = state.messages.map(m => m.role)
+
+    const history = []
+    for (let n = 1; n <= N; n++) {
+      history.push({ role: 'tool', content: '🔧 grep', cls: '', meta: { tool_call_id: `t${n}` } })
+    }
+    history.push({ role: 'assistant', content: 'Done', cls: 'msg msg-a' })
+    state = reducer(state, refreshSlot.fulfilled(refreshPayload('chat-1', history), 'r1', 'chat-1'))
+
+    expect(state.messages.map(m => m.role)).toEqual(live)
+    expect(state.messages.filter(m => m.role === 'thinking').map(m => m.content))
+      .toEqual(Array.from({ length: N }, (_, i) => `why t${i + 1}`))
+    // No tail stack: nothing reasoning-shaped after the answer.
+    expect(state.messages[state.messages.length - 1].role).toBe('assistant')
+  })
+
+  it('anchors on the earlier row of an auto-approved tool pair (#4218)', () => {
+    // An auto-approved call persists TWO tool rows sharing one tool_call_id
+    // (🔧 pre-approval + ✅ post-approval). The block reasoned its way TO the
+    // call, so it belongs above the first of the pair, not between them.
+    let state = reducer(base, setActiveSlot('chat-1'))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'why t1' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'The answer', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: '_done', content: '' }))
+
     state = reducer(state, refreshSlot.fulfilled(
       refreshPayload('chat-1', [
         { role: 'tool', content: '🔧 grep', cls: '', meta: { tool_call_id: 't1' } },
+        { role: 'tool', content: '✅ grep', cls: '', meta: { tool_call_id: 't1' } },
         { role: 'assistant', content: 'The answer', cls: 'msg msg-a' },
       ]),
       'r1', 'chat-1',
     ))
 
-    // Both blocks survive with the right text; the second one's POSITION does not.
-    expect(state.messages.filter(m => m.role === 'thinking').map(m => m.content))
-      .toEqual(['why t1', 'why t2'])
-    expect(state.messages.map(m => m.role)).toEqual(['tool', 'thinking', 'assistant', 'thinking'])
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'tool', 'assistant'])
+    expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(1)
   })
 })
 
@@ -2681,7 +2736,6 @@ describe('selectSlotPendingSpawnApprovals', () => {
     expect(pending[0].id).toBe('a2')
   })
 })
-
 
 describe('steer does not deadlock pending approval (#1667)', () => {
   const slot = 'slot-1'

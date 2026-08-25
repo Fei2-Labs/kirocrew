@@ -27,7 +27,18 @@ export interface ChatMessageListProps {
   messages: ChatMessage[]
   running: boolean
   contentWidth?: string
-  onApprove?: (approvalId: string, decision: string) => void
+  /** Resolve a pending approval. MUST return the request's promise: rejection
+   *  reaches the approval row's rollback and the buttons come back. The type
+   *  deliberately has no `void` arm so a fire-and-forget handler — the exact
+   *  shape behind #5524 — cannot compile against this boundary. */
+  onApprove?: (approvalId: string, decision: string) => Promise<unknown>
+  /** Offer the standing-trust tier on pending-approval rows. FAIL-CLOSED: set it
+   *  only when `onApprove` routes to an endpoint that RECORDS standing trust
+   *  (the slot approve endpoint carries the decision verbatim). Hosts resolving
+   *  through the one-shot `resolveApproval` endpoint must leave it unset — that
+   *  path has no trust verb, so a Trust offer there overstates the grant
+   *  (#5400, #5434). */
+  canTrust?: boolean
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   /** Optional host-injected renderer for tool messages (role 'tool'/'tool_call'/
    *  'tool_result'). Lets a Redux-connected host (e.g. the dashboard's split-view
@@ -57,6 +68,7 @@ const ChatMessageList = memo(function ChatMessageList({
   running,
   contentWidth = '900px',
   onApprove,
+  canTrust,
   onFileOpen,
   renderTool,
   hideCardOwnedOAuth = false,
@@ -149,7 +161,7 @@ const ChatMessageList = memo(function ChatMessageList({
       </div>
     )
     const row = (children: React.ReactNode, tight = false) => (
-      <div key={key} className={`px-4 mx-auto w-full ${tight ? 'py-0.5' : 'py-1'}`} style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
+      <div key={key} className={`px-4 mx-auto w-full ${tight ? 'py-0' : 'py-1'}`} style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         {children}
       </div>
     )
@@ -189,7 +201,7 @@ const ChatMessageList = memo(function ChatMessageList({
       : undefined
 
     return (
-      <div key={'grp-' + item.startIdx} className="px-4 mx-auto w-full py-0.5" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
+      <div key={'grp-' + item.startIdx} className="px-4 mx-auto w-full py-0" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         <CollapsibleToolGroup
           count={nonPerm.length}
           autoExpand={running && item.startIdx >= messages.length - 5}
@@ -198,6 +210,7 @@ const ChatMessageList = memo(function ChatMessageList({
           permissionMeta={lastPerm?.meta}
           pendingPermCount={unresolvedPerms.length}
           onApprove={handleApprove}
+          canTrust={canTrust}
         >
           {/* Grouped messages (thinking, permission) return null from renderMessage
               intentionally — CollapsibleToolGroup handles their display via its
@@ -206,7 +219,7 @@ const ChatMessageList = memo(function ChatMessageList({
         </CollapsibleToolGroup>
       </div>
     )
-  }, [renderMessage, running, messages.length, contentWidth, onApprove])
+  }, [renderMessage, running, messages.length, contentWidth, onApprove, canTrust])
 
   // Render a DisplayItem (single, group, or turn)
   const renderDisplayItem = useCallback((item: DisplayItem, i: number) => {

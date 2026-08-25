@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import sqlite3
@@ -260,8 +261,10 @@ class TestFolderWatcherScan:
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder", "properties": "{}"}
 
         # Mock ingest to create items
-        async def fake_ingest(path, **kwargs):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kwargs):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -319,6 +322,15 @@ class TestFolderWatcherScan:
         source_id = store.add_source("test", "local_folder", str(vault))
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder", "properties": "{}"}
 
+        # Honor the pipeline contract: on_committed fires on the committing
+        # branch. A mock that ingests without reporting reads as a rollback.
+        async def fake_ingest(path, *, on_committed=None, **kwargs):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
+            return "job1"
+        pipeline.ingest_file = fake_ingest
+
         await fw.scan_source(source)
 
         # Modify a file with explicit future mtime (avoids 1s granularity flakiness)
@@ -344,8 +356,10 @@ class TestFolderWatcherScan:
         source_id = store.add_source("test", "local_folder", str(vault))
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder", "properties": "{}"}
 
-        async def fake_ingest(path, **kwargs):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kwargs):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -641,8 +655,39 @@ class TestOrphanCleanupExclusion:
         assert row is not None
 
 
+class _ThreadPerCallExecutor(concurrent.futures.ThreadPoolExecutor):
+    """Executor that gives every submitted call its OWN thread.
+
+    ``asyncio.to_thread`` runs on the loop's default ``ThreadPoolExecutor``,
+    which hands consecutive calls to the same idle worker. Under that executor
+    a flush and its commit land on one thread whether they were offloaded
+    together or separately, so a same-thread assertion cannot tell the two
+    apart -- and the store's connection is thread-local, which is exactly the
+    difference that matters. Never reusing a thread makes "one worker hop" and
+    "two worker hops" distinguishable, so splitting them fails the assertion.
+    """
+
+    def __init__(self) -> None:
+        # ``set_default_executor`` requires this concrete executor type on
+        # Python 3.12. The inherited pool stays idle; each submit gets its own
+        # live one-worker pool below so consecutive calls cannot reuse a thread.
+        super().__init__(max_workers=1)
+        self._per_call_executors: list[concurrent.futures.ThreadPoolExecutor] = []
+
+    def submit(self, fn, /, *args, **kwargs):  # type: ignore[override]
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._per_call_executors.append(executor)
+        return executor.submit(fn, *args, **kwargs)
+
+    def shutdown(self, wait=True, *, cancel_futures=False):  # type: ignore[override]
+        for executor in self._per_call_executors:
+            executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+        self._per_call_executors.clear()
+        super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
 class TestAsyncToThread:
-    """Test that _walk and _hash_file are offloaded to thread."""
+    """Blocking folder-scan work must not run on the event-loop thread."""
 
     @pytest.mark.asyncio
     async def test_walk_runs_in_thread(self, store, pipeline, tmp_path):
@@ -677,8 +722,10 @@ class TestAsyncToThread:
         source = {"id": source_id, "uri": str(vault),
                   "source_type": "local_folder", "properties": "{}"}
 
-        async def fake_ingest(path, **kwargs):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kwargs):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -695,6 +742,103 @@ class TestAsyncToThread:
         assert threading.get_ident() not in dedup_threads, (
             "dedup_document ran on the event-loop thread; it must be offloaded via "
             "asyncio.to_thread (see ingestion.py / watcher.py for the precedent)")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("paused", [False, True])
+    async def test_last_seen_flush_and_commit_run_off_the_event_loop(
+            self, tmp_path, monkeypatch, paused):
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        note = vault / "note.md"
+        note.write_text("hello")
+
+        db = MagicMock()
+        flush_threads: list[int] = []
+        commit_threads: list[int] = []
+        db.commit.side_effect = lambda: commit_threads.append(threading.get_ident())
+        store = MagicMock()
+        store.db = db
+        pipeline = MagicMock()
+        pipeline._dedup_enabled = False
+        fw = FolderWatcher(store, pipeline)
+        monkeypatch.setattr(fw, "_walk", lambda *a, **kw: [(str(note), 1.0)])
+        monkeypatch.setattr(
+            fw,
+            "_load_state",
+            lambda source_id: {
+                str(note): {"status": "done", "mtime": 2.0, "item_ids": "[]"}
+            },
+        )
+        monkeypatch.setattr(fw, "_is_paused", lambda source_id: paused)
+        original_flush = fw._flush_last_seen
+
+        def record_flush(batch):
+            flush_threads.append(threading.get_ident())
+            original_flush(batch)
+
+        monkeypatch.setattr(fw, "_flush_last_seen", record_flush)
+        loop_thread = threading.get_ident()
+        asyncio.get_running_loop().set_default_executor(_ThreadPerCallExecutor())
+
+        await fw.scan_source(
+            {"id": "source", "uri": str(vault), "properties": "{}"}
+        )
+
+        assert len(flush_threads) == len(commit_threads) == 1
+        assert flush_threads[0] != loop_thread, (
+            "the last-seen flush ran on the event-loop thread")
+        # The store's SQLite connection is thread-local, so a commit that lands
+        # on a different worker than its flush commits a DIFFERENT connection --
+        # which, under the thread-per-call executor above, is what splitting the
+        # single worker hop into two `asyncio.to_thread` calls produces.
+        assert flush_threads == commit_threads, (
+            "the flush and its commit ran on different worker threads, so they "
+            "used different thread-local SQLite connections; keep them in one "
+            "asyncio.to_thread hop")
+
+    @pytest.mark.asyncio
+    async def test_stale_claim_release_runs_off_the_event_loop(
+            self, tmp_path, monkeypatch):
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        note = vault / "note.md"
+        note.write_text("changed")
+
+        store = MagicMock()
+        release_threads: list[int] = []
+        store.release_stale_claim.side_effect = (
+            lambda *args: release_threads.append(threading.get_ident())
+        )
+        pipeline = MagicMock()
+        pipeline._dedup_enabled = False
+        fw = FolderWatcher(store, pipeline)
+        monkeypatch.setattr(fw, "_walk", lambda *a, **kw: [(str(note), 2.0)])
+        monkeypatch.setattr(fw, "_hash_file", lambda path: "new-hash")
+        monkeypatch.setattr(
+            fw,
+            "_load_state",
+            lambda source_id: {
+                str(note): {
+                    "status": "deduped",
+                    "mtime": 1.0,
+                    "content_hash": "old-hash",
+                    "text_hash": "old-text-hash",
+                    "item_ids": "[]",
+                }
+            },
+        )
+        monkeypatch.setattr(fw, "_is_paused", lambda source_id: False)
+        monkeypatch.setattr(fw, "_update_state", MagicMock())
+        monkeypatch.setattr(fw, "_flush_last_seen", MagicMock())
+        monkeypatch.setattr(fw, "_ingest_file", AsyncMock(return_value=([], "deduped")))
+        loop_thread = threading.get_ident()
+
+        await fw.scan_source(
+            {"id": "source", "uri": str(vault), "properties": "{}"}
+        )
+
+        assert len(release_threads) == 1
+        assert release_threads[0] != loop_thread
 
 
 class TestDeleteSourceCascade:
@@ -907,8 +1051,10 @@ class TestInterruptedScanRetryCap:
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder",
                   "properties": "{}"}
 
-        async def fake_ingest(path, **kw):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kw):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -958,8 +1104,10 @@ class TestInterruptedScanRetryCap:
         doc.write_text("# Rewritten after the cap was spent")
         os.utime(doc, (9999999999, 9999999999))
 
-        async def fake_ingest(path, **kw):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kw):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -1098,5 +1246,46 @@ class TestFolderFileStateAttemptsMigration:
                 ("/legacy/doc.md",)).fetchone()
             assert row["status"] == "scanning"
             assert row["attempts"] == 0
+        finally:
+            store.close()
+
+
+class TestDocumentStateTableSchema:
+    """``_migrate`` backfills COLUMNS; ``_init_schema`` owns creating the tables."""
+
+    _STATE_TABLES = ("folder_file_state", "artifact_item_state", "agent_item_state")
+
+    @staticmethod
+    def _columns(store, table: str) -> set[str]:
+        return {r[1] for r in store.db.execute(
+            "SELECT * FROM pragma_table_info(?)", (table,)).fetchall()}
+
+    def test_absent_state_tables_come_back_with_their_full_shape(self, tmp_path):
+        """Opening a database whose document-state tables are gone recreates them.
+
+        ``_migrate`` runs ``PRAGMA table_info`` and then ``ALTER TABLE`` on all
+        three unconditionally, and an ALTER against a missing table raises
+        ``no such table`` -- so what keeps the column backfill safe is
+        ``__init__`` running ``_init_schema`` (whose ``CREATE TABLE IF NOT
+        EXISTS`` carries every column) FIRST. This pins that ordering, which is
+        otherwise only a comment.
+        """
+        db_path = tmp_path / "dropped.db"
+        store = KnowledgeStore(str(db_path))
+        expected = {t: self._columns(store, t) for t in self._STATE_TABLES}
+        store.close()
+        assert all(expected.values()), "fresh schema must define all three tables"
+
+        conn = sqlite3.connect(str(db_path))
+        for table in self._STATE_TABLES:
+            conn.execute(f"DROP TABLE {table}")  # noqa: S608
+        conn.commit()
+        conn.close()
+
+        store = KnowledgeStore(str(db_path))
+        try:
+            for table in self._STATE_TABLES:
+                assert self._columns(store, table) == expected[table], (
+                    f"{table} did not come back with its full column set")
         finally:
             store.close()

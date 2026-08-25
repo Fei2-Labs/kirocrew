@@ -2,6 +2,7 @@ import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
+import { releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { safeSetItem } from '../utils/safeStorage'
 import ChatInput from '../components/ChatInput'
 import { SlotProvider } from '../providers/SlotContext'
@@ -13,6 +14,9 @@ import type { PasteBlock } from '../utils/pasteTokens'
 const touchEnv = vi.hoisted(() => ({ touch: false }))
 vi.mock('../utils/isTouchDevice', () => ({ isTouchDevice: () => touchEnv.touch }))
 
+const mobileEnv = vi.hoisted(() => ({ mobile: false }))
+vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => mobileEnv.mobile }))
+
 const defaultProps = {
   value: '',
   onChange: vi.fn(),
@@ -23,6 +27,7 @@ beforeEach(() => {
   vi.restoreAllMocks()
   localStorage.clear()
   touchEnv.touch = false
+  mobileEnv.mobile = false
 })
 
 describe('ChatInput', () => {
@@ -55,6 +60,18 @@ describe('ChatInput', () => {
     it('shows offline placeholder when connected=false', () => {
       renderWithProviders(<ChatInput {...defaultProps} connected={false} />)
       expect(screen.getByPlaceholderText(/Gateway offline/)).toBeInTheDocument()
+    })
+
+    it('makes the touch-device + control open the native file picker directly in a wide viewport', () => {
+      touchEnv.touch = true
+      renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} />)
+
+      const input = screen.getAllByLabelText('Attach files').find((element) => element.tagName === 'INPUT')
+      const mobilePlus = screen.getByTitle('Attach files').closest('label')
+      expect(input).toBeDefined()
+      expect(mobilePlus).toHaveAttribute('for', input?.id)
+      expect(screen.queryByRole('button', { name: 'Add files & options' })).not.toBeInTheDocument()
+      expect(screen.queryByText('Upload file')).not.toBeInTheDocument()
     })
   })
 
@@ -253,6 +270,21 @@ describe('ChatInput', () => {
       } finally {
         vi.useRealTimers()
       }
+    })
+
+    it('consumes the swallowed Enter so no newline lands in the draft', () => {
+      // The reported symptom: pick a candidate, press Enter to send, and the draft
+      // gains a line break instead. The guard is allowed to decline the submit; it is
+      // not allowed to let the textarea's default action edit the text. `fireEvent`
+      // returns false when a handler called preventDefault.
+      const onSend = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} value="你好" onSend={onSend} sendOnEnter="enter" />)
+      const ta = screen.getByLabelText('Message input')
+      fireEvent.compositionStart(ta)
+      fireEvent.compositionEnd(ta)
+      const notCancelled = fireEvent.keyDown(ta, { key: 'Enter', isComposing: false })
+      expect(notCancelled).toBe(false)
+      expect(onSend).not.toHaveBeenCalled()
     })
 
     it('does not call onSend on Enter when sendOnEnter is false', () => {
@@ -1077,6 +1109,20 @@ describe('ChatInput', () => {
       ta.blur()
       rerender(<ChatInput {...defaultProps} autoFocusKey="A" />)
       expect(ta).not.toHaveFocus()
+    })
+
+    it('skips exactly one autofocus after a keyboard-driven switch released the composer (macOS chord chaining)', () => {
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} autoFocusKey="A" />)
+      const ta = screen.getByLabelText('Message input')
+      ta.blur()
+      // A keyboard jump armed the release: this switch's autofocus is
+      // skipped so the next chord is not input-gated dead on macOS.
+      releaseComposerForKeyboardSwitch()
+      rerender(<ChatInput {...defaultProps} autoFocusKey="B" />)
+      expect(ta).not.toHaveFocus()
+      // One-shot: the next switch (pointer-driven — no release) focuses again.
+      rerender(<ChatInput {...defaultProps} autoFocusKey="C" />)
+      expect(ta).toHaveFocus()
     })
 
     it('does not focus on a touch device, even when the key changes', () => {

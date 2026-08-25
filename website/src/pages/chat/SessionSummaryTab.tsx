@@ -1,6 +1,6 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, ChevronRight, ListChecks, ListTree, RefreshCw, Clock, RotateCcw, MoveUpRight, Sparkles, Loader2 } from 'lucide-react'
+import { AlertTriangle, ChevronRight, ChevronUp, ListChecks, ListTree, RefreshCw, Clock, RotateCcw, MoveUpRight, Sparkles, Loader2 } from 'lucide-react'
 
 import { api, ApiError } from '../../api/client'
 import { parseErrorCode } from '../../utils/errorReport'
@@ -41,6 +41,7 @@ import {
 const OPEN_KEY_PREFIX = 'mc-summary-open:'
 const NOTES_KEY_PREFIX = 'mc-summary-notes:'
 const TRIAGE_KEY_PREFIX = 'mc-summary-triage:'
+const TRIAGE_ALL_KEY_PREFIX = 'mc-summary-triage-all:'
 
 /** Per-slot disclosure state. Persisted so re-opening the panel does not undo
  *  the reader's own collapsing, matching how the panel tab strip persists.
@@ -89,11 +90,62 @@ function loadTriageOpen(slot: string): Record<string, boolean> {
   }
 }
 
+/** Whether the block renders every open item or only the first `TRIAGE_VISIBLE`.
+ *  Capped by default: the block answers "does this session need me?", and past a
+ *  few rows it pushes the intent list off screen on exactly the sessions with
+ *  the most to show. Persisted like the other disclosures, so a reader who wants
+ *  the whole list does not re-expand it on every visit. */
+function loadTriageAll(slot: string): boolean {
+  return safeGetItem(TRIAGE_ALL_KEY_PREFIX + slot) === '1'
+}
+
 const STATE_LABEL: Record<IntentState, string> = {
   'done': 'pages.chat.sessionSummary.state_done',
   'needs-you': 'pages.chat.sessionSummary.state_needs_you',
   'in-progress': 'pages.chat.sessionSummary.state_active',
   'dropped': 'pages.chat.sessionSummary.state_dropped',
+}
+
+/** Bottom-edge overflow cue for one of the panel's capped regions.
+ *
+ *  A cap that lands on a clean row boundary is indistinguishable from a list
+ *  that simply ended, and the platform gives no help: overlay scrollbars stay
+ *  hidden until the reader scrolls. So a bounded region has to carry its own
+ *  affordance, or expanding it reads as "these are all of them".
+ *
+ *  Gated on MEASUREMENT rather than on the region being expanded, which is the
+ *  part that matters: a fade over a list with nothing beneath it invents hidden
+ *  content, and that is the same lie as hiding content, told the other way
+ *  round. So it appears only while something is genuinely below the fold — never
+ *  on a short list that fits, and never once the reader reaches the end. */
+function useOverflowFade<T extends HTMLElement>(enabled: boolean) {
+  const ref = useRef<T | null>(null)
+  const [faded, setFaded] = useState(false)
+  const measure = useCallback(() => {
+    const el = ref.current
+    // 2px of slack: fractional layout leaves a sub-pixel remainder at the true
+    // end of a scroll, which would otherwise strand the fade lit at the bottom.
+    setFaded(!!el && enabled && el.scrollHeight - el.scrollTop - el.clientHeight > 2)
+  }, [enabled])
+  // Re-measured after every render, which is what keeps the cue correct without
+  // this hook's caller having to enumerate everything that changes the content
+  // height — a new payload, an item expanding, a locale swap. Setting the same
+  // value is a no-op in React, so this cannot loop.
+  useLayoutEffect(measure)
+  useEffect(() => {
+    const el = ref.current
+    if (!enabled || !el) return
+    el.addEventListener('scroll', measure, { passive: true })
+    // The region is bounded in `vh`, so its own box changes with the window even
+    // when its content does not.
+    const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null
+    ro?.observe(el)
+    return () => {
+      el.removeEventListener('scroll', measure)
+      ro?.disconnect()
+    }
+  }, [enabled, measure])
+  return { ref, faded }
 }
 
 /** One derived word per intent, never two competing badges — progress and
@@ -242,6 +294,11 @@ export default function SessionSummaryTab({ slot }: { slot: string }) {
   const [openMap, setOpenMap] = useState<Record<string, boolean>>(() => loadOpen(slot))
   const [notesOpen, setNotesOpen] = useState<boolean>(() => loadNotesOpen(slot))
   const [triageOpen, setTriageOpen] = useState<Record<string, boolean>>(() => loadTriageOpen(slot))
+  const [triageAll, setTriageAll] = useState<boolean>(() => loadTriageAll(slot))
+  // Each capped region gets its own cue: they cap independently, and either can
+  // be at its end while the other still has more below.
+  const openItemsFade = useOverflowFade<HTMLDivElement>(triageAll)
+  const notesFade = useOverflowFade<HTMLDivElement>(notesOpen)
   // Generation is the one thing this panel does that spends money, so its
   // in-flight and failure states are local rather than folded into the query's:
   // `isFetching` already means "re-reading the sidecar", which is free, and a
@@ -342,6 +399,13 @@ export default function SessionSummaryTab({ slot }: { slot: string }) {
     [slot],
   )
 
+  const toggleTriageAll = useCallback(() => {
+    setTriageAll(prev => {
+      safeSetItem(TRIAGE_ALL_KEY_PREFIX + slot, prev ? '0' : '1')
+      return !prev
+    })
+  }, [slot])
+
   // Memoized so the `??` fallback does not produce a new array identity every
   // render, which would defeat the triage memo below.
   const intents = useMemo(() => data?.intents ?? [], [data])
@@ -354,6 +418,9 @@ export default function SessionSummaryTab({ slot }: { slot: string }) {
   )
   const triage = useMemo(() => allOpen.slice(0, TRIAGE_VISIBLE), [allOpen])
   const hiddenOpen = allOpen.length - triage.length
+  // What the block actually renders. `triage` stays the capped set because the
+  // heading chip and the block's own visibility key off it.
+  const shownOpen = triageAll ? allOpen : triage
 
   if (isLoading) {
     return (
@@ -512,49 +579,124 @@ export default function SessionSummaryTab({ slot }: { slot: string }) {
 
       <div className="flex-1 overflow-y-auto p-3">
         {triage.length > 0 && (
-          <div className="bg-bg-accent border border-border-strong rounded-md p-[11px] mb-3">
-            <div className="flex items-center gap-[7px] text-[13px] font-semibold text-text-strong mb-2">
+          // Expanded, the CARD is what is bounded — not the list inside it. The
+          // heading, the padding and the toggle are charged against the third
+          // rather than added on top of it, so the box a reader can point at is
+          // the box the cap governs. Capping the list instead leaves the card
+          // measurably larger than its stated limit, which reads as the cap not
+          // working.
+          <div
+            className={`bg-bg-accent border border-border-strong rounded-md p-[11px] mb-3 ${
+              triageAll ? 'flex flex-col max-h-[33vh]' : ''
+            }`}
+          >
+            <div className="shrink-0 flex items-center gap-[7px] text-[13px] font-semibold text-text-strong mb-2">
               <ListChecks className="lucide-inline" />
               {i18nT('pages.chat.sessionSummary.open_items_heading')}
             </div>
-            {triage.map((item, i) => {
-              const key = triageKey(item)
-              const open = triageOpen[key] === true
-              return (
-                <div key={key} className={i > 0 ? 'pt-[7px] mt-[7px] border-t border-border' : ''}>
-                  <button
-                    type="button"
-                    onClick={() => toggleTriage(key)}
-                    aria-expanded={open}
-                    className="w-full text-left flex items-start gap-2 rounded hover:bg-bg-hover"
-                  >
-                    <span className="flex-1 min-w-0 text-[13px] text-text-strong">{item.what}</span>
-                    <ChevronRight
-                      className={`lucide-inline shrink-0 mt-[3px] text-muted-strong transition-transform ${open ? 'rotate-90' : ''}`}
-                    />
-                  </button>
-                  {open && (
-                    <div className="mt-[3px]">
-                      {item.why && <div className="text-[12px] text-muted">{item.why}</div>}
-                      {item.expect && (
-                        <div className="text-[11px] text-muted-strong mt-[3px] italic">
-                          {item.expect}
+            {/* The list takes whatever the heading and toggle leave, and scrolls
+                inside that. `min-h-0` is load-bearing: a flex child's default
+                `min-height:auto` refuses to shrink below its content, so without
+                it the list wins the argument and the card grows past the cap.
+                Scroll is contained because this sits inside the panel's own
+                scroll area, where chaining would carry the reader out of the list
+                the moment they reach its end.
+
+                The scroller sits inside a relative box so the fade can be a
+                SIBLING of it. A fade nested inside a scroller is positioned
+                against the content and scrolls away with it, which puts the cue
+                everywhere except the edge it describes. That box mirrors the
+                scroller's own flex sizing and stays IN FLOW: taking the scroller
+                out of flow with `absolute` leaves the card no content to measure,
+                and a card whose height is a `max-h` ceiling rather than a fixed
+                height then collapses to its heading. */}
+            <div className={triageAll ? 'relative flex-1 min-h-0 flex flex-col' : undefined}>
+              <div
+                ref={openItemsFade.ref}
+                className={
+                  triageAll ? 'flex-1 min-h-0 overflow-y-auto overscroll-contain' : undefined
+                }
+              >
+                {shownOpen.map((item, i) => {
+                  const key = triageKey(item)
+                  const open = triageOpen[key] === true
+                  return (
+                    <div
+                      key={key}
+                      className={i > 0 ? 'pt-[7px] mt-[7px] border-t border-border' : ''}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => toggleTriage(key)}
+                        aria-expanded={open}
+                        className="w-full text-left flex items-start gap-2 rounded hover:bg-bg-hover"
+                      >
+                        <span className="flex-1 min-w-0 text-[13px] text-text-strong">
+                          {item.what}
+                        </span>
+                        <ChevronRight
+                          className={`lucide-inline shrink-0 mt-[3px] text-muted-strong transition-transform ${open ? 'rotate-90' : ''}`}
+                        />
+                      </button>
+                      {open && (
+                        <div className="mt-[3px]">
+                          {item.why && <div className="text-[12px] text-muted">{item.why}</div>}
+                          {item.expect && (
+                            <div className="text-[11px] text-muted-strong mt-[3px] italic">
+                              {item.expect}
+                            </div>
+                          )}
+                          <div className="text-[11px] text-muted-strong mt-1 flex items-center gap-1">
+                            <ChevronRight className="lucide-inline" />
+                            {i18nT('pages.chat.sessionSummary.from_intent', {
+                              intent: item.fromIntent,
+                            })}
+                          </div>
                         </div>
                       )}
-                      <div className="text-[11px] text-muted-strong mt-1 flex items-center gap-1">
-                        <ChevronRight className="lucide-inline" />
-                        {i18nT('pages.chat.sessionSummary.from_intent', { intent: item.fromIntent })}
-                      </div>
                     </div>
-                  )}
-                </div>
-              )
-            })}
+                  )
+                })}
+              </div>
+              {openItemsFade.faded && (
+                // Decorative: it reports a fact the scroll position already
+                // carries, and a screen reader is never in doubt about how much
+                // of a list remains. `pointer-events-none` keeps it from
+                // swallowing clicks on the row it sits over.
+                <div
+                  aria-hidden
+                  data-testid="summary-open-items-fade"
+                  className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-gradient-to-t from-bg-accent to-transparent"
+                />
+              )}
+            </div>
             {hiddenOpen > 0 && (
-              // Without this the block silently withholds items on exactly the
-              // sessions that have the most of them.
-              <div className="pt-[7px] mt-[7px] border-t border-border text-[12px] text-muted-strong">
-                {i18nT('pages.chat.sessionSummary.open_items_more', { n: hiddenOpen })}
+              // A real control, not a caption: the row reads as an affordance,
+              // so it has to be one. Without it the block silently withholds
+              // items on exactly the sessions that have the most of them.
+              //
+              // Collapsed it is the count alone — the number IS the invitation,
+              // and a chevron beside it competes with the per-item chevrons this
+              // row is not one of. Expanded the count is spent, so the row needs
+              // its own affordance, and an up-chevron after the label points at
+              // the collapse it performs while keeping both labels on one left
+              // edge.
+              <div className="shrink-0 pt-[7px] mt-[7px] border-t border-border">
+                <button
+                  type="button"
+                  onClick={toggleTriageAll}
+                  aria-expanded={triageAll}
+                  className="w-full text-left flex items-center gap-1 text-[12px] text-muted-strong rounded hover:bg-bg-hover hover:text-text"
+                >
+                  {triageAll ? (
+                    <>
+                      {i18nT('pages.chat.sessionSummary.open_items_less')}
+                      <ChevronUp className="lucide-inline shrink-0" />
+                    </>
+                  ) : (
+                    i18nT('pages.chat.sessionSummary.open_items_more', { n: hiddenOpen })
+                  )}
+                </button>
               </div>
             )}
           </div>
@@ -580,12 +722,21 @@ export default function SessionSummaryTab({ slot }: { slot: string }) {
       </div>
 
       {(data?.constraints?.length ?? 0) > 0 && (
-        <div className="shrink-0 border-t border-border-strong bg-card">
+        // Same rule as the open-items card: expanded, the whole footer is what is
+        // bounded, so its header is charged against the third rather than added
+        // on top. It binds harder here than above, because `shrink-0` means that
+        // without a ceiling a long notes list grows the footer itself and squeezes
+        // the intent list toward zero instead of scrolling.
+        <div
+          className={`shrink-0 border-t border-border-strong bg-card ${
+            notesOpen ? 'flex flex-col max-h-[33vh]' : ''
+          }`}
+        >
           <button
             type="button"
             onClick={toggleNotes}
             aria-expanded={notesOpen}
-            className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-bg-hover"
+            className="shrink-0 w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-bg-hover"
           >
             <span className="text-[11px] font-semibold tracking-[0.02em] text-muted">
               {i18nT('pages.chat.sessionSummary.project_notes')}
@@ -599,13 +750,44 @@ export default function SessionSummaryTab({ slot }: { slot: string }) {
             />
           </button>
           {notesOpen && (
-            <ul className="pl-7 pr-3 pb-2.5 list-disc">
-              {data?.constraints.map((note, i) => (
-                <li key={i} className="text-[12px] text-muted my-[3px]">
-                  {note}
-                </li>
-              ))}
-            </ul>
+            <div className="relative flex-1 min-h-0 flex flex-col">
+              {/* The SCROLLER carries the tab stop, not the list. Bounding this
+                  list created a scroll region whose items are plain text, so
+                  without a tab stop everything below the fold is pointer-only.
+                  It is a wrapping div rather than the `<ul>` itself because an
+                  explicit `role` REPLACES an element's implicit one: `role="region"`
+                  on the list would stop its `<li>`s being exposed as `listitem`s,
+                  costing "list, N items" and list navigation for exactly the cohort
+                  this is for. `ring-inset` rather than an outline — an outline on a
+                  scroll container is clipped to a hairline on one edge, which is not
+                  a visible focus indicator (WCAG 2.4.7). The open-items list needs
+                  none of this: its rows are buttons, so tabbing scrolls them into
+                  view. */}
+              {/* eslint-disable jsx-a11y/no-noninteractive-tabindex */}
+              <div
+                ref={notesFade.ref}
+                role="region"
+                aria-label={i18nT('pages.chat.sessionSummary.project_notes')}
+                tabIndex={0}
+                className="flex-1 min-h-0 overflow-y-auto overscroll-contain focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+              >
+                <ul className="pl-7 pr-3 pb-2.5 list-disc">
+                  {data?.constraints.map((note, i) => (
+                    <li key={i} className="text-[12px] text-muted my-[3px]">
+                      {note}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              {/* eslint-enable jsx-a11y/no-noninteractive-tabindex */}
+              {notesFade.faded && (
+                <div
+                  aria-hidden
+                  data-testid="summary-notes-fade"
+                  className="pointer-events-none absolute inset-x-0 bottom-0 h-6 bg-gradient-to-t from-card to-transparent"
+                />
+              )}
+            </div>
           )}
         </div>
       )}

@@ -27,7 +27,7 @@ import {
 } from '../hooks/useWebSocket'
 import { api } from '../api/client'
 import { store as globalStore } from '../store'
-import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, sweepStaleOptimistic, appendMessage, OPTIMISTIC_TIMEOUT_MS } from '../store/chatSlice'
+import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, appendMessage } from '../store/chatSlice'
 import { sseSlots } from '../store/dashboardSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import type { ChatSlot } from '../types'
@@ -630,7 +630,7 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().folderSuggestions[ACTIVE]).toEqual({
-      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12,
+      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12, turns: 0,
     })
 
     act(() => {
@@ -977,6 +977,26 @@ describe('useWebSocket frame router', () => {
     // Draining the last chunk stops the playing indicator.
     act(() => { MockAudio.instances[1].onended?.() })
     expect(chat().voicePlaying).toBe(false)
+  })
+
+  it('uses the WAV MIME type supplied with a local voice chunk', async () => {
+    const blobs: Blob[] = []
+    URL.createObjectURL = vi.fn((blob: Blob) => {
+      blobs.push(blob)
+      return 'blob:voice-wav'
+    })
+    vi.stubGlobal('Audio', MockAudio)
+    const { ws } = mount()
+
+    await act(async () => {
+      ws.simulateMessage({
+        type: 'voice_chunk',
+        data: { slot: ACTIVE, audio: btoa('wav'), audioMime: 'audio/wav' },
+      })
+    })
+
+    expect(blobs).toHaveLength(1)
+    expect(blobs[0].type).toBe('audio/wav')
   })
 
   it('advances past a chunk whose audio element errors', async () => {
@@ -1758,47 +1778,3 @@ describe('useWebSocket slots reconcile', () => {
   })
 })
 
-describe('useWebSocket client-side optimistic timeout sweep (#3973)', () => {
-  beforeEach(() => { vi.useFakeTimers() })
-  afterEach(() => { vi.useRealTimers() })
-
-  it('dispatches sweepStaleOptimistic on a 10s interval independent of the heartbeat', () => {
-    const testStore = createTestStore({
-      chat: { ...chatReducer(undefined, { type: '@@INIT' }), activeSlot: ACTIVE },
-    })
-    // Inject an optimistic message with a backdated timestamp so the sweep can mark it stale
-    const oldTs = Date.now() - (OPTIMISTIC_TIMEOUT_MS + 5_000)
-    testStore.dispatch(appendMessage({
-      role: 'user', content: 'pending msg', cls: '', ts: '2026-08-16T14:00:00.000Z',
-      meta: { sendId: 's-timer', optimistic: true, optimisticTs: oldTs },
-    }))
-    expect(testStore.getState().chat.messages[0].meta?.stale).toBeUndefined()
-
-    const wrapper = ({ children }: { children: React.ReactNode }) =>
-      createElement(QueryClientProvider, { client: new QueryClient({ defaultOptions: { queries: { retry: false } } }) },
-        createElement(Provider, { store: testStore }, children))
-
-    renderHook(() => useWebSocket(), { wrapper })
-
-    // The WebSocket may or may not have connected — the timer fires regardless.
-    // Advance past the 10s interval.
-    act(() => { vi.advanceTimersByTime(10_000) })
-
-    expect(testStore.getState().chat.messages[0].meta?.stale).toBe(true)
-  })
-
-  it('cleans up the interval on unmount', () => {
-    const testStore = createTestStore({
-      chat: { ...chatReducer(undefined, { type: '@@INIT' }), activeSlot: ACTIVE },
-    })
-    const wrapper = ({ children }: { children: React.ReactNode }) =>
-      createElement(QueryClientProvider, { client: new QueryClient({ defaultOptions: { queries: { retry: false } } }) },
-        createElement(Provider, { store: testStore }, children))
-
-    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
-    const clearSpy = vi.spyOn(global, 'clearInterval')
-    act(() => { unmount() })
-    expect(clearSpy).toHaveBeenCalled()
-    clearSpy.mockRestore()
-  })
-})

@@ -100,10 +100,13 @@ test.describe('Capabilities Page — /capabilities', () => {
       await expect(createSheet).toBeVisible({ timeout: 5000 })
 
       // The Name field's label is a <span>, not a <label for>, so the input has
-      // no accessible name — the placeholder is its stable handle. Template,
-      // workspace and memory store keep their defaults: this test is about the
-      // create/delete round-trip, not about the bindings.
+      // no accessible name — the placeholder is its stable handle. Workspace and
+      // memory store keep their defaults; the Agent Template does NOT have one and
+      // must be chosen, because pre-filling it made a new crew a silent alias for
+      // the default agent, so Create now refuses until it is set.
       await createSheet.getByPlaceholder('e.g. oncall').fill(agentName)
+      await createSheet.getByRole('combobox', { name: 'Agent Template' }).click()
+      await page.getByRole('option', { name: 'kirocrew', exact: true }).click()
       await createSheet.getByRole('button', { name: 'Create', exact: true }).click()
 
       // A successful create closes the sheet and refetches the roster.
@@ -115,6 +118,10 @@ test.describe('Capabilities Page — /capabilities', () => {
       await card.click()
       const editSheet = page.getByRole('dialog', { name: `Edit crew ${agentName}` })
       await expect(editSheet).toBeVisible({ timeout: 5000 })
+      // The editor is a rail plus one pane, so removal lives on its own pane and
+      // the button is not mounted until that pane is showing. This is the click a
+      // user makes; without it the button below is simply absent.
+      await editSheet.getByTestId('crew-rail-danger').click()
       await editSheet.getByRole('button', { name: 'Delete crew', exact: true }).click()
       // Delete is a two-step confirm: the first press only arms it, so without
       // this second press the sheet never closes and the delete never happens.

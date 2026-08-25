@@ -20,13 +20,23 @@ properties that used to drift between the three copies:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from unittest import mock
 
 import pytest
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only gh hardening")
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    # NOT because the hardening is POSIX-only -- it no longer is. These
+    # assertions pin the POSIX policy's own messages ("world-writable", "owned
+    # by another user (uid ...)") and build `#!/bin/sh` gh stubs, none of which
+    # the Windows branch produces or can execute. The Windows policy has its
+    # own suite in test/test_windows_acl.py; porting these assertions to be
+    # platform-agnostic is separate work.
+    reason="asserts the POSIX branch's messages and fixtures (see test_windows_acl.py)",
+)
 
 from kiro_crew import github_runner as runner  # noqa: E402
 
@@ -35,6 +45,7 @@ from kiro_crew import github_runner as runner  # noqa: E402
 def _clean_runner_state(monkeypatch):
     runner.reset_cache()
     monkeypatch.delenv("KIROCREW_GH_BIN", raising=False)
+    monkeypatch.delenv("_KIROCREW_GH_PREVALIDATED", raising=False)
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(runner, "agent_writable_roots", lambda: ())
     yield
@@ -62,6 +73,13 @@ class TestResolveGh:
         monkeypatch.setattr(
             runner, "check_provider_path_component",
             lambda path, *, label, uid, strict: None,
+        )
+        # Same reasoning for the Windows walk, which reads a real ACL and so
+        # depends on the runner's own tmp ancestry just as much.
+        monkeypatch.setattr(
+            runner,
+            "check_provider_path_component_windows",
+            lambda path, *, label, me_sid, strict: None,
         )
 
     def test_caller_override_wins_over_generic_and_candidates(self, monkeypatch, tmp_path):
@@ -177,6 +195,90 @@ class TestResolveGh:
         assert runner.resolve_gh(override_env="KIROCREW_TEST_GH") == second
 
 
+# ── prevalidated handoff (sandboxed children) ────────────────────────────────
+
+
+def _prevalidated_value(path: str) -> str:
+    st = os.stat(path)
+    return f"{path}|{st.st_dev}:{st.st_ino}"
+
+
+class TestPrevalidatedGh:
+    def test_handoff_wins_and_skips_the_ownership_walk(self, monkeypatch, tmp_path):
+        """Inside a single-uid userns the ownership walk refuses everything, so
+        the handoff must resolve WITHOUT calling it -- an exploding walk proves
+        the skip rather than merely coexisting with a permissive one."""
+        gh = _fake_gh(tmp_path / "bin")
+        monkeypatch.setenv(runner.GH_PREVALIDATED_ENV, _prevalidated_value(gh))
+
+        def _explode(path, *, label, uid, strict):
+            raise AssertionError("ownership walk must not run for a prevalidated handoff")
+
+        monkeypatch.setattr(runner, "check_provider_path_component", _explode)
+        assert runner.resolve_gh() == gh
+
+    def test_identity_mismatch_is_refused(self, monkeypatch, tmp_path):
+        """A binary swapped in after the parent's validation has a different
+        inode: the pin closes the validate-then-exec window the skipped
+        ownership walk would otherwise reopen. Built from two LIVE files --
+        two simultaneously-existing files can never share an inode on one
+        filesystem -- because delete-then-recreate can reuse the freed inode
+        (observed on CI) and would make the mismatch nondeterministic."""
+        target = _fake_gh(tmp_path / "bin")
+        other = _fake_gh(tmp_path / "other-bin", name="gh2")
+        st = os.stat(other)
+        monkeypatch.setenv(runner.GH_PREVALIDATED_ENV, f"{target}|{st.st_dev}:{st.st_ino}")
+        with pytest.raises(runner.SetupError, match="identity mismatch"):
+            runner.resolve_gh()
+
+    def test_malformed_handoff_fails_loudly(self, monkeypatch):
+        for bad in ("", "no-identity", "/x|not-numbers", "|1:2"):
+            runner.reset_cache()
+            monkeypatch.setenv(runner.GH_PREVALIDATED_ENV, bad)
+            with pytest.raises(runner.SetupError):
+                runner.resolve_gh()
+
+    def test_world_writable_target_is_refused(self, monkeypatch, tmp_path):
+        gh = _fake_gh(tmp_path / "bin")
+        # Deliberately world-writable: this test asserts the guard REFUSES it.
+        os.chmod(gh, 0o757)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        monkeypatch.setenv(runner.GH_PREVALIDATED_ENV, _prevalidated_value(gh))
+        with pytest.raises(runner.SetupError, match="world-writable"):
+            runner.resolve_gh()
+
+    def test_agent_writable_tree_is_still_refused(self, monkeypatch, tmp_path):
+        """The namespace does not destroy this check, so the child keeps it:
+        a handoff pointing into the agent's own tree is refused even though
+        the parent supposedly validated it."""
+        gh = _fake_gh(tmp_path / "bin")
+        monkeypatch.setattr(runner, "agent_writable_roots", lambda: (tmp_path,))
+        monkeypatch.setenv(runner.GH_PREVALIDATED_ENV, _prevalidated_value(gh))
+        with pytest.raises(runner.SetupError, match="agent-writable"):
+            runner.resolve_gh()
+
+    def test_changed_handoff_is_not_served_from_cache(self, monkeypatch, tmp_path):
+        first = _fake_gh(tmp_path / "first-bin")
+        second = _fake_gh(tmp_path / "second-bin")
+        monkeypatch.setenv(runner.GH_PREVALIDATED_ENV, _prevalidated_value(first))
+        assert runner.resolve_gh() == first
+        monkeypatch.setenv(runner.GH_PREVALIDATED_ENV, _prevalidated_value(second))
+        assert runner.resolve_gh() == second
+
+    def test_producer_pins_the_resolved_binary(self, monkeypatch, tmp_path):
+        gh = _fake_gh(tmp_path / "bin")
+        monkeypatch.setattr(runner, "resolve_gh", lambda **kw: gh)
+        env = runner.prevalidated_gh_env()
+        st = os.stat(gh)
+        assert env == {runner.GH_PREVALIDATED_ENV: f"{gh}|{st.st_dev}:{st.st_ino}"}
+
+    def test_producer_is_empty_when_no_gh_resolves(self, monkeypatch):
+        def _fail(**kw):
+            raise runner.SetupError("no gh")
+
+        monkeypatch.setattr(runner, "resolve_gh", _fail)
+        assert runner.prevalidated_gh_env() == {}
+
+
 # ── gh_env ───────────────────────────────────────────────────────────────────
 
 
@@ -249,7 +351,18 @@ class TestGhEnv:
 
 
 def _proc(returncode: int = 0) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=["gh"], returncode=returncode, stdout="", stderr="")
+    """A stand-in for what ``subprocess.run`` returns to ``run_gh`` -- BYTES.
+
+    ``run_gh`` captures bytes and decodes them strictly in its own frame, so a
+    stub at the subprocess boundary must hand it bytes. Handing it `str` raises
+    `AttributeError: 'str' object has no attribute 'decode'`.
+
+    This file is skipped on Windows (see the module-level `pytestmark`), so
+    these five tests are the ones a Windows-only local run does NOT execute --
+    which is exactly how the `str` version of this helper reached CI green
+    locally and red on the Linux shards.
+    """
+    return subprocess.CompletedProcess(args=["gh"], returncode=returncode, stdout=b"", stderr=b"")
 
 
 class TestRunGh:

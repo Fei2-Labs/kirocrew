@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.acp.types import JSONRPC_METHOD_NOT_FOUND
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, read_local_secret
 from kiro_crew.dashboard.origin import parse_dashboard_url
 from kiro_crew.loopback_http import loopback_urlopen
@@ -702,7 +703,7 @@ def _read_message(stdin) -> dict[str, Any] | None:
                     continue
                 body = b"".join(chunks)
                 return json.loads(body.decode("utf-8"))
-            except (ValueError, json.JSONDecodeError):
+            except ValueError:
                 continue
         # Bare JSON line (backwards compat)
         try:
@@ -1053,12 +1054,15 @@ def _run_stdio_dispatch_loop(
         if method == "initialize":
             _caps: dict[str, Any] = {"tools": {"listChanged": False}}
             if advertise_caller_identity:
-                # Pooled-operation opt-in: gatewayd pools ONLY backends that
-                # advertise the caller-identity extension (others fall back
-                # to per-session spawn). Advertising is what makes the
-                # per-call ``_meta.kirocrew.caller`` path live end-to-end —
-                # without it the dispatch loop's caller slot never receives
-                # gateway-authored metadata.
+                # Pooled-operation opt-in for IDENTITY, not for pooling:
+                # gatewayd injects the per-call ``_meta.kirocrew.caller`` block
+                # only into a backend that advertised this capability, and
+                # nothing declines to POOL one that did not (see
+                # ``rewriter.UNPOOLABLE_SERVERS``, which is empty and documents
+                # exactly that). So NOT advertising does not buy a per-session
+                # spawn -- it buys a shared process whose dispatch-loop caller
+                # slot never receives gateway-authored metadata, which is how a
+                # session-scoped tool silently degrades to unattached behaviour.
                 _caps["experimental"] = caller_identity_capability()
             respond(
                 req_id,
@@ -1179,4 +1183,11 @@ def _run_stdio_dispatch_loop(
                 )
                 _worker_thread.start()
         elif req_id is not None:
-            respond(req_id, None, error={"code": -32601, "message": f"Unknown method: {method}"})
+            respond(
+                req_id,
+                None,
+                error={
+                    "code": JSONRPC_METHOD_NOT_FOUND,
+                    "message": f"Unknown method: {method}",
+                },
+            )

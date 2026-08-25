@@ -18,11 +18,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve diff base (merge-base)
+        id: diffbase
+        env:
+          BASE_TIP: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # base.sha is the base branch tip when the PR event fired, not the
+          # branch-off point, so diffing it directly pulls in sibling commits.
+          if ! MERGE_BASE=$(git merge-base "$BASE_TIP" "$HEAD_SHA"); then
+            echo "::error::Could not resolve the merge-base of $BASE_TIP and $HEAD_SHA (this job needs fetch-depth: 0)"
+            exit 1
+          fi
+          echo "Diff base: $MERGE_BASE"
+          echo "sha=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+
       - name: Get changed files
         id: changed
         run: |
           echo "files<<EOF" >> $GITHUB_OUTPUT
-          git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} >> $GITHUB_OUTPUT
+          git diff --name-only ${{ steps.diffbase.outputs.sha }}..${{ github.event.pull_request.head.sha }} >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
       # Deterministic replication of the blocking rules from
@@ -33,7 +48,7 @@ jobs:
         if: contains(steps.changed.outputs.files, 'website/src/')
         working-directory: website
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ steps.diffbase.outputs.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           echo "::group::use-lucide-icons — no inline SVGs"
@@ -105,7 +120,7 @@ jobs:
       - name: Check backend security rules
         if: contains(steps.changed.outputs.files, 'src/kiro_crew/')
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ steps.diffbase.outputs.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           echo "::group::sensitive-path reads must go through is_sensitive_path()"
@@ -185,6 +200,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve diff base (merge-base)
+        id: diffbase
+        env:
+          BASE_TIP: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # base.sha is the base branch tip when the PR event fired, not the
+          # branch-off point, so diffing it directly pulls in sibling commits.
+          if ! MERGE_BASE=$(git merge-base "$BASE_TIP" "$HEAD_SHA"); then
+            echo "::error::Could not resolve the merge-base of $BASE_TIP and $HEAD_SHA (this job needs fetch-depth: 0)"
+            exit 1
+          fi
+          echo "Diff base: $MERGE_BASE"
+          echo "sha=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+
       - name: Install woke
         env:
           WOKE_VERSION: "0.19.0"
@@ -193,7 +223,12 @@ jobs:
           asset="woke-${WOKE_VERSION}-linux-amd64.tar.gz"
           archive="${RUNNER_TEMP}/${asset}"
           bin_dir="${RUNNER_TEMP}/woke-bin"
-          curl -sSfL \
+          # --retry-all-errors is required in addition to --retry: a bare
+          # --retry covers transient HTTP statuses and timeouts but not a
+          # mid-transfer connection reset (curl exit 35), which is how the
+          # Releases CDN fails here. The sha256sum check below still gates a
+          # truncated or substituted download.
+          curl -sSfL --retry 3 --retry-delay 2 --retry-all-errors \
             "https://github.com/get-woke/woke/releases/download/v${WOKE_VERSION}/${asset}" \
             -o "$archive"
           printf '%s  %s\n' "$WOKE_SHA256" "$archive" | sha256sum -c -
@@ -205,7 +240,7 @@ jobs:
 
       - name: Scan only changed lines
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ steps.diffbase.outputs.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           # _vendor is third-party code (llama-cpp-python) whose upstream URLs
@@ -257,9 +292,41 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve diff base (merge-base)
+        id: diffbase
+        env:
+          BASE_TIP: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # This job runs in the semgrep container, where the checkout is owned
+          # by a different uid than the job user; git refuses to read it
+          # ("dubious ownership") without this exemption. The other jobs run
+          # directly on the runner and do not need it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # base.sha is the base branch tip when the PR event fired, not the
+          # branch-off point, so diffing it directly pulls in sibling commits.
+          if ! MERGE_BASE=$(git merge-base "$BASE_TIP" "$HEAD_SHA"); then
+            echo "::error::Could not resolve the merge-base of $BASE_TIP and $HEAD_SHA (this job needs fetch-depth: 0)"
+            exit 1
+          fi
+          echo "Diff base: $MERGE_BASE"
+          echo "sha=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+
+      # Regression harness for the custom rules in semgrep/. The fixtures in
+      # semgrep-tests/ assert both directions from inline annotations — a
+      # `ruleid:` line must match, an `ok:` line must not — so an edit to a
+      # hand-tuned rule (or an engine bump past the pinned image) goes red
+      # HERE instead of on some future contributor's unrelated PR. Runs on
+      # the same pinned image as the scan below so rules gate on the exact
+      # engine version that enforces them. The rules deliberately live in a
+      # non-hidden `semgrep/` dir: semgrep 1.78's test mode cannot discover
+      # tests when rules live in a hidden directory (see issue #4869).
+      - name: Semgrep rule tests (custom rules)
+        run: semgrep --test --config semgrep/ semgrep-tests/
+
       - name: Semgrep scan (diff only)
         env:
-          SEMGREP_BASELINE_REF: ${{ github.event.pull_request.base.sha }}
+          SEMGREP_BASELINE_REF: ${{ steps.diffbase.outputs.sha }}
         run: |
           semgrep scan \
             --config p/python \
@@ -267,13 +334,13 @@ jobs:
             --config p/security-audit \
             --config p/secrets \
             --config p/owasp-top-ten \
-            --config .semgrep/ \
+            --config semgrep/ \
             --baseline-commit "$SEMGREP_BASELINE_REF" \
             --error
 
   # ── PR Hygiene ───────────────────────────────────────────────────────
   # Enforces: (1) conventional commit message format on PR title,
-  # (2) single commit per PR (squash before merge).
+  # (2) at most two commits per PR (squash review-round noise before merge).
   pr-hygiene:
     name: PR Hygiene
     runs-on: ubuntu-latest
@@ -308,17 +375,24 @@ jobs:
           fi
           echo "PR title follows conventional commits: $PR_TITLE"
 
-      # ── Single commit per PR ────────────────────────────────────────
-      # Contributors must squash into one commit before pushing.
-      # This keeps PRs atomic and reviewable as a single logical change.
-      - name: Enforce single commit
+      # ── Commit count per PR ─────────────────────────────────────────
+      # Contributors may carry at most two commits. One remains the norm;
+      # the second exists so a mechanical follow-up (a generated artifact
+      # rebuild, a formatting sweep) can stay separable from the change it
+      # accompanies instead of being squashed into it. Anything beyond that
+      # is review-round noise and must be squashed before pushing.
+      - name: Enforce commit count
         env:
+          # base.sha (not the merge-base): rev-list is a commit-range query, so
+          # a non-ancestor base still yields only the PR's own commits — see the
+          # merge-base fix (#4968), which deliberately left this site alone.
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
+          MAX_COMMITS: "2"
         run: |
           COMMIT_COUNT=$(git rev-list --count "$BASE".."$HEAD")
-          if [ "$COMMIT_COUNT" -ne 1 ]; then
-            echo "::error::PR must contain exactly 1 commit (has $COMMIT_COUNT). Squash before pushing:"
+          if [ "$COMMIT_COUNT" -lt 1 ] || [ "$COMMIT_COUNT" -gt "$MAX_COMMITS" ]; then
+            echo "::error::PR must contain 1 or $MAX_COMMITS commits (has $COMMIT_COUNT). Squash before pushing:"
             echo ""
             echo "  git fetch origin"
             echo "  git rebase origin/main"
@@ -328,4 +402,4 @@ jobs:
             echo ""
             exit 1
           fi
-          echo "Single commit verified."
+          echo "Commit count verified ($COMMIT_COUNT of at most $MAX_COMMITS)."

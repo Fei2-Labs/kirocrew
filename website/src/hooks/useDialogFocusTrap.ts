@@ -5,6 +5,7 @@
 // keyboard users activate obscured controls, so every dialog needs the same
 // three pieces. They live here rather than being re-implemented per dialog.
 import { useEffect, type RefObject } from 'react'
+import { useDocumentImeLatch } from './useImeGuard'
 
 /** Focusable descendants of a dialog, in DOM order, skipping disabled ones. */
 export const FOCUSABLE =
@@ -57,10 +58,31 @@ export function useDialogFocusTrap(
     return () => restoreTo?.focus?.({ preventScroll: true })
   }, [containerRef])
 
+  // IME guard for the Tab-cycles-focus path. This listener receives NATIVE
+  // KeyboardEvents (window capture), which `useImeGuard`'s synthetic-only
+  // `claimEnter` cannot consume — so it shares the guard's tracked latch via
+  // `useDocumentImeLatch` (which owns the document-capture composition
+  // tracking, the enabled-keyed reset, and the stranded-latch recovery).
+  // IMEs use Tab to cycle the candidate list, and on WebKit the keydown that
+  // commits a candidate arrives AFTER `compositionend` with `isComposing`
+  // already false — unguarded, a Tab composed into a dialog input that
+  // happens to be the last (or first) focusable element yanks focus and
+  // aborts the composition.
+  const imeLatch = useDocumentImeLatch(enabled)
+
   useEffect(() => {
     if (!enabled) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && handleEscape) {
+        // An Escape the IME owns must not dismiss the dialog: the user is
+        // cancelling a candidate list, not their part-filled form. `claimKey`
+        // owns the whole decline (see its contract in useImeGuard.ts) — a
+        // mid-composition Escape keeps its default action so the IME can
+        // still cancel the candidate. The claim sits INSIDE this branch on
+        // purpose: `claimKey` stops propagation on the keys it declines, and
+        // a hoisted claim would swallow Escapes belonging to callers that own
+        // dismissal on bubble-phase listeners (`handleEscape = false`).
+        if (!imeLatch.claimKey(e)) return
         onEscape()
         return
       }
@@ -72,18 +94,24 @@ export function useDialogFocusTrap(
       const firstEl = items[0]
       const lastEl = items[items.length - 1]
       const active = document.activeElement
-      if (!e.shiftKey && active === lastEl) {
-        e.preventDefault()
-        firstEl.focus()
-      } else if (e.shiftKey && (active === firstEl || active === container)) {
-        e.preventDefault()
-        lastEl.focus()
-      } else if (!container.contains(active)) {
-        e.preventDefault()
-        firstEl.focus()
-      }
+      const wrapsForward = !e.shiftKey && active === lastEl
+      const wrapsBackward = e.shiftKey && (active === firstEl || active === container)
+      const refocuses = !wrapsForward && !wrapsBackward && !container.contains(active)
+      // A mid-dialog Tab is the browser's to move, not the trap's — so it is
+      // also not the trap's to claim: claiming it would consume legitimate
+      // navigation inside the post-composition latch window.
+      if (!wrapsForward && !wrapsBackward && !refocuses) return
+      // A Tab the IME owns must not cycle focus — the user is choosing a
+      // candidate, not leaving the field. `claimKey` owns the whole decline
+      // (stopPropagation always; preventDefault only in the post-composition
+      // latch window where the browser would otherwise act) — see its
+      // contract in useImeGuard.ts. It must run before the preventDefault()
+      // and focus move so the IME keeps the key.
+      if (!imeLatch.claimKey(e)) return
+      e.preventDefault()
+      ;(wrapsBackward ? lastEl : firstEl).focus()
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [containerRef, onEscape, enabled, handleEscape])
+  }, [containerRef, onEscape, enabled, handleEscape, imeLatch])
 }

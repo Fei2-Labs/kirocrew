@@ -11,6 +11,7 @@ import InfoTip from '../components/InfoTip'
 import Modal from '../components/Modal'
 import Clickable from '../components/Clickable'
 import { useNavigate } from 'react-router-dom'
+import { useDocumentImeLatch } from '../hooks/useImeGuard'
 import { useAppDispatch } from '../store'
 import { addNotification } from '../store/notificationsSlice'
 import { setPendingInput } from '../store/chatSlice'
@@ -20,6 +21,7 @@ import {
   Ellipsis, RotateCw, FileText, GitCommit, Rocket, Info, AlertTriangle, ShieldAlert,
 } from 'lucide-react'
 import * as api from './devFleetApi'
+import { ApiError } from '../api/client'
 
 import { i18nT } from '../i18n/t'
 import { compareText } from '../i18n/format'
@@ -391,6 +393,10 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
   const popRef = useRef<HTMLDivElement>(null)
   const cancelRef = useRef<HTMLButtonElement>(null)
   const confirmRef = useRef<HTMLButtonElement>(null)
+  // Shared IME latch for the boundary-Tab trap below (see the comment on the
+  // Tab branches): the trap listens at document capture, so it receives
+  // NATIVE KeyboardEvents that the synthetic-only guard cannot consume.
+  const imeLatch = useDocumentImeLatch(open)
 
   const close = useCallback(() => {
     setOpen(false)
@@ -408,11 +414,25 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
     }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // An Escape the IME owns is cancelling a candidate, not the popover —
+        // and `close()` also yanks focus back to the trigger, the same harm
+        // as the Tab wrap below. Same claim, same reason.
+        if (!imeLatch.claimKey(e)) return
         close()
       } else if (e.key === 'Tab' && e.shiftKey && document.activeElement === cancelRef.current) {
+        // A boundary Tab the IME owns must not cycle focus — the user is
+        // choosing a candidate, not leaving the field. `claimKey` owns the
+        // whole decline (native-event contract in useImeGuard.ts) and must
+        // run before the preventDefault() and focus move. Both ring
+        // boundaries are buttons today, so no composition can start on them —
+        // the guard pins that this stays safe if the popover ever grows a
+        // text field. Mid-popover Tabs fall through: they are the browser's
+        // to move, so they are also not the trap's to claim.
+        if (!imeLatch.claimKey(e)) return
         e.preventDefault()
         confirmRef.current?.focus()
       } else if (e.key === 'Tab' && !e.shiftKey && document.activeElement === confirmRef.current) {
+        if (!imeLatch.claimKey(e)) return
         e.preventDefault()
         cancelRef.current?.focus()
       }
@@ -432,7 +452,7 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
       window.removeEventListener('scroll', onScrollOrResize, true)
       window.removeEventListener('resize', onScrollOrResize)
     }
-  }, [close, open])
+  }, [close, open, imeLatch])
 
   const toggle = () => {
     if (!open && triggerRef.current) setRect(triggerRef.current.getBoundingClientRect())
@@ -607,7 +627,7 @@ function ToastHost() {
   }, [])
   if (!toasts.length) return null
   return (
-    <div role="status" aria-live="polite" style={{ position: 'fixed', top: 14, left: '50%', transform: 'translateX(-50%)', zIndex: 9997, display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'center', pointerEvents: 'none' } as CSSProperties}>
+    <div role="status" aria-live="polite" className="fixed top-safe-offset-3.5" style={{ left: '50%', transform: 'translateX(-50%)', zIndex: 9997, display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'center', pointerEvents: 'none' } as CSSProperties}>
       {toasts.map((t) => (
         <div key={t.id} style={{ background: 'var(--card)', color: 'var(--card-fg)', border: '1px solid ' + (t.type === 'error' ? 'var(--danger)' : t.type === 'success' ? 'var(--ok)' : 'var(--border)'), borderRadius: 8, padding: '7px 14px', fontSize: 12.5, boxShadow: '0 4px 14px rgba(0,0,0,0.25)', maxWidth: 520 } as CSSProperties}>
           {t.msg}
@@ -689,6 +709,13 @@ export default function DevFleetPage() {
   // so the fleet-driven reattach below never starts a second poll loop for a
   // run this session is already polling.
   const provAttachedRef = useRef<Set<string>>(new Set())
+  // Synchronous per-worktree in-flight guard for the provision() entry point.
+  // React state updates are asynchronous: setProv({ status: 'starting' })
+  // does not disable the Provision button until the next render commit.
+  // A rapid double-click therefore sends two POST requests before any re-render.
+  // This ref is checked and set BEFORE the first `await`, so the second click
+  // in the same render turn is blocked synchronously rather than racing the DOM.
+  const provInFlightRef = useRef<Set<string>>(new Set())
   // Poll-loop lifecycle: loops exit when the component unmounts or a run is
   // explicitly dismissed — otherwise navigation would leak up-to-900-request
   // closures, and dismissing the stepper would be undone by the next tick.
@@ -830,14 +857,40 @@ export default function DevFleetPage() {
     // A poll for this run is already in flight (it outlived a previous mount of
     // this page, which is intended — the build's auto-restart must not be lost
     // to navigation). Starting a second loop here would race it: both would see
-    // `done` and both would fire the restart POST. Skip and let the existing
-    // loop own the run.
-    if (_activeSyncPolls.has(rid)) return
+    // `done` and both would fire the restart POST. Skip — but start a
+    // lightweight state relay so this mount's UI stays updated.
+    if (_activeSyncPolls.has(rid)) {
+      _syncStateRelay(rid, startedAt)
+      return
+    }
     _activeSyncPolls.add(rid)
     try {
       await _pollSyncRunLoop(rid, startedAt)
     } finally {
       _activeSyncPolls.delete(rid)
+    }
+  }
+
+  // Lightweight relay: polls /run to keep THIS mount's syncRun state in sync
+  // while the primary poll (from a prior mount) handles the auto-restart logic.
+  // Exits when the run finishes, the component unmounts, or the run is dismissed.
+  async function _syncStateRelay(rid: string, startedAt: number) {
+    for (let i = 0; i < 900; i++) {
+      await sleep(2000)
+      if (!pollAliveRef.current) return
+      if (cancelledRunsRef.current.has(rid)) return
+      let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string } | null = null
+      try { run = await api.get('/run?id=' + rid) } catch { continue }
+      if (!run) continue
+      const t0 = run.started ? run.started * 1000 : startedAt
+      const out = run.output || []
+      const last = [...out].reverse().find((l: string) => l?.trim() && !STEP_MARKER_RE.test(l)) || ''
+      if (run.status === 'done' || run.status === 'timeout') {
+        const okRun = run.exit_code === 0
+        setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last })
+        return
+      }
+      setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, last, stepLabel: run.step_label })
     }
   }
 
@@ -1018,6 +1071,20 @@ export default function DevFleetPage() {
   }
 
   async function provision(name: string) {
+    // Synchronous guard: blocks re-entry before React re-renders the button into
+    // its disabled state. A rapid double-click fires both event handlers in the
+    // same render turn (before any setState takes effect), so checking React state
+    // here would NOT catch the second click.  provInFlightRef is updated
+    // synchronously and persists across renders, so it reliably blocks the second
+    // invocation whether it arrives in the same turn or in a later one while the
+    // request is still awaited. The finally block releases the guard after the
+    // request/polling lifecycle exits; remounting creates a fresh ref.
+    if (provInFlightRef.current.has(name)) {
+      // The first invocation already owns the API request, polling, and UI state.
+      // Returning here prevents both a duplicate POST and a second poll loop.
+      return
+    }
+    provInFlightRef.current.add(name)
     const startedAt = Date.now()
     clearTimeout(provDoneTimersRef.current[name])
     setProvLogOpen((o) => { const n = { ...o }; delete n[name]; return n })
@@ -1045,6 +1112,11 @@ export default function DevFleetPage() {
       notify(msg, { type: 'error' })
       setProv((p) => ({ ...p, [name]: { status: 'failed', failed: true, lines: [msg], startedAt, exit: null } }))
       setProvLogOpen((o) => ({ ...o, [name]: true }))
+    } finally {
+      // Release the per-name guard so a retry after failure or dismissal can
+      // re-enter.  pollProvisionRun already owns its completion lifecycle;
+      // this only gates the entry point.
+      provInFlightRef.current.delete(name)
     }
   }
 
@@ -1060,12 +1132,33 @@ export default function DevFleetPage() {
     finally { setFlag(name + ':remove', false) }
   }
 
+  // Normalize a failed POST /sync into the shape the caller below already
+  // handles. The single-flight refusal is an HTTP 409 whose body names the run
+  // already in flight, so it arrives as a thrown error and never as a returned
+  // body — which is what left the `!ok && run_id` branch below unreachable.
+  // Every other status is a real failure carrying its message.
+  function syncPostFailure(e: unknown): { ok: false; run_id?: string; error: string } {
+    let rid: unknown
+    if (e instanceof ApiError && e.status === 409) {
+      try { rid = (JSON.parse(e.body) as { run_id?: unknown })?.run_id } catch { /* not JSON */ }
+    }
+    return {
+      ok: false,
+      run_id: typeof rid === 'string' && rid ? rid : undefined,
+      error: (e as Error)?.message || String(e),
+    }
+  }
+
   async function syncMain() {
     setFlag('__syncmain', true)
     try {
-      const r = await api.post<{ ok?: boolean; run_id?: string; error?: string }>('/sync', {})
+      const r = await api.post<{ ok?: boolean; run_id?: string; error?: string }>('/sync', {}).catch(syncPostFailure)
       if (!r?.ok && r?.run_id) {
-        // Sync already running — reattach to the in-flight run instead of erroring
+        // Sync already running — reattach to the in-flight run instead of erroring.
+        // A second press is a user who cannot see the run, so an error toast would
+        // leave them exactly where they started. `startedAt` is provisional: the
+        // poll loop recomputes elapsed from the run's own `started` on its first
+        // tick, and it refuses a second loop for a rid already being polled.
         setSyncRun({ rid: r.run_id, status: 'running', lines: [], startedAt: Date.now() })
         pollSyncRun(r.run_id, Date.now())
         return
@@ -1132,12 +1225,17 @@ export default function DevFleetPage() {
         let st: { running?: boolean; done?: number; items?: Record<string, { status?: string; error?: string | null }> } | null = null
         try { st = await api.get('/prune-status') } catch { continue }
         if (!st) continue
-        // Rebuild the item map in the ORIGINAL selection order; fall back to
-        // the pending seed for any name the backend has not populated yet.
+        // Rebuild the item map in the ORIGINAL selection order over the FULL
+        // regular-plus-forced set: the checklist, denominator, and success
+        // tally must all cover every name the backend tracks, forced worktrees
+        // included. Counting over ``names`` alone drops the forced worktrees
+        // from the denominator and the tally, restoring the ``1/0`` counter and
+        // the false failure toast. Fall back to the pending seed for any name
+        // the backend has not populated yet.
         const raw = st.items || {}
-        const backendTotal = Object.keys(raw).length || names.length
+        const backendTotal = Object.keys(raw).length || allNames.length
         const items: Record<string, { status: string; error?: string | null }> =
-          Object.fromEntries(names.map((n) => [n, {
+          Object.fromEntries(allNames.map((n) => [n, {
             status: raw[n]?.status || 'pending',
             error: raw[n]?.error ?? null,
           }]))
@@ -1146,14 +1244,14 @@ export default function DevFleetPage() {
           // A name the backend never tracked (filtered server-side, e.g. the
           // worktree vanished between preview and execute) must terminate as
           // an explained failure, not sit "Pending" in a finished checklist.
-          for (const n of names) {
+          for (const n of allNames) {
             if (!raw[n]) items[n] = { status: 'failed', error: 'not processed (unknown or no longer a worktree)' }
           }
         }
-        setPruneProgress({ names, items, done: st.done || 0, total: names.length, running })
+        setPruneProgress({ names: allNames, items, done: st.done || 0, total: allNames.length, running })
         if (!running) {
-          const removed = names.filter((n) => items[n]?.status === 'done').length
-          const failed = names.filter((n) => items[n]?.status === 'failed').length
+          const removed = allNames.filter((n) => items[n]?.status === 'done').length
+          const failed = allNames.filter((n) => items[n]?.status === 'failed').length
           notify(removed > 0 ? `Pruned ${removed} worktree(s)` + (failed > 0 ? ` (${failed} failed)` : '') : `Prune: ${failed} failed`, { type: removed > 0 ? 'success' : 'error' })
           invalidateAll()
           setTimeout(() => setPruneProgress(null), 5000)
@@ -1810,7 +1908,7 @@ export default function DevFleetPage() {
             {/* The how-to describes row actions; with no readable fleet there are
                 no rows, and instructions for absent controls read as a broken page. */}
             {!noFleet && (
-            <p className="text-[12.5px] text-muted leading-relaxed mt-3 mb-1 max-w-[860px]">
+            <p className="text-[12.5px] text-muted leading-relaxed mt-3 mb-1">
               {i18nT('pages.devFleetPage.each_row_below_is_a_git_worktree_discovered_from')}{' '}
               <span className="text-text-strong">{i18nT('pages.devFleetPage.pull_build')}</span> {i18nT('pages.devFleetPage.on_the_main_row_to_fast_forward_it_from_origin_a')} <span className="text-text-strong">{i18nT('pages.devFleetPage.pod_2')}</span> {i18nT('pages.devFleetPage.boots_any_worktree_as_an_isolated_throwaway_gate')}{' '}
               <span className="text-text-strong">{i18nT('pages.devFleetPage.rebase')}</span> {i18nT('pages.devFleetPage.moves_a_feature_branch_onto_the_latest_main_and')}{' '}
@@ -1821,7 +1919,7 @@ export default function DevFleetPage() {
               <div
                 role="note"
                 data-testid="inferred-main-checkout"
-                className="flex items-center gap-2 mt-2 max-w-[860px] text-[12px] leading-relaxed text-text-strong"
+                className="flex items-center gap-2 mt-2 text-[12px] leading-relaxed text-text-strong"
               >
                 <Info size={13} className="lucide-inline shrink-0" />
                 <span>{i18nT('pages.devFleetPage.the_primary_checkout_this_fleet_is_discovered_fr')}:</span>
@@ -1832,7 +1930,7 @@ export default function DevFleetPage() {
               <div
                 role="alert"
                 data-testid="gateway-restart-error"
-                className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger-subtle px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed text-danger"
+                className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger-subtle px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed text-danger"
               >
                 <AlertTriangle size={14} className="lucide-inline shrink-0 mt-0.5" />
                 {/* select-text + break-words: the message can be a pair of
@@ -1852,7 +1950,7 @@ export default function DevFleetPage() {
               <div
                 role="alert"
                 data-testid="serving-install-warning"
-                className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn-subtle px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed text-warn"
+                className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn-subtle px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed text-warn"
               >
                 <AlertTriangle size={14} className="lucide-inline shrink-0 mt-0.5" />
                 <div className="min-w-0">
@@ -1865,7 +1963,7 @@ export default function DevFleetPage() {
             {!podsAvailable && (
               <div
                 role="note"
-                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed"
+                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed"
               >
                 <Info size={14} className="lucide-inline shrink-0 mt-0.5 text-muted" />
                 <div className="min-w-0">
@@ -1878,7 +1976,7 @@ export default function DevFleetPage() {
             {gatewayReason && (
               <div
                 role="note"
-                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 max-w-[860px] text-[12.5px] leading-relaxed"
+                className="flex items-start gap-2 rounded-md border border-border bg-bg-elevated px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed"
               >
                 <Info size={14} className="lucide-inline shrink-0 mt-0.5 text-muted" />
                 <div className="min-w-0">

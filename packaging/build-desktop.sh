@@ -12,7 +12,7 @@
 # The result is a double-clickable app that embeds the whole Python backend +
 # dashboard — no system Python, pip, npm, or node required by the end user.
 #
-# This REPLACES the old PyInstaller approach. PBS interpreters are self-contained
+# PBS interpreters are self-contained
 # and use @executable_path-relative dylib references, so the bundle is genuinely
 # portable across machines without needing the exact same system Python version.
 #
@@ -313,6 +313,9 @@ LAUNCH
     rm -rf lib/python3.12/test lib/python3.12/idlelib lib/python3.12/tkinter \
            lib/python3.12/turtledemo lib/python3.12/ensurepip lib/python3.12/lib2to3 2>/dev/null || true )
 
+  # After pruning, so it validates what actually ships.
+  stdlib_probe_gate "$out"
+
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
 
@@ -364,7 +367,42 @@ build_backend_windows() {
     find Lib/site-packages -type d \( -name tests -o -name test \) -prune -exec rm -rf {} + 2>/dev/null || true
     rm -rf Lib/test Lib/idlelib Lib/tkinter Lib/turtledemo Lib/ensurepip Lib/lib2to3 2>/dev/null || true )
 
+  # After pruning, so it validates what actually ships.
+  stdlib_probe_gate "$out"
+
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
+}
+
+# Stdlib-probe agreement gate: every package bundle-integrity.js probes must be
+# present, as an importable package, in the tree we just built. That module
+# refuses to spawn a backend whose stdlib looks incomplete, so a name it probes
+# that this bundle does not ship (a Python bump turning a package back into a
+# module, a rename, or a new prune above) would refuse EVERY launch of a healthy
+# app — a permanent failure strictly worse than the transient one it prevents.
+# Failing the build here converts that into a build error the developer sees.
+#   $1 = built backend tree
+stdlib_probe_gate() {
+  local out="$1"
+  if ! command -v node >/dev/null 2>&1; then
+    log "node unavailable — SKIPPING stdlib-probe gate for $(basename "$out")"
+    return 0
+  fi
+  log "Verifying bundle-integrity.js stdlib probes resolve ($(basename "$out"))…"
+  node -e '
+    const fs=require("fs"), path=require("path");
+    const { findMissingBundleParts, REQUIRED_STDLIB_PARTS } =
+      require(path.join(process.argv[1], "bundle-integrity"));
+    const out = process.argv[2];
+    const missing = findMissingBundleParts(fs, path, out);
+    if (missing.length) {
+      console.error(`ERROR: bundle-integrity.js probes ${REQUIRED_STDLIB_PARTS.length} stdlib `
+        + `packages; this bundle is missing: ${missing.join(", ")}`);
+      console.error("       The launcher would refuse to start this bundle on every launch.");
+      console.error("       Fix the prune step, or update REQUIRED_STDLIB_PARTS in");
+      console.error("       website/electron/bundle-integrity.js to match the shipped stdlib.");
+      process.exit(1);
+    }
+  ' "$ELECTRON_DIR" "$out" || exit 1
 }
 
 # Resolver-agreement gate: the Electron launcher (find-bin.js) must locate the
@@ -465,7 +503,7 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
     # scheme could not disambiguate the two apps (none is registered today).
     EB_ARGS+=(
       "-c.productName=KiroCrew Nightly"
-      "-c.mac.icon=icon-nightly.png"
+      "-c.mac.icon=icon-nightly.icns"
       "-c.linux.icon=icon-nightly.png"
       "-c.win.icon=icon-nightly.png"
       # Finder/Dock title (CFBundleDisplayName) mirrors the spaced display
@@ -491,6 +529,18 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
       "-c.rpm.packageName=kirocrew-nightly"
       "-c.linux.executableName=kirocrew-desktop-nightly"
       "-c.extraMetadata.desktopName=kirocrew-desktop-nightly.desktop"
+      # The npm package `name` is per-channel for the same reason the Linux
+      # package name is. It is not build metadata: appInfo derives
+      # updaterCacheDirName from it (`sanitizedName.toLowerCase() +
+      # "-updater"`), Electron derives the userData directory from it, and NSIS
+      # receives it as ${APP_PACKAGE_NAME}. Shared, that makes nightly and
+      # stable write ONE %LOCALAPPDATA%\<name>-updater and ONE
+      # %APPDATA%\<name> -- so uninstalling either channel would delete the
+      # other's pending update download, its differential baseline, and its
+      # window state. productName and nsis.guid already separate the install
+      # directory and the registry key; this separates the per-user state they
+      # do not cover.
+      "-c.extraMetadata.name=kirocrew-desktop-nightly"
       # Squirrel.Windows keyed the INSTALL identity off squirrelWindows.name;
       # NSIS keys it off two separate things, and nightly needs both:
       #
@@ -512,6 +562,30 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
       # changing it later orphans installed updaters, so it is pinned from the
       # first shipped build.
       "-c.nsis.guid=0f417bf9-2759-51d6-acfb-f864805d1f41"
+      # WINDOWS-ONLY appId split. The shared appId above is required on macOS
+      # (Squirrel.Mac validates against the host's designated requirement, which
+      # pins the bundle id), but on Windows it reaches ${APP_ID}, which the NSIS
+      # template uses for two registrations that are global per-id rather than
+      # per-install: WinShell::SetLnkAUMI stamps the AppUserModelID onto the
+      # desktop and Start Menu shortcuts, and WinShell::UninstAppUserModelId
+      # removes that registration outright.
+      #
+      # The update path is safe on its own: nsis.allowToChangeInstallationDirectory
+      # is false, so that define is never emitted, setIsTryToKeepShortcuts always
+      # yields "true", and the old uninstaller runs with --keep-shortcuts, which
+      # skips the deregistration. A real UNINSTALL does not. Uninstall one
+      # channel and WinShell::UninstAppUserModelId runs against the id BOTH
+      # channels share, deregistering the AppUserModelID the surviving channel's
+      # shortcuts still carry -- its desktop shortcut then resolves to a dead
+      # registration and the shell reports that app as relocated or missing even
+      # though its .exe is untouched.
+      #
+      # Scoped to `win` deliberately: appInfo.id prefers the platform-specific
+      # value, so a top-level -c.appId would also move the macOS bundle id and
+      # strand every installed mac app's updates. This is the same identity
+      # main.js already claims at runtime via app.setAppUserModelId, so the
+      # packaged shortcuts and the running process finally agree.
+      "-c.win.appId=com.amazon.kiro.crew.nightly"
     )
   fi
   # Start from a pristine output dir. A prior interrupted universal build can

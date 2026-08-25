@@ -10,12 +10,17 @@ import asyncio
 import json
 import logging
 import random
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.acp.client import AcpError, AcpPromptBusy
+from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -30,6 +35,25 @@ from kiro_crew.sel import sel as _sel
 
 _PROMPT_BUSY_RETRIES = 2
 _PROMPT_BUSY_DELAY = 1.5  # seconds between retries
+
+# Cap on the wrapper chain walked to find a turn's billing stats. A provider is
+# wrapped at most a few layers deep, so a longer walk means a cycle or an
+# unrelated object graph, not a deeper seam.
+_WRAPPER_WALK_MAX_NODES = 8
+
+# Sentinel for "no prior stats object was observed", distinct from a provider that
+# legitimately exposes None. Used by provider_last_turn_usage's identity guard.
+_NO_PRIOR_STATS = object()
+
+# Where stream_and_collect hands its caller the billing it observed across ALL
+# attempts of one logical turn. A retry installs fresh per-turn stats, so a
+# post-hoc read of last_prompt_stats sees only the final attempt and silently
+# drops an attempt that was billed before a transient error. This carries the sum
+# instead, and provider_last_turn_usage consumes it. The value is a
+# (stats object, TurnUsage) pair: the provider outlives the turn, so the identity
+# of the stats the sum was computed from is what tells a later turn that the sum
+# is not its own.
+_TURN_BILLED_ATTR = "_kc_turn_billed"
 
 # Transient backend (Bedrock 5xx / throttle / stream-reset) retry budget. These
 # are server-side hiccups where the credential is VALID — retry helps, re-auth
@@ -152,6 +176,402 @@ def transient_retry_delay(attempt: int) -> float:
     return base + _JITTER_RNG.random() * 0.25 * base
 
 
+def first_advertised_fallback(advertised: Any, rejected: str | None) -> str | None:
+    """First advertised model that is neither *rejected* nor ``"auto"``.
+
+    Used as the reactive replacement when the configured model (often ``"auto"``)
+    is refused mid-prompt — e.g. on a GovCloud partition that does not serve the
+    ``"auto"`` sentinel.  Shared by :func:`run_bg_oneliner` and
+    :func:`stream_and_collect` so every background LLM path has the same
+    fallback behaviour.
+    """
+    rej = (rejected or "").strip().lower()
+    for m in advertised or []:
+        if not isinstance(m, str) or not m.strip():
+            continue
+        low = m.strip().lower()
+        if low == rej or low == "auto":
+            continue
+        return m
+    return None
+
+
+# ── Throttle-exhaustion fallback chain (agent.fallback_model) ──
+#
+# When the active model's same-model transient budget (_TRANSIENT_RETRIES)
+# exhausts on a throttle/capacity error, an ordered chain of fallback models is
+# tried instead of surfacing the error. This lives entirely on the Kiro Crew
+# side (kiro-cli
+# has no fallback mechanism) and is NEVER silent: every swap is logged at
+# warning, published on the provider (TURN_FALLBACK_ATTR) so the delivering
+# surface can prepend a visible notice, and — on the interactive path —
+# announced in chat (see dashboard/chat_runner). An empty chain (the default)
+# disables the feature: behavior is byte-for-byte the pre-feature error surface.
+
+# Attempts per fallback candidate: initial + ONE ~2s retry — deliberately NOT a
+# fresh _TRANSIENT_RETRIES budget. Throttle-exhaustion events are often
+# cell-scoped and model-agnostic (a frontend admission-tier outage takes out
+# ALL models in the cell), so deep per-candidate retries mostly re-confirm a
+# correlated outage slowly. One retry covers the uncorrelated single-shot 5xx
+# on a healthy candidate while keeping the worst case bounded (~35s of backoff
+# across a 4-candidate chain).
+FALLBACK_CANDIDATE_ATTEMPTS = 2
+
+# Provider attribute carrying the active fallback as ``(primary, candidate)``.
+# Doubles as (a) the sticky-restore marker — the next stream_and_collect call
+# on the same provider probes one ``set_model(primary)`` restore — and (b) the
+# visibility source for unattended surfaces (cron/heartbeat read it after the
+# turn and prepend a warning line to the delivered result). Cleared on a
+# successful restore, never on turn completion: the swap is sticky for the
+# remainder of the session by design.
+TURN_FALLBACK_ATTR = "_kc_active_fallback"
+
+
+def provider_fallback_active(provider: Any) -> bool:
+    """True while *provider* carries an active fallback marker.
+
+    THE shared usage-attribution guard: while a fallback serves the session,
+    an explicit model pin (``job.model`` / ``info.model`` / ``slot.model``)
+    must NOT be recorded as the turn's model — the durable usage row would
+    bill the fallback's spend to a model that never executed. Callers blank
+    the explicit value when this is true (mirroring the ``_seq_downgraded``
+    precedent), deferring to ``model_source`` — which reads the model that
+    actually ran.
+    """
+    marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+    return isinstance(marker, (tuple, list)) and len(marker) >= 2
+
+
+def next_fallback_candidate(
+    chain: Sequence[str],
+    active_model: str,
+    advertised: Sequence[str] | None,
+) -> str | None:
+    """First usable fallback candidate from *chain*, or ``None``.
+
+    Skips empties, the currently-active model (a chain entry equal to what is
+    already failing cannot help), and — when an advertised list is known — any
+    id the backend did not advertise (unentitled/unknown). ``"auto"`` is a
+    legitimate candidate (the backend's availability-aware routing) and is
+    filtered by the same advertised check: a partition that does not serve
+    ``"auto"`` skips it rather than sending a no-op swap. An EMPTY advertised
+    list fails OPEN (candidates accepted): entitlement unknown is not
+    entitlement denied, matching ``model_is_unusable``'s stance, and the
+    substitute ``set_model`` path re-validates against the live list anyway.
+    """
+    adv = {a.strip().lower() for a in (advertised or []) if isinstance(a, str) and a.strip()}
+    act = (active_model or "").strip().lower()
+    for cand in chain:
+        if not isinstance(cand, str):
+            continue
+        low = cand.strip().lower()
+        if not low or low == act:
+            continue
+        if adv and low not in adv:
+            logger.debug("model fallback: skipping %r (not advertised)", cand)
+            continue
+        return cand
+    return None
+
+
+@dataclass
+class FallbackState:
+    """Walk state for one logical turn's fallback-chain traversal.
+
+    ``pos`` is the next chain index to consider (monotonic — a candidate is
+    never revisited), ``active`` the candidate currently being attempted,
+    ``attempts`` how many attempts the active candidate has consumed (capped at
+    :data:`FALLBACK_CANDIDATE_ATTEMPTS`), ``primary`` the model that was active
+    when the chain walk started, and ``walked`` every candidate actually tried
+    (for the chain-exhausted error story).
+    """
+
+    chain: tuple[str, ...]
+    pos: int = 0
+    active: str | None = None
+    attempts: int = 0
+    primary: str = ""
+    walked: list[str] = dataclass_field(default_factory=list)
+
+    def next_candidate(self, active_model: str, advertised: Sequence[str] | None) -> str | None:
+        """Advance to and return the next usable candidate, or ``None``."""
+        remaining = self.chain[self.pos :]
+        cand = next_fallback_candidate(remaining, active_model, advertised)
+        if cand is None:
+            self.pos = len(self.chain)
+            return None
+        self.pos += remaining.index(cand) + 1
+        return cand
+
+
+async def advance_fallback_candidate(
+    provider: Any,
+    fb_state: "FallbackState",
+    *,
+    surface: str,
+    log_suffix: str = "",
+) -> str | None:
+    """One chain-walk step — THE shared advance used by every fallback surface.
+
+    ``stream_and_collect`` (Case 2.75), the sub-agent transient ladder, and the
+    dashboard's ``_fallback_swap_for_turn`` all advance the chain through this
+    single body so throttle classification, marker semantics, and skip rules
+    cannot diverge across surfaces. It: seeds ``fb_state.primary`` from a
+    surviving sticky marker first (a session already on a fallback whose true
+    primary only the marker remembers) and the active model second; walks the
+    chain skipping the primary, unadvertised ids, and the currently-active
+    (failing) candidate; applies the first candidate whose substitute
+    ``set_model`` lands; publishes the sticky marker
+    (:data:`TURN_FALLBACK_ATTR`); and emits the greppable swap warning.
+    Returns the applied candidate, or ``None`` when the chain is exhausted or
+    the provider exposes no ``set_model`` seam — the caller then surfaces the
+    original error exactly as before this feature existed.
+    """
+    advertised = provider_advertised_ids(provider)
+    # An empty read means the session is auto-routed (``provider_active_model``
+    # deliberately filters the ``"auto"`` sentinel) or genuinely unknown; either
+    # way ``"auto"`` is the honest primary. Seeding it (a) makes the restore
+    # probe re-enter auto routing instead of hitting the dashboard's
+    # stale-clear arm with an empty primary (which would let the backfill pin
+    # the fallback permanently), (b) suppresses the auto->auto no-op swap via
+    # the active-skip below, and (c) keeps the notice card naming a real
+    # primary instead of a placeholder.
+    active = provider_active_model(provider) or (fb_state.active or "") or "auto"
+    if not fb_state.primary:
+        _marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+        _marker_primary = ""
+        if isinstance(_marker, (tuple, list)) and _marker and isinstance(_marker[0], str):
+            _marker_primary = _marker[0].strip()
+        fb_state.primary = _marker_primary or active
+    set_model_fn = resolve_substitute_set_model(provider)
+    if set_model_fn is None:
+        return None
+    while True:
+        cand = fb_state.next_candidate(fb_state.primary or active, advertised)
+        if cand is None:
+            return None
+        if cand.strip().lower() == (active or "").strip().lower():
+            # With a marker-seeded primary, the chain can still name the
+            # CURRENTLY-failing fallback the session sits on — retrying it is
+            # what this walk exists to escape.
+            continue
+        _raw_before = provider_raw_model(provider)
+        try:
+            await set_model_fn(cand)
+        except Exception:
+            logger.debug(
+                "model fallback: set_model(%r) failed; skipping candidate",
+                cand,
+                exc_info=True,
+            )
+            continue
+        # Witness the swap before publishing: a non-raising set_model can be a
+        # silent no-op (resolve_usable_model collapses an unservable target to
+        # "" and returns without switching). Publishing an unwitnessed swap
+        # would announce a model that never took over and retry the same
+        # failing model. Only enforceable when the model attribute is readable
+        # (a provider exposing no model string cannot be witnessed — fail open,
+        # matching the pre-existing trust in set_model for such providers).
+        _raw_after = provider_raw_model(provider)
+        if (
+            _raw_before
+            and _raw_after == _raw_before
+            and _raw_after.strip().lower() != cand.strip().lower()
+        ):
+            logger.debug(
+                "model fallback: set_model(%r) was a silent no-op (model still %r); "
+                "skipping candidate",
+                cand,
+                _raw_after,
+            )
+            continue
+        fb_state.active = cand
+        fb_state.attempts = 1
+        fb_state.walked.append(cand)
+        try:
+            setattr(provider, TURN_FALLBACK_ATTR, (fb_state.primary, cand))
+        except Exception:
+            logger.debug("publishing fallback marker failed", exc_info=True)
+        logger.warning(
+            "model fallback: %s -> %s (reason=throttle-exhaustion, surface=%s%s)",
+            fb_state.primary or "?",
+            cand,
+            surface,
+            log_suffix,
+        )
+        return cand
+
+
+def resolve_substitute_set_model(provider: Any) -> Callable[[str], Awaitable[None]] | None:
+    """The provider's substitute-path ``set_model`` coroutine, or ``None``.
+
+    Prefers ``provider.set_model``; falls back to the wrapped client
+    (``provider.client`` / ``provider._client``) for wrappers like
+    ``AcpProvider`` that do not re-export it. Callers pre-filter candidates
+    against the advertised list, so the explicit-pick guard inside
+    ``AcpClient.set_model`` / ``AcpSessionProvider.set_model`` does not fire
+    for a served candidate.
+    """
+    fn = getattr(provider, "set_model", None)
+    if callable(fn):
+        return fn
+    for attr in ("client", "_client"):
+        try:
+            inner = getattr(provider, attr, None)
+        except Exception:  # pragma: no cover - exotic property getters
+            inner = None
+        fn = getattr(inner, "set_model", None) if inner is not None else None
+        if callable(fn):
+            return fn
+    return None
+
+
+def provider_advertised_ids(provider: Any) -> list[str]:
+    """Advertised model ids from the provider, ``[]`` when unknown."""
+    getter = getattr(provider, "available_models", None)
+    if not callable(getter):
+        return []
+    try:
+        return advertised_model_ids(getter())
+    except Exception:
+        return []
+
+
+def provider_active_model(provider: Any) -> str:
+    """The model currently serving the provider's session, ``""`` if unknown."""
+    for attr in ("served_model", "_model"):
+        try:
+            val = getattr(provider, attr, "")
+        except Exception:  # pragma: no cover - exotic property getters
+            val = ""
+        if isinstance(val, str) and val.strip() and val.strip().lower() != "auto":
+            return val.strip()
+    return ""
+
+
+def provider_raw_model(provider: Any) -> str:
+    """The provider's raw model attribute, ``"auto"`` INCLUDED, ``""`` if unknown.
+
+    The witness reader for fallback state transitions: unlike
+    :func:`provider_active_model` (which filters the ``"auto"`` sentinel for
+    walk semantics), this reports the attribute verbatim so a caller can
+    observe whether a non-raising ``set_model`` actually moved the session.
+    ``resolve_usable_model`` collapses an unservable target to ``""`` and
+    ``set_model`` then returns WITHOUT switching — treating "didn't raise" as
+    "switched" is what let a no-op restore clear sticky state while still on
+    the fallback (and the backfill then pinned it permanently).
+    """
+    for attr in ("served_model", "_model"):
+        try:
+            val = getattr(provider, attr, "")
+        except Exception:  # pragma: no cover - exotic property getters
+            val = ""
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+async def probe_fallback_restore(provider: Any, *, surface: str = "unattended") -> None:
+    """One ``set_model(primary)`` restore probe at the start of a turn.
+
+    No-op unless :data:`TURN_FALLBACK_ATTR` marks an active fallback. The
+    restore only fires while the session is still on the fallback this feature
+    set (a user/session-level model change in between clears the marker without
+    touching the model — never override an explicit later pick). Success clears
+    the marker and logs (recovery is the quiet default: no chat notice);
+    failure keeps the fallback for this turn. Never raises.
+    """
+    state = getattr(provider, TURN_FALLBACK_ATTR, None)
+    if not state:
+        return
+    try:
+        primary, candidate = state
+    except Exception:
+        return
+    current = provider_active_model(provider)
+    if current and candidate and current.strip().lower() != str(candidate).strip().lower():
+        # The session moved off our fallback by other means (explicit pick,
+        # session reset). The marker is stale — drop it, restore nothing.
+        try:
+            setattr(provider, TURN_FALLBACK_ATTR, None)
+        except Exception:
+            pass
+        return
+    if not primary:
+        try:
+            setattr(provider, TURN_FALLBACK_ATTR, None)
+        except Exception:
+            pass
+        return
+    set_model_fn = resolve_substitute_set_model(provider)
+    if set_model_fn is None:
+        return
+    try:
+        await set_model_fn(primary)
+    except Exception as exc:
+        logger.info(
+            "model fallback: primary %s still unavailable (%s); staying on %s " "(surface=%s)",
+            primary,
+            exc,
+            candidate,
+            surface,
+        )
+        return
+    # Witness the restore before clearing: a non-raising set_model(primary)
+    # can be a silent no-op (e.g. an "auto" primary on a partition that
+    # stopped advertising it resolves to "" and returns without switching).
+    # Clearing the marker while still on the fallback would let the next
+    # backfill pin the temporary fallback permanently. Keep the marker and
+    # retry at the next turn start instead.
+    _raw = provider_raw_model(provider)
+    if _raw and candidate and _raw.strip().lower() == str(candidate).strip().lower():
+        logger.info(
+            "model fallback: restore to %s was a silent no-op (still on %s); "
+            "keeping fallback (surface=%s)",
+            primary,
+            candidate,
+            surface,
+        )
+        return
+    try:
+        setattr(provider, TURN_FALLBACK_ATTR, None)
+    except Exception:
+        pass
+    logger.warning(
+        "model fallback: restored %s -> %s (reason=primary-recovered, surface=%s)",
+        candidate,
+        primary,
+        surface,
+    )
+
+
+def configured_fallback_chain() -> tuple[str, ...]:
+    """The throttle-fallback chain derived from ``agent.fallback_model``, or ``()``.
+
+    The config is a SINGLE value; the walk order is derived here (the one
+    derivation every surface shares): ``""`` disables the feature everywhere
+    (``()`` — callers pass it straight to ``fallback_models=`` and Case 2.75
+    stays inert); ``"auto"`` (the default) yields ``("auto",)`` — defer to the
+    backend's availability-aware routing; a concrete id yields
+    ``(id, "auto")`` — the pinned fallback first, ``"auto"`` as the final
+    fallthrough (the backend routes to whatever is actually available).
+
+    ``KiroCrewConfig.load()`` is fingerprint-cached (mtime/size/mode of both
+    config files), so the steady-state cost is two stats — the same read the
+    interactive turn path already performs inline on the event loop every
+    turn.
+    """
+    try:
+        fm = KiroCrewConfig.load().agent.fallback_model
+    except Exception:
+        return ()
+    if not fm:
+        return ()
+    if fm == "auto":
+        return ("auto",)
+    return (fm, "auto")
+
+
 class PromptBusyExhaustedError(Exception):
     """Provider was shut down after prompt-busy retries were exhausted."""
 
@@ -210,7 +630,7 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
         return []
     try:
         parsed = json.loads(tool_input)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         # Not JSON — treat the raw string as a path/command candidate
         return [tool_input]
     if isinstance(parsed, str):
@@ -290,20 +710,16 @@ async def run_bg_oneliner(
     low-level helper stays free of a dashboard/session import cycle.
     """
     session = await sessions.get_bg_session()
-
-    def _first_advertised_fallback(advertised: Any, rejected: str | None) -> str | None:
-        """First advertised model that is neither the rejected id nor the
-        ``"auto"`` sentinel — the reactive replacement when the preferred model
-        is refused mid-prompt."""
-        rej = (rejected or "").strip().lower()
-        for m in advertised or []:
-            if not isinstance(m, str) or not m.strip():
-                continue
-            low = m.strip().lower()
-            if low == rej or low == "auto":
-                continue
-            return m
-        return None
+    # The stats object as it stands BEFORE this turn. The runner replaces it when
+    # a turn actually begins, so comparing identity at teardown separates a turn
+    # that ran from one whose dispatch failed while the previous turn's already
+    # recorded credits were still installed.
+    stats_before = _billing_stats(session)
+    # Wall clock for the turn itself, started after the session is in hand so the
+    # acquire wait is not charged as turn time. The acp provider never fills
+    # TurnUsage.duration_ms, so this local measurement is the only duration a
+    # background row can carry, and every other dispatch surface supplies one.
+    turn_started = time.monotonic()
 
     async def _drive(model_to_use: str | None) -> str:
         text = ""
@@ -400,7 +816,7 @@ async def run_bg_oneliner(
             rejected = getattr(exc, "rejected_model", None)
             advertised = getattr(exc, "advertised", None) or []
             fallback = (
-                _first_advertised_fallback(advertised, rejected)
+                first_advertised_fallback(advertised, rejected)
                 if rejected and not strict_model
                 else None
             )
@@ -411,19 +827,132 @@ async def run_bg_oneliner(
             )
             return await _run(fallback)
     finally:
-        await session.destroy()
+        # Account BEFORE destroy(): the turn's billing lives on the session this
+        # tears down. Every caller of this helper — titles, link labels, folder
+        # icons, session summaries, tips, the canary — reaches the provider
+        # through here and none of them recorded spend of their own, so the
+        # bill moved while the usage store stayed empty. Recording at this one
+        # point covers all of them and a new caller cannot forget to.
+        # The inner finally is load-bearing: persisting is an await, and
+        # CancelledError is a BaseException that no `except Exception` catches,
+        # so without it a cancellation landing on that await would skip
+        # destroy() and leak the session's runtime.
+        try:
+            try:
+                # Imported here rather than at module scope because the usage
+                # module's own import chain reaches back into this one -- history
+                # and several dashboard handlers import ToolApprovalPolicy /
+                # run_bg_oneliner from here -- so a module-scope import raises
+                # ImportError against a partially initialized llm_helpers. It
+                # also pulls ~600 modules that every consumer of this low-level
+                # module would otherwise pay for at boot.
+                from kiro_crew.dashboard.handlers.usage import persist_token_record_async
+
+                usage = provider_last_turn_usage(session, since=stats_before)
+                if usage.credits or usage.input_tokens or usage.output_tokens:
+                    await persist_token_record_async(
+                        sel_session_key,
+                        # The model the session SERVED, never the one requested: a
+                        # rejected preference is replaced by the reactive fallback
+                        # above, so recording the request would bill the spend to a
+                        # model that did not run. An unreadable served model falls
+                        # through to model_source rather than naming a guess.
+                        str(getattr(session, "served_model", "") or "").strip(),
+                        usage,
+                        _provider_label(session),
+                        surface=f"bg:{sel_source}",
+                        elapsed_ms=int((time.monotonic() - turn_started) * 1000),
+                        model_source=session,
+                    )
+            except Exception:
+                logger.debug("bg oneliner accounting failed source=%s", sel_source, exc_info=True)
+        finally:
+            await session.destroy()
 
 
-def provider_last_turn_usage(provider: Any) -> TurnUsage:
+def _billing_stats(provider: Any) -> Any:
+    """The per-turn stats object behind *provider*, or ``None``.
+
+    Returned as the object rather than a value so callers can compare identity:
+    the runner installs a FRESH stats object as it begins a turn, which is what
+    tells a completed turn apart from one that never started.
+    """
+    try:
+        for node in _billing_stat_holders(provider):
+            stats = getattr(node, "last_prompt_stats", None)
+            if stats is not None:
+                return stats
+    except Exception:
+        logger.debug("billing stats lookup failed", exc_info=True)
+    return None
+
+
+def _attempt_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> TurnUsage:
+    """Billing accrued on ONE attempt, read from the provider's live stats.
+
+    ``since`` is the stats object observed before the attempt. The runner installs
+    a fresh stats object as it begins a turn, with the credit counters at zero; a
+    dispatch that fails BEFORE that point -- a busy session, a dead runtime --
+    leaves the PREVIOUS turn's object in place, still carrying credits that were
+    already recorded. Comparing identity reports nothing in that case instead of
+    billing the earlier turn a second time.
+    """
+    stats = _billing_stats(provider)
+    if stats is None:
+        return TurnUsage()
+    if since is not _NO_PRIOR_STATS and stats is since:
+        return TurnUsage()
+    try:
+        return TurnUsage(credits=float(getattr(stats, "credits", 0.0) or 0.0))
+    except Exception:
+        logger.debug("attempt usage read failed", exc_info=True)
+    return TurnUsage()
+
+
+def _sum_usage(left: TurnUsage, right: TurnUsage) -> TurnUsage:
+    """Add two attempts' billing. Never raises; unknown fields stay at zero."""
+    try:
+        return TurnUsage(
+            credits=float(left.credits or 0.0) + float(right.credits or 0.0),
+            input_tokens=int(getattr(left, "input_tokens", 0) or 0)
+            + int(getattr(right, "input_tokens", 0) or 0),
+            output_tokens=int(getattr(left, "output_tokens", 0) or 0)
+            + int(getattr(right, "output_tokens", 0) or 0),
+        )
+    except Exception:
+        logger.debug("usage sum failed", exc_info=True)
+        return left
+
+
+def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> TurnUsage:
     """Best-effort read of the just-completed turn's billing usage.
 
     ``stream_and_collect`` breaks on ``EVENT_COMPLETE`` and returns only text,
     discarding the event's ``usage``. Background surfaces that dispatch through
     it (cron, heartbeat, autonudge, workflow, task-runner self-review) therefore
     have no event to hand :func:`persist_token_record_async`. This recovers the
-    turn's billing from the provider's ``last_prompt_stats`` — the same post-turn
-    read ``chat_runner`` performs — and wraps it in a ``TurnUsage`` so it can be
-    passed straight through as the ``event`` argument.
+    turn's billing and wraps it in a ``TurnUsage`` so it can be passed straight
+    through as the ``event`` argument.
+
+    A turn can span several attempts: ``stream_and_collect`` retries a busy
+    session and a transient backend error, and each retry installs fresh per-turn
+    stats. Reading the provider's live stats afterwards therefore sees only the
+    LAST attempt and loses any earlier attempt that was already billed. So the
+    total ``stream_and_collect`` accumulated is preferred when present, and
+    consumed here -- one turn's billing is reported once. Callers that drive
+    ``provider.stream`` themselves publish no total and fall back to the live
+    read, which is what ``since`` guards (see :func:`_attempt_usage`).
+
+    The total is published WITH the stats object it was computed from, and is
+    accepted only while that object is still the provider's current one. The
+    provider outlives the turn -- the shared background session is reused by every
+    background caller, and a Slack session by every turn in its thread -- so a
+    total left unread by one turn would otherwise be consumed by the next one,
+    billing that turn's spend to the wrong surface and losing its own. Today every
+    reader happens to be paired with a publish in the same turn, which makes the
+    residue unreachable; the guard is here so that safety does not depend on the
+    next caller preserving that pairing. A fresh turn installs fresh stats, so a
+    stale total simply fails the identity check and the live read takes over.
 
     On the ACP backend the only non-zero per-turn billing signal is ``credits``;
     the token fields stay 0, matching the real usage record. Providers that expose
@@ -431,13 +960,187 @@ def provider_last_turn_usage(provider: Any) -> TurnUsage:
     (credits=0). Never raises.
     """
     try:
-        inner = getattr(provider, "_client", None) or getattr(provider, "_handle", None)
-        stats = getattr(inner, "last_prompt_stats", None) if inner is not None else None
-        if stats is not None:
-            return TurnUsage(credits=float(getattr(stats, "credits", 0.0) or 0.0))
+        accumulated = getattr(provider, _TURN_BILLED_ATTR, None)
+        if isinstance(accumulated, tuple) and len(accumulated) == 2:
+            published_stats, total = accumulated
+            # Clear on every read, match or not: a total that failed the identity
+            # check belongs to a turn that is already over and must not be seen
+            # again by a third one.
+            try:
+                delattr(provider, _TURN_BILLED_ATTR)
+            except Exception:
+                logger.debug("clearing accumulated turn usage failed", exc_info=True)
+            if isinstance(total, TurnUsage) and published_stats is _billing_stats(provider):
+                return total
     except Exception:
-        logger.debug("provider_last_turn_usage read failed", exc_info=True)
-    return TurnUsage()
+        logger.debug("accumulated turn usage read failed", exc_info=True)
+    return _attempt_usage(provider, since=since)
+
+
+def _billing_stat_holders(provider: Any) -> "list[Any]":
+    """Objects that may carry ``last_prompt_stats``, nearest wrapper first.
+
+    The turn-runner sits behind a different attribute per seam: the acp provider
+    keeps it on ``_client``, the session provider on ``_handle``, and the shared
+    background session hands non-kiro callers a thin adapter whose only link to
+    the runner is ``_sess.provider``. Walking all of them keeps a background turn
+    on the claude_code / bedrock seam from reporting 0 credits for a turn that
+    was billed. Bounded and identity-deduped so a self-referential wrapper chain
+    cannot loop.
+    """
+    out: list[Any] = []
+    seen: set[int] = set()
+    frontier: list[Any] = [provider]
+    while frontier and len(out) < _WRAPPER_WALK_MAX_NODES:
+        node = frontier.pop(0)
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        out.append(node)
+        for attr in ("_client", "_handle", "_sess", "provider"):
+            frontier.append(getattr(node, attr, None))
+    return out
+
+
+def _provider_label(provider: Any) -> str:
+    """Backend label for the usage row's ``provider`` dimension. Never raises.
+
+    Left unset the row lands with ``provider=""`` and drops out of the usage
+    page's provider and provider-model breakdowns, so a background turn's spend
+    would be recorded yet unattributable to a backend.
+
+    ``provider_label`` is the shared resolver for this vocabulary -- the same
+    ``acp`` / ``claude_code`` / ``kas`` keys the session map and resume-compat
+    check use -- and it answers from the backend that actually served the turn,
+    which is the precedence this module already applies to the model and the
+    agent. Reading ``config.agent.provider`` instead would report a declaration:
+    that field's enum admits only ``acp``, so a claude_code-backed session would
+    be labelled ``acp``.
+
+    The resolver only recognises a provider it is handed directly, and the shared
+    background session wraps one behind ``_sess.provider``, so the wrapper chain
+    is walked and the first node that names a non-default backend wins. Falling
+    back to the default label rather than to ``""`` matches every other writer of
+    this field.
+    """
+    try:
+        from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
+        from kiro_crew.providers.acp import provider_label
+
+        for node in _billing_stat_holders(provider):
+            label = provider_label(node)
+            if label and label != PROVIDER_LABEL_DEFAULT:
+                return label
+        return PROVIDER_LABEL_DEFAULT
+    except Exception:
+        logger.debug("resolving provider label failed", exc_info=True)
+        return ""
+
+
+@asynccontextmanager
+async def background_turn(
+    sessions: Any,
+    *,
+    task: str,
+    agent: "str | None" = None,
+) -> "AsyncIterator[Any]":
+    """Take the shared background session for ONE turn, then release and account.
+
+    Every background caller needs the same three steps around its prompt: acquire
+    the shared session (which takes its per-session semaphore), release that
+    semaphore in a ``finally`` or the next caller deadlocks on it, and recycle the
+    session afterwards. Callers that hand-rolled those steps had no reason to also
+    record what the turn cost, so background spend reached the provider's bill
+    without ever reaching the usage store — invisible on the dashboard even though
+    the account balance moved. Recording here makes it structural: a turn taken
+    through this manager is accounted for, and a new background caller cannot
+    forget to.
+
+    ``task`` labels the work in the ``surface`` dimension as ``bg:<task>`` so spend
+    is attributable per background job instead of pooling into one anonymous
+    bucket. Keep it a short fixed label — never per-session text, which would make
+    the dimension unbounded.
+
+    ``agent`` is forwarded to ``get_or_create`` ONLY when a caller supplies it:
+    the key decides which session is returned, but the agent decides what the
+    session is created AS, so injecting a default here would silently change that
+    for callers that deliberately pass none. The recorded row still names the
+    background agent so the dimension is never blank.
+
+    Exceptions are deliberately NOT swallowed. Callers distinguish "the session
+    could not be acquired" (nothing was sent, so nothing was billed) from "the turn
+    ran and failed" (billed), and collapsing the two corrupts the retry budgets
+    built on that distinction. Only the accounting write is best-effort.
+    """
+    from kiro_crew.session import BACKGROUND_AGENT, BACKGROUND_KEY  # circular import
+
+    if agent is None:
+        client, _new, _resumed = await sessions.get_or_create(BACKGROUND_KEY)
+    else:
+        client, _new, _resumed = await sessions.get_or_create(BACKGROUND_KEY, agent=agent)
+    # The stats object as it stands BEFORE this turn. The shared session serves
+    # many turns, and the runner replaces this object only once a turn actually
+    # begins, so identity is what separates a turn that ran from one whose
+    # dispatch failed while a previous, already-recorded turn's credits were
+    # still installed.
+    stats_before = _billing_stats(client)
+    # Wall clock for the turn itself, started after the acquire so queue wait is
+    # not charged as turn time. The acp provider never fills TurnUsage.duration_ms,
+    # so this is the only duration a background row can carry.
+    turn_started = time.monotonic()
+    try:
+        yield client
+    finally:
+        turn_elapsed_ms = int((time.monotonic() - turn_started) * 1000)
+        # Snapshot the billing BEFORE releasing. ``last_prompt_stats`` is shared
+        # mutable state on the session: the next waiter's turn carries it over
+        # (zeroing credits) or starts accumulating its own, so a read after
+        # release attributes that waiter's spend to this task, or loses the row
+        # entirely. This read is a synchronous attribute walk, so taking it here
+        # costs nothing and keeps release ahead of every await.
+        usage = provider_last_turn_usage(client, since=stats_before)
+        # Release before any await: it is synchronous, so no cancellation can
+        # land between the turn ending and the next caller being unblocked.
+        # CancelledError is a BaseException that no `except Exception` catches,
+        # and an await ordered ahead of this would let a cancelled task hold the
+        # shared semaphore forever.
+        try:
+            sessions.release(BACKGROUND_KEY)
+        except Exception:
+            logger.debug("background session release failed task=%s", task, exc_info=True)
+        # Recycle sits in a finally for the same cancellation reason, and follows
+        # accounting because it may replace the provider entirely.
+        try:
+            try:
+                # Same cycle as the oneliner's teardown: the usage module's import
+                # chain reaches back into this one (history and several dashboard
+                # handlers import ToolApprovalPolicy / run_bg_oneliner from here),
+                # so a module-scope import raises ImportError against a partially
+                # initialized llm_helpers, and it would pull ~600 modules into
+                # every consumer's boot.
+                from kiro_crew.dashboard.handlers.usage import persist_token_record_async
+
+                # A turn that never reached the provider bills nothing and has no
+                # row to write; the same guard the chat path applies keeps
+                # acquire-time failures from landing as zero-credit noise.
+                if usage.credits or usage.input_tokens or usage.output_tokens:
+                    await persist_token_record_async(
+                        BACKGROUND_KEY,
+                        "",
+                        usage,
+                        _provider_label(client),
+                        surface=f"bg:{task}",
+                        agent=agent or BACKGROUND_AGENT,
+                        elapsed_ms=turn_elapsed_ms,
+                        model_source=client,
+                    )
+            except Exception:
+                logger.debug("background turn accounting failed task=%s", task, exc_info=True)
+        finally:
+            try:
+                await sessions.recycle_background()
+            except Exception:
+                logger.debug("background recycle failed task=%s", task, exc_info=True)
 
 
 async def stream_and_collect(
@@ -455,6 +1158,8 @@ async def stream_and_collect(
     session_key: str = "",
     agent: str = "",
     app: str = "",
+    model_fallback: bool = False,
+    fallback_models: Sequence[str] = (),
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -508,12 +1213,43 @@ async def stream_and_collect(
             was silently not enforced for tools this helper approved. Callers
             using ``REJECT_ALL`` or ``AUTO_APPROVE`` are unaffected — the first
             runs no tools, the second never consults the gate.
+        fallback_models: Ordered chain of model ids tried when the same-model
+            transient budget exhausts on a throttle/capacity error (Case 2.75).
+            Empty (the default) disables the chain — behavior is byte-for-byte
+            today's fail-loudly. Requires ``retry_transient=True`` (a caller
+            that owns the outer transient loop also owns any fallback policy).
+            Every swap is logged at warning and published on the provider via
+            :data:`TURN_FALLBACK_ATTR`; the swap is sticky for the session and
+            a later call on the same provider probes one primary restore.
 
     Returns:
         The complete response text.
     """
     transient_attempts = 0
+    _model_fallback_attempted = False
     attempt = 0
+    _fb_chain = tuple(
+        m.strip() for m in (fallback_models or ()) if isinstance(m, str) and m.strip()
+    )
+    _fb_state = FallbackState(_fb_chain) if _fb_chain else None
+    # Cross-attempt tool-activity flag for the fallback chain ONLY. Case 2's
+    # same-model retry keys off ``result_text`` alone (pre-existing behavior,
+    # pinned byte-for-byte by the empty-chain regression tests), but the chain
+    # replays the ORIGINAL prompt up to FALLBACK_CANDIDATE_ATTEMPTS × len(chain)
+    # more times — a tool that completed an external mutation before any text
+    # streamed would be re-run on every one of them. Same activity predicate as
+    # the sub-agent ladder and the dashboard's ``_turn_emitted``: any fired
+    # tool call blocks the replay, text or no text.
+    _fb_tool_activity = False
+    # Sticky-restore probe (§restore policy): if an earlier turn on this
+    # provider fell back, try ONCE to move back to the primary before this
+    # turn streams. Quiet on success (log only); a still-throttled primary
+    # keeps the fallback for this turn.
+    if getattr(provider, TURN_FALLBACK_ATTR, None) is not None:
+        await probe_fallback_restore(provider, surface="stream_and_collect")
+    # Accumulates across attempts, so it lives OUTSIDE the retry loop: a turn that
+    # was billed and then retried must report the sum, not the last attempt.
+    turn_billed = TurnUsage()
     while True:
         result_text = ""
         tool_call_count = 0
@@ -537,6 +1273,10 @@ async def stream_and_collect(
         gate_decided_ids: set[str] = set()
         executed_calls: list[tuple[str, str]] = []
         retrying = False
+        # Billing accrued on THIS attempt is measured against the stats object as
+        # it stands now: a retry installs a fresh one, so without a per-attempt
+        # baseline an attempt that was billed and then failed is invisible.
+        attempt_stats_before = _billing_stats(provider)
         try:
             async for event in provider.stream(message):
                 if event.kind == EVENT_TEXT_CHUNK:
@@ -571,6 +1311,10 @@ async def stream_and_collect(
                         continue
                 elif event.kind == EVENT_TOOL_CALL:
                     tool_call_count += 1
+                    # Sticky across attempts (never reset in the retry loop):
+                    # once ANY attempt fired a tool, the fallback chain must
+                    # not replay the original prompt — see _fb_tool_activity.
+                    _fb_tool_activity = True
                     if on_tool_gate:
                         executed_calls.append((event.tool_call_id or "", event.title or ""))
                     if max_turns is not None and tool_call_count > max_turns:
@@ -681,12 +1425,152 @@ async def stream_and_collect(
                 retrying = True
                 continue
 
+            # ── Case 2.75: throttle-exhaustion fallback chain ──
+            # The same-model budget (Case 2) is spent and the error is still
+            # transient (throttle/capacity — a throttle carries no rejection
+            # metadata, so Case 2.5 can never fire for it). Walk the configured
+            # chain: substitute set_model, then re-prompt. Two attempts per
+            # candidate (initial + one ~2s retry — see FALLBACK_CANDIDATE_
+            # ATTEMPTS), advance on transient failure, propagate non-transient
+            # immediately (the classifier gate above already ensures that).
+            # Empty chain ⇒ this block is inert and Case 3 surfaces the error
+            # exactly as before this feature existed.
+            #
+            # ``not _fb_tool_activity`` is load-bearing over and above
+            # ``not result_text``: a tool call can complete an EXTERNAL
+            # MUTATION before any text streams, and unlike Case 2's bounded
+            # same-model retry (pre-existing semantics, deliberately
+            # untouched), the chain replays the original prompt on every
+            # candidate — re-running that mutation each time. Any fired tool
+            # across ANY attempt disables the chain for this call; the error
+            # then surfaces exactly as it did before this feature.
+            if (
+                retry_transient
+                and not result_text
+                and not _fb_tool_activity
+                and _fb_state is not None
+                and acp_error_is_transient(exc)
+                and transient_attempts >= _TRANSIENT_RETRIES
+            ):
+                if (
+                    _fb_state.active is not None
+                    and _fb_state.attempts < FALLBACK_CANDIDATE_ATTEMPTS
+                ):
+                    # Final attempt on the current candidate.
+                    _fb_state.attempts += 1
+                    delay = transient_retry_delay(1)
+                    logger.warning(
+                        "model fallback: candidate %s still failing (attempt %d/%d), "
+                        "retrying in %.1fs: %s",
+                        _fb_state.active,
+                        _fb_state.attempts,
+                        FALLBACK_CANDIDATE_ATTEMPTS,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+                    retrying = True
+                    continue
+                # Advance to the next usable candidate via the shared walk
+                # step (marker-seeded primary, skip-active, substitute
+                # set_model, sticky-marker publish, greppable warning).
+                _cand = await advance_fallback_candidate(
+                    provider, _fb_state, surface="stream_and_collect"
+                )
+                if _cand is not None:
+                    await asyncio.sleep(transient_retry_delay(1))
+                    retrying = True
+                    continue
+                if _fb_state.walked:
+                    # Chain exhausted: surface the ORIGINAL error class with the
+                    # chain's story attached for the delivering surface, and
+                    # keep the incident greppable.
+                    _story = (
+                        f"{_fb_state.primary or 'the selected model'} throttled; "
+                        f"fallbacks {', '.join(_fb_state.walked)} also unavailable"
+                    )
+                    logger.warning(
+                        "model fallback: chain exhausted (%s); surfacing original error: %s",
+                        _story,
+                        exc,
+                    )
+                    try:
+                        exc._kc_fallback_story = _story  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                # Fall through to Case 2.5 / Case 3.
+
+            # ── Case 2.5: model rejected (e.g. "auto" on GovCloud) — retry once
+            # with the first advertised model. ──
+            # Same reactive fallback as run_bg_oneliner: some partitions do not
+            # serve the "auto" sentinel, and the advertised list cannot gate it
+            # statically. When the backend rejects a model AND names available
+            # alternatives, retry ONCE with the first usable advertised model.
+            # Only fires when no tokens have streamed (safe to replay) and the
+            # error carries rejection metadata.
+            #
+            # OPT-IN (model_fallback=True): a silent model swap is only correct
+            # for a caller that did NOT choose the model — a background/system
+            # turn on the governed "auto" (history consolidation). An interactive
+            # turn where the user picked a model must surface the rejection, not
+            # swap underneath them (AGENTS.md), so the default is off.
+            rejected = getattr(exc, "rejected_model", None)
+            advertised = getattr(exc, "advertised", None) or []
+            if (
+                model_fallback
+                and not result_text
+                and rejected
+                and advertised
+                and not _model_fallback_attempted
+            ):
+                fallback = first_advertised_fallback(advertised, rejected)
+                if fallback:
+                    _model_fallback_attempted = True
+                    set_model_fn = getattr(provider, "set_model", None)
+                    if set_model_fn:
+                        try:
+                            await set_model_fn(fallback)
+                        except Exception:
+                            logger.debug(
+                                "set_model(%r) failed during model fallback",
+                                fallback,
+                                exc_info=True,
+                            )
+                    logger.warning(
+                        "stream_and_collect: model %r rejected; " "retrying once with %r",
+                        rejected,
+                        fallback,
+                    )
+                    retrying = True
+                    continue
+
             # ── Case 3: fatal (auth, validation, exhausted retries) — propagate. ──
             raise
         finally:
             # Runs before the value reaches the caller on success, and before the exception
             # propagates on failure, so the acknowledgement always precedes the cleanup that
             # would otherwise requeue the question.
+            #
+            # Billing is folded in on EVERY attempt, including the ones abandoned by a
+            # retry: an attempt whose metering frame landed before the error was billed,
+            # and the retry replaces the stats object that carried it. The total is
+            # published on the attempt that is terminal -- the same `not retrying`
+            # condition the callbacks below use -- so one logical turn publishes once,
+            # whether it returns or raises.
+            turn_billed = _sum_usage(
+                turn_billed, _attempt_usage(provider, since=attempt_stats_before)
+            )
+            if not retrying:
+                try:
+                    setattr(
+                        provider,
+                        _TURN_BILLED_ATTR,
+                        (_billing_stats(provider), turn_billed),
+                    )
+                except Exception:
+                    # A provider that refuses the attribute (slots, frozen doubles)
+                    # simply leaves the caller on the live-stats fallback.
+                    logger.debug("publishing accumulated turn usage failed", exc_info=True)
             if not retrying and on_steer_consumed:
                 for consumed_text in consumed_this_attempt:
                     on_steer_consumed(consumed_text)
@@ -717,13 +1601,20 @@ async def stream_and_collect_json(
     *,
     approval_policy: ToolApprovalPolicy = ToolApprovalPolicy.AUTO_APPROVE,
     hooks: HookManager | None = None,
+    model_fallback: bool = False,
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
 
     Combines ``stream_and_collect`` with ``parse_llm_json``.
     Returns parsed dict or None on failure.
     """
-    text = await stream_and_collect(provider, message, approval_policy=approval_policy, hooks=hooks)
+    text = await stream_and_collect(
+        provider,
+        message,
+        approval_policy=approval_policy,
+        hooks=hooks,
+        model_fallback=model_fallback,
+    )
     return parse_llm_json(text)
 
 
@@ -928,7 +1819,11 @@ async def _resolve_permission(
 _JSON_DECODER = json.JSONDecoder()
 
 
-def _extract_json_of_type(text: str, expected_type: type) -> dict | list | None:
+def _extract_json_of_type(
+    text: str,
+    expected_type: type | tuple[type, ...],
+    prefer: Callable[[Any], bool] | None = None,
+) -> dict | list | None:
     """Extract the first top-level JSON value of *expected_type* embedded in prose.
 
     Scans successive ``{`` (dict) or ``[`` (list) offsets and uses the stdlib
@@ -942,7 +1837,17 @@ def _extract_json_of_type(text: str, expected_type: type) -> dict | list | None:
     ``{`` nested inside an earlier-starting ``[ ... ]`` is consumed by that
     array's decode, so a dict request never digs a nested object out of a
     surrounding array.
+
+    When *prefer* is given, a preferred value is returned only when the choice
+    is UNAMBIGUOUS: all preferred matches in the text must be equal (a model
+    restating the same payload twice is not ambiguity). Two or more DIFFERENT
+    preferred matches return None — the caller cannot know which one is the
+    real payload, and guessing (e.g. executing a worked example that precedes
+    the actual plan) is worse than failing. When no preferred match exists,
+    the first type-matching value is returned as a fallback.
     """
+    preferred: list[dict | list] = []
+    fallback: dict | list | None = None
     i = 0
     n = len(text)
     while i < n:
@@ -958,14 +1863,38 @@ def _extract_json_of_type(text: str, expected_type: type) -> dict | list | None:
             continue
         try:
             data, end = _JSON_DECODER.raw_decode(text, i)
+        except RecursionError:
+            # Adversarially deep nesting (e.g. "[" * 100_000 in prose): the
+            # stdlib decoder recurses per nesting level and overflows long
+            # before any structural bound. This text is untrusted model output,
+            # and callers handle only JSONDecodeError (parse_json's ValueError
+            # contract, the spine extractor's never-raises contract) — so the
+            # error must not escape. Fail the WHOLE scan closed: a truncated
+            # scan cannot certify a preferred match as unambiguous, so keeping
+            # candidates collected before the bomb would let a worked example
+            # launder past the ambiguity refusal (GPT review, #4974 round 4).
+            # Callers already have recovery paths for None (schema retry loop,
+            # the spine's forcing re-emit); salvaging a prefix of a reply that
+            # contains a nesting bomb is not worth defeating them.
+            return None
         except json.JSONDecodeError:
             i += 1
             continue
         if isinstance(data, expected_type):
-            return data  # type: ignore[return-value]
-        # Valid JSON of the wrong type — skip past its full extent.
+            if prefer is None:
+                return data  # type: ignore[return-value]
+            if prefer(data):
+                preferred.append(data)
+            elif fallback is None:
+                fallback = data  # type: ignore[assignment]
+        # Valid JSON that is not an immediate result — skip past its full extent.
         i = end
-    return None
+    if preferred:
+        first = preferred[0]
+        if all(candidate == first for candidate in preferred[1:]):
+            return first
+        return None
+    return fallback
 
 
 def _parse_llm(text: str, expected_type: type) -> dict | list | None:

@@ -116,6 +116,7 @@ export default function SessionActionsMenu({
   const reloadBlocked = isRunning || hasActiveSubagents
   const currentFolderId = slot?.folder_id
   const colorIndex = slot?.color_index
+  const colorHex = slot?.color_hex
 
   // Folders drive the Move submenu. A menu's Content only mounts while it's open
   // (Radix), so this keyed query effectively runs only while a menu is open and
@@ -199,7 +200,7 @@ export default function SessionActionsMenu({
     ],
     // Colour — its own section
     [
-      <SessionColorSwatches key="color" slotKey={slotKey} colorIndex={colorIndex} onPicked={onColorPicked} />,
+      <SessionColorSwatches key="color" slotKey={slotKey} colorIndex={colorIndex} colorHex={colorHex} onPicked={onColorPicked} />,
     ],
     // Session runtime — relaunch the agent process in place so it picks up
     // MCP servers / agent-spec / env changes made after the session started.

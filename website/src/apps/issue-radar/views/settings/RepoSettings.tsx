@@ -345,7 +345,7 @@ export default function RepoSettings({ repoRef }: { repoRef: RepoRef }) {
         {/* Only rendered for a self-managed instance, where it is the only thing
             distinguishing this project from a same-named one on the public site. */}
         <ProviderHostTag repoRef={repoRef} />
-        {isReadOnly(entry?.permissions) && <ReadOnlyTag />}
+        {isReadOnly(entry?.permissions) && <ReadOnlyTag repoRef={entry} />}
         <a
           href={repoWebUrl(repoRef)}
           target="_blank"

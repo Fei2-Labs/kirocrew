@@ -162,7 +162,7 @@ class TestNoteToolRead:
             (link_dir / "SKILL.md").symlink_to(skills_dir / "alpha" / "SKILL.md")
         except (OSError, NotImplementedError):
             pytest.skip("symlinks unavailable on this platform")
-        loader._iter_cache = None  # re-walk so the alias is served
+        loader._invalidate_iter_cache()  # re-walk so the alias is served
         recorded = self._read(
             loader, tool_name="fs_read", raw_params={"path": str(link_dir / "SKILL.md")}
         )
@@ -320,65 +320,151 @@ class TestSkillsLoader:
 
 class TestRepoScope:
     """``repo_scope:`` frontmatter mechanically suppresses a skill unless the
-    CWD (or an ancestor) contains the named relative path — the loader-enforced
-    gate for repo-specific skills with destructive instructions (PR #353
-    arbiter: prose scope guards are probabilistic; containment must be
-    mechanical before shipping to every install)."""
+    SESSION's active project directory (or an ancestor) contains the named
+    relative path — the loader-enforced gate for repo-specific skills with
+    destructive instructions (PR #353 arbiter: prose scope guards are
+    probabilistic; containment must be mechanical before shipping to every
+    install).
 
-    def _write_skill(self, root: Path, name: str, scope: str | None) -> None:
+    The gate is keyed on the project, never on the process working directory:
+    this runs in the gateway while it assembles context, so ``Path.cwd()`` is
+    the gateway's own directory and answers by install shape rather than by the
+    work the session is doing (issue #4322)."""
+
+    def _write_skill(
+        self, root: Path, name: str, scope: str | None, always: bool = False
+    ) -> None:
         d = root / name
         d.mkdir(parents=True)
         fm = f"---\nname: {name}\ntriggers: zebra quokka\n"
         if scope:
             fm += f"repo_scope: {scope}\n"
+        if always:
+            fm += "always: true\n"
         (d / "SKILL.md").write_text(fm + "---\nbody")
 
-    def test_scoped_skill_suppressed_outside_repo(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def _repo(self, tmp_path: Path, name: str = "checkout") -> Path:
+        repo = tmp_path / name
+        (repo / "src" / "kiro_crew").mkdir(parents=True)
+        # A real checkout carries a .git entry, and the gate reads it as the
+        # boundary the ancestor walk stops at, so the fixture needs one to model a
+        # repository rather than a bare directory tree.
+        (repo / ".git").mkdir()
+        return repo
+
+    def test_scoped_skill_suppressed_without_a_project(self, tmp_path: Path) -> None:
+        # No project named at all -> fail closed. An un-scoped surface (eval
+        # harness, a session with no project set) never inherits repo rules.
+        skills = tmp_path / "skills"
+        self._write_skill(skills, "repo-only", "src/kiro_crew")
+        loader = SkillsLoader(skills_path=skills, install_builtins=False)
+        assert loader.get_triggered_skills("zebra quokka") == []
+
+    def test_scoped_skill_suppressed_outside_repo(self, tmp_path: Path) -> None:
         skills = tmp_path / "skills"
         self._write_skill(skills, "repo-only", "src/kiro_crew")
         loader = SkillsLoader(skills_path=skills, install_builtins=False)
         outside = tmp_path / "elsewhere"
         outside.mkdir()
-        monkeypatch.chdir(outside)
-        assert loader.get_triggered_skills("zebra quokka") == []
+        assert loader.get_triggered_skills("zebra quokka", project_dir=str(outside)) == []
 
-    def test_scoped_skill_eligible_inside_repo(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_scoped_skill_eligible_inside_repo(self, tmp_path: Path) -> None:
         skills = tmp_path / "skills"
         self._write_skill(skills, "repo-only", "src/kiro_crew")
         cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
         loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
-        repo = tmp_path / "checkout"
-        (repo / "src" / "kiro_crew").mkdir(parents=True)
-        subdir = repo / "website"
+        subdir = self._repo(tmp_path) / "website"
         subdir.mkdir()
-        monkeypatch.chdir(subdir)  # ancestor contains src/kiro_crew
-        assert loader.get_triggered_skills("zebra quokka") == ["repo-only"]
+        # ancestor of the project dir contains src/kiro_crew
+        assert loader.get_triggered_skills("zebra quokka", project_dir=str(subdir)) == [
+            "repo-only"
+        ]
 
-    def test_unscoped_skill_unaffected(
+    def test_process_cwd_does_not_admit_the_skill(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # The regression this gate had: a gateway whose OWN cwd sits inside a
+        # scoped checkout admitted the skill into every session, whatever the
+        # session was working on. Standing in the repo must decide nothing.
+        skills = tmp_path / "skills"
+        self._write_skill(skills, "repo-only", "src/kiro_crew")
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
+        loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
+        monkeypatch.chdir(self._repo(tmp_path))
+        other = tmp_path / "some-rust-project"
+        other.mkdir()
+        assert loader.get_triggered_skills("zebra quokka") == []
+        assert loader.get_triggered_skills("zebra quokka", project_dir=str(other)) == []
+
+    def test_always_path_is_gated_identically(self, tmp_path: Path) -> None:
+        # Both injection paths share one helper; a pinned skill must not be a
+        # way around the gate.
+        skills = tmp_path / "skills"
+        self._write_skill(skills, "repo-only", "src/kiro_crew", always=True)
+        loader = SkillsLoader(skills_path=skills, install_builtins=False)
+        other = tmp_path / "some-rust-project"
+        other.mkdir()
+        assert loader.get_always_skills() == []
+        assert loader.get_always_skills(str(other)) == []
+        assert loader.get_always_skills(str(self._repo(tmp_path))) == ["repo-only"]
+
+    def test_unscoped_skill_unaffected(self, tmp_path: Path) -> None:
         skills = tmp_path / "skills"
         self._write_skill(skills, "anywhere", None)
         cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
         loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
-        outside = tmp_path / "elsewhere"
-        outside.mkdir()
-        monkeypatch.chdir(outside)
         assert loader.get_triggered_skills("zebra quokka") == ["anywhere"]
 
-    def test_traversal_scope_fails_closed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_traversal_scope_fails_closed(self, tmp_path: Path) -> None:
         # ".." in the scope must never widen the check — fails closed.
         skills = tmp_path / "skills"
         self._write_skill(skills, "sneaky", "../..")
         loader = SkillsLoader(skills_path=skills, install_builtins=False)
-        monkeypatch.chdir(tmp_path)
-        assert loader.get_triggered_skills("zebra quokka") == []
+        assert loader.get_triggered_skills("zebra quokka", project_dir=str(tmp_path)) == []
+
+    def test_scoped_skill_is_absent_from_the_index_too(self, tmp_path: Path) -> None:
+        # Dropping only the BODY leaves the summary line in the skill index, and
+        # the index tells the agent to read the full file for anything related -
+        # so the repo-specific procedure stays one `cat` away.
+        skills = tmp_path / "skills"
+        self._write_skill(skills, "repo-only", "src/kiro_crew")
+        self._write_skill(skills, "anywhere", None)
+        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
+        loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
+        other = tmp_path / "some-rust-project"
+        other.mkdir()
+        for block in (
+            loader.get_context(project_dir=str(other)),
+            loader.get_context(budget=100_000, project_dir=str(other)),
+            loader.get_context(),
+        ):
+            assert "repo-only" not in block
+            assert "anywhere" in block
+        # ...and present once the project is the scoped tree.
+        inside = loader.get_context(project_dir=str(self._repo(tmp_path)))
+        assert "repo-only" in inside
+
+    def test_pod_e2e_declares_a_repo_scope(self) -> None:
+        # pod-e2e drives this repo's pod tooling and its triggers are matched by
+        # word overlap, so it must carry the gate rather than rely on prose.
+        # The description carries the applicability statement as well: the gate
+        # covers the injection paths, and the description is what an agent reads
+        # on the paths it does not cover (an explicit `$name` load, a
+        # `skill_search` hit, or reading the file directly).
+        from kiro_crew import skills as skills_mod
+
+        skill_md = (
+            Path(skills_mod.__file__).parent
+            / "apps"
+            / "builtins"
+            / "dev_fleet"
+            / "skills"
+            / "pod-e2e"
+            / "SKILL.md"
+        )
+        head = skill_md.read_text(encoding="utf-8")[:2048]
+        assert "repo_scope: src/kiro_crew" in head
+        assert "ONLY for developing Kiro Crew itself" in head
 
 
 class TestRelocatedSkillCleanup:
@@ -1401,9 +1487,9 @@ class TestTriggerPerformance:
         calls = {"n": 0}
         orig = loader._iter_uncached
 
-        def _counting():
+        def _counting(project_key=None):
             calls["n"] += 1
-            return orig()
+            return orig(project_key)
 
         monkeypatch.setattr(loader, "_iter_uncached", _counting)
         for _ in range(5):
@@ -1804,3 +1890,150 @@ class TestSearchSkills:
         loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
         loader.search_skills("alpha")
         assert loader._usage.score("s1")[0] == 0.0  # searching is not using
+
+
+class TestDisabledAppSkillsAreNotTriggered:
+    """Disabling an app must actually stop its bundled skills loading (#4023).
+
+    The skill tree an app bundles under ``skills/<app>/`` was never gated on the
+    app's enabled state, so a disabled app's skills stayed in the matching index
+    and kept firing into every turn's context on generic trigger words -- burning
+    tokens and polluting the prompt for an app the user explicitly opted out of,
+    with no visible reason.
+    """
+
+    @staticmethod
+    def _write_app_skill(skills: Path, app: str, name: str, triggers: str) -> None:
+        d = skills / app / name
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: d\ntriggers: {triggers}\n---\n\nbody\n"
+        )
+
+    @staticmethod
+    def _apps(monkeypatch, **enabled: bool) -> None:
+        """Stub the app registry: name -> enabled."""
+        import kiro_crew.apps.manager as mgr
+
+        monkeypatch.setattr(
+            mgr, "list_apps",
+            lambda: [{"name": n, "enabled": e} for n, e in enabled.items()],
+        )
+
+    def test_a_disabled_apps_skill_does_not_trigger(self, tmp_path, monkeypatch):
+        skills = tmp_path / "skills"
+        self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
+        self._apps(monkeypatch, deploy_web=False)
+        loader = SkillsLoader(
+            skills_path=skills, install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
+
+        assert loader.get_triggered_skills("please deploy this") == []
+
+    def test_an_enabled_apps_skill_still_triggers(self, tmp_path, monkeypatch):
+        skills = tmp_path / "skills"
+        self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
+        self._apps(monkeypatch, deploy_web=True)
+        loader = SkillsLoader(
+            skills_path=skills, install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
+
+        assert loader.get_triggered_skills("please deploy this") == ["deploy_web/artifact-deploy"]
+
+    def test_only_the_disabled_apps_skill_is_withheld(self, tmp_path, monkeypatch):
+        """One disabled app must not silence a sibling app's skill."""
+        skills = tmp_path / "skills"
+        self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
+        self._write_app_skill(skills, "ops_mc", "ops-mission-control", "deploy")
+        self._apps(monkeypatch, deploy_web=False, ops_mc=True)
+        loader = SkillsLoader(
+            skills_path=skills, install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
+
+        assert loader.get_triggered_skills("please deploy this") == ["ops_mc/ops-mission-control"]
+
+    def test_a_plain_user_skill_is_never_gated(self, tmp_path, monkeypatch):
+        """A skill owned by no app has no enablement to consult."""
+        skills = tmp_path / "skills"
+        d = skills / "my-notes"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("---\nname: my-notes\ndescription: d\ntriggers: deploy\n---\n\nb\n")
+        self._apps(monkeypatch, deploy_web=False)
+        loader = SkillsLoader(
+            skills_path=skills, install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
+
+        assert loader.get_triggered_skills("please deploy this") == ["my-notes"]
+
+    def test_an_unreadable_app_registry_hides_nothing(self, tmp_path, monkeypatch):
+        """Fail OPEN here, deliberately: a transient read error must not silently
+        strip an enabled app's skills out of context."""
+        import kiro_crew.apps.manager as mgr
+
+        skills = tmp_path / "skills"
+        self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
+
+        def _boom():
+            raise OSError("installed.json unreadable")
+
+        monkeypatch.setattr(mgr, "list_apps", _boom)
+        loader = SkillsLoader(
+            skills_path=skills, install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
+
+        assert loader.get_triggered_skills("please deploy this") == ["deploy_web/artifact-deploy"]
+
+    @staticmethod
+    def _link_shipped_builtin_skill(skills: Path) -> str:
+        """Flat-link a REAL shipped builtin's skill into *skills*, as bridges does.
+
+        Uses ``auto-improvement``'s ``ai-discover``: the flat name sorts before
+        the app name, so the flat registration is the one ``_iter_skill_files``'s
+        ``seen_real`` dedup keeps -- and its realpath resolves into the PACKAGE
+        tree (``apps/builtins/auto_improvement/skills/ai-discover``), not the
+        data-home apps root. Returns the app's manifest name.
+        """
+        import kiro_crew.skills as skills_mod
+
+        target = (
+            Path(skills_mod.__file__).parent
+            / "apps" / "builtins" / "auto_improvement" / "skills" / "ai-discover"
+        )
+        skills.mkdir(parents=True, exist_ok=True)
+        try:
+            (skills / "ai-discover").symlink_to(target, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks unavailable on this platform")
+        return "auto-improvement"
+
+    def test_a_disabled_builtins_package_tree_skill_is_gated(self, tmp_path, monkeypatch):
+        """The headline case (#4023): a shipped builtin registers its skills
+        straight out of the package tree, and the flat link -- whose name says
+        nothing -- can be the registration the walk keeps. Ownership must resolve
+        through the builtin's manifest, not only the data-home apps root."""
+        skills = tmp_path / "skills"
+        app = self._link_shipped_builtin_skill(skills)
+        self._apps(monkeypatch, **{app: False})
+        loader = SkillsLoader(
+            skills_path=skills, install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
+
+        assert loader.get_triggered_skills("find hotspots for me") == []
+
+    def test_an_enabled_builtins_package_tree_skill_still_triggers(self, tmp_path, monkeypatch):
+        """The gate's other direction: enabling the builtin restores matching."""
+        skills = tmp_path / "skills"
+        app = self._link_shipped_builtin_skill(skills)
+        self._apps(monkeypatch, **{app: True})
+        loader = SkillsLoader(
+            skills_path=skills, install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        )
+
+        assert loader.get_triggered_skills("find hotspots for me") == ["ai-discover"]

@@ -41,7 +41,6 @@ from kiro_crew.computer_use.types import (
     ERROR_PREFIX,
     PERMISSION_UNSUPPORTED,
     PLATFORM_LINUX,
-    PLATFORM_WINDOWS,
     STATE_KEY_ENABLED,
     ComputerUseUnsupported,
 )
@@ -123,36 +122,70 @@ class TestImportSafety:
             macos_ffi.frameworks()
 
     def test_package_contains_no_subprocess_spawn(self):
-        """No spawn node in the package, with ONE audited exception.
+        """No spawn node in the package, with THREE audited exceptions.
 
         The in-process ImageIO capture replaced the only ``screencapture``
         shell-out, so nothing in the observation/input path shells out — and a
         reintroduced spawn (e.g. an ``osascript`` shortcut) would be an ungoverned
         shell plane inside the feature that exists to avoid one.
 
-        ``overlay.py`` is the exception, and the exemption is narrow by
-        construction. It launches the Cursor Motion renderer, which MUST be a
-        separate process: AppKit needs a main-thread run loop and the gateway's main
-        thread is the asyncio loop. The spawn is pinned by
+        ``overlay.py`` launches the Cursor Motion renderer, which MUST be a separate
+        process: AppKit needs a main-thread run loop and the gateway's main thread is
+        the asyncio loop. The spawn is pinned by
         ``test_overlay_spawn_is_a_fixed_module_launch`` below to a fixed
-        ``sys.executable -m <module>`` argv with no shell, no agent-supplied
-        argument, and no PATH lookup. See also its ``BENIGN_SPAWNS`` entry in
-        ``test_spawn_audit.py``.
+        ``sys.executable -m <module>`` argv with no shell, no agent-supplied argument,
+        and no PATH lookup.
+
+        ``launch_windows.py`` / ``launch_macos.py`` are ``computer_launch_app``'s
+        whole purpose: opening an application IS creating a process, so the verb
+        cannot exist without a spawn. What keeps the exemption narrow is that neither
+        spawn takes an agent-supplied ARGV — the argument is a name resolved against
+        an OS catalog and then verified — which the sibling tests here and in
+        ``test_computer_use_launch.py`` pin structurally. Each also carries a
+        ``BENIGN_SPAWNS`` entry in ``test_spawn_audit.py`` with the same reasoning.
         """
         # ``os.system`` / ``os.popen`` invoke a SHELL and are forbidden everywhere in
-        # the package, overlay included — there is no legitimate use for either.
+        # the package, exceptions included — there is no legitimate use for either.
+        spawn_exempt = {"overlay.py", "launch_windows.py", "launch_macos.py"}
         offenders: list[str] = []
         for path in sorted(_PACKAGE_ROOT.glob("*.py")):
             source = path.read_text(encoding="utf-8")
             for token in ("os.system(", "os.popen(", "shell=True"):
                 if token in source:
                     offenders.append(f"{path.name}: {token}")
-            if path.name == "overlay.py":
+            if path.name in spawn_exempt:
                 continue
             for token in ("subprocess.", "create_subprocess_"):
                 if token in source:
                     offenders.append(f"{path.name}: {token}")
         assert offenders == [], offenders
+
+    def test_a_launch_spawn_interpolates_nothing_into_its_argv(self):
+        """The launch spawns carry a resolved path/name and NOTHING else.
+
+        The structural half of the launch verb's bound, and the reason the exemption
+        above is narrow rather than a hole: a spawn that grew a second element — a
+        document, a flag, a URL — would turn "open an application" into "run a
+        program with attacker-chosen input", and because computer use is deliberately
+        not governance-gated that input would also skip the
+        ``BUILTIN_DENIED_RULES`` floor every ``bash`` call passes.
+
+        Asserted on the SOURCE rather than by calling, because the danger is a future
+        edit adding an argument, and a behavioural test would only catch it if someone
+        also wrote a case for the new argument.
+        """
+        expected = {
+            # Windows: the verified executable, alone.
+            "launch_windows.py": "[executable],",
+            # macOS: ``open -a <bundle>``. ``-a`` is what makes it an APPLICATION
+            # launch; ``open <path>`` would open a document with its handler.
+            "launch_macos.py": '[_OPEN_BIN, "-a", bundle_path],',
+        }
+        for name, argv_literal in expected.items():
+            source = (_PACKAGE_ROOT / name).read_text(encoding="utf-8")
+            assert argv_literal in source, f"{name}: launch argv is no longer {argv_literal}"
+            # One Popen per module, so the pinned literal cannot be the only one.
+            assert source.count("subprocess.Popen(") == 1, name
 
     def test_overlay_spawn_is_a_fixed_module_launch(self):
         """The one permitted spawn carries nothing agent-supplied.
@@ -178,10 +211,16 @@ class TestImportSafety:
 # ──────────────────────────────────────────────────────────────────────────
 @pytest.fixture
 def unsupported_backend(monkeypatch):
-    """Pin the process to a driverless platform and install its backend."""
+    """Pin the process to a driverless platform and install its backend.
+
+    LINUX is the driverless platform: Windows has a read-path driver, so pointing
+    this fixture there would assert a refusal the driver no longer gives. The
+    Windows read path and its per-verb input refusals are covered in
+    ``test_computer_use_windows_driver.py`` instead.
+    """
     monkeypatch.setattr(platform_compat, "IS_MACOS", False)
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    monkeypatch.setattr(platform_compat, "IS_LINUX", False)
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(platform_compat, "IS_LINUX", True)
     register_computer_use_backend(None)
     reset_shared_backend()
     service_mod.reset_shared_service()
@@ -209,17 +248,16 @@ def enabled_keystone(tmp_path, monkeypatch):
 
 
 class TestRefusalsOnUnsupportedPlatform:
-    def test_windows_selects_the_windows_placeholder(self, unsupported_backend):
+    def test_a_driverless_platform_selects_the_shared_unsupported_base(self, unsupported_backend):
         assert isinstance(unsupported_backend, UnsupportedBackend)
-        assert unsupported_backend.platform_id == PLATFORM_WINDOWS
+        assert unsupported_backend.platform_id == PLATFORM_LINUX
 
     def test_status_is_unsupported_with_an_actionable_reason(self, unsupported_backend):
         status = unsupported_backend.status()
         assert status.supported is False
         # Concrete rather than "not supported": a user should learn what is missing
         # and a maintainer should find the next implementation step named.
-        assert "UI Automation" in status.reason
-        assert "macOS-only" in status.reason
+        assert "AT-SPI" in status.reason
 
     def test_linux_reason_names_the_wayland_capture_problem(self, monkeypatch):
         monkeypatch.setattr(platform_compat, "IS_MACOS", False)
@@ -260,7 +298,7 @@ class TestRefusalsOnUnsupportedPlatform:
     @pytest.mark.asyncio
     async def test_refusal_names_the_platform(self, unsupported_backend, enabled_keystone):
         result = await tools_mod.dispatch("computer_list_apps", {}, session_key="dashboard:slot1")
-        assert PLATFORM_WINDOWS in result
+        assert PLATFORM_LINUX in result
 
     @pytest.mark.asyncio
     async def test_disabled_keystone_beats_the_platform_refusal(
@@ -278,7 +316,7 @@ class TestRefusalsOnUnsupportedPlatform:
         result = await tools_mod.dispatch("computer_list_apps", {}, session_key="dashboard:slot1")
         assert result.startswith(ERROR_PREFIX)
         assert "disabled" in result
-        assert PLATFORM_WINDOWS not in result
+        assert PLATFORM_LINUX not in result
 
     @pytest.mark.asyncio
     async def test_unknown_tool_is_refused_before_validation(

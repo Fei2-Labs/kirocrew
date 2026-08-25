@@ -47,6 +47,7 @@ boot holding the chosen adapter for every extension point, plus three carriers:
 | `mcp_tooling` | adapter | `DefaultMcpToolingProvider` (all methods empty) | enterprise MCP server + skills + provider MCP scopes |
 | `agent_catalog` | adapter | `DefaultAgentCatalogProvider` (`builtin_agents()` → `[]`) | edition agent-catalog rows |
 | `prompt_sources` | adapter | `DefaultPromptSourceProvider` (`prompt_source_roots()` → `[]`) | edition prompt/SOP roots |
+| `import_sources` | adapter | `DefaultImportSourceProvider` (`import_sources()` → `[]`) | edition onboarding-import sources |
 | `capability_manager` | adapter | `DefaultCapabilityManager` (`available()` → `False`) | operations-based external package manager: MCP servers, skills, agent packages, and client plugins |
 | `external_access` | adapter | `DefaultExternalAccessPolicy` (`admits_registry()` / `admits_cloud_deployment()` → `True`) | allowlist installable content to an internal registry; withhold cloud deployment |
 | `registry` | adapter | `DefaultAppRegistryPolicy` (public-forge baseline) | internal git hosts |
@@ -96,6 +97,14 @@ boot holding the chosen adapter for every extension point, plus three carriers:
 Core code reads adapters directly when it has the context, or via
 `current_context()` for module-level functions (e.g. `hooks.py` deny path).
 `current_context()` lazily builds the standalone default if boot has not run.
+
+`installed_context()` returns the INSTALLED context or `None` as a bare
+attribute read — it never resolves, never raises, and does no I/O. Use it ONLY
+where the answer for "no context" is already the conservative one (the
+exempt-host lookup below is the one such caller), because it skips the config
+load and entry-point discovery that `current_context()` performs on every call
+while unbooted. A caller that must honour a companion's policy has to go through
+`current_context()` and take the fail-closed `PlatformCompositionError`.
 
 ## Boot sequence
 
@@ -381,12 +390,22 @@ delegates to that same global. Wired sites:
   `getattr(policy, "exempt_exact_hosts", None)` (a pre-method companion adapter
   degrades to the empty set) and is NEVER sourced from `config.json` — an
   agent-writable exemption would be a hole in the redaction ceiling, so the
-  companion adapter is the only supplier. Degrade semantics are INVERTED vs
-  `redact_via_context`'s baseline-redact fallback: a `PlatformCompositionError`
-  propagates fail-closed, but any other adapter failure degrades to
+  companion adapter is the only supplier. EVERY failure degrades to
   `frozenset()` — the empty set means MORE redaction (every host runs the
-  heuristics), the safe direction; NO logging on the degrade path (runs inside
-  the stdio MCP servers). **Deferred-import exception:** `security` reads the set
+  heuristics), the safe direction, and stricter than any companion-supplied list
+  could be; NO logging on the degrade path (runs inside the stdio MCP servers).
+  The set is read via `installed_context()`, so a process with no installed
+  context takes that same empty set WITHOUT resolving one: resolving would load
+  config and discover entry points per call, and on a non-standalone profile
+  `current_context()` never memoizes its fail-closed verdict, so a per-line
+  caller (`_pump_stderr` redacting backend stderr) would re-pay that synchronous
+  I/O for every line on the gateway event loop. This is deliberately INVERTED vs
+  `redact_via_context`, which must keep propagating: that seam SUBSTITUTES a
+  companion's redaction for the baseline, so a missing context there would fail
+  OPEN, whereas here it fails STRICTER. Because this lookup only ever RELAXES the
+  heuristics, it can never be the reason a credential reaches a log — the
+  credential pass (`redact_credentials`) is independent of it and unchanged by a
+  missing context. **Deferred-import exception:** `security` reads the set
   through a FUNCTION-LOCAL import of `kiro_crew.platform.context` (the `sel.py`
   pattern), so the CPP import-direction invariant holds — `platform/defaults.py`
   imports `security` at module load, and `security` never reaches `platform` at
@@ -587,10 +606,10 @@ delegates to that same global. Wired sites:
   by the time a jail backend probes it.
 
 
-### Amazon-edition seam additions (v1, no `CONTRACT_VERSION` bump)
+### Edition seam additions (v1, no `CONTRACT_VERSION` bump)
 
-Existing-Protocol methods added / wired so the Amazon companion can re-introduce
-dropped MeshClaw behavior without the core importing it. All are v1 additions (a
+Existing-Protocol methods added / wired so a companion can re-introduce behavior
+the public fork dropped without the core importing it. All are v1 additions (a
 `Default*` no-op reproduces today's OSS behavior exactly — a standalone process
 is byte-identical) with no `CONTRACT_VERSION` bump.
 
@@ -600,6 +619,18 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
 - `AppsLoader.registry_rows() -> List[Dict]` — ADD-only merged by
   `apps/registry.py::_load_registry_file` after bundled `app-registry.json`
   (same-`name` core row wins). Default `[]`.
+- `AppsLoader.default_registries() -> List[Dict]` — external app registries the
+  edition pins, merged with the operator's `config.registries` by
+  `apps/registry.py::_effective_registries`, which is the single list every
+  registry consumer reads (index fetch/refresh, the trusted-host allowlist, row
+  lookup, install, the blob-proxy allowlist). Rows are the field shape of
+  `ExternalRegistryConfig` (`{name, repo, branch, trust}`). Unlike
+  `registry_rows`, the **edition row wins** a `name` collision — and when the two
+  rows name DIFFERENT repositories, **neither** is served, because the index cache
+  is keyed by name and the displaced row's cache would otherwise be read under the
+  winner's identity. Merged at the
+  consumption sites, never inside `KiroCrewConfig`, so a config save can never
+  persist an edition default into the operator's file. Default `[]`.
 - `DashboardContributor.on_user_message(app, message)` — fired once per user
   message by `dashboard/chat_handlers.py::api_chat` before the turn, inside a
   fail-safe `safe_context_call`. OBSERVER only. Default no-op.
@@ -838,6 +869,24 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   companion returns its resolved package prompt roots. **Split out of
   `McpToolingProvider` into its own Protocol** (a distinct concern). v1 addition;
   `Default` returns `[]`.
+- `ImportSourceProvider.import_sources() -> List[ImportSource]` — WIRED:
+  `onboarding_import._sources()` unions the returned descriptors over the core
+  builtins for every scan, apply, and id-validation path, so a registered source
+  is accepted by `/api/onboarding/import/*` and rendered by the import wizard with
+  no core branching. Default `[]`, so the public edition offers only the foreign
+  agents it ships. One descriptor carries id, display name, root resolution, and
+  the agent's own managed MCP server names, so a registration cannot
+  half-work; a malformed one (no id, a reserved id, no
+  resolvable root, an id that reuses a builtin, a traversing `home_dir`, or a
+  `stale_mcp_binaries` entry naming a shared runtime) is dropped with a warning
+  rather than shadowing a builtin or reclaiming unrelated MCP servers. A
+  descriptor names neither a reader nor a layout: the engine does all reading, so a
+  registered source cannot bypass the content gates inside the engine's readers.
+  `superseded` is a separate opt-in: only an agent this product REPLACES has its
+  leftover MCP entries reclaimed from the user's global provider config, because a
+  live foreign agent's servers are still in use. A registered source is read as an
+  install of this product's own on-disk layout — a predecessor, a rename, or a
+  fork. v1 addition; `Default` returns `[]`.
 
 **`McpToolingProvider` is intentionally scoped to MCP tooling only** —
 `extra_mcp_servers()`, `extra_skills()`, and `extra_mcp_scopes()`. The former

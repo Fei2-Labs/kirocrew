@@ -37,6 +37,10 @@ def schemas() -> list[dict[str, Any]]:
         (f.max_len for f in LEARN_ADD_SCHEMA.fields if f.name == "negative"),
         MAX_SHORT_STRING,
     )
+    _scope_max = next(
+        (f.max_len for f in LEARN_ADD_SCHEMA.fields if f.name == "repo_scope"),
+        MAX_SHORT_STRING,
+    )
     return [
         {
             "name": "learn_add",
@@ -74,14 +78,19 @@ def schemas() -> list[dict[str, Any]]:
                             "characters — rejected if exceeded."
                         ),
                     },
-                    "scope": {
+                    "repo_scope": {
                         "type": "string",
-                        "enum": ["global", "workspace"],
-                        "description": "Where to save: 'global' (default, all workspaces) or 'workspace' (active workspace only)",
-                    },
-                    "workspace": {
-                        "type": "string",
-                        "description": "Workspace name (required when scope='workspace'). Use the workspace name from your session context.",
+                        "maxLength": _scope_max,
+                        "description": (
+                            "Optional. Restrict this correction to ONE repository, "
+                            "given as a path fragment that repository contains "
+                            "(e.g. 'src/kiro_crew'). The correction then applies "
+                            "only in sessions whose project is inside that tree, "
+                            "and is withheld everywhere else. Use it for a rule "
+                            "that is only true of one codebase; omit it for a "
+                            "durable preference that should always apply. Omitted "
+                            "means it applies everywhere."
+                        ),
                     },
                 },
                 "required": ["rule", "category"],
@@ -117,8 +126,25 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
     _gov_mem = mcp_core._vet_memory_writes_governance(mcp_core._resolve_session_key())
     if _gov_mem:
         return f"Error: {_gov_mem}"
-    scope = args.get("scope", "global")
-    payload: dict[str, str] = {"rule": rule, "category": category, "scope": scope}
+    # A stale client still holding the old advertised schema can send
+    # scope="workspace". Silently forcing that to "global" would take a correction
+    # meant for one workspace and inject it into EVERY session -- the exact harm
+    # this change exists to end, and worse than the old behaviour, where the tier
+    # was inert and reached no prompt at all. So a legacy scope asking for anything
+    # narrower than global is REFUSED, with the replacement named. Refusing loses
+    # nothing that ever worked, and it tells the caller instead of widening silently.
+    _legacy_scope = args.get("scope")
+    if isinstance(_legacy_scope, str) and _legacy_scope.strip() not in ("", "global"):
+        return (
+            f"Error: scope={_legacy_scope.strip()!r} is no longer accepted. That tier "
+            "never reached a prompt, and saving it as a global lesson would apply it "
+            "in every session. Use repo_scope to restrict a lesson to one repository."
+        )
+    # The tool no longer offers a workspace scope: that tier never reached a
+    # prompt, so a lesson saved under it reported success and changed nothing.
+    # Restricting a correction to one codebase is what repo_scope does, and the
+    # context builder enforces it before injection.
+    payload: dict[str, str] = {"rule": rule, "category": category, "scope": "global"}
     # The tool schema advertises ``negative`` -- and the ``rule`` description
     # explicitly tells the model to prefer it over inlining a "-- NOT: ..."
     # clause -- but this payload never forwarded it, so the clause was dropped
@@ -127,11 +153,9 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
     negative = args.get("negative", "")
     if negative:
         payload["negative"] = negative
-    if scope == "workspace":
-        ws = args.get("workspace", "")
-        if not ws:
-            return "Error: workspace name is required when scope='workspace'"
-        payload["workspace"] = ws
+    repo_scope = args.get("repo_scope", "")
+    if repo_scope:
+        payload["repo_scope"] = repo_scope
     d = mcp_core._post("/api/lessons", payload)
     err_val = d.get("error")
     if err_val:
@@ -160,7 +184,52 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
         # sentence naming the instance mix-up -- so every tool gets that copy,
         # not just this one.
         return f"Error: {err_val}"
-    return f"Saved lesson ({scope}): {rule}"
+    scope_note = f" (applies only in {repo_scope})" if repo_scope else ""
+    # The route used to answer ``{"ok": true}`` on every success path, so this tool
+    # reported "Saved lesson" even when the store had REFUSED the value or a dedup
+    # rule had dropped it -- the model was told its correction was persisted when
+    # nothing had been. ``outcome`` names what actually happened; an older gateway
+    # that does not send it falls through to the saved wording, which is what this
+    # tool said unconditionally before.
+    outcome = d.get("outcome")
+    reason = d.get("reason")
+    detail = f" ({reason})" if isinstance(reason, str) and reason else ""
+    if outcome == "refused":
+        return (
+            f"Lesson was NOT saved{scope_note}: the memory store refused this "
+            f"value{detail}. Nothing was stored, so the correction is not in effect. "
+            "Re-state it in plainer wording, or tell the user it could not be saved."
+        )
+    if outcome == "deduped":
+        return (
+            f"Lesson was NOT saved as a new entry{detail}: an existing stored lesson "
+            f"already covers it, and that lesson stays in effect. Rule: {rule}"
+        )
+    if outcome == "unchanged":
+        # No exact-match claim here, because ``unchanged`` does not mean the stored row
+        # equals the submission. It means nothing was WRITTEN, and the store keeps
+        # several fields on a re-submit rather than rewriting them: the category is
+        # write-once (correcting it means delete then re-add), and a bare re-submit
+        # keeps a stored NOT-clause instead of deleting it. So a re-submit carrying a
+        # NEW category, or omitting a clause that is stored, still lands here -- and
+        # telling the caller it was saved "exactly as submitted" would be false in
+        # both cases. Name what was kept instead, so the model knows why the value it
+        # sent did not take effect.
+        if reason == "kept_stored_clause":
+            return (
+                f"Lesson was already stored{scope_note}, and it carries a NOT-clause "
+                f"this submission did not include -- the stored clause was kept, not "
+                f"removed. Nothing was written, and the lesson remains in effect: {rule}"
+            )
+        return (
+            f"Lesson was already stored{scope_note} and nothing was written. A "
+            f"re-submit does not rewrite the stored category or NOT-clause, so those "
+            f"keep the values they already had -- changing one means removing the "
+            f"lesson and adding it again. It remains in effect: {rule}"
+        )
+    if outcome == "enriched":
+        return f"Updated the stored lesson{scope_note} with the new clause: {rule}"
+    return f"Saved lesson{scope_note}: {rule}"
 
 
 def learn_list(name: str, args: dict[str, Any]) -> str:

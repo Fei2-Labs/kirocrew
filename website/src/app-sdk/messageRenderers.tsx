@@ -21,6 +21,7 @@ import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage
 import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
+import NudgeCard from '../pages/chat/NudgeCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
@@ -28,6 +29,7 @@ import PastedChip from '../components/PastedChip'
 import { type PasteBlock, findTokenRanges, recollapsePastes } from '../utils/pasteTokens'
 import type { ChatMessage } from '../types'
 import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
+import { turnHadPolicyBlock } from './turnPolicyBlock'
 
 /** Everything a renderer may read. Passed per row so entries stay pure functions. */
 export interface MessageRenderContext {
@@ -159,11 +161,11 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   }, [message.meta?.input_preview, rawLabel])
 
   return (
-    <div className="animate-scale-in flex items-center gap-1.5 flex-wrap">
+    <div className="animate-scale-in flex items-center gap-2 flex-wrap">
       <button
         onClick={() => setExpanded(e => !e)}
         aria-expanded={expanded}
-        className={`inline-flex items-center gap-1 text-[13px] font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
+        className={`inline-flex items-center gap-2 text-[13px] leading-5 font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
       >
         <Icon size={12} className={iconClass} />
         <span className="truncate">{label}</span>
@@ -173,14 +175,14 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
           onClick={() => onFileOpen(filePath)}
           title={i18nT('appSdk.chatMessageList.open_path', { path: filePath })}
           aria-label={i18nT('appSdk.chatMessageList.open_path', { path: filePath })}
-          className="inline-flex items-center gap-1 text-[12px] font-mono px-1.5 py-0.5 rounded-md border border-border text-muted cursor-pointer hover:text-text hover:border-border-strong transition-all"
+          className="inline-flex items-center gap-1 text-[12px] leading-5 font-mono px-1.5 py-0.5 rounded-md border border-border text-muted cursor-pointer hover:text-text hover:border-border-strong transition-all"
         >
           {filePath.split('/').pop()}
           <PanelRight size={11} />
         </button>
       )}
       {expanded && message.content && (
-        <pre className="w-full text-[11px] font-mono text-muted bg-bg-elevated rounded-md p-2 mt-1 ml-4 max-h-40 overflow-auto whitespace-pre-wrap break-all border border-border">
+        <pre className="w-full text-[11px] leading-4 font-mono text-muted bg-bg-elevated rounded-md p-2 mt-1 ml-4 max-h-40 overflow-auto whitespace-pre-wrap break-all border border-border">
           {purpose && rawLabel && purpose !== rawLabel ? rawLabel + '\n\n' + message.content : message.content}
         </pre>
       )}
@@ -208,7 +210,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     roles: ['*'],
     match: m => m.kind === 'stop_event' || m.meta?.kind === 'stop_event',
     render: (m, ctx) => ctx.row(
-      <div className="text-danger text-[13px] font-mono px-3 py-2 rounded-md bg-danger-subtle inline-flex items-center gap-1.5">
+      <div className="text-danger text-[13px] leading-5 font-mono px-3 py-2 rounded-md bg-danger-subtle inline-flex items-center gap-2">
         {m.content}
       </div>,
     ),
@@ -271,6 +273,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
             variants={m.variants}
             variantIdx={m.variant_idx}
             turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
+            suppressSteerAck={turnHadPolicyBlock(ctx.messages, ctx.index)}
           />
         </div>,
       )
@@ -302,8 +305,8 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
         : m.content
       return ctx.wrapper(
         <>
-          {cronLabel && <span className="text-muted text-[11px] font-medium px-1 mb-0.5"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
-          <div className="msg-content px-3.5 py-2.5 text-sm leading-relaxed whitespace-pre-wrap rounded-lg bg-warning-subtle text-fg border border-warning/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+          {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
+          <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warning-subtle text-fg ring-1 ring-inset forced-colors:border ring-warning/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
             <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} /></MessageErrorBoundary>
           </div>
         </>,
@@ -314,7 +317,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'error',
     roles: ['error'],
     render: (m, ctx) => ctx.row(
-      <div className="bg-danger-subtle text-danger text-[13px] px-3 py-2 rounded-md border border-danger/15 self-center animate-scale-in">
+      <div className="bg-danger-subtle text-danger text-[13px] leading-5 px-3 py-2 rounded-md ring-1 ring-inset forced-colors:border ring-danger/15 self-center animate-scale-in">
         {m.content}
       </div>,
     ),
@@ -323,7 +326,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'notice',
     roles: ['notice'],
     render: (m, ctx) => ctx.row(
-      <div className="bg-card text-muted text-[13px] px-3 py-2 rounded-md border border-border self-center animate-scale-in">
+      <div className="bg-card text-muted text-[13px] leading-5 px-3 py-2 rounded-md ring-1 ring-inset forced-colors:border ring-border self-center animate-scale-in">
         {m.content}
       </div>,
     ),
@@ -350,6 +353,14 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       if (!banner) return null
       return ctx.row(banner)
     },
+  },
+  {
+    // Auto-nudge cycle marker. `onOpenLoop` (jump to the loop popover) is
+    // ChatPage chrome and is deliberately absent here: the card renders its
+    // full content without it, only the affordance is page-specific.
+    id: 'nudge',
+    roles: ['nudge'],
+    render: (m, ctx) => ctx.row(<NudgeCard message={m} disclosureKey={ctx.key} />),
   },
 ]
 

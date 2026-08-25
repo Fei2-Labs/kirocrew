@@ -282,8 +282,18 @@ is what makes nightlies read as previews of the *next* release:
 | `pyproject.toml` | `[project] version` — what the wheel carries |
 | `website/electron/package.json` | `version` — the updater's version compare |
 
-Keep it a bare `X.Y.Z`: `nightly.yml` builds both a semver and a PEP 440 stamp
-from it, and a suffixed base (`.dev0`) produces invalid versions.
+Keep it a bare `X.Y.Z` **on `main`**: `nightly.yml` builds both a semver and a
+PEP 440 stamp from it, and a suffixed base (`.dev0`) produces invalid versions.
+
+On an **insider release branch** the in-code version instead carries the RC, so
+a source/dev checkout reads as the candidate it is. All three files use the
+**same dual-valid spelling** `X.Y.Z-rc.N` (e.g. `0.4.0-rc.4`): it is valid
+SemVer for `package.json` **and** valid (non-canonical) PEP 440, which pip and
+setuptools normalize to `X.Y.ZrcN`. Do not use the canonical PEP 440 spelling
+(`0.4.0rc4`) in `__init__.py` — `packaging/build-desktop.sh` greps `__version__`
+straight into electron-builder's `extraMetadata.version`, which rejects
+non-SemVer and kills a local `make desktop`. The tag still overrides all three
+at build time (see `docs/build/release.md` → "Version numbering policy").
 
 ### One trap worth knowing
 
@@ -378,7 +388,16 @@ user.
 ```bash
 pytest                       # full suite (pytest-asyncio, pytest-xdist)
 pytest -k test_name          # single test
+pytest test/test_agent.py    # one file — what you want most of the time
 ```
+
+The suite is large (56k+ tests) and runs in parallel. Each worker needs about
+1.5 GiB, mostly just to collect the suite, so **on a laptop with 8–16 GiB of RAM a
+full run does not fit alongside a browser.** You do not have to work that out: the
+worker count is bounded by how much memory is actually free, and if it gets clamped
+the run says so in one line. If it clamps to one or two workers, run the subset you
+are changing instead — a full-suite checkpoint is what CI is for. Details and the
+override knobs: [testing-conventions](docs/system-specs/common/testing-conventions.md).
 
 | Pattern | Example |
 |---------|---------|
@@ -428,7 +447,7 @@ When your change is ready, the workflow is already codified rather than left to
 taste. See Development Skills above: `kirocrew-worktree-dev` covers building and
 verifying in a worktree, and `prepare-pr` takes it from there, driving the change
 to a review-ready pull request by committing, syncing onto the base, squashing to
-the single commit this repo requires, opening or updating the PR, then polling CI
+the one or two commits this repo allows, opening or updating the PR, then polling CI
 and the review bots and fixing what they find. An agent that loads it follows the
 same route a maintainer would, which is why the process holds regardless of who or
 what wrote the code. If you are contributing with an agent, point it at that skill

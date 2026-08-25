@@ -29,11 +29,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.atomic_write import read_bytes_with_retry, replace_with_retry
+from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
 from kiro_crew.config.paths import data_home
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.state import row_mid
 from kiro_crew.history import append_if_absent_off_loop
-from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.spawn_warm import warm_project_agents_for_spawn
 from kiro_crew.subagent_persistence import _agent_dir, read_state
@@ -69,6 +72,16 @@ _SUB_TASK_SUFFIX = (
     "with a summary of the result (<=150 words) wrapped EXACTLY as: "
     "<<<SUMMARY your summary here >>>"
 )
+
+
+def _decision_shaped(value: object) -> bool:
+    """Prefer predicate: a dict carrying the decision payload's ``actions`` list.
+
+    Disambiguates the payload from stray braced JSON in surrounding prose (an
+    inline worked example, a ``{placeholder}`` aside) -- those parse as dicts
+    but never carry the schema the executor consumes."""
+    return isinstance(value, dict) and isinstance(value.get("actions"), list)
+
 
 _DECISION_PROMPT = """You are the routing decision function for a multi-topic chat. \
 Decide what to do with each PENDING message. Reply with ONLY a JSON object, no prose.
@@ -254,13 +267,13 @@ class CrewStore:
         Only ``FileNotFoundError`` means "nothing enqueued yet". Anything else
         propagates: the slot refuses to build, which surfaces as a failed
         request the user can retry once the file is dealt with. A wedged slot
-        is recoverable; an erased queue is not. Writes go through
-        ``tmp.replace()``, so a malformed payload is not a torn write of ours —
+        is recoverable; an erased queue is not. Writes go through a
+        write-tmp-then-rename, so a malformed payload is not a torn write of ours —
         it is damage from outside, and papering over it is the wrong default.
         """
         path = self.dir / name
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(read_bytes_with_retry(path).decode("utf-8"))
         except FileNotFoundError:
             return []
         except (json.JSONDecodeError, OSError) as exc:
@@ -304,7 +317,23 @@ class CrewStore:
                         return  # a newer snapshot already landed
                 tmp = self.dir / f".{name}.tmp"
                 tmp.write_text(payload, encoding="utf-8")
-                tmp.replace(self.dir / name)
+                # `replace_with_retry`, not `tmp.replace()`: this is the write half
+                # of the window #4331 fixed on the read half. On Windows the rename
+                # raises `PermissionError` while ANY other handle is open on either
+                # path -- an indexer, an AV scanner, or this store's own concurrent
+                # reader -- and the payload is lost even though the write itself was
+                # correct. `_written_seq` is advanced only after the rename returns,
+                # so a lost rename also leaves the sequence un-advanced and the next
+                # writer wins by default: the user's message is simply gone.
+                #
+                # `Path.replace` was also unreachable for the repo's own emulator on
+                # Python 3.10, where pathlib holds a captured reference to
+                # `os.replace` rather than looking it up per call -- the same reason
+                # #4331 had to move the read off `Path.read_text`.
+                #
+                # This runs in `run_in_executor` (or inline with no loop), so the
+                # helper's off-the-event-loop gate leaves the retry enabled here.
+                replace_with_retry(tmp, self.dir / name)
                 # Advance ONLY after the atomic replace succeeded — a failed
                 # write must stay retryable, not be recorded as landed. The
                 # per-name io_lock guarantees no concurrent writer for this
@@ -993,6 +1022,68 @@ class CrewOrchestrator:
         except Exception:
             logger.debug("crew: agent-cache warm failed", exc_info=True)
 
+    async def _dispatch_agent(self, slot: Any) -> str:
+        """The kiro-cli agent TEMPLATE this slot's crew dispatches as.
+
+        ``slot.agent`` holds a CREW name — a key of the config's ``agents``
+        mapping — while ``spawn()`` validates its ``agent=`` against the kiro-cli
+        TEMPLATE names ``list_agents()`` reports. The two coincide for every crew
+        whose ``kiro_agent`` repeats its own name, which is all of them except
+        the default crew: ``default`` binds the template ``kirocrew``. Passing the
+        crew name straight through therefore worked by coincidence everywhere
+        except the crew every session starts on, where ``_validate_agent`` refused
+        the dispatch and the user saw "Couldn't start that one".
+
+        Resolution is deliberately per dispatch rather than cached on the slot: a
+        config edit must take effect on the next message, and the crew name stays
+        the durable identity.
+
+        The warm is kept and runs first — the resolved template may itself be a
+        project agent, which ``_validate_agent`` only ever sees through the warmed
+        cache. Falls back to the crew name on any resolution failure, so a broken
+        config degrades to the previous behaviour instead of losing the dispatch.
+
+        An UNKNOWN crew name (``requested_resolved`` False) also returns the raw
+        crew name rather than the default binding the resolver fell back to:
+        dispatching that binding would silently run the default agent under a
+        stale name, whereas the crew name is refused by ``_validate_agent`` —
+        the unknown-name path stays fail-closed.
+
+        An EMPTY crew also resolves (as ``None``, i.e. the default binding)
+        rather than passing ``""`` through: ``spawn()``'s governance agent-scope
+        check (``capabilities.spawn.scopes.agents``) only vets a NAMED agent, so
+        ``agent=""`` would run the default agent without the administrator's
+        allowlist ever seeing it. Resolving pins the concrete template name the
+        dispatch will run, keeping it inside the governance check.
+        """
+        await self._warm_agent_cache(slot)
+        crew = str(getattr(slot, "agent", "") or "")
+
+        def _resolve() -> str:
+            cfg = KiroCrewConfig.load()
+            bindings = resolve_agent_bindings(cfg, crew or None, self._slot_cwd(slot) or None)
+            if crew and not getattr(bindings, "requested_resolved", True):
+                # The crew name matched neither an alias nor a materialized
+                # agent, so the resolver fell back to the DEFAULT binding.
+                # Dispatching that binding would silently run the default
+                # agent under an unknown/stale crew name — return the raw
+                # crew name instead so _validate_agent refuses it, keeping
+                # the unknown-name path fail-closed.
+                logger.warning(
+                    "crew: crew %r is unknown; refusing default-agent fallback",
+                    crew,
+                )
+                return crew
+            return str(bindings.kiro_agent or crew)
+
+        try:
+            # KiroCrewConfig.load() reads and parses from disk; this runs on the
+            # event loop, so it goes to a worker thread.
+            return await asyncio.to_thread(_resolve)
+        except Exception:
+            logger.warning("crew: could not resolve crew %r to a template", crew, exc_info=True)
+            return crew
+
     async def _post_durable(self, slot: Any, content: str, kind: str = "crew") -> bool:
         """`_post`, then wait for the durable transcript row to actually land.
 
@@ -1064,7 +1155,12 @@ class CrewOrchestrator:
             # main persistence path — which is why patching one channel at a time
             # (ws frame, ConversationLog) kept leaving another.
             meta = {"crew_reply": True} if is_answer else None
-            slot.append("assistant", content, cls, broadcast=False, meta=meta)
+            # The durable copy below must carry the window copy's minted
+            # ``meta.mid`` (read off the append's return via ``row_mid``): one
+            # logical message, one identity, so a bounded slot-detail read
+            # matches the persisted row by id instead of re-appending the
+            # forward.
+            window_mid = row_mid(slot.append("assistant", content, cls, broadcast=False, meta=meta))
             self._state.broadcast_ws(
                 "chat_message",
                 {"slot": slot.key, "role": "assistant", "content": content,
@@ -1085,6 +1181,7 @@ class CrewOrchestrator:
                 # The SAME class as the in-memory copy: this log is what a restart
                 # replays from, and it had no field for the marker at all.
                 cls=cls,
+                mid=window_mid,
             )
         except Exception:
             logger.debug("crew: conversation_log append failed", exc_info=True)
@@ -1331,8 +1428,15 @@ class CrewOrchestrator:
                     self._sessions, prompt, model=self._decision_model,
                     sel_source="crew_decision", timeout=_DECISION_TIMEOUT,
                 )
-                m = re.search(r"\{.*\}", raw, re.DOTALL)
-                actions = json.loads(m.group(0))["actions"] if m else []
+                data = _extract_json_of_type(raw, dict, prefer=_decision_shaped)
+                if not isinstance(data, dict):
+                    # No usable JSON object: nothing parseable, or two
+                    # DIFFERENT actions-shaped dicts (the shared contract
+                    # refuses to guess which is the real payload). The prompt
+                    # demands a JSON-only reply, so all of these are model
+                    # failures -- take the retry-then-defer path.
+                    raise ValueError("decision reply carried no usable JSON object")
+                actions = data["actions"]
                 break
             except Exception:
                 if attempt == 2:
@@ -1389,7 +1493,7 @@ class CrewOrchestrator:
                 # the same flag on the main path. Without it, a temporary crew slot
                 # leaked stored memory and lessons into every subagent it spawned.
                 no_reads = bool(getattr(slot, "blocks_reads", False))
-                await self._warm_agent_cache(slot)
+                dispatch_agent = await self._dispatch_agent(slot)
             except Exception:
                 e["state"] = prior_state or "pending"
                 e.pop("dispatch_id", None)
@@ -1414,7 +1518,7 @@ class CrewOrchestrator:
                 # subagent edits files, and without this it edited ANOTHER
                 # project's tree. Same value the warm above validated.
                 cwd=self._slot_cwd(slot),
-                agent=getattr(slot, "agent", "") or "",
+                agent=dispatch_agent,
                 keep=True,
                 _preassigned_id=dispatch_id,
                 include_memory=not no_reads,
@@ -1540,13 +1644,14 @@ class CrewOrchestrator:
         # id rather than a guess. Without this the continuation minted its id
         # inside the call, and a restart could neither adopt the started run nor
         # safely reopen the entry.
+        dispatch_agent = await self._dispatch_agent(slot)
         info = self._subagents.continue_conversation(
             t["topic_id"], e["text"] + _SUB_TASK_SUFFIX,
             # Same governance key as the spawn path: a continuation re-enters the
             # capability check, so keying it to the tab would let a resumed topic
             # run under a surface the linked session never granted.
             parent_session_key=effective_session_key(slot),
-            agent=getattr(slot, "agent", "") or "",
+            agent=dispatch_agent,
             # Same cwd as the spawn path. `spawn` resolves an empty cwd to the
             # pool project BEFORE validating the agent, so a project-local agent
             # was rejected here and the rejection fell through to a digest-only
@@ -1590,12 +1695,12 @@ class CrewOrchestrator:
                     )
                     raise
                 no_reads = bool(getattr(slot, "blocks_reads", False))
-                await self._warm_agent_cache(slot)
+                dispatch_agent = await self._dispatch_agent(slot)
                 fresh = self._subagents.spawn(
                     seed + _SUB_TASK_SUFFIX,
                     parent_session_key=effective_session_key(slot),
                     cwd=self._slot_cwd(slot),
-                    agent=getattr(slot, "agent", "") or "", keep=True,
+                    agent=dispatch_agent, keep=True,
                     _preassigned_id=respawn_id,
                     include_memory=not no_reads,
                     include_lessons=not no_reads,

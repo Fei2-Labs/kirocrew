@@ -13,6 +13,14 @@ name: Cross-Platform Portability
 # tests (they may legitimately assert POSIX behaviour behind a skip marker),
 # and `platform_compat.py` itself -- that module's whole job is to name the
 # os-specific primitives everything else routes through.
+#
+# The test exclusion has to be spelled out as a pathspec, not assumed from the
+# `test/` tree living outside `src/`: ~120 test modules ship INSIDE the package
+# under `src/kiro_crew/apps/builtins/*/tests/`, and they were in scope for as long
+# as this gate has existed. Nothing went red only because the scan reads ADDED
+# lines and no PR had added many such literals at once; the modules already on
+# `main` are full of them (`/usr/bin/gh`, `/tmp/...`), every one behind a
+# `skipif(sys.platform == "win32")` or a mock that never touches a real path.
 
 on:
   pull_request:
@@ -53,6 +61,7 @@ jobs:
             'src/kiro_crew/**/*.py' \
             ':(exclude)src/kiro_crew/_vendor/**' \
             ':(exclude)src/kiro_crew/platform_compat.py' \
+            ':(exclude)src/kiro_crew/**/tests/**' \
             2>/dev/null | grep -E '^\+' | grep -vE '^\+\+\+' || true)"
 
           if [ -z "$added" ]; then

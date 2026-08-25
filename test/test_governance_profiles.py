@@ -8,7 +8,9 @@ narrowing, and mtime hot-reload.
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 
 import pytest
 
@@ -891,7 +893,7 @@ def test_under_lock_restat_commits_fingerprint_of_published_snapshot(profiles_di
     gp.reset_store()
     assert gp.resolve_active_scope("cron:j:r") is not None
     store = gp._STORE
-    assert store._fingerprint == gp._dir_fingerprint(profiles_dir)
+    assert store._fingerprint == (gp._dir_fingerprint(profiles_dir), gp._fallback_token())
 
     # A further edit reloads and re-commits, still matching the on-disk state.
     path.write_text(
@@ -905,7 +907,7 @@ def test_under_lock_restat_commits_fingerprint_of_published_snapshot(profiles_di
     )
     prof = gp.resolve_active_scope("cron:j:r")
     assert prof is not None and resolve(None, prof, "tools", "code").permitted
-    assert store._fingerprint == gp._dir_fingerprint(profiles_dir)
+    assert store._fingerprint == (gp._dir_fingerprint(profiles_dir), gp._fallback_token())
 
     # And the store has converged: a further access does NOT reload again.
     calls = {"n": 0}
@@ -1379,3 +1381,428 @@ def test_resolution_is_checked_before_bind_lookups(profiles_dir, monkeypatch):
     assert prof.name.startswith("_deny_all_unloaded"), prof.name
     assert not resolve(None, prof, "channels", "slack").permitted
     assert not looked_up, "resolution must be checked BEFORE any bind lookup"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# fallback_profile_names — visibility into which profiles are deny-all fallbacks
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_fallback_profile_names_empty_on_valid_profiles(profiles_dir):
+    """A correctly-parsed profile does not appear in fallback_profile_names."""
+    _write(
+        profiles_dir,
+        "host",
+        {
+            "name": "host",
+            "bind": {"type": "surface", "id": "host"},
+            "tools": {"mode": "allow", "allow": ["read"]},
+        },
+    )
+    assert gp.fallback_profile_names() == frozenset()
+
+
+def test_companion_edition_profile_with_unregistered_capability_stays_loaded(profiles_dir):
+    """A host.json naming a capability THIS build does not register must still load.
+
+    The internal edition registers extra ``capabilities.*`` rows and seeds them into
+    ``host.json``; a public build sharing the same data home has no such rows. The
+    profile must NOT degrade to the deny-all fallback (which showed every governance
+    row as "deny all" in the dashboard) — the unknown key is skipped and the known
+    controls keep governing.
+    """
+    _write(
+        profiles_dir,
+        "host",
+        {
+            "name": "host",
+            "bind": {"type": "surface", "id": "dashboard"},
+            "tools": {"mode": "allow", "allow": ["read"]},
+            "capabilities": {
+                "capability_install": {"enabled": True},
+                "external_access": {"enabled": True},
+                "spawn": {"enabled": True},
+            },
+        },
+    )
+    gp.reset_store()
+    assert gp.fallback_profile_names() == frozenset()
+    prof = gp.resolve_active_scope("dashboard:slot1")
+    assert prof is not None and prof.name == "host"
+    assert prof.unknown_scopes == (
+        "capabilities.capability_install",
+        "capabilities.external_access",
+    )
+    # Not the deny-all fallback: the declared allow-set survived.
+    tools = prof.get("tools")
+    assert tools is not None and tools.permits("read").permitted  # type: ignore[union-attr]
+
+    # L3: the record must survive the mtime/fingerprint reload path, not just the
+    # first load — a cached snapshot that dropped it would make the operator signal
+    # disappear on the next edit.
+    path = profiles_dir / "host.json"
+    body = json.loads(path.read_text())
+    body["tools"] = {"mode": "allow", "allow": ["read", "code"]}
+    path.write_text(json.dumps(body))
+    os.utime(path, (time.time() + 5, time.time() + 5))
+    reloaded = gp.resolve_active_scope("dashboard:slot1")
+    assert reloaded is not None and reloaded.name == "host"
+    assert reloaded.unknown_scopes == (
+        "capabilities.capability_install",
+        "capabilities.external_access",
+    )
+    assert gp.fallback_profile_names() == frozenset()
+    # …and the edit actually took effect, proving a fresh parse ran.
+    reloaded_tools = reloaded.get("tools")
+    assert reloaded_tools.permits("code").permitted  # type: ignore[union-attr]
+
+
+def test_companion_edition_profile_with_unregistered_narrowing_degrades_to_deny_all(
+    profiles_dir,
+):
+    """An unknown capability declared ``enabled: false`` must NOT be tolerated.
+
+    ``spwan`` is a typo for ``spawn``. Tolerating it would silently permit the
+    capability the operator tried to disable, so the profile fails closed and the
+    loader substitutes the bind-preserving deny-all fallback — loud, not silent.
+    """
+    _write(
+        profiles_dir,
+        "host",
+        {
+            "name": "host",
+            "bind": {"type": "surface", "id": "dashboard"},
+            "tools": {"mode": "allow", "allow": ["read"]},
+            "capabilities": {"spwan": {"enabled": False}},
+        },
+    )
+    gp.reset_store()
+    assert "host" in gp.fallback_profile_names()
+    prof = gp.resolve_active_scope("dashboard:slot1")
+    # Bound to its surface, but deny-all: the declared allow-set did NOT survive.
+    assert prof is not None
+    tools = prof.get("tools")
+    assert tools is not None and not tools.permits("read").permitted  # type: ignore[union-attr]
+    assert gp.unknown_profile_scopes() == {}
+
+
+def test_unknown_profile_scopes_reports_only_tolerated_profiles(profiles_dir):
+    """The operator-signal accessor names the tolerated keys per file stem."""
+    _write(
+        profiles_dir,
+        "host",
+        {
+            "name": "host",
+            "bind": {"type": "surface", "id": "dashboard"},
+            "capabilities": {"external_access": {"enabled": True}},
+        },
+    )
+    _write(
+        profiles_dir,
+        "cron-tight",
+        {
+            "name": "cron-tight",
+            "bind": {"type": "surface", "id": "cron"},
+            "capabilities": {"spawn": {"enabled": False}},
+        },
+    )
+    gp.reset_store()
+    assert gp.unknown_profile_scopes() == {"host": ("capabilities.external_access",)}
+
+
+def test_fallback_profile_names_includes_unreadable_file(profiles_dir, monkeypatch):
+    """A present-but-unreadable file lands in fallback_profile_names."""
+    path = profiles_dir / "host.json"
+    _write_host_profile(path)
+    _make_read_text_raise(monkeypatch, path, OSError("permission denied"))
+    gp.reset_store()
+    assert "host" in gp.fallback_profile_names()
+
+
+def test_fallback_profile_names_includes_invalid_utf8(profiles_dir):
+    """An invalid-encoding file lands in fallback_profile_names."""
+    path = profiles_dir / "cron.json"
+    path.write_bytes(b"\xff\xfe invalid utf8")
+    gp.reset_store()
+    assert "cron" in gp.fallback_profile_names()
+
+
+def test_fallback_profile_names_includes_invalid_json(profiles_dir):
+    """A file with invalid JSON lands in fallback_profile_names."""
+    (profiles_dir / "host.json").write_text("not valid json {{{")
+    gp.reset_store()
+    assert "host" in gp.fallback_profile_names()
+
+
+def test_fallback_profile_names_includes_invalid_schema(profiles_dir):
+    """A file with valid JSON but invalid schema lands in fallback_profile_names."""
+    _write(
+        profiles_dir,
+        "host",
+        {
+            "name": "host",
+            "bind": {"type": "surface", "id": "host"},
+            "tools": {"mode": "banana"},  # invalid mode
+        },
+    )
+    assert "host" in gp.fallback_profile_names()
+
+
+def test_fallback_profile_names_valid_profile_not_in_set(profiles_dir):
+    """A valid profile coexisting with a broken one does not appear in fallback."""
+    _write(
+        profiles_dir,
+        "cron",
+        {
+            "name": "cron",
+            "bind": {"type": "surface", "id": "cron"},
+            "tools": {"mode": "allow", "allow": ["read"]},
+        },
+    )
+    (profiles_dir / "broken.json").write_text("not json")
+    gp.reset_store()
+    names = gp.fallback_profile_names()
+    assert "broken" in names
+    assert "cron" not in names
+
+
+def test_fallback_profile_names_includes_broken_extends_chain(profiles_dir):
+    """A profile whose ``extends`` parent is missing is also a deny-all fallback.
+
+    This is the third substitution site in ``_reload`` and the least obvious one:
+    the file itself parses perfectly, so nothing about it looks broken — only the
+    unresolvable chain makes it deny-all. Without it recorded here the operator
+    sees the same total-lockdown page with no explanation, which is exactly the
+    symptom the fallback signal exists to remove.
+    """
+    _write(
+        profiles_dir,
+        "cron",
+        {
+            "name": "cron",
+            "bind": {"type": "surface", "id": "cron"},
+            "extends": "no-such-parent",
+            "tools": {"mode": "allow", "allow": ["read"]},
+        },
+    )
+    gp.reset_store()
+    assert "cron" in gp.fallback_profile_names()
+    # And the surface is still BOUND to that deny-all rather than falling through
+    # to the ceiling alone — the fail-closed invariant the branch exists for.
+    resolved = gp.resolve_active_scope("cron:job-7:run-1")
+    assert resolved is not None
+    assert resolved.name == "cron"
+
+
+def test_fallback_profile_names_excludes_a_valid_extends_chain(profiles_dir):
+    """The companion guard: a RESOLVABLE chain must not be reported as a fallback.
+
+    Without this, the assertion above would still pass if every ``extends`` user
+    were flagged, which would put a permanent false banner on a perfectly good
+    profile hierarchy.
+    """
+    _write(
+        profiles_dir,
+        "base",
+        {"name": "base", "tools": {"mode": "allow", "allow": ["read", "write"]}},
+    )
+    _write(
+        profiles_dir,
+        "cron",
+        {
+            "name": "cron",
+            "bind": {"type": "surface", "id": "cron"},
+            "extends": "base",
+            "tools": {"mode": "allow", "allow": ["read"]},
+        },
+    )
+    gp.reset_store()
+    assert gp.fallback_profile_names() == frozenset()
+
+
+def test_fallback_profile_names_bind_preserved_unreadable(profiles_dir, monkeypatch):
+    """A bind-preserving deny-all (from a prior load) still appears in fallback."""
+    import os
+
+    path = profiles_dir / "host.json"
+    _write_host_profile(path)
+    gp.reset_store()
+    # First load succeeds.
+    assert gp.fallback_profile_names() == frozenset()
+
+    # Make unreadable and bump mtime.
+    _make_read_text_raise(monkeypatch, path, OSError("permission denied"))
+    st = path.stat()
+    os.utime(path, (st.st_atime, st.st_mtime + 5))
+
+    assert "host" in gp.fallback_profile_names()
+
+
+# ── Configurable loosened fallback (policy top-level ``fallback``): when a
+#    profile FILE is unusable, an enterprise ceiling may substitute a looser
+#    profile than deny-all — e.g. deny only channels + apps, leave the basic
+#    operational planes (subagent/cron/heartbeat, tools, commands, fs, network) to
+#    the ceiling. Default (no ``fallback`` declared) stays deny-all. ──
+
+
+def test_policy_fallback_key_parses_into_ceiling():
+    from kiro_crew.platform.context import PlatformCompositionError
+    from kiro_crew.platform.governance import parse_policy
+
+    # Absent → None: the deny-all default is preserved (public edition unchanged).
+    c0 = parse_policy({"version": 1, "boot": {"fail_closed": True}})
+    assert c0.fallback_profile is None
+
+    # Present → a Profile that lists ONLY channels + apps (both denied), leaving
+    # every other plane ABSENT so the ceiling alone governs it.
+    c1 = parse_policy(
+        {
+            "version": 1,
+            "boot": {"fail_closed": True},
+            "fallback": {
+                "channels": {"members": {"mode": "allow", "allow": []}},
+                "apps": {"mode": "allow", "allow": []},
+            },
+        }
+    )
+    assert c1.fallback_profile is not None
+    # The two named planes are governed (present) and denied…
+    assert "channels" in c1.fallback_profile.controls
+    assert "apps" in c1.fallback_profile.controls
+    assert not resolve(None, c1.fallback_profile, "apps", "some-app").permitted
+    # …every unlisted plane is ABSENT, so the profile does not narrow it (the
+    # ceiling governs → permitted at the profile level).
+    assert "tools" not in c1.fallback_profile.controls
+    assert "capabilities.spawn" not in c1.fallback_profile.controls
+    assert resolve(None, c1.fallback_profile, "tools", "read").permitted
+    assert resolve(None, c1.fallback_profile, "capabilities.spawn", "researcher").permitted
+
+    # Non-dict fallback → fail closed at boot.
+    with pytest.raises(PlatformCompositionError):
+        parse_policy({"version": 1, "boot": {"fail_closed": True}, "fallback": []})
+    # A STRUCTURAL key inside the fallback (extends/name/bind/updates/fallback/…)
+    # would be silently dropped by _parse_controls, so it must fail closed rather
+    # than vanish — e.g. `fallback: {"extends": "lockdown"}` losing its intent.
+    with pytest.raises(PlatformCompositionError):
+        parse_policy(
+            {"version": 1, "boot": {"fail_closed": True}, "fallback": {"extends": "lockdown"}}
+        )
+    # An unknown scope INSIDE the fallback fails closed exactly like a real
+    # profile would (the fallback is parsed with the same scope validation).
+    with pytest.raises(PlatformCompositionError):
+        parse_policy(
+            {
+                "version": 1,
+                "boot": {"fail_closed": True},
+                "fallback": {"capabilities": {"zzz_not_a_scope": {"enabled": False}}},
+            }
+        )
+
+
+def _install_ceiling(monkeypatch, ceiling):
+    """Point governance_profiles' current_context() at a ceiling for the test."""
+    import types
+
+    from kiro_crew.platform import context as ctx_mod
+
+    monkeypatch.setattr(
+        ctx_mod, "current_context", lambda: types.SimpleNamespace(governance=ceiling)
+    )
+
+
+def test_unusable_profile_uses_declared_loosened_fallback(profiles_dir, monkeypatch):
+    # With a ceiling that declares a loosened fallback (deny only channels+apps),
+    # an unusable profile FILE falls back to THAT profile, NOT deny-all: the basic
+    # operational planes stay permitted, only channels + apps are denied.
+    from kiro_crew.platform.governance import parse_policy
+
+    ceiling = parse_policy(
+        {
+            "version": 1,
+            "boot": {"fail_closed": True},
+            "fallback": {
+                "channels": {"members": {"mode": "allow", "allow": []}},
+                "apps": {"mode": "allow", "allow": []},
+            },
+        }
+    )
+    _install_ceiling(monkeypatch, ceiling)
+
+    # Schema-invalid profile bound to the cron surface → unusable → fallback.
+    _write(
+        profiles_dir,
+        "cron",
+        {"name": "cron", "bind": {"type": "surface", "id": "cron"}, "tools": {"mode": "banana"}},
+    )
+    prof = gp.resolve_active_scope("cron:job-1:run-1")
+    assert prof is not None, "bound surface must resolve to the loosened fallback, not None"
+    # Only channels + apps are denied by the fallback…
+    assert "channels" in prof.controls and "apps" in prof.controls
+    assert not resolve(None, prof, "apps", "some-app").permitted
+    # …the basic operational planes are left to the ceiling (NOT deny-all'd).
+    assert resolve(
+        None, prof, "capabilities.spawn", "researcher"
+    ).permitted, "spawn must stay available under the loosened fallback"
+    assert resolve(None, prof, "tools", "read").permitted
+
+
+def test_unusable_profile_defaults_to_deny_all_without_declared_fallback(profiles_dir, monkeypatch):
+    # No declared fallback (governance present but fallback_profile is None) →
+    # deny-all is preserved: the public/default posture is unchanged.
+    from kiro_crew.platform.governance import parse_policy
+
+    _install_ceiling(monkeypatch, parse_policy({"version": 1, "boot": {"fail_closed": True}}))
+    _write(
+        profiles_dir,
+        "cron",
+        {"name": "cron", "bind": {"type": "surface", "id": "cron"}, "tools": {"mode": "banana"}},
+    )
+    prof = gp.resolve_active_scope("cron:job-1:run-1")
+    assert prof is not None
+    assert not resolve(None, prof, "tools", "read").permitted
+    assert not resolve(None, prof, "capabilities.spawn", "researcher").permitted  # deny-all
+
+
+def test_declared_fallback_applies_after_governance_composes(profiles_dir, monkeypatch):
+    # Boot-order race guard: if the store is first touched BEFORE governance
+    # composes, an unusable profile bakes deny-all. Once governance composes with a
+    # declared fallback, the NEXT resolve must pick it up WITHOUT any file mtime
+    # change — the fallback token folded into the freshness key forces one reload.
+    # Without that token the baked deny-all would persist until a file changed,
+    # silently ignoring the declared fallback (the boot-order race the fix closes).
+    import types
+
+    from kiro_crew.platform import context as ctx_mod
+    from kiro_crew.platform.governance import parse_policy
+
+    _write(
+        profiles_dir,
+        "cron",
+        {"name": "cron", "bind": {"type": "surface", "id": "cron"}, "tools": {"mode": "banana"}},
+    )
+
+    # Phase 1: governance not composed yet → deny-all baked into the snapshot.
+    monkeypatch.setattr(ctx_mod, "current_context", lambda: types.SimpleNamespace(governance=None))
+    prof1 = gp.resolve_active_scope("cron:job-1:run-1")
+    assert prof1 is not None
+    assert not resolve(None, prof1, "capabilities.spawn", "researcher").permitted
+
+    # Phase 2: governance composes with a declared loosened fallback. NO file change.
+    ceiling = parse_policy(
+        {
+            "version": 1,
+            "boot": {"fail_closed": True},
+            "fallback": {
+                "channels": {"members": {"mode": "allow", "allow": []}},
+                "apps": {"mode": "allow", "allow": []},
+            },
+        }
+    )
+    monkeypatch.setattr(
+        ctx_mod, "current_context", lambda: types.SimpleNamespace(governance=ceiling)
+    )
+    prof2 = gp.resolve_active_scope("cron:job-1:run-1")
+    assert prof2 is not None
+    assert resolve(
+        None, prof2, "capabilities.spawn", "researcher"
+    ).permitted, "declared fallback must apply once governance composes, without a file change"

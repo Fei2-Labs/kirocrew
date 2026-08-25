@@ -9,6 +9,8 @@ from pathlib import Path
 from sage_lib import learning as L  # noqa: N812
 from sage_lib import store
 
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
+
 
 def _pattern(title, repo="github.com/o/r", guidance="do the thing carefully", **kw):
     p = {"title": title, "scope": "common", "repo_identity": repo, "dimension": "security",
@@ -186,6 +188,7 @@ class TestStagingRefusesPlantedLinks(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_staging_does_not_follow_a_planted_symlink(self):
         secret = self.root / "credentials"
         secret.write_text("aws_secret_access_key = SHOULD-NEVER-BE-READ\n",
@@ -266,12 +269,14 @@ class TestGuardedCandidateReads(unittest.TestCase):
         cf.symlink_to(secret)
         return cf
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_list_candidate_does_not_publish_a_planted_link(self):
         """This feeds the dashboard, so an unguarded read is an egress path."""
         self._plant()
         rendered = repr(L.list_candidate(self.root))
         self.assertNotIn("NEVER-READ", rendered)
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_selective_clear_does_not_reserialize_a_planted_link(self):
         cf = self._plant()
         L.clear_candidate(self.root, None, only_ids=["nope"])
@@ -296,6 +301,7 @@ class TestCandidateLockRefusesPlantedLockFile(unittest.TestCase):
         ns_dir.mkdir(parents=True, exist_ok=True)
         return ns_dir / "candidate.md.lock"
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_symlinked_lock_file_does_not_truncate_its_target(self):
         victim = self.root / "precious.txt"
         victim.write_text("KEEP-ME\n", encoding="utf-8")
@@ -391,6 +397,7 @@ class TestCandidateLockPortability:
         lock = L._namespace_dir("default", tmp_path) / "candidate.md.lock"
         assert lock.is_file()
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_symlink_is_still_refused_without_the_flag(self, tmp_path, monkeypatch):
         monkeypatch.delattr(L.os, "O_NOFOLLOW", raising=False)
         ns = L._namespace_dir("default", tmp_path)

@@ -400,6 +400,28 @@ export interface IssueStateResponse {
   state_reason: string | null
 }
 
+/** Thrown by `setIssueAssignees` on a 409: somebody else changed the assignees
+ * between the read this client rendered and the write. Carries the set the forge
+ * actually holds so the caller can re-render instead of retrying blindly. */
+export class AssigneesConflictError extends Error {
+  current: string[]
+  constructor(message: string, current: string[]) {
+    super(message)
+    this.name = 'AssigneesConflictError'
+    this.current = current
+  }
+}
+
+/** Response to an assignee edit — the issue's authoritative assignee logins
+ * after the replace. Read back from the provider (not the request), because a
+ * success is not required to be an exact echo (GitLab Free keeps only one). */
+export interface IssueAssigneesResponse {
+  owner: string
+  repo: string
+  number: number
+  assignees: string[]
+}
+
 /** The pull-request actions the UI can invoke on ONE PR.
  *
  * Merging comes in two forms and neither can land code the repo's rules have not
@@ -816,6 +838,35 @@ async function parseErrorBody(r: Response): Promise<string> {
   }
 }
 
+/** One dependency edge in the repo's dependency graph: `blocked` cannot proceed
+ * until `blocker` is closed/merged. `source` records where the edge came from —
+ * `native` is a GitHub-native issue dependency; `inferred` is derived from
+ * timeline cross-references (and never written back to GitHub). */
+export interface DepEdge {
+  blocked: number
+  blocker: number
+  source: 'native' | 'inferred'
+}
+
+/** A node in the dependency graph's node map, keyed by its number as a string.
+ * A thin descriptor the client joins against the live issue/PR list rows where
+ * present, and falls back to when a referenced number is not in the loaded list. */
+export interface DepNode {
+  kind: 'issue' | 'pull'
+  state: 'open' | 'closed' | 'merged'
+  title: string
+}
+
+/** The `GET /api/apps/issue-radar/deps` payload. Schema-versioned so a client
+ * can refuse a shape it does not understand rather than mis-render it. */
+export interface DepsResponse {
+  schema: number
+  fetched_at?: string
+  edges: DepEdge[]
+  /** Node descriptors keyed by number-as-string (e.g. `"5190"`). */
+  nodes: Record<string, DepNode>
+}
+
 /** The full identity of a connected repository.
  *
  * A ref is `owner`/`repo` plus the provider and — for self-managed instances —
@@ -833,8 +884,12 @@ export interface RepoRef {
   host?: string
 }
 
-/** Which forge a repo lives on. */
-export type SourceProvider = 'github' | 'gitlab'
+/** Which forge a repo lives on.
+ *
+ * `azure` is Azure DevOps on `dev.azure.com`, where `owner` carries
+ * `{organization}/{project}` — a slash-joined pair, the same way `owner` carries a
+ * nested group path on GitLab. */
+export type SourceProvider = 'github' | 'gitlab' | 'azure'
 
 /** Which provider account an account-scoped endpoint should ask about.
  *
@@ -1316,6 +1371,46 @@ export const issueRadarApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...repoBody(ref), number, state, state_reason: stateReason }),
     })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** REPLACE an issue's assignees with `assignees` (the FINAL set of logins, not
+   * an add/remove delta). Requires triage/push access (403 otherwise). An empty
+   * array clears all assignees; a junk entry is a 400, never a silent clear.
+   *
+   * `expected` is the set you last READ and is REQUIRED: the write only lands if
+   * the forge still holds it. That is what stops replace semantics from silently
+   * erasing a concurrent edit — two people who each add one name would otherwise
+   * have the later write overwrite the earlier addition. A stale `expected` throws
+   * {@link AssigneesConflictError} carrying the current set; re-render from it and
+   * let the user redo the edit rather than retrying the same body.
+   *
+   * A login the forge will not assign is a 400 whose `error` sentence names the
+   * refused logins (the body also carries `invalid_assignees`), and NOTHING is
+   * applied — GitHub answers 422 for the whole request and GitLab is pre-checked
+   * against the project roster. Rendering the thrown message is therefore already
+   * actionable; it is not an upstream failure to retry.
+   *
+   * On success the returned `assignees` is read back from the write rather than
+   * echoed from the request, because a success is not required to be an exact echo
+   * (GitLab Free keeps only the first assignee) — render THAT. */
+  setIssueAssignees: async (
+    ref: RepoRef, number: number, assignees: string[], expected: string[],
+  ): Promise<IssueAssigneesResponse> => {
+    const r = await fetch(`${API}/issue/assignees`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), number, assignees, expected }),
+    })
+    if (r.status === 409) {
+      const body = (await r.json().catch(() => ({}))) as { error?: string; assignees?: string[] }
+      throw new AssigneesConflictError(
+        body.error || i18nT('apps.issueRadar.api.assignees_changed_elsewhere'),
+        body.assignees ?? [],
+      )
+    }
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },
@@ -1852,6 +1947,18 @@ export const issueRadarApi = {
       // an object and never falls back to reading loose fields.
       body: JSON.stringify({ ...repoBody(ref), settings: patch }),
     })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** The repo's dependency edges (blocked-by / blocking) + a node map, for the
+   * Graph tab and the detail-pane "Blocked by / Blocking" section. Cache-first,
+   * like `/issues`. The backend route lands in a SEPARATE PR (M1), so callers
+   * must treat a 404/500/empty answer as "no dependency data yet" and render a
+   * designed empty state rather than an error — see GraphView / DepsSection. */
+  deps: async (ref: RepoRef): Promise<DepsResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/deps?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },

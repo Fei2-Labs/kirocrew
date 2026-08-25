@@ -392,8 +392,8 @@ class FolderWatcher:
             if idx and idx % _PAUSE_RECHECK_FILES == 0:
                 paused = self._is_paused(source_id)
             if paused:
-                self._flush_last_seen(last_seen_batch)
-                self.store.db.commit()
+                await asyncio.to_thread(
+                    self._flush_last_seen_and_commit, last_seen_batch)
                 return {**stats, "status": "paused"}
 
             state = existing.get(file_path)
@@ -467,10 +467,14 @@ class FolderWatcher:
             # file has changed, so that claim now points at the wrong document and
             # has to go before the new content lands.
             if state:
-                self.store.release_stale_claim(
-                    source_id, state.get("content_hash"), content_hash,
+                await asyncio.to_thread(
+                    self.store.release_stale_claim,
+                    source_id,
+                    state.get("content_hash"),
+                    content_hash,
                     json.loads(state.get("item_ids", "[]") or "[]"),
-                    state.get("text_hash"))
+                    state.get("text_hash"),
+                )
 
             # New or changed file — ingest
             if state and state.get("status") == "done":
@@ -530,8 +534,8 @@ class FolderWatcher:
                         stats["budget_reached"] = 1
                         break
 
-        self._flush_last_seen(last_seen_batch)
-        self.store.db.commit()  # Batch commit for all non-crash-recovery updates
+        await asyncio.to_thread(
+            self._flush_last_seen_and_commit, last_seen_batch)
         # Always report chunks consumed so the caller can track global budget.
         stats["chunks_ingested"] = chunks_ingested
         # Targeted cross-source dedup for each newly ingested/changed file, so a folder
@@ -791,6 +795,22 @@ class FolderWatcher:
             batch)
         batch.clear()
 
+    def _flush_last_seen_and_commit(self, batch: list[tuple[str, str, str]]) -> None:
+        """Apply the accumulated last-seen touches and commit them.
+
+        Exists so the caller can offload BOTH in a single ``asyncio.to_thread``
+        hop. ``store.db`` is a thread-local connection, so two separate hops are
+        not equivalent to one: the default executor is free to run them on
+        different workers, and the commit would then land on a different
+        connection than the ``executemany`` it is meant to commit.
+
+        The commit deliberately does not run in a ``finally``. A failed flush has
+        nothing to commit, and the exception propagates to the caller exactly as
+        it did when both statements ran inline.
+        """
+        self._flush_last_seen(batch)
+        self.store.db.commit()
+
     def _is_paused(self, source_id: str) -> bool:
         """Check if source has scan_paused flag set."""
         row = self.store.db.execute(
@@ -888,10 +908,90 @@ class FolderWatcher:
             now = datetime.now().isoformat()
             self._update_state(source_id, file_path, "", 0, json.dumps(old_item_ids), now, "failed", "sensitive path blocked")
             return None, "failed"
-        try:
-            before_ids = {r["id"] for r in self.store.db.execute(
-                "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()}
 
+        # The pipeline reports the items it created through `on_committed`, which
+        # it invokes INSIDE its own `run_to_completion` finalize hop -- the same
+        # uncancellable unit that commits them (see `_finalize` in ingestion.py).
+        # Taking the ids from there, instead of reading them back afterwards, is
+        # what makes two separate hazards unreachable:
+        #
+        # * No query. The previous before/after diff read the source's ENTIRE
+        #   item-id set twice per file. `idx_items_source_id` keeps that an index
+        #   scan, but it still materializes one row per item in the SOURCE --
+        #   ~20k rows apiece on a large folder source, measured at >1s each --
+        #   synchronously on the event loop, which trips the loop-stall watchdog
+        #   and crash-loops the gateway.
+        # * No await after the commit. ANY await between the pipeline's commit
+        #   and this function's return is an orphan window: a shutdown cancelling
+        #   there leaves committed items that no `folder_file_state` row names,
+        #   so the next scan re-ingests the file and duplicates them while the
+        #   first group stays untracked and undeletable. Offloading the reads
+        #   would have introduced exactly that window; not needing them removes
+        #   it. `test_knowledge_ingest_scan_off_loop.py` ratchets both properties.
+        #
+        # `on_committed` fires only on the fully-successful branch, so it also
+        # replaces the `sources.sync_status` read that used to detect a partial
+        # rollback -- and it does so per call, rather than reading a column a
+        # concurrent ingest on the same source can flip.
+        committed: list[str] | None = None
+
+        def _record_committed(item_ids: list[str]) -> None:
+            # Runs INSIDE the pipeline's finalize hop, on its worker thread --
+            # the same uncancellable unit that commits the group. Persisting the
+            # row HERE, not just capturing the ids in memory, is what closes the
+            # remaining orphan window: the pipeline awaits again after the
+            # finalize hop (`generate_source_summary`), so a shutdown cancelling
+            # there would otherwise leave a committed group that only this
+            # closure remembers -- the caller's own state write never runs, the
+            # 'scanning' marker survives, and the next sweep re-ingests the file
+            # alongside the untracked first group.
+            #
+            # A targeted UPDATE, not `_write_state_row`: the 'scanning' marker
+            # the caller wrote before invoking us already carries the file's
+            # content hash and mtime, which this frame does not have. Every call
+            # site writes that marker first, so the row is always there to hit.
+            # `status='done'` also clears the retry budget, matching every other
+            # terminal write. The caller's own 'done' write (same values) still
+            # lands afterwards on the uncancelled path, which keeps this order-
+            # independent. `store.db` is per-thread and, on this worker,
+            # autocommit -- no separate commit hop, no transaction to interleave.
+            nonlocal committed
+            committed = list(item_ids)
+            # Fail-safe, never fail-closed: the write below is a durability
+            # UPGRADE over the in-memory capture, not a precondition. Before it
+            # existed this callback could not raise; letting a raise escape now
+            # would poison the finalize hop AFTER the group has committed and
+            # the superseded items are deleted -- the pipeline would report the
+            # whole ingest failed, the caller would write a terminal 'failed'
+            # row, and the next sweep would re-ingest alongside the committed
+            # group: exactly the duplication this write exists to prevent. On
+            # a swallowed error the memory path still stands and the caller's
+            # own 'done' write persists the group on the uncancelled path; the
+            # exposure shrinks back to the cancellation window, never past the
+            # pre-write behavior. Writer-lock contention past busy_timeout
+            # (e.g. a large concurrent import_bundle) is the realistic raiser.
+            try:
+                text_hash: str | None = None
+                if committed:
+                    row = self.store.db.execute(
+                        "SELECT content_hash FROM items WHERE id = ?",
+                        (committed[0],)).fetchone()
+                    if row:
+                        text_hash = row["content_hash"]
+                self.store.db.execute(
+                    "UPDATE folder_file_state SET item_ids = ?, text_hash = ?, "
+                    "status = 'done', error_message = NULL, attempts = 0, "
+                    "last_seen = ? WHERE source_id = ? AND file_path = ?",
+                    (json.dumps(committed), text_hash,
+                     datetime.now().isoformat(), source_id, file_path))
+                self.store.db.commit()
+            except Exception:
+                logger.warning(
+                    "could not persist committed group for %s inside the "
+                    "commit callback; deferring to the caller's state write",
+                    file_path, exc_info=True)
+
+        try:
             # Hand the pipeline the path that was just validated, not the one that
             # was validated a moment earlier -- re-deriving it there would reopen the
             # window this check closed. The display name still comes from the logical
@@ -900,24 +1000,22 @@ class FolderWatcher:
                 resolved, source_id=source_id, namespace=namespace,
                 original_name=Path(file_path).name,
                 old_item_ids=old_item_ids,
+                on_committed=_record_committed,
                 on_duplicate=on_duplicate)
 
             if job_id and (self.pipeline.get_job_status(job_id) or {}).get(
                     "status") == DUPLICATE_JOB_STATUS:
                 return [], "deduped"
 
-            # Detect partial failure (pipeline rolls back but doesn't raise)
-            row = self.store.db.execute(
-                "SELECT sync_status FROM sources WHERE id = ?", (source_id,)).fetchone()
-            if row and row["sync_status"] == "error":
+            # Detect partial failure (pipeline rolls back but doesn't raise): the
+            # finalize hop reports a committed group only on the branch that
+            # commits one, so an unset `committed` IS the rollback signal.
+            if committed is None:
                 now = datetime.now().isoformat()
                 self._update_state(source_id, file_path, "", 0, json.dumps(old_item_ids), now, "failed", "partial ingestion failure")
                 return None, "failed"
 
-            after_ids = {r["id"] for r in self.store.db.execute(
-                "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()}
-
-            return list(after_ids - before_ids), "done"
+            return committed, "done"
         except Exception as e:
             logger.exception("Failed to ingest %s", file_path)
             now = datetime.now().isoformat()

@@ -631,7 +631,31 @@ def add_connected_repo(
 # on the server. Any provider not listed here is matched case-SENSITIVELY -- the
 # fail-safe default for an authorization gate, so an unknown/self-managed
 # provider never silently widens the allowlist to case-variants.
+#
+# Azure DevOps is deliberately ABSENT. Its documented uniqueness rule for both
+# project names and Git repository names is "must not be identical", which does
+# not state a case-folding rule; the naming-restrictions page states one
+# explicitly only for Artifacts FEED names ("can't differ from another feed name
+# only by capitalization"), and that explicit contrast is evidence against
+# assuming the same for projects and repos. Listing it on an unverified
+# assumption is the one direction that fails unsafely: it would merge two
+# distinct projects' caches and admit a case-variant through the gate. It can be
+# added once the behaviour is confirmed against a real organization.
 _CASE_INSENSITIVE_NAME_PROVIDERS = frozenset({"github"})
+
+
+def name_compare_key(name: str, provider: str) -> str:
+    """``name`` reduced to the form ``provider``'s case semantics compare on.
+
+    The ONE definition of "same name" for a provider. A caller that needs a dict
+    or set key rather than a pairwise comparison -- a probe memo, a
+    connected-repo membership test -- goes through this instead of hand-rolling a
+    ``.casefold()``, so it cannot drift from :func:`_name_matches` and start
+    disagreeing with the authorization gate about which names are the same.
+    """
+    if provider.lower() in _CASE_INSENSITIVE_NAME_PROVIDERS:
+        return name.casefold()
+    return name
 
 
 def _name_matches(a: str, b: str, provider: str) -> bool:
@@ -644,9 +668,7 @@ def _name_matches(a: str, b: str, provider: str) -> bool:
     case-variant of a connected GitLab project pass the gate and then resolve to
     a DIFFERENT project under the owner's credentials.
     """
-    if provider.lower() in _CASE_INSENSITIVE_NAME_PROVIDERS:
-        return a.casefold() == b.casefold()
-    return a == b
+    return name_compare_key(a, provider) == name_compare_key(b, provider)
 
 
 def _same_repo(
@@ -1057,7 +1079,13 @@ def write_issue_ai_cache(
 
     Stamped with ``generated_at`` so the UI can show how old the summary is —
     without it a cached card gives no hint whether it was written minutes or
-    months ago."""
+    months ago.
+
+    ``ui_language`` (the BCP-47 tag the prose was generated under, ``""`` for
+    English-default installs) rides along because a cached result is only
+    servable for the language it was written in — the route compares it on
+    read and treats a mismatch as a miss, so a dashboard-language switch
+    regenerates instead of serving the old language."""
     atomic_write(
         issue_ai_cache_path(owner, repo, number, root),
         json.dumps(
@@ -1065,6 +1093,7 @@ def write_issue_ai_cache(
                 "owner": owner, "repo": repo, "number": int(number),
                 "summary": payload.get("summary", ""),
                 "suggested_labels": payload.get("suggested_labels", []),
+                "ui_language": str(payload.get("ui_language") or ""),
                 "generated_at": _now_iso(),
             },
             indent=2,
@@ -1073,9 +1102,11 @@ def write_issue_ai_cache(
 
 
 def read_issue_ai_cache(owner: str, repo: str, number: int, root: Path | None = None) -> dict | None:
-    """Return ``{"summary", "suggested_labels", "generated_at"}`` for a cached
-    issue, or None. Caches written before the stamp existed fall back to the
-    file's mtime (see _cache_generated_at)."""
+    """Return ``{"summary", "suggested_labels", "ui_language", "generated_at"}``
+    for a cached issue, or None. Caches written before the stamp existed fall
+    back to the file's mtime (see _cache_generated_at); ones written before
+    ``ui_language`` existed read as ``""``, which matches the English-default
+    sentinel so legacy entries stay servable on unconfigured installs."""
     path = issue_ai_cache_path(owner, repo, number, root)
     if not path.is_file():
         return None
@@ -1086,6 +1117,7 @@ def read_issue_ai_cache(owner: str, repo: str, number: int, root: Path | None = 
     return {
         "summary": data.get("summary", ""),
         "suggested_labels": data.get("suggested_labels", []),
+        "ui_language": str(data.get("ui_language") or ""),
         "generated_at": _cache_generated_at(data, path),
     }
 
@@ -1325,6 +1357,159 @@ def drop_tagging_suggestions(
         return {"suggestions": remaining, "generated_at": current["generated_at"]}
 
 
+# ── dependency-edge cache (blocked-by / blocking graph) ──────────────────────
+#
+# One document per repo holding the dependency DAG for its OPEN work items: the
+# GitHub-native blocked-by edges plus the ones we infer from timeline
+# cross-references. Schema-versioned exactly like ISSUES_CACHE_SCHEMA — a stale
+# or missing stamp reads as a MISS (returns None) so the /deps route refetches
+# with the current edge shape rather than serving a graph missing a field.
+#
+#   v1: {schema, fetched_at, edges:[{blocked, blocker, source}], nodes:{...}}
+DEPS_CACHE_SCHEMA = 1
+
+# How long a synced dependency graph is served before it is considered stale.
+#
+# This constant has TWO consumers with DIFFERENT needs, which is why it stays at
+# ten minutes even though the /deps route alone would be happy with hours:
+#
+#   * the /deps route, which since serve-stale-revalidate-behind no longer blocks
+#     a request on an expired cache (it returns the stale graph and refreshes in
+#     the background), so for the route this TTL governs how often a BACKGROUND
+#     rebuild fires and a long value would be harmless;
+#   * crew_runtime._read_or_refresh_deps, the sweep that feeds SIG_DEP_UNBLOCKED.
+#     For the sweep this TTL IS the freshness horizon on which a crew waiting for
+#     its blocker to merge gets woken, so raising it directly delays that wake.
+#
+# Serve-stale already removes the ~11s stall a user could hit here, so there is
+# nothing left to buy by stretching it -- and the cost would land on the sweep,
+# not on the route that wanted it. Decoupling the two horizons (a long refresh
+# interval for the route, a short one for the sweep) is a separate change.
+DEPS_CACHE_TTL_SEC = 600.0
+
+# Edge provenance. A native edge is one GitHub itself records via the
+# dependencies API; an inferred edge is backfilled from a timeline
+# cross-reference so the graph is useful in repos where nobody sets native
+# dependencies. A native edge WINS over an inferred duplicate (see
+# _normalize_deps).
+DEP_SOURCE_NATIVE = "native"
+DEP_SOURCE_INFERRED = "inferred"
+_DEP_SOURCES = (DEP_SOURCE_NATIVE, DEP_SOURCE_INFERRED)
+
+
+def deps_cache_path(owner: str, repo: str, root: Path | None = None) -> Path:
+    return repo_data_dir(owner, repo, root) / "deps-cache.json"
+
+
+def _normalize_deps(
+    edges: Any, nodes: Any
+) -> tuple[list[dict], dict[str, dict]]:
+    """Coerce a raw deps payload to ``(edges, nodes)`` in the stored shape.
+
+    Deliberately tolerant: a partially-written or hand-edited document should
+    degrade to a smaller graph, never break the /deps route. Edges are
+    deduplicated on the ``(blocked, blocker)`` pair with a NATIVE edge winning
+    over an inferred duplicate (a self-edge, or one with a non-positive number,
+    is dropped). ``nodes`` keeps only well-formed entries keyed by the number as
+    a string, matching the on-the-wire JSON object-key type.
+    """
+    by_pair: dict[tuple[int, int], dict] = {}
+    if isinstance(edges, list):
+        for raw in edges:
+            if not isinstance(raw, dict):
+                continue
+            raw_blocked = raw.get("blocked")
+            raw_blocker = raw.get("blocker")
+            if raw_blocked is None or raw_blocker is None:
+                continue
+            try:
+                blocked = int(raw_blocked)
+                blocker = int(raw_blocker)
+            except (TypeError, ValueError):
+                continue
+            if blocked <= 0 or blocker <= 0 or blocked == blocker:
+                continue
+            source = raw.get("source")
+            if source not in _DEP_SOURCES:
+                source = DEP_SOURCE_INFERRED
+            pair = (blocked, blocker)
+            existing = by_pair.get(pair)
+            # Native wins: only overwrite an existing entry when the newcomer is
+            # native and the incumbent is not, so a native edge is never demoted
+            # to inferred by a later duplicate.
+            if existing is None or (
+                source == DEP_SOURCE_NATIVE
+                and existing.get("source") != DEP_SOURCE_NATIVE
+            ):
+                by_pair[pair] = {"blocked": blocked, "blocker": blocker, "source": source}
+    out_edges = [by_pair[p] for p in sorted(by_pair)]
+
+    out_nodes: dict[str, dict] = {}
+    if isinstance(nodes, dict):
+        for key, val in nodes.items():
+            try:
+                number = int(key)
+            except (TypeError, ValueError):
+                continue
+            if number <= 0 or not isinstance(val, dict):
+                continue
+            out_nodes[str(number)] = {
+                "kind": str(val.get("kind") or "issue"),
+                "state": str(val.get("state") or "open"),
+                "title": str(val.get("title") or ""),
+            }
+    return out_edges, out_nodes
+
+
+def read_deps_cache(owner: str, repo: str, root: Path | None = None) -> dict | None:
+    """Return ``{"edges", "nodes", "fetched_at"}`` for a repo, or None when the
+    graph has never been synced.
+
+    An unreadable file, or one written under an older ``DEPS_CACHE_SCHEMA`` (or
+    with no stamp at all), is treated as a MISS — same guard as every other
+    cache — so the route refetches with the current edge shape.
+    """
+    path = deps_cache_path(owner, repo, root)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != DEPS_CACHE_SCHEMA:
+        return None  # stale schema → treat as a miss so the route refetches
+    edges, nodes = _normalize_deps(data.get("edges"), data.get("nodes"))
+    fetched_at = data.get("fetched_at")
+    return {
+        "edges": edges,
+        "nodes": nodes,
+        "fetched_at": float(fetched_at)
+        if isinstance(fetched_at, (int, float)) and not isinstance(fetched_at, bool)
+        else 0.0,
+    }
+
+
+def write_deps_cache(
+    owner: str, repo: str, edges: list[dict], nodes: dict[str, dict],
+    *, root: Path | None = None,
+) -> None:
+    """Store the dependency graph for a repo, stamping the current schema and the
+    fetch time. Edges/nodes are normalized on the way in (native-wins dedup,
+    self-edges dropped) so a caller cannot persist a malformed graph."""
+    norm_edges, norm_nodes = _normalize_deps(edges, nodes)
+    atomic_write(
+        deps_cache_path(owner, repo, root),
+        json.dumps(
+            {
+                "schema": DEPS_CACHE_SCHEMA, "owner": owner, "repo": repo,
+                "fetched_at": time.time(),
+                "edges": norm_edges, "nodes": norm_nodes,
+            },
+            indent=2,
+        ),
+    )
+
+
 def add_label_to_cache(owner: str, repo: str, label: dict, *, root: Path | None = None) -> None:
     """Append a newly-created label to the labels cache so the pickers show it
     immediately. No-op when the cache doesn't exist yet (a later refresh fetches
@@ -1466,6 +1651,44 @@ def apply_state_change_to_caches(
             kept = [i for i in issues if i.get("number") != int(number)]
             if len(kept) != len(issues):
                 data["issues"] = kept
+                atomic_write(path, json.dumps(data, indent=2))
+
+
+def apply_assignees_change_to_caches(
+    owner: str, repo: str, number: int, assignees: list[str], *, root: Path | None = None
+) -> None:
+    """Patch an issue's assignees in the detail cache + whichever list cache
+    holds it, so the sidebar and the row reflect the change without a refetch.
+
+    ``assignees`` is the authoritative full set of logins returned by the write.
+    Both the detail payload and the list row store assignees as a bare login
+    list, so the same value writes to both."""
+    logins = [a for a in assignees if a]
+
+    dpath = issue_detail_cache_path(owner, repo, number, root)
+    if dpath.is_file():
+        try:
+            d = json.loads(dpath.read_text(encoding="utf-8"))
+            if isinstance(d.get("detail"), dict):
+                d["detail"]["assignees"] = logins
+                atomic_write(dpath, json.dumps(d, indent=2))
+        except json.JSONDecodeError:
+            pass
+
+    for st in ("open", "closed"):
+        # Hold the lock across read AND write, matching the label patch: a
+        # concurrent full refresh would otherwise land between them and be
+        # clobbered by this stale copy.
+        with issues_cache_lock(owner, repo, root, st):
+            data, path = _load_list_cache(owner, repo, root, st)
+            if not data:
+                continue
+            changed = False
+            for iss in data.get("issues", []):
+                if iss.get("number") == int(number):
+                    iss["assignees"] = logins
+                    changed = True
+            if changed:
                 atomic_write(path, json.dumps(data, indent=2))
 
 

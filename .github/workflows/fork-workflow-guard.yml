@@ -1,8 +1,9 @@
 name: Fork Workflow-Change Guard
 
-# Blocks a FORK pull request that modifies CI/workflow files under `.github/**`
+# Flags a FORK pull request that modifies CI/workflow files under `.github/**`
 # — the vector a fork could use to fake basic-CI results (rewrite ci.yml to pass)
-# or tamper with CODEOWNERS/other automation.
+# or tamper with CODEOWNERS/other automation. This posts an ADVISORY check-run
+# signal; it is not itself a merge gate (see the enforcement note below).
 #
 # WHY DETERMINISTIC (no model): "does the diff touch .github/**" is a file-path
 # check — a grep on the authentic changed-file list is 100% reliable, instant,
@@ -16,8 +17,14 @@ name: Fork Workflow-Change Guard
 #
 # OVERRIDE: a maintainer who has reviewed a legitimate workflow change applies
 # the `allow-fork-workflow-change` label; the guard then re-evaluates green.
-# Complements a CODEOWNERS rule on `.github/workflows/**` (which forces review;
-# this enforces it as a required, blocking check).
+# ENFORCEMENT (what actually stops a malicious fork workflow change): this
+# guard is an advisory signal only — it is NOT listed in any branch/ruleset
+# `required_status_checks` and pr-readiness.yml does not consult it. The real
+# protection is two-fold: (1) fork workflow_run jobs require maintainer approval
+# before they run (repo "require approval for all external contributors"
+# setting), and (2) the catch-all `*` rule in CODEOWNERS forces code-owner
+# review, which covers `.github/**` by inheritance. Wiring this guard in as a
+# required, blocking check is a maintainer policy decision, not yet configured.
 
 on:
   workflow_run:

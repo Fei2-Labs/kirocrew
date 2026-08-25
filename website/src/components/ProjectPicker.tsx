@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, RefObject } from 'react'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { createPortal } from 'react-dom'
 import { FolderOpen, ChevronRight, ChevronLeft, Clock, Search } from 'lucide-react'
 import { api } from '../api/client'
@@ -16,6 +17,7 @@ interface Props {
 export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRect, onSelect }: Props) {
   const [tab, setTab] = useState<'recent' | 'browse'>('recent')
   const [input, setInput] = useState('')
+  const ime = useImeGuard()
   const [browsePath, setBrowsePath] = useState('')
   const [browseParent, setBrowseParent] = useState('')
   const [browseDirs, setBrowseDirs] = useState<{ name: string; path: string }[]>([])
@@ -188,7 +190,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
                   placeholder={i18nT('components.projectPicker.search_recent_projects_2')}
                   value={recentQuery}
                   onChange={e => setRecentQuery(e.target.value)}
-                  className="w-full bg-bg-elevated border border-border rounded pl-7 pr-3 py-1.5 text-[13px] text-text placeholder:text-muted focus:outline-none focus:border-accent"
+                  className="w-full bg-bg-elevated border border-border rounded pl-7 pr-3 py-1.5 text-[13px] text-text placeholder:text-muted focus:outline-none focus-visible:border-accent"
                 />
               </div>
             </div>
@@ -237,13 +239,16 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
               placeholder={i18nT('components.projectPicker.path_to_project')}
               value={input}
               onChange={e => setInput(e.target.value)}
+              {...ime.bindComposition()}
               onKeyDown={e => {
                 const n = filteredBrowse.length
                 const commit = () => { const p = input.trim() || browsePath; if (p) select(p) }
                 if (e.key === 'ArrowDown') { e.preventDefault(); setBrowseSel(s => (n ? Math.min(s + 1, n - 1) : 0)) }
                 else if (e.key === 'ArrowUp') { e.preventDefault(); setBrowseSel(s => Math.max(s - 1, 0)) }
                 else if (e.key === 'Enter') {
-                  e.preventDefault()
+                  // Rule 2: the handler also carries the arrow keys, so only the
+                  // Enter path is claimed — arrow navigation stays untouched.
+                  if (!ime.claimEnter(e)) return
                   if (e.metaKey || e.ctrlKey) commit()                               // ⌘/Ctrl+Enter commits the current dir
                   else if (n > 0 && filteredBrowse[browseSel]) browse(filteredBrowse[browseSel].path)  // Enter drills into the highlighted folder
                   else commit()                                                       // nothing to drill into -> commit typed path
@@ -251,9 +256,20 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
                 else if (e.key === 'ArrowLeft' && e.currentTarget.selectionStart === 0 && e.currentTarget.selectionEnd === 0 && browseParent && browseParent !== browsePath) {
                   e.preventDefault(); browse(browseParent)                            // caret at start -> go to parent
                 }
-                else if (e.key === 'Escape' || e.key === 'Tab') { e.preventDefault(); onOpenChange(false); btnRef?.current?.focus() }
+                else if (e.key === 'Escape' || e.key === 'Tab') {
+                  // This input is a composable free-text path field. An Escape
+                  // or Tab the IME owns is cancelling or cycling the candidate
+                  // list, not leaving the picker — acting on it would close the
+                  // popover and yank focus mid-composition. `claimKey` claims
+                  // through this input's own tracked latch (the
+                  // `bindComposition` spread above feeds it) and owns the
+                  // whole decline: native consumption per the latch contract,
+                  // and the synthetic propagation stop React ancestors read.
+                  if (!ime.claimKey(e)) return
+                  e.preventDefault(); onOpenChange(false); btnRef?.current?.focus()
+                }
               }}
-              className="flex-1 bg-bg-elevated border border-border rounded px-2 py-1.5 text-[13px] font-mono text-text placeholder:text-muted focus:outline-none focus:border-accent"
+              className="flex-1 bg-bg-elevated border border-border rounded px-2 py-1.5 text-[13px] font-mono text-text placeholder:text-muted focus:outline-none focus-visible:border-accent"
             />
             <button disabled={!input.trim() && !browsePath} onMouseDown={e => { e.preventDefault(); select(input.trim() || browsePath) }} className="px-2 py-1 text-[11px] bg-accent/20 text-accent rounded hover:bg-accent/30 disabled:opacity-40 disabled:cursor-not-allowed shrink-0">{i18nT('components.projectPicker.select')}</button>
           </div>

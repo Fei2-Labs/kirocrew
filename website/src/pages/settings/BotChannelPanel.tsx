@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, Check, AlertTriangle, Lock } from 'lucide-react'
-import { SettingsSection, SettingsCard, SettingsInput, SettingsToggle } from '../../components/settings'
+import { SettingsSection, SettingsCard, SettingsInput, SettingsSelect, SettingsToggle } from '../../components/settings'
 import { SecretField } from '../../components/SecretField'
 import { Btn } from '../../components/ui'
 import { TagListEditor } from './SlackPanel'
@@ -23,10 +23,20 @@ export interface BotChannelConfigData {
   allowed_thread_ids?: string[]
   /** Explicit allow-everyone opt-in (optional; only WeCom sends this). */
   allow_all_users?: boolean
+  /** Shared-channel config (optional; only Discord sends these). */
+  allowed_channel_ids?: string[]
+  auto_thread?: boolean
+  /** Progress-display config (optional; only Discord sends these). */
+  reactions_enabled?: boolean
+  show_thinking?: boolean
   soft_threshold_pct: number
+  /** Spoken answers (optional; only channels declaring `voiceReplies` send it). */
+  voice_replies?: boolean
   /** Telegram forum per-topic config (optional; only Telegram sends these). */
   allow_forum?: boolean
   allowed_forum_chat_ids?: string[]
+  /** When to answer inside an allow-listed forum topic (optional; Telegram). */
+  forum_activation?: string
   /** Sidebar folder this channel's sessions are filed into ("" = off). */
   session_folder?: string
 }
@@ -43,9 +53,17 @@ export interface BotChannelConfigSave {
   allowed_thread_ids?: string[]
   /** Explicit allow-everyone opt-in (optional; only WeCom sends this). */
   allow_all_users?: boolean
+  /** Shared-channel config (optional; only Discord sends these). */
+  allowed_channel_ids?: string[]
+  auto_thread?: boolean
+  /** Progress-display config (optional; only Discord sends these). */
+  reactions_enabled?: boolean
+  show_thinking?: boolean
   soft_threshold_pct: number
+  voice_replies?: boolean
   allow_forum?: boolean
   allowed_forum_chat_ids?: string[]
+  forum_activation?: string
   session_folder?: string
 }
 
@@ -107,6 +125,17 @@ export interface BotChannelSpec {
   thresholdDescription: string
   /** Fail-closed hint shown when enabled + token set but allowlist empty. */
   emptyAllowlistHint: string
+  /**
+   * Optional reasoning toggle. Present only for a channel that can render a
+   * collapsed quote after the answer; a channel that omits it never sends the
+   * field, so its save payload is unchanged.
+   */
+  showThinking?: { label: string; description: string }
+  /**
+   * Optional spoken-answer toggle. Present only for a channel that can upload
+   * synthesized audio; a channel that omits it never sends the field.
+   */
+  voiceReplies?: { label: string; description: string }
   /** Optional shared-thread allow-list rendered below user access controls. */
   threadAllowlist?: {
     label: string
@@ -114,6 +143,29 @@ export interface BotChannelSpec {
     placeholder: string
     help: ReactNode
     warning: ReactNode
+  }
+  /**
+   * Optional shared-channel allow-list (Discord server channels). When present,
+   * the panel renders a channel-id tag editor plus the auto-thread toggle;
+   * channels that omit it (Telegram, Webex) are unaffected and never send
+   * ``allowed_channel_ids`` or ``auto_thread``.
+   */
+  sharedChannels?: {
+    label: string
+    description: string
+    placeholder: string
+    help: ReactNode
+    warning: ReactNode
+    autoThreadLabel: string
+    autoThreadDescription: string
+    /** Config path the auto-thread toggle writes, for `<SettingRef>` deep-links. */
+    autoThreadConfigKey: string
+    /**
+     * Hint shown while auto-thread is off and channels are listed. An allowed
+     * channel is only ever answered in a thread promoted from the message, so an
+     * off toggle makes every listed channel inert rather than answered in place.
+     */
+    autoThreadOffHint: string
   }
   /**
    * Optional forum/per-topic config (Telegram supergroups). When present, the
@@ -128,6 +180,34 @@ export interface BotChannelSpec {
     allowlistPlaceholder: string
     /** Fail-closed hint shown when the toggle is on but the list is empty. */
     emptyHint: string
+    /**
+     * Optional activation selector: when the bot answers inside an allow-listed
+     * topic. Values are the backend's own modes, so the option list and the
+     * labels stay positionally paired.
+     */
+    activation?: {
+      label: string
+      description: string
+      hint: string
+      options: string[]
+      optionLabels: string[]
+    }
+  }
+  /**
+   * Optional progress-display toggles rendered in the Behavior card: how much of
+   * a running turn the channel shows (the phase-reaction ladder, and whether the
+   * model's reasoning is surfaced). Channels that omit it are unaffected and
+   * never send ``reactions_enabled`` or ``show_thinking``.
+   */
+  progressDisplay?: {
+    reactionsLabel: string
+    reactionsDescription: string
+    /** Config path the reactions toggle writes, for `<SettingRef>` deep-links. */
+    reactionsConfigKey: string
+    thinkingLabel: string
+    thinkingDescription: string
+    /** Config path the thinking toggle writes, for `<SettingRef>` deep-links. */
+    thinkingConfigKey: string
   }
   /** API calls. */
   getConfig: () => Promise<BotChannelConfigData>
@@ -141,9 +221,15 @@ type Draft = {
   allowed_user_ids: string[]
   allowed_thread_ids: string[]
   allow_all_users: boolean
+  allowed_channel_ids: string[]
+  auto_thread: boolean
+  reactions_enabled: boolean
+  show_thinking: boolean
   soft_threshold_pct: string
+  voice_replies: boolean
   allow_forum: boolean
   allowed_forum_chat_ids: string[]
+  forum_activation: string
   /** Whether this channel files its sessions in a folder at all (off = unfiled). */
   session_folder_on: boolean
   /** Folder name, kept while the toggle is off so turning it back on restores it. */
@@ -156,9 +242,24 @@ function draftFrom(c: BotChannelConfigData): Draft {
     allowed_user_ids: [...c.allowed_user_ids],
     allowed_thread_ids: [...(c.allowed_thread_ids ?? [])],
     allow_all_users: !!c.allow_all_users,
+    allowed_channel_ids: [...(c.allowed_channel_ids ?? [])],
+    // Defaults ON, matching the backend default: `!!c.auto_thread` would read a
+    // channel that never sends the field as an explicit opt-out and then save
+    // that false back over a config the user never touched.
+    auto_thread: c.auto_thread ?? true,
+    // Same default-ON reasoning as `auto_thread` above: an absent field means
+    // "this channel does not send it", never "the user opted out".
+    reactions_enabled: c.reactions_enabled ?? true,
+    // Default OFF, so `!!` is the faithful read here: reasoning stays private
+    // until someone asks for it.
+    show_thinking: !!c.show_thinking,
     soft_threshold_pct: String(c.soft_threshold_pct),
+    voice_replies: !!c.voice_replies,
     allow_forum: !!c.allow_forum,
     allowed_forum_chat_ids: [...(c.allowed_forum_chat_ids ?? [])],
+    // Falls back to the backend's own default rather than to "", which is not a
+    // valid mode and would post a value the loader then has to reject.
+    forum_activation: c.forum_activation || 'always',
     // A configured name IS the on-state — the backend has one field, where ""
     // means off, so the toggle is derived rather than separately persisted.
     session_folder_on: !!c.session_folder,
@@ -284,9 +385,20 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
     }
     if (spec.threadAllowlist) payload.allowed_thread_ids = draft.allowed_thread_ids
     if (spec.allowAll) payload.allow_all_users = draft.allow_all_users
+    if (spec.sharedChannels) {
+      payload.allowed_channel_ids = draft.allowed_channel_ids
+      payload.auto_thread = draft.auto_thread
+    }
+    if (spec.showThinking) payload.show_thinking = draft.show_thinking
+    if (spec.voiceReplies) payload.voice_replies = draft.voice_replies
     if (spec.forum) {
       payload.allow_forum = draft.allow_forum
       payload.allowed_forum_chat_ids = draft.allowed_forum_chat_ids
+      if (spec.forum.activation) payload.forum_activation = draft.forum_activation
+    }
+    if (spec.progressDisplay) {
+      payload.reactions_enabled = draft.reactions_enabled
+      payload.show_thinking = draft.show_thinking
     }
     // Off sends "" (the field's off-state); on with a blank name falls back to
     // the channel's own name, which is what the toggle's description promises.
@@ -454,6 +566,46 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
         </SettingsCard>
       </SettingsSection>
 
+      {/* ── Shared channels (optional; Discord server channels) ── */}
+      {spec.sharedChannels && (
+        <SettingsSection title={i18nT('pages.settings.botChannelPanel.shared_channels')}>
+          <SettingsCard index={3}>
+            <TagListEditor
+              label={spec.sharedChannels.label}
+              description={spec.sharedChannels.description}
+              values={draft.allowed_channel_ids}
+              placeholder={spec.sharedChannels.placeholder}
+              onChange={v => upd({ allowed_channel_ids: v })}
+              validate={v => /^\d+$/.test(v)}
+              readOnly={ro}
+            />
+            <p className="text-[12px] text-muted mt-2 mb-0">
+              {spec.sharedChannels.help}
+            </p>
+            <p className="text-[12px] text-warn mt-2 mb-0 flex items-start gap-1.5">
+              <AlertTriangle size={13} className="flex-none mt-0.5" />
+              <span>{spec.sharedChannels.warning}</span>
+            </p>
+            <div className="border-t border-border mt-4 pt-4">
+              <SettingsToggle
+                label={spec.sharedChannels.autoThreadLabel}
+                description={spec.sharedChannels.autoThreadDescription}
+                configKey={spec.sharedChannels.autoThreadConfigKey}
+                checked={draft.auto_thread}
+                onChange={v => upd({ auto_thread: v })}
+                disabled={ro}
+              />
+              {!draft.auto_thread && draft.allowed_channel_ids.length > 0 && (
+                <p className="text-[12px] text-warn mt-2 mb-0 flex items-start gap-1.5">
+                  <AlertTriangle size={13} className="flex-none mt-0.5" />
+                  <span>{spec.sharedChannels.autoThreadOffHint}</span>
+                </p>
+              )}
+            </div>
+          </SettingsCard>
+        </SettingsSection>
+      )}
+
       {/* ── Forum topics (optional; Telegram supergroups) ── */}
       {spec.forum && (
         <SettingsSection title={i18nT('pages.settings.botChannelPanel.forum_topics')}>
@@ -484,6 +636,20 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
                 </p>
               )}
             </div>
+            {spec.forum.activation && (
+              <div className="border-t border-border mt-4 pt-4">
+                <SettingsSelect
+                  label={spec.forum.activation.label}
+                  description={spec.forum.activation.description}
+                  hint={spec.forum.activation.hint}
+                  value={draft.forum_activation}
+                  options={spec.forum.activation.options}
+                  optionLabels={spec.forum.activation.optionLabels}
+                  onChange={v => upd({ forum_activation: v })}
+                  disabled={ro}
+                />
+              </div>
+            )}
           </SettingsCard>
         </SettingsSection>
       )}
@@ -499,6 +665,48 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
             placeholder="80"
             disabled={ro}
           />
+          {spec.progressDisplay && (
+            <>
+              <SettingsToggle
+                label={spec.progressDisplay.reactionsLabel}
+                description={spec.progressDisplay.reactionsDescription}
+                configKey={spec.progressDisplay.reactionsConfigKey}
+                checked={draft.reactions_enabled}
+                onChange={v => upd({ reactions_enabled: v })}
+                disabled={ro}
+              />
+              <SettingsToggle
+                label={spec.progressDisplay.thinkingLabel}
+                description={spec.progressDisplay.thinkingDescription}
+                configKey={spec.progressDisplay.thinkingConfigKey}
+                checked={draft.show_thinking}
+                onChange={v => upd({ show_thinking: v })}
+                disabled={ro}
+              />
+            </>
+          )}
+          {spec.showThinking && (
+            <div className="border-t border-border mt-4 pt-4">
+              <SettingsToggle
+                label={spec.showThinking.label}
+                description={spec.showThinking.description}
+                checked={draft.show_thinking}
+                onChange={v => upd({ show_thinking: v })}
+                disabled={ro}
+              />
+            </div>
+          )}
+          {spec.voiceReplies && (
+            <div className="border-t border-border mt-4 pt-4">
+              <SettingsToggle
+                label={spec.voiceReplies.label}
+                description={spec.voiceReplies.description}
+                checked={draft.voice_replies}
+                onChange={v => upd({ voice_replies: v })}
+                disabled={ro}
+              />
+            </div>
+          )}
           {/* Optional per-channel session filing. Off by default: sessions from
               this channel stay unfiled in the sidebar, as before. */}
           <div className="border-t border-border mt-4 pt-4">

@@ -33,7 +33,7 @@ from kiro_crew.acp.client import (
 )
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead, AcpRuntimeError, AcpSessionHandle
 from kiro_crew.acp.session_handle import WatchdogSettings
-from kiro_crew.acp.types import STOP_REASON_END_TURN
+from kiro_crew.acp.types import ACP_BACKENDS_KIRO_IDENTITY_STORE, STOP_REASON_END_TURN
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.mcp_gateway.claim import schedule_claim
@@ -175,7 +175,7 @@ class AcpSessionProvider(LLMProvider):
         """
         if self._owns_runtime:
             try:
-                await self._runtime.kill()
+                await self._runtime.kill(expected=True)  # deliberate session teardown
             except Exception:
                 logger.debug("AcpSessionProvider.shutdown: runtime kill failed", exc_info=True)
         else:
@@ -189,17 +189,35 @@ class AcpSessionProvider(LLMProvider):
             # prompt on that sessionId with "already in progress". So cancel the
             # session's turn first (best-effort, bounded so an unresponsive
             # runtime can't turn shutdown into a hang), then destroy the handle.
-            if self._handle.is_turn_active:
-                try:
-                    await asyncio.wait_for(self._handle.cancel(), timeout=5.0)
-                except Exception:
-                    logger.debug(
-                        "AcpSessionProvider.shutdown: session cancel failed", exc_info=True
-                    )
+            # The destroy is in a `finally` because the cancel above can be
+            # left through a door `except Exception` does not cover:
+            # `asyncio.CancelledError` is a `BaseException`. That is not a
+            # theoretical exit — the session-restart path runs
+            # `asyncio.wait_for(p.shutdown(), timeout=_SHUTDOWN_TIMEOUT_SECS)`
+            # inside an `asyncio.gather`, so both a shutdown that outruns the
+            # budget and a cancelled restart task deliver a cancellation into
+            # this coroutine, at whatever await it is sitting on.
+            #
+            # Sequentially, that skipped the destroy entirely — and the destroy
+            # is where this arm's two invariants live: `terminate_session`
+            # evicts the session from the SHARED kiro-cli process (it is the
+            # only RSS reclaim on a runtime nothing here is allowed to kill),
+            # and the transcript unlink is the only thing that removes
+            # `~/.kiro/sessions/cli/{sid}.json(+.jsonl)`, as the comment below
+            # says. Nothing retries: every caller drops the provider afterwards.
             try:
-                await self._handle.destroy()
-            except Exception:
-                logger.debug("AcpSessionProvider.shutdown: destroy failed", exc_info=True)
+                if self._handle.is_turn_active:
+                    try:
+                        await asyncio.wait_for(self._handle.cancel(), timeout=5.0)
+                    except Exception:
+                        logger.debug(
+                            "AcpSessionProvider.shutdown: session cancel failed", exc_info=True
+                        )
+            finally:
+                try:
+                    await self._handle.destroy()
+                except Exception:
+                    logger.debug("AcpSessionProvider.shutdown: destroy failed", exc_info=True)
             # destroy() deletes the shared-subagent session transcript
             # (~/.kiro/sessions/cli/{sid}.json+.jsonl); no separate cleanup call
             # needed. cleanup_session() below remains for the LLMProvider API.
@@ -253,14 +271,34 @@ class AcpSessionProvider(LLMProvider):
         return await self._guarded(self._handle.steer(message))
 
     @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the handle's last steer (0.0 if never steered)."""
+        return float(getattr(self._handle, "last_steer_monotonic", 0.0) or 0.0)
+
+    @property
     def supports_steer(self) -> bool:
         """True when the backing handle supports mid-turn steer (kiro-cli)."""
         return self._handle.supports_steer
 
     async def stream_command(self, command: str) -> AsyncIterator[LLMEvent]:
-        """Execute a slash command via prompt (kiro handles commands in-prompt)."""
-        async for event in self.stream(command):
-            yield event
+        """Execute a slash command natively via ``_kiro.dev/commands/execute``.
+
+        Routes through AcpSessionHandle.stream_command so kiro-cli executes the
+        command itself and returns its structured output deterministically —
+        no LLM round-trip. (Previously delegated to stream(), which sent the
+        command through session/prompt: a full model turn that summarized the
+        output instead of returning it.) The handle keeps /compact, /help, and
+        non-kiro backends (KAS) on the prompt transport — see its docstring.
+        Same exception translation as stream(): everything leaving this
+        surface stays within AcpError.
+        """
+        try:
+            async for event in self._handle.stream_command(command):
+                yield event
+        except AcpRuntimeDead as exc:
+            raise self._translate_dead(exc) from exc
+        except AcpRuntimeError as exc:
+            raise AcpError(str(exc)) from exc
 
     def _translate_dead(self, exc: AcpRuntimeDead) -> AcpProcessDied | AcpAuthRequired:
         """Map a shared-runtime death (AcpRuntimeDead — an AcpRuntimeError OUTSIDE
@@ -427,6 +465,17 @@ class AcpSessionProvider(LLMProvider):
         session under the kiro label.
         """
         return self._runtime.acp_backend
+
+    @property
+    def uses_kiro_identity_store(self) -> bool:
+        """True when this provider's child signs in from kiro-cli's own store.
+
+        Membership in ``ACP_BACKENDS_KIRO_IDENTITY_STORE`` (harness-parity
+        H5/H14), read off the runtime's backend for the same reason
+        :attr:`backend` is: this provider fronts whichever backend the runtime
+        spawned.
+        """
+        return self._runtime.acp_backend in ACP_BACKENDS_KIRO_IDENTITY_STORE
 
     def has_active_turn(self) -> bool:
         """True if a prompt turn is currently in progress.

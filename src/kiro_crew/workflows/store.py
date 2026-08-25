@@ -8,7 +8,7 @@ rerun / restart-subtree all keep working — and a successful run's script stays
 reusable.
 
 Layout: ``<workflows.dir>/runs/<run_id>.json`` — one self-contained file per run
-(``RunHandle.to_store_json``). JSON only (BSC12 — never pickle/marshal). Writes are
+(``RunHandle.to_store_json``). JSON only — never pickle/marshal. Writes are
 atomic (temp file + ``os.replace``) so a crash mid-write can't corrupt a run file.
 
 The store is a thin, side-effect-only persistence layer: the registry owns the
@@ -126,7 +126,15 @@ class WorkflowRunStore:
             tmp.write_text(payload, encoding="utf-8")
             os.replace(tmp, path)  # atomic on POSIX
             try:
-                os.chmod(path, 0o600)
+                # POSIX tightening only, deliberately NOT
+                # ``platform_compat.restrict_to_owner``: that helper spawns
+                # ``icacls`` on Windows (a blocking subprocess), and ``save``
+                # runs on the event loop via the registry's persist hooks,
+                # where a blocking call freezes every gateway task. The
+                # payload is already passed through ``_redact`` above, so
+                # what a wider Windows DACL could expose is the redacted
+                # run record, not credentials.
+                os.chmod(path, 0o600)  # lockdown-ok: #5228 -- icacls would block the event loop
             except OSError:
                 pass
         except Exception:  # noqa: BLE001 - persistence must never break a run

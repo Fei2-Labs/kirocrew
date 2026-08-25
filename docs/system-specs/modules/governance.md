@@ -448,8 +448,72 @@ The Slack posture check itself stays policy-only (a profile cannot carry
 `posture`, Rule 6).
 
 Profiles hot-reload via an mtime fingerprint (`ProfileStore`); a schema-invalid
-profile falls back to deny-all (Validation rule 5), **not** the ceiling.
-`extends` is monotonic narrowing (`compose_profiles`).
+profile falls back to deny-all (Validation rule 5), **not** the ceiling — unless
+the policy declares a top-level `fallback` profile (see *Configurable fallback*
+below), which is substituted instead. `extends` is monotonic narrowing
+(`compose_profiles`).
+
+**Configurable fallback (policy-only).** By default the substitute for an unusable
+profile is the most-restrictive deny-all. A policy MAY declare a top-level
+`fallback` object — parsed as a narrow-only profile (same scope validation; an
+unknown scope in it fails closed at boot, on both sides of the key-open asymmetry
+described below, because it is part of the policy document rather than a profile
+file) — which the loader substitutes at all
+three unusable-file sites instead of deny-all. Intersected with the ceiling like
+any profile, it can only narrow it: it lets an operator keep the basic operational
+planes available (subagent/cron/heartbeat/taskrunner) while still denying the
+sensitive ones (for example `channels`/`apps`) when a profile file cannot be
+loaded. Absent the key the fallback stays deny-all (the default is unchanged). A
+profile may NOT declare `fallback` (policy-only, rejected at parse). The chosen
+fallback is resolved against the composed ceiling, and the profile-store freshness
+key folds in whether a fallback is declared, so a store first-touched before the
+ceiling composed reloads once it does rather than baking deny-all permanently.
+
+**Unknown `capabilities.*` child in a PROFILE — tolerated ONLY when `enabled: true`.**
+An unknown governed key normally fails closed. The one exception is a child of a
+*key-open* namespace (`capabilities`) inside a **profile file**, and it is
+deliberately **asymmetric**:
+
+- **A payload of exactly `{"enabled": true}` (that one key, boolean identity) →
+  tolerated.** `parse_profile` skips it, logs a warning naming the profile and the
+  key, and records it on `Profile.unknown_scopes`. Known siblings in the same block
+  still parse and still enforce.
+- **Anything else → fails closed** exactly as before the tolerance existed
+  (`enabled: false`, `enabled` absent, a non-dict value, a non-boolean `enabled`,
+  or **any extra key beyond `enabled`** — capability payloads carry inner
+  narrowing rulesets like `spawn.agents`, so `{"enabled": true, "agents": {...}}`
+  is an enable-plus-narrowing whose narrowing must not be dropped), so the loader
+  substitutes the bind-preserving deny-all fallback.
+
+The tolerated side exists because cross-edition data-home sharing is supported: an
+edition that `register_scope`s extra capability rows seeds them into `host.json`
+with `enabled: true`, and a build without those rows used to reject the whole
+profile and degrade the surface to deny-all (every governance row reading "deny
+all"). It is safe because a profile is narrow-only and the intersection is applied
+by `resolve` (rule-2 intersect of ceiling ∘ profile) — declining to narrow an
+unregistered scope cannot change any decision in any build.
+
+The fail-closed side exists because an unknown **narrowing** is indistinguishable
+from a typo'd narrowing of a core capability: `{"spwan": {"enabled": false}}` reads
+exactly like a failed attempt to disable `spawn`. Tolerating it would silently grant
+what the operator tried to deny, so the loud deny-all fallback is the correct
+outcome — it surfaces the typo.
+
+**Accepted design consequence.** One residual class is knowingly not caught: a
+typo'd capability name that carries `enabled: true` (for example
+`{"spwan": {"enabled": true}}`) is tolerated rather than surfaced as an error. This
+is inert by the argument above — the declaration could not have changed a decision
+whether it was honored or skipped — so the cost is a missed diagnostic, not a
+permission change. `Profile.unknown_scopes`, surfaced in the Security page's
+governance payload as `unknown_profile_scopes`, is what makes that class visible.
+
+Three things are deliberately unchanged: a **policy** naming an unknown key still
+raises regardless of `enabled` (tamper-evidence, Rule 8); the policy's top-level
+`fallback` object — parsed as a profile body but not through `parse_profile` — still
+fails closed at boot; and an unknown **top-level** governed family in a profile
+still fails closed. The tolerance assumes `SCOPE_CATALOG` is **append-only** (a
+scope is added or retired, never renamed in place), else a renamed row declared
+`enabled: true` would be silently tolerated instead of surfacing as a migration.
 
 **Present-but-unrecoverable profile — governed fleet fails closed, standalone is
 lenient.** The reload reads each file's bytes SEPARATELY from parsing and handles
@@ -876,7 +940,34 @@ ALLOWED turn in the channel could otherwise pull it into agent context), the
 `handle_message` keeps its own gate as defense-in-depth for its OTHER entry points
 (interaction re-dispatch, synthetic sends). **`!stop` (cancellation) is the sole
 exemption** — a denied channel must still be able to halt a runaway session it
-previously started; `!restart` is NOT cancellation and stays gated. The OPTIONS
+previously started; `!restart` is NOT cancellation and stays gated.
+
+The exemption is **channel-neutral**, not Slack-only. `messaging/dispatch.py`'s
+`inbound_permitted(channel_type, *, text, has_attachments)` carries it for every
+channel on the shared pipeline, via `is_pure_cancel()`. Two properties make it
+safe to state that broadly. The match is whole-message, so `/stop the presses`
+is an ordinary sentence rather than a cancel, and an ATTACHMENT-bearing message
+is never exempt: a channel that fetches media after authorization would
+otherwise let a denied channel trigger a download by attaching a file to the one
+word that skips the gate. Both arguments default to the gated behaviour, so a
+caller that does not pass them is unchanged. This matters most where the channel
+has no widgets: with `max_buttons=0` a typed `/stop` is the only cancel
+affordance the operator has.
+
+`_CANCEL_ALIASES` is the recognised set, and it is a MIRROR of the per-channel
+command tables (`/stop`, `/cancel`, Discord's `!` bang forms, WeCom's `停止`),
+which is the one thing about this exemption that has actually gone wrong: WeCom
+shipped `停止` in its own table and on its `/help` card while the shared set knew
+only the ASCII spellings, leaving a denied WeCom conversation with no reachable
+off-switch in the language that channel exists for. Deriving the union in
+`messaging/` would invert the dependency — the shared layer importing all nine
+channel packages — so the tripwire is a test
+(`test_messaging_dispatch.py::test_the_shared_set_covers_the_channel_command_tables`)
+which DISCOVERS the channel tables by walking the packages, checks both
+directions (an alias no channel accepts is an exemption granted to a dead word),
+and fails on a table shape it cannot parse rather than skipping it. An earlier
+version named Discord and Telegram by hand and was blind to the three channels
+that diverged, which is the same mirror one level up. The OPTIONS
 Send / legacy-choice buttons are gated at dispatch BEFORE they edit/post the
 selection to the channel (their re-dispatched turn is gated too, but the message
 edit precedes it); the spent-marker `_done_` no-op posts nothing and stays exempt.
@@ -900,7 +991,8 @@ scope a release or the companion registers), intersects each boot-frozen POLICY
 control with the host-surface PROFILE control using the model's own
 `_compose_controls`, and reports
 `{scope, archetype, governed, source, scope_note, detail}` per scope plus
-`{version, has_policy, profile, surface, other_bound_surfaces, unavailable}`.
+`{version, has_policy, profile, surface, other_bound_surfaces, fallback_profiles,
+unavailable}`.
 
 **A row describes ONE surface, and must say which.** The host profile governs
 in-process host actions, so it legitimately pins capabilities the host process
@@ -919,6 +1011,28 @@ switched off. Two fields keep that honest:
   control, count, or rule from those profiles, so the POSTURE-only boundary below
   is unchanged. This answers the question a host-scoped row provokes: *is cron
   really off, or is that just the host's ceiling?*
+- **`fallback_profiles`** — file stems of every profile currently replaced by the
+  fallback built-in — deny-all by default, or the policy's declared `fallback`
+  profile (from `governance_profiles.fallback_profile_names()`), sorted.
+  **Names only**, same exposure contract as `other_bound_surfaces`: a stem is not
+  rule content, so the POSTURE-only boundary is unchanged. `_reload` substitutes
+  that built-in at three sites — a present-but-unreadable file, a file whose JSON
+  or schema does not parse, and a file that parses but `extends` a parent that is
+  missing or chained — and enforcement is correct in all three. What is NOT correct
+  without this field is the *display*: the substitute reports `source: "profile"`,
+  so an unusable file renders identically to a deliberate operator lockdown, and an
+  operator has to read server logs to tell them apart.
+
+  Reported as the whole SET rather than a flag for the host-resolved profile, for
+  two reasons. A bound non-host profile deny-alls its own surface just as silently
+  while appearing in `other_bound_surfaces` looking healthy. And a flag derived by
+  matching a resolved profile's declared `name` against file stems mislabels a
+  profile whose name collides with a broken sibling's stem, whereas these ARE the
+  stems.
+
+  One documented gap: a first-ever load of an unreadable file has no salvageable
+  bind, so it is an UNBOUND deny-all. Its stem appears here, but no surface
+  resolves to it — that surface falls back to the ceiling rather than being denied.
 
 **Posture, not contents (security boundary).** The serialized `detail` carries
 only POSTURE — set `mode`, entry COUNTS (`allow_count`/`deny_count`),
@@ -1217,8 +1331,13 @@ scope growth without server-recorded grants is not covered by this decision.
 
 The anonymous daily heartbeat and official-app install receipt (`beacon.py` and
 `apps/install_receipt.py`; full spec in [metrics.md](metrics.md) → "Anonymous
-outbound telemetry") are the repo's **only default-on egress family**. Both use
-fixed anonymous payloads and the same effective-enable ladder. They are governed
+outbound telemetry"), together with the in-app session-pulse survey
+(`dashboard/handlers/feedback.py`), are the repo's **only default-on egress
+family**. All three gate on the same `beacon.telemetry_permitted` effective-enable
+ladder. The heartbeat and install receipt send fixed anonymous payloads; the
+survey egresses the user's own submitted answers plus an anonymous per-install
+id (`beacon.install_id`), and only once that same ladder — including the
+first-run privacy disclosure — permits it. They are governed
 by the `capabilities.telemetry` `SCOPE_CATALOG` capability row
 (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
 change, mirroring the theme rows above).
@@ -1429,9 +1548,12 @@ Two things computer use still shares with this module, neither of them a decisio
 ## Audit
 
 `sel.log_governance_decision` records a `governance_decision` event
-(`outcome ∈ {allowed, denied}` — the existing permit vocabulary). On-disk SEL is
-not redacted by the writer and the HMAC chain signs the bytes as written, so the
-operation / item / reason are redacted via `redact_via_context` **before** `log`.
+(`outcome ∈ {allowed, denied}` — the existing permit vocabulary). The SEL writer
+applies the baseline credential/exfiltration passes to `metadata` values and the
+free-form top-level strings (`operation` / `resources` / `error`) before
+persisting, but `redact_via_context` is broader than those passes — so the
+operation / item / reason are ALSO redacted via `redact_via_context` **before**
+`log`; the writer's pass is a second layer, not a replacement.
 
 ## CLI
 

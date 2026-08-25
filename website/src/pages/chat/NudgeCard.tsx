@@ -39,6 +39,19 @@ export function parseNudgeMessage(
 }
 
 /**
+ * The chip's one-line label for a nudge turn.
+ *
+ * Exported because the pinned-prompt banner shows the same label for a pinned
+ * nudge: two spellings of this ternary over the same two keys would drift the
+ * moment the chip's wording changes.
+ */
+export function nudgeLabel(cycle: number | null): string {
+  return cycle !== null
+    ? i18nT('pages.chat.nudgeCard.auto_nudge_cycle', { count: cycle })
+    : i18nT('pages.chat.nudgeCard.auto_nudge')
+}
+
+/**
  * True when this nudge row belongs to the loop that is currently active.
  *
  * The Loop button opens the popover for whatever loop is bound to the slot
@@ -73,21 +86,21 @@ export default memo(function NudgeCard({
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   const { cycle, body } = parseNudgeMessage(message)
   const firstLine = body.split('\n').find(l => l.trim().length > 0)?.trim() ?? ''
-  const label = cycle !== null ? i18nT('pages.chat.nudgeCard.auto_nudge_cycle', { count: cycle }) : i18nT('pages.chat.nudgeCard.auto_nudge')
+  const label = nudgeLabel(cycle)
 
   return (
     <div
-      className="self-center w-full max-w-full min-w-0 rounded-md border border-border bg-card text-muted animate-scale-in"
+      className="self-center w-full max-w-full min-w-0 rounded-md ring-1 ring-inset forced-colors:border ring-border bg-card text-muted animate-scale-in"
       data-testid="nudge-card"
       data-cycle={cycle ?? ''}
     >
-      <div className="flex items-center gap-1.5 px-2.5 py-1.5 min-w-0">
+      <div className="flex items-center gap-2 px-3 py-2 min-w-0">
         <button
           type="button"
           onClick={() => setExpanded(v => !v)}
           aria-expanded={expanded}
           aria-label={expanded ? i18nT('pages.chat.nudgeCard.hide_nudge_instructions') : i18nT('pages.chat.nudgeCard.show_nudge_instructions')}
-          className="flex items-center gap-1.5 min-w-0 flex-1 text-left text-[13px] hover:text-fg transition-colors"
+          className="flex items-center gap-2 min-w-0 flex-1 text-left text-[13px] leading-5 hover:text-fg transition-colors"
           data-testid="nudge-card-toggle"
         >
           <ChevronRight
@@ -98,14 +111,14 @@ export default memo(function NudgeCard({
           <RefreshCw size={13} className="lucide-inline shrink-0" aria-hidden="true" />
           <span className="font-medium shrink-0">{label}</span>
           {!expanded && firstLine && (
-            <span className="truncate text-[12px] opacity-70 min-w-0">{firstLine}</span>
+            <span className="truncate text-[12px] leading-5 opacity-70 min-w-0">{firstLine}</span>
           )}
         </button>
         {onOpenLoop && (
           <button
             type="button"
             onClick={onOpenLoop}
-            className="shrink-0 text-[11px] px-1.5 py-0.5 rounded border border-border hover:text-fg transition-colors"
+            className="shrink-0 text-[11px] leading-4 px-1.5 py-0.5 rounded border border-border hover:text-fg transition-colors"
             data-testid="nudge-card-open-loop"
           >
             {i18nT('pages.chat.nudgeCard.loop')}
@@ -114,7 +127,7 @@ export default memo(function NudgeCard({
       </div>
       {expanded && (
         <div
-          className="px-2.5 pb-2.5 pt-0 text-[12px] font-mono leading-relaxed whitespace-pre-wrap overflow-hidden"
+          className="px-3 pb-3 pt-0 text-[12px] font-mono leading-5 whitespace-pre-wrap overflow-hidden"
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
           data-testid="nudge-card-body"
         >

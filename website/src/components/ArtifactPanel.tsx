@@ -12,6 +12,7 @@ import { useFileArtifactComments } from './FileArtifactComments'
 import { formatArtifactCommentsMessage } from './CommentOverlay'
 import { copyToClipboard } from '../utils/clipboard'
 import { api } from '../api/client'
+import { useDocumentImeLatch } from '../hooks/useImeGuard'
 import type { Artifact } from '../types'
 
 import { i18nT } from '../i18n/t'
@@ -28,6 +29,11 @@ interface Props {
   onSubmitComments?: (message: string) => void
   /** Render as a SidePanel tab body (fills parent, no resize handle/border). */
   embedded?: boolean
+  /** Stable cross-remount identity (slot + tab id) for the embedded body's
+   *  scroll position — a chat-slot switch unmounts the whole tab body, and
+   *  this is what lets the document come back where the user left it (see
+   *  `useScrollMemory`). Omitted by hosts without that lifecycle. */
+  scrollMemoryKey?: string
 }
 
 const BODY_HEIGHT_STYLE: React.CSSProperties = { height: '100%', minHeight: 0 }
@@ -100,13 +106,19 @@ function SubmitBar({ count, submitting, onSubmit, bleed = false }: {
  * `onSubmitComments` (the local-file user-message path) rather than the
  * full-page `iterateWithAgent` navigate — and only for human comments.
  */
-export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSubmitComments, embedded }: Props) {
+export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSubmitComments, embedded, scrollMemoryKey }: Props) {
   const navigate = useNavigate()
   const previewRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const fsPreviewRef = useRef<HTMLDivElement>(null)
   const fsScrollRef = useRef<HTMLDivElement>(null)
   const [fullscreen, setFullscreen] = useState(false)
+  // Shared IME latch for the full-screen preview's Tab trap: a Tab that lands
+  // during an IME composition (or its post-`compositionend` window) is
+  // choosing a candidate, not leaving the field, so the trap must decline it
+  // instead of yanking focus and aborting the composition
+  // (`useDialogFocusTrap` is the reference consumer of the same seam).
+  const fsImeLatch = useDocumentImeLatch(fullscreen)
 
   // Live artifact — authoritative for kind/name/content once loaded. Seeded
   // with what handleArtifactOpen captured so the panel renders immediately.
@@ -212,6 +224,12 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSub
     bodyPreviewRef: React.RefObject<HTMLDivElement>,
     layer: typeof fa,
     flush = false,
+    // Embedded body only: cross-remount scroll identity, forwarded to
+    // ArtifactBodyNative (whose inner div is the real scroll container).
+    // The fullscreen instance omits it so two live instances never share a
+    // key. Iframe kinds scroll inside their sandbox — deliberately out of
+    // scope (#5701).
+    bodyScrollMemoryKey?: string,
   ) => (
     <div ref={bodyScrollRef} className="relative h-full overflow-auto pr-2">
       {isHydrating ? (
@@ -255,6 +273,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSub
           scrollNonce={layer.scrollNonce}
           unreadRootIds={layer.unreadRootIds}
           flush={flush}
+          scrollMemoryKey={bodyScrollMemoryKey}
         />
       )}
     </div>
@@ -319,7 +338,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSub
     >
       <div className="flex-1 overflow-hidden -mx-5 -my-4 py-4 flex flex-col pl-4 pr-0 min-h-0">
         <div className="relative flex-1 min-w-0 min-h-0">
-          {renderBody(scrollRef, previewRef, fa, true)}
+          {renderBody(scrollRef, previewRef, fa, true, scrollMemoryKey)}
         </div>
         {/* Sidebar stacks below content (height-capped) so content stays primary. */}
         {fa.sidebarOpen && (
@@ -333,9 +352,29 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, onSub
       {!fullscreen && fa.popovers}
     </DetailPanel>
     {fullscreen && createPortal(
-      <div className="fixed inset-0 z-[9999] bg-bg flex flex-col" role="dialog" aria-modal="true" aria-label={i18nT('components.artifactPanel.full_screen_artifact_preview')}
+      <div className="fixed inset-0 z-[9999] bg-bg flex flex-col p-safe" role="dialog" aria-modal="true" aria-label={i18nT('components.artifactPanel.full_screen_artifact_preview')}
         ref={el => { if (el && !el.dataset.focused) { el.dataset.focused = '1'; const first = el.querySelector<HTMLElement>('button:not([disabled]),textarea,input,a[href],select,[tabindex]:not([tabindex="-1"])'); first?.focus() } }}
-        onKeyDown={e => { if (e.key === 'Tab') { const focusable = e.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]),textarea,input,a[href],select,[tabindex]:not([tabindex="-1"])'); if (focusable.length === 0) return; const first = focusable[0], last = focusable[focusable.length - 1]; if (e.shiftKey) { if (document.activeElement === first) { e.preventDefault(); last.focus() } } else { if (document.activeElement === last) { e.preventDefault(); first.focus() } } } }}>
+        onKeyDown={e => {
+          if (e.key !== 'Tab') return
+          const focusable = e.currentTarget.querySelectorAll<HTMLElement>('button:not([disabled]),textarea,input,a[href],select,[tabindex]:not([tabindex="-1"])')
+          if (focusable.length === 0) return
+          const first = focusable[0], last = focusable[focusable.length - 1]
+          const wrapsBackward = e.shiftKey && document.activeElement === first
+          const wrapsForward = !e.shiftKey && document.activeElement === last
+          // A mid-dialog Tab is the browser's to move, and not the trap's to
+          // claim. A boundary Tab the IME owns must not cycle focus — the user
+          // is choosing a candidate, not leaving the field — so `claimKey`
+          // (native-event contract in useImeGuard.ts) runs before the
+          // preventDefault() and focus move.
+          if (!wrapsBackward && !wrapsForward) return
+          // `claimKey` consumes the native event (document/window listeners),
+          // but React 17+ checks the SYNTHETIC propagation flag when walking
+          // component ancestors — stop that half too so a declined Tab cannot
+          // trigger an ancestor's own keyboard handling.
+          if (!fsImeLatch.claimKey(e.nativeEvent)) { e.stopPropagation(); return }
+          e.preventDefault()
+          ;(wrapsBackward ? last : first).focus()
+        }}>
         {/* Header — pl-20 clears macOS traffic-light buttons */}
         <div className="flex items-center justify-between pl-20 pr-6 h-12 shrink-0 border-b border-border">
           <span className="flex items-center gap-2 min-w-0">

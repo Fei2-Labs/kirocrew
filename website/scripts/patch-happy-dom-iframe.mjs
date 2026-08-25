@@ -44,8 +44,14 @@ if (!original.includes(oldCode)) {
     console.log('patch-happy-dom-iframe: already patched, skipping.')
     process.exit(0)
   }
-  console.error('patch-happy-dom-iframe: target code not found — happy-dom may have been updated.')
-  process.exit(1)
+  console.warn(
+    'patch-happy-dom-iframe: target code not found — happy-dom may have been updated.\n' +
+    '  The patch is SKIPPED. If iframe-related tests fail, update the patch to match\n' +
+    '  the new HTMLIFrameElement.js source. See: website/scripts/patch-happy-dom-iframe.mjs'
+  )
+  // In CI, fail closed: a missing patch means tests will crash with opaque
+  // DOMExceptions. Locally, exit 0 so `npm install` doesn't break for everyone.
+  process.exit(process.env.CI ? 1 : 0)
 }
 
 writeFileSync(target, original.replace(oldCode, newCode))

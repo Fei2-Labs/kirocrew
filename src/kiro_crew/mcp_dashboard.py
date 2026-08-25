@@ -46,12 +46,18 @@ require authorization needs its own keystone leaf, and being merely unreferenced
 in the default spec is not that. Session control (driving or stopping another
 session) is that shape.
 
-Identity posture: these tools use the NON-strict session resolver (inherited
-from the ``mcp_core`` request helpers). The header is ATTRIBUTION here, not
-authorization — the endpoints authorize on the internal secret, and the session
-a move targets is named explicitly by slot key, never derived from the caller's
-identity. The strict resolver would fail closed in sandboxed sessions without
-protecting anything, since no effect here reads the header.
+Identity posture: two resolvers, for two different jobs. The SEL invocation log
+(``_call_tool``) uses the NON-strict resolver — that header is ATTRIBUTION, and
+a lenient misattribution there is tolerable. Every decision that SCOPES what a
+caller may see or verify-writes — ``_visible_chat_slots``,
+``_refuse_tree_shaping_if_unverifiable``, and ``chat_folder_move_session``'s own
+caller check (the one tool here that writes to a session other than the
+caller's) — uses :func:`mcp_core._resolve_session_key_strict`, whose first
+source is the gateway-injected per-call caller block — the only identity that
+holds on a pooled backend serving many sessions (this server advertises
+``kirocrew.caller-identity`` so gatewayd injects one; see
+``ADVERTISE_CALLER_IDENTITY``). An unverifiable caller is refused by those
+paths, never waved through on the lenient walk.
 """
 
 from __future__ import annotations
@@ -71,6 +77,7 @@ from kiro_crew.mcp_core import (
     _post,
     _resolve_session_key,
     _resolve_session_key_strict,
+    strict_identity_diagnosis,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
@@ -80,6 +87,9 @@ from kiro_crew.validation import (
     CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     CHAT_FOLDER_TREE_SCHEMA,
     MCP_DASHBOARD_SCHEMAS,
+    SESSION_CREATE_SCHEMA,
+    SESSION_READ_MESSAGE_SCHEMA,
+    SESSION_STOP_SCHEMA,
     validate_tool_args,
 )
 
@@ -87,6 +97,18 @@ logger = logging.getLogger(__name__)
 
 SERVER_NAME = "kirocrew-dashboard"
 SERVER_VERSION = "1.0.0"
+
+#: The session-control half of this server's tool set, in one place because three
+#: separate things must agree on it: the caller-identity gate in
+#: ``_call_tool_inner``, the channel-agent containment list
+#: (``CHANNEL_AGENT_BLOCKED_TOOLS``), and the pinned advertised set in the
+#: registration tests. Spelling it out per site is how ``session_create`` came to
+#: be gated for identity but reachable from a channel agent.
+SESSION_CONTROL_TOOLS: tuple[str, ...] = (
+    "session_create",
+    "session_stop",
+    "session_read_message",
+)
 
 # The folder endpoints store ``name[:100]``. Mirroring the number here is what
 # lets this server refuse an overlong name instead of writing one it cannot
@@ -122,9 +144,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "chat_folder_tree; missing path segments are created too (mkdir -p). "
                 "Omit ``parent`` (or pass 'root') for a top-level folder. Creating a "
                 "folder never moves anything — file sessions into it with "
-                "chat_folder_move_session. Not available to an app agent: the folder "
-                "tree is shared with the person and every other app, so an app files "
-                "its own sessions into folders that already exist."
+                "chat_folder_move_session. An app agent may create at the top level "
+                "or inside a folder it created itself, and the new folder belongs to "
+                "it; creating inside one of the person's folders is refused."
             ),
             "inputSchema": {
                 "type": "object",
@@ -152,9 +174,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "(sessions and subfolders travel with it); nothing is deleted. "
                 "Cycle-guarded: a folder cannot become its own descendant. "
                 "``folder`` and ``new_parent`` are each a folder id or human path; "
-                "omit ``new_parent`` (or pass 'root') for the top level. Not available "
-                "to an app agent — reparenting reshapes a tree shared with the person "
-                "and every other app."
+                "omit ``new_parent`` (or pass 'root') for the top level. An app agent "
+                "may move only a folder it created itself, and only to the top level "
+                "or under another of its own."
             ),
             "inputSchema": {
                 "type": "object",
@@ -193,6 +215,95 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["session"],
+            },
+        },
+        {
+            "name": "session_create",
+            "description": (
+                "Open a NEW chat session, pre-named and bound to the agent you pick, so a "
+                "separate workstream has a home of its own. The new session appears in "
+                "the user's sidebar like any other — they can read it, take it over and "
+                "close it — so use it to stand up a workstream alongside this one (watch a "
+                "build, grind a long refactor) rather than to hide work. It starts empty: "
+                "the person is the one who types the first message into it. Returns its "
+                "key; pass that as `target` to the other session tools."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "Short name for the session, shown in the sidebar. Say what the "
+                            "session is FOR so the user can tell your sessions apart."
+                        ),
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": (
+                            "Agent to bind the session to. Omit to use the default agent."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "session_stop",
+            "description": (
+                "Stop another session's in-flight turn — the same thing as pressing Stop "
+                "in that tab. Use it when a peer session is working on something you now "
+                "know is wrong or already done, and letting it finish would waste the run "
+                "or make a conflicting change. The first call cancels cooperatively; "
+                "calling again while that is still pending escalates to a hard kill. "
+                "A stop card appears in the "
+                "target's transcript so the person reading it sees what happened. Stopping "
+                "discards the turn's work, so read the session first when you are not sure "
+                "what it is doing."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
+            "name": "session_read_message",
+            "description": (
+                "Read the tail of another session's transcript, plus whether it is still "
+                "working. Use it to watch a peer session's progress: `wait`, then read — "
+                "pass the ``next_since`` from the previous read back as ``since`` "
+                "and you get only what arrived in between, so a poll loop does not re-read "
+                "the same messages. ``running: false`` with nothing new means the target "
+                "finished and is idle, which is the difference between 'not done yet' and "
+                "'done'. READ-only: it never sends anything or changes the target's state."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max messages to return (default 20, max 100).",
+                        "default": 20,
+                    },
+                    "since": {
+                        "type": "integer",
+                        "description": (
+                            "Return messages from this index onward — pass the ``next_since`` from "
+                            "your previous read to get only new ones. Omit for the newest tail."
+                        ),
+                    },
+                },
+                "required": ["target"],
             },
         },
     ]
@@ -285,7 +396,7 @@ def _ambiguous_segment_error(seg: str, matches: list[dict]) -> str:
 
 
 def _resolve_chat_folder_ref(
-    ref: str, folders: list[dict], *, create_missing: bool
+    ref: str, folders: list[dict], *, create_missing: bool, session_key: str | None = None
 ) -> tuple[str, list[str], str | None]:
     """Resolve a sidebar-folder reference to a folder id. THE resolution chokepoint.
 
@@ -335,7 +446,7 @@ def _resolve_chat_folder_ref(
     # the two readings are compared would mutate the tree on a reference we are
     # about to refuse.
     walked, created, walk_err = _walk_chat_folder_segments(
-        ref, folders, create_missing=create_missing and not exact
+        ref, folders, create_missing=create_missing and not exact, session_key=session_key
     )
     if walk_err:
         return "", created, walk_err
@@ -358,7 +469,7 @@ def _resolve_chat_folder_ref(
 
 
 def _walk_chat_folder_segments(
-    ref: str, folders: list[dict], *, create_missing: bool
+    ref: str, folders: list[dict], *, create_missing: bool, session_key: str | None = None
 ) -> tuple[str, list[str], str | None]:
     """Walk a ``/``-separated path segment by segment. ONE walk, two modes.
 
@@ -407,7 +518,11 @@ def _walk_chat_folder_segments(
             continue
         if not create_missing:
             return "", created, None
-        made = _post("/api/chat/folders", {"name": seg, "parent_id": parent})
+        made = _post(
+            "/api/chat/folders",
+            {"name": seg, "parent_id": parent},
+            session_key=session_key,
+        )
         if made.get("error"):
             return "", created, str(made["error"])
         folders.append(made)
@@ -423,9 +538,18 @@ def _resolve_chat_folder_id(ref: str, folders: list[dict]) -> tuple[str, str | N
     return fid, err
 
 
-def _ensure_chat_folder_path(ref: str, folders: list[dict]) -> tuple[str, list[str], str | None]:
-    """Resolve a parent-folder reference, creating missing segments (mkdir -p)."""
-    return _resolve_chat_folder_ref(ref, folders, create_missing=True)
+def _ensure_chat_folder_path(
+    ref: str, folders: list[dict], *, session_key: str
+) -> tuple[str, list[str], str | None]:
+    """Resolve a parent-folder reference, creating missing segments (mkdir -p).
+
+    ``session_key`` is REQUIRED because this variant writes: the intermediate
+    segments are real folders, and each must be created under the identity the
+    caller's gate verified rather than one the write helper re-derives.
+    """
+    return _resolve_chat_folder_ref(
+        ref, folders, create_missing=True, session_key=session_key
+    )
 
 
 def _resolve_chat_slot_key(ref: str, slots: list[dict]) -> tuple[str, str | None]:
@@ -542,6 +666,22 @@ def _caller_app_scope(caller_key: str, rows: list[dict]) -> str | None:
     for r in rows:
         if str(r.get("key") or "") == slot:
             return str(r.get("app") or "")
+    # A slot bound to a channel or cron session runs its turns under
+    # ``linked_session_key`` ("when set, _run_chat uses this as session key" --
+    # ``DashboardState``), so the caller presents THAT key and the match above
+    # cannot find it. The rows serialize the field, so an app-owned linked slot
+    # would otherwise read as unscoped here even though its owner is on record.
+    #
+    # POSITIVE matches only: a channel- or cron-born row is created with no
+    # ``app``, so returning on an ownerless match would answer "" (the person)
+    # for a delegated caller that the refusal below would otherwise fail closed
+    # on -- weakening this layer instead of extending it.
+    for r in rows:
+        if str(r.get("linked_session_key") or "") == caller_key:
+            linked_app = str(r.get("app") or "")
+            if linked_app:
+                return linked_app
+            break
     if caller_key.startswith(_DELEGATED_CALLER_PREFIXES):
         return None
     if caller_key.startswith("dashboard:"):
@@ -577,6 +717,7 @@ def _visible_chat_slots() -> tuple[list[dict], str | None]:
         return [], (
             "cannot verify which session is calling, so the session list is "
             "withheld — these tools scope what they show to the caller"
+            + strict_identity_diagnosis(SERVER_NAME)
         )
     scope = _caller_app_scope(caller_key, rows)
     if scope is None:
@@ -590,52 +731,184 @@ def _visible_chat_slots() -> tuple[list[dict], str | None]:
     return [r for r in live if str(r.get("app") or "") == scope], None
 
 
-def _refuse_tree_shaping_if_app_scoped(verb: str) -> str | None:
-    """Error text when the caller may not reshape the folder tree, else None.
+def _refuse_tree_shaping_if_unverifiable(verb: str) -> tuple[str, str | None]:
+    """``(verified_caller_key, error)`` — the key to WRITE under, or why not.
 
-    Folders are ONE tree per instance with no owner field, so there is no "this
-    app's folder" to confine a write to: creating, renaming, reparenting or
-    deleting one lands in the person's sidebar and in every other app's view of
-    it. An app-scoped caller is therefore refused the tree-shaping verbs
-    outright rather than given authority that cannot be bounded.
+    Folders now carry an owner (``chat_folders._folder_owner_app``), so an app
+    HAS a folder of its own to write to and the endpoint bounds each write to
+    it: an app may create at the top level or inside its own folders, and may
+    rename, reparent or delete only what it owns. The person keeps full
+    authority over everything, and an app keeps read of the whole tree plus
+    filing its OWN sessions into any folder.
 
-    What an app KEEPS is everything already scoped to it: reading the tree, and
-    filing its OWN sessions into a folder that exists. The person's own agent is
-    unscoped and keeps full authority — reorganising sessions is the point of
-    these tools.
+    So this layer no longer decides the policy — it would be a second copy of a
+    rule the endpoint enforces under the store lock, and only the endpoint can
+    see the authoritative tree. What stays here is the one question the endpoint
+    cannot answer: whether the caller can be placed at all. An unverifiable or
+    delegated caller has no scope to bound a write to, and a write to shared
+    structure is not the place to assume the caller is the human.
 
-    Identity is resolved strictly, and an unverifiable caller is refused too: a
-    write to shared structure is not the place to assume the caller is the human.
+    The verified key is RETURNED rather than left for the write helpers to
+    re-derive. Those default to :func:`_resolve_session_key`, whose ``/proc``
+    ancestor walk can resolve to a different slot than the strict check above —
+    so re-resolving would check one identity and write under another, and for an
+    app-owned session the walk landing on an ancestor makes the write arrive at
+    the endpoint looking like the unconfined person. Every caller of this gate
+    must pass what it returns straight to the write.
     """
     caller_key = _resolve_session_key_strict()
     if not caller_key:
-        return (
+        return "", (
             f"Error: cannot verify which session is calling, so {verb} is "
             "refused — reshaping the shared folder tree requires a caller "
             "identity the gateway can vouch for."
+            + strict_identity_diagnosis(SERVER_NAME)
         )
     rows, err = _get_rows("/api/chat/slots")
     if err:
-        return f"Error: {err}"
+        return "", f"Error: {err}"
     scope = _caller_app_scope(caller_key, rows)
     if scope is None:
-        return (
+        return "", (
             f"Error: cannot establish what this caller is allowed to change, so "
             f"{verb} is refused — a subagent or a scheduled job runs on behalf of "
             "whatever created it and cannot be granted more than that."
         )
-    if scope:
-        return (
-            f"Error: {verb} is not available to an app — the folder tree is "
-            "shared with the person and every other app, and folders carry no "
-            "owner, so there is no app-private folder to change. Filing your "
-            "own sessions into an existing folder still works."
+    if scope and not caller_key.startswith("dashboard:"):
+        # An app-owned LINKED session -- a channel- or cron-bound slot runs its
+        # turns under ``linked_session_key`` -- is the one shape whose staleness
+        # nothing downstream can notice. The endpoint re-derives the app from
+        # this key and refuses a key that NAMES a slot which is gone, but
+        # ``caller_names_a_missing_slot`` is ``dashboard:``-only BY DESIGN: for
+        # any other shape absence is not evidence of a vanished slot, since a
+        # Slack thread or a channel session legitimately never had one, and
+        # refusing those would take these tools from callers no app could have
+        # been attached to.
+        #
+        # So for a linked key the endpoint cannot tell "this app's slot just
+        # closed" from "no app owns this caller", and would read the second and
+        # apply the person's authority. THIS layer can tell, because it resolved
+        # the scope positively a moment ago, so the refusal belongs here.
+        return "", (
+            f"Error: {verb} is refused for a channel- or schedule-bound session "
+            "owned by an app — its identity cannot be re-verified at the point of "
+            "the write, so the folder rules could not be bounded to it. Run this "
+            "from the app's own dashboard session."
         )
-    return None
+    return caller_key, None
 
 
 def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     """Dispatch one validated tool call."""
+    caller_key = ""
+    if name in SESSION_CONTROL_TOOLS:
+        # Authorization for all four is the CALLER'S IDENTITY: the route decides
+        # what a session may reach from the key sent here. The lenient resolver
+        # walks /proc ancestors, and a spawned subagent lives under its parent
+        # slot's process tree — so the walk would hand a subagent its parent's
+        # identity and let it read, message, or stop the parent's sibling
+        # sessions. Only the signed sources count.
+        #
+        # The verified key is KEPT and handed to the request helper below. Gating
+        # on the strict resolver and then letting the helper resolve again would
+        # authorize the check and the action as potentially different sessions:
+        # the lenient walk reads mutable process state, so what it answers at
+        # request time need not be what the gate approved.
+        caller_key = _resolve_session_key_strict()
+        if not caller_key:
+            return (
+                "Error: this session cannot be identified well enough to control another "
+                "session. Session control authorizes on the calling session's identity, and "
+                "only a gateway-issued key counts — a spawned subagent has none of its own."
+                + strict_identity_diagnosis(SERVER_NAME)
+            )
+
+    if name == "session_create":
+        args = validate_tool_args(args, SESSION_CREATE_SCHEMA)
+        resp = _post(
+            "/api/session-control/create",
+            {"title": args.get("title", ""), "agent": args.get("agent", "")},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not create a session: {resp['error']}"
+        return (
+            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}). "
+            "It is empty and waiting in the user's sidebar; watch it with "
+            "session_read_message."
+        )
+
+    if name == "session_stop":
+        args = validate_tool_args(args, SESSION_STOP_SCHEMA)
+        resp = _post(
+            "/api/session-control/stop",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not stop that session: {resp['error']}"
+        target = resp.get("target", args["target"])
+        info = resp.get("info")
+        if info:
+            # The target was not running (or a stop was already in flight) — say
+            # so rather than implying a turn was cancelled.
+            return f"\u2139\ufe0f `{target}`: {info} — nothing to stop."
+        return f"\U0001f6d1 Stop sent to `{target}`. Its transcript now shows the stop card."
+
+    if name == "session_read_message":
+        args = validate_tool_args(args, SESSION_READ_MESSAGE_SCHEMA)
+        query = f"target={quote(str(args['target']))}&limit={args.get('limit', 20)}"
+        if args.get("since") is not None:
+            query += f"&since={int(args['since'])}"
+        resp = _get(f"/api/session-control/read?{query}", caller_key)
+        if resp.get("error"):
+            return f"Error: could not read that session: {resp['error']}"
+        msg_rows = resp.get("messages") or []
+        state_line = "still working" if resp.get("running") else "idle"
+        queued = resp.get("queue_depth", 0)
+        if queued:
+            state_line += f", {queued} message(s) queued"
+        head_line = (
+            f"\U0001f4d6 `{resp.get('target', '')}` — {resp.get('title', '')} "
+            f"({state_line}; total={resp.get('total', 0)})"
+        )
+        if not msg_rows:
+            # The cursor rides along even with nothing to show. A poll loop's most
+            # common answer is an empty window, and a caller left without a
+            # position either re-reads without `since` -- taking the tail, which
+            # silently skips everything older than the last `limit` rows once the
+            # target answers in a burst -- or keeps reusing a cursor from before,
+            # re-reading rows it has already seen. `next_since` is absent only when
+            # rows have been trimmed and positions stopped being exact, which is
+            # the one case a cursor must not be invented for.
+            empty_lines = [head_line, "No messages in that window yet."]
+            if "next_since" in resp:
+                empty_lines.append(
+                    f"Pass since={resp['next_since']} on your next read to resume from here."
+                )
+            return "\n".join(empty_lines)
+        read_lines = [head_line]
+        for row in msg_rows:
+            text_body = str(row.get("content", ""))
+            if row.get("truncated"):
+                text_body += " …[truncated]"
+            read_lines.append(f"[{row.get('index')}] {row.get('role')}: {text_body}")
+        read_lines.append(
+            (
+                f"Pass since={resp['next_since']} on your next read to see only what "
+                f"is new. (total={resp.get('total', 0)} is the backlog depth — when it "
+                f"exceeds next_since there are older rows this window did not reach, so "
+                f"read again immediately rather than waiting.)"
+            )
+            if "next_since" in resp
+            else (
+                "This session is long enough that older messages have been trimmed, so "
+                "cursor positions are no longer exact and `since` reads are refused. "
+                "Read again without `since` to get the latest messages."
+            )
+        )
+        return "\n".join(read_lines)
+
     if name == "chat_folder_tree":
         validate_tool_args(args, CHAT_FOLDER_TREE_SCHEMA)
         chat_folders, folders_err = _get_rows("/api/chat/folders")
@@ -703,7 +976,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "chat_folder_create":
         args = validate_tool_args(args, CHAT_FOLDER_CREATE_SCHEMA)
-        gate = _refuse_tree_shaping_if_app_scoped("creating a folder")
+        caller_key, gate = _refuse_tree_shaping_if_unverifiable("creating a folder")
         if gate:
             return gate
         # A '/' in a NAME is what makes a rendered path ambiguous (a folder named
@@ -722,7 +995,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # mkdir -p over the parent path: resolve as far as the tree already
         # goes, then create each missing segment.
         parent_id, created_segments, parent_err = _ensure_chat_folder_path(
-            str(args.get("parent") or ""), chat_folders
+            str(args.get("parent") or ""), chat_folders, session_key=caller_key
         )
         made_note = (
             f" (created parent path: {'/'.join(created_segments)})" if created_segments else ""
@@ -747,7 +1020,11 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 "characters or fewer"
             )
         body = {"name": safe_name, "parent_id": parent_id}
-        d = _post("/api/chat/folders", body)
+        # The verified key is passed through unchanged: re-resolving inside the
+        # helper would let the write carry a different session's authority than
+        # the one the gate checked, and the endpoint's ownership rule is only as
+        # good as the identity that reaches it.
+        d = _post("/api/chat/folders", body, session_key=caller_key)
         if d.get("error"):
             return redact(f"Error: {d['error']}{made_note}")
         chat_folders.append(d)
@@ -757,7 +1034,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "chat_folder_move":
         args = validate_tool_args(args, CHAT_FOLDER_MOVE_SCHEMA)
-        gate = _refuse_tree_shaping_if_app_scoped("moving a folder")
+        caller_key, gate = _refuse_tree_shaping_if_unverifiable("moving a folder")
         if gate:
             return gate
         chat_folders, folders_err = _get_rows("/api/chat/folders")
@@ -771,7 +1048,11 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         dest_id, dest_err = _resolve_chat_folder_id(args.get("new_parent") or "", chat_folders)
         if dest_err:
             return f"Error: {dest_err}"
-        d = _patch(f"/api/chat/folders/{fld_id}", {"parent_id": dest_id})
+        d = _patch(
+            f"/api/chat/folders/{fld_id}",
+            {"parent_id": dest_id},
+            session_key=caller_key,
+        )
         if d.get("error"):
             # The endpoint owns the cycle guard (a folder cannot move into its
             # own descendant) — surface its verdict rather than re-deriving it.
@@ -810,7 +1091,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return (
                 "Error: cannot verify which session is calling, so this move is "
                 "refused — filing another session requires a caller identity the "
-                "gateway can vouch for."
+                "gateway can vouch for." + strict_identity_diagnosis(SERVER_NAME)
             )
         # The verified key is passed through unchanged: re-resolving inside the
         # helper would let the write carry a different session's authority than
@@ -841,6 +1122,37 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
     )
 
 
+#: Whether this server advertises ``kirocrew.caller-identity`` — i.e. whether it
+#: consumes the per-call caller block gatewayd injects instead of reading identity
+#: from its own process. True here because it does: every scoping decision
+#: (``_visible_chat_slots``, ``_refuse_tree_shaping_if_unverifiable``) resolves
+#: the caller through :func:`mcp_core._resolve_session_key_strict`, whose first
+#: source is that block.
+#:
+#: Advertising is not cosmetic. ``mcp_gateway/backend.py`` strips any client-forged
+#: caller block from EVERY forwarded request and re-injects its own only when the
+#: backend advertised this capability — so without the advertisement the block
+#: never arrives, and this server's resolver reads an empty identity no matter how
+#: correctly it is written. Nothing declines to POOL an unadvertised backend
+#: (``rewriter.UNPOOLABLE_SERVERS`` is empty and documents that the capability is
+#: read only to decide injection), so the unadvertised state was not "per-session
+#: spawn" — it was pooled AND identity-blind. For this server that fail-closed
+#: every scoped tool on a pooled backend: an unverifiable caller is refused, so
+#: the tools stopped working for exactly the sessions pooling was built to serve.
+#:
+#: A module-level constant rather than a bare argument below so the value is
+#: readable without executing :func:`run_mcp_server`, and so
+#: ``test/test_mcp_managed_caller_identity.py`` can assert it against the argument
+#: actually handed to the shim.
+ADVERTISE_CALLER_IDENTITY = True
+
+
 def run_mcp_server() -> None:
     """Run the MCP stdio server — reads JSON-RPC from stdin, writes to stdout."""
-    run_mcp_stdio_loop(SERVER_NAME, SERVER_VERSION, _list_tools, _call_tool)
+    run_mcp_stdio_loop(
+        SERVER_NAME,
+        SERVER_VERSION,
+        _list_tools,
+        _call_tool,
+        advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
+    )

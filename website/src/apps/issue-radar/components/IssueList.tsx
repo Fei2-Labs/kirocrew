@@ -4,6 +4,7 @@ import { Virtuoso } from 'react-virtuoso'
 import { RefreshCw, Search, X } from 'lucide-react'
 import { useIssueRadar } from '../context'
 import { relativeTimeOrDate, relativeTime } from '../lib/format'
+import { providerTerms, trackedItemProjectScope } from '../lib/links'
 import type { Issue } from '../api'
 import LabelChip from './LabelChip'
 import ListSkeleton from './ListSkeleton'
@@ -33,8 +34,16 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
     filteredIssues, sortedIssues, issuesLoading, issuesError, issuesPartial,
     stateFilter, issues, colorByName,
     selectedIssue, setSelectedIssue, refresh, refreshing, listDetail,
-    query, setQuery, issuesUpdatedAt,
+    query, setQuery, issuesUpdatedAt, active,
   } = useIssueRadar()
+  // The refresh controls name where the data comes FROM, and that is not always
+  // GitHub — a GitLab or Azure DevOps workspace being told its issues came from
+  // GitHub is simply wrong copy.
+  const terms = providerTerms(active)
+  // Azure DevOps overloads `owner` as `{organization}/{project}`, so the project
+  // name is its second segment. Empty for every other provider, whose tracked
+  // items really are repository-scoped.
+  const projectScope = trackedItemProjectScope(active)
 
   const reduce = useReducedMotion()
   const animate = !reduce && sortedIssues.length <= ANIM_CAP
@@ -82,10 +91,15 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
         <div className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 transition-colors focus-within:border-accent">
           <Search size={14} className="flex-shrink-0 text-muted opacity-60" />
           <input
+            /* focus-cue-ok: the cue is on the WRAPPER, not here — the pill above
+               carries `focus-within:border-accent`, so focusing this input turns
+               the whole border accent-coloured. Same structure as PrList's search
+               box; a ring on the bare input would sit inside that border and read
+               as two nested outlines. */
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={i18nT('apps.issueRadar.components.issueList.search_issues')}
-            aria-label={i18nT('apps.issueRadar.components.issueList.search_issues_2')}
+            placeholder={i18nT('apps.issueRadar.components.issueList.search', { label: i18nT(terms.trackedItemPluralTitleKey) })}
+            aria-label={i18nT('apps.issueRadar.components.issueList.search_2', { label: i18nT(terms.trackedItemPluralTitleKey) })}
             className="flex-1 min-w-0 bg-transparent py-2.5 text-[13px] text-text placeholder:text-muted outline-none"
           />
           {query && (
@@ -111,7 +125,7 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
         {issuesError && <div className="px-4 py-2 text-[14px] text-danger">{issuesError.message}</div>}
         {!issuesLoading && filteredIssues.length === 0 && (
           <div className="px-4 pb-2">
-            <ListEmptyState searching={Boolean(query.trim())} label={i18nT('apps.issueRadar.components.issueList.issues')} />
+            <ListEmptyState searching={Boolean(query.trim())} label={i18nT(terms.trackedItemPluralTitleKey)} />
           </div>
         )}
         {!issuesLoading && sortedIssues.length > 0 && (
@@ -184,10 +198,20 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
         <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-8 bg-gradient-to-t from-bg to-transparent" />
       </div>
 
+      {/* Azure DevOps work items hang off the PROJECT, not the repository, so two
+          connected repos in one project show the identical list. Undisclosed, that
+          duplication reads as a caching bug, or gets the same item triaged twice by
+          two people who each think they are looking at their own repo's queue. */}
+      {projectScope && (
+        <div className="flex-shrink-0 px-4 pt-2 text-[11px] leading-snug text-muted opacity-80">
+          {i18nT('apps.issueRadar.components.issueList.tracked_items_are_project_scoped', { project: projectScope })}
+        </div>
+      )}
+
       {/* Footer — count on the left, last-refresh time + refresh on the right. */}
       <div className="flex-shrink-0 flex items-center gap-2 px-4 pt-2 pb-4 text-[12px] text-muted">
         <span title={stateFilter === 'closed' && issues.length >= 100 ? i18nT('apps.issueRadar.components.issueList.closed_issues_are_capped_at_the_100_most_recentl') : undefined}>
-          {i18nT('apps.issueRadar.components.issueList.issue', { count: filteredIssues.length })}
+          {i18nT(terms.trackedItemCountKey, { count: filteredIssues.length })}
         </span>
         {/* Cold-start: these are only the newest page while the full list loads
             behind them. Say so, so the count does not read as the whole repo. */}
@@ -199,14 +223,14 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
         )}
         <span className="ml-auto flex items-center gap-2">
           {lastUpdated && (
-            <span className="tabular-nums" title={i18nT('apps.issueRadar.components.issueList.time_since_the_issue_list_was_last_fetched_from')}>
+            <span className="tabular-nums" title={i18nT('apps.issueRadar.components.issueList.time_since_issue_list_last_fetched_from', { provider: terms.providerName })}>
               {i18nT('apps.issueRadar.components.issueList.updated')} {lastUpdated}
             </span>
           )}
           <button
             onClick={refresh}
             disabled={refreshing}
-            title={i18nT('apps.issueRadar.components.issueList.re_fetch_issues_labels_from_github')}
+            title={i18nT('apps.issueRadar.components.issueList.re_fetch_issues_and_labels_from', { provider: terms.providerName })}
             aria-label={i18nT('apps.issueRadar.components.issueList.refresh_issues')}
             className="inline-flex items-center cursor-pointer bg-transparent text-muted hover:text-text disabled:opacity-30"
           >

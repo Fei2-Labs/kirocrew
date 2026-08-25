@@ -15,6 +15,10 @@ import pytest
 
 from kiro_crew.subagent import _TURN_LIMIT, SubagentManager
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 # Subagent-registry isolation is provided globally by the autouse
 # ``_isolate_subagents_dir`` fixture in ``conftest.py`` — no per-file fixture needed.
 

@@ -36,6 +36,13 @@ kiro-cli login
 `kirocrew doctor` reports the binary and the login state on separate lines, so
 check both.
 
+**macOS desktop app:** if a command resolves in Terminal but not inside the
+app, the cause is usually launchd's minimal `PATH`, which a shell rc file
+never changes. The fix is `launchctl setenv PATH "$PATH"` plus a full quit and
+relaunch — see the
+[macOS troubleshooting guide](https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/macos-troubleshooting.md)
+for the recipe and how to persist it across reboots.
+
 ### Dashboard asks for sign-in but `kiro-cli` is already authenticated
 
 Typical on a headless host that authenticates `kiro-cli` with an API key rather
@@ -160,8 +167,11 @@ on another port with `KIROCREW_PORT`.
 
 ### Context window filling up
 
-Kiro Crew auto-compacts at `session.autocompact_pct` context usage (90% by
-default). If compaction fires often:
+Kiro Crew auto-compacts at `session.autocompact_pct` context usage (70% by
+default for a new install — an existing `config.json` keeps whatever value it
+already stores, which for installs created before this default changed is
+`90.0`; check with `kirocrew config get session.autocompact_pct`). If
+compaction fires often:
 
 - Reduce always-on skills, which consume context in every session
 - Check memory size: large preferences and project files eat into the budget

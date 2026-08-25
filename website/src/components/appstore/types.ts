@@ -67,6 +67,14 @@ export type InstalledApp = {
   installedAt: string
   source?: string
   origin?: string     // "builtin" | "registry" | "local" | "external"
+  /**
+   * The git URL this app was installed from, recorded at install time. It is
+   * the only repo identifier that survives independently of the store's
+   * registry caches, so art resolution falls back to it when neither the row
+   * nor the manifest names a repo. Empty on a built-in, a local-directory
+   * install, and on records written before provenance was captured.
+   */
+  sourceUrl?: string
   resources?: string  // "gateway" | "app"
   lifecycle?: string  // "gateway" | "app" | "locked"
   migratedTo?: string
@@ -84,13 +92,24 @@ export type InstalledApp = {
     crons?: { name: string }[]
     tags?: string[]
     jobFamilies?: string[]
-    ui?: { entry?: string; pages?: { route: string; label: string; icon: string }[] }
+    ui?: {
+      entry?: string
+      pages?: { route: string; label: string; icon: string }[]
+      /**
+       * Host surfaces this app replaces while enabled. Serialized by the manifest
+       * but previously undeclared here, so a reader outside `overlaySlots.ts` (which
+       * carries its own record type) could not see it.
+       */
+      overlays?: { id: string; replaces: string }[]
+    }
     permissions?: { api?: string[]; events?: string[]; mcpTools?: string[]; storage?: boolean; cron?: boolean; network?: boolean }
     setup?: { onInstall?: string; onUpdate?: string; onUninstall?: string; onEnable?: string; onDisable?: string }
     minKiroCrewVersion?: string
     iconPath?: string
     repo?: string
     screenshots?: string[]
+    /** Dark-appearance screenshots, when the manifest ships a second set. */
+    screenshotsDark?: string[]
     heroImage?: string
     heroImageDark?: string
     // The wide detail-page banners. Ten of the twelve builtins ship them, but
@@ -159,6 +178,36 @@ export function isVerified(app: Pick<RegistryApp, 'origin' | 'author' | '_regist
   // Legacy fallback (older gateway: no ``verified`` field).
   if (app.origin === 'builtin') return true
   return (app.author || '').toLowerCase() === 'kirocrew'
+}
+
+/** The ``source`` prefix ``install_from_registry`` records on a cloned app. */
+const REGISTRY_SOURCE_PREFIX = 'registry:'
+
+/**
+ * Whether an installed app's bytes came from a registry clone rather than from a
+ * directory on this machine.
+ *
+ * This is the discriminator ``handle_update_app`` itself branches on, and the two
+ * refresh paths are not interchangeable: a registry-sourced app is re-cloned
+ * through ``/api/apps/registry/install``, while an app installed from a path is
+ * re-copied from that path by ``POST /api/apps/{name}/update``. A local-source app
+ * has no registry row at all, so sending it down the registry path fails with
+ * "not found in registry" however it was installed.
+ *
+ * ``origin`` is the fallback for a record written before ``source`` was stored —
+ * the same secondary signal ``manager.py`` accepts for the same question. It is
+ * also the fallback when ``source`` is present but not a string: the detail page
+ * spreads a CATALOG row into its app object when the installed-record fetch
+ * fails, and ``registry.py`` copies index keys verbatim for a row it has not
+ * installed, so an external index can publish ``source: {type: "git"}``. The
+ * declared type says ``string``, but the payload is untrusted and this runs
+ * inside the ``autoAction`` effect — an unguarded ``startsWith`` throws there and
+ * Sync never dispatches at all.
+ */
+export function isRegistrySourced(app: Pick<InstalledApp, 'source' | 'origin'>): boolean {
+  const source = app.source
+  if (typeof source === 'string' && source) return source.startsWith(REGISTRY_SOURCE_PREFIX)
+  return app.origin === 'registry'
 }
 
 /**
@@ -232,8 +281,25 @@ export function normalizeInstalledApp<T extends InstalledApp>(raw: T): T {
       sops: strings(manifest.sops),
       tags: strings(manifest.tags),
       jobFamilies: strings(manifest.jobFamilies),
-      screenshots: strings(manifest.screenshots),
       highlights: strings(manifest.highlights),
+      // Art fields, coerced here for the reason in this function's docstring: the
+      // payload's entry point is where a wrong TYPE stops being every consumer's
+      // problem. `screenshots` was coerced and its dark sibling was not, which is
+      // how `"screenshotsDark": {}` reached a bare `.map`, and `"iconPath": {}` a
+      // bare `startsWith` — each throwing on the surface that read it rather than
+      // degrading. `repo` rides along because it is the base the others resolve
+      // against, so a non-string there produces a nonsense request instead of none.
+      iconUrl: str(manifest.iconUrl),
+      iconUrlDark: str(manifest.iconUrlDark),
+      iconPath: str(manifest.iconPath),
+      iconPathDark: str(manifest.iconPathDark),
+      heroImage: str(manifest.heroImage),
+      heroImageDark: str(manifest.heroImageDark),
+      heroImageDetail: str(manifest.heroImageDetail),
+      heroImageDetailDark: str(manifest.heroImageDetailDark),
+      repo: str(manifest.repo),
+      screenshots: strings(manifest.screenshots),
+      screenshotsDark: strings(manifest.screenshotsDark),
       // A cron entry is only useful for its name, which is also the only field
       // the dashboard reads, so an entry without one is dropped rather than
       // rendered as a blank row.

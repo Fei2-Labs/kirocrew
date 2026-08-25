@@ -733,6 +733,151 @@ describe('SecurityPanel — governance policy viewer', () => {  beforeEach(() =>
       screen.queryByText(/A surface with its own profile can allow what the host cannot/),
     ).not.toBeInTheDocument()
   })
+
+  it('shows a warning banner naming the unusable profiles', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: ['host'] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText(/policy fallback ceiling/)).toBeInTheDocument()
+    expect(screen.getByText(/Affected: host\./)).toBeInTheDocument()
+    // The remedy is only useful if it says WHERE the file is.
+    expect(screen.getByText(/profiles folder of your Kiro Crew data home/)).toBeInTheDocument()
+    // Causes and the restart caveat live on the demoted line, not in the body.
+    expect(screen.getByText(/extends a profile that is missing/)).toBeInTheDocument()
+  })
+
+  it('names every unusable profile, not just the host one', async () => {
+    // The reason the contract is a list: a broken sibling surface deny-alls
+    // itself just as silently, and a host-only boolean could not report it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: ['cron', 'subagent'] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText(/Affected: cron, subagent\./)).toBeInTheDocument()
+  })
+
+  it('does not show fallback banner when fallback_profiles is empty', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ fallback_profiles: [] }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
+  })
+
+  it('does not show fallback banner when fallback_profiles is absent', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govGoverned())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Fallback profile in effect')).not.toBeInTheDocument()
+  })
+
+  it('lists unknown companion scopes per affected profile', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        unknown_profile_scopes: {
+          host: ['capabilities.board', 'capabilities.channels'],
+          cron: ['capabilities.board'],
+        },
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Profile scopes not in this build')).toBeInTheDocument()
+    // One row per profile stem, each naming its own skipped scopes.
+    expect(screen.getByText('host')).toBeInTheDocument()
+    expect(screen.getByText('cron')).toBeInTheDocument()
+    // Joined via fmtList (Intl.ListFormat unit type), same contract as the
+    // fallback banner: en joins with ', ', zh with 、 and no spaces.
+    expect(screen.getByText('capabilities.board, capabilities.channels')).toBeInTheDocument()
+    // Rows are sorted with compareText: the fixture feeds insertion order
+    // host→cron, so an unsorted render would show host first. Node.compareDocumentPosition
+    // pins the DOM order the comparator produces.
+    const cron = screen.getByText('cron')
+    const host = screen.getByText('host')
+    expect(cron.compareDocumentPosition(host) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // The explanation is a tooltip, not body copy: it must NOT be in the
+    // document until the InfoTip is opened.
+    expect(screen.queryByText(/companion edition/)).not.toBeInTheDocument()
+  })
+
+  it('explains companion scopes in the InfoTip on demand', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: { host: ['capabilities.board'] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    const block = (await screen.findByText('Profile scopes not in this build')).parentElement!
+    fireEvent.click(within(block).getByRole('button', { name: /more information/i }))
+    expect(
+      await screen.findByText(/this build does not register.*no effect in this build/),
+    ).toBeInTheDocument()
+  })
+
+  it('renders unknown scopes stacked with the fallback banner they are siblings of', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({
+        fallback_profiles: ['cron'],
+        unknown_profile_scopes: { host: ['capabilities.board'] },
+      }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    // Both sibling diagnostics render together — one must not suppress the other.
+    expect(await screen.findByText('Fallback profile in effect')).toBeInTheDocument()
+    expect(screen.getByText('Profile scopes not in this build')).toBeInTheDocument()
+  })
+
+  it('shows unknown scopes even with no policy and no host profile', async () => {
+    // The payload aggregates EVERY loaded profile, so a standalone install with
+    // only a companion-edition subagent.json is a valid producer state. The
+    // no-policy card must yield to the diagnostic rather than swallow it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govNoPolicy({ unknown_profile_scopes: { subagent: ['capabilities.board'] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    expect(await screen.findByText('Profile scopes not in this build')).toBeInTheDocument()
+    expect(screen.getByText('subagent')).toBeInTheDocument()
+    expect(screen.queryByText('No enterprise policy in effect')).not.toBeInTheDocument()
+  })
+
+  it('renders no unknown-scopes block when the field is an empty object', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: {} }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+
+  it('renders no row for a profile whose scope list is empty', async () => {
+    // The producer contract says an empty list cannot happen; the filter makes
+    // the UI true independent of it — no badge with nothing after it.
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      govGoverned({ unknown_profile_scopes: { host: [] } }),
+    )
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
+
+  it('renders no unknown-scopes block when the field is absent', async () => {
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue(govGoverned())
+    renderWithProviders(<SecurityPanel />, { route: '/?section=governance' })
+
+    await screen.findByText('Policy v1')
+    expect(screen.queryByText('Profile scopes not in this build')).not.toBeInTheDocument()
+  })
 })
 
 describe('SecurityPanel — posture disclosure', () => {
@@ -1398,7 +1543,7 @@ describe('SecurityPanel — inspector rail', () => {
     expect(screen.queryByText('30 credential paths')).not.toBeInTheDocument()
     // ...and the choice is a deep link, so the section survives a reload and can
     // be targeted by a command-palette result.
-    expect(screen.getByTestId('search')).toHaveTextContent('section=rules')
+    expect(screen.getByTestId('search')).toHaveTextContent('sub=rules')
   })
 
   it('an unreadable third-party-apps value gets NO rail summary, rather than reading "Off"', async () => {

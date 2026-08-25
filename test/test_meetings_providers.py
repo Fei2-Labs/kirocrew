@@ -39,6 +39,16 @@ from kiro_crew.apps.builtins.meetings.backend.providers import calendar as cal
 from kiro_crew.apps.builtins.meetings.backend.providers import tasks as taskprov
 
 
+class _AnyPort:
+    """Stands in for ``link_unfurl.ALLOWED_PORTS`` when a test server binds an
+    ephemeral port. Only ``in`` is used against that frozenset, so accepting
+    everything is the whole contract — and it beats materializing 65k ints.
+    """
+
+    def __contains__(self, _port: object) -> bool:
+        return True
+
+
 def _ics(*events: str, prodid: str = "-//test//EN") -> str:
     body = "\n".join(events)
     return f"BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:{prodid}\n{body}\nEND:VCALENDAR\n"
@@ -367,6 +377,13 @@ class TestParseIcs:
         assert event.attendees == ["Bob Example", "carol@example.test"]
 
     def test_whole_day_event(self):
+        """A VALUE=DATE event is kept — anchored at midnight UTC — and flagged all-day.
+
+        The anchor is a DATE, not an instant: without `all_day` the renderer reads
+        it in the browser's zone and shows the previous day everywhere west of UTC.
+        The flag is what lets the UI display the calendar date unconverted, so it
+        must be True here and must survive `to_dict` (the sync route's wire format).
+        """
         today = datetime.now(timezone.utc).strftime("%Y%m%d")
         text = (
             "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:day\nSUMMARY:All day\n"
@@ -375,6 +392,91 @@ class TestParseIcs:
         events = cal.parse_ics(text)
         assert len(events) == 1
         assert events[0].title == "All day"
+        assert events[0].all_day is True
+        assert events[0].to_dict()["all_day"] is True
+
+    def test_a_timed_event_is_not_all_day(self):
+        """A real 00:00 meeting is a timed instant, not an all-day event.
+
+        All-day-ness is decided from DTSTART's FORM (VALUE=DATE), never inferred
+        from a midnight timestamp — the two are indistinguishable once parsed.
+        """
+        midnight = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y%m%dT000000Z")
+        text = _ics(_vevent(UID="mid", SUMMARY="Midnight standup", DTSTART=midnight))
+        event = cal.parse_ics(text)[0]
+        assert event.all_day is False
+        assert event.to_dict()["all_day"] is False
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("20260818", True),
+            ("20260818T090000Z", False),  # timed body is never a date
+            ("20260818T090000", False),
+            ("2026081", False),  # too short to be YYYYMMDD
+            ("202608180", False),  # too long
+            ("2026081a", False),  # non-digit
+        ],
+    )
+    def test_date_only_is_decided_by_the_body_shape(self, value, expected):
+        """A DATE is exactly eight digits; the VALUE parameter is not consulted.
+
+        Exporters emit a date body with the parameter missing, vendor-prefixed
+        (X-VALUE=DATE), or mislabeled (VALUE=DATE-TIME); a parameter test drops
+        those events, a shape test keeps them visible as the dates they are.
+        """
+        assert cal._is_date_only(value) is expected
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            "",  # bare date body, no VALUE parameter at all
+            ";X-VALUE=DATE",  # vendor-prefixed parameter
+            ";VALUE=DATE-TIME",  # mislabeled: DATE body under a DATE-TIME label
+            ';VALUE="DATE"',  # RFC 5545 §3.2 quoted form
+            ";value=date",  # parameters are case-insensitive
+        ],
+    )
+    def test_a_date_body_is_kept_and_flagged_whatever_the_parameter_says(self, params):
+        """Never-drop: every date-shaped DTSTART yields a visible all-day event.
+
+        The module's convention — a visible meeting beats a silently missing
+        one — must hold for nonconformant parameter spellings too.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        text = (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:day\nSUMMARY:All day\n"
+            f"DTSTART{params}:{today}\nEND:VEVENT\nEND:VCALENDAR\n"
+        )
+        events = cal.parse_ics(text)
+        assert len(events) == 1
+        assert events[0].all_day is True
+
+    def test_a_timed_body_under_a_date_label_stays_timed(self):
+        """A mislabeled VALUE=DATE with a DATE-TIME body names an instant."""
+        stamp = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime("%Y%m%dT%H%M%SZ")
+        text = (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:mis\nSUMMARY:S\n"
+            f"DTSTART;VALUE=DATE:{stamp}\nEND:VEVENT\nEND:VCALENDAR\n"
+        )
+        event = cal.parse_ics(text)[0]
+        assert event.all_day is False
+
+    def test_an_all_day_event_without_dtend_spans_the_whole_day(self):
+        """RFC 5545 §3.6.1: a DATE DTSTART with no DTEND/DURATION ends next midnight.
+
+        The generic default is a nominal hour, which for a whole-day event would
+        put `end` at 01:00 of the same day on the wire.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        text = (
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:day\nSUMMARY:All day\n"
+            f"DTSTART;VALUE=DATE:{today}\nEND:VEVENT\nEND:VCALENDAR\n"
+        )
+        event = cal.parse_ics(text)[0]
+        start = datetime.strptime(event.start, "%Y-%m-%dT%H:%M:%SZ")
+        end = datetime.strptime(event.end, "%Y-%m-%dT%H:%M:%SZ")
+        assert (end - start) == timedelta(days=1)
 
     def test_duration_instead_of_dtend(self):
         text = _ics(_vevent(UID="dur", SUMMARY="S", DTSTART=_stamp(1), DURATION="PT45M"))
@@ -527,8 +629,29 @@ class TestUrlValidation:
         assert target.host == "example.test"
         assert target.port == 443
 
-    def test_port_is_taken_from_the_url(self, public_dns: None):
-        assert cal._normalize_url("https://example.test:8443/cal.ics").port == 8443
+    def test_a_non_standard_port_is_refused(self, public_dns: None):
+        """Ports narrow to 443, which is stricter than "whatever the URL names".
+
+        The shared vet allows 80 and 443 only, and https-only leaves 443. A
+        calendar on some other port is nearly always an internal service, and the
+        port is the cheapest place to stop this endpoint being used to probe for
+        one. No working configuration is broken by starting strict: `ics` only
+        ever documented a published `https://` URL, and relaxing later is a
+        one-line change to that allow-list.
+        """
+        with pytest.raises(cal.CalendarError):
+            cal._normalize_url("https://example.test:8443/cal.ics")
+
+    def test_port_80_is_refused_even_though_the_shared_vet_allows_it(
+        self, public_dns: None
+    ):
+        """The shared vet's allow-list is {80, 443} because it also serves
+        plain-http link unfurling; THIS caller is https-only, so the stated scope
+        is 443 alone. ``https://host:80`` would pass the vet and then fail the TLS
+        handshake with a message that does not name the cause — refuse it up front.
+        """
+        with pytest.raises(cal.CalendarError):
+            cal._normalize_url("https://example.test:80/cal.ics")
 
     def test_host_is_keyed_as_the_connector_will_see_it(self, public_dns: None):
         """The pin is looked up by yarl's ``raw_host``, so it must be stored that way.
@@ -596,6 +719,22 @@ class TestUrlValidation:
         source = inspect.getsource(cal.IcsCalendarProvider)
         assert "calendar redirect URL is malformed" in source
 
+    @pytest.mark.parametrize(
+        "url", ["https://\ud800.example/cal.ics", "https://ex\udcffample.test/c.ics"]
+    )
+    def test_a_host_the_resolver_cannot_encode_is_a_calendar_error_not_a_500(
+        self, url: str, public_dns: None
+    ):
+        """A lone surrogate in the host must not escape as ``UnicodeError``.
+
+        `calendar.source` arrives as a JSON string, which can carry an unpaired
+        surrogate, and ``UnicodeError`` is a ``ValueError`` rather than an
+        ``OSError`` — so it slipped past both the resolver's fail-closed catch and
+        the ``URL(...)`` guard, and reached the settings handler as an HTTP 500.
+        """
+        with pytest.raises(cal.CalendarError):
+            cal._normalize_url(url)
+
     def test_missing_host_refused(self):
         with pytest.raises(cal.CalendarError):
             cal._normalize_url("https:///cal.ics")
@@ -607,6 +746,64 @@ class TestUrlValidation:
     def test_private_and_loopback_addresses_refused(self, host):
         # The request-forgery gate: the gateway performs this fetch, so an
         # internal-only address must never be reachable through a config value.
+        with pytest.raises(cal.CalendarError):
+            cal._normalize_url(f"https://{host}/cal.ics")
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            # RFC 6598 shared space, what a tailnet and most carrier NAT hand out.
+            # `is_private` does not cover it; only `is_global` does. On a machine on
+            # a tailnet, this range IS the private network.
+            "100.64.0.1",
+            # Deprecated IPv6 site-local: reports `is_global=True`, so an
+            # `is_private`-only check reads it as a public address.
+            "[fec0::1]",
+        ],
+    )
+    def test_addresses_the_local_vet_approved_are_now_refused(self, host: str):
+        """The gap that motivated delegating the address vet.
+
+        Both of these were APPROVED while this module carried its own
+        `is_private`-based check — verified by running the pre-change code — and are
+        refused now that :func:`link_unfurl.vet_unfurl_url` owns the decision. They
+        are asserted at THIS call site rather than left to that module's own suite,
+        because what is under test is that the calendar gate reaches it at all;
+        re-introducing a local check is the regression these names catch.
+        """
+        with pytest.raises(cal.CalendarError):
+            cal._normalize_url(f"https://{host}/cal.ics")
+
+    @pytest.mark.parametrize(
+        "host",
+        ["0177.0.0.1", "0x7f000001", "2130706433", "127.1", "[::ffff:127.0.0.1]"],
+    )
+    def test_alternate_ip_encodings_are_refused_by_the_vet_not_the_resolver(
+        self, host: str
+    ):
+        """Encodings `ipaddress` rejects but the OS resolver accepts.
+
+        These were NOT reachable before this change: `ipaddress` declined to parse
+        them, they fell through to DNS, getaddrinfo folded them back to loopback,
+        and the private-address rule caught them there. The defect was that the
+        refusal depended on the resolver's reading of a string the vet had given up
+        on — agreement, not a decision. `canonicalize_ip` makes them literals, so
+        the vet judges the address itself.
+
+        Pinned as behavior rather than as a fix: a future change that stops
+        canonicalizing would move the decision back onto getaddrinfo silently.
+        """
+        with pytest.raises(cal.CalendarError):
+            cal._normalize_url(f"https://{host}/cal.ics")
+
+    @pytest.mark.parametrize("host", ["printer.local", "abcdefgh.onion"])
+    def test_hosts_that_cannot_name_a_public_service_are_refused(
+        self, host: str, public_dns: None
+    ):
+        """``.local`` resolves through mDNS, a side channel; ``.onion`` does not
+        resolve at all. Neither can name a public calendar, and the local vet had
+        no suffix rule — with DNS stubbed public, both were approved.
+        """
         with pytest.raises(cal.CalendarError):
             cal._normalize_url(f"https://{host}/cal.ics")
 
@@ -904,14 +1101,19 @@ class TestDnsRebindingIsRefused:
 
         * the https-only scheme allow-list (a local TLS server would need a CA and
           a trusted cert, which buys no coverage of the address decision), and
-        * the private/loopback address refusal (127.0.0.1 IS the test server).
+        * the private/loopback address refusal (127.0.0.1 IS the test server), and
+          the 80/443 port rule (the server binds an ephemeral port).
 
-        Both have their own dedicated tests above, and neither is what these tests
+        All have their own dedicated tests above, and none is what these tests
         exercise. Everything else — resolution, the all-or-nothing address check,
         the pin, the connector, the hop loop — runs for real.
         """
         monkeypatch.setattr(cal, "_ALLOWED_SCHEMES", ("https", "http"))
-        monkeypatch.setattr(cal, "_refuse_private_address", lambda _addr: None)
+        # The address vet is `link_unfurl`'s now, so the refusals to lift are its.
+        # Neutralized on THAT module, which is where the real code reads them from
+        # — patching a local name here would pass while testing nothing.
+        monkeypatch.setattr(cal.link_unfurl, "_reject_if_internal_ip", lambda _c: None)
+        monkeypatch.setattr(cal.link_unfurl, "ALLOWED_PORTS", _AnyPort())
 
     @pytest.mark.asyncio
     async def test_the_fetch_lands_on_the_vetted_address_not_the_rebound_one(

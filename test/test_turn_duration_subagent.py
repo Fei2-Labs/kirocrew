@@ -33,6 +33,10 @@ from kiro_crew.acp.types import TurnUsage
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.subagent import SubagentManager
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 # Implausibly large: no unit-test turn runs ~16 minutes, so a row carrying this
 # value can only have come from the provider, never from the local wall clock.
 _PROVIDER_DURATION_MS = 987654
@@ -43,14 +47,14 @@ _TURN_SLEEP_SECS = 0.03
 
 
 def _text_event(text: str) -> SimpleNamespace:
-    return SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text)
+    return SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text, runtime_global=False)
 
 
 def _complete_event(usage: TurnUsage | None = None) -> SimpleNamespace:
     """An EVENT_COMPLETE. With no ``usage`` it mirrors the real acp stream,
     where nothing assigns ``duration_ms`` and the row must fall back to the
     caller's ``elapsed_ms``."""
-    ev = SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn")
+    ev = SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn", runtime_global=False)
     if usage is not None:
         ev.usage = usage
     return ev

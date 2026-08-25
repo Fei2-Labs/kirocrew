@@ -62,8 +62,51 @@ rebuild that hopes for reproducibility. The mechanism:
   identity. pip users selecting a promoted (prerelease-versioned) wheel by
   version must allow prereleases; the stable channel feed remains
   channel-sticky.
+- **Stable DISPLAYS a clean base version even though the bytes keep the RC
+  stamp.** The embedded version cannot change under promotion, so the remedy is
+  at the read layer: `_display_version()` in
+  `src/kiro_crew/dashboard/handlers/updates.py` folds the running version to its
+  bare `X.Y.Z` on the **stable** channel only (insider/nightly keep the full
+  stamp), so About and the Releases page show `0.4.0`, not `0.4.0rc3` /
+  `0.4.0-insider.3`. It is DISPLAY-ONLY — every version *comparison* still reads
+  the raw `__version__`, so it cannot cause an update loop —
+  `test/test_stable_version_display.py` is the regression gate. **This fix must
+  ride in the RC bytes**: promotion never rebuilds, so a display change added
+  after the RC is cut can never reach the promoted stable. Land it before the RC
+  is cut, or stable shows the RC stamp with no in-band remedy.
 - **Hot patches follow the same rule**: at least one recorded RC before the
   bare patch tag.
+
+### Runbook: promoting an RC to stable
+
+The constraint that shapes the whole timeline: **promotion is byte-for-byte, so
+anything a stable user will see must already be in the RC that gets promoted** —
+there is no build step at stable-tag time to add it.
+
+1. **Before the RC is cut — bake the fix in.**
+   - *CHANGELOG*: the release branch already carries `## [X.Y.Z] — <date>` (no
+     `[Unreleased]`, enforced by the changelog gate). Confirm at cut time.
+   - *Version display*: the base-version fold above must be merged to `main`
+     and cherry-picked to `release/X.Y` **before the RC is cut**, or stable will
+     show the RC stamp.
+2. **Cut the RC — verify content, not PR status.** On the target commit confirm:
+   `github-release` has an `if:`; `CHANGELOG.md` line 5 is `## [X.Y.Z]` with zero
+   non-bare-release `##` headings; exactly one `### Contributors`;
+   `__version__ = "X.Y.Z"`; the bytecode/pycache test fix is present; the
+   base-version fold is present (stable About shows `X.Y.Z`); no existing bare
+   `vX.Y.Z` tag. Then tag `vX.Y.Z-insider.N`.
+3. **Soak.** Ship the RC on insider and let real users run it. **Do not push any
+   byte-affecting change to the release branch between soak and promote** — the
+   guarantee is that stable gets exactly the soaked bytes.
+4. **Promote (bare tag).** Confirm the `vX.Y.Z-insider.N` run at the target
+   commit is SUCCESS (`resolve-promotion` finds the candidate by it). Push a bare
+   `vX.Y.Z` tag on that commit. The build lanes skip; `resolve-promotion`
+   re-verifies the recorded bundle and republishes it to stable.
+   `Create GitHub Release` runs (the `if:` fix) and renders GitHub's own
+   contributor block — **do not hand-write a contributors list in the body**
+   (that duplicated the native block on v0.3.0). Verify: stable feed points at
+   the RC's version, About shows the clean `X.Y.Z` via the fold, CHANGELOG shows
+   no draft heading.
 
 ## Workflows in the release path
 
@@ -245,14 +288,17 @@ version derivation and `uses:` calls.
    signing credentials.
 2. **notarize** (macos-15). `notarytool submit --wait`, `stapler staple`, then a
    fail-closed `spctl --assess` that must report `Notarized Developer ID`. On an
-   `Invalid` verdict the itemized Apple log is printed. The DMG is then **rebuilt
-   from the stapled app** (`hdiutil`, plus an `/Applications` symlink), signed by
-   a second CDSigner task with a `type: dmg` manifest, notarized, stapled, and
-   held to the same `spctl` gate. The DMG signature is load-bearing twice over:
-   an `hdiutil` DMG carries an adhoc signature that the Apple notary accepts but
-   Gatekeeper treats as "no usable signature" ("app is damaged" on drag-out),
-   and an unsigned DMG cannot be stapled at all (`stapler` Error 73), so
-   first-install verification would need network. The stapled DMG is attested
+   `Invalid` verdict the itemized Apple log is printed. The branded
+   electron-builder DMG is then converted to a writable layout template; its
+   unsigned app is removed and replaced with the stapled app before the image
+   is shrunk and recompressed. This preserves the Finder background and icon
+   positions while ensuring no unsigned app survives. The resulting DMG is
+   signed by a second CDSigner task with a `type: dmg` manifest, notarized,
+   stapled, and held to the same `spctl` gate. The DMG signature is load-bearing
+   twice over: an `hdiutil` DMG carries an adhoc signature that the Apple notary
+   accepts but Gatekeeper treats as "no usable signature" ("app is damaged" on
+   drag-out), and an unsigned DMG cannot be stapled at all (`stapler` Error 73),
+   so first-install verification would need network. The stapled DMG is attested
    after stapling, because stapling changes the shipping bytes. The job ends by
    attaching the gated artifact, which is the sole input of everything
    downstream. The Apple credential is fetched from AWS Secrets Manager at
@@ -347,6 +393,47 @@ number collapse onto the same PEP 440 wheel version, because `release.yml` maps
 by trailing number alone. `v0.2.0-rc.1` and `v0.2.0-insider.1` both map to
 `0.2.0rc1`, and the second publish fails as a republish of an immutable key.
 Stick to one convention (`-rc.N`) per base version.
+
+### Version numbering policy
+
+`__version__` in `src/kiro_crew/__init__.py` is the branch's DECLARED identity.
+A tagged build overrides all three manifests from the tag (the table above), so
+the in-code value is what a non-tag build reports and what the promote sequence
+manipulates — the final byte stamp is decided by the tag, not this value.
+
+- **On an insider release branch, `__version__` carries the RC suffix, and the
+  tag matches.** The branch reads as what it is: `__version__ = "X.Y.Z-rc.N"`,
+  tags `vX.Y.Z-insider.N`. Do not leave a release branch declaring a bare
+  `X.Y.Z` while it is still cutting RCs. All three version files
+  (`src/kiro_crew/__init__.py`, `pyproject.toml`,
+  `website/electron/package.json`) use the **same dual-valid spelling**
+  `X.Y.Z-rc.N` — valid SemVer and valid (non-canonical) PEP 440. The canonical
+  PEP 440 form (`0.4.0rc4`) is forbidden in `__init__.py`:
+  `packaging/build-desktop.sh` feeds `__version__` verbatim to
+  electron-builder, which requires SemVer.
+- **Promoting an insider line to stable is a three-step sequence:**
+  1. **Drop the RC in a PR** — change `__version__` from `X.Y.ZrcN` to the bare
+     `X.Y.Z`. This is the release commit; it also sets the base the stable
+     display folds to (`_display_version`, see "Client auto-update").
+  2. **Cut one more RC tag** (`vX.Y.Z-insider.<N+1>`) on that commit and let it
+     soak. This bare-`__version__` commit is the promotion candidate.
+  3. **Tag the bare `vX.Y.Z`** on the same commit to promote — promotion
+     republishes the soaked candidate's exact bytes (see "Stable promotion").
+- **`main` (nightly) is always one MINOR ahead of the active insider line.**
+  While `release/0.4` stabilizes on insider at `0.4.x`, `main`'s `__version__`
+  is already `0.5.0`. The release branch owns the version being shipped; `main`
+  owns the next one. This keeps every nightly strictly newer than any RC of the
+  shipping line, so a nightly user is never offered what looks like a downgrade
+  to an RC.
+
+**Why the display still folds even after step 1.** The build stamps the version
+FROM THE TAG, and the desktop's embedded version MUST equal the feed version or
+the auto-updater's compare gate breaks (see "Client auto-update"). So the
+promotion candidate's *bytes* still carry the RC/insider stamp (`0.4.0rcN` /
+`0.4.0-insider.N`) even though the branch declares a bare `__version__`. The
+bare declaration sets the source-of-truth and the fold's base; `_display_version`
+is what actually shows a stable user `0.4.0`. The two are complementary, not
+alternatives.
 
 ## CLI channel and the signed manifest
 
@@ -477,12 +564,17 @@ Two Windows details do not generalise from the other platforms:
   without it the app would quit and then wait for the user to click through a
   setup wizard rather than swapping silently the way macOS and Linux do.
 
-`SUPPORTED_PLATFORMS` is necessary but not sufficient: a platform can have a lane
-on some channels and not others. `WINDOWS_CHANNELS` restricts Windows to
-`{nightly, insider}` because stable has no Windows lane (see below), and a client
-resolving a channel with no feed reports `disabled: "channel"` rather than
-arming an updater that can only 404. `test_windows_signing_contract.py` pins that
-set to the callers that actually invoke the lane, so the two cannot drift.
+`SUPPORTED_PLATFORMS` is necessary but not sufficient: a channel can lack a
+desktop publish lane entirely, which is what `KNOWN_CHANNELS` and
+`channelHasLane()` record. There is deliberately no Windows-specific channel set:
+every channel in `KNOWN_CHANNELS` publishes Windows, so a separate set would be a
+declaration claiming a restriction that does not exist. A channel with no lane
+reports `disabled: "channel"` rather than arming an updater that can only 404.
+`test_the_updater_offers_exactly_the_channels_that_publish_windows` in
+`test_windows_signing_contract.py` pins `KNOWN_CHANNELS` to the callers that
+actually invoke the lane, in both directions, so the two cannot drift -- and if a
+channel ever loses its Windows lane, that test fails until the restriction is
+reintroduced.
 
 The client resolves `{feedBase}/{channel}/` as a **directory** (the trailing
 slash matters: without it `new URL("latest-mac.yml", base)` replaces the last
@@ -529,7 +621,10 @@ those installs permanently with a manual DMG re-download as the only escape.
 safe to remove once no pre-migration installs remain.
 
 Four updater policy flags each differ from the library default on purpose:
-`autoDownload=false` (consent-first: discovery must never pull megabytes),
+`autoDownload=false` (the library must never fetch from inside
+`checkForUpdates`; whether a discovered update downloads without a click is a
+separate preference read per discovery, and keeping the flag false is what
+routes the automatic and the consented download through one guarded function),
 `autoInstallOnAppQuit=false` (the default would swap the bundle on quit without
 stopping the embedded Python gateway), `allowDowngrade=true` (the gate is
 difference-based, so a feed pointed at an older version is offered, which is
@@ -537,6 +632,48 @@ what makes a channel switch-back work), and `allowPrerelease=true` (every
 nightly and insider stamp is a semver prerelease and would otherwise be
 invisible to its own channel). The library still refuses an equal version before
 the `allowDowngrade` branch, which is what prevents a self-reinstall loop.
+
+**Desktop updates download automatically by default, and install on the next
+quit.** The `autoDownloadUpdates` preference (electron-store, default `true`,
+opt out in Settings → About) decides whether the `update-available` handler
+calls `startDownload()` itself. The INSTALL is not made automatic by this: the
+existing `update-downloaded` handler arms a `before-quit` install that stops the
+gateway first, so a downloaded update lands on the user's own next quit rather
+than interrupting a live session. `autoInstallOnAppQuit` stays false on every
+platform — on macOS that flag stages eagerly, which arms ShipIt to swap the
+bundle on ANY exit (including exits that skip the gateway teardown) and cannot
+be un-armed, so it would also defeat release retraction.
+
+Turning the preference off keeps bytes already fetched but **disarms the
+install-on-quit for a stage that was downloaded automatically**, so the update a
+user just declined does not land on their next quit; a stage they explicitly
+downloaded stays armed, because the preference is not what put it there. The
+stage itself is never discarded, so an explicit Install still applies it with
+nothing to re-download.
+
+**Which channel a build follows is a default plus an opt-in, not a property of
+the bytes.** `channelForVersion()` classifies the version stamp and `nightly`
+stays pinned by it, but for the two production lanes `resolveChannel()` honours
+the persisted Settings → About preference and defaults to **stable** when none is
+set. It cannot read the lane out of the stamp, because stable is PROMOTED: the
+stable and insider downloads of a promoted version are the same notarized file
+carrying the same `-insider.N` stamp, so a stamp-derived channel would send every
+promoted-stable install to the insider feed. The consequences to know:
+
+- **Insider is an explicit opt-in.** Any install with no recorded preference
+  follows stable — including one installed from the insider DMG, and including an
+  insider install that predates this rule. The two downloads are identical files,
+  so nothing in them can record which page one came from, and nothing already on
+  disk distinguishes an insider install from a stable one that has been offered
+  the promoted build. Insider is reached by the switcher, once, per install.
+- **There is no way to seed that preference retroactively.** A migration would
+  have to read the channel from the version stamp, and the first build carrying
+  any such migration is itself promotion-stamped, so it would write `insider` for
+  every stable install — the defect this rule exists to remove, made permanent.
+  A future transition could use a persisted last-run version; this one cannot.
+- **The "you are running prerelease bytes" note still keys on the stamp**
+  (`stampedChannel`), not on the followed channel, because that statement is
+  about the bytes and stays literally true on a promoted stable install.
 
 The specific to Kiro Crew part is install ordering: the app supervises a bundled
 Python gateway child, so before `quitAndInstall` the client stops it gracefully
@@ -552,9 +689,11 @@ whenever `AWS_WINDOWS_SIGNING_ROLE_ARN` is present and the caller passed
 `use_prod_environment: true`. Signing happens inside the build because the NSIS
 installer compresses its own already-signed executables.
 
-`publish-windows.yml` then publishes that installer on the **nightly and insider
-channels**, following the same contract as `publish-linux.yml`: an immutable
-versioned key, then the feed, then the mutable `latest/` alias.
+`publish-windows.yml` then publishes that installer on **every desktop channel --
+nightly, insider and stable**, following the same contract as `publish-linux.yml`:
+an immutable versioned key, then the feed, then the mutable `latest/` alias.
+Nightly and insider publish a fresh signed build; stable republishes the verified
+promotion bundle's installer (see the stable note below).
 
     desktop/<channel>/<version>/KiroCrew-Setup.exe            immutable
     desktop/<channel>/<version>/KiroCrew-Setup.exe.blockmap   immutable
@@ -596,15 +735,31 @@ Three things about this lane are deliberate rather than incidental:
   the same run already published, while a sustained failure still must. Asking the Actions API what this run uploaded needs `actions: read`,
   which the reusable workflow and both caller jobs grant; without it the probe
   403s and, because it fails closed, the lane aborts rather than publishing.
-- **The stable channel is not wired.** Stable republishes the immutable
-  promotion bundle that `scripts/release_promotion.py` verifies byte for byte,
-  and its `ARTIFACT_NAMES` table has no Windows role. Adding one would make a
-  stable release depend on a successful Windows build, which is the coupling
-  `soft_fail` exists to prevent, so giving Windows a promotion role is a separate
-  decision. Until it is made, Windows users track nightly or insider, and the
-  client refuses to offer stable updates rather than pointing at a feed nobody
-  wrote; the mechanism above is unchanged for stable once the bundle learns about
-  Windows.
+- **Stable publishes by promotion, and the Windows role is optional.** Stable
+  does not rebuild: it republishes the bundle `scripts/release_promotion.py`
+  verified byte for byte. Windows contributes two roles to that bundle,
+  `windows_installer` and `windows_blockmap`, and both are **optional** rather
+  than required. Optional is the whole point: a required role would make a stable
+  release depend on a successful Windows build, which is the coupling `soft_fail`
+  exists to prevent, so a candidate recorded from a run whose Windows build failed
+  simply carries no installer and the other platforms still ship. The two travel
+  as a pair, because an installer promoted without its blockmap still updates and
+  merely turns every client's update into a full download instead of a
+  differential one -- a silent degradation, which is exactly the kind that has to
+  be made impossible rather than documented.
+
+  In promote mode the lane verifies the whole bundle before it looks at the
+  installer, and re-verifies the attestation this same workflow produced at
+  insider time instead of minting a second one (a fresh attestation over
+  republished bytes would testify only that stable's own run held the file, which
+  is equally true of tampered bytes).
+
+  `record-promotion` therefore **waits on** `build-windows` without **requiring**
+  it. Waiting is mandatory: assembling before the installer artifact exists would
+  silently record a Windows-less candidate from a build that actually succeeded.
+  Requiring success is forbidden: it recreates the coupling, and `soft_fail`
+  forces that job's result to `success` even on failure, so the check would assert
+  nothing.
 
 The `KiroCrew-Setup.exe` basename is a public contract: it is what
 `manualDownloadUrl()` hands a user whose in-app update failed, which is why it
@@ -735,6 +890,32 @@ tone, contributor lines) is specified once in
 [AGENTS.md](../../AGENTS.md) → "Release Changelog". The dashboard reads the
 changelog from `KIROCREW_PROJECT_DIR/CHANGELOG.md` for source installs and from
 the bundled copy inside the package for wheel installs.
+
+**`main` holds the canonical copy.** A release branch necessarily carries its
+own `CHANGELOG.md`, so two copies exist while a release is in flight, and that
+divergence is what the 0.3.0 incident grew out of: the release branch's copy was
+rewritten in isolation and lost three shipped sections that `main` still had.
+The rules that keep the two from drifting:
+
+- **Write the section on the release branch first** (it is what ships), then port
+  it to `main` **verbatim** — a port adds a section and removes nothing.
+- **`main` is the recovery source.** If a release branch's changelog is damaged,
+  restore from `main` rather than reconstructing by hand; `main` is never rewound
+  by a release cut, so its copy is the one that still has the full history.
+- **Write it from the commit range, under the release's final heading.** There is no
+  `## [Unreleased]` section to accumulate into and no in-progress prerelease heading
+  to rename later — `scripts/check_changelog_history.py` refuses both, at head, with
+  or without a base ref. So the section is composed once, from
+  `git log --oneline <last-tag>..HEAD`, and every commit in that range is accounted
+  for rather than sampled. 0.4.0 is the cautionary case: its per-PR accumulation
+  reached 721 lines while describing about 11% of the 453 commits it covered, and it
+  named none of the eighteen breaking changes it shipped.
+- **Editing the in-flight section after it is written needs the documented human
+  override**, because the immutability rule cannot tell a not-yet-shipped section
+  from a shipped one without a tag lookup, and a shallow CI checkout has no tags.
+  This is the intended trade: a fix cherry-picked into a later RC that deserves a
+  changelog line is rare, and the alternative — an exemption keyed on position in
+  the file — once made the most recently shipped section the only editable one.
 
 ## Deliberately not built
 

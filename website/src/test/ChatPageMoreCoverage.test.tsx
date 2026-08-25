@@ -114,7 +114,7 @@ vi.mock('../components/MarkdownRenderer', () => ({
 }))
 vi.mock('../components/TypewriterText', () => ({ default: () => null }))
 vi.mock('../components/OverlayDrawer', () => ({ default: ({ children }: { children?: ReactNode }) => children }))
-vi.mock('../components/AgentDropdownList', () => ({ default: () => null, ManageAgentsFooter: () => null }))
+vi.mock('../components/AgentDropdownList', () => ({ default: () => null, DefaultAgentRow: () => null, ManageAgentsFooter: () => null }))
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
@@ -161,7 +161,6 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       })),
       isAtBottom: true,
       scrollToBottom: vi.fn(),
-      scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
@@ -548,10 +547,11 @@ describe('ChatPage window-event listeners', () => {
           detail: { code: 'npm test', reqId: 'r2' },
         }))
       })
-      // The handler opens the panel synchronously, then races the PTY against a
-      // ~6 s cap. Either leg answers; the `settled` latch is what guarantees the
-      // code-block button is told once and only once.
-      expect(store.getState().chat.activityOpen).toBe(true)
+      // "Run in terminal" now routes to the app-wide dock panel
+      // (useBottomTerminal), not the chat-scoped activity panel, so
+      // `chat.activityOpen` is intentionally untouched. The handler races the
+      // PTY against a ~6 s cap; either leg answers, and the `settled` latch is
+      // what guarantees the code-block button is told once and only once.
       await act(async () => { await vi.advanceTimersByTimeAsync(7_000) })
       await waitFor(() => expect(results.length).toBe(1), { timeout: 5_000 })
     } finally {
@@ -584,8 +584,9 @@ describe('ChatPage welcome-state history suggestions', () => {
     })
     const { store } = renderChatPage([], { sessions: HISTORY })
     await waitFor(() => expect(inputProps).not.toBeNull())
-    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     await typeQuery('rate limiter')
+    // #765: history is seeded lazily by the typed query, not on mount.
+    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     const list = await screen.findByRole('listbox', { name: 'Previous chats' }, { timeout: 5_000 })
     const options = within(list).getAllByRole('option')
     expect(options).toHaveLength(1)
@@ -597,8 +598,9 @@ describe('ChatPage welcome-state history suggestions', () => {
   it('dismisses the suggestions on Escape', async () => {
     const { store } = renderChatPage([], { sessions: HISTORY })
     await waitFor(() => expect(inputProps).not.toBeNull())
-    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     await typeQuery('rate limiter')
+    // #765: history is seeded lazily by the typed query, not on mount.
+    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     expect(await screen.findByRole('listbox', { name: 'Previous chats' }, { timeout: 5_000 })).toBeInTheDocument()
     act(() => { fireEvent.keyDown(document, { key: 'Escape' }) })
     await waitFor(() => expect(screen.queryByRole('listbox', { name: 'Previous chats' })).toBeNull())
@@ -607,8 +609,11 @@ describe('ChatPage welcome-state history suggestions', () => {
   it('offers nothing when no past session matches', async () => {
     const { store } = renderChatPage([], { sessions: HISTORY })
     await waitFor(() => expect(inputProps).not.toBeNull())
-    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     await typeQuery('kubernetes migration')
+    // #765: history is seeded lazily by the typed query, not on mount — wait
+    // for the seed to land so the "no match" below is a real negative, not a
+    // not-yet-loaded false pass.
+    await waitFor(() => expect(store.getState().chat.history).toHaveLength(2))
     expect(screen.queryByRole('listbox', { name: 'Previous chats' })).toBeNull()
   })
 })

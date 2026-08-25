@@ -5,7 +5,7 @@
  *
  * - **No paper open** → `ProjectList`, which follows the standard page layout
  *   (`PageHeader` + `px-4 md:px-6 pb-8` container + `StatCard` row + `Card` sections).
- * - **A paper open** → a split-pane workspace: file tree, Monaco source pane and
+ * - **A paper open** → a split-pane workspace: file tree, Pierre source pane and
  *   diagnostics on the left; the rendered PDF on the right; an optional co-author
  *   chat panel beyond that. A paper and its PDF need the full viewport, so the
  *   editor is deliberately full-bleed and carries its own toolbar.
@@ -24,6 +24,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ArrowDownToLine, ArrowLeft, ArrowUpFromLine, FileDown, Loader2, MessageSquare, Play, Sparkles, TerminalSquare, X, ChevronDown, ChevronUp } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Btn } from '../../components/ui'
+import { useConfirm } from '../../components/ConfirmDialog'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import SearchableSelect from '../../components/SearchableSelect'
 import { useAppDispatch, useAppSelector } from '../../store'
@@ -96,6 +97,7 @@ const isFlushAbort = (err: Error): boolean => err.message === FLUSH_FAILED
  */
 
 export default function PapyrusPage() {
+  const { confirm, confirmDialog } = useConfirm()
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
@@ -150,7 +152,7 @@ export default function PapyrusPage() {
   // DURING the save, which is exactly what has to be detected.
   const bufferRef = useRef('')
   // Re-entry guard for save-and-compile. In a ref so the Cmd+S handler passed to
-  // Monaco keeps a stable identity across compile cycles.
+  // The editor keeps a stable identity across compile cycles.
   const compilingRef = useRef(false)
 
   useEffect(() => { bufferFileRef.current = currentFile }, [currentFile])
@@ -452,11 +454,13 @@ export default function PapyrusPage() {
     //
     // Placed above the clear so the early return leaves every guard exactly as it
     // was; the ordering the tests pin (clear -> reload) is unchanged.
-    if (dirtyRef.current && !window.confirm(
-      i18nT('apps.papyrus.workspace.co_author_conflict_discard_confirm', {
+    if (dirtyRef.current && !(await confirm({
+      title: i18nT('apps.papyrus.workspace.co_author_conflict_discard_title'),
+      body: i18nT('apps.papyrus.workspace.co_author_conflict_discard_confirm', {
         file: conflicted ?? '',
       }),
-    )) return
+      confirmLabel: i18nT('apps.papyrus.workspace.co_author_conflict_discard_button'),
+    }))) return
     // Cleared BEFORE the reload, and the refs too: `reloadOpenFile` refuses to adopt
     // while the buffer is dirty, and its no-flush branch would otherwise re-record the
     // very conflict being resolved. So the guard has to be down for the reload to run.
@@ -486,7 +490,7 @@ export default function PapyrusPage() {
       dirtyRef.current = true
       setDirty(true)
     }
-  }, [reloadOpenFile])
+  }, [reloadOpenFile, confirm])
 
   const applyCompileResult = useCallback((result: Awaited<ReturnType<typeof papyrusApi.compile>>) => {
     setDiagnostics(Array.isArray(result.errors) ? result.errors : [])
@@ -1133,6 +1137,7 @@ export default function PapyrusPage() {
           )}
         </AnimatePresence>
       </div>
+      {confirmDialog}
     </div>
   )
 }

@@ -20,7 +20,7 @@ import { screen, waitFor, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import PapyrusPage from '../apps/papyrus/PapyrusPage'
 import { renderWithProviders } from './helpers'
-import { readFileSync } from 'node:fs'
+import { readSource } from './readSource'
 import { papyrusApi } from '../apps/papyrus/api'
 
 vi.mock('../apps/papyrus/api', async (importOriginal) => ({
@@ -68,10 +68,7 @@ vi.mock('../apps/papyrus/PdfPreview', () => ({ default: () => <div data-testid="
 
 const api = vi.mocked(papyrusApi)
 
-const PapyrusPageSource = readFileSync(
-  'src/apps/papyrus/PapyrusPage.tsx',
-  'utf-8',
-)
+const PapyrusPageSource = readSource('src/apps/papyrus/PapyrusPage.tsx')
 
 const PROJECT = 'thesis'
 const MAIN = 'main.tex'
@@ -459,11 +456,10 @@ describe('Papyrus editor is read-only while the shown text is not the file', () 
     }
   })
 
-  it('the editor actually applies it to Monaco', () => {
-    // A prop the component accepts and ignores would pass the assertions above.
-    const src = readFileSync('src/apps/papyrus/PapyrusEditor.tsx', 'utf-8')
-    expect(src).toMatch(/options=\{\{\s*\n\s*readOnly,/)
-  })
+  // That the editor HONOURS the flag — rather than accepting and ignoring it — is
+  // asserted behaviourally in PapyrusEditorSeed.test.tsx, which mocks only Pierre
+  // and renders the real PapyrusEditor. It cannot live here: this file replaces
+  // PapyrusEditor with a textarea so the buffer can be made dirty at all.
 })
 
 describe('a failed background refresh does not destroy the buffer', () => {
@@ -548,7 +544,7 @@ describe('a failed conflict reload keeps the overwrite guard up', () => {
   // version — the same overwrite, reached by a failed recovery instead of an edit.
 
   const resolver = PapyrusPageSource.match(
-    /const resolveConflict = useCallback\(async \(\) => \{[\s\S]*?\n  \}, \[reloadOpenFile\]\)/,
+    /const resolveConflict = useCallback\(async \(\) => \{[\s\S]*?\n  \}, \[reloadOpenFile, confirm\]\)/,
   )
 
   it('restores both flags when the reload does not adopt', () => {
@@ -619,7 +615,7 @@ describe('an unresolved co-author conflict blocks the save', () => {
     // `reloadOpenFile` refuses to adopt while the buffer is dirty, and its no-flush
     // branch would otherwise re-record the very conflict being resolved.
     const resolver = PapyrusPageSource.match(
-      /const resolveConflict = useCallback\(async \(\) => \{[\s\S]*?\n  \}, \[reloadOpenFile\]\)/,
+      /const resolveConflict = useCallback\(async \(\) => \{[\s\S]*?\n  \}, \[reloadOpenFile, confirm\]\)/,
     )
     expect(resolver, 'resolveConflict not found').not.toBeNull()
     expect(resolver![0].indexOf('conflictFileRef.current = null')).toBeLessThan(

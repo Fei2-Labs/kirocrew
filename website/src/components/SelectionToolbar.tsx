@@ -1,9 +1,10 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { MessageSquareQuote, MessageCircleQuestion, Copy, Check } from 'lucide-react'
+import { MessageSquareQuote, MessageCircleQuestionMark, Copy, Check } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { i18nT } from '../i18n/t'
 
 export interface SelectionAction {
   id: string
@@ -244,7 +245,7 @@ interface SelectionToolbarProps {
   containerRef: React.RefObject<HTMLElement | null>
   /** Actions to show in the toolbar */
   actions: SelectionAction[]
-  /** External trigger (e.g. from Monaco) — shows toolbar at given position with given text */
+  /** External trigger (e.g. from the code editor) — shows toolbar at given position with given text */
   externalSelection?: { text: string; x: number; y: number } | null
 }
 
@@ -279,7 +280,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   const checkSelection = useCallback(() => {
     const sel = window.getSelection()
     if (!sel || sel.isCollapsed || !sel.toString().trim()) {
-      // Only dismiss if toolbar was shown by DOM selection (not external/Monaco)
+      // Only dismiss if toolbar was shown by DOM selection (not external/editor)
       if (sourceRef.current === 'dom') setVisible(false)
       return
     }
@@ -344,7 +345,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     }
   }, [visible, pos])
 
-  // External trigger (Monaco selections that don't use window.getSelection)
+  // External trigger (editor selections that don't use window.getSelection)
   useEffect(() => {
     if (externalSelection) {
       selectedTextRef.current = externalSelection.text
@@ -512,7 +513,7 @@ export function useSelectionActions(
     actions.push({
       id: 'quote',
       icon: <MessageSquareQuote size={12} />,
-      label: 'Quote',
+      label: i18nT('components.selectionToolbar.quote'),
       onClick: onQuote,
     })
   }
@@ -523,8 +524,8 @@ export function useSelectionActions(
   if (onAsk) {
     actions.push({
       id: 'ask',
-      icon: <MessageCircleQuestion size={12} />,
-      label: 'Ask in Side',
+      icon: <MessageCircleQuestionMark size={12} />,
+      label: i18nT('components.selectionToolbar.ask'),
       onClick: onAsk,
     })
   }
@@ -532,7 +533,7 @@ export function useSelectionActions(
   actions.push({
     id: 'copy',
     icon: <Copy size={12} />,
-    label: 'Copy',
+    label: i18nT('components.selectionToolbar.copy'),
     onClick: (text) => { copyToClipboard(text) },
   })
 

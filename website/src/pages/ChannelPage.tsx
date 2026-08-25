@@ -127,7 +127,7 @@ function AgentBadge({ agent, index }: { agent: ChannelAgent; index: number }) {
 
 function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
   msg: ChannelMessage; agents: ChannelAgent[]
-  onReply?: () => void; onOpenThread?: () => void; onApprove?: (action: string) => void
+  onReply?: () => void; onOpenThread?: () => void; onApprove?: (action: string) => Promise<unknown>
 }) {
   const isHuman = msg.fromId === 'human'
   const approvalMode = useAppSelector((s: RootState) => s.dashboard.approvalMode)
@@ -151,10 +151,20 @@ function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
           <span className="text-[13px] text-muted ml-auto">{time}</span>
         </div>
         <div className="text-sm text-text">{msg.msgType === 'approval' ? <span className="whitespace-pre-wrap">{msg.content}</span> : <MarkdownRenderer content={msg.content} />}</div>
-        {/* Approval card */}
+        {/* Approval card. hasCommand={false}: the channel approval message has
+            no STRUCTURED command field — the card is titled with the agent's
+            ROLE, and the fenced content is the tool input after credential
+            redaction and truncation (channel.py), which must never serve as an
+            exact-match trust pattern. The approve endpoint also accepts only
+            approved/rejected/trust, so command-scoped tiers stay off this
+            surface until the message schema actually carries a command.
+            trustAllLabelKey: the channel `trust` decision is channel-wide and
+            persisted to disk (it sets the channel's trusted flag and saves it),
+            so the trust-all option must say so — the default label reads as
+            session-scoped. */}
         {msg.msgType === 'approval' && onApprove && (
           <div className="mt-2">
-            <ApprovalCard title={msg.fromRole} toolInput={msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')} showButtons={approvalMode === 'normal'} onApprove={onApprove} />
+            <ApprovalCard title={msg.fromRole} hasCommand={false} toolInput={msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')} showButtons={approvalMode === 'normal'} trustAllLabelKey="components.trustDropdown.trust_all_tools_channel" onApprove={onApprove} />
           </div>
         )}
         {/* Thread badge + reply */}
@@ -364,14 +374,14 @@ function MentionInput({ agents, value, onChange, onSend }: {
         aria-label={i18nT('pages.channelPage.message_the_channel')}
         className="w-full bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none flex-1 transition-colors focus-ring resize-none"
         placeholder={i18nT('pages.channelPage.message_the_channel_type_to_mention')}
-        {...ime.composition}
+        {...ime.bindComposition()}
         onKeyDown={e => {
           if (show && active.length > 0) {
             if (e.key === 'ArrowDown') { e.preventDefault(); setSel(s => (s + 1) % active.length) }
             else if (e.key === 'ArrowUp') { e.preventDefault(); setSel(s => (s - 1 + active.length) % active.length) }
-            else if (e.key === 'Enter' && !ime.isComposing(e)) { e.preventDefault(); pick(active[sel]) }
+            else if (e.key === 'Enter') { if (ime.claimEnter(e)) pick(active[sel]) }
             else if (e.key === 'Escape') { ime.reset(); setShow(false) }
-          } else if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e)) { e.preventDefault(); onSend() }
+          } else if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) onSend() }
         }} />
     </div>
   )
@@ -380,6 +390,7 @@ function MentionInput({ agents, value, onChange, onSend }: {
 // ── Add Agent Form ──
 
 function AddAgentForm({ onAdd, onCancel }: { onAdd: (role: string, task: string, agent: string) => void; onCancel: () => void }) {
+  const ime = useImeGuard()
   const [role, setRole] = useState('')
   const [task, setTask] = useState('')
   const { agents, defaultAgent } = useAgents(0)
@@ -394,7 +405,14 @@ function AddAgentForm({ onAdd, onCancel }: { onAdd: (role: string, task: string,
         className="w-full text-[13px]" />
       <Input value={task} onChange={e => setTask(e.target.value)} placeholder={i18nT('pages.channelPage.task_e_g_search_cloudwatch_logs')} aria-label={i18nT('pages.channelPage.task')}
         className="w-full text-[13px]"
-        onKeyDown={e => { if (e.key === 'Enter' && role.trim()) onAdd(role.trim(), task.trim(), agent || defaultAgent) }} />
+        {...ime.bindComposition()}
+        onKeyDown={e => {
+          if (e.key !== 'Enter') return
+          // Rule 1: single-line input — the guard alone is enough; claiming would
+          // suppress an implicit form submit where one is wanted.
+          if (ime.isComposing(e)) return
+          if (role.trim()) onAdd(role.trim(), task.trim(), agent || defaultAgent)
+        }} />
       <div className="flex gap-1">
         <Btn onClick={() => { if (role.trim()) onAdd(role.trim(), task.trim(), agent || defaultAgent) }} disabled={!role.trim()} primary className="flex-1">{i18nT('pages.channelPage.add')}</Btn>
         <Btn onClick={onCancel}>{i18nT('pages.channelPage.cancel')}</Btn>
@@ -661,7 +679,7 @@ export default function ChannelPage() {
                 <MessageBubble key={msg.id} msg={msg} agents={channel.agents}
                   onReply={() => openThread(msg.id)}
                   onOpenThread={() => openThread(msg.id)}
-                  onApprove={msg.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, msg.fromId, action).catch(() => {}) : undefined} />
+                  onApprove={msg.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, msg.fromId, action) : undefined} />
               ))}
               {channel.agents.filter(a => a.state === 'working' || a.state === 'tool_running').map(a => (
                 <div key={a.id + '-typing'} className="flex items-center gap-2 px-3 py-1.5 text-[13px] text-muted animate-pulse">
@@ -685,12 +703,12 @@ export default function ChannelPage() {
                   }} />
                 }>
                   <div className="flex flex-col gap-1 -mx-3 -mt-2">
-                    {parent && <MessageBubble msg={parent} agents={channel.agents}
-                      onApprove={parent.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, parent.fromId, action).catch(() => {}) : undefined} />}
+                    {parent && <MessageBubble key={parent.id} msg={parent} agents={channel.agents}
+                      onApprove={parent.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, parent.fromId, action) : undefined} />}
                     {replies.length > 0 && <div className="border-t border-border my-2" />}
                     {replies.map(msg => (
                       <MessageBubble key={msg.id} msg={msg} agents={channel.agents}
-                        onApprove={msg.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, msg.fromId, action).catch(() => {}) : undefined} />
+                        onApprove={msg.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, msg.fromId, action) : undefined} />
                     ))}
                     {channel.agents.filter(a => a.state === 'working' || a.state === 'tool_running').map(a => (
                       <div key={a.id + '-typing-t'} className="flex items-center gap-2 px-2 py-1 text-[13px] text-muted animate-pulse">

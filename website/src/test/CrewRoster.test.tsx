@@ -179,6 +179,17 @@ async function openCreate(): Promise<HTMLElement> {
   return await screen.findByRole('dialog', { name: 'Create a new crew' })
 }
 
+/**
+ * Move the editor to one of its rail panes.
+ *
+ * The editor is a rail plus one pane, so a control is only mounted while its own
+ * pane is showing. Tests that touch a binding, the routing field or the removal
+ * step navigate there first — the same click a user makes.
+ */
+function gotoPane(sheet: HTMLElement, key: string) {
+  fireEvent.click(within(sheet).getByTestId(`crew-rail-${key}`))
+}
+
 describe('crew roster — cards', () => {
   it('renders one card per crew and badges only the default one', async () => {
     await renderRoster()
@@ -259,6 +270,7 @@ describe('crew roster — isolation preview notice', () => {
   it('hangs the same caveat off the workspace and memory bindings', async () => {
     await renderRoster()
     const sheet = await openEditor('oncall')
+    gotoPane(sheet, 'place')
     // Two tips, one per binding the notice is about. The editor is an overlay,
     // so the page-level notice is not readable from here — the tooltip is the
     // only place this caveat reaches a user who is mid-edit.
@@ -307,13 +319,12 @@ describe('crew roster — filtering', () => {
     expect(screen.queryAllByTestId('crew-card')).toHaveLength(0)
   })
 
-  it('does not flash the empty state while a refreshTrigger-driven refetch is in flight', async () => {
-    // `refreshTrigger` is part of the roster query key, so any WS-driven bump
-    // (a `refresh` / `sessions_restarting` / `refine` frame from ANOTHER
-    // session, a cron, or a restart) mints a fresh query whose `data` starts
-    // `undefined`. Without `placeholderData: keepPreviousData` that collapses
-    // `agents` to `[]` for the refetch window and the roster flashes the
-    // "No crews yet" empty state on a populated install — the reported bug.
+  it('does not flash the empty state while an invalidateQueries-driven refetch is in flight', async () => {
+    // After retiring the refreshTrigger-in-queryKey pattern (#4179), the
+    // roster query key is stable (`['kirocrew-agents']`) and refetches are
+    // triggered by `queryClient.invalidateQueries` from the WS handler.
+    // `invalidateQueries` keeps the cached data visible during the refetch,
+    // so the roster must never collapse to the empty state.
     let resolveSecond: (v: unknown) => void = () => {}
     mockApi.kirocrewAgents
       .mockResolvedValueOnce(AGENTS_RESPONSE)
@@ -332,10 +343,8 @@ describe('crew roster — filtering', () => {
     )
     await waitFor(() => expect(screen.getAllByTestId('crew-card')).toHaveLength(2))
 
-    // Bump refreshTrigger → the roster query key changes and refetches. The
-    // second fetch is deliberately left pending so the "no data yet" window is
-    // observable rather than a sub-millisecond flicker.
-    act(() => { store.dispatch({ type: 'dashboard/triggerRefresh' }) })
+    // Simulate the WS handler: invalidate the query in-place (no key change).
+    act(() => { qc.invalidateQueries({ queryKey: ['kirocrew-agents'] }) })
 
     // The prior roster must remain on screen throughout the pending refetch —
     // no empty state, cards intact.
@@ -501,9 +510,17 @@ describe('crew editor — opening', () => {
     await renderRoster()
     const sheet = await openEditor('oncall')
 
+    // One assertion per pane the binding lives on, because a pane mounts only
+    // while it is showing. Visiting each is the point: it also proves the rail
+    // routes to the right one.
+    gotoPane(sheet, 'place')
     expect(within(sheet).getByRole('combobox', { name: 'Workspace' })).toHaveTextContent('oncall')
     expect(within(sheet).getByRole('combobox', { name: 'Memory Store' })).toHaveTextContent('oncall-mem')
+
+    gotoPane(sheet, 'template')
     expect(within(sheet).getByRole('combobox', { name: 'Agent Template' })).toHaveTextContent('oncall-agent')
+
+    gotoPane(sheet, 'model')
     expect(within(sheet).getByRole('combobox', { name: 'Edit default model' })).toHaveTextContent('claude-opus-5')
   })
 
@@ -513,6 +530,10 @@ describe('crew editor — opening', () => {
     // Create mode has no crew to edit yet, so the bindings start on the defaults.
     expect(within(sheet).getByRole('combobox', { name: 'Workspace' })).toHaveTextContent('default')
     expect(within(sheet).getByRole('combobox', { name: 'Memory Store' })).toHaveTextContent('default')
+    // The Agent Template is the exception: it has NO safe default, because
+    // pre-filling the built-in made a new crew an alias for the default agent.
+    expect(within(sheet).getByRole('combobox', { name: 'Agent Template' }))
+      .toHaveTextContent('Select an agent template…')
   })
 })
 
@@ -529,7 +550,7 @@ describe('crew editor — create', () => {
     expect(screen.getByRole('dialog', { name: 'Create a new crew' })).toBeInTheDocument()
   })
 
-  it('creates the crew with the chosen bindings', async () => {
+  it('refuses a crew with no Agent Template chosen, without calling the api', async () => {
     await renderRoster()
     const sheet = await openCreate()
 
@@ -537,10 +558,32 @@ describe('crew editor — create', () => {
     await user.type(within(sheet).getByPlaceholderText('e.g. oncall'), 'staging')
     fireEvent.click(within(sheet).getByRole('button', { name: 'Create' }))
 
+    // The template used to be pre-filled with 'kirocrew', so a crew created
+    // this way became an alias for the DEFAULT agent and the chat picker
+    // appeared to "fall back to default" (#1684). It is now an explicit choice.
+    expect(await within(sheet).findByText('Agent Template is required')).toBeInTheDocument()
+    expect(mockApi.createKirocrewAgent).not.toHaveBeenCalled()
+  })
+
+  it('creates the crew with the chosen bindings', async () => {
+    await renderRoster()
+    const sheet = await openCreate()
+
+    const user = userEvent.setup()
+    await user.type(within(sheet).getByPlaceholderText('e.g. oncall'), 'staging')
+    // The template must be picked deliberately — nothing pre-fills it.
+    // Keyboard-driven: a POINTER click on the Radix select inside this dialog
+    // recurses in happy-dom's blur handling (RangeError: Maximum call stack size
+    // exceeded), which then wedges React's act queue for every later test here.
+    const template = within(sheet).getByRole('combobox', { name: 'Agent Template' })
+    fireEvent.keyDown(template, { key: 'ArrowDown' })
+    fireEvent.click(await screen.findByRole('option', { name: 'oncall-agent' }))
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Create' }))
+
     await waitFor(() =>
       expect(mockApi.createKirocrewAgent).toHaveBeenCalledWith({
         name: 'staging',
-        kiro_agent: 'kirocrew',
+        kiro_agent: 'oncall-agent',
         workspace: 'default',
         memory_store: 'default',
         triggers: '',
@@ -554,6 +597,10 @@ describe('crew editor — save', () => {
     await renderRoster()
     const sheet = await openEditor('oncall')
 
+    // Save is gated on there being something to save, so make one real edit; the
+    // point of this test is the payload's SHAPE, which every other field pins.
+    gotoPane(sheet, 'routing')
+    fireEvent.change(within(sheet).getByRole('textbox', { name: 'Triggers' }), { target: { value: 'pager' } })
     fireEvent.click(within(sheet).getByRole('button', { name: 'Save changes' }))
 
     await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalled())
@@ -561,16 +608,33 @@ describe('crew editor — save', () => {
       kiro_agent: 'oncall-agent',
       workspace: 'oncall',
       memory_store: 'oncall-mem',
-      triggers: '',
+      triggers: 'pager',
       model: 'claude-opus-5',
     })
+  })
+
+  it('offers no Save until something is actually pending', async () => {
+    // The wake pane's pause/run controls apply immediately, so a live Save beside
+    // them would imply those toggles are drafts that Cancel could roll back.
+    await renderRoster()
+    const sheet = await openEditor('oncall')
+
+    expect(within(sheet).getByRole('button', { name: 'Save changes' })).toBeDisabled()
+    gotoPane(sheet, 'routing')
+    fireEvent.change(within(sheet).getByRole('textbox', { name: 'Triggers' }), { target: { value: 'pager' } })
+    expect(within(sheet).getByRole('button', { name: 'Save changes' })).toBeEnabled()
+
+    // Typing it back is not a pending change.
+    fireEvent.change(within(sheet).getByRole('textbox', { name: 'Triggers' }), { target: { value: '' } })
+    expect(within(sheet).getByRole('button', { name: 'Save changes' })).toBeDisabled()
   })
 
   it('sends edited routing triggers', async () => {
     await renderRoster()
     const sheet = await openEditor('oncall')
 
-    fireEvent.change(within(sheet).getByLabelText('Triggers'), {
+    gotoPane(sheet, 'routing')
+    fireEvent.change(within(sheet).getByRole('textbox', { name: 'Triggers' }), {
       target: { value: 'incident, prod outage' },
     })
     fireEvent.click(within(sheet).getByRole('button', { name: 'Save changes' }))
@@ -590,6 +654,8 @@ describe('crew editor — save', () => {
     const sheet = await openEditor('oncall')
 
     expect(within(sheet).queryByRole('switch')).not.toBeInTheDocument()
+    gotoPane(sheet, 'routing')
+    fireEvent.change(within(sheet).getByRole('textbox', { name: 'Triggers' }), { target: { value: 'pager' } })
     fireEvent.click(within(sheet).getByRole('button', { name: 'Save changes' }))
     await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalled())
     expect(mockApi.setDefaultAgent).not.toHaveBeenCalled()
@@ -740,6 +806,7 @@ describe('crew editor — delete', () => {
 
     // First press arms the confirm; it must NOT delete. A one-click destructive
     // button in a slide-in panel was the flagged regret risk.
+    gotoPane(sheet, 'danger')
     fireEvent.click(within(sheet).getByRole('button', { name: 'Delete crew' }))
     expect(mockApi.deleteKirocrewAgent).not.toHaveBeenCalled()
     expect(within(sheet).getByText(/Delete crew oncall\?/)).toBeInTheDocument()
@@ -752,6 +819,7 @@ describe('crew editor — delete', () => {
     await renderRoster()
     const sheet = await openEditor('oncall')
 
+    gotoPane(sheet, 'danger')
     fireEvent.click(within(sheet).getByRole('button', { name: 'Delete crew' }))
     fireEvent.click(within(sheet).getByTestId('cancel-delete-crew'))
     expect(within(sheet).queryByTestId('confirm-delete-crew')).not.toBeInTheDocument()

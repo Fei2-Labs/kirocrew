@@ -491,7 +491,7 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 |--------|---------|-------|
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
-| `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
+| `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
 | `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session` |
 
 CLI commands and their MCP twins:
@@ -521,7 +521,25 @@ answers `tools/list` from):
 - **Subagents:** `spawn_status`, `spawn_continue`, `spawn_steer`,
   `spawn_release`, `spawn_sub_agents`, `wait`
 - **Messaging and notification:** `send_message`, `send_notification`,
-  `delete_message`, `file_send`, `read_slack_profile`
+  `delete_message`, `file_send`, `read_slack_profile`. `send_message` is the
+  agent's only proactive egress, and it names its destination rather than
+  inferring one: `session="slack"` / `channel` / `user` / `thread_ts` are the
+  Slack fields, and `channel_type` is the non-Slack one — the transport of the
+  conversation the calling session already belongs to. Exactly one of the two
+  families may appear per call. The routing ladder and the fail-closed contract
+  behind `channel_type` are in
+  [messaging](../system-specs/modules/messaging.md) § Proactive sends. Two
+  things to know before adding a destination to it:
+  - **The governance gate must name the transport the message actually leaves
+    over.** The `channels` scope is a per-transport allowlist, so vetting
+    `"slack"` for a Telegram send evaluates a Telegram denial against Slack's
+    rule — and refuses a permitted Telegram send whenever Slack is denied.
+  - **`channel_type` is the one `send_message` argument that requires
+    `_resolve_session_key_strict()`.** It posts into one specific conversation,
+    which is the "targets a specific session" case below; the lenient walk
+    climbs process ancestors, so a sub-agent would resolve to its parent and
+    deliver into the parent's chat window. An unresolvable identity refuses the
+    call rather than guessing.
 - **Session-bound directives** (`session_directive.DIRECTIVE_TOOLS`):
   `ask_question`, `suggest_followup`, `monitor_start`, `monitor_update`,
   `autonudge_stop`, `set_project`
@@ -535,8 +553,8 @@ answers `tools/list` from):
   `artifact_get_comments`, `artifact_post_comment`, `artifact_reply_comment`,
   `artifact_delete_comment`, `artifact_mark_review`, `deploy_artifact`
 - **Knowledge and skills:** `local_knowledge_search`, `knowledge_dedup`,
-  `skill_discover`, `skill_search`, `skill_fetch`, `browse_outline`,
-  `browse_search`
+  `knowledge_list_sources`, `skill_discover`, `skill_search`, `skill_fetch`,
+  `browse_outline`, `browse_search`
 - **Workflows and hooks:** `workflow_author`, `workflow_list`,
   `workflow_cancel`, `workflow_rerun_subtree`, `register_hook`
 - **Diagnostics:** `resource_status`, `issue_radar_record_investigation`
@@ -672,11 +690,60 @@ is documented here rather than hidden.
 
 The asymmetry in the last column is not an oversight. Sessions carry an owning
 app, so "yours" is a decidable question and an app is confined to its own.
-Folders carry no owner at all: one tree serves the person and every app, so
-there is no app-private folder to bound a create, rename, reparent or delete to.
-Until folders have ownership, an app is refused the tree-shaping verbs outright
-rather than handed authority nothing can scope — while keeping the two things
-that are already scoped to it, reading the tree and filing its own sessions.
+Folders now answer the same question: a folder created by an app carries it in
+`owner_app`, and an absent key reads as the person's — which is why the field
+arrived without a migration, since every folder written before it existed is the
+person's. An app may create at the top level or inside a folder it owns, and may
+rename, reparent or delete only what it owns; the top level is not a folder row
+and so has no owner to violate, which is where an app's own tree starts. A
+reparent is refused when the folder's SUBTREE holds one the caller does not own,
+because a move takes the subtree with it and would relocate the person's folder
+under cover of moving the app's. A rename, colour or collapse is not gated that
+way -- it relocates nothing. The person is never confined by any of this, and an
+app keeps what it always had: reading the whole tree, and filing its OWN sessions
+into any folder that exists.
+
+**An app cannot delete a folder at all.** Not even an empty one it owns. A delete
+relocates everything the folder contains, and those contents live in a DIFFERENT
+store from the folder -- sessions are in the slot table and the session archive,
+neither sharing a lock with it -- so "is this folder empty?" cannot be established
+atomically with the removal. Successively narrower rules each leaked through
+another seam: a session filed while the archive scan awaited, a child created while
+the lock was acquired, a session closing after the scan and writing its `folder_id`
+on the way out. Each was closable alone; the class was not, so the verb is withheld
+instead. Nothing shipped loses a capability -- no MCP tool exposes deletion and the
+only client of the route is the dashboard UI -- and an app organizes its work by
+creating, renaming and reparenting its own folders and filing its own sessions. The
+person deletes a full folder exactly as before.
+
+The policy lives in the endpoints, not in the MCP server. Only the endpoint holds
+the store lock and sees the authoritative tree, so a second copy of the rule in
+the tool layer could only drift or race. What the tool layer still decides is the
+one question the endpoint cannot: whether the caller can be placed at all, since
+an unverifiable or delegated caller has no scope to bound a write to.
+
+Moving the decision to the endpoint makes the write's IDENTITY load-bearing, so
+the gate returns the key it verified and every folder write sends that key
+unchanged. The write helpers default to `_resolve_session_key`, whose `/proc`
+ancestor walk can resolve to a different slot than `_resolve_session_key_strict`
+did; letting them re-resolve would check one identity and write under another,
+and for an app-owned session the walk landing on an ancestor makes the write
+arrive looking like the unconfined person -- which would let an app reach the
+folders the ownership rule exists to protect. `chat_folder_move_session` already
+worked this way; create and move now do too, including each intermediate folder a
+`mkdir -p` parent path creates.
+
+The same reasoning covers the OTHER way an app's write can arrive unattributable.
+An empty scope reads as the person, which is correct for a caller that never had a
+slot -- a Slack thread, a channel session, the person's own cron -- but not for a
+`dashboard:` key, which NAMES a slot: absence there means the app it would have
+been confined to is exactly what got popped, which is what a tab closing mid-call
+produces. The folder mutations therefore refuse a caller matching
+`caller_names_a_missing_slot`, the predicate that exists so a route outside the
+MCP tool set can apply the rule `_caller_app_scope` already applies inside it. It
+stays per-route rather than in the middleware on purpose: a popped slot no longer
+says whose tab it was, so refusing centrally would also refuse the person's own
+in-flight calls on every internal route at once.
 
 **Assignment is still not authorization.** Being unreferenced by default keeps a
 capability cheap and deliberate; it does not prove the user consented to reach the
@@ -710,11 +777,11 @@ a half-registered server fails the suite rather than shipping.
 ### The one deliberate exception
 
 `kirocrew computer call <tool>` has **no MCP twin, on purpose.** It is not a
-capability; it is a human debug and repro harness that runs the ten existing
+capability; it is a human debug and repro harness that runs the eleven existing
 `computer_*` tools through the same gated chokepoint (optionally a JSON array of
 them in one process, so `element_index` values stay resolvable across calls). The
 MCP-first rule exists so the model gets a structured tool instead of shelling
-out, and the model already has all ten. A tool that runs other tools would let a
+out, and the model already has all eleven. A tool that runs other tools would let a
 model launder one per-call gate decision into many, so do NOT add
 `computer_call`.
 

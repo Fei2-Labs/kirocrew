@@ -39,7 +39,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Collection, Iterator, Optional
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.loader import config_dir as _config_dir
@@ -49,6 +49,7 @@ from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
 from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, transport
 from kiro_crew.mcp_gateway.apps import sweep_spool as apps_sweep_spool
 from kiro_crew.mcp_gateway.backend import Backend, BackendGone, spawn_backend
+from kiro_crew.mcp_gateway.backend_tmp import sweep_all_backend_tmp
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
 from kiro_crew.mcp_gateway.hashing import hash_effective_env, non_secret_env
 from kiro_crew.mcp_gateway.manager import _scrub_sensitive_env, is_credential_env_key
@@ -65,13 +66,16 @@ from kiro_crew.mcp_gateway.prewarm import (
     default_hot_keys_path,
     prewarm_from_payloads,
 )
+from kiro_crew.mcp_gateway.resolve_once import resolved_launch
 from kiro_crew.mcp_gateway.rewriter import (
     env_sidecar_dir,
     env_sidecar_name,
     forward_declared_env_enabled,
+    pool_identity_env_keys,
     records_dir,
     resolve_overlay_dir,
 )
+from kiro_crew.mcp_gateway.secret_uri import resolve_secret_uris
 from kiro_crew.mcp_gateway.shutdown_budget import DRAIN_SECS, POOL_SHUTDOWN_SECS
 from kiro_crew.mcp_gateway.spill import cleanup_old_spill_files
 from kiro_crew.mcp_gateway.stub import fallback_counts as stub_fallback_counts
@@ -79,7 +83,8 @@ from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.peer_resolve import resolve_peer_identity
 from kiro_crew.platform_compat import IS_WINDOWS
 from kiro_crew.platform_compat import get_process_start_id as _get_process_start_id
-from kiro_crew.sandbox import warm_backend
+from kiro_crew.platform_compat import proc_rss_bytes as _proc_rss_bytes
+from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES, warm_backend
 from kiro_crew.sel import SecurityEventLog
 
 logger = logging.getLogger(__name__)
@@ -123,10 +128,15 @@ def _emit_lazy_load_metrics(elapsed_ms: float, *, warm: bool) -> None:
 
 
 # Max bytes accepted for any single stub->gateway frame. Registration
-# payloads from the stub are well under 4 KiB; 1 MiB is a very loose cap
+# payloads from the stub are well under 4 KiB, so this is a very loose cap
 # that still guards against a malformed or hostile peer blowing memory
 # with ``readuntil(b"\n")``.
-_MAX_FRAME_BYTES = READ_BUFFER_LIMIT_BYTES  # 1 MiB; see pool.READ_BUFFER_LIMIT_BYTES
+#
+# It is the read-buffer limit: 64 MiB by default, and operator-tunable via
+# ``mcp_gateway.read_buffer_limit_bytes`` / ``KIROCREW_MCP_READ_LIMIT``. Anything
+# that materializes a frame this size -- a test, a fuzz payload -- allocates tens
+# of MiB, so build it inside the function that needs it.
+_MAX_FRAME_BYTES = READ_BUFFER_LIMIT_BYTES  # see pool.READ_BUFFER_LIMIT_BYTES
 
 # How long a connection handler waits for the first Register message
 # before giving up on an idle client. Keeps the event loop from
@@ -326,6 +336,10 @@ async def run_gatewayd(
     await transport.remove_stale(socket_path)
 
     resolver = target_resolver if target_resolver is not None else env_target_resolver
+    # Pre-resolved npm specs launch straight from the store; everything else is
+    # handed through unchanged. Wrapping an INJECTED resolver too keeps the
+    # behaviour identical whether the daemon resolves from env or a test's stub.
+    resolver = resolve_once_resolver(resolver)
     # Shared circuit breaker keyed by server name: a server
     # that crash-loops on spawn trips OPEN and get_or_create rejects further
     # spawns so the stub falls back to per-session exec instead of churning.
@@ -423,6 +437,7 @@ async def run_gatewayd(
     # a dangling socket that confuses the next startup probe.
     server: Optional[transport.TransportServer] = None
     sweeper: Optional[asyncio.Task[None]] = None
+    tmp_sweeper: Optional[asyncio.Task[None]] = None
     socket_liveness: Optional[asyncio.Task[None]] = None
     diagnostic: Optional[asyncio.Task[None]] = None
     heartbeat: Optional[asyncio.Task[None]] = None
@@ -471,6 +486,22 @@ async def run_gatewayd(
             _idle_sweeper(pool, idle_timeout_secs, sweep_interval, stop_event),
             name="mcp-gateway-idle-sweeper",
         )
+
+        # Backend temp containment (#5064): reclaim per-process temp dirs
+        # whose owner is dead AND whose content is idle (see backend_tmp --
+        # deletion deliberately lives ONLY here, never on a shutdown path,
+        # because a launcher's exit is not proof its process tree is gone).
+        # First pass at task start (same boot posture as the spool sweep),
+        # then hourly; offloaded and best-effort.
+        async def _backend_tmp_sweeper() -> None:
+            while True:
+                try:
+                    await asyncio.to_thread(sweep_all_backend_tmp)
+                except Exception:
+                    logger.debug("backend-tmp: sweep failed", exc_info=True)
+                await asyncio.sleep(3600)
+
+        tmp_sweeper = asyncio.create_task(_backend_tmp_sweeper(), name="mcp-gateway-tmp-sweeper")
 
         # Socket-liveness self-exit: the daemon is its own session/group
         # leader, so a launcher that dies without signalling it (pytest
@@ -679,6 +710,11 @@ async def run_gatewayd(
             sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await sweeper
+
+        if tmp_sweeper is not None:
+            tmp_sweeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await tmp_sweeper
 
         if socket_liveness is not None:
             socket_liveness.cancel()
@@ -1113,20 +1149,38 @@ def _declared_non_secret_env(pool_key: PoolKey) -> dict[str, str]:
     What survives is operator-declared, non-secret, and part of the PoolKey —
     every session sharing this backend agrees on it by construction.
 
+    A name in ``mcp_gateway.pool_identity_env`` survives (1) BECAUSE it is part
+    of the PoolKey: :func:`rewriter.pool_identity_env_keys` is the authoritative
+    read, the same one the coherence gate in :func:`_declared_env_pairs` uses, so
+    the sentence above stays true rather than being weakened. It cannot bypass
+    (2) — that helper drops credential-scrub names before returning them.
+
     BLOCKING: reads a file. Callers must run it off the event loop.
     """
-    pairs = _declared_env_pairs(pool_key)
+    identity_keys = pool_identity_env_keys()
+    pairs = _declared_env_pairs(pool_key, identity_keys)
     return {
-        k: v for k, v in non_secret_env(pairs).items() if not is_credential_env_key(k)
+        k: v
+        for k, v in non_secret_env(pairs, identity_keys=identity_keys).items()
+        if not is_credential_env_key(k)
     }
 
 
-def _declared_env_pairs(pool_key: PoolKey) -> dict[str, str]:
+def _declared_env_pairs(pool_key: PoolKey, identity_keys: Collection[str]) -> dict[str, str]:
     """Return the declared env sidecar's contents for ``pool_key``, or ``{}``.
 
     Unfiltered, but coherence-gated: a sidecar whose contents no longer hash to
     ``pool_key.effective_env_hash`` yields ``{}``. Callers apply whatever
     co-tenancy filtering their acquisition path requires.
+
+    ``identity_keys`` is REQUIRED rather than read here, so the caller's ONE
+    snapshot of ``pool_identity_env_keys()`` governs both the hash recomputed
+    below and whatever filtering the caller then applies. Reading it here as well
+    would make those two decisions two different observations of a file an
+    operator can edit at any moment: the gate could accept a sidecar under one
+    set while the caller filtered under another, and the wider of the two would
+    decide what reaches the backend. Passing it in makes that mismatch
+    unrepresentable instead of merely unlikely.
 
     BLOCKING: reads a file. Callers must run it off the event loop.
     """
@@ -1165,7 +1219,18 @@ def _declared_env_pairs(pool_key: PoolKey) -> dict[str, str]:
     # Recomputing the hash here and requiring equality closes that window. The
     # construction mirrors the stub's ``_parse_env_json`` (str-coerced keys and
     # values, empty keys dropped) so a coherent sidecar always matches.
-    if hash_effective_env(pairs) != pool_key.effective_env_hash:
+    #
+    # ``identity_keys`` comes from the OPERATOR's config, never from the Register
+    # frame, and is the CALLER's single snapshot -- see this function's docstring
+    # for why it is a parameter rather than a second read. The stub was handed the
+    # same set on its argv only so it could compute this hash; a stub that claims a
+    # different set produces a hash this line does not reproduce, so the mismatch
+    # branch runs and nothing is forwarded. That is what keeps "which secrets may
+    # reach a shared backend" an operator decision while leaving the stub the
+    # untrusted client it is documented to be — and it needs no new check, because
+    # the gate that already guards a spec edited mid-session guards a lying stub
+    # identically.
+    if hash_effective_env(pairs, identity_keys=identity_keys) != (pool_key.effective_env_hash):
         logger.warning(
             "declared-env: sidecar for %r no longer matches the PoolKey it was "
             "hashed under (the spec was edited after this session started); "
@@ -1186,18 +1251,23 @@ def _declared_env_for_private_backend(pool_key: PoolKey) -> dict[str, str]:
     another session's backend. Here the declaring session and the only consuming
     session are the same one.
 
-    Nor is this gated on ``forward_declared_env``: that switch exists to let an
-    operator accept the co-tenancy hazard for POOLED backends. Withholding the
-    env here would instead be a regression — the same server spawned without a
-    gateway gets its declared env from the agent runtime, so a private backend
-    that silently dropped it would break servers that work today.
+    Nor is this gated on ``forward_declared_env``: post-flip that switch is an
+    escape hatch for disabling forwarding fleet-wide, not a gate on accepting a
+    co-tenancy hazard — the hazard it once gated is closed by construction for
+    pooled backends (only keys inside ``effective_env_hash`` are forwarded, and
+    the coherence gate re-checks the sidecar against that hash at spawn). Note
+    the per-server opt-out is membership in ``mcp_gateway.stub_servers``, which is
+    the only stub trigger; this flag is the coarser fleet-wide spelling.
+    Withholding the env here would instead be a regression — the same server
+    spawned without a gateway gets its declared env from the agent runtime, so a
+    private backend that silently dropped it would break servers that work today.
 
     The coherence gate still applies: a sidecar edited after this session
     started yields ``{}`` rather than values the running stub never hashed.
 
     BLOCKING: never call this on the event loop.
     """
-    return _declared_env_pairs(pool_key)
+    return _declared_env_pairs(pool_key, pool_identity_env_keys())
 
 
 def _declared_env_to_forward(pool_key: PoolKey) -> dict[str, str]:
@@ -1253,10 +1323,14 @@ def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dic
         return None
     command, *args = parts
     env = _scrub_sensitive_env(dict(os.environ))
-    # Strip PYTHONPATH/PYTHONHOME so the KiroCrew process's own Python
-    # environment doesn't leak into Python-based MCP backends (import conflicts).
-    env.pop("PYTHONPATH", None)
-    env.pop("PYTHONHOME", None)
+    # Strip the Kiro Crew process's own Python env vars so they don't leak into
+    # Python-based MCP backends: PYTHONPATH/PYTHONHOME cause import conflicts,
+    # and PYTHONPYCACHEPREFIX (desktop-app-only, see pycache_gc.py) would make
+    # a pooled backend mirror its stdlib into the shared bytecode cache. Reuses
+    # sandbox._PYTHON_ENV_PREFIXES instead of hand-listing keys, so this scrub
+    # site can't drift from the kiro-cli/agent spawn path's scrub again.
+    for key in _PYTHON_ENV_PREFIXES:
+        env.pop(key, None)
     # No KIROCREW_CHANNEL_ID is exported into the backend env. It used to be
     # copied from PoolKey.channel_id, which only made sense while a backend was
     # owned by one channel. A pooled backend serves several channels, so a
@@ -1265,6 +1339,54 @@ def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dic
     # to spawn it first. The channel is delivered PER CALL instead, in
     # _meta.kirocrew.caller (see _inject_caller_meta).
     return command, args, env, pool_key.work_dir
+
+
+def _resolve_once_home() -> str:
+    """The data home whose resolve-once store this daemon reads.
+
+    Mirrors the socket-path resolution so the daemon and the gateway that filled
+    the store agree on where it lives.
+    """
+    home = os.environ.get("KIROCREW_HOME")
+    return str(Path(home) if home else _config_dir())
+
+
+def resolve_once_resolver(inner: TargetResolver) -> TargetResolver:
+    """Wrap ``inner`` so an already-resolved npm spec launches without npm.
+
+    An ``npx`` target re-asks the registry what its spec means on every launch.
+    When the gateway has pre-resolved that spec into its store, this substitutes
+    the recorded entry point, turning the launch into a plain ``node`` exec with
+    no network and no dependency resolution.
+
+    Purely a substitution: env and work_dir are whatever ``inner`` computed, so
+    the PoolKey's env hash still describes what is spawned. Anything not
+    pre-resolved -- a non-npm command, a spec never prefetched, a store entry
+    that has gone stale on disk -- passes through untouched, so this can only
+    remove work from the launch path, never add a failure to it.
+    """
+
+    def _resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dict[str, str], str]]:
+        target = inner(pool_key)
+        if target is None:
+            return None
+        command, args, env, work_dir = target
+        try:
+            launch = resolved_launch(_resolve_once_home(), command, args)
+        except Exception:  # pragma: no cover — a store read must never break spawn
+            logger.debug("resolve-once lookup failed; using npm launcher", exc_info=True)
+            return target
+        if launch is None:
+            return target
+        resolved_command, resolved_args = launch
+        logger.info(
+            "resolve-once: %s launching pre-resolved tree instead of %s",
+            pool_key.server_name,
+            os.path.basename(command),
+        )
+        return resolved_command, resolved_args, env, work_dir
+
+    return _resolver
 
 
 # --- Connection handling ----------------------------------------------------
@@ -1644,7 +1766,9 @@ def _audit_peer_identity_denied(reason: str, peer_pid: int | None, stub_uuid: st
         logger.debug("SEL audit emit for peer identity denial failed", exc_info=True)
 
 
-def _apply_claim(frame: dict[str, Any]) -> dict[str, Any]:
+async def _apply_claim(
+    frame: dict[str, Any], pool: Optional["BackendPool"] = None
+) -> dict[str, Any]:
     """Apply a ``claim`` frame to every indexed connection of the target PID.
 
     Returns the ack frame. Validation is deny-by-default: a non-integer or
@@ -1696,7 +1820,13 @@ def _apply_claim(frame: dict[str, Any]) -> dict[str, Any]:
     # be rejected.
     raw_token = frame.get("pid_start_id")
     claim_token = raw_token if isinstance(raw_token, str) else None
-    for conn in conns:
+    # Pass 1: retarget every eligible connection SYNCHRONOUSLY (no awaits)
+    # before any eviction runs — see the wrong-principal note below.
+    retargeted: list[tuple[Any, str]] = []
+    # Snapshot: the eviction below AWAITS, and a connection disconnecting
+    # during that await mutates the live ``conns`` set mid-iteration —
+    # aborting the claim with no ack and leaving the remaining stubs stale.
+    for conn in list(conns):
         recorded_token = conn.pid_start_ids.get(pid)
         if claim_token is not None and recorded_token is not None and claim_token != recorded_token:
             skipped += 1
@@ -1717,7 +1847,33 @@ def _apply_claim(frame: dict[str, Any]) -> dict[str, Any]:
         old_key = conn.caller.session_key if conn.caller is not None else ""
         if old_key == updated_caller.session_key:
             continue  # already correct — idempotent re-claim
+        # Reassign the owner BEFORE any eviction awaits — and reassign
+        # EVERY eligible connection before the FIRST eviction awaits (the
+        # second pass below): an eviction yields, and a sibling connection
+        # still carrying the old caller during that await would forward
+        # its frames as the previous session — wrong-principal execution.
+        # A subscribe arriving during an await must likewise already be
+        # authorized as the NEW caller on every connection.
         conn.caller = updated_caller
+        retargeted.append((conn, old_key))
+    # Pass 2: all connections now carry the new owner; run the evictions.
+    for conn, old_key in retargeted:
+        if pool is not None:
+            # The stub changed OWNER: its resource subscriptions belong to
+            # the old principal, and without eviction the new session would
+            # keep receiving the old session's resource-update URIs (which
+            # can carry tokens or presigned params). Caller-binding
+            # ownership lives here at the connection layer, so this is the
+            # one moment the clearance fires; the backend releases upstream
+            # as the grant-time caller.
+            for backend in pool.backends_hosting_stub(conn.stub_uuid):
+                try:
+                    await backend.evict_stub_subscriptions(conn.stub_uuid)
+                except Exception:
+                    logger.exception(
+                        "claim: subscription eviction failed for stub %s",
+                        conn.stub_uuid,
+                    )
         updated += 1
         _audit_caller_claimed(old_key, updated_caller.session_key, conn.pool_label, "allowed")
         logger.info(
@@ -1930,8 +2086,7 @@ async def _handle_connection(
         peer_result = socketsec.check_peer_is_self(writer)
         if peer_result is socketsec.PeerCredResult.MISMATCH:
             logger.warning(
-                "rejecting gateway connection: peer principal is a different "
-                "user (%s)",
+                "rejecting gateway connection: peer principal is a different " "user (%s)",
                 peer_result.value,
             )
             _audit_peer_denied(f"peer principal mismatch ({peer_result.value})")
@@ -1942,7 +2097,9 @@ async def _handle_connection(
                 "this platform and socket %s is not owner-only (0600)",
                 socket_path,
             )
-            _audit_peer_denied(f"peer principal unverifiable and socket not owner-only: {socket_path}")
+            _audit_peer_denied(
+                f"peer principal unverifiable and socket not owner-only: {socket_path}"
+            )
             return
         logger.debug(
             "peer uid unverifiable on this platform; socket %s verified "
@@ -1988,7 +2145,7 @@ async def _handle_connection(
     # (fixes warm-pool re-claim staleness). Validation + auditing live in
     # ``_apply_claim``.
     if register.get("type") == "claim":
-        await _write_json_line(writer, _apply_claim(register))
+        await _write_json_line(writer, await _apply_claim(register, pool))
         return
 
     # Abort-push short-circuit (one-shot control connection from the main
@@ -2020,7 +2177,8 @@ async def _handle_connection(
             # Audit the denial like every other app-call outcome (same SEL shape
             # as app_call.handle_app_call's allow/deny events).
             _audit(
-                "denied", "mcp-apps feature disabled",
+                "denied",
+                "mcp-apps feature disabled",
                 spool_id=str(register.get("spool_id") or ""),
                 tool=str(register.get("tool") or ""),
             )
@@ -2070,6 +2228,7 @@ async def _handle_connection(
         """
         if not exclusive_stub_uuid:
             pool.unreserve(pool_key)
+
     if not stub_uuid:
         await _write_json_line(
             writer,
@@ -2121,7 +2280,9 @@ async def _handle_connection(
                         # ``user_identity`` is the legacy spelling an older
                         # stub may still send; the field was deleted from
                         # PoolKey but stays honored here as a diagnostic.
-                        register.get("principal_id") or register.get("user_identity") or ""
+                        register.get("principal_id")
+                        or register.get("user_identity")
+                        or ""
                     ),
                     channel_id=str(register.get("channel_id") or ""),
                     from_gateway=True,
@@ -2355,7 +2516,9 @@ async def _handle_connection(
                     _acquire_t0 = time.monotonic()
                     try:
                         backend, _was_spawned = await _acquire_backend(
-                            pool, pool_key, resolver,
+                            pool,
+                            pool_key,
+                            resolver,
                             exclusive_stub_uuid=exclusive_stub_uuid,
                         )
                         # acquire-only duration, captured before the attach_stub
@@ -2455,7 +2618,9 @@ async def _handle_connection(
                 _lazy_t0 = time.monotonic()
                 try:
                     backend, _lazy_was_spawned = await _acquire_backend(
-                        pool, pool_key, resolver,
+                        pool,
+                        pool_key,
+                        resolver,
                         exclusive_stub_uuid=exclusive_stub_uuid,
                     )
                     # acquire/spawn-only duration, captured before the attach +
@@ -2550,6 +2715,8 @@ async def _handle_connection(
                     backend,
                     inbox,
                     writer_task,
+                    caller=caller,
+                    conn=conn,
                 )
                 if recovered is None:
                     # Genuinely unrecoverable (no captured init, circuit
@@ -2640,9 +2807,7 @@ async def _handle_connection(
             if orphan is not None:
                 await orphan.shutdown(timeout=2.0)
         except Exception:
-            logger.warning(
-                "releasing private backend for stub %s failed", stub_uuid, exc_info=True
-            )
+            logger.warning("releasing private backend for stub %s failed", stub_uuid, exc_info=True)
         if writer_task is not None:
             writer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2694,8 +2859,7 @@ async def _acquire_backend(
         # filesystem, either of which would stall gateway traffic and heartbeat
         # processing if done inline after a config invalidation.
         declared = await asyncio.to_thread(
-            _declared_env_for_private_backend if exclusive_stub_uuid
-            else _declared_env_to_forward,
+            _declared_env_for_private_backend if exclusive_stub_uuid else _declared_env_to_forward,
             pool_key,
         )
         if declared:
@@ -2712,13 +2876,40 @@ async def _acquire_backend(
                 # too, so no value may reach the log.
                 ", ".join(sorted(declared)),
             )
+        # Resolve secret:// URIs in env values — ephemeral, in-memory only.
+        # The sidecar on disk retains the raw URI template; resolution happens
+        # at spawn time so values are always fresh from the vault.
+        spawn_env, _secret_keys = await asyncio.to_thread(
+            resolve_secret_uris,
+            spawn_env,
+            Path(_config_dir()),
+        )
         backend = await spawn_backend(
             pool_key=pool_key,
             command=command,
             args=list(args),
             env=spawn_env,
             work_dir=work_dir,
+            # Containment yields ONLY to a spec-declared temp. ``spawn_env``
+            # also carries the daemon's ambient TMPDIR/TMP/TEMP (macOS and
+            # Windows always export one), so spawn_backend cannot infer
+            # declaration from env membership -- this closure is the one
+            # place that still knows the declared set. Key NAMES are passed
+            # (matched case-insensitively inside; Windows env keys are
+            # case-insensitive) so spawn_backend can also prune the ambient
+            # keys the operator did NOT declare.
+            declared_temp_keys=tuple(
+                key for key in declared if key.upper() in ("TMPDIR", "TMP", "TEMP")
+            ),
         )
+        # Security note: resolved secrets exist ONLY in the local spawn_env
+        # dict passed to the child via Popen(env=...).  They are NEVER written
+        # to the parent's os.environ, so /proc/<gateway_pid>/environ cannot
+        # leak them — the /proc concern is architecturally moot.  The pop
+        # below is defense-in-depth: it removes the plaintext from the
+        # parent's Python heap once the child has inherited it at exec.
+        for _sk in _secret_keys:
+            spawn_env.pop(_sk, None)
         # Start the stdout pump immediately so replies to the first
         # forwarded message can route back. The task is owned by the
         # Backend and cancelled at shutdown().
@@ -2746,6 +2937,8 @@ async def _respawn_backend_for_stub(
     old_backend: Backend,
     old_inbox: Optional["asyncio.Queue[bytes]"],
     old_writer_task: Optional[asyncio.Task[None]],
+    caller: Optional[CallerContext] = None,
+    conn: Optional[_StubConn] = None,
 ) -> Optional[tuple[Backend, "asyncio.Queue[bytes]", asyncio.Task[None]]]:
     """Rebuild a fresh backend for ``stub_uuid`` after its shared backend
     died and re-bind this stub to it transparently.
@@ -2786,6 +2979,13 @@ async def _respawn_backend_for_stub(
                 # catch a hang). Mirrors _write_json_line's bounded drain.
                 await asyncio.wait_for(writer.drain(), timeout=_WRITE_REPLY_TIMEOUT_SECS)
 
+    # Captured BEFORE detach (which prunes them): the URIs whose live
+    # subscriptions must be replayed onto the replacement backend, or they
+    # silently go dark — kiro-cli never learns the old backend died, so it
+    # will never re-subscribe on its own.
+    replay_uris: list[str] = []
+    with contextlib.suppress(Exception):
+        replay_uris = old_backend.resource_subscription_uris(stub_uuid)
     with contextlib.suppress(Exception):
         await old_backend.detach_stub(stub_uuid)
 
@@ -2801,7 +3001,9 @@ async def _respawn_backend_for_stub(
 
     try:
         new_backend, _ = await _acquire_backend(
-            pool, pool_key, resolver,
+            pool,
+            pool_key,
+            resolver,
             # A respawn must not silently promote a private backend into the
             # shared bucket: the replacement inherits the original binding.
             exclusive_stub_uuid=stub_uuid if old_backend.exclusive_token else "",
@@ -2838,6 +3040,47 @@ async def _respawn_backend_for_stub(
             )
             return None
         new_inbox = await new_backend.attach_stub(stub_uuid)
+        if replay_uris and conn is not None:
+            # Rekey race: a ``claim`` frame can retarget this connection's
+            # identity during the awaits above (acquire + prime). The
+            # captured URIs belong to the OLD principal — replaying them
+            # now would resubscribe the old owner's resources onto the
+            # rekeyed stub, the exact leak ``evict_stub_subscriptions``
+            # exists to prevent. Recheck the live owner at the last moment
+            # and skip the replay when it changed (fail closed: the new
+            # owner subscribes on its own; the old owner's leases on the
+            # dead backend died with it).
+            live_key = conn.caller.session_key if conn.caller is not None else ""
+            captured_key = caller.session_key if caller is not None else ""
+            if live_key != captured_key:
+                logger.info(
+                    "respawn skipping subscription replay (owner rekeyed "
+                    "mid-respawn) stub=%s pool=%s",
+                    stub_uuid,
+                    pool_key.human_readable(),
+                )
+                replay_uris = []
+        if replay_uris:
+            # A server refusal of an individual replayed subscribe is
+            # fail-closed by design (the update goes undelivered, never
+            # mis-attributed). A WRITE failure is different: the fresh
+            # backend's pipe is already broken, so reporting this respawn
+            # as a success would hand the stub a backend whose replayed
+            # subscriptions are silently dark forever. Give up loudly —
+            # the caller tears the stub down and kiro-cli reconnects.
+            try:
+                await new_backend.replay_resource_subscriptions(
+                    stub_uuid, replay_uris, caller=caller
+                )
+            except BackendGone as exc:
+                logger.info(
+                    "respawn give-up (subscription replay failed) " "stub=%s pool=%s: %s",
+                    stub_uuid,
+                    pool_key.human_readable(),
+                    exc,
+                )
+                await new_backend.detach_stub(stub_uuid)
+                return None
     finally:
         # A private backend never took a reservation, and releasing one would
         # decrement a POOLED connection sharing this digest (see
@@ -2877,9 +3120,7 @@ async def _drain_inbox_to_stub(
                 with _counted_stub_write():
                     async with guard:
                         writer.write(payload)
-                        await asyncio.wait_for(
-                            writer.drain(), timeout=_WRITE_REPLY_TIMEOUT_SECS
-                        )
+                        await asyncio.wait_for(writer.drain(), timeout=_WRITE_REPLY_TIMEOUT_SECS)
             except (ConnectionError, BrokenPipeError):
                 # Scope E: log late responses dropped after stub detach
                 # instead of letting BrokenPipeError propagate unlogged.
@@ -3087,75 +3328,16 @@ def _count_open_fds() -> int:
 
 
 def _read_rss_kb() -> int:
-    """Return current RSS in kilobytes, or ``-1`` if unavailable.
+    """Return this process's CURRENT RSS in kilobytes, or ``-1`` if unavailable.
 
-    Platform implementations:
-    - Linux: ``/proc/self/status`` VmRSS field (already in KB).
-    - macOS: ``resource.getrusage`` (``ru_maxrss`` is in bytes on macOS).
-    - Other POSIX: ``resource.getrusage`` (``ru_maxrss`` is in KB on Linux,
-      but this branch only runs on non-Linux where it is bytes; if neither
-      applies we fall through to ``-1``).
-    - Windows: ``GetProcessMemoryInfo`` via ctypes (WorkingSetSize in bytes).
-
-    Returns ``-1`` when the platform cannot provide the value.
+    Delegates to :func:`platform_compat.proc_rss_bytes` — the one per-platform
+    current-RSS reader — so this diagnostic cannot drift from the figure the
+    dashboard reports. The per-platform duplicate that used to live here read
+    ``ru_maxrss`` on macOS, which is a high-water mark that never decreases, so
+    a spike the gateway had already released stayed in every later snapshot.
     """
-    # Linux — parse VmRSS from /proc/self/status (current RSS, not peak).
-    try:
-        with open("/proc/self/status", "r", encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-
-    # macOS / other POSIX — resource.getrusage gives ru_maxrss.
-    # On macOS ru_maxrss is in bytes; on other BSDs it is in KB.
-    if sys.platform != "win32":
-        try:
-            import resource
-
-            ru = resource.getrusage(resource.RUSAGE_SELF)
-            maxrss = ru.ru_maxrss
-            if maxrss > 0:
-                if sys.platform == "darwin":
-                    return maxrss // 1024  # bytes → KB
-                return maxrss  # already in KB on most other POSIX
-        except (OSError, ValueError, AttributeError, ImportError):
-            pass
-
-    # Windows — GetProcessMemoryInfo returns WorkingSetSize in bytes.
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            import ctypes.wintypes as wintypes
-
-            SIZE_T = ctypes.c_size_t
-
-            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
-                _fields_ = [
-                    ("cb", wintypes.DWORD),
-                    ("PageFaultCount", wintypes.DWORD),
-                    ("PeakWorkingSetSize", SIZE_T),
-                    ("WorkingSetSize", SIZE_T),
-                    ("QuotaPeakPagedPoolUsage", SIZE_T),
-                    ("QuotaPagedPoolUsage", SIZE_T),
-                    ("QuotaPeakNonPagedPoolUsage", SIZE_T),
-                    ("QuotaNonPagedPoolUsage", SIZE_T),
-                    ("PagefileUsage", SIZE_T),
-                    ("PeakPagefileUsage", SIZE_T),
-                ]
-
-            psapi = ctypes.WinDLL("psapi", use_last_error=True)  # type: ignore[attr-defined]
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-            pmc = PROCESS_MEMORY_COUNTERS()
-            pmc.cb = ctypes.sizeof(pmc)
-            handle = kernel32.GetCurrentProcess()
-            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(pmc), pmc.cb):
-                return pmc.WorkingSetSize // 1024  # bytes → KB
-        except (OSError, AttributeError, ValueError):
-            pass
-
-    return -1
+    rss_bytes = _proc_rss_bytes()
+    return rss_bytes // 1024 if rss_bytes > 0 else -1
 
 
 def _collect_task_stacks() -> list[dict[str, Any]]:
@@ -3217,8 +3399,15 @@ def _snapshot_state(
     }
 
 
-def _write_diagnostic(path: Path, record: dict[str, Any]) -> None:
-    """Append one JSONL line to the diagnostic side-channel.
+def _write_diagnostic(path: Path, *records: dict[str, Any]) -> None:
+    """Append one JSONL line per record to the diagnostic side-channel.
+
+    Records that belong to the same event MUST be passed in a single call:
+    they share one open-append-close cycle. Back-to-back appends from
+    separate calls can collide on Windows — an open that lands while the
+    previous writer's handle is still closing fails with a sharing
+    violation — and the never-raises contract below turns that transient
+    collision into a silently dropped record.
 
     Never raises — the diagnostic task is defensive enough that a missing
     directory or EROFS on the log volume must not crash gatewayd itself.
@@ -3226,7 +3415,8 @@ def _write_diagnostic(path: Path, record: dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+            for record in records:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
     except OSError as exc:  # pragma: no cover — defensive
         logger.warning("zombie diagnostic write failed: %s", exc)
 
@@ -3241,13 +3431,14 @@ async def _zombie_diagnostic(
 
     Every :data:`_ZOMBIE_PROBE_INTERVAL_SECS` seconds:
 
-    1. Collect a health snapshot via :func:`_snapshot_state`.
-    2. Append the snapshot to the diagnostic JSONL under the ``probe`` tag
-       so there is a continuous baseline to correlate against.
-    3. If ``server.is_serving()`` is ``False`` while ``stop_event`` is
-       still unset, the accept loop has died silently — dump every live
-       task stack, log at error level, and set ``stop_event`` so the
-       process exits cleanly and the watchdog respawns us.
+    1. Collect a health snapshot via :func:`_snapshot_state`, tagged
+       ``probe`` — the continuous baseline to correlate against.
+    2. If ``server.is_serving()`` is ``False`` while ``stop_event`` is
+       still unset, the accept loop has died silently — append the probe
+       baseline and a ``zombie_detected`` dump of every live task stack
+       through a single write, log at error level, and set ``stop_event``
+       so the process exits cleanly and the watchdog respawns us.
+    3. Otherwise append just the probe baseline.
     """
     diag_path = _zombie_diagnostic_path()
     try:
@@ -3271,23 +3462,31 @@ async def _zombie_diagnostic(
                 task_count=task_count,
             )
             snap["tag"] = "probe"
-            await asyncio.to_thread(_write_diagnostic, diag_path, snap)
 
             if snap["is_serving"] is False and not stop_event.is_set():
-                snap["tag"] = "zombie_detected"
-                snap["tasks"] = _collect_task_stacks()
-                snap["traceback"] = traceback.format_stack()
-                await asyncio.to_thread(_write_diagnostic, diag_path, snap)
+                # The accept loop died silently. The probe baseline and the
+                # zombie dump go through ONE _write_diagnostic call (a single
+                # open) — two back-to-back appends race on Windows, where the
+                # second open can hit a sharing violation while the first
+                # writer's handle is still closing, silently dropping the
+                # zombie_detected record.
+                dump = dict(snap)
+                dump["tag"] = "zombie_detected"
+                dump["tasks"] = _collect_task_stacks()
+                dump["traceback"] = traceback.format_stack()
+                await asyncio.to_thread(_write_diagnostic, diag_path, snap, dump)
                 logger.error(
                     "zombie gatewayd detected: is_serving=False while stop_event unset; "
                     "tasks=%d fd=%d rss_kb=%d — diagnostic dumped to %s; setting stop_event",
-                    snap["task_count"],
-                    snap["fd_count"],
-                    snap["rss_kb"],
+                    dump["task_count"],
+                    dump["fd_count"],
+                    dump["rss_kb"],
                     diag_path,
                 )
                 stop_event.set()
                 return
+
+            await asyncio.to_thread(_write_diagnostic, diag_path, snap)
     except asyncio.CancelledError:
         pass
 

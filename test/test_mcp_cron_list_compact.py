@@ -19,6 +19,14 @@ from kiro_crew.validation import ValidationError
 # ── Fixtures ──
 
 
+#: The session every seeded job is owned by, matching the identity the ``home``
+#: fixture gives the caller. ``cron_list`` scopes to the calling session's own
+#: rows, so a job with no owner would simply not be listed and every rendering
+#: assertion below would read "No cron jobs." -- these tests are about the OUTPUT
+#: FORMAT, not about authorization (see test/test_mcp_cron_caller_identity.py).
+_OWNER = "dashboard:list-format-slot"
+
+
 def _seed_jobs(tmp_path, count: int, msg_size: int = 1500) -> CronService:
     """Build ``count`` cron jobs with realistic-sized messages."""
     svc = CronService(base_dir=tmp_path)
@@ -29,6 +37,7 @@ def _seed_jobs(tmp_path, count: int, msg_size: int = 1500) -> CronService:
             message=f"job {i} payload\n{big_msg}",
             every_secs=300 + i,
             channel=None,
+            session_key=_OWNER,
         )
     return svc
 
@@ -37,6 +46,19 @@ def _seed_jobs(tmp_path, count: int, msg_size: int = 1500) -> CronService:
 def home(monkeypatch, tmp_path):
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
     monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
+    monkeypatch.delenv("KIROCREW_CLI", raising=False)
+    # The identity the seeded jobs are owned by; see _OWNER.
+    monkeypatch.setenv("KIROCREW_SESSION_KEY", _OWNER)
+    # Every job seeded in this module belongs to that session. Defaulted here
+    # rather than threaded through ~15 call sites: the owner is a precondition of
+    # these tests, not part of what any of them is checking.
+    original = CronService.add_job
+
+    def _owned(self, *args, **kwargs):
+        kwargs.setdefault("session_key", _OWNER)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CronService, "add_job", _owned)
     return tmp_path
 
 

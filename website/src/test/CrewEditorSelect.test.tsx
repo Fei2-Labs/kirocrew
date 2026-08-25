@@ -235,6 +235,8 @@ describe('crew editor — collision warning', () => {
     // has already happened.
     await renderRoster()
     const sheet = await openEditor('oncall')
+    // Both the picker and the warning live on the workspace/memory pane.
+    fireEvent.click(within(sheet).getByTestId('crew-rail-place'))
 
     // oncall starts on its own store, so nothing collides yet.
     expect(within(sheet).queryByText(/Also used by/)).not.toBeInTheDocument()
@@ -256,6 +258,16 @@ describe('crew editor — collision warning', () => {
       expect(within(sheet).getByText(/Also used by kirocrew/)).toBeInTheDocument(),
     )
     expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
+
+    // The overview must agree with that warning about WHICH resource collides.
+    // Reading a persisted per-agent count here instead of the in-flight value
+    // reports the collision the crew used to have, so the same screen showed a
+    // sharing count with no pill on the node that caused it.
+    fireEvent.click(within(sheet).getByTestId('crew-rail-overview'))
+    await waitFor(() =>
+      expect(within(sheet).getByTestId('crew-wire-memory')).toHaveTextContent('Shared'),
+    )
+    expect(within(sheet).getByTestId('crew-wire-workspace')).not.toHaveTextContent('Shared')
   })
 })
 
@@ -300,5 +312,30 @@ describe('crew editor — keyboard (via a binding select)', () => {
     await waitFor(() =>
       expect(screen.queryByRole('dialog', { name: 'Create a new crew' })).not.toBeInTheDocument(),
     )
+  })
+})
+
+describe('crew editor — overview diagram nodes navigate to their pane', () => {
+  it('clicking the workspace node lands on the workspace/memory pane, focus following', async () => {
+    // The clicked node unmounts with the overview pane, which would drop
+    // keyboard focus to the body — the arriving tabpanel must catch it.
+    await renderRoster()
+    const sheet = await openEditor('oncall')
+    fireEvent.click(within(sheet).getByTestId('crew-wire-workspace'))
+
+    expect(within(sheet).getByTestId('crew-rail-place')).toHaveAttribute('aria-selected', 'true')
+    expect(within(sheet).getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
+    // Focus is handed to the panel, and the panel must arrive NAMED — an
+    // unnamed tabpanel is announced as nothing but "tab panel".
+    const panel = within(sheet).getByRole('tabpanel', { name: 'Workspace · Memory' })
+    expect(document.activeElement).toBe(panel)
+  })
+
+  it('clicking the unbound webhook ghost lands on the webhook pane', async () => {
+    // The ghost reports a missing binding; its pane is where the binding is made.
+    await renderRoster()
+    const sheet = await openEditor('oncall')
+    fireEvent.click(within(sheet).getByTestId('crew-wire-webhook'))
+    expect(within(sheet).getByTestId('crew-rail-webhook')).toHaveAttribute('aria-selected', 'true')
   })
 })

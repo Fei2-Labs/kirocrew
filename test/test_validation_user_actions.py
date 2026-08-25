@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # ── MCP Core: simulate kiro-cli calling tools via JSON-RPC ──
 
 
@@ -232,6 +234,31 @@ class TestMcpCoreUserActions:
 class TestMcpCronUserActions:
     """Simulate the exact JSON-RPC calls kiro-cli sends to kirocrew-cron."""
 
+    @pytest.fixture(autouse=True)
+    def _cron_caller_is_named(self, named_cron_caller: str) -> str:
+        """These are cron TOOL-PATH simulations, not authorization tests.
+
+        ``mcp_cron`` refuses a write from a caller it cannot name, so this states
+        the identity precondition a real kiro-cli call always carries. Scoped to
+        this class: the rest of the module drives other servers.
+        """
+        self._session_key = named_cron_caller
+        return named_cron_caller
+
+    def _own(self, svc, job_id: str = "abc12345") -> MagicMock:
+        """Make the mocked store report *job_id* as owned by this caller.
+
+        The ownership gate reads the stored row now, so a mock that leaves
+        ``get_job`` unset returns a bare ``MagicMock`` whose ``session_key``
+        compares unequal to the caller's and the tool refuses. It used to be
+        waved through, because an unidentified caller was.
+        """
+        job = MagicMock()
+        job.id = job_id
+        job.session_key = self._session_key
+        svc.get_job.return_value = job
+        return job
+
     def _simulate_tool_call(self, tool_name: str, arguments: dict) -> str:
         from kiro_crew.mcp_cron import _call_tool
 
@@ -416,6 +443,9 @@ class TestMcpCronUserActions:
             job.schedule.every_secs = 300
             job.schedule.cron_expr = None
             job.schedule.at_ts = None
+            # The visibility filter reads the row owner now; a bare MagicMock
+            # attribute is not this caller and the row would be hidden.
+            job.session_key = self._session_key
             svc.list_jobs.return_value = [job]
             result = self._simulate_tool_call("cron_list", {})
         assert "my job" in result
@@ -433,6 +463,7 @@ class TestMcpCronUserActions:
     def test_remove_job(self):
         with patch("kiro_crew.mcp_cron.CronService") as mock_svc:
             svc = mock_svc.return_value
+            self._own(svc)
             svc.remove_job.return_value = True
             result = self._simulate_tool_call("cron_remove", {"job_id": "abc12345"})
         assert "Removed" in result
@@ -440,6 +471,7 @@ class TestMcpCronUserActions:
     def test_pause_job(self):
         with patch("kiro_crew.mcp_cron.CronService") as mock_svc:
             svc = mock_svc.return_value
+            self._own(svc)
             svc.enable_job.return_value = True
             result = self._simulate_tool_call("cron_pause", {"job_id": "abc12345"})
         assert "Paused" in result
@@ -447,6 +479,7 @@ class TestMcpCronUserActions:
     def test_resume_job(self):
         with patch("kiro_crew.mcp_cron.CronService") as mock_svc:
             svc = mock_svc.return_value
+            self._own(svc)
             svc.enable_job.return_value = True
             result = self._simulate_tool_call("cron_resume", {"job_id": "abc12345"})
         assert "Resumed" in result

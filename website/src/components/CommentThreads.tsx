@@ -22,6 +22,7 @@ import { platformShortcut } from '../utils/platform'
 import { timeAgo } from '../utils/timeAgo'
 
 import { i18nT } from '../i18n/t'
+import { useImeGuard } from '../hooks/useImeGuard'
 /** One review conversation: the comment that opened it plus its replies. */
 export interface CommentThread {
   /** Provider thread id — absent for standalone comments and review summaries. */
@@ -149,6 +150,7 @@ function ReplyBox({
   error: string | null
   label?: string
 }) {
+  const ime = useImeGuard()
   const [open, setOpen] = useState(false)
   const [text, setText] = useState('')
   const trimmed = text.trim()
@@ -183,12 +185,12 @@ function ReplyBox({
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
+        {...ime.bindComposition<HTMLTextAreaElement>()}
         // Enter inserts a newline (comments are markdown and often multi-line);
         // Cmd/Ctrl+Enter sends, matching the rest of the dashboard's composers.
         onKeyDown={(e) => {
           if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-            e.preventDefault()
-            void send()
+            if (ime.claimEnter(e)) void send()
           }
           if (e.key === 'Escape') setOpen(false)
         }}
@@ -199,7 +201,7 @@ function ReplyBox({
           // Both modifiers send (see the keydown handler), so name the one the
           // reader actually has rather than hardcoding the mac chord.
           { keys: platformShortcut('Cmd+Enter') })}
-        className="w-full resize-y rounded-lg border border-border bg-card px-2.5 py-2 text-[13px] text-text placeholder:text-muted outline-none focus:border-accent"
+        className="w-full resize-y rounded-lg border border-border bg-card px-2.5 py-2 text-[13px] text-text placeholder:text-muted outline-none focus-visible:border-accent"
       />
       <div className="flex items-center gap-2">
         <button

@@ -148,15 +148,22 @@ home (`~/.kiro/crew-venv`, override with `KIROCREW_VENV`) and symlinks
 data home, so no whole-home operation can ever delete the live interpreter. The
 selected channel is recorded to `~/.kiro/crew/channel`.
 
-If the host has no Python 3.10+, the installer installs one from your distro:
-`apt` on Debian/Ubuntu (including the split `python3-venv` package), `dnf` on
-Amazon Linux / RHEL / CentOS Stream, and `yum` on CentOS 7. Where no base-repo
-package supplies 3.10+ (CentOS 7 ships 3.6, older Ubuntu 3.8) it uses an
-**already-installed** [mise](https://mise.jdx.dev/) python-build-standalone
-interpreter if you have one (it runs on the older glibc those releases carry);
-otherwise it prints how to get a newer Python and stops. The signed installer
-never pipes an unsigned third-party script into a shell — to use the mise path,
-install mise yourself first (`curl https://mise.run | sh`). When it finishes it
+If the host has no Python 3.10+, the installer provisions one itself instead of
+touching the system: it downloads a SHA-256-pinned [uv](https://docs.astral.sh/uv/)
+binary (or uses an already-installed `uv` on `PATH`), then installs a
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+CPython 3.12 into a user-owned directory beside the data home
+(`~/.kiro/crew-python`, override with `KIROCREW_PYTHON_DIR`). No package
+manager, no sudo, and the prebuilt interpreter runs on old-glibc distros
+(CentOS 7) whose base repos never reach 3.10. Pass `--managed-python` (or set
+`KIROCREW_MANAGED_PYTHON=1`) to always use the uv-provisioned interpreter and
+skip the system ones entirely — useful when the system Python is fragile or
+version-managed. The choice is sticky: it is recorded in the data home
+(`python-mode`, next to `channel`), so later installer runs — including the
+re-run `kirocrew update` performs — keep it without the flag; opt back out
+with `--system-python`. The signed installer never pipes an unsigned
+third-party script into a shell: uv is fetched as a tarball and verified
+against pinned digests, exactly like the wheel itself. When it finishes it
 prints the next step: `kirocrew gateway` to start now, or `kirocrew service
 install` to run it as a service.
 
@@ -270,13 +277,11 @@ Optional extras (install with e.g. `pip install "kirocrew[voice]"`):
 | `otlp` | `opentelemetry-exporter-otlp-proto-http` | OTLP/HTTP metrics export. Installing it does not enable egress; that still needs an explicit `telemetry.otlp_endpoint` |
 | `perf` | `py-spy` | Out-of-process profiling (`kirocrew perf sample --pid`). The in-process sampler needs nothing extra |
 | `teams` | `PyJWT[crypto]` | Microsoft Teams channel (validates the inbound Bot Framework RS256 JWT) |
-| `desktop` | `pyinstaller` | Building a frozen backend from `packaging/kirocrew-backend.spec` |
 | `dev` | pytest, black, isort, flake8, mypy, ... | Contributor tooling; what `make build` installs |
 
-The `desktop` extra exists, but neither `make desktop` nor `make backend-bin`
-needs it: both run `packaging/build-desktop.sh`, which embeds a
-python-build-standalone interpreter instead of freezing one. PyInstaller is only
-required if you invoke `packaging/kirocrew-backend.spec` directly.
+`make desktop` and `make backend-bin` need no extra: both run
+`packaging/build-desktop.sh`, which provisions a python-build-standalone
+interpreter and pip-installs the project into it.
 
 ### d. Bundled desktop app
 
@@ -288,14 +293,18 @@ npm, or Node:
 make desktop
 ```
 
-Output is a DMG (plus a zip) on macOS, and an AppImage plus a `.deb` and an
-`.rpm` on Linux, under `website/electron/dist/`. On macOS the default is ONE
-universal DMG: the Electron shell is lipo-merged, and the backend, which cannot
-be lipo-merged, ships as two complete PBS trees selected at launch by
-`process.arch`. The x86_64 backend is built under Rosetta 2, so a universal
-build needs an Apple-Silicon host; `UNIVERSAL=0` forces a faster host-arch-only
-build. Linux is always host-arch, and the three Linux formats come from one
-backend tree packaged three times.
+Output is a DMG (plus a zip) on macOS, an AppImage plus a `.deb` and an `.rpm`
+on Linux, and an assisted NSIS Setup.exe on Windows, under
+`website/electron/dist/`. The macOS DMG opens to a branded
+drag-to-Applications layout carrying the opening animation's artwork. The
+Windows wizard keeps native controls and its
+per-user default while carrying matching Kiro Crew artwork through its sidebar
+and header. On macOS the default is ONE universal DMG: the Electron shell is
+lipo-merged, and the backend, which cannot be lipo-merged, ships as two complete
+PBS trees selected at launch by `process.arch`. The x86_64 backend is built
+under Rosetta 2, so a universal build needs an Apple-Silicon host;
+`UNIVERSAL=0` forces a faster host-arch-only build. Linux is always host-arch,
+and the three Linux formats come from one backend tree packaged three times.
 
 #### Installing a Linux desktop package
 
@@ -331,8 +340,10 @@ excludes Ubuntu 20.04, Debian 11 and Amazon Linux 2 — on those, use the
 [one-line install](#a-one-line-install-fastest) instead.
 
 Prebuilt downloads for the release channels are linked from the
-[README](../../README.md#app-downloads). Windows has no desktop build yet:
-run the gateway from a source install and open the dashboard in a browser.
+[README](../../README.md#app-downloads). The Windows desktop installer remains
+a preview artifact; see [windows-install.md](windows-install.md) for its current
+publishing and signing status. The source install remains the fully supported
+Windows path.
 
 See [desktop-app.md](../build/desktop-app.md) for the full pipeline (frontend,
 PBS provisioning, pip install, pruning, electron-builder) and how the app
@@ -427,8 +438,9 @@ channel later -- Slack (`kirocrew setup --slack` or
 [Telegram](../../src/kiro_crew/docs/telegram-integration.md),
 [Teams](../../src/kiro_crew/docs/teams-integration.md),
 [Webex](../../src/kiro_crew/docs/webex-integration.md),
-[WeCom](../../src/kiro_crew/docs/wecom-integration.md), or
-[WeChat](../../src/kiro_crew/docs/weixin-integration.md) --
+[WeCom](../../src/kiro_crew/docs/wecom-integration.md),
+[WeChat](../../src/kiro_crew/docs/weixin-integration.md), or
+[WhatsApp](../../src/kiro_crew/docs/whatsapp-integration.md) --
 when you want to reach the same agent away from your desk.
 
 These flags narrow the wizard:
@@ -1052,8 +1064,9 @@ sign-off is tracked in
   [Telegram](../../src/kiro_crew/docs/telegram-integration.md),
   [Teams](../../src/kiro_crew/docs/teams-integration.md),
   [Webex](../../src/kiro_crew/docs/webex-integration.md),
-  [WeCom](../../src/kiro_crew/docs/wecom-integration.md), and
-  [WeChat](../../src/kiro_crew/docs/weixin-integration.md).
+  [WeCom](../../src/kiro_crew/docs/wecom-integration.md),
+  [WeChat](../../src/kiro_crew/docs/weixin-integration.md), and
+  [WhatsApp](../../src/kiro_crew/docs/whatsapp-integration.md).
 - [Remote and mobile access](remote-and-mobile.md): 24/7 operation on a remote
   host, and reaching the dashboard from a phone.
 - [Architecture overview](../architecture/overview.md): system diagrams and the

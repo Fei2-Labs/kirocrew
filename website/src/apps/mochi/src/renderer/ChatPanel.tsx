@@ -39,6 +39,7 @@ import rehypeRaw from 'rehype-raw'
 import { rehypeSanitize, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
 import { mdImageDestToPath } from '../../../../utils/fileTokens'
 import { classifyPlatform } from '../../../../hooks/useGatewayPlatform'
+import { useImeGuard } from '../../../../hooks/useImeGuard'
 import type { ApprovalRequest, ChatMessage } from '../shared/types'
 import { applyTheme, type ThemeId } from '../shared/themes'
 import { PINNED_PANEL_WIDTH } from '../shared/constants'
@@ -512,6 +513,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
   }, []) // mount once — uses refs for latest state
 
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  // Enter sends here, so the guard has to own the key: it also covers WebKit, where
+  // the keydown committing an IME candidate reports the native flag as false.
+  const ime = useImeGuard()
 
   // Height of the bottom stack (banners + attachments + composer), measured
 
@@ -898,7 +902,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       setMessages(prev => [...prev, {
         id: `approval-error-${id}-${Date.now()}`,
         role: 'assistant',
-        content: i18nT('apps.mochi.chat.send_failed'),
+        // A stale pre-owner session is an AUTH failure, not a network one:
+        // the generic "check your connection" copy would send the user
+        // debugging the wrong thing, so name the real remedy (sign in again).
+        content: res.staleOwnerSession
+          ? i18nT('api.client.stale_owner_session_sign_in_again')
+          : i18nT('apps.mochi.chat.send_failed'),
         timestamp: Date.now(),
       }])
       return
@@ -1491,6 +1500,16 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
 
         <textarea
           ref={inputRef}
+          {...ime.bindComposition<HTMLTextAreaElement>({
+            onFocus: (e) => {
+              e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border-focus)'
+              e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-glow)'
+            },
+            onBlur: (e) => {
+              e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border)'
+              e.currentTarget.style.boxShadow = editingTs ? '0 0 0 2px var(--accent-glow)' : 'none'
+            },
+          })}
           value={input} onChange={(e) => { setInput(e.target.value); setCmdIdx(0); autoResize(e.currentTarget) }}
           onKeyDown={(e) => {
             // Command autocomplete navigation
@@ -1500,12 +1519,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
               if (showAutocomplete) {
                 if (e.key === 'ArrowDown') { e.preventDefault(); setCmdIdx(i => (i + 1) % filtered.length); return }
                 if (e.key === 'ArrowUp') { e.preventDefault(); setCmdIdx(i => (i - 1 + filtered.length) % filtered.length); return }
-                if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing)) {
+                if (e.key === 'Tab') {
                   e.preventDefault(); setInput(filtered[cmdIdx].cmd); setCmdIdx(0); return
+                }
+                // While the picker is open Enter belongs to it, so the key is claimed
+                // here either way and never falls through to the send branch below.
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  if (ime.claimEnter(e)) { setInput(filtered[cmdIdx].cmd); setCmdIdx(0) }
+                  return
                 }
               }
             }
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleSend() }
+            if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) handleSend() }
           }}
           onPaste={(e) => {
             const files = filesFrom(e.clipboardData)
@@ -1533,14 +1558,6 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
             lineHeight: '1.4',
             maxHeight: 120, overflowY: 'auto',
             boxShadow: editingTs ? '0 0 0 2px var(--accent-glow)' : undefined,
-          }}
-          onFocus={(e) => {
-            e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border-focus)'
-            e.currentTarget.style.boxShadow = '0 0 0 3px var(--accent-glow)'
-          }}
-          onBlur={(e) => {
-            e.currentTarget.style.borderColor = editingTs ? 'var(--accent)' : 'var(--border)'
-            e.currentTarget.style.boxShadow = editingTs ? '0 0 0 2px var(--accent-glow)' : 'none'
           }}
         />
         <button onClick={handleSend} title={i18nT('apps.mochi.chat.send')} aria-label={i18nT('apps.mochi.chat.send')} style={{
@@ -1870,7 +1887,9 @@ const trustScopeBtnStyle: React.CSSProperties = {
   textAlign: 'left',
 }
 
-const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => void; onImageClick?: (b64: string) => void; onApproval?: (id: string, action: string, pattern?: string) => void; onEdit?: (content: string) => void; animate?: boolean }>(({ message, onOption, onImageClick, onApproval, onEdit, animate = true }) => {
+// Exported for the capture harness (capture/mochi-trust-label.tsx), which mounts
+// the real approval card as screenshot evidence; not part of the app's API.
+export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => void; onImageClick?: (b64: string) => void; onApproval?: (id: string, action: string, pattern?: string) => void; onEdit?: (content: string) => void; animate?: boolean }>(({ message, onOption, onImageClick, onApproval, onEdit, animate = true }) => {
   const mounted = React.useRef(false)
   const shouldAnimate = animate && !mounted.current
   const [copied, setCopied] = React.useState(false)
@@ -1945,8 +1964,21 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
               {req.fullCommand && (
                 <button
                   onClick={() => onApproval?.(req.id, 'trust_command', req.fullCommand)}
+                  // The untruncated command as a tooltip: the label is budget-clamped,
+                  // and this grant is an exact-string match, so the user must be able
+                  // to read the whole thing before agreeing to it.
+                  title={req.fullCommand}
                   style={trustScopeBtnStyle}
-                ><Shield size={11} />{i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}</button>
+                ><Shield size={11} style={{ flexShrink: 0 }} />
+                  {/* The label WRAPS rather than ellipsizing: the panel column
+                      (~240px of text) shows only ~28 chars per line, so a CSS
+                      ellipsis would re-collide the very labels the 64-char budget
+                      distinguishes. minWidth:0 lets the flex item shrink;
+                      overflowWrap:'anywhere' lets an unbreakable run (a sha, a
+                      base64 arg) wrap instead of clipping past the panel edge. */}
+                  <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+                    {i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}
+                  </span></button>
               )}
               {showTrustBase && (
                 <button

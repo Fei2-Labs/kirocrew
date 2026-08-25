@@ -27,6 +27,12 @@ export interface FolderSuggestionCardProps {
  * backend offers at most one card per slot for that slot's lifetime, so
  * declining cannot be re-asked and accepting is a plain folder move the user can
  * undo from the sidebar.
+ *
+ * Answering is not the only way out: an untouched card ages out after
+ * FOLDER_SUGGESTION_MAX_TURNS of the user's own confirmed sends made while this
+ * card was on screen (chatSlice's `ageFolderSuggestion`, dispatched by the
+ * ChatPage render site), so a wrong guess costs the composer band a few turns rather
+ * than the whole session.
  */
 export default function FolderSuggestionCard({ folderName, breadcrumb, onAccept, onDecline }: FolderSuggestionCardProps) {
   // Show the breadcrumb only when it adds ancestry: for a root folder it is just
@@ -55,10 +61,21 @@ export default function FolderSuggestionCard({ folderName, breadcrumb, onAccept,
       <FolderInput size={14} className="shrink-0" aria-hidden="true" style={{ color: 'var(--accent)' }} />
 
       <div className="min-w-0 flex-1">
-        {/* One interpolated string, not a concatenation of "Move this session to"
-            + name + "?": a split sentence cannot be reordered by a translator,
-            and several locales need the folder name somewhere other than last. */}
-        <span className="block text-[12px] leading-tight truncate" style={{ color: 'var(--text)' }}>
+        {/* One interpolated string, not a concatenation of "Move this session
+            into folder" + name + "?": a split sentence cannot be reordered by a
+            translator, and several locales need the folder name somewhere other
+            than last. The name is quoted so a folder called "trash" or "later"
+            reads as a destination rather than as part of the question.
+            `title` mirrors the parentPath line below: this span truncates, and
+            for a ROOT folder the breadcrumb is suppressed, so the question is
+            the only place the name appears — without the tooltip a long name
+            clipped mid-word would leave no way to confirm the destination
+            before pressing a button that does not name it either. */}
+        <span
+          className="block text-[12px] leading-tight truncate"
+          style={{ color: 'var(--text)' }}
+          title={i18nT('components.folderSuggestionCard.move_to_folder_question', { folder: folderName })}
+        >
           {i18nT('components.folderSuggestionCard.move_to_folder_question', { folder: folderName })}
         </span>
         {parentPath && (

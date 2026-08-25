@@ -29,6 +29,8 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/telegram/config", handlers.api_telegram_config_save)
     app.router.add_get("/api/webex/config", handlers.api_webex_config_get)
     app.router.add_put("/api/webex/config", handlers.api_webex_config_save)
+    app.router.add_get("/api/imessage/config", handlers.api_imessage_config_get)
+    app.router.add_put("/api/imessage/config", handlers.api_imessage_config_save)
     app.router.add_get("/api/wecom/config", handlers.api_wecom_config_get)
     app.router.add_put("/api/wecom/config", handlers.api_wecom_config_save)
     # Microsoft Teams: inbound Bot Framework webhook (self-authenticating via
@@ -50,6 +52,7 @@ def register(app: web.Application) -> None:
     # only ever authenticates POST /api/hooks/agent, never these).
     app.router.add_get("/api/webhooks", handlers.api_webhooks)
     app.router.add_post("/api/webhooks/tokens", handlers.api_webhook_token_create)
+    app.router.add_patch("/api/webhooks/tokens/{token_id}", handlers.api_webhook_token_update)
     app.router.add_delete("/api/webhooks/tokens/{token_id}", handlers.api_webhook_token_delete)
     app.router.add_delete("/api/webhooks/contexts/{hook_id}", handlers.api_webhook_context_delete)
     app.router.add_post("/api/webhooks/test", handlers.api_webhook_test)

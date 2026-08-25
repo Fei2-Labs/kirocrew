@@ -1779,7 +1779,11 @@ class TestRestrictToOwner:
             raise OSError("no perms")
 
         monkeypatch.setattr(pc, "IS_WINDOWS", False)
-        monkeypatch.setattr(pc.Path, "chmod", _boom)
+        # The POSIX tightening now goes through restrict_dir_to_owner, which
+        # calls os.chmod rather than Path.chmod -- patching the old seam would
+        # intercept nothing, the raise would never fire, and this test would
+        # pass without ever exercising the warn-and-continue handler.
+        monkeypatch.setattr(pc.os, "chmod", _boom)
         with caplog.at_level(logging.WARNING, logger=pc.logger.name):
             pc.make_owner_only_dir(target)
         assert target.is_dir()
@@ -1787,11 +1791,17 @@ class TestRestrictToOwner:
 
     def test_make_owner_only_dir_uses_the_dacl_on_windows(self, monkeypatch, tmp_path):
         called: list[Any] = []
+        wrong: list[Any] = []
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "restrict_to_owner", called.append)
+        # Must be the DIRECTORY helper: restrict_to_owner's grants are
+        # file-shaped (no (OI)(CI)), so files created inside would not inherit
+        # the lockdown.
+        monkeypatch.setattr(pc, "restrict_dir_to_owner", called.append)
+        monkeypatch.setattr(pc, "restrict_to_owner", wrong.append)
         target = tmp_path / "secrets"
         pc.make_owner_only_dir(target)
         assert called and str(called[0]) == str(target)
+        assert wrong == []
 
 
 # ---------------------------------------------------------------------------
@@ -1912,47 +1922,142 @@ def _fake_resource(monkeypatch: pytest.MonkeyPatch, **members: Any) -> None:
     monkeypatch.setattr(pc, "resource", types.SimpleNamespace(**defaults), raising=False)
 
 
-def _memory_info_dll(working_set: int, *, ok: bool = True) -> Any:
+def _memory_info_dll(working_set: int, *, ok: bool = True, peak: int = 0) -> Any:
     def _get_memory_info(_handle: Any, counters: Any, _cb: Any) -> int:
         counters._obj.WorkingSetSize = working_set
+        counters._obj.PeakWorkingSetSize = peak
         return 1 if ok else 0
 
     return types.SimpleNamespace(GetProcessMemoryInfo=_Fn(_get_memory_info))
 
 
+def _fake_mach_libsystem(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    resident: int,
+    resident_max: int,
+    kern_return: int = 0,
+) -> None:
+    """Stand in for ``libSystem``'s ``task_info``, filling the real struct.
+
+    The struct is the module-level layout, so a wrong field order in production
+    surfaces here as the wrong number rather than passing on a hand-built dict.
+    """
+
+    def _task_info(_task: Any, _flavor: Any, out: Any, _count: Any) -> int:
+        out._obj.resident_size = resident
+        out._obj.resident_size_max = resident_max
+        return kern_return
+
+    fake = types.SimpleNamespace(
+        mach_task_self=_Fn(lambda: 1),
+        task_info=_Fn(_task_info),
+    )
+    monkeypatch.setattr(pc.ctypes, "CDLL", lambda _path, **_kw: fake)
+
+
 class TestProcRss:
-    def test_linux_scales_kib_to_bytes(self, monkeypatch):
+    """``proc_rss_bytes`` must report CURRENT residency, not the peak.
+
+    ``ru_maxrss`` is a high-water mark that never decreases for the life of the
+    process, so using it made the dashboard's per-process memory figure a
+    monotonic peak-since-boot that no ``ps -o rss=`` reading could reproduce.
+    These tests pin the live source per platform and keep ``ru_maxrss`` confined
+    to the labelled fallback.
+    """
+
+    def test_linux_reads_statm_not_the_getrusage_peak(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=9_999_999),
+        )
+        monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: 4096)
+        assert pc.proc_rss_bytes() == 4096
+
+    @_LINUX_ONLY
+    def test_linux_current_reader_agrees_with_proc_status(self):
+        # statm's resident pages and status' VmRSS are the same quantity, and
+        # VmRSS is what `ps -o rss=` prints -- the number a user compares against.
+        vm_rss_kb = 0
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    vm_rss_kb = int(line.split()[1])
+                    break
+        assert vm_rss_kb > 0
+        measured = pc._linux_current_rss_bytes()
+        assert measured is not None
+        # Sampled a moment apart, so allow drift rather than demanding equality.
+        assert abs(measured - vm_rss_kb * 1024) < 4 * 1024 * 1024
+
+    def test_linux_fallback_scales_the_peak_from_kib_to_bytes(self, monkeypatch):
+        # Unit handling is the trap: ru_maxrss is KiB on Linux and bytes on
+        # macOS, with nothing in the value to tell them apart.
         monkeypatch.setattr(pc, "IS_POSIX", True)
         monkeypatch.setattr(pc.sys, "platform", "linux")
         _fake_resource(
             monkeypatch,
             getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=2048),
         )
+        monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
         assert pc.proc_rss_bytes() == 2048 * 1024
 
-    def test_macos_reports_bytes_directly(self, monkeypatch):
+    def test_macos_reads_the_mach_resident_size(self, monkeypatch):
+        # Not resident_size_max, which is the same peak bug in Mach clothing.
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "darwin")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=7_777_777),
+        )
+        _fake_mach_libsystem(monkeypatch, resident=123_456, resident_max=999_999_999)
+        assert pc.proc_rss_bytes() == 123_456
+
+    def test_macos_task_info_failure_falls_back_to_the_peak_in_bytes(self, monkeypatch):
         monkeypatch.setattr(pc, "IS_POSIX", True)
         monkeypatch.setattr(pc.sys, "platform", "darwin")
         _fake_resource(
             monkeypatch,
             getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=999),
         )
+        _fake_mach_libsystem(monkeypatch, resident=1, resident_max=2, kern_return=5)
+        # macOS ru_maxrss is ALREADY bytes -- scaling it by 1024 here would
+        # over-report by three orders of magnitude.
         assert pc.proc_rss_bytes() == 999
 
-    def test_a_getrusage_failure_is_zero(self, monkeypatch):
+    def test_macos_missing_libsystem_falls_back(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "darwin")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=555),
+        )
+
+        def _no_libsystem(_path: Any, **_kw: Any) -> Any:
+            raise OSError("no libSystem")
+
+        monkeypatch.setattr(pc.ctypes, "CDLL", _no_libsystem)
+        assert pc.proc_rss_bytes() == 555
+
+    def test_a_total_posix_failure_is_zero(self, monkeypatch):
         def _boom(_who: Any) -> Any:
             raise OSError("no rusage")
 
         monkeypatch.setattr(pc, "IS_POSIX", True)
         _fake_resource(monkeypatch, getrusage=_boom)
+        monkeypatch.setattr(pc, "_linux_current_rss_bytes", lambda: None)
+        monkeypatch.setattr(pc, "_macos_current_rss_bytes", lambda: None)
         assert pc.proc_rss_bytes() == 0
 
     def test_windows_reads_the_working_set(self, monkeypatch):
         _fake_windows(
             monkeypatch,
-            psapi=_memory_info_dll(8192),
+            psapi=_memory_info_dll(8192, peak=4_000_000),
             kernel32=types.SimpleNamespace(GetCurrentProcess=_const(1)),
         )
+        # WorkingSetSize is already current; PeakWorkingSetSize must not leak in.
         assert pc.proc_rss_bytes() == 8192
 
     def test_windows_failure_is_zero(self, monkeypatch):
@@ -1968,6 +2073,76 @@ class TestProcRss:
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.delattr(pc.ctypes, "WinDLL", raising=False)
         assert pc.proc_rss_bytes() == 0
+
+
+class TestMachTaskBasicInfoLayout:
+    """A wrong layout reads a neighbouring field and looks plausible.
+
+    ``task_info`` writes into raw memory and reports back how many
+    ``natural_t``-sized elements it filled, so a struct whose size disagrees
+    with the kernel's yields a number with no error -- exactly the failure mode
+    that is indistinguishable from the peak-vs-current bug being fixed.
+    """
+
+    def test_the_element_count_matches_mach_task_basic_info_count(self):
+        # MACH_TASK_BASIC_INFO_COUNT from <mach/task_info.h>.
+        assert pc._MACH_TASK_BASIC_INFO_COUNT == 12
+        assert ctypes.sizeof(pc._MachTaskBasicInfo) == 48
+
+    def test_resident_size_precedes_its_own_high_water_mark(self):
+        # Both are uint64 and adjacent, so transposing them is a silent revert
+        # to reporting the peak.
+        assert pc._MachTaskBasicInfo.resident_size.offset == 8
+        assert pc._MachTaskBasicInfo.resident_size_max.offset == 16
+
+    def test_the_flavor_selector_is_mach_task_basic_info(self):
+        assert pc._MACH_TASK_BASIC_INFO == 20
+
+
+class TestProcPeakRss:
+    """The peak is still reported, but as its own clearly-named reading."""
+
+    def test_posix_scales_kib_to_bytes_on_linux(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "linux")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=2048),
+        )
+        assert pc.proc_peak_rss_bytes() == 2048 * 1024
+
+    def test_posix_reports_bytes_directly_on_macos(self, monkeypatch):
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        monkeypatch.setattr(pc.sys, "platform", "darwin")
+        _fake_resource(
+            monkeypatch,
+            getrusage=lambda _who: types.SimpleNamespace(ru_maxrss=999),
+        )
+        assert pc.proc_peak_rss_bytes() == 999
+
+    def test_a_getrusage_failure_is_zero(self, monkeypatch):
+        def _boom(_who: Any) -> Any:
+            raise OSError("no rusage")
+
+        monkeypatch.setattr(pc, "IS_POSIX", True)
+        _fake_resource(monkeypatch, getrusage=_boom)
+        assert pc.proc_peak_rss_bytes() == 0
+
+    def test_windows_reads_the_peak_working_set(self, monkeypatch):
+        _fake_windows(
+            monkeypatch,
+            psapi=_memory_info_dll(8192, peak=4_000_000),
+            kernel32=types.SimpleNamespace(GetCurrentProcess=_const(1)),
+        )
+        assert pc.proc_peak_rss_bytes() == 4_000_000
+
+    def test_windows_failure_is_zero(self, monkeypatch):
+        _fake_windows(
+            monkeypatch,
+            psapi=_memory_info_dll(8192, ok=False, peak=4_000_000),
+            kernel32=types.SimpleNamespace(GetCurrentProcess=_const(1)),
+        )
+        assert pc.proc_peak_rss_bytes() == 0
 
 
 class TestProcRssForPid:

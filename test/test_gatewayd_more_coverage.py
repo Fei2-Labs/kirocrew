@@ -482,6 +482,15 @@ class TestRegisterBookkeeping:
 # --- bridge-phase frame hygiene ---------------------------------------------
 
 
+#: Stands in for the oversize frame, which the test body materializes.
+#: ``_MAX_FRAME_BYTES`` is 64 MiB, and a bytes literal that size inside
+#: ``parametrize`` is allocated while the module is IMPORTED -- so every xdist
+#: worker pays it during collection and holds it for the whole session, because
+#: the mark keeps its argvalues alive on the function object. One test needs the
+#: payload; all of them were paying for it.
+_OVERSIZE_FRAME = "oversize-frame"
+
+
 class TestBridgeFrameHygiene:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -489,7 +498,7 @@ class TestBridgeFrameHygiene:
         [
             (asyncio.LimitOverrunError("no separator found", 64), True),
             (b"", True),
-            (b"x" * (gw._MAX_FRAME_BYTES + 2), True),
+            (_OVERSIZE_FRAME, True),
             (b"not json at all\n", False),
             (b"[1, 2, 3]\n", False),
         ],
@@ -503,6 +512,8 @@ class TestBridgeFrameHygiene:
         connection. Neither may ever acquire a backend."""
         acquire = AsyncMock()
         monkeypatch.setattr(gw, "_acquire_backend", acquire)
+        if bad_frame is _OVERSIZE_FRAME:
+            bad_frame = b"x" * (gw._MAX_FRAME_BYTES + 2)
         # The trailing ping is the probe: it is answered only if the connection
         # survived the bad frame.
         reader = _ScriptedReader(_register_frame(), bad_frame, {"type": "ping"})
@@ -745,7 +756,7 @@ class TestBackendGoneHandling:
         replacement = asyncio.create_task(asyncio.Event().wait(), name="cov-drain")
         respawn_args: list[tuple[Any, ...]] = []
 
-        async def _respawn(*args: Any):
+        async def _respawn(*args: Any, **kwargs: Any):
             # Mirror the real helper's contract: it stops the old inbox drain
             # before handing back a fresh backend, so the two writer tasks
             # never race onto the same socket.
@@ -893,14 +904,19 @@ class TestDisconnectTeardown:
 class TestRunGatewaydLifecycle:
     @pytest.mark.asyncio
     async def test_prewarm_count_is_clamped_and_persisted_hot_keys_are_warmed(
-        self, tmp_path, monkeypatch
+        self, tmp_path, short_sock_dir, monkeypatch
     ):
         """``prewarm_count >= max_backends`` would pin the whole pool, so it is
         clamped to leave one reclaimable slot -- and only the clamped number of
         persisted hot keys is warmed."""
-        socket_path = tmp_path / "gw.sock"
+        # The endpoint must bind under a short root (sun_path cap). The daemon
+        # derives its hot-keys store as a sibling of the socket
+        # (``default_hot_keys_path``), so the seed file has to live in the same
+        # short dir. The credential watch path is passed explicitly, so it can
+        # stay on tmp_path.
+        socket_path = short_sock_dir / "gw.sock"
         socket_path.parent.mkdir(parents=True, exist_ok=True)
-        hot_keys_path = tmp_path / "hot-keys.json"
+        hot_keys_path = short_sock_dir / "hot-keys.json"
         now = time.time()
         hot_keys_path.write_text(
             json.dumps(
@@ -966,9 +982,9 @@ class TestRunGatewaydLifecycle:
 
     @pytest.mark.asyncio
     async def test_a_crashing_connection_handler_is_logged_and_the_daemon_keeps_serving(
-        self, tmp_path, monkeypatch, caplog
+        self, short_sock_dir, monkeypatch, caplog
     ):
-        socket_path = tmp_path / "gw-crash.sock"
+        socket_path = short_sock_dir / "gw-crash.sock"
         handled = asyncio.Event()
 
         async def _explode(*args, **kwargs):

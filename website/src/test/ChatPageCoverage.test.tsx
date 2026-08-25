@@ -77,7 +77,13 @@ let chatInputProps: ChatInputProps | null = null
 interface AgentDropdownListProps {
   onSelect: (name: string) => void
 }
+interface DefaultAgentRowProps {
+  agentName: string
+  isDefault: boolean
+  onSetDefault: () => void
+}
 let agentDropdownProps: AgentDropdownListProps | null = null
+let defaultAgentRowProps: DefaultAgentRowProps | null = null
 
 vi.mock('../components/QueueStack', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/QueueStack')>()
@@ -118,6 +124,7 @@ vi.mock('../components/AgentDropdownList', () => ({
     return <div data-testid="agent-dropdown" />
   },
   ManageAgentsFooter: () => null,
+  DefaultAgentRow: (props: DefaultAgentRowProps) => { defaultAgentRowProps = props; return null },
 }))
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
@@ -167,7 +174,6 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       })),
       isAtBottom: false,
       scrollToBottom: vi.fn(),
-      scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
@@ -334,6 +340,7 @@ beforeEach(() => {
   userMsgProps = null
   chatInputProps = null
   agentDropdownProps = null
+  defaultAgentRowProps = null
   sessionStorage.clear()
   setItemSpy.mockClear()
   window.history.replaceState({}, '', '/chat')
@@ -397,6 +404,21 @@ describe('ChatPage agent-switch failure feedback', () => {
     expect(store.getState().chat.agentSwitchNotice).toBeNull()
   })
 })
+describe('ChatPage default-agent footer row', () => {
+  it('points the row at the session\'s own agent and writes that one', async () => {
+    const setDefault = apiSpy('setDefaultAgent')
+    setDefault.mockResolvedValue(undefined)
+    renderChatPage([])
+
+    await waitFor(() => expect(chatInputProps?.onAgentClick).toBeTypeOf('function'))
+    act(() => { chatInputProps!.onAgentClick!({ left: 40, top: 80 } as DOMRect) })
+    await waitFor(() => expect(defaultAgentRowProps).not.toBeNull())
+
+    expect(defaultAgentRowProps!.agentName).toBe('default')
+    act(() => { defaultAgentRowProps!.onSetDefault() })
+    await waitFor(() => expect(setDefault).toHaveBeenCalledWith('default'))
+  })
+})
 
 describe('ChatPage renderMessage — role dispatch', () => {
   it('renders a thinking row as a reasoning block and drops an empty one', async () => {
@@ -406,8 +428,9 @@ describe('ChatPage renderMessage — role dispatch', () => {
     ])
     // The trace is folded behind its own disclosure, so the label is what
     // reaches the transcript — the point being that it is NOT an ordinary
-    // assistant bubble.
-    await waitFor(() => expect(shown()).toContain('Thinking'))
+    // assistant bubble. A block that merely mounts is settled, so it carries
+    // the finished-form label, not the in-progress one.
+    await waitFor(() => expect(shown()).toContain('Thought process'))
     expect(screen.queryByTestId('assistant-msg')).not.toBeInTheDocument()
     // The empty thinking row still occupies a display slot but renders nothing.
     expect(rows()).toHaveLength(2)

@@ -52,7 +52,6 @@ src/apps/mochi/src/shared/appearanceTypes.ts 8.7   # 6/69
 src/apps/mochi/src/shared/utils.ts 0.0   # 0/44
 src/apps/ops-mission-control/HandoverPanel.tsx 0.0   # 0/42
 src/apps/ops-mission-control/api.ts 42.4   # 36/85
-src/apps/papyrus/PapyrusEditor.tsx 0.0   # 0/49
 src/apps/papyrus/ProjectList.tsx 48.6   # 36/74
 src/apps/papyrus/api.ts 9.8   # 6/61
 src/apps/personal-shopper/HistoryTab.tsx 0.0   # 0/45
@@ -68,16 +67,13 @@ src/apps/workflows/WorkflowsRuns.tsx 35.5   # 22/62
 src/components/AddJobSplitButton.tsx 66.7   # 2/3
 src/components/AppIcon.tsx 51.1   # 24/47
 src/components/BottomTerminalPanel.tsx 55.1   # 49/89
-src/components/ChatPane.tsx 69.0   # 100/145
 src/components/CommentThreadPopover.tsx 59.0   # 46/78
-src/components/EmbeddedDragRegionReporter.tsx 13.9   # 5/36
 src/components/ExecutionsView.tsx 48.8   # 20/41
 src/components/FileArtifactComments.tsx 52.0   # 52/100
 src/components/GitPanel.tsx 0.0   # 0/44
 src/components/InlineCommentOverlay.tsx 31.9   # 23/72
 src/components/LogEntry.tsx 0.0   # 0/16
 src/components/MarkdownToc.tsx 55.0   # 77/140
-src/components/SessionPulseSurveyCard.tsx 47.9   # 34/71
 src/components/Strands.tsx 52.2   # 71/136
 src/components/folderColorPaint.ts 0.0   # 0/4
 src/components/notifications/NotificationDetailPanel.tsx 43.2   # 16/37
@@ -98,7 +94,6 @@ src/pages/MigrationPage.tsx 0.0   # 0/38
 src/pages/chat/KnowledgePicker.tsx 0.0   # 0/23
 src/pages/chat/PinnedPrompt.tsx 3.5   # 2/57
 src/pages/chat/SidePanel.tsx 69.3   # 124/179
-src/pages/chat/WorkflowProgressBar.tsx 51.2   # 22/43
 src/pages/overview/EmbeddingModelCard.tsx 58.7   # 64/109
 src/pages/overview/MemoryGraphTab.tsx 68.3   # 97/142
 src/pages/overview/PortabilityTab.tsx 0.0   # 0/60

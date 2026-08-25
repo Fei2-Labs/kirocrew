@@ -179,6 +179,15 @@ _LIBS_DIR_NAME = "llama_cpp_libs"
 # from (see _vendor/llama_cpp/llama_cpp.py). An operator-set value wins, which
 # is the escape hatch for a GPU build or a hand-assembled lib dir.
 _LIB_PATH_ENV = "LLAMA_CPP_LIB_PATH"
+# The upstream Linux x86_64 CPU wheel is built with these code-generation
+# switches enabled. Its startup path executes the corresponding instructions
+# before llama.cpp can make a runtime dispatch decision, so loading it on a
+# weaker CPU raises SIGILL and kills the whole process. Linux exposes `pni` for
+# SSE3; the parser below normalizes that spelling to `sse3`.
+_LINUX_X86_64_REQUIRED_CPU_FLAGS = frozenset(
+    {"avx", "avx2", "bmi2", "f16c", "fma", "sse3", "ssse3"}
+)
+_LINUX_CPUINFO_PATH = Path("/proc/cpuinfo")
 
 # The native-library closure every supported platform MUST ship, keyed by the
 # `llama_cpp_libs/<dir>` name. `libllama` is the entry point ctypes opens by
@@ -260,6 +269,33 @@ def _platform_libs_dirname() -> str | None:
     return None
 
 
+def _linux_x86_64_cpu_flags(
+    cpuinfo_path: Path = _LINUX_CPUINFO_PATH,
+) -> frozenset[str] | None:
+    """Return features shared by every visible Linux x86_64 processor.
+
+    ``None`` means the host did not expose a usable feature list. Callers must
+    fail closed because a wrong optimistic answer can terminate the process
+    with SIGILL before Python can catch anything.
+    """
+    try:
+        cpuinfo = cpuinfo_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    per_cpu: list[frozenset[str]] = []
+    for line in cpuinfo.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().lower() == "flags":
+            flags = {flag.lower() for flag in value.split()}
+            if "pni" in flags:
+                flags.add("sse3")
+            per_cpu.append(frozenset(flags))
+    if not per_cpu:
+        return None
+    return frozenset.intersection(*per_cpu)
+
+
 def verify_vendored_libs(root: Path | None = None) -> dict[str, list[str]]:
     """Report vendored native libs that :data:`_REQUIRED_VENDORED_LIBS` expects but are absent.
 
@@ -268,7 +304,7 @@ def verify_vendored_libs(root: Path | None = None) -> dict[str, list[str]]:
     running one. ``root`` defaults to the installed ``_vendor`` directory, so
     the same check runs against a source tree, an unpacked sdist, or an
     installed wheel — that cross-lane reuse is the point, since each packaging
-    lane (sdist rules, wheel package_data, PyInstaller spec) selects these
+    lane (sdist rules, wheel package_data) selects these
     files by a different mechanism and can therefore drop them independently.
 
     A platform dir that is entirely absent is reported as missing all of its
@@ -360,6 +396,32 @@ def _load_llama_class():
                 _LIB_PATH_ENV,
             )
             return None
+        if libs_dirname == "linux_x86_64":
+            cpu_flags = _linux_x86_64_cpu_flags()
+            if cpu_flags is None:
+                logger.warning(
+                    "Cannot verify CPU compatibility for the bundled Linux x86_64 "
+                    "llama.cpp runtime from %s. Refusing the native runtime because "
+                    "an unsupported instruction would terminate the gateway; memory "
+                    "falls back to keyword search. Set %s to use an operator-provided "
+                    "runtime.",
+                    _LINUX_CPUINFO_PATH,
+                    _LIB_PATH_ENV,
+                )
+                return None
+            missing_cpu_flags = sorted(_LINUX_X86_64_REQUIRED_CPU_FLAGS - cpu_flags)
+            if missing_cpu_flags:
+                logger.warning(
+                    "Bundled Linux x86_64 llama.cpp runtime requires CPU features "
+                    "%s; this host is missing %s. Refusing the native runtime because "
+                    "it would terminate the gateway with SIGILL; memory falls back to "
+                    "keyword search. Set %s to use a compatible operator-provided "
+                    "runtime.",
+                    ", ".join(sorted(_LINUX_X86_64_REQUIRED_CPU_FLAGS)),
+                    ", ".join(missing_cpu_flags),
+                    _LIB_PATH_ENV,
+                )
+                return None
     # setdefault so an operator-provided override (e.g. a GPU build) wins.
     os.environ.setdefault(_LIB_PATH_ENV, str(libs_dir))
     _install_diskcache_stub()
@@ -1641,7 +1703,7 @@ _SSL_CA_PATHS = (
 def _make_ssl_context() -> ssl.SSLContext:
     """Create an SSL context that finds system CA certs on all supported platforms.
 
-    Bundled Python runtimes (like the PyInstaller desktop backend) may not ship
+    Bundled Python runtimes (like the desktop backend's interpreter) may not ship
     their own CA bundle and rely on ``ssl.SSLContext.load_default_certs()`` which
     calls OpenSSL's defaults — those can miss when the compiled-in cert path
     doesn't match the host OS (common on AL2 with cross-compiled Python).

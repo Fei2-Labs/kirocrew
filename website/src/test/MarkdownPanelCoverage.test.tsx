@@ -1,22 +1,28 @@
 /**
  * Cold-path tests for `MarkdownPanel`.
  *
- * The existing suites cover the ⋯ menu inventory and the reveal-forces-source
- * rule. This one aims at what they never enter: the exported source-position
- * resolvers, the Download hand-off, the panel's refresh / save / cancel /
- * diff / fullscreen chrome, the preview find bar, the artifact + knowledge
- * promotion mutations, and the CSS-Custom-Highlight comment overlay.
+ * The existing suites cover the ⋯ menu inventory and the reveal contract. This
+ * one aims at what they never enter: the exported source-position resolvers,
+ * the Download hand-off, the panel's refresh / save / cancel / diff /
+ * fullscreen chrome, the preview find bar, the artifact + knowledge promotion
+ * mutations, and the CSS-Custom-Highlight comment overlay.
  *
  * `Highlight` and `CSS.highlights` are stubbed BEFORE the module is imported,
  * because MarkdownPanel captures both into module-level constants at load time.
  * happy-dom ships neither, so without the stub `FIND_HL_SUPPORTED` is false and
- * every highlight path is unreachable. Monaco is mocked for the same reason the
- * reveal-line suite mocks it: it is lazy, heavy, and does not lay out here.
+ * every highlight path is unreachable.
+ *
+ * Pierre is stubbed for the same reason the reveal suite stubs it: the code,
+ * editor and diff surfaces are lazy chunks that paint into a shadow root, so
+ * nothing inside them is queryable here. What IS queryable — and what these
+ * tests are about — is the panel's own chrome around them.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { forwardRef, useImperativeHandle, createRef } from 'react'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import type { PierreEditorHandle } from '../pierre'
 
 // ── CSS Custom Highlight API stub (must precede the dynamic import) ──────────
 const highlightRegistry = new Map<string, Range[]>()
@@ -34,15 +40,26 @@ vi.stubGlobal('CSS', {
   supports: () => false,
 })
 
-vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, language }: { value?: string; language?: string }) => (
-    <div data-testid="monaco" data-language={language} data-value={value} />
+// `PierreEditor` must be a forwardRef: the panel hands it `editorRef`
+// (`setRevealEditor`), and a plain function component both warns and never
+// reports a handle.
+vi.mock('../pierre', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  PierreEditor: forwardRef<PierreEditorHandle, { file: { contents: string } }>(
+    function PierreEditorStub({ file }, ref) {
+      useImperativeHandle(ref, () => ({ jumpToLine: () => {}, focus: () => {} }), [])
+      return <div data-testid="pierre-editor" data-value={file.contents} />
+    },
   ),
-  DiffEditor: () => <div data-testid="monaco-diff" />,
-  loader: { config: () => {} },
+  PierreCode: ({ file }: { file: { contents: string } }) => (
+    <div data-testid="pierre-code" data-value={file.contents} />
+  ),
+  PierreFilePair: ({ oldFile, newFile }: {
+    oldFile: { contents: string } | null; newFile: { contents: string } | null
+  }) => (
+    <div data-testid="pierre-diff" data-old={oldFile?.contents ?? ''} data-new={newFile?.contents ?? ''} />
+  ),
 }))
-vi.mock('monaco-editor', () => ({}))
-vi.mock('../utils/monacoLocal', () => ({ ensureMonacoLocal: async () => {} }))
 
 vi.mock('../api/client', () => ({
   api: {
@@ -59,6 +76,7 @@ vi.mock('../api/client', () => ({
 const { api } = await import('../api/client')
 const { default: MarkdownPanel, OverflowMenu, resolveSourcePos, findCoords } =
   await import('../components/MarkdownPanel')
+type MarkdownPanelHandle = import('../components/MarkdownPanel').MarkdownPanelHandle
 
 // ── fetch router ────────────────────────────────────────────────────────────
 interface FetchOpts {
@@ -290,7 +308,6 @@ interface MountOpts {
   onClose?: () => void
   onContentChange?: (c: string) => void
   onDiffModeChange?: (d: boolean) => void
-  onOpenFolder?: (p: string) => void
   onSubmitComments?: (m: string) => void
   /** Omit the key entirely to let the auto-diff heuristic decide. */
   initialDiffMode?: boolean
@@ -305,7 +322,6 @@ function mountPanel(opts: MountOpts = {}) {
     onClose: opts.onClose ?? vi.fn(),
     onRefresh: opts.onRefresh,
     onDiffModeChange: opts.onDiffModeChange,
-    onOpenFolder: opts.onOpenFolder,
     onSubmitComments: opts.onSubmitComments,
     savedBaseline: opts.savedBaseline,
     initialDiffMode: 'initialDiffMode' in opts ? opts.initialDiffMode : false,
@@ -317,6 +333,18 @@ function mountPanel(opts: MountOpts = {}) {
 /** Open the panel's ⋯ menu (the first one — the header's, not fullscreen's). */
 function openPanelMenu() {
   fireEvent.click(screen.getAllByTestId('markdown-panel-more-options')[0])
+}
+
+/**
+ * The unsaved-changes banner stays MOUNTED and animates its own row height
+ * (`grid-template-rows` 0fr→1fr), so its Save / Cancel buttons are in the DOM
+ * whether or not the buffer is dirty — the header must not change height. Its
+ * `aria-hidden` is therefore the only honest read of "is the banner showing",
+ * and the only one an assertion can use without re-asserting Tailwind.
+ */
+function bannerShown(): boolean {
+  const banner = screen.getByText('Unsaved changes').closest('[aria-hidden]') as HTMLElement
+  return banner.getAttribute('aria-hidden') === 'false'
 }
 
 describe('MarkdownPanel — refresh', () => {
@@ -345,66 +373,193 @@ describe('MarkdownPanel — refresh', () => {
 })
 
 describe('MarkdownPanel — save and cancel', () => {
-  /** A dirty markdown buffer switched into source mode, where Save/Cancel live. */
-  function mountDirtySource(opts: MountOpts = {}) {
-    const r = mountPanel({ content: 'edited body', savedBaseline: 'disk body', ...opts })
-    fireEvent.click(screen.getByText('View Source'))
-    return r
+  /** A dirty buffer. Save / Cancel live in the unsaved-changes banner, which is
+   *  mode-independent — a dirty preview shows them too. */
+  function mountDirty(opts: MountOpts = {}) {
+    return mountPanel({ content: 'edited body', savedBaseline: 'disk body', ...opts })
   }
 
   it('marks the buffer dirty from a restored draft that differs from disk', () => {
-    mountPanel({ content: 'edited body', savedBaseline: 'disk body' })
-    expect(screen.getByTitle('Unsaved changes')).toBeInTheDocument()
+    mountDirty()
+    expect(bannerShown()).toBe(true)
+  })
+
+  it('keeps the banner hidden while the buffer matches disk', () => {
+    mountPanel({ content: 'same body', savedBaseline: 'same body' })
+    expect(bannerShown()).toBe(false)
   })
 
   it('hands the current buffer to the owner on Save', async () => {
     const onSave = vi.fn(async () => {})
-    mountDirtySource({ onSave })
+    mountDirty({ onSave })
     fireEvent.click(screen.getByText('Save'))
     await waitFor(() => expect(onSave).toHaveBeenCalledWith('/tmp/notes.md', 'edited body'))
   })
 
   it('surfaces the failure message when the save is rejected', async () => {
     const onSave = vi.fn(async () => { throw new Error('disk is read-only') })
-    mountDirtySource({ onSave })
+    mountDirty({ onSave })
     fireEvent.click(screen.getByText('Save'))
     expect(await screen.findByText('disk is read-only')).toBeInTheDocument()
   })
 
+  // The discard guard is the in-app dialog, never window.confirm: the native
+  // confirm is synchronous and freezes the renderer's event loop, so a Quit
+  // event queued behind it fires the instant it dismisses.
   it('re-reads from disk on Cancel once the discard is confirmed', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const confirmSpy = vi.spyOn(window, 'confirm')
     const onRefresh = vi.fn(async () => {})
-    mountDirtySource({ onRefresh })
+    mountDirty({ onRefresh })
     fireEvent.click(screen.getByText('Cancel'))
-    await waitFor(() => expect(onRefresh).toHaveBeenCalledWith('/tmp/notes.md'))
-    expect(window.confirm).toHaveBeenCalledWith('Discard unsaved changes?')
-  })
-
-  it('keeps the edits when the discard confirmation is declined', () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
-    const onRefresh = vi.fn(async () => {})
-    mountDirtySource({ onRefresh })
-    fireEvent.click(screen.getByText('Cancel'))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('Discard unsaved changes?')).toBeInTheDocument()
+    // Opening the dialog alone must not discard anything.
     expect(onRefresh).not.toHaveBeenCalled()
-    expect(screen.getByText('Save')).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Discard changes' }))
+    await waitFor(() => expect(onRefresh).toHaveBeenCalledWith('/tmp/notes.md'))
+    expect(confirmSpy).not.toHaveBeenCalled()
   })
 
-  it('routes Escape through the same discard guard as the close button', () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
+  it('keeps the edits when the discard confirmation is declined', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm')
+    const onRefresh = vi.fn(async () => {})
+    mountDirty({ onRefresh })
+    fireEvent.click(screen.getByText('Cancel'))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(onRefresh).not.toHaveBeenCalled()
+    expect(bannerShown()).toBe(true)
+    expect(confirmSpy).not.toHaveBeenCalled()
+  })
+
+  it('routes Escape through the same discard guard as the close button', async () => {
     const onClose = vi.fn()
-    mountPanel({ content: 'edited body', savedBaseline: 'disk body', onClose })
+    mountDirty({ onClose })
     fireEvent.keyDown(document, { key: 'Escape' })
+    // Declining keeps the buffer and the panel.
+    const first = await screen.findByRole('dialog')
+    fireEvent.click(within(first).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     expect(onClose).not.toHaveBeenCalled()
-    vi.mocked(window.confirm).mockReturnValue(true)
+    // Re-asking and confirming closes.
     fireEvent.keyDown(document, { key: 'Escape' })
-    expect(onClose).toHaveBeenCalledOnce()
+    const second = await screen.findByRole('dialog')
+    fireEvent.click(within(second).getByRole('button', { name: 'Discard changes' }))
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce())
+  })
+
+  /**
+   * The browser rail re-targets the tab it is docked in. That is safe only while
+   * the buffer is untouched, so the panel answers a predicate instead of asking
+   * the user: a dirty tab is left alone and the caller opens its own tab. There
+   * is nothing to confirm, and a confirm here would be answering a question whose
+   * outcome does not depend on the answer.
+   */
+  it('never prompts on navigation, and reports a dirty buffer so the caller spares it', () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const ref = createRef<MarkdownPanelHandle>()
+    render(<MarkdownPanel embedded ref={ref} filePath="/tmp/notes.md" content="edited body"
+      savedBaseline="disk body" onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} initialDiffMode={false} />, { wrapper })
+
+    let stillClean: (() => boolean) | undefined
+    const nav = vi.fn((fn?: () => boolean) => { stillClean = fn })
+    act(() => ref.current!.requestNavigate(nav))
+
+    // The navigation proceeds unconditionally; only its predicate differs.
+    expect(window.confirm).not.toHaveBeenCalled()
+    expect(nav).toHaveBeenCalledOnce()
+    expect(stillClean?.()).toBe(false)
+  })
+
+  it('reports a clean buffer so the caller re-targets the tab in place', () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const ref = createRef<MarkdownPanelHandle>()
+    render(<MarkdownPanel embedded ref={ref} filePath="/tmp/notes.md" content="same body"
+      savedBaseline="same body" onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} initialDiffMode={false} />, { wrapper })
+
+    let stillClean: (() => boolean) | undefined
+    const nav = vi.fn((fn?: () => boolean) => { stillClean = fn })
+    act(() => ref.current!.requestNavigate(nav))
+
+    expect(window.confirm).not.toHaveBeenCalled()
+    expect(nav).toHaveBeenCalledOnce()
+    expect(stillClean?.()).toBe(true)
+  })
+
+  it('still guards CLOSE with the discard prompt', async () => {
+    // Closing does destroy the buffer, so the question is real there. Dropping
+    // the navigation prompt must not drop this one.
+    const confirmSpy = vi.spyOn(window, 'confirm')
+    const onClose = vi.fn()
+    const ref = createRef<MarkdownPanelHandle>()
+    render(<MarkdownPanel embedded ref={ref} filePath="/tmp/notes.md" content="edited body"
+      savedBaseline="disk body" onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={onClose} initialDiffMode={false} />, { wrapper })
+
+    act(() => ref.current!.requestClose())
+
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('Discard unsaved changes?')).toBeInTheDocument()
+    expect(confirmSpy).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The navigation reads the target file asynchronously and only replaces this
+   * tab once it lands, so the up-front answer can be stale by then — the user
+   * can type during the read. The predicate handed to `nav` is what the caller
+   * re-asks at the moment it would destroy the buffer.
+   */
+  it('reports the buffer dirty through the late guard even though it was clean at the ask', () => {
+    const ref = createRef<MarkdownPanelHandle>()
+    const { rerender } = render(<MarkdownPanel embedded ref={ref} filePath="/tmp/notes.md" content="same body"
+      savedBaseline="same body" onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} initialDiffMode={false} />, { wrapper })
+
+    let stillClean: (() => boolean) | undefined
+    act(() => ref.current!.requestNavigate(fn => { stillClean = fn }))
+    expect(stillClean?.()).toBe(true)
+
+    // The read is in flight; the user edits the buffer it is about to replace.
+    rerender(<MarkdownPanel embedded ref={ref} filePath="/tmp/notes.md" content="typed while loading"
+      savedBaseline="same body" onContentChange={vi.fn()} onSave={vi.fn(async () => {})}
+      onClose={vi.fn()} initialDiffMode={false} />)
+
+    expect(stillClean?.()).toBe(false)
   })
 
   it('saves on Cmd+S while editing a dirty buffer', async () => {
     const onSave = vi.fn(async () => {})
-    mountDirtySource({ onSave })
+    mountDirty({ onSave })
+    // Cmd+S is gated on `editing` — the shortcut belongs to the edit surface.
+    fireEvent.click(screen.getByText('View Source'))
     fireEvent.keyDown(document, { key: 's', metaKey: true })
     await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+  })
+
+  it('ignores Cmd+S while the discard dialog is open', async () => {
+    // The native confirm blocked the event loop, so no shortcut could fire
+    // mid-question; the async dialog must restore that property — a mid-dialog
+    // save would persist the very draft the user is about to discard.
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.click(screen.getByText('View Source'))
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await screen.findByRole('dialog')
+    fireEvent.keyDown(document, { key: 's', metaKey: true })
+    expect(onSave).not.toHaveBeenCalled()
+    // The dialog is still up and still answers.
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+  })
+
+  it('ignores Cmd+S from the rendered preview, which has nothing to save', async () => {
+    const onSave = vi.fn(async () => {})
+    mountDirty({ onSave })
+    fireEvent.keyDown(document, { key: 's', metaKey: true })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(onSave).not.toHaveBeenCalled()
   })
 })
 
@@ -421,15 +576,48 @@ describe('MarkdownPanel — diff chrome', () => {
     expect(await screen.findByText('+1')).toBeInTheDocument()
   })
 
-  it('flips the split/unified control only once a diff is on screen', async () => {
+  it('hands the buffer and its baseline to the Pierre diff surface', async () => {
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: 'x', original: 'one\ntwo\n', status: 'clean' } as never)
+    mountPanel({ content: 'one\ntwo\nthree\n', initialDiffMode: undefined })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    fireEvent.click(screen.getAllByLabelText('Toggle diff view')[0])
+    // Pierre owns the rows and the header; the pair it is GIVEN is the panel's
+    // side of the contract, and getting it backwards inverts every +/- sign.
+    const surface = await screen.findByTestId('pierre-diff')
+    expect(surface).toHaveAttribute('data-old', 'one\ntwo\n')
+    expect(surface).toHaveAttribute('data-new', 'one\ntwo\nthree\n')
+  })
+
+  it('says so instead of rendering an empty canvas for a file with no changes', async () => {
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: '', original: 'same\n', status: 'clean' } as never)
+    mountPanel({ content: 'same\n', initialDiffMode: undefined })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    fireEvent.click(screen.getAllByLabelText('Toggle diff view')[0])
+    expect(await screen.findByText('No changes in this file')).toBeInTheDocument()
+    expect(screen.queryByTestId('pierre-diff')).toBeNull()
+    // …and offers the way back out.
+    fireEvent.click(screen.getByText('Show full file'))
+    await waitFor(() => expect(screen.queryByText('No changes in this file')).toBeNull())
+  })
+
+  it('offers split/unified as a menu row only once a diff is on screen', async () => {
+    // The control moved out of the header bar into the ⋯ menu as a checkbox
+    // row: with the file-browser toggle present, the bar was carrying three
+    // peer actions and clipped under width pressure.
     mountPanel({ initialDiffMode: undefined })
     await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
-    expect(screen.queryByLabelText('Switch to unified view')).toBeNull()
+    openPanelMenu()
+    expect(screen.queryByRole('menuitemcheckbox', { name: /Split view/ })).toBeNull()
+    openPanelMenu() // the trigger toggles, so this closes it again
+
     fireEvent.click(screen.getAllByLabelText('Toggle diff view')[0])
-    const split = screen.getByLabelText('Switch to unified view')
-    expect(split).toHaveAttribute('aria-pressed', 'true')
+    openPanelMenu()
+    const split = screen.getByRole('menuitemcheckbox', { name: /Split view/ })
+    expect(split).toHaveAttribute('aria-checked', 'true')
     fireEvent.click(split)
-    expect(screen.getByLabelText('Switch to split view')).toHaveAttribute('aria-pressed', 'false')
+    // A checkbox row leaves the menu open, so it can be re-read in place.
+    expect(screen.getByRole('menuitemcheckbox', { name: /Split view/ }))
+      .toHaveAttribute('aria-checked', 'false')
   })
 
   it('adopts the owner-restored diff preference over the auto-diff heuristic', async () => {
@@ -451,17 +639,17 @@ describe('MarkdownPanel — diff chrome', () => {
 })
 
 describe('MarkdownPanel — breadcrumb', () => {
-  it('opens a clicked ancestor directory at its absolute path', () => {
-    const onOpenFolder = vi.fn()
-    mountPanel({ filePath: '/home/dev/docs/notes.md', onOpenFolder })
-    fireEvent.click(screen.getByTitle('Open folder /home/dev'))
-    expect(onOpenFolder).toHaveBeenCalledWith('/home/dev')
+  it('shows the trailing path segments with the file last', () => {
+    mountPanel({ filePath: '/home/dev/docs/notes.md' })
+    expect(screen.getByText('notes.md')).toBeInTheDocument()
+    expect(screen.getByText('docs')).toBeInTheDocument()
+    expect(screen.getByText('dev')).toBeInTheDocument()
   })
 
-  it('leaves the breadcrumb inert when the host has no folder surface', () => {
+  it('carries the full path for copy/tooltip even though only the tail shows', () => {
     mountPanel({ filePath: '/home/dev/docs/notes.md' })
-    expect(screen.queryByTitle('Open folder /home/dev')).toBeNull()
-    expect(screen.getByText('notes.md')).toBeInTheDocument()
+    expect(screen.getByTitle('/home/dev/docs/notes.md')).toBeInTheDocument()
+    expect(screen.queryByText('/home')).toBeNull()
   })
 })
 
@@ -521,6 +709,26 @@ describe('MarkdownPanel — fullscreen overlay', () => {
     expect(document.activeElement).toBe(last)
   })
 
+  it('declines a boundary Tab that belongs to an IME composition', async () => {
+    // On WebKit the keydown that commits a candidate arrives AFTER
+    // compositionend with `isComposing` already false — unguarded, the trap
+    // would yank focus and abort the composition (issue class of the shared
+    // hook's own guard).
+    const dialog = await goFullscreen()
+    const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]),textarea,input,a[href],select,[tabindex]:not([tabindex="-1"])',
+    ))
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+
+    last.focus()
+    fireEvent.compositionStart(last)
+    fireEvent.compositionEnd(last)
+    fireEvent.keyDown(dialog, { key: 'Tab' })
+    expect(document.activeElement).toBe(last)
+    expect(document.activeElement).not.toBe(first)
+  })
+
   it('carries the editing toolbar into the overlay', async () => {
     mountPanel({ content: 'edited body', savedBaseline: 'disk body' })
     fireEvent.click(screen.getByText('View Source'))
@@ -529,8 +737,8 @@ describe('MarkdownPanel — fullscreen overlay', () => {
     const dialog = await screen.findByRole('dialog')
     // Source-mode controls exist in the overlay header, not only the side panel.
     expect(dialog.querySelector('[aria-label="Toggle word wrap"]')).not.toBeNull()
-    expect(dialog.querySelector('[aria-label="Toggle autocomplete"]')).not.toBeNull()
     expect(dialog.querySelector('[aria-label="Toggle line numbers"]')).not.toBeNull()
+    expect(dialog.querySelector('[aria-label="Toggle diff view"]')).not.toBeNull()
   })
 })
 
@@ -642,6 +850,13 @@ describe('MarkdownPanel — inline comment highlights', () => {
     }))
   }
 
+  /** The scroll container the panel binds its pointer + observer listeners to.
+   *  Reached through the markdown body rather than a class name, so a Tailwind
+   *  edit to the scroll box does not silently unbind these tests. */
+  function scrollRoot(): HTMLElement {
+    return document.querySelector('.msg-content')!.parentElement as HTMLElement
+  }
+
   it('paints a persisted draft comment as a custom highlight', async () => {
     seedDraft('beta')
     mountPanel({ filePath: FILE, content: BODY, onSubmitComments: vi.fn() })
@@ -680,12 +895,12 @@ describe('MarkdownPanel — inline comment highlights', () => {
         return caret
       },
     })
-    const scrollRoot = document.querySelector('.overflow-auto') as HTMLElement
-    await act(async () => { fireEvent.mouseMove(scrollRoot, { clientX: 20, clientY: 20 }) })
+    const root = scrollRoot()
+    await act(async () => { fireEvent.mouseMove(root, { clientX: 20, clientY: 20 }) })
     const tip = document.querySelector('.mc-comment-tooltip')
     expect(tip).not.toBeNull()
     expect(tip).toHaveTextContent('needs a citation')
-    await act(async () => { fireEvent.mouseLeave(scrollRoot) })
+    await act(async () => { fireEvent.mouseLeave(root) })
     expect(document.querySelector('.mc-comment-tooltip')).toBeNull()
   })
 
@@ -893,34 +1108,46 @@ describe('MarkdownPanel — authoring an inline comment', () => {
   })
 })
 
-describe('MarkdownPanel — source-mode view options', () => {
-  it('persists each editor view toggle so it survives a remount', () => {
+describe('MarkdownPanel — view options', () => {
+  /** The view toggles moved into the ⋯ menu as checkbox rows (side-panel
+   *  revamp): the header bar carries only mode toggles now. */
+  const checkbox = (name: RegExp) => screen.getByRole('menuitemcheckbox', { name })
+
+  it('persists each view toggle so it survives a remount', () => {
     const { unmount } = mountPanel()
-    fireEvent.click(screen.getByText('View Source'))
-    const wrap = screen.getByTitle('Toggle word wrap')
-    const complete = screen.getByTitle('Toggle autocomplete')
-    const nums = screen.getByTitle('Toggle line numbers')
-    expect(wrap).toHaveAttribute('aria-pressed', 'true')
+    openPanelMenu()
+    const wrap = checkbox(/Word wrap/)
+    const nums = checkbox(/Line numbers/)
+    const fold = checkbox(/Collapse unchanged/)
+    expect(wrap).toHaveAttribute('aria-checked', 'true')
+    expect(nums).toHaveAttribute('aria-checked', 'true')
+    // Off by default: a file-panel diff shows the whole file until asked.
+    expect(fold).toHaveAttribute('aria-checked', 'false')
     fireEvent.click(wrap)
-    fireEvent.click(complete)
     fireEvent.click(nums)
-    expect(wrap).toHaveAttribute('aria-pressed', 'false')
-    expect(complete).toHaveAttribute('aria-pressed', 'false')
-    expect(nums).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(fold)
+    expect(checkbox(/Word wrap/)).toHaveAttribute('aria-checked', 'false')
+    expect(checkbox(/Line numbers/)).toHaveAttribute('aria-checked', 'false')
+    expect(checkbox(/Collapse unchanged/)).toHaveAttribute('aria-checked', 'true')
+    expect(localStorage.getItem('mc-file-wordwrap')).toBe('0')
+    expect(localStorage.getItem('mc-file-linenums')).toBe('0')
+    expect(localStorage.getItem('mc-file-collapse-unchanged')).toBe('1')
     unmount()
 
     mountPanel()
-    fireEvent.click(screen.getByText('View Source'))
-    expect(screen.getByTitle('Toggle word wrap')).toHaveAttribute('aria-pressed', 'false')
-    expect(screen.getByTitle('Toggle line numbers')).toHaveAttribute('aria-pressed', 'false')
+    openPanelMenu()
+    expect(checkbox(/Word wrap/)).toHaveAttribute('aria-checked', 'false')
+    expect(checkbox(/Line numbers/)).toHaveAttribute('aria-checked', 'false')
+    expect(checkbox(/Collapse unchanged/)).toHaveAttribute('aria-checked', 'true')
   })
 
-  it('takes the options row out of the tab order while in preview', () => {
+  it('keeps the menu open across a toggle, so several can be set in one visit', () => {
     mountPanel()
-    // The row stays mounted (grid-rows animation) but must not be reachable.
-    expect(screen.getByTitle('Toggle word wrap')).toHaveAttribute('tabindex', '-1')
-    fireEvent.click(screen.getByText('View Source'))
-    expect(screen.getByTitle('Toggle word wrap')).toHaveAttribute('tabindex', '0')
+    openPanelMenu()
+    fireEvent.click(checkbox(/Word wrap/))
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    fireEvent.click(checkbox(/Line numbers/))
+    expect(screen.getByRole('menu')).toBeInTheDocument()
   })
 
   it('returns to the preview from source mode via the same toggle', () => {
@@ -936,6 +1163,15 @@ describe('MarkdownPanel — source-mode view options', () => {
     await waitFor(() => expect(document.querySelector('img')).not.toBeNull())
     expect(screen.queryByText('View Source')).toBeNull()
     expect(screen.queryByLabelText('Toggle diff view')).toBeNull()
+  })
+
+  it('opens a code file straight in the editor, with no preview to return to', async () => {
+    // Code files lost their read-only "preview" (it was the same text twice);
+    // they open in the Pierre editor and the mode toggle is hidden.
+    mountPanel({ filePath: '/tmp/mod.py', content: 'a = 1\n' })
+    expect(await screen.findByTestId('pierre-editor')).toBeInTheDocument()
+    expect(screen.queryByText('View Source')).toBeNull()
+    expect(screen.queryByText('View Preview')).toBeNull()
   })
 })
 

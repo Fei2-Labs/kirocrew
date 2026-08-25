@@ -6,10 +6,10 @@
  *
  *  1. The GRANT SCOPE. A trust click widens what runs unasked, and the `pattern`
  *     string decides by how much. The pet panel must produce EXACTLY what the
- *     dashboard's TrustDropdown produces for the same click; until that transform
- *     is hoisted into a shared module (its own core-scoped PR — see
- *     src/shared/trustPatterns.ts), these exact-output assertions are what keep
- *     the two from drifting and the pet from granting wider than its label says.
+ *     dashboard's TrustDropdown produces for the same click. The transforms are
+ *     hoisted into one shared module (src/shared/trustPatterns.ts re-exports
+ *     website/src/utils/trustPatterns.ts); the identity assertions below make a
+ *     re-introduced copy fail here rather than drift silently.
  *  2. The BUBBLE COPY. It must name the agent's purpose and NOTHING about the
  *     command: a bubble sits on the desktop in front of anyone looking at the
  *     screen. A future edit that interpolates the command there would be a leak,
@@ -24,6 +24,12 @@ import {
 } from '../src/shared/trustPatterns'
 import { permissionApprovalFromFrame } from '../panel/panelBridge'
 import { approvalBubbleText, approvalPurpose } from '../src/renderer/hooks/useApprovalBubble'
+// The dashboard import, used ONLY so the identity test can prove both call
+// sites resolve to the SAME implementation, not two byte-identical copies.
+import {
+  trustBasePattern as dashboardTrustBasePattern,
+  truncateCommandLabel as dashboardTruncateCommandLabel,
+} from '../../../utils/trustPatterns'
 
 /** A permission-role chat frame, as the gateway broadcasts it. */
 function frame(meta: Record<string, unknown>): Record<string, unknown> {
@@ -46,9 +52,40 @@ describe('trust pattern transform (shared with the dashboard)', () => {
   })
 
   it('truncates only the LABEL, never the pattern', () => {
-    const long = 'a'.repeat(60)
-    expect(truncateCommandLabel(long)).toHaveLength(31) // 30 + ellipsis
+    const long = 'a'.repeat(300)
+    expect(truncateCommandLabel(long)).toHaveLength(256)
     expect(trustBasePattern(long)).toBe(long + ' *')
+  })
+
+  it('IS the dashboard implementation — one module, not two synced copies', () => {
+    // Reference identity, not byte-parity: a re-introduced local copy could stay
+    // byte-identical for a while and drift later, but it can never be the same
+    // function object. This is what makes the next duplication redden on day one.
+    expect(truncateCommandLabel).toBe(dashboardTruncateCommandLabel)
+    expect(trustBasePattern).toBe(dashboardTrustBasePattern)
+  })
+
+  it('renders the same label as the dashboard for the same command', () => {
+    // One behavioral spot check on top of the identity assertion, so a future
+    // wrapper (same module, different behavior) is also caught.
+    const cmd = `gh api repos/kirodotdev/KiroCrew/contents/${'p/'.repeat(120)}config.json --jq .sha`
+    expect(cmd.length).toBeGreaterThan(256)
+    expect(truncateCommandLabel(cmd)).toBe(dashboardTruncateCommandLabel(cmd))
+    expect(truncateCommandLabel(cmd)).toHaveLength(256)
+  })
+
+  it('does not render two commands from the original report with the same label', () => {
+    // The label is the only thing the user reads before granting an exact-string
+    // match. These two differ only in the filename, past the old 30-char budget,
+    // and rendered identically before the fix. Asserting inequality (not just the
+    // new number) catches a build that reintroduces the collision at any length
+    // shorter than where these diverge.
+    const config = 'gh api repos/owner/some-repository/contents/config.json --jq .sha'
+    const secrets = 'gh api repos/owner/some-repository/contents/secrets.json --jq .sha'
+    expect(truncateCommandLabel(config)).not.toBe(truncateCommandLabel(secrets))
+    // ...and pin that the OLD budget is what made them collide, so this test
+    // fails if the budget is narrowed back.
+    expect(truncateCommandLabel(config, 30)).toBe(truncateCommandLabel(secrets, 30))
   })
 
   it('offers the family grant only when it differs from the exact command', () => {

@@ -37,6 +37,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew import github_runner
 from kiro_crew.dashboard.urls import is_loopback
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.platform.governance_profiles import (
@@ -97,31 +98,40 @@ def _cli_path() -> str | None:
 
     Deliberately does **not** consult ``PATH`` — see ``_CLI_CANDIDATE_PATHS``.
 
-    A candidate is additionally refused when the binary or its directory is
-    writable by the gateway user (checked on POSIX; the Windows entry needs
-    elevation to write). The pinned list mostly needs root, but two entries do
-    not everywhere: Homebrew chowns ``/opt/homebrew/bin`` (and sometimes
-    ``/usr/local/bin``) to the console user, and identity resolution makes
-    this a request-triggered execution on the auth path — an agent that can
-    write there must not be able to plant a ``tailscale`` the next
-    credential-bearing request executes. A refused Homebrew install degrades
-    exactly like a missing binary: the feature contributes nothing and the
-    documented ``dashboard.url`` fallback still works.
+    A candidate is additionally refused when its platform's ownership policy
+    cannot establish trusted provenance. POSIX keeps the stricter local check
+    below; Windows reuses the shared executable validator, which reads the
+    binary and parent ACLs because mode bits carry no useful signal there. A
+    refusal degrades exactly like a missing binary: the feature contributes
+    nothing and the documented ``dashboard.url`` fallback still works.
     """
     # getattr: os.geteuid does not exist on Windows, and tests exercise this
     # path with IS_POSIX patched True on every platform.
     for candidate in _CLI_CANDIDATE_PATHS:
         if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
             continue
-        if IS_POSIX and not _posix_candidate_trusted(candidate):
-            logger.debug(
-                "tailscale CLI at %s is in a location this deployment cannot "
-                "trust; refusing to execute it (planted-binary defence). Use "
-                "an explicit dashboard.url instead.",
-                candidate,
-            )
-            continue
-        return candidate
+        validated = candidate
+        if IS_POSIX:
+            if not _posix_candidate_trusted(candidate):
+                logger.debug(
+                    "tailscale CLI at %s is in a location this deployment cannot "
+                    "trust; refusing to execute it (planted-binary defence). Use "
+                    "an explicit dashboard.url instead.",
+                    candidate,
+                )
+                continue
+        else:
+            try:
+                validated = github_runner.validate_provider_executable(candidate)
+            except ValueError as exc:
+                logger.debug(
+                    "tailscale CLI at %s failed executable trust validation: %s. "
+                    "Use an explicit dashboard.url instead.",
+                    candidate,
+                    exc,
+                )
+                continue
+        return validated
     return None
 
 
@@ -205,7 +215,7 @@ def _run_json_detail(args: list[str]) -> tuple[Any | None, bool]:
         return None, False
     try:
         return json.loads(proc.stdout or ""), False
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         logger.debug("tailscale %s produced non-JSON output: %s", " ".join(args), exc)
         return None, False
 
@@ -292,6 +302,130 @@ def tailnet_origin() -> str | None:
     """
     name = self_dns_name()
     return f"https://{name}" if name else None
+
+
+#: ``BackendState`` values that mean the daemon is running but this machine is
+#: not signed in to a tailnet. Upstream's own enum (``ipn.State``); only the
+#: not-signed-in half is listed because that is the one an operator fixes by
+#: signing in, and treating an unknown future value as "signed in" would send
+#: them to the wrong remedy.
+_BACKEND_STATES_NEEDING_LOGIN = frozenset({"NeedsLogin", "NoState", "NeedsMachineAuth"})
+
+
+@dataclass(frozen=True)
+class DaemonProbe:
+    """Why this machine does or does not have a usable tailnet name.
+
+    Exists because :func:`self_dns_name` deliberately collapses every failure to
+    ``None`` — right for its caller (which only wants "a name or nothing") and
+    useless for an onboarding UI, which has to tell the operator WHICH thing to
+    go fix. The three negatives have three different remedies and must not be
+    rendered as one "Tailscale not working":
+
+    * ``installed=False`` — install Tailscale.
+    * ``reachable=False`` — the daemon is not answering; start it.
+    * ``logged_in=False`` — signed out; sign in.
+    * all true but ``name=""`` — signed in, but MagicDNS is off for the tailnet.
+
+    ``peer_count`` / ``peers_online`` describe the OTHER devices on this tailnet,
+    and they answer a question no amount of local state can: whether there is a
+    phone to reach this dashboard FROM. Publishing succeeds and the QR renders
+    perfectly on a tailnet of one, and then the scan fails in the browser with an
+    unexplained "cannot connect" — the single most likely way a new operator gets
+    stuck, because nothing on this machine is wrong.
+
+    Keeps this module's "nothing here raises" invariant: every failure lands in
+    a field, never in an exception.
+    """
+
+    name: str
+    installed: bool
+    reachable: bool
+    logged_in: bool
+    detail: str
+    peer_count: int = 0
+    peers_online: int = 0
+
+
+def _count_peers(status: dict) -> tuple[int, int]:
+    """``(peers, online)`` for the tailnet's OTHER devices. Never raises.
+
+    Counted from the status document already parsed by the caller rather than by
+    a second daemon call. A malformed or absent ``Peer`` map counts as zero, which
+    is the same reading as a tailnet of one — both mean "we cannot show that a
+    second device exists", and the advisory that follows is phrased as an absence
+    of evidence rather than as a certainty.
+    """
+    raw = status.get("Peer")
+    if not isinstance(raw, dict):
+        return 0, 0
+    peers = [p for p in raw.values() if isinstance(p, dict)]
+    online = sum(1 for p in peers if p.get("Online") is True)
+    return len(peers), online
+
+
+def probe_daemon() -> DaemonProbe:
+    """Diagnose the local daemon for the onboarding card. Never raises.
+
+    A LIVE read, unlike the startup value ``GET /api/tailnet/status`` reports.
+    The two are deliberately different questions — "what can this machine do
+    next" versus "what does the running server already trust" — and conflating
+    them is how a resolvable name gets rendered as an origin that is actually in
+    the allowlist.
+    """
+    if _cli_path() is None:
+        return DaemonProbe(
+            name="",
+            installed=False,
+            reachable=False,
+            logged_in=False,
+            detail="Tailscale is not installed in a standard location.",
+        )
+    status, _transient = _run_json_detail(["status", "--json"])
+    if not isinstance(status, dict):
+        return DaemonProbe(
+            name="",
+            installed=True,
+            reachable=False,
+            logged_in=False,
+            detail="Tailscale is installed, but its daemon did not answer.",
+        )
+    backend_state = status.get("BackendState")
+    logged_in = not (
+        isinstance(backend_state, str) and backend_state in _BACKEND_STATES_NEEDING_LOGIN
+    )
+    if not logged_in:
+        return DaemonProbe(
+            name="",
+            installed=True,
+            reachable=True,
+            logged_in=False,
+            detail="Tailscale is running but this machine is not signed in.",
+        )
+    peer_count, peers_online = _count_peers(status)
+    name = self_dns_name() or ""
+    if not name:
+        return DaemonProbe(
+            name="",
+            installed=True,
+            reachable=True,
+            logged_in=True,
+            detail=(
+                "Signed in, but no MagicDNS name is available for this machine — "
+                "MagicDNS may be disabled for this tailnet."
+            ),
+            peer_count=peer_count,
+            peers_online=peers_online,
+        )
+    return DaemonProbe(
+        name=name,
+        installed=True,
+        reachable=True,
+        logged_in=True,
+        detail="",
+        peer_count=peer_count,
+        peers_online=peers_online,
+    )
 
 
 def is_governance_pinned_off(*, audit_tool: str = "") -> bool:

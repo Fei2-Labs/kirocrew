@@ -25,7 +25,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -217,6 +219,61 @@ class TestDrainPendingContext:
         ]
 
         assert chat_runner.drain_pending_context(slot) == ""
+
+    def test_frame_carries_silent_consumption_contract(self):
+        """Every drained block instructs the agent to consume it silently.
+
+        Regression for #4780: the feature-request seed (and any other
+        pending-context producer) was framed with a bare source label and no
+        consumption contract, so on a fresh session the agent recited the
+        injected workflow verbatim as its visible reply. The contract line
+        must sit INSIDE the frame (between the opening delimiter and the
+        content) so it binds per-block, for every producer, and must both
+        forbid echoing and redirect the reply to the user's visible message.
+        """
+        slot = _slot()
+        slot._pending_context = [
+            {"content": "WORKFLOW: greet the user", "source": "feature-request"},
+        ]
+
+        out = chat_runner.drain_pending_context(slot)
+
+        opening = out.index('[Background context from "feature-request"]')
+        contract = out.index(chat_runner._CONTEXT_FRAME_CONTRACT)
+        content = out.index("WORKFLOW: greet the user")
+        closing = out.index("[End of background context]")
+        assert opening < contract < content < closing
+        # The two load-bearing clauses, pinned as text so a rewording that
+        # drops either fails here rather than in production transcripts.
+        assert "never quote, echo" in chat_runner._CONTEXT_FRAME_CONTRACT
+        assert "user's visible message" in chat_runner._CONTEXT_FRAME_CONTRACT
+
+    def test_every_block_gets_its_own_contract_line(self):
+        """Multi-entry drains repeat the contract per frame — a single leading
+        notice would detach from later blocks when a consumer reorders or
+        truncates, so the contract is part of each frame, not a preamble."""
+        slot = _slot()
+        slot._pending_context = [
+            {"content": "first", "source": "a"},
+            {"content": "second", "source": "b"},
+        ]
+
+        out = chat_runner.drain_pending_context(slot)
+
+        assert out.count(chat_runner._CONTEXT_FRAME_CONTRACT) == 2
+
+    def test_empty_source_attributes_to_app(self):
+        """api_chat_slot_context always writes ``source`` — as "" when the
+        caller omitted it — so a dict-default alone never fires and the header
+        would read [Background context from ""]: an unattributed block under
+        the frame's "not authored by the user" claim."""
+        slot = _slot()
+        slot._pending_context = [{"content": "x", "source": ""}]
+
+        out = chat_runner.drain_pending_context(slot)
+
+        assert '[Background context from "app"]' in out
+        assert 'from ""' not in out
 
 
 # ── turn metric ───────────────────────────────────────────────────────────
@@ -858,6 +915,10 @@ class TestCrossSurfaceReply:
         state = _state(tmp_path)
         transport = AsyncMock()
         transport.capabilities.max_message_chars = 10
+        # Explicit 0: a MagicMock attribute is a child object, not a number,
+        # so chunk_for_transport cannot compare it. 0 = not byte-capped, which
+        # is the character path this test is about.
+        transport.capabilities.max_message_bytes = 0
         link = MagicMock(channel_id="123", thread_id=None, channel_type="telegram")
 
         with patch.object(chat_runner, "_resolve_mirror_target", return_value=(link, transport)):
@@ -870,6 +931,7 @@ class TestCrossSurfaceReply:
         state = _state(tmp_path)
         transport = AsyncMock()
         transport.capabilities.max_message_chars = 4096
+        transport.capabilities.max_message_bytes = 0
         transport.send_message.side_effect = RuntimeError("offline")
         link = MagicMock(channel_id="123", thread_id=None, channel_type="telegram")
 
@@ -1390,6 +1452,67 @@ class TestStartNextQueuedTurn:
         assert any("Session reset" in err for err in _errors(slot))
         assert slot._stopping is False
 
+    @pytest.mark.asyncio
+    async def test_a_held_note_lands_above_the_successors_own_row(self, tmp_path):
+        """A note held mid-turn must be written before the next turn's user row.
+
+        The note's context half drains inside that turn's ``_run_chat``, so
+        flushing after it started would put the visible line below the response
+        the note shaped. Only ``_finish_queue_cycle`` used to flush, and the main
+        dispatch path calls it AFTER this function.
+        """
+        state, slot = _state(tmp_path), _slot()
+        slot._deferred_notes.append({"content": "held", "cls": "reconcile-note"})
+        slot.queue_append("next please")
+        state.subagents = None
+
+        with patch.object(
+            chat_runner, "spawn_guarded_turn", return_value=MagicMock()
+        ), patch.object(chat_runner, "_run_chat", return_value=MagicMock()):
+            assert await chat_runner._start_next_queued_turn(state, slot) is True
+
+        roles = [m["role"] for m in slot.messages]
+        contents = [m["content"] for m in slot.messages]
+        assert "held" in contents
+        assert "user" in roles
+        assert contents.index("held") < roles.index("user")
+        assert slot._deferred_notes == []
+
+    @pytest.mark.asyncio
+    async def test_a_held_note_is_withheld_from_a_plans_next_stage(self, tmp_path):
+        """A plain user message queued during a plan must not release the note.
+
+        This is the flush that leaks FIRST. A queued user message carries no
+        ``kind``, so the origin-tag guard admits the flush -- and it runs ABOVE the
+        ``in_stage`` dequeue gate that then holds that message back. So the note
+        was released while no user turn started at all, and the next stage drained
+        its context half. ``_stage_loop``'s exit flush is the seam that owes it
+        delivery, so withholding delays rather than loses it.
+        """
+        state, slot = _state(tmp_path), _slot()
+        slot._deferred_notes.append({"content": "held", "cls": "reconcile-note"})
+        slot.queue_append("a plain user message")  # carries no `kind`
+        slot._in_stage_execution = True
+        state.subagents = None
+
+        assert await chat_runner._start_next_queued_turn(state, slot) is False
+
+        assert len(slot._queue) == 1, "fixture: the user message must be held back"
+        assert len(slot._deferred_notes) == 1, "the note was released into the next stage"
+        assert "held" not in [m["content"] for m in slot.messages]
+
+        # Control: the same fixture with the plan gate CLEAR does flush, so the
+        # assertion above measures the stage guard rather than the dequeue hold.
+        state2, slot2 = _state(tmp_path), _slot()
+        slot2._deferred_notes.append({"content": "held", "cls": "reconcile-note"})
+        slot2.queue_append("a plain user message")
+        state2.subagents = None
+        with patch.object(
+            chat_runner, "spawn_guarded_turn", return_value=MagicMock()
+        ), patch.object(chat_runner, "_run_chat", return_value=MagicMock()):
+            assert await chat_runner._start_next_queued_turn(state2, slot2) is True
+        assert slot2._deferred_notes == [], "control: the note should flush off-plan"
+
 
 class TestRunPendingSynthesis:
     @pytest.mark.asyncio
@@ -1448,11 +1571,96 @@ class TestRunPendingSynthesis:
         assert slot._pending_synthesis is False
         assert slot._synthesis_inflight is False
 
+    @pytest.mark.asyncio
+    async def test_synthesis_prompt_is_appended_as_an_inject_row(self, tmp_path):
+        """The prompt must reach the transcript as `inject`, never as user speech.
+
+        This site bypasses `_start_next_queued_turn` (it runs no queue entry),
+        which is the only other place a turn-dispatching path appends a row. It
+        previously appended nothing at all, so the prompt reached the
+        conversation log with no dashboard row and resurfaced attributed to the
+        USER on replay.
+        """
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = True
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+
+        async def _ok():
+            return None
+
+        # Observed INSIDE the dispatch, so the test can prove the row was already
+        # appended when the turn started. Asserting only on the final state cannot
+        # tell append-before-dispatch from append-after, and the ordering is the
+        # whole point: a turn that dies immediately must still leave the row.
+        seen: dict = {}
+
+        def _capture(_state, _slot, coro, *a, **kw):
+            seen["rows"] = len(_slot.messages)
+            coro.close()  # never awaited; avoids an un-awaited-coroutine warning
+            return asyncio.ensure_future(_ok())
+
+        with patch.object(chat_runner, "spawn_guarded_turn", side_effect=_capture), patch.object(
+            chat_runner, "_run_chat", return_value=MagicMock()
+        ) as run_chat:
+            await chat_runner._run_pending_synthesis(state, slot)
+
+        assert seen.get("rows") == 1, "the row must exist BEFORE the turn is dispatched"
+        rows = [m for m in slot.messages if m.get("content", "").startswith("[SYSTEM] Sub-agent")]
+        assert len(rows) == 1, "the synthesis prompt must appear exactly once"
+        row = rows[0]
+        assert row["role"] == "inject"
+        # Never the user-bubble class: that is what produced the reported defect.
+        assert row.get("cls") == "msg msg-inject"
+        # Durable provenance. `cls` is NOT persisted for role `inject`, so a render
+        # side keyed on cls-derived data mis-renders every restored row; `meta` is.
+        assert (row.get("meta") or {}).get("injectKind") == "synthesis"
+        # And the turn itself must declare it is runner-authored, rather than
+        # leaving a downstream marker-match to recover the same fact.
+        assert run_chat.call_args.kwargs.get("_synthetic_payload") is True
+
+    def test_inject_provenance_survives_the_persistence_boundary(self):
+        """`injectKind` must round-trip; the older `cls` channel does not.
+
+        This is the property the whole render decision now rests on. An inject
+        row's ``cls`` is persisted only for ``role == "system"``, so the
+        ``cronLabel`` the frontend reads (synthesized from ``cls`` at emit time)
+        silently disappears on the next rehydrate — which is exactly how a
+        carve-out keyed on it swallowed every restored cron notification. Assert
+        the durable channel directly rather than trusting the live shape.
+        """
+        from kiro_crew.dashboard.chat_persistence import _build_message_entry_uncached
+
+        cron_cls = json.dumps({"cronLabel": "nightly-audit"})
+        entry = _build_message_entry_uncached(
+            {
+                "role": "inject",
+                "content": '[Cron notification from "nightly-audit"]\nreport\n',
+                "cls": cron_cls,
+                "meta": {"injectKind": "cron", "cronLabel": "nightly-audit"},
+            }
+        )
+        # The negative half — proves the bug this replaces was real, and fails if
+        # someone "fixes" it by widening the cls gate instead.
+        assert "cls" not in entry, "cls is not persisted for an inject row"
+        assert entry["meta"]["injectKind"] == "cron"
+        assert entry["meta"]["cronLabel"] == "nightly-audit"
+
+        synth = _build_message_entry_uncached(
+            {
+                "role": "inject",
+                "content": "[SYSTEM] Sub-agent synthesis: go",
+                "cls": "msg msg-inject",
+                "meta": {"injectKind": "synthesis"},
+            }
+        )
+        assert synth["meta"]["injectKind"] == "synthesis"
+
 
 class TestFinishQueueCycle:
     @pytest.mark.asyncio
     async def test_eligible_synthesis_is_started_instead_of_going_idle(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot  # a live slot is registered
         slot._pending_synthesis = True
         state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
 
@@ -1464,6 +1672,106 @@ class TestFinishQueueCycle:
         assert not any(m.get("role") == "done" for m in slot.messages)
         if slot.task is not None:
             slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_held_note_is_withheld_from_an_automatic_synthesis_turn(self, tmp_path):
+        """A note is owed to the next USER turn, so synthesis must not drain it.
+
+        Synthesis is dispatched from this same function, so flushing here would
+        hand the held context to a turn the user never asked for. The user-turn
+        seams flush on their own, so withholding cannot lose the note.
+        """
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot  # a live slot is registered
+        slot._pending_synthesis = True
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+
+        with patch.object(
+            type(slot), "flush_deferred_notes", return_value=0
+        ) as flush, patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
+            chat_runner._finish_queue_cycle(state, slot)
+            await asyncio.sleep(0)
+
+        assert slot._synthesis_inflight is True
+        flush.assert_not_called()
+        if slot.task is not None:
+            slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_held_note_is_withheld_from_a_plans_next_stage(self, tmp_path):
+        """This function runs per stage, so a flush here feeds stage N+1.
+
+        Each stage of a plan is its own ``_run_chat``, and this is called from that
+        turn's ``finally`` while ``_in_stage_execution`` is still set -- so the note
+        reached the next stage instead of the next USER turn. Distinct from the
+        synthesis case above: here ``will_synthesize`` is False, which is exactly
+        why the old guard admitted the flush.
+        """
+        state, slot = _state(tmp_path), _slot()
+        state._slots[slot.key] = slot
+        slot._in_stage_execution = True
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+
+        with patch.object(type(slot), "flush_deferred_notes", return_value=0) as flush:
+            chat_runner._finish_queue_cycle(state, slot)
+            await asyncio.sleep(0)
+        flush.assert_not_called()
+        if slot.task is not None:
+            slot.task.cancel()
+
+        # Control: identical state with the plan gate clear DOES flush, so the
+        # assertion above cannot pass for some reason unrelated to the stage.
+        state2, slot2 = _state(tmp_path), _slot()
+        state2._slots[slot2.key] = slot2
+        state2.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+
+        with patch.object(type(slot2), "flush_deferred_notes", return_value=0) as flush2:
+            chat_runner._finish_queue_cycle(state2, slot2)
+            await asyncio.sleep(0)
+        flush2.assert_called_once()
+        if slot2.task is not None:
+            slot2.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_closing_slot_does_not_lose_its_held_note_to_synthesis(self, tmp_path):
+        """A slot already removed from the registry has no next USER turn.
+
+        The withhold above is scoped to WHICH successor drains the note, and it
+        assumes a successor exists. A slot gone from ``state._slots`` is being
+        torn down, so withholding there discards the note the POST acknowledged.
+        """
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=[]))
+        slot._pending_synthesis = True
+        slot._deferred_notes.append({"content": "held across the close", "cls": "reconcile-note"})
+        # The teardown already dropped it from the registry.
+        assert state._slots.get(slot.key) is None
+
+        with patch.object(chat_runner, "_run_pending_synthesis", new=AsyncMock()):
+            chat_runner._finish_queue_cycle(state, slot)
+            await asyncio.sleep(0)
+
+        assert slot._deferred_notes == [], "the held note was discarded on close"
+        assert any(
+            m.get("role") == "inject" and "held across the close" in m.get("content", "")
+            for m in slot.messages
+        )
+        if slot.task is not None:
+            slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_with_no_synthesis_still_flushes(self, tmp_path):
+        """The withhold is scoped to synthesis; every other cycle still flushes."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_synthesis = False
+
+        with patch.object(
+            type(slot), "flush_deferred_notes", return_value=0
+        ) as flush, patch.object(chat_runner, "maybe_refresh_title", new=AsyncMock()):
+            chat_runner._finish_queue_cycle(state, slot)
+            await asyncio.sleep(0)
+
+        flush.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_idle_cycle_emits_done_and_refreshes_the_sidebar(self, tmp_path):
@@ -2243,3 +2551,268 @@ class TestRunChatPlanGate:
         await _drive(state, slot)
 
         assert not slot._stage_titles
+
+
+def _bindings(*, kiro_agent, resolved_alias, requested_resolved):
+    """A minimal ResolvedBindings stand-in for the app-agent dispatch guard.
+
+    Only the fields ``_run_chat`` reads off the resolve result are populated;
+    ``model`` is a real ``str`` so ``normalize_agent_model`` stays happy.
+    """
+    return SimpleNamespace(
+        kiro_agent=kiro_agent,
+        resolved_alias=resolved_alias,
+        memory_store_name="default",
+        model="",
+        requested_resolved=requested_resolved,
+    )
+
+
+class TestAppAgentDispatchGuard:
+    """SELF-HEAL + FAIL-LOUD for an app-owned slot whose agent read cold.
+
+    An app's agents live only in ``~/.kiro/agents/<app>--<agent>.json`` and are
+    never in ``config.agents``; resolve_agent_bindings can honor them only via
+    the materialized-agent snapshot, which is cold on the event loop until the
+    off-loop boot/registration warm lands. A cold read silently falls back to
+    the default agent (``requested_resolved=False``).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cold_app_slot_self_heals_to_the_app_agent(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="hi"), _complete()])
+        slot = _slot()
+        slot._app = "myapp"
+        slot.agent = "my-app-agent"
+
+        cold = _bindings(
+            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
+        )
+        warm = _bindings(
+            kiro_agent="my-app-agent",
+            resolved_alias="my-app-agent",
+            requested_resolved=True,
+        )
+        refresh = MagicMock()
+        with patch.object(
+            chat_runner, "resolve_agent_bindings", side_effect=[cold, warm]
+        ) as resolve, patch.object(
+            chat_runner, "refresh_materialized_agents", refresh
+        ), patch.object(
+            chat_runner, "subprocess_executor", MagicMock(return_value=None)
+        ), patch.object(
+            chat_runner, "warm_project_agent_names", new=AsyncMock()
+        ):
+            await _drive(state, slot)
+
+        # Warmed the snapshot off the loop and re-resolved exactly once.
+        refresh.assert_called_once()
+        assert resolve.call_count == 2
+        # The healed agent — not the default — was dispatched, and no error card.
+        state.sessions.get_or_create.assert_awaited()
+        assert state.sessions.get_or_create.await_args.kwargs["agent"] == "my-app-agent"
+        assert _errors(slot) == []
+
+    @pytest.mark.asyncio
+    async def test_app_slot_recovers_from_source_after_rescan_miss(self, tmp_path):
+        # The snapshot RESCAN misses (spec never materialized though source is
+        # intact), so the self-heal escalates: re-register this app's agents FROM
+        # SOURCE (refresh_app_agents) then re-resolve — which now succeeds.
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="hi"), _complete()])
+        slot = _slot()
+        slot._app = "myapp"
+        slot.agent = "my-app-agent"
+
+        cold = _bindings(
+            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
+        )
+        warm = _bindings(
+            kiro_agent="my-app-agent",
+            resolved_alias="my-app-agent",
+            requested_resolved=True,
+        )
+        refresh = MagicMock()
+        reregister = MagicMock(return_value=["my-app-agent"])
+        with patch.object(
+            chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, warm]
+        ) as resolve, patch.object(
+            chat_runner, "refresh_materialized_agents", refresh
+        ), patch(
+            "kiro_crew.apps.bridges.register_app", reregister
+        ), patch(
+            "kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)
+        ), patch.object(
+            chat_runner, "subprocess_executor", MagicMock(return_value=None)
+        ), patch.object(
+            chat_runner, "warm_project_agent_names", new=AsyncMock()
+        ):
+            await _drive(state, slot)
+
+        # Rescan missed, so the from-source re-registration ran for THIS app,
+        # and the resolver was consulted a third time.
+        refresh.assert_called_once()
+        reregister.assert_called_once_with("myapp")
+        assert resolve.call_count == 3
+        # The healed agent — not the default — was dispatched, and no error card.
+        state.sessions.get_or_create.assert_awaited()
+        assert state.sessions.get_or_create.await_args.kwargs["agent"] == "my-app-agent"
+        assert _errors(slot) == []
+
+    @pytest.mark.asyncio
+    async def test_still_cold_app_slot_fails_loud_and_never_runs_default(self, tmp_path):
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._app = "myapp"
+        slot.agent = "my-app-agent"
+
+        cold = _bindings(
+            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
+        )
+        refresh = MagicMock()
+        reregister = MagicMock(return_value=[])
+        with patch.object(
+            chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]
+        ) as resolve, patch.object(
+            chat_runner, "refresh_materialized_agents", refresh
+        ), patch(
+            "kiro_crew.apps.bridges.register_app", reregister
+        ), patch(
+            "kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)
+        ), patch.object(
+            chat_runner, "subprocess_executor", MagicMock(return_value=None)
+        ), patch.object(
+            chat_runner, "warm_project_agent_names", new=AsyncMock()
+        ):
+            await _drive(state, slot)
+
+        # Self-heal was fully attempted (rescan + re-register-from-source + three
+        # re-resolves) but the agent stayed cold.
+        refresh.assert_called_once()
+        reregister.assert_called_once_with("myapp")
+        assert resolve.call_count == 3
+        # Fail-loud: the default agent is NEVER dispatched...
+        state.sessions.get_or_create.assert_not_awaited()
+        # ...and a clear card names the requested agent.
+        errors = _errors(slot)
+        assert any("my-app-agent" in e and "isn't loaded yet" in e for e in errors)
+
+    @pytest.mark.asyncio
+    async def test_disabled_app_slot_skips_source_recovery_and_fails_loud(self, tmp_path):
+        # A DISABLED app whose slot still gets a turn must NOT have its
+        # deregistered agent re-materialized: the from-source recovery is gated on
+        # is_app_enabled (under the app lifecycle lock), so refresh_app_agents is
+        # never called and the turn fails loud instead of reactivating a disabled
+        # app's agent.
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._app = "myapp"
+        slot.agent = "my-app-agent"
+
+        cold = _bindings(
+            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
+        )
+        reregister = MagicMock(return_value=["my-app-agent"])
+        with patch.object(
+            chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]
+        ), patch.object(
+            chat_runner, "refresh_materialized_agents", MagicMock()
+        ), patch(
+            "kiro_crew.apps.bridges.register_app", reregister
+        ), patch(
+            "kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=False)
+        ), patch.object(
+            chat_runner, "subprocess_executor", MagicMock(return_value=None)
+        ), patch.object(
+            chat_runner, "warm_project_agent_names", new=AsyncMock()
+        ):
+            await _drive(state, slot)
+
+        # Disabled -> recovery skipped: refresh_app_agents never ran...
+        reregister.assert_not_called()
+        # ...the default agent was NOT dispatched, and the turn failed loud.
+        state.sessions.get_or_create.assert_not_awaited()
+        errors = _errors(slot)
+        assert any("my-app-agent" in e and "isn't loaded yet" in e for e in errors)
+
+    @pytest.mark.asyncio
+    async def test_recovery_awaits_register_before_releasing_lock_on_cancel(self, tmp_path):
+        # register_app runs in a non-cancellable executor thread. If the recovery
+        # coroutine is cancelled mid-registration it must WAIT for that thread to
+        # finish before the lifecycle lock releases — otherwise a concurrent
+        # disable could deregister and the still-running thread republish a
+        # now-disabled agent. Prove the cancelled task stays blocked until
+        # register_app completes.
+        import kiro_crew.dashboard.chat_runner as cr
+
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def slow_register(_name):
+            started.set()
+            release.wait(5)
+            finished.set()
+
+        slot = _slot()
+        slot._app = "myapp"
+        slot.agent = "my-app-agent"
+        warm = _bindings(
+            kiro_agent="my-app-agent",
+            resolved_alias="my-app-agent",
+            requested_resolved=True,
+        )
+        with patch.object(cr, "resolve_agent_bindings", return_value=warm), patch.object(
+            cr, "subprocess_executor", MagicMock(return_value=None)
+        ), patch(
+            "kiro_crew.apps.manager.is_app_enabled", MagicMock(return_value=True)
+        ), patch(
+            "kiro_crew.apps.bridges.register_app", slow_register
+        ):
+            task = asyncio.create_task(
+                cr._recover_app_agent_binding(MagicMock(), slot, project=None)
+            )
+            await asyncio.to_thread(started.wait, 5)  # register_app is now running
+            task.cancel()
+            # Shielded: the cancelled task must NOT complete while register_app is
+            # still running — it is blocked awaiting the executor future.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(task), 0.2)
+            release.set()  # let register_app finish
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert finished.is_set()  # register_app ran to completion before propagating
+
+    @pytest.mark.asyncio
+    async def test_eager_spawn_bails_for_unresolved_app_slot(self, tmp_path):
+        # An app slot that stays cold after the eager self-heal must NOT register
+        # a speculative session: resolve_agent_bindings returns the DEFAULT agent
+        # on a cold miss, so a registered session would bind the wrong agent and
+        # the first real turn would reuse it, bypassing the _run_chat fail-loud
+        # guard. The eager path bails and leaves it to the first real turn.
+        state, slot = _state(tmp_path), _slot()
+        slot._app = "myapp"
+        slot.agent = "my-app-agent"
+        state.get_slot = MagicMock(return_value=slot)
+        # Never reached when the bail is present; set so a REMOVED bail would fail
+        # on the assertion below (get_or_create awaited) rather than on unpacking.
+        state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
+        cold = _bindings(
+            kiro_agent="kirocrew", resolved_alias="default", requested_resolved=False
+        )
+        with patch.object(chat_runner.asyncio, "sleep", new=AsyncMock()), patch.object(
+            chat_runner, "_consume_pending_reset", new=AsyncMock()
+        ), patch.object(
+            chat_runner, "resolve_agent_bindings", side_effect=[cold, cold, cold]
+        ), patch.object(
+            chat_runner, "refresh_materialized_agents", MagicMock()
+        ), patch(
+            "kiro_crew.apps.bridges.register_app", MagicMock(return_value=[])
+        ), patch.object(
+            chat_runner, "subprocess_executor", MagicMock(return_value=None)
+        ):
+            await chat_runner._eager_spawn(state, slot)
+
+        state.sessions.get_or_create.assert_not_awaited()

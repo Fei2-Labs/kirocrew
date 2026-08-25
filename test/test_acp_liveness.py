@@ -8,17 +8,26 @@ the /proc evidence paths against a fake proc tree — no real processes.
 
 from __future__ import annotations
 
+import asyncio
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
+from conftest import requires_symlinks
+from kiro_crew.acp import liveness
 from kiro_crew.acp.liveness import (
     CHILD_EXIT_GRACE_SECS,
     EVIDENCE_ESTABLISHED_FLAT,
+    EVIDENCE_SHELL_CHILD_ABSENT,
     VERDICT_DEAD,
     VERDICT_STUCK_INPUT,
     VERDICT_UNKNOWN,
     VERDICT_WORKING,
     LivenessOracle,
     ToolCallState,
+    consult_offloaded,
 )
 
 
@@ -55,9 +64,9 @@ class FakeProc:
         wchan: str = "",
         starttime: float = 10_000_000.0,
     ) -> None:
-        # Default starttime is huge (in ticks) so process_age_secs computes a
-        # negative age → "started after dispatch" → the pre-existing-lookalike
-        # start-time guard accepts the match regardless of the host's HZ.
+        # Default starttime is huge (in ticks) so its boot-clock start lands far
+        # after any dispatch stamp these tests use → "started after dispatch" →
+        # the pre-existing-lookalike guard accepts the match on any host HZ.
         d = self.root / str(pid)
         (d / "task" / str(pid)).mkdir(parents=True, exist_ok=True)
         kids = " ".join(str(c) for c in (children or []))
@@ -120,7 +129,20 @@ def _oracle(fake: FakeProc, clock: _Clock, sample_min: float = 3.0) -> LivenessO
 
 
 def _shell_tool(command: str, clock: _Clock) -> ToolCallState:
-    return ToolCallState(title="bash", command=command, dispatch_ts=clock.t, is_shell=True)
+    """A shell ToolCallState dispatched now.
+
+    ``dispatch_boot_ts`` is the boot-clock stamp production takes at
+    EVENT_TOOL_CALL; the fake tree has no suspend, so it coincides with the fake
+    monotonic clock. ``FakeProc.add_pid``'s huge default starttime therefore reads
+    as started-after-dispatch on any host HZ, and ``starttime=0`` reads as older.
+    """
+    return ToolCallState(
+        title="bash",
+        command=command,
+        dispatch_ts=clock.t,
+        dispatch_boot_ts=clock.t,
+        is_shell=True,
+    )
 
 
 def test_matched_live_shell_child_is_working(tmp_path):
@@ -181,6 +203,357 @@ def test_no_matching_child_is_unknown(tmp_path):
     verdict, evidence = oracle.check_tool(100, tool)
     assert verdict == VERDICT_UNKNOWN
     assert "no matching" in evidence
+
+
+# ── The never-matched fork: absent child vs unrecognized live child (#4840) ──
+
+# Dating a process against its dispatch needs the platform tick rate, which does
+# not exist off Linux (Windows has no os.sysconf, and no /proc for the oracle to
+# read either). There the attribution fails open, so these start-time cases have
+# nothing to assert; the fail-open itself is pinned by
+# ``test_no_tick_rate_fails_open_instead_of_claiming_absence``, which runs
+# everywhere.
+_needs_tick_rate = pytest.mark.skipif(
+    not hasattr(os, "sysconf"),
+    reason="start-time attribution needs SC_CLK_TCK (Linux); fail-open covered separately",
+)
+
+
+def _hz() -> int:
+    return os.sysconf("SC_CLK_TCK")
+
+
+def _old_pid(fake: FakeProc, pid: int, **kw) -> None:
+    """A descendant that started LONG before any tool dispatch.
+
+    ``FakeProc.add_pid`` defaults to a huge starttime so a process reads as
+    "started after dispatch" on any host HZ; these tests need the opposite, so
+    the starttime is 0 ticks, i.e. boot second 0.
+    """
+    fake.add_pid(pid, starttime=0.0, **kw)
+
+
+def test_no_tick_rate_fails_open_instead_of_claiming_absence(tmp_path, monkeypatch):
+    """Off Linux the attribution is unavailable, and that must read as unknown.
+
+    ``os.sysconf`` does not exist on Windows (AttributeError, not OSError), which
+    once escaped as far as ``check_tool``'s catch-all and turned every shell
+    verdict into "oracle error". With the tick rate unreadable every descendant
+    reads as possibly-this-tool's, so the absence tag cannot fire -- the same
+    fail-open direction as a missing boot stamp.
+    """
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    monkeypatch.setattr(liveness, "process_start_boot_secs", lambda _ticks: None)
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("ls /some/dir | grep needle | wc -l", clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence == "no matching shell child", evidence
+
+
+def test_tick_rate_lookup_survives_a_platform_without_sysconf(monkeypatch):
+    """The helper answers None rather than raising where os.sysconf is absent."""
+    monkeypatch.delattr(os, "sysconf", raising=False)
+
+    assert liveness.process_start_boot_secs(12345.0) is None
+
+
+@_needs_tick_rate
+def test_absent_shell_child_is_tagged_when_every_descendant_predates_dispatch(tmp_path):
+    """#4840: the sub-second command whose result frame was lost.
+
+    The oracle's first look happens at check_after_secs, by which time an ``ls |
+    grep | wc`` child is long gone — it is never observed alive, so the
+    matched-then-gone DEAD branch cannot fire. The runtime's tree still holds its
+    long-lived MCP stub children, all of them older than the dispatch, which is
+    positive evidence that nothing was started for this tool.
+    """
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201, 202], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    _old_pid(fake, 202, cmdline="python -m kiro_crew.mcp_gateway.stub --server slack")
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("ls /some/dir | grep needle | wc -l", clock)
+    clock.advance(61.0)  # first look lands after the tool-idle threshold
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN  # inferred absence is never a kill
+    assert evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT), evidence
+
+
+def test_unmatched_but_young_descendant_keeps_the_full_window(tmp_path):
+    """The match heuristic missing live work must NOT read as absence.
+
+    A shell command that exec'd away (or whose cached input was redacted past
+    any usable fragment) leaves a descendant started after the dispatch. That is
+    the case build-scale forbearance exists for, so it keeps the plain evidence.
+    """
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201, 300], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    fake.add_pid(300, cmdline="/opt/vendor/bin/opaque-worker --serve")  # young
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("[REDACTED-CREDENTIAL] x", clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert not evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT), evidence
+
+
+def test_readable_but_empty_tree_is_an_absent_child(tmp_path):
+    """A runtime with no MCP servers has no descendants at all, and its child
+    list still reads (as empty) — which IS evidence: nothing is running, so the
+    tag must fire rather than falling back to the full window."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, cmdline="kiro-cli acp")
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("ls /some/dir | grep needle | wc -l", clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT), evidence
+
+
+def test_unreadable_child_list_keeps_the_full_window(tmp_path):
+    """An unobservable tree is not an absent child.
+
+    Without a readable ``/proc/<pid>/task/<tid>/children`` (no procfs, a kernel
+    without CONFIG_PROC_CHILDREN, a sandbox that hides the subtree) the walk
+    returns the runtime alone — the same shape as a genuinely empty tree, so
+    absence must not be claimed from it.
+    """
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, cmdline="kiro-cli acp")
+    (fake.root / "100" / "task" / "100" / "children").unlink()
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("ls /some/dir | grep needle | wc -l", clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert not evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT), evidence
+
+
+def test_every_production_dispatch_answers_both_attribution_fields():
+    """Drift ratchet: both attribution inputs fail OPEN when omitted.
+
+    Without ``dispatch_boot_ts`` a never-matched shell tool silently returns to
+    the full build window; without ``dispatch_parked_secs`` a frame queued behind
+    an approval disowns its own live child. Neither shows up as a test failure
+    anywhere else, so every production ``ToolCallState`` construction must answer
+    both explicitly -- including with a 0.0 that says "this path cannot park".
+    """
+    import ast
+
+    import kiro_crew.acp.liveness as liveness_mod
+
+    required = {"dispatch_boot_ts", "dispatch_parked_secs"}
+    package_root = Path(liveness_mod.__file__).resolve().parents[1]
+    sites: list[tuple[str, int, set[str]]] = []
+    for path in package_root.rglob("*.py"):
+        if "/tests/" in path.as_posix():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "ToolCallState(" not in text:
+            continue
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "ToolCallState":
+                passed = {kw.arg for kw in node.keywords if kw.arg}
+                sites.append((path.name, node.lineno, required - passed))
+
+    assert sites, "no production ToolCallState construction found - the ratchet has gone blind"
+    missing = [(name, line, sorted(gap)) for name, line, gap in sites if gap]
+    assert not missing, f"dispatch sites not answering an attribution field: {missing}"
+
+
+def test_missing_boot_stamp_keeps_the_full_window(tmp_path):
+    """No boot-clock stamp, no absence claim.
+
+    ``boottime_now()`` answers None where the clock is unavailable, so every
+    descendant reads as possibly-this-tool's and the window is untouched.
+    """
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    oracle = _oracle(fake, clock)
+    tool = ToolCallState(
+        title="bash",
+        command="ls /some/dir | grep needle | wc -l",
+        dispatch_ts=clock.t,
+        dispatch_boot_ts=None,
+        is_shell=True,
+    )
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert not evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT), evidence
+
+
+@_needs_tick_rate
+def test_a_suspend_after_dispatch_does_not_disown_a_live_child(tmp_path):
+    """Regression: a host suspend must not age a live child out of its dispatch.
+
+    ``/proc`` dates processes on the boot clock, which counts suspended time;
+    ``time.monotonic()`` does not. Deriving the start as ``monotonic_now - age``
+    therefore placed a child a full suspend EARLIER than it started, so a laptop
+    resumed mid-command saw its live child rejected as a pre-existing lookalike
+    AND counted as "nothing started since dispatch" -- the absent-child narrowing
+    would then cancel a running command. Both sides now read the boot clock, so
+    the suspend moves neither.
+
+    Here: dispatched at boot 5000, child spawned at boot 5001, then the host
+    suspends 300s (uptime jumps to 5301 while the monotonic clock does not move).
+    """
+    hz = _hz()
+    clock = _Clock()  # monotonic: unmoved by the suspend
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201, 300], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    fake.add_pid(300, cmdline="bash -c long-build release", starttime=5001.0 * hz)
+    (fake.root / "uptime").write_text("5301.00 9000.00\n")  # boot clock after resume
+    oracle = _oracle(fake, clock)
+    tool = ToolCallState(
+        title="bash",
+        command="long-build release",
+        dispatch_ts=clock.t,
+        dispatch_boot_ts=5000.0,
+        is_shell=True,
+    )
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_WORKING, evidence
+    assert "300" in evidence
+
+
+@_needs_tick_rate
+def test_zombie_only_tree_is_absent_not_live(tmp_path):
+    """A zombie is the exited child, not a running one.
+
+    The reaped-but-not-yet-collected shell child must not buy the full window
+    back: zombies are skipped, so the tree reads as having no live descendant
+    started since dispatch.
+    """
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201, 300], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    fake.add_pid(300, state="Z", cmdline="bash -c ls /some/dir | grep needle | wc -l")
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("ls /some/dir | grep needle | wc -l", clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT), evidence
+
+
+def test_live_matched_child_still_wins_over_the_absence_test(tmp_path):
+    """The absence pass must not disturb the WORKING path: a matched live child
+    is still WORKING even though its older siblings fill the tree."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201, 300], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    fake.add_pid(300, cmdline="bash -c long-build release > build.log 2>&1")
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("long-build release > build.log 2>&1", clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_WORKING
+    assert "300" in evidence
+
+
+@_needs_tick_rate
+def test_a_stamp_taken_late_still_owns_its_child(tmp_path):
+    """Regression: a frame queued behind an approval must not disown its child.
+
+    The stamp is taken when the tool_call frame is PROCESSED. While the dispatch
+    loop is parked on a consumer-side await (an approval, an IM send, a hook) the
+    runtime can already have spawned, so the child predates its own stamp -- and
+    an UNMATCHABLE one (a command redacted past any usable fragment, or a shell
+    that exec'd away) would then be counted as "nothing started since dispatch".
+    The loop measures that park, so the attribution window opens by exactly it.
+
+    Here: 150s of banked parking, child spawned at boot 4900, stamp taken at
+    5000 -- 100s "before" its own dispatch, inside the 10s + 150s window.
+    """
+    hz = _hz()
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201, 300], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    fake.add_pid(300, cmdline="/opt/vendor/bin/opaque-worker", starttime=4900.0 * hz)
+    oracle = _oracle(fake, clock)
+    tool = ToolCallState(
+        title="bash",
+        command="[REDACTED-CREDENTIAL] x",  # nothing matchable survives
+        dispatch_ts=clock.t,
+        dispatch_boot_ts=5000.0,
+        dispatch_parked_secs=150.0,
+        is_shell=True,
+    )
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert not evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT), evidence
+
+
+@_needs_tick_rate
+def test_matching_but_older_child_vetoes_the_absence_claim(tmp_path):
+    """A live process that looks like the command is not evidence of absence.
+
+    The dispatch stamp is taken when the tool_call frame is PROCESSED, and the
+    dispatch loop's consumer can park for minutes on an approval, an IM send or
+    a hook while kiro-cli has already spawned. Such a child predates its own
+    stamp, so it is still refused as a match (it may equally be a coincidental
+    lookalike) -- but it must keep the full window rather than being reported as
+    nothing-is-running.
+    """
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[201, 300], cmdline="kiro-cli acp")
+    _old_pid(fake, 201, cmdline="python -m kiro_crew.mcp_gateway.stub --server github")
+    _old_pid(fake, 300, cmdline="bash -c long-build release > build.log 2>&1")
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("long-build release > build.log 2>&1", clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert not evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT), evidence
+
+
+@_needs_tick_rate
+def test_pre_existing_lookalike_is_still_rejected_as_a_match(tmp_path):
+    """Start-time attribution moved into a helper — the lookalike guard it came
+    from must keep rejecting a matching process that predates the dispatch."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    _old_pid(fake, 100, children=[200], cmdline="kiro-cli acp")
+    _old_pid(fake, 200, cmdline="bash -c long-build release > build.log 2>&1")
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool("long-build release > build.log 2>&1", clock)
+
+    verdict, _ = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN  # matching cmdline, but it predates us
 
 
 def test_stuck_input_detected_on_flat_tty_blocked_child(tmp_path):
@@ -254,6 +627,7 @@ def test_mcp_tool_moving_counters_working(tmp_path):
     assert verdict == VERDICT_WORKING
 
 
+@requires_symlinks
 def test_mcp_tool_flat_with_runtime_backend_socket_is_tagged_established_flat(tmp_path):
     """A genuinely flat tool subtree whose RUNTIME process holds an established
     backend socket is the LLM-turn-inside-a-tool shape (e.g. use_subagent
@@ -281,6 +655,7 @@ def test_mcp_tool_flat_with_runtime_backend_socket_is_tagged_established_flat(tm
     assert evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
 
 
+@requires_symlinks
 def test_mcp_tool_flat_ordinary_tool_with_runtime_socket_not_tagged(tmp_path):
     """F1 regression: a quiet ordinary MCP tool (no model-wrapping tool_name)
     running while the runtime holds a persistent ESTABLISHED socket must NOT
@@ -314,6 +689,7 @@ def test_mcp_tool_flat_ordinary_tool_with_runtime_socket_not_tagged(tmp_path):
     assert "mcp subtree flat" in evidence
 
 
+@requires_symlinks
 def test_mcp_tool_flat_without_runtime_socket_keeps_plain_evidence(tmp_path):
     """A quiet MCP tool with no established socket on the runtime process keeps
     the untagged flat evidence — the full build-scale tool windows apply. Also
@@ -340,6 +716,7 @@ def test_mcp_tool_flat_without_runtime_socket_keeps_plain_evidence(tmp_path):
     assert "mcp subtree flat" in evidence
 
 
+@requires_symlinks
 def test_mcp_tool_baseline_sample_never_tagged(tmp_path):
     """The first (baseline) tick reports "sampling" — no real flatness delta
     exists yet, so the established_flat tag must not fire even with a live
@@ -388,6 +765,7 @@ def test_model_wait_flat_no_socket_is_dead(tmp_path):
     assert "no established backend socket" in evidence
 
 
+@requires_symlinks
 def test_model_wait_flat_with_established_socket_is_unknown_tagged(tmp_path):
     """Flat counters but an established backend connection → probably a
     non-streamed server-side think → UNKNOWN with the established_flat tag
@@ -442,3 +820,114 @@ def test_helpers_never_raise_on_garbage(tmp_path):
 
     verdict, _ = oracle.check_tool(100, tool)
     assert verdict in (VERDICT_UNKNOWN, VERDICT_WORKING)
+
+
+# ── Shared offloaded-consult guard ──
+#
+# consult_offloaded is the single copy of the guard sequence AcpClient and
+# AcpSessionHandle both delegate to. The call-site behaviors (retirement at
+# boundaries, oracle generation swaps) stay pinned by test_acp_client.py and
+# test_acp_stale_recovery.py; these tests pin the helper's own contract so a
+# regression in it is attributed to the shared code, not to one caller.
+
+
+class _Holder:
+    """Minimal ConsultFutureHolder: just the tracked-future slot."""
+
+    def __init__(self) -> None:
+        self._consult_future: asyncio.Future[tuple[str, str]] | None = None
+
+
+@pytest.mark.asyncio
+async def test_consult_offloaded_refused_submission_reads_unknown():
+    """A refused executor job degrades to UNKNOWN — it never raises.
+
+    The callers are silent-read polls and watchdog ticks: an executor shut
+    down during teardown (or refusing thread creation under load) must read as
+    an inconclusive probe, not abort the live turn with a RuntimeError.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    pool.shutdown(wait=True)
+    holder = _Holder()
+
+    verdict = await consult_offloaded(
+        holder,
+        lambda: (VERDICT_WORKING, "never runs"),
+        (),
+        executor_factory=lambda: pool,
+    )
+
+    assert verdict == (VERDICT_UNKNOWN, "oracle offload error")
+    # The failed submission left no tracked future behind to wedge the next
+    # poll on "prior consult still in flight".
+    assert holder._consult_future is None
+
+
+@pytest.mark.asyncio
+async def test_consult_offloaded_skips_while_prior_walk_is_in_flight():
+    """An unfinished prior walk answers UNKNOWN without submitting again."""
+    holder = _Holder()
+    prior = asyncio.get_running_loop().create_future()
+    holder._consult_future = prior
+
+    verdict = await consult_offloaded(
+        holder,
+        lambda: (VERDICT_WORKING, "must not be submitted"),
+        (),
+        executor_factory=lambda: pytest.fail("submitted despite in-flight prior"),
+    )
+
+    assert verdict == (VERDICT_UNKNOWN, "prior consult still in flight")
+    # The in-flight prior stays tracked; the guard did not replace it.
+    assert holder._consult_future is prior
+    prior.cancel()
+
+
+@pytest.mark.asyncio
+async def test_consult_offloaded_tracks_and_returns_the_walk_result():
+    """The happy path stores the submitted future and returns its verdict."""
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        holder = _Holder()
+
+        verdict = await consult_offloaded(
+            holder,
+            lambda pid: (VERDICT_WORKING, f"pid {pid} moving"),
+            (42,),
+            executor_factory=lambda: pool,
+        )
+
+        assert verdict == (VERDICT_WORKING, "pid 42 moving")
+        assert holder._consult_future is not None
+        assert holder._consult_future.done()
+    finally:
+        pool.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_consult_offloaded_consumes_a_failed_priors_exception():
+    """A done-with-exception prior is consumed, then a fresh walk submitted.
+
+    A prior that completed after a ``wait_for`` timeout detached its awaiter
+    would otherwise report through ``Future.__del__`` as an unhandled-asyncio
+    crash for what is an ordinary probe failure.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        holder = _Holder()
+        prior: asyncio.Future[tuple[str, str]] = asyncio.get_running_loop().create_future()
+        prior.set_exception(RuntimeError("walk failed after awaiter left"))
+        holder._consult_future = prior
+
+        verdict = await consult_offloaded(
+            holder,
+            lambda: (VERDICT_WORKING, "fresh walk"),
+            (),
+            executor_factory=lambda: pool,
+        )
+
+        assert verdict == (VERDICT_WORKING, "fresh walk")
+        # exception() retrieved without raising == consumed.
+        assert prior.exception() is not None
+    finally:
+        pool.shutdown(wait=True)

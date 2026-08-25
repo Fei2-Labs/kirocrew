@@ -44,8 +44,12 @@ Each session can operate in one of three memory modes:
 | **Incognito** | ✅ | ❌ | ❌ | Sensitive tasks — reads context but blocks learn_add and consolidation |
 | **Temporary** | ❌ | ❌ | ❌ | Isolated experiments — no memory interaction at all |
 
-Set via the dashboard Welcome view (ghost button), Slack (`!incognito` or
-`!temporary` prefix), or the mode icon in the chat header.
+Set via the dashboard Welcome view (ghost button), the mode icon in the chat
+header, Slack (`!incognito` / `!temporary` prefix), or Telegram (`/incognito` /
+`/temporary`). Telegram spells them as commands because it has a command grammar;
+the modes, the guarantees and the durability are the same on both channels, and
+both accept a question after the modifier to mark the conversation and answer in
+one message.
 
 All modes still write session JSONL files (for history/resume). Incognito
 blocks learn_add and consolidation. Temporary additionally blocks memory
@@ -93,8 +97,22 @@ Kiro Crew automatically consolidates conversations into memory:
 
 No manual action needed — it happens in the background.
 
+## Reading Memory Programmatically
+
+The markdown layer is readable through the CLI, so consumers depend on an
+interface rather than the on-disk layout:
+
+- `kirocrew memory show [preferences|projects|history]` — print the markdown
+  layer (all three when no target is given). `--format json` returns structured
+  entries with `path`, `updated_at`, and `content`; `--since YYYY-MM-DD` limits
+  history to days on or after that date.
+- `kirocrew memory export --include-markdown` — add a `markdown` collection to
+  the JSON export. Without the flag the export shape is unchanged.
+
+Both run non-interactively (no TTY or editor needed), so they work from
+scheduled jobs.
+
 ## Editing Memory
 
 - **Dashboard**: Overview → Memory tab → edit preferences.md or projects.md
-- **CLI**: `kirocrew memory show` / `kirocrew memory edit`
 - **Chat**: ask Kiro Crew to update its memory files directly

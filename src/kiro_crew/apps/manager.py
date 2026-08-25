@@ -9,7 +9,6 @@ registration (agents, skills, crons) to bridge functions.
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import json
 import logging
@@ -37,6 +36,7 @@ from kiro_crew.config.loader import (
     config_path,
     write_config_atomically,
 )
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform import current_context, safe_context_call
 from kiro_crew.sel import sel
 
@@ -273,10 +273,23 @@ def _validate_source_path(source: Path) -> list[str]:
         return errors
     try:
         manifest = AppManifest.from_json_file(manifest_path)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         errors.append(f"invalid {APP_MANIFEST_FILENAME}: {exc}")
         return errors
     errors.extend(manifest.validate(app_root=source))
+    # `ui.overlays` replaces a host surface by naming an overlay component compiled
+    # into the dashboard bundle. An installed app has no way to supply one -- there is
+    # no per-overlay `entryPoint` the way `ui.pages` has -- so accepting the manifest
+    # here would install an app whose declaration can only fail later as a browser
+    # console warning, the one channel an app author never reads. Refuse at install,
+    # which is the channel they do read. Builtins are validated by discovery.py and
+    # are unaffected.
+    if manifest.ui.overlays:
+        errors.append(
+            "ui.overlays is not available to installed apps: an overlay must name a "
+            "component compiled into the dashboard bundle, so a declaration here can "
+            "never render"
+        )
     if manifest.minKiroCrewVersion:
         ver_err = _check_min_version(manifest.minKiroCrewVersion)
         if ver_err:
@@ -395,17 +408,17 @@ def _copy_app_tree(source: Path, dest: Path) -> None:
 # otherwise race the installed-check against the copy — and update/uninstall
 # use shared move-aside names (``.{name}-data-tmp``), so an interleaving can
 # destroy preserved user data.  Different apps proceed in parallel.
-_LIFECYCLE_LOCKS: dict[str, "asyncio.Lock"] = {}
+_LIFECYCLE_LOCKS: dict[str, LoopBoundLock] = {}
 
 
-def app_lifecycle_lock(name: str) -> "asyncio.Lock":
-    """Return the per-app asyncio lock guarding install/update/uninstall.
+def app_lifecycle_lock(name: str) -> LoopBoundLock:
+    """Return the per-app lock guarding install/update/uninstall (loop-bound, #4800).
 
     Must be called from (and the lock used on) the event loop thread; the
     guarded blocking work itself runs off-loop via executor/``to_thread``.
     """
     if name not in _LIFECYCLE_LOCKS:
-        _LIFECYCLE_LOCKS[name] = asyncio.Lock()
+        _LIFECYCLE_LOCKS[name] = LoopBoundLock()
     return _LIFECYCLE_LOCKS[name]
 
 
@@ -1610,7 +1623,16 @@ def register_external_app(
 # both the hardcoded list and the file-based manifests read it from here, so a
 # builtin cannot become default-on in one registration path while the other
 # path's test still forbids it.
-_DEFAULT_ON_BUILTINS: frozenset[str] = frozenset({"projects"})  # Task Runner
+_DEFAULT_ON_BUILTINS: frozenset[str] = frozenset(
+    {
+        "projects",  # Task Runner
+        # Command Bar replaces the quick-search (Cmd+K) surface rather than adding
+        # a sidebar entry, so shipping it off leaves the gesture on the legacy
+        # palette and the launcher unseen. Disabling the app is what restores the
+        # old surface, which is the opt-out this exemption trades for.
+        "command-bar",
+    }
+)
 
 # EMPTY, and that is a finished migration rather than an oversight. Every builtin now
 # ships as a file-based manifest under ``builtins/<dir>/app.json`` and is picked up by

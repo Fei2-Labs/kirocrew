@@ -146,7 +146,7 @@ def _registration_source(app_name: str) -> tuple[AppManifest | None, Path]:
                 AppManifest.from_json_file(shipped_root / "app.json"),
                 shipped_root,
             )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             logger.warning(
                 "App %s: shipped resource manifest is unreadable: %s",
                 app_name,
@@ -896,10 +896,19 @@ def _register_agents(app_name: str, manifest: AppManifest, app_root: Path) -> li
         # Read agent JSON to get the agent name
         try:
             agent_data = json.loads(agent_path.read_text(encoding="utf-8"))
-            agent_name = agent_data.get("name", agent_path.stem)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("App %s: unreadable agent %s: %s", app_name, agent_path, exc)
             continue
+        if not isinstance(agent_data, dict):
+            # Valid JSON that is not an object (a list, a scalar, null) parses
+            # fine, but every `.get` below would raise. Same disposition as the
+            # unreadable case: skip this agent rather than register a config
+            # the spec never described.
+            logger.warning(
+                "App %s: agent spec %s is not a JSON object; skipping", app_name, agent_path
+            )
+            continue
+        agent_name = agent_data.get("name", agent_path.stem)
 
         # The agent name is app-controlled (read from the agent JSON) and is
         # about to become a filesystem path component. Reject any path separator
@@ -1365,14 +1374,51 @@ def _deregister_crons(app_name: str) -> int:
 
 
 def load_app_cron_defs(app_name: str) -> list[dict[str, Any]]:
-    """Load persisted cron definitions for an app (used by CronService bridge)."""
+    """Load persisted cron definitions for an app (used by CronService bridge).
+
+    The return type is a promise to the caller, so it is enforced rather than
+    assumed. ``app-crons.json`` lives in the app's INSTALL directory, which is
+    ordinary user-writable state -- a hand-edit, a partial restore, or an app
+    that writes its own file can leave valid JSON that is not a list of
+    objects. That parses cleanly, so catching ``JSONDecodeError`` does not see
+    it, and the value flows into ``register_app_crons_with_service``'s
+    ``for d in defs: d.get("name", "")`` -- which raises ``AttributeError`` on
+    a string (iterating a JSON object yields its keys) and ``TypeError`` on a
+    scalar, from OUTSIDE the per-job ``try`` that makes one bad cron skippable.
+
+    Two levels, because they fail differently:
+
+    - a non-list top level is the whole file being wrong, and is treated
+      exactly like the unreadable case above -- no definitions, app enables
+      without crons.
+    - a non-object ENTRY is one bad row among good ones, and is skipped the
+      way an entry whose registration raises already is, so the remaining
+      crons still register.
+    """
     path = _app_crons_path(app_name)
     if not path.is_file():
         return []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return []
+    if not isinstance(data, list):
+        logger.warning(
+            "App %s: cron manifest %s is not a JSON array (%s); ignoring it",
+            app_name,
+            path,
+            type(data).__name__,
+        )
+        return []
+    defs = [entry for entry in data if isinstance(entry, dict)]
+    if len(defs) != len(data):
+        logger.warning(
+            "App %s: cron manifest %s has %d entry/entries that are not JSON objects; skipping them",
+            app_name,
+            path,
+            len(data) - len(defs),
+        )
+    return defs
 
 
 async def register_app_crons_with_service(app_name: str, cron_service: Any) -> list[str]:
@@ -2273,7 +2319,6 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             if not agent_path.resolve().is_relative_to(app_root.resolve()):
                 continue
             data = json.loads(agent_path.read_text(encoding="utf-8"))
-            agent_name = data.get("name", agent_path.stem)
         except (json.JSONDecodeError, OSError) as exc:
             # A declared agent we CANNOT read is not the same as a removed one. If
             # we skipped it, its name would be absent from `current_links` and the
@@ -2289,6 +2334,20 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
             )
             current_links = None  # type: ignore[assignment]  # sentinel: do not prune agents
             break
+        if not isinstance(data, dict):
+            # Valid JSON that is not an object (a list, a scalar, null) parses
+            # fine, but it carries no readable `name` — the same cannot-read !=
+            # removed situation as above. Abort the agent prune so this agent
+            # does not fall out of `current_links` and lose its last-good
+            # materialized config.
+            logger.warning(
+                "Skipping agent prune for %s: declared agent %s is not a JSON object",
+                app_name,
+                agent_path_str,
+            )
+            current_links = None  # type: ignore[assignment]  # sentinel: do not prune agents
+            break
+        agent_name = data.get("name", agent_path.stem)
         current_links.add(_safe_link_name(_namespace(app_name, agent_name)) + ".json")
     agents_dir = _kiro_agents_dir()
     if current_links is not None and agents_dir.is_dir():
@@ -2389,6 +2448,13 @@ def register_app(app_name: str) -> RegistrationResult:
     except Exception as exc:
         result.errors.append(f"agent registration failed: {exc}")
 
+    declared = len(manifest.agents or [])
+    if declared and not result.agents:
+        result.errors.append(
+            f"registered 0 of {declared} declared agent(s) for {app_name!r} "
+            "-- agent source missing or unreadable"
+        )
+
     try:
         result.skills = _register_skills(app_name, manifest, app_root)
     except Exception as exc:
@@ -2425,7 +2491,15 @@ def refresh_app_agents(app_name: str) -> list[str]:
     info = get_app(app_name)
     if info and info.get("resources") == "app":
         return []
-    return _register_agents(app_name, manifest, _app_resource_root(app_name))
+    app_root = _app_resource_root(app_name)
+    # Admission gate — mirror register_app. A re-materialization MUST honor the
+    # same execution decision, or a revoked app's agents (and the MCP servers
+    # merged into them) would be rewritten and become dispatchable again. On
+    # denial, scrub any stale materialized agents and register nothing.
+    if _registration_denied(app_name, action="resource_register", app_root=app_root):
+        _deregister_agents(app_name)
+        return []
+    return _register_agents(app_name, manifest, app_root)
 
 
 def reconcile_enabled_app_resources() -> dict[str, int]:

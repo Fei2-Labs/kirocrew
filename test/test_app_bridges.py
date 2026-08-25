@@ -18,6 +18,7 @@ from hypothesis import strategies as st
 from kiro_crew import platform_compat
 from kiro_crew.apps.bridges import (
     RegistrationResult,
+    _app_crons_path,
     _deregister_agents,
     _deregister_crons,
     _deregister_mcp_servers,
@@ -30,6 +31,7 @@ from kiro_crew.apps.bridges import (
     _safe_link_name,
     deregister_app,
     load_app_cron_defs,
+    refresh_app_agents,
     register_app,
     register_app_crons_with_service,
 )
@@ -322,6 +324,30 @@ class TestAgentRegistration:
         assert link.is_file(), "the working config must survive a failed rewrite"
         assert link.read_text(encoding="utf-8") == good, "…with its old contents intact"
 
+    @pytest.mark.parametrize("content", ["[1, 2, 3]", "42", "null", "true", '"a string"'])
+    def test_a_valid_json_non_object_agent_spec_is_skipped(
+        self, tmp_path, app_env, content
+    ):
+        """A spec that is valid JSON but not an object parses fine, so the
+        JSONDecodeError guard never fires — but ``.get`` on the parsed value
+        would raise AttributeError and take down the whole registration pass.
+        Same disposition as the unreadable case: skip that agent, register
+        nothing for it, and do not crash.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        (app_root / "agents" / "my-agent.json").write_text(content, encoding="utf-8")
+
+        registered = _register_agents("test-app", manifest, app_root)
+
+        assert registered == []
+        link = app_env["kiro_agents"] / "test-app--my-agent.json"
+        assert not link.exists(), "a spec that was never understood must not be materialized"
+
     def test_a_legacy_symlink_is_still_replaced(self, tmp_path, app_env):
         """A symlink from an older KiroCrew is dropped and replaced with a real file."""
         src = _make_app_source(tmp_path)
@@ -591,6 +617,63 @@ class TestCronRegistration:
         assert len(defs) == 1
         assert defs[0]["enabled"] is False
 
+    @pytest.mark.parametrize("payload", ["{}", '{"name": "x"}', "42", '"str"', "null", "true"])
+    def test_non_list_cron_manifest_is_ignored(self, payload, tmp_path, app_env):
+        """Valid JSON that is not an array yields no definitions, not a crash.
+
+        ``app-crons.json`` sits in the app's install directory, which is
+        ordinary user-writable state. A non-array parses cleanly, so the
+        ``JSONDecodeError`` guard never sees it and the value is returned
+        under a ``list[dict]`` annotation that promised otherwise.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        _app_crons_path("test-app").write_text(payload, encoding="utf-8")
+
+        assert load_app_cron_defs("test-app") == []
+
+    def test_non_object_entries_are_skipped_and_the_rest_survive(self, tmp_path, app_env):
+        """One malformed row must not cost the good rows beside it.
+
+        Matches the disposition the registration loop already gives an entry
+        whose ``add_job`` raises: skip that one, keep going.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        _app_crons_path("test-app").write_text(
+            json.dumps([{"name": "test-app/good", "every": 60}, "junk", 7, None, []]),
+            encoding="utf-8",
+        )
+
+        defs = load_app_cron_defs("test-app")
+        assert defs == [{"name": "test-app/good", "every": 60}]
+
+    def test_a_non_list_manifest_does_not_break_registration(self, tmp_path, app_env):
+        """The end-to-end shape: enabling the app must not raise.
+
+        ``register_app_crons_with_service`` reads ``d.get("name", "")`` OUTSIDE
+        its per-job ``try``, so before the guard a JSON object here raised
+        ``AttributeError`` (iterating an object yields its string keys) and a
+        scalar raised ``TypeError`` -- out of the app-enable path entirely.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from kiro_crew.apps.bridges import register_app_crons_with_service
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        _app_crons_path("test-app").write_text(
+            json.dumps({"name": "test-app/refresh", "every": 60}), encoding="utf-8"
+        )
+
+        mock_sdk = MagicMock()
+        mock_sdk.list_jobs.return_value = []
+        with patch("kiro_crew.apps.bridges.CronSDK", return_value=mock_sdk):
+            result = _run(register_app_crons_with_service("test-app", MagicMock()))
+
+        assert result == []
+        mock_sdk.add_job_async.assert_not_called()
+
     def test_deregister_crons(self, tmp_path, app_env):
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -697,6 +780,43 @@ class TestTopLevel:
         assert len(result.skills) == 1
         assert len(result.crons) == 1
         assert result.errors == []
+
+    def test_register_app_reports_zero_registered_when_agent_source_missing(
+        self, tmp_path, app_env
+    ):
+        # A manifest that DECLARES agents but whose agent source is absent /
+        # unreadable materializes none. That must surface as a visible error
+        # (which reconcile counts), not a silent 0-agent success.
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        # Drop the declared agent's source from the installed snapshot.
+        (app_env["home"] / "apps" / "test-app" / "agents" / "my-agent.json").unlink()
+
+        result = register_app("test-app")
+
+        assert result.agents == []
+        assert any("0 of" in error and "test-app" in error for error in result.errors)
+
+    def test_refresh_app_agents_denied_scrubs_and_registers_nothing(
+        self, tmp_path, app_env, monkeypatch
+    ):
+        # An app whose execution admission was revoked must NOT be re-materialized
+        # by the from-source recovery path: refresh_app_agents must honor the same
+        # gate register_app does -- scrub any stale agent spec and register nothing
+        # -- or a revoked app's agent (and its merged MCP servers) becomes
+        # dispatchable again.
+        import kiro_crew.apps.execution as execution_mod
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        assert refresh_app_agents("test-app")  # admitted: materializes, returns names
+        assert any(app_env["kiro_agents"].iterdir())
+
+        monkeypatch.setattr(execution_mod, "third_party_execution_allowed", lambda: False)
+        refreshed = refresh_app_agents("test-app")
+
+        assert refreshed == []
+        assert not any(app_env["kiro_agents"].iterdir())
 
     def test_install_while_execution_denied_registers_nothing(self, tmp_path, app_env, monkeypatch):
         import kiro_crew.apps.execution as execution_mod
@@ -3296,6 +3416,33 @@ class TestPruneAbortsOnUnreadableAgent:
 
         bridges_mod._prune_stale_app_resources("test-app", manifest, app_root)
         assert keep.is_file(), "prune must abort — not delete a config over an unreadable source"
+
+    @pytest.mark.parametrize("content", ["[1, 2, 3]", "42", "null", "true", '"a string"'])
+    def test_a_valid_json_non_object_agent_spec_aborts_the_agent_prune(
+        self, tmp_path, app_env, monkeypatch, content
+    ):
+        """Valid JSON that is not an object parses fine, so the JSONDecodeError
+        guard never fires — but ``.get`` on the parsed value would raise
+        AttributeError. A spec that cannot be read as an object is the same
+        cannot-read != removed situation: the agent must be RETAINED (treated
+        as present), never pruned out of its last-good materialized config.
+        """
+        from kiro_crew.apps import bridges as bridges_mod
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        manifest = AppManifest.from_json_file(
+            app_env["home"] / "apps" / "test-app" / APP_MANIFEST_FILENAME
+        )
+        app_root = app_env["home"] / "apps" / "test-app"
+        # A materialized config that MUST survive if the prune aborts.
+        keep = app_env["kiro_agents"] / "test-app--my-agent.json"
+        keep.write_text('{"name": "my-agent"}', encoding="utf-8")
+        # Make the declared agent source valid JSON but not an object.
+        (app_root / "agents" / "my-agent.json").write_text(content, encoding="utf-8")
+
+        bridges_mod._prune_stale_app_resources("test-app", manifest, app_root)
+        assert keep.is_file(), "prune must retain the agent — a non-object spec is unreadable, not removed"
 
 
 class TestMalformedConfigIsNotClobbered:

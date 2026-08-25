@@ -118,6 +118,7 @@ const HEIGHT_REPORTER_BODY = `(function(){
   var shrinkTimer = null;
   var rafId = 0;
   var raf = window.requestAnimationFrame || function(cb){ return setTimeout(cb, 16); };
+  var unraf = window.cancelAnimationFrame || clearTimeout;
   function send(h){
     lastSent = h;
     parent.postMessage({type:'mc-widget-height', height:h}, '*');
@@ -160,7 +161,17 @@ const HEIGHT_REPORTER_BODY = `(function(){
   function schedule(){
     // Coalesce a burst of ResizeObserver callbacks (an animation can fire many
     // per frame) into a single measurement per frame.
-    if (rafId) return;
+    //
+    // Cancel-and-reschedule rather than an early return on a pending handle:
+    // requestAnimationFrame may return a handle whose callback never runs (a
+    // frame queued for a page the browser then puts in the back/forward cache is
+    // dropped), and latching on such a handle would stop this widget's height
+    // tracking permanently. Same defect and same fix as CliPanel's theme
+    // scheduler. NOTE this block lives inside a template literal, so it must
+    // carry neither a backtick nor a dollar-brace interpolation opener -- both
+    // terminate the literal, and the resulting parse error points here rather
+    // than at the string, which is why this warning is worth the two lines.
+    if (rafId) unraf(rafId);
     rafId = raf(evaluate);
   }
   new ResizeObserver(schedule).observe(document.body);
@@ -461,9 +472,15 @@ const COMMENT_BRIDGE_BODY = `(function(){
 
 function buildThemeCss(vars: Record<string, string>, mode: 'dark' | 'light'): string {
   const rootBody = Object.entries(vars).map(([k, v]) => `${k}:${v}`).join(';')
+  // No readable vars means no theme to apply, and inventing one is worse than
+  // the browser's own defaults — a guard pins that this path emits no `:root`.
   if (!rootBody) return ''
   return (
     `:root{${rootBody};color-scheme:${mode}}` +
+    // On the root element as well as the body: background propagates from html
+    // to the canvas, so an LLM body that sets its own background still paints
+    // over a themed base instead of over white.
+    `html{background:var(--bg)}` +
     `body{background:var(--bg);color:var(--text)}`
   )
 }
@@ -579,6 +596,20 @@ export function buildSrcdoc({
   tailwindCfg.textContent = TAILWIND_V4_DIRECTIVES
   head.appendChild(tailwindCfg)
 
+  // <style> with base body styles + theme vars.
+  //
+  // This MUST precede the Tailwind runtime <script src> below. A classic script
+  // in <head> blocks parsing of everything after it, so with the style behind it
+  // the document has no background and no `color-scheme` until that script has
+  // been fetched and executed — and the browser paints its default WHITE canvas
+  // for that whole window. On a phone over a slow link that reads as a white
+  // flash on every artifact and widget open. Inline CSS costs no fetch, so
+  // putting it first makes the first paint already themed.
+  const style = doc.createElement('style')
+  const themeCss = buildThemeCss(themeVars, mode)
+  style.textContent = themeCss ? `${BASE_BODY_CSS} ${themeCss}` : BASE_BODY_CSS
+  head.appendChild(style)
+
   // Same-origin Tailwind v4 browser runtime (replaces public cdn.tailwindcss.com).
   // NOTE: we insert a placeholder <meta> instead of a live <script> element and
   // substitute it in the final serialized HTML. happy-dom eagerly fetches
@@ -591,12 +622,6 @@ export function buildSrcdoc({
   tailwindPlaceholder.setAttribute('name', 'x-script-placeholder')
   tailwindPlaceholder.setAttribute('data-src', scriptOrigin + TAILWIND_RUNTIME_PATH)
   head.appendChild(tailwindPlaceholder)
-
-  // <style> with base body styles + theme vars
-  const style = doc.createElement('style')
-  const themeCss = buildThemeCss(themeVars, mode)
-  style.textContent = themeCss ? `${BASE_BODY_CSS} ${themeCss}` : BASE_BODY_CSS
-  head.appendChild(style)
 
   // Loading overlay: shown while Tailwind JIT compiles, hidden once ready or
   // after a timeout. Only injected when showLoadingOverlay is set.
@@ -744,8 +769,11 @@ function buildSrcdocSSR({ html, themeVars, mode, includeHeightReporter }: BuildS
     `<meta name="viewport" content="width=device-width, initial-scale=1">` +
     `<meta http-equiv="Content-Security-Policy" content="${cspFor('')}">` +
     `<style type="text/tailwindcss">${TAILWIND_V4_DIRECTIVES}</style>` +
-    `<script src="${TAILWIND_RUNTIME_PATH}"><\/script>` +
+    // Theme style precedes the runtime <script src> for the same reason as the
+    // DOM path: a head script blocks parsing, so a style behind it leaves the
+    // document unthemed — and painted white — until the script lands.
     `<style>${styleCss}</style>` +
+    `<script src="${TAILWIND_RUNTIME_PATH}"><\/script>` +
     `</head><body class="${mode}">` +
     `<!-- SSR fallback: LLM body omitted -->` +
     reporter +

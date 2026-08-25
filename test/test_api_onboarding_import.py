@@ -1017,3 +1017,45 @@ def test_backfill_embeddings_sweeps_a_ready_model(monkeypatch) -> None:
     assert (
         module._backfill_embeddings(SimpleNamespace(backfill_missing_embeddings=lambda: 12)) == 12
     )
+
+
+def test_the_two_source_id_patterns_cannot_drift() -> None:
+    """The handler keeps its own copy of the source-id shape rule.
+
+    That copy is deliberate — reaching through ``_backend()`` for request
+    validation would make all 35 handler test doubles carry an engine attribute
+    they do not otherwise need. But a second spelling of one rule is the exact
+    drift this PR's registry exists to end, so the two are pinned equal here
+    rather than trusted to stay in step.
+    """
+    module = _handler_module()
+    backend = importlib.import_module("kiro_crew.onboarding_import")
+
+    assert module._SOURCE_ID_SHAPE_RE.pattern == backend._SOURCE_ID_RE.pattern
+
+
+def test_handler_category_tables_match_the_backend() -> None:
+    """The handler's category tables must track ``onboarding_import.CATEGORY_IDS``.
+
+    ``_scan_response`` rejects a payload whose category id is not in the handler's
+    own ``_CATEGORY_IDS`` and then indexes ``_CATEGORY_NAMES[category_id]``, so a
+    category added to the backend but missed here does not degrade to "that
+    category is hidden" — it raises and the endpoint 500s, breaking the import
+    wizard for EVERY source. Pin both tables so the omission fails loudly in CI.
+
+    The SOURCE tables are deliberately absent: the handler no longer keeps a copy
+    of the source list to drift from. It derives ids from the engine's registry,
+    which is what makes an edition-registered source reachable at all.
+    """
+    module = _handler_module()
+    backend = importlib.import_module("kiro_crew.onboarding_import")
+
+    assert module._CATEGORY_IDS == frozenset(backend.CATEGORY_IDS)
+    assert set(module._CATEGORY_NAMES) >= frozenset(backend.CATEGORY_IDS) - {"instructions"}
+    # Diagnostic-only categories never enter _CATEGORY_IDS (they are not
+    # importable), but their ids DO reach the Review step's "Not imported"
+    # rows, where a missing label silently falls back to "General". Pin every
+    # category the unsupported-dirs table can emit to a real label.
+    assert set(module._CATEGORY_NAMES) >= {
+        category for _, category in backend._GEMINI_UNSUPPORTED_DIRS
+    }

@@ -16,7 +16,6 @@ vi.mock('../hooks/useUptime', () => ({
 
 vi.mock('../api/client', () => ({
   api: {
-    restartSessions: vi.fn().mockResolvedValue({}),
     memorySettings: vi.fn().mockResolvedValue({ history_idle_hours: 3, history_max_days: 90, migrated: false }),
   },
 }))
@@ -107,8 +106,30 @@ describe('OverviewPage — mission control', () => {
     expect(screen.queryByTestId('usage-tab')).not.toBeInTheDocument()
   })
 
-  it('keeps the Apply & Restart action in the hero', () => {
+  // Overview reads state and edits nothing, so it offers no apply/restart
+  // action: the button that used to sit here had no change to apply, and its
+  // one effect (dropping live agent sessions) belongs with the surfaces that
+  // edit the config those sessions load. Asserted so it is not re-added.
+  it('offers no restart action in the hero', () => {
     renderWithProviders(<OverviewPage />, { store: statusStore() })
-    expect(screen.getByRole('button', { name: /Restart/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Restart/i })).not.toBeInTheDocument()
+  })
+
+  // The region below the summary cards is empty in the stock build, and the
+  // panel seam is only worth anything if the page actually READS it — a
+  // registry nothing renders is the failure this asserts against.
+  it('renders nothing in the lower panel region until a panel is registered', () => {
+    renderWithProviders(<OverviewPage />, { store: statusStore() })
+    expect(screen.queryByTestId('edition-panel')).not.toBeInTheDocument()
+  })
+
+  it('renders a registered lower panel', async () => {
+    const { registerOverviewPanel } = await import('../pages/overviewPanel')
+    registerOverviewPanel({
+      id: 'test:lower-panel',
+      component: () => <div data-testid="edition-panel">registered</div>,
+    })
+    renderWithProviders(<OverviewPage />, { store: statusStore() })
+    expect(screen.getByTestId('edition-panel')).toBeInTheDocument()
   })
 })

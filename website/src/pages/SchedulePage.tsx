@@ -1,9 +1,11 @@
 import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
+import { useImeGuard } from '../hooks/useImeGuard'
 import Clickable from '../components/Clickable'
 import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download } from 'lucide-react'
 import { api } from '../api/client'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useArmedDelete } from '../hooks/useArmedDelete'
 import { PageHeader, Card, Btn, SendBtn, Badge, SearchInput, EmptyState, FilteredEmpty, Skeleton, Input } from '../components/ui'
 import { CodeBlock } from '../components/CodeBlock'
 import SegmentedControl from '../components/SegmentedControl'
@@ -11,6 +13,7 @@ import WeekGrid from '../components/WeekGrid'
 import TimezoneSelect from '../components/TimezoneSelect'
 import JobForm from '../components/JobForm'
 import JobLogsView from '../components/JobLogsView'
+import ErrorNotice from '../components/ErrorNotice'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import InfoTip from '../components/InfoTip'
 import type { CronJob } from '../types'
@@ -134,6 +137,7 @@ function EmptyFolderChip({ folder, onRename, onDelete, error }: { folder: CronFo
   const [confirming, setConfirming] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editName, setEditName] = useState(folder.name)
+  const ime = useImeGuard()
 
   const commitRename = () => {
     const trimmed = editName.trim()
@@ -152,11 +156,11 @@ function EmptyFolderChip({ folder, onRename, onDelete, error }: { folder: CronFo
             className="bg-bg rounded px-2 py-0.5 flex-none min-w-[120px]"
             value={editName}
             onChange={e => setEditName(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') commitRename()
-              if (e.key === 'Escape') setEditing(false)
-            }}
-            onBlur={commitRename}
+            {...ime.bindEnter({
+              onEnter: commitRename,
+              onEscape: () => setEditing(false),
+              onBlur: commitRename,
+            })}
           />
         ) : (
           <span className="text-sm font-medium text-text">{folder.name}</span>
@@ -269,6 +273,8 @@ export default function SchedulePage() {
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(loadCollapsedFolders)
   const [folderModal, setFolderModal] = useState<{ mode: 'create'; resolve?: (id: string | undefined) => void } | null>(null)
   const [folderModalName, setFolderModalName] = useState('')
+  const folderNameIme = useImeGuard()
+  const batchConfirmIme = useImeGuard()
   const [folderModalError, setFolderModalError] = useState<string | null>(null)
   const toggleFolderCollapse = useCallback((folderId: string) => {
     setCollapsedFolders(prev => {
@@ -379,30 +385,18 @@ export default function SchedulePage() {
     }
   }, [load, refreshFolders, setActionError])
 
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
-  const [deletingId, setDeletingId] = useState<string | null>(null)
-  const confirmRevertTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const armDelete = useCallback((id: string) => {
-    setConfirmDeleteId(id)
-    if (confirmRevertTimer.current) clearTimeout(confirmRevertTimer.current)
-    confirmRevertTimer.current = setTimeout(() => setConfirmDeleteId(null), 3000)
-  }, [])
-  useEffect(() => () => { if (confirmRevertTimer.current) clearTimeout(confirmRevertTimer.current) }, [])
-  const deleteJob = useCallback(async (id: string) => {
+  // performDelete reports its own errors, so confirmDelete never rejects.
+  const performDelete = useCallback(async (id: string) => {
     try {
-      if (confirmRevertTimer.current) clearTimeout(confirmRevertTimer.current)
-      setDeletingId(id)
       await api.deleteCron(id)
       setSelected(prev => prev?.id === id ? null : prev)
       await load()
     } catch (e: unknown) {
       setActionError({ id, msg: e instanceof Error ? e.message : i18nT('pages.schedulePage.delete_failed') })
-    } finally {
-      setDeletingId(null)
-      setConfirmDeleteId(null)
     }
   }, [load, setActionError])
-  const filteredJobs = useMemo(() => sanitizedJobs.filter(j => !cronFilter || (j.name+' '+j.safeMessage+' '+(j.agent||'')+' '+(j.model||'')).toLowerCase().includes(cronFilter.toLowerCase())), [sanitizedJobs, cronFilter])
+  const { armedId: confirmDeleteId, arm: armDelete, confirm: confirmDelete, isDeleting } = useArmedDelete(performDelete)
+  const filteredJobs = useMemo(() => sanitizedJobs.filter(j => !cronFilter || (j.name+' '+j.safeMessage+' '+(j.agent||'')+' '+(j.model||'')+' '+(j.session_key||'')).toLowerCase().includes(cronFilter.toLowerCase())), [sanitizedJobs, cronFilter])
   const scheduleComparators = useMemo(() => ({
     name: (a: CronJob, b: CronJob) => a.name.localeCompare(b.name),
     schedule: (a: CronJob, b: CronJob) => (a.schedule || '').localeCompare(b.schedule || ''),
@@ -519,7 +513,7 @@ export default function SchedulePage() {
         <div className={`flex-1 overflow-y-auto px-3 sm:px-6 min-h-0 ${showEmptyState ? 'pb-2' : 'pb-8'}`}>
           {loadError ? (
             <div className="flex flex-col items-center justify-center py-20 text-center">
-              <p className="text-danger text-sm mb-3">{loadError}</p>
+              <ErrorNotice message={loadError} askAgent className="mb-3" />
               <Btn onClick={load}>{i18nT('pages.schedulePage.retry')}</Btn>
             </div>
           ) : loading ? (
@@ -738,12 +732,20 @@ export default function SchedulePage() {
                       own surface): the default cell background is transparent and
                       the scrolling columns would show through. Sticky changes
                       paint position, not column width, so the `w-[176px]`
-                      contract above still holds. The pinned edge carries no
-                      static border: the seam cue is the measured gradient
-                      painted after the table, shown only while the scroller
-                      actually hides columns, so a full-width desktop table is
-                      byte-identical to the unpinned rendering at rest. */}
-                  <TableHead className="sticky right-0 w-[176px] bg-card">{i18nT('pages.schedulePage.actions')}</TableHead>
+                      contract above still holds. The seam is TWO parts, both
+                      gated on the measured overflow flag so a full-width table
+                      renders neither: a 1px child div in this cell (legible over
+                      whitespace, where a fade into the same surface colour
+                      vanishes — a child div and not `border-l`, because under
+                      Preflight's `border-collapse: collapse` a cell border
+                      belongs to the collapsed table grid and stays at the
+                      cell's layout slot instead of travelling with the sticky
+                      cell) and the gradient painted after the table (says
+                      "content continues", which a 1px rule alone does not). */}
+                  <TableHead className="sticky right-0 w-[176px] bg-card">
+                    {jobsTableEdges.right && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
+                    {i18nT('pages.schedulePage.actions')}
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>{jobs.length === 0
@@ -796,7 +798,18 @@ export default function SchedulePage() {
                   />
                 </TableCell>
                 <TableCell className="truncate"><code>{j.id}</code></TableCell>
-                <TableCell className="truncate text-text-strong" title={j.name}>{j.name}</TableCell>
+                {/* Name on line 1, its owning session on line 2 — same pairing
+                    as the Type and Schedule columns. The empty state renders
+                    EXPLICIT copy, italic prose against the owned state's mono,
+                    because "no owning session" is the fact that explains why a
+                    job is invisible to cron_list in chat — a blank line would
+                    hide exactly the state this line exists to show. */}
+                <TableCell className="truncate text-text-strong" title={`${j.name} · ${j.session_key || i18nT('pages.schedulePage.no_owning_session')}`}>
+                  <span className="block truncate">{j.name}</span>
+                  {j.session_key
+                    ? <span className="block truncate text-[11px] font-mono font-normal text-muted">{j.session_key}</span>
+                    : <span className="block truncate text-[11px] italic font-normal text-muted">{i18nT('pages.schedulePage.no_owning_session')}</span>}
+                </TableCell>
                 {/* Kind on line 1, its owner on line 2 — mirrors the
                     schedule/timezone pair in the next column. The agent's model
                     is tooltip-only: at this width it truncated to noise, and the
@@ -825,6 +838,7 @@ export default function SchedulePage() {
                     `bg-card` it matches the rest of the row exactly. */}
                 <TableCell className="sticky right-0 whitespace-nowrap bg-card" onClick={e => e.stopPropagation()}>
                   <div aria-hidden className={`absolute inset-0 -z-10 transition-colors group-hover/jobrow:bg-bg-hover ${selected?.id === j.id ? 'bg-accent-subtle' : ''} ${selectedIds.has(j.id) ? 'bg-accent-subtle/60' : ''}`} />
+                  {jobsTableEdges.right && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
                   <div className="flex items-center gap-1.5">
                     {j.is_running
                       ? <span title={i18nT('pages.schedulePage.cancel_running_execution')}><Btn danger onClick={() => cancelRun(j.id)} disabled={cancelling.has(j.id)}>{cancelling.has(j.id) ? '...' : i18nT('pages.schedulePage.cancel')}</Btn></span>
@@ -841,10 +855,10 @@ export default function SchedulePage() {
                         ChatInput's Continue/Send buttons. */}
                     <Btn
                       danger
-                      disabled={deletingId === j.id}
+                      disabled={isDeleting(j.id)}
                       title={confirmDeleteId === j.id ? i18nT('pages.schedulePage.click_again_to_confirm') : i18nT('pages.schedulePage.delete_job')}
-                      onClick={() => confirmDeleteId === j.id ? deleteJob(j.id) : armDelete(j.id)}
-                    >{deletingId === j.id ? '...' : confirmDeleteId === j.id ? i18nT('pages.schedulePage.confirm_delete_job') : i18nT('pages.schedulePage.delete')}</Btn>
+                      onClick={() => { if (confirmDeleteId === j.id) void confirmDelete(j.id); else armDelete(j.id) }}
+                    >{isDeleting(j.id) ? '...' : confirmDeleteId === j.id ? i18nT('pages.schedulePage.confirm_delete_job') : i18nT('pages.schedulePage.delete')}</Btn>
                     <CronRowActions
                       job={j}
                       folders={cronFolders}
@@ -915,7 +929,13 @@ export default function SchedulePage() {
               aria-label={i18nT('pages.schedulePage.cronFolders.new_folder_name')}
               value={folderModalName}
               onChange={e => setFolderModalName(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && folderModalName.trim()) handleFolderModalSubmit() }}
+              {...folderNameIme.bindComposition()}
+              onKeyDown={e => {
+                if (e.key !== 'Enter') return
+                // Rule 1: single-line input; emptiness stays outside the guard.
+                if (folderNameIme.isComposing(e)) return
+                if (folderModalName.trim()) handleFolderModalSubmit()
+              }}
               placeholder={i18nT('pages.schedulePage.cronFolders.new_folder_name')}
               className="w-full"
             />
@@ -975,9 +995,11 @@ export default function SchedulePage() {
               autoFocus
               value={confirmText}
               onChange={e => setConfirmText(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && confirmArmed && !batchDeleting) runBatchDelete() }}
+              {...batchConfirmIme.bindEnter({
+                onEnter: () => { if (confirmArmed && !batchDeleting) runBatchDelete() },
+              })}
               placeholder={BULK_DELETE_TOKEN}
-              className="w-full px-3 py-2 rounded-md bg-bg border border-border text-sm text-text outline-none focus:border-accent"
+              className="w-full px-3 py-2 rounded-md bg-bg border border-border text-sm text-text outline-none focus-visible:border-accent"
             />
             {batchError && <p className="text-danger text-[12px] mt-2">{batchError}</p>}
           </DialogBody>
@@ -1149,6 +1171,17 @@ function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, on
               <div className="flex flex-col gap-1.5">
                 <div className="text-[12px] text-muted font-medium">{i18nT('pages.schedulePage.last_run')}</div>
                 <span className="text-sm text-text">{fmtDateTimeNumeric(job.last_run_ts)}</span>
+              </div>
+            )}
+            {/* The row's owner line truncates; here the full key is readable.
+                The ownerless copy stays italic-vs-mono distinguishable, same
+                treatment as the table row. */}
+            {job && (
+              <div className="flex flex-col gap-1.5">
+                <div className="text-[12px] text-muted font-medium">{i18nT('pages.schedulePage.owning_session')}</div>
+                {job.session_key
+                  ? <code className="text-[12px] font-mono break-all text-text">{job.session_key}</code>
+                  : <span className="text-sm italic text-muted">{i18nT('pages.schedulePage.no_owning_session')}</span>}
               </div>
             )}
           </>

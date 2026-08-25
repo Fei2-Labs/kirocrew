@@ -445,9 +445,15 @@ Unknown keywords are ignored, so a richer schema still validates on the parts th
 understands. `bool` is explicitly **not** an `integer` or `number`.
 
 `parse_json(text)` is tolerant of the two shapes a model actually returns: a
-fenced ` ```json ` block, and JSON wrapped in prose (it falls back to the
-outermost `{...}` / `[...]` span, trying whichever delimiter appears first so a
-prose-wrapped array yields the array, not an inner object). It never `eval`s.
+fenced ` ```json ` block, and JSON wrapped in prose. Prose recovery delegates to
+the shared `llm_helpers._extract_json_of_type` scanner (stdlib `raw_decode` over
+successive `{` / `[` offsets), so a stray brace or bracket in the prose no longer
+corrupts recovery, and a prose-wrapped array still yields the outer array, not an
+inner object. `coerce_and_validate` derives a prefer predicate from the schema's
+container `type`, so an object schema selects the object even when stray prose
+parses as an array first (and vice versa); two *different* candidates of the
+preferred shape refuse the guess and count as a parse failure, feeding the retry
+loop. It never `eval`s.
 
 `run_with_schema(produce, prompt, schema, retries=DEFAULT_SCHEMA_RETRIES)` drives
 the loop: the prompt is augmented with the serialized schema and a JSON-only
@@ -804,12 +810,20 @@ The neighbouring suites carry the same rule for their own invariants: never rela
 `tests/workflows/malicious/` corpus, and never relax the layering without
 `test_workflows_architecture.py`.
 
-> Open question: several module docstrings and test docstrings cite a gate catalog
-> at `docs/system-specs/modules/workflow-gates.md` (and short-form "GATES.md")
-> using labels like A4, B5, C1, D1, F1, F2, G1. That file does not exist in this
-> repo, so the labels are unresolvable. Each gate's actual enforcement is the named
-> test, and this spec states the invariants directly rather than by label. Either
-> write the catalog or drop the label references from the code comments.
+The gate labels cited by the engine's docstrings and by the `test_workflows_*`
+docstrings (A4, B5, C1, D1, F1, F2, G1, …) are defined in
+[workflow-gates.md](workflow-gates.md), which names the test pinning each. A gate
+is closed by that test, not by either document: where a row and its test disagree,
+the test is right. This spec states the invariants directly rather than by label,
+so the catalog is a lookup table for the ids, not a second contract.
+
+> Open question: `M<n>` milestone markers (`M5`, `M6`, `M6.7`, …) still appear on
+> comments and docstrings across every workflow surface — the engine's tests, the
+> MCP tools, the validators, the gateway wiring, and the Workflows UI. They are
+> delivery markers, not gates, so nothing defines them, and
+> `grep -rnE '\bM(5|6)(\.[0-9]+)?\b'` is the live list rather than an inventory
+> kept here, which would go stale on the next edit. Clearing them belongs to each
+> file's own pass.
 
 ## Related
 

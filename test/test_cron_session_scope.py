@@ -34,17 +34,26 @@ class TestCronAddSessionKey:
         jobs = [j for j in svc.list_jobs() if j.name == name]
         assert jobs[0].session_key == "sess-abc"
 
-    def test_no_session_key_leaves_empty(self, monkeypatch):
-        """Without KIROCREW_SESSION_KEY, session_key is empty."""
+    def test_an_unidentified_caller_cannot_create_an_ownerless_job(self, monkeypatch):
+        """Without a resolvable identity, ``cron_add`` refuses instead of storing "".
+
+        This used to store an ownerless row, and on a pooled backend -- where no
+        identity was resolvable at all -- that was EVERY row, which is what made
+        the ownership gate unenforceable. Refusing stops this server from adding
+        to the ownerless set; the CLI and the importer still write to it, and such
+        rows are visible-but-not-mutable through MCP. See
+        ``test/test_mcp_cron_caller_identity.py`` for the full rule.
+        """
         monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
         monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
-        monkeypatch.setattr("kiro_crew.mcp_cron._resolve_session_key", lambda: "")
+        monkeypatch.delenv("KIROCREW_CLI", raising=False)
+        monkeypatch.setattr("kiro_crew.mcp_cron._authz_session_key", lambda: "")
         name = _unique_name()
-        _call_tool_inner("cron_add", {"name": name, "message": "hi", "every": 120})
+        result = _call_tool_inner("cron_add", {"name": name, "message": "hi", "every": 120})
 
+        assert "cannot determine which session is calling" in result
         svc = CronService()
-        jobs = [j for j in svc.list_jobs() if j.name == name]
-        assert jobs[0].session_key == ""
+        assert [j for j in svc.list_jobs() if j.name == name] == []
 
 
 class TestCronRemoveAllScoped:
@@ -90,7 +99,11 @@ class TestCronRemoveAllScoped:
         assert "Removed 2 job(s)" in result
 
     def test_no_session_key_no_cli_returns_error(self, monkeypatch):
-        """Without session key or CLI flag, returns error."""
+        """Without session key or CLI flag, returns error.
+
+        Still an error, now the shared one every mutating tool gives an
+        unidentifiable caller rather than a message unique to this tool.
+        """
         monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
         monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
         monkeypatch.delenv("KIROCREW_CLI", raising=False)
@@ -99,15 +112,14 @@ class TestCronRemoveAllScoped:
         # Create a job via CLI so it exists
         monkeypatch.setenv("KIROCREW_CLI", "1")
         monkeypatch.setenv("KIROCREW_SESSION_KEY", "sess-owner")
-        monkeypatch.setattr("kiro_crew.mcp_cron._resolve_session_key", lambda: "sess-owner")
         _call_tool_inner("cron_add", {"name": name, "message": "a", "every": 120})
 
         # Try to remove without session key or CLI
         monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
         monkeypatch.delenv("KIROCREW_CLI", raising=False)
-        monkeypatch.setattr("kiro_crew.mcp_cron._resolve_session_key", lambda: "")
+        monkeypatch.setattr("kiro_crew.mcp_cron._authz_session_key", lambda: "")
         result = _call_tool_inner("cron_remove_all", {})
-        assert "Error: no session key set" in result
+        assert "cannot determine which session is calling" in result
 
     def test_no_matching_jobs_returns_message(self, monkeypatch):
         """Session with no owned jobs gets appropriate message."""

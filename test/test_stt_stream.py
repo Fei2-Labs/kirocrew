@@ -368,8 +368,46 @@ class TestAppleStreamingSession:
             await ws.close()
 
 
+@pytest.fixture()
+def transcribe_consented(tmp_path_factory, monkeypatch):
+    """Record operator consent for Transcribe in a throwaway data home.
+
+    Streaming Transcribe is a paid service, so ``api_ws_stt`` refuses without a
+    grant for the configured profile+region. Every class that drives that handler
+    needs this; it is module-level rather than copied per class so the two cannot
+    drift. Cases that assert the REFUSAL live in ``test_aws_consent.py``.
+
+    Also stubs the live-account check, which would otherwise spawn the AWS CLI --
+    these cases are about the stream, not the identity probe.
+    """
+    home = tmp_path_factory.mktemp("stt-consent-home")
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    from kiro_crew import aws_consent
+    from kiro_crew.config.loader import config_dir
+
+    config_dir().mkdir(parents=True, exist_ok=True)
+    cfg = _cfg()
+    aws_consent.record_grant(
+        aws_consent.SERVICE_TRANSCRIBE,
+        profile=cfg.stt.transcribe_profile,
+        region=cfg.stt.transcribe_region,
+        account="111122223333",
+        arn="arn:aws:iam::111122223333:user/test",
+        granted_at="2026-08-21T00:00:00+00:00",
+    )
+
+    async def _probe(_profile, _region, *, use_cache=True):
+        return aws_consent.Identity(ok=True, account="111122223333")
+
+    monkeypatch.setattr(aws_consent, "probe_identity", _probe)
+
+
 class TestStreamLifecycle:
     """Mock TranscribeStreamingClient to verify lifecycle + redaction."""
+
+    @pytest.fixture(autouse=True)
+    def _consented(self, transcribe_consented):
+        """Every case here drives ``api_ws_stt``, which is consent-gated."""
 
     @pytest.fixture(autouse=True)
     def _require_amazon_transcribe(self):
@@ -800,6 +838,10 @@ class TestSttLanguageCodes:
 class TestDefensiveGuards:
     """Regression tests for review-bot rev 2 findings (posts #9, #10)."""
 
+    @pytest.fixture(autouse=True)
+    def _consented(self, transcribe_consented):
+        """Every case here drives ``api_ws_stt``, which is consent-gated."""
+
     @pytest.mark.asyncio
     async def test_guard_audit_sel_failure_preserves_status_code(self, monkeypatch):
         """If sel() raises on a guard rejection, client must still get 403/503, not 500.
@@ -1029,7 +1071,32 @@ class TestSttProviderGating:
         monkeypatch.setattr(
             apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
         )
-        assert core._stt_providers() == ["whisper", "mlx", "transcribe"]
+        # `parakeet` is gated the same way as `mlx` (Apple-Silicon-only), so both
+        # are present here.
+        assert core._stt_providers() == ["whisper", "mlx", "parakeet", "transcribe"]
+
+    def test_stt_providers_calls_is_apple_silicon_exactly_once(self, monkeypatch):
+        """`parakeet` reuses the `mlx` gate's already-computed Apple-Silicon
+        result rather than re-probing. Off Apple Silicon (e.g. under Rosetta),
+        `_is_apple_silicon()` shells out to `sysctl` synchronously, and
+        `_stt_providers()` runs on the dashboard's event loop (GET/PUT
+        /api/config/stt) -- a second call would double that blocking cost on
+        every request."""
+        from kiro_crew import apple_speech
+        from kiro_crew.dashboard.handlers import core
+
+        calls = []
+
+        def fake_is_apple_silicon():
+            calls.append(1)
+            return True
+
+        monkeypatch.setattr(core, "_is_apple_silicon", fake_is_apple_silicon)
+        monkeypatch.setattr(
+            apple_speech, "availability", lambda: apple_speech.Availability(False, "pinned off")
+        )
+        core._stt_providers()
+        assert len(calls) == 1
 
     def test_providers_exclude_mlx_off_apple_silicon(self, monkeypatch):
         from kiro_crew import apple_speech
@@ -1050,7 +1117,7 @@ class TestSttProviderGating:
 
         monkeypatch.setattr(core, "_is_apple_silicon", lambda: True)
         monkeypatch.setattr(apple_speech, "availability", lambda: apple_speech.Availability(True))
-        assert core._stt_providers() == ["whisper", "mlx", "apple", "transcribe"]
+        assert core._stt_providers() == ["whisper", "mlx", "apple", "parakeet", "transcribe"]
 
     def test_providers_exclude_apple_when_toolchain_missing(self, monkeypatch):
         """A host that could run the framework but has no Swift toolchain must not be

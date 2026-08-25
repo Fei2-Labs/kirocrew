@@ -81,7 +81,9 @@ from kiro_crew.platform.governance import (
 from kiro_crew.platform.governance_profiles import (
     HOST_SESSION_KEY,
     bound_surfaces,
+    fallback_profile_names,
     resolve_active_scope,
+    unknown_profile_scopes,
 )
 from kiro_crew.security import DENY_REASON_MATCH_PREFIX
 
@@ -1805,6 +1807,35 @@ def build_governance_policy_snapshot() -> dict:
             # under these profiles. Naming them is what lets the viewer show a
             # host row as one surface's posture instead of an install-wide "off".
             "other_bound_surfaces": _other_bound_surfaces(),
+            # Every profile currently replaced by the deny-all fallback, by file
+            # stem, sorted. NAMES ONLY — the same exposure contract as
+            # ``other_bound_surfaces`` above, and no rule content, so the
+            # posture-only rule in :func:`_serialize_ruleset` still holds.
+            #
+            # Deliberately NOT narrowed to the host profile. The store knows every
+            # unusable profile, and a bound non-host one (``cron``, ``subagent``,
+            # an app bind) deny-alls its own surface just as silently: it appears
+            # in ``other_bound_surfaces`` looking healthy while the operator is
+            # back to reading server logs, which is the exact harm this signal
+            # exists to remove. Reporting the set also removes an ambiguity a
+            # host-only boolean had: matching a resolved profile's ``name``
+            # against file stems mislabels a profile whose declared name collides
+            # with a broken sibling's stem, whereas these ARE the stems.
+            "fallback_profiles": sorted(fallback_profile_names()),
+            # Capability scopes a profile declares that THIS build does not
+            # register, by file stem → sorted scope names. NAMES ONLY, same
+            # exposure contract as the two fields above.
+            #
+            # These profiles LOADED (enforcement is intact and the key governs
+            # nothing here) so they are absent from ``fallback_profiles`` — which
+            # is exactly why they need their own field: the asymmetric key-open
+            # tolerance means a tolerated key is otherwise visible only in a
+            # startup log line. Non-empty is normal when the data home is shared
+            # with an edition that registers extra rows, and is a typo signal
+            # when it is not.
+            "unknown_profile_scopes": {
+                stem: sorted(scopes) for stem, scopes in unknown_profile_scopes().items()
+            },
             "unavailable": False,
             "scopes": scopes,
         }
@@ -1817,6 +1848,8 @@ def build_governance_policy_snapshot() -> dict:
             "profile": None,
             "surface": "host",
             "other_bound_surfaces": [],
+            "fallback_profiles": [],
+            "unknown_profile_scopes": {},
             "unavailable": True,
             "scopes": [],
         }

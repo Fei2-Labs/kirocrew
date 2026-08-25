@@ -21,6 +21,31 @@ PREPARE_PR_SKILL = ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev
 PREPARE_PR_FINDINGS = ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr" / "scripts" / "pr_findings.py"
 
 
+def _bash() -> str | None:
+    """Return a Bash that can consume native paths from this Python process.
+
+    On Windows, ``shutil.which("bash")`` commonly resolves to the WSL launcher
+    in System32.  That executable starts a Linux process but does not translate
+    the Windows argv paths or inherit arbitrary environment variables, so these
+    host-side workflow tests produce false failures.  Git for Windows ships a
+    native-path-aware Bash; prefer it when available.
+    """
+    if os.name == "nt":
+        git = shutil.which("git")
+        if git:
+            candidate = Path(git).resolve().parent.parent / "bin" / "bash.exe"
+            if candidate.is_file():
+                return str(candidate)
+        for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+            root = os.environ.get(env_name)
+            if root:
+                candidate = Path(root) / "Git" / "bin" / "bash.exe"
+                if candidate.is_file():
+                    return str(candidate)
+        return None
+    return shutil.which("bash")
+
+
 def _prompt(name: str) -> str:
     """Read a review-prompt file.
 
@@ -100,7 +125,18 @@ class TestHumanOverrideHandler:
         assert "issue_comment:" in workflow
         assert "pull_request_target:" not in workflow
         assert "actions/checkout@" not in workflow
-        assert "/ai-review override <fable|gpt|all> <current-sha>: <reason>" in workflow
+        assert "/ai-review override <fable|gpt|design|ux|first-principles|all> <current-sha>: <reason>" in workflow
+
+    def test_handler_covers_the_design_family_lanes(self) -> None:
+        # Promoting UX / First Principles to blocking is only safe if a false
+        # BLOCK has a human escape hatch. The override handler must accept the
+        # design-family targets and re-run those lanes -- the re-run's
+        # human-override step then skips the model and the gate passes.
+        workflow = _workflow("ai-review-human-override.yml")
+        assert "(fable|gpt|design|ux|first-principles|all)" in workflow
+        assert 'rerun_reviewer "design-review.yml"' in workflow
+        assert 'rerun_reviewer "ux-review.yml"' in workflow
+        assert 'rerun_reviewer "first-principles-review.yml"' in workflow
 
     def test_handler_requires_write_permission_fresh_sha_and_reason(self) -> None:
         workflow = _workflow("ai-review-human-override.yml")
@@ -141,6 +177,34 @@ class TestLineReviewHumanOverrides:
         assert "✅ human override accepted" in workflow
         assert "Human judgment by $OVERRIDE_ACTOR overrides Opus 4.8" in workflow
         assert "/ai-review override fable $HEAD:" in workflow
+
+    @pytest.mark.parametrize(
+        "name,target,lane",
+        [
+            ("design-review.yml", "design", "Design Review"),
+            ("ux-review.yml", "ux", "UX Review"),
+            ("first-principles-review.yml", "first-principles", "First Principles Review"),
+        ],
+    )
+    def test_design_family_consumes_a_bot_authored_sha_scoped_record(self, name, target, lane) -> None:
+        # The newly-blocking lanes mirror the fable/gpt override contract: a
+        # bot-authored, SHA-scoped record skips the model review and passes the
+        # gate, so a false BLOCK is clearable without a code change.
+        workflow = _workflow(name)
+        assert f"target={target} head=$HEAD" in workflow
+        assert '.user.login == "github-actions[bot]"' in workflow
+        assert "steps.human_override.outputs.active != 'true'" in workflow
+        assert "✅ human override accepted" in workflow
+        assert f"overrides {lane} for $HEAD. Passing gate." in workflow
+        # The resolver MUST run before the OIDC/credentials step, and that step
+        # must itself be gated on the override -- otherwise an OIDC failure
+        # skips the resolver and the override can never clear an infra-failed
+        # lane (regression guard for the round-2 ordering finding).
+        assert workflow.index("name: Resolve human override") < workflow.index(
+            "uses: aws-actions/configure-aws-credentials"
+        )
+        creds_if = workflow.split("uses: aws-actions/configure-aws-credentials")[1].split("with:")[0]
+        assert "steps.human_override.outputs.active != 'true'" in creds_if
 
     def test_gpt_has_clear_verdict_banner_and_human_override(self) -> None:
         workflow = _workflow("codex-review.yml")
@@ -260,7 +324,7 @@ class TestPrReadiness:
         assert 'cat "codex-pass-3.md"' not in review_step
 
     def test_utf8_byte_bounds_tolerate_a_split_multibyte_character(self, tmp_path: Path) -> None:
-        bash = shutil.which("bash")
+        bash = _bash()
         if bash is None or shutil.which("iconv") is None:
             pytest.skip("GPT review workflow truncation requires Bash and iconv")
 
@@ -635,7 +699,7 @@ class TestFirstPrinciplesReview:
     def test_credential_gate_matches_real_token_shapes(self, tmp_path: Path) -> None:
         # Execute the ACTUAL gate regex against representative inputs, so a broken
         # character class fails here instead of publishing a token.
-        bash = shutil.which("bash")
+        bash = _bash()
         if bash is None:
             pytest.skip("the gate runs under Bash")
         match = re.search(
@@ -892,7 +956,7 @@ class TestFirstPrinciplesShellSyntax:
 
     @pytest.mark.parametrize("lane", FP_LANES)
     def test_every_run_block_parses(self, lane: str, tmp_path: Path) -> None:
-        bash = shutil.which("bash")
+        bash = _bash()
         if bash is None:
             pytest.skip("run blocks are Bash; skip where Bash is absent")
         blocks = self._run_blocks(lane)
@@ -945,7 +1009,7 @@ class TestFirstPrinciplesScopeGateBehavior:
         ],
     )
     def test_surface_classification(self, lane: str, touched: str, want: bool) -> None:
-        bash = shutil.which("bash")
+        bash = _bash()
         if bash is None:
             pytest.skip("surface classification runs only under Bash")
         block = self._classifier(lane)
@@ -1354,6 +1418,23 @@ class TestClaudeReviewQualityDimensions:
         assert "Style, formatting, naming, import order" in disco
         assert "flake8, mypy, isort, eslint" in disco
         assert "Judge" in disco and "behaviour, not form" in disco
+
+    def test_retired_single_user_premise_is_gone(self) -> None:
+        """Regression for #3484: both opus lanes carried a variant of the
+        retired 'single-user tool ... proportional to that shape' premise
+        that a prior fix (#3451) replaced with deployment-neutral framing in
+        the four workflow-inline reviewer prompts, but left these two shared
+        prompt files untouched -- a contradiction between the lanes reading
+        the same repo. The replacement text still quotes "single-user tool"
+        once, as an example of forbidden reasoning -- that is intentional and
+        not the retired premise.
+        """
+        for stage in ("opus-discovery", "opus-validate"):
+            text = _flat(_review_prompt(stage))
+            assert "proportional to that shape" not in text, stage
+            assert "Judge reachability against that shape" not in text, stage
+            assert "DO NOT REASON FROM AN ASSUMED USER COUNT" in text, stage
+            assert "DERIVED rather than speculative" in text, stage
 
 
 class TestGptPrIntentGrounding:
