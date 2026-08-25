@@ -22,6 +22,26 @@ const CRON_DOW_TO_GRID: Record<number, number> = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5,
 
 
 
+/** The pinned crew, rendered as a fact rather than a disabled selector — a
+ * greyed-out control asks to be re-enabled; a value does not. Shrink-wrapped
+ * so it cannot read as an editable input among the real ones, and the hint
+ * says WHY it is fixed, replacing the picker's own hint line. */
+function LockedAgentValue({ name }: { name: string }) {
+  const hint = i18nT('components.jobForm.agent_pinned_hint')
+  return (
+    <span className="flex flex-col items-start gap-1">
+      <span className="text-[11px] text-muted/70">{hint}</span>
+      <span
+        className="inline-flex items-center rounded-full border border-border bg-bg-hover px-2.5 py-0.5 font-mono text-[12px] text-text-strong"
+        title={hint}
+        data-testid="jobform-locked-agent"
+      >
+        {name}
+      </span>
+    </span>
+  )
+}
+
 /** Job execution kind. 'message' runs the agent; 'script'/'command' are
  * LLM-less (Python callable / shell) and have no message, agent, or approval. */
 export type JobKind = 'message' | 'script' | 'command'
@@ -105,6 +125,11 @@ interface Props {
   prefill?: CronPrefill
   agents: KiroCrewAgent[]
   defaultAgent: string
+  /** Pin the job to ONE crew: the agent field renders as a fixed value instead
+   *  of a selector, and the submit body always carries this name. For hosts
+   *  that embed the form inside a single crew's own surface, where offering a
+   *  crew picker would just be a way to file the job in the wrong place. */
+  lockedAgent?: string
   onSaved: () => void
   /** Vertical layout for side panel, horizontal for inline create */
   layout?: 'vertical' | 'horizontal'
@@ -116,7 +141,9 @@ interface Props {
   onSavingChange?: (saving: boolean) => void
 }
 
-export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange }: Props) {
+export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange }: Props) {
+  // "" and undefined both mean unlocked, so render and submit share one truth.
+  const locked = lockedAgent || undefined
   const defaults = parseJobDefaults(job)
   // In create mode (no job), a preset can seed the prompt + schedule fields.
   // Edit mode always reflects the job as-stored and ignores any prefill.
@@ -182,7 +209,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
 
   const submit = async () => {
     setError(''); setSaving(true)
-    const f = { name, message: msg, agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
+    const f = { name, message: msg, agent: locked ?? agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
     const body = buildBody(f, tz, setError, !!job)
     if (!body) { setSaving(false); return }
     try {
@@ -252,7 +279,9 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
         <div className="flex gap-2 items-center flex-wrap">
           <Input placeholder={i18nT('components.jobForm.job_name')} value={name} onChange={e => setName(e.target.value)} />
           <Input placeholder={i18nT('components.jobForm.message_task')} style={{ flex: 2 }} value={msg} onChange={e => setMsg(e.target.value)} />
-          <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} />
+          {locked
+            ? <LockedAgentValue name={locked} />
+            : <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} />}
           <SimpleSelect
             options={modelOptions.values}
             optionLabels={modelOptions.labels}
@@ -316,8 +345,12 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
         {!isLlmless && (<>
         <div className="flex flex-col gap-1">
           <span className="text-[12px] text-muted font-medium">{i18nT('components.jobForm.agent')}</span>
-          <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_agent_handles_this_job_leave_default_for_t')}</span>
-          <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} />
+          {locked
+            ? <LockedAgentValue name={locked} />
+            : (<>
+              <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_agent_handles_this_job_leave_default_for_t')}</span>
+              <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} />
+            </>)}
         </div>
         </>)}
         {!isLlmless && (

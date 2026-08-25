@@ -3463,6 +3463,8 @@
   "components": {
     "crewWakeSection": {
       "could_not_load_this_crew_s_schedules_so_what_wak": "Could not load this crew's schedules, so what wakes it is unknown.",
+      "cancel_new_schedule": "Cancel new schedule",
+      "new_schedule": "New schedule",
       "no_schedules_run_this_crew_automatically": "No schedules run this crew automatically.",
       "open_schedule": "Open Schedule",
       "schedule": "schedule",
@@ -4011,6 +4013,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "A short label for this job",
+      "agent_pinned_hint": "Created from this crew's editor, so the job runs as this crew.",
       "agent": "Agent",
       "approval": "Approval",
       "approval_default": "Approval: default",
@@ -6130,6 +6133,7 @@
       "danger_zone": "Danger zone",
       "default_2": "default",
       "delete_crew": "Delete crew",
+      "finish_the_new_schedule_first": "Finish or cancel the new schedule first",
       "delete_crew_named_confirm": "Delete crew {{name}}? New chats will no longer use it. Its files, memory and past conversations are kept, but you would have to set it up again.",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "Deleting a crew unbinds it from new sessions. Its workspace, memory store and past transcripts are kept.",
       "directory": "Directory",

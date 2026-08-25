@@ -4689,6 +4689,8 @@
     "crewWakeSection": {
       "active": "attivo",
       "could_not_load_this_crew_s_schedules_so_what_wak": "Non è stato possibile caricare le pianificazioni di questo crew, quindi non si sa cosa lo attivi.",
+      "cancel_new_schedule": "Annulla nuova pianificazione",
+      "new_schedule": "Nuova pianificazione",
       "no_schedules_run_this_crew_automatically": "Nessuna pianificazione esegue questo crew automaticamente.",
       "open_schedule": "Apri Pianificazione",
       "pause_named": "Metti in pausa {{name}}",
@@ -5717,6 +5719,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "Una breve etichetta per questo job",
+      "agent_pinned_hint": "Creato dall’editor di questa crew; il job viene eseguito come questa crew.",
       "add": "Aggiungi",
       "agent": "Agente",
       "approval": "Approvazione",
@@ -9479,6 +9482,7 @@
       "danger_zone": "Zona di pericolo",
       "default_2": "predefinito",
       "delete_crew": "Elimina il crew",
+      "finish_the_new_schedule_first": "Prima completa o annulla la nuova pianificazione",
       "delete_crew_named_confirm": "Eliminare il crew {{name}}? Le nuove chat non lo useranno più. I suoi file, la sua memoria e le conversazioni passate restano, ma dovresti configurarlo di nuovo.",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "Eliminare un crew lo scollega soltanto dalle nuove sessioni. Il suo workspace, il suo archivio della memoria e le trascrizioni passate vengono conservati.",
       "directory": "Directory",

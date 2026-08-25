@@ -4559,6 +4559,8 @@
     "crewWakeSection": {
       "active": "활성",
       "could_not_load_this_crew_s_schedules_so_what_wak": "이 크루의 일정을 불러올 수 없어 무엇이 깨우는지 알 수 없습니다.",
+      "cancel_new_schedule": "새 일정 취소",
+      "new_schedule": "새 일정",
       "no_schedules_run_this_crew_automatically": "이 크루를 자동으로 실행하는 일정이 없습니다.",
       "open_schedule": "일정 열기",
       "pause_named": "{{name}} 일시중지",
@@ -5551,6 +5553,7 @@
     },
     "jobForm": {
       "a_short_label_for_this_job": "이 작업의 짧은 레이블",
+      "agent_pinned_hint": "이 Crew의 편집기에서 생성되어 작업이 이 Crew로 실행됩니다.",
       "add": "작업 추가",
       "agent": "에이전트",
       "approval": "승인",
@@ -9223,6 +9226,7 @@
       "danger_zone": "위험 구역",
       "default_2": "기본값",
       "delete_crew": "크루 삭제",
+      "finish_the_new_schedule_first": "먼저 새 일정을 완료하거나 취소하세요",
       "delete_crew_named_confirm": "크루 {{name}}을(를) 삭제하시겠습니까? 새 채팅에서는 더 이상 사용되지 않습니다. 파일, 메모리, 지난 대화는 유지되지만 다시 설정해야 합니다.",
       "deleting_a_crew_unbinds_it_from_new_sessions_its": "크루를 삭제하면 새 세션에서 연결이 해제됩니다. 워크스페이스, 메모리 저장소, 지난 기록은 유지됩니다.",
       "directory": "디렉터리",

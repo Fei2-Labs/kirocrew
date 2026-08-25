@@ -820,7 +820,8 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    *  pointed somewhere else, so a crew never opens on the pane the previous one
    *  happened to be left on. */
   const [pane, setPane] = useState<CrewPaneKey>('overview')
-  useEffect(() => { setPane('overview') }, [sheet])
+  const [schedDraft, setSchedDraft] = useState(false)
+  useEffect(() => { setPane('overview'); setSchedDraft(false) }, [sheet])
 
   /** Pane changes driven from INSIDE a pane (an overview diagram node) rather
    *  than from the rail. The clicked node unmounts with its pane, which would
@@ -889,8 +890,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     }
     if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
     if (triggers !== (editingAgent.triggers || '')) out.add('routing')
+    // An open inline schedule-create form is pending work too: it gets the
+    // rail's unsaved dot and the note, so closing the editor cannot silently
+    // eat a half-typed schedule the way an untracked surface would.
+    if (schedDraft) out.add('schedules')
     return out
-  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers])
+  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers, schedDraft])
 
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
@@ -1221,7 +1226,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   )}
 
                   {pane === 'schedules' && (
-                    <CrewWakeSection crew={editing} isDefaultCrew={editing === defaultAgent} />
+                    <CrewWakeSection crew={editing} isDefaultCrew={editing === defaultAgent} onDraftChange={setSchedDraft} />
                   )}
 
                   {pane === 'webhook' && <CrewWebhookSection crew={editing} />}
@@ -1279,7 +1284,11 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 {createMut.isPending ? i18nT('pages.kiroCrewAgentsPage.creating') : i18nT('pages.kiroCrewAgentsPage.create')}
               </SendBtn>
             ) : (
-              <SendBtn onClick={saveEdit} disabled={sheetBusy || dirtyPanes.size === 0}>{i18nT('pages.kiroCrewAgentsPage.save_changes')}</SendBtn>
+              <SendBtn
+                onClick={saveEdit}
+                disabled={sheetBusy || dirtyPanes.size === 0 || schedDraft}
+                title={schedDraft ? i18nT('pages.kiroCrewAgentsPage.finish_the_new_schedule_first') : undefined}
+              >{i18nT('pages.kiroCrewAgentsPage.save_changes')}</SendBtn>
             )}
           </DialogFooter>
 
