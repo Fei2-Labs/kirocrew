@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
@@ -13,6 +14,8 @@ from kiro_crew.connections import get_provider
 from kiro_crew.connections.registry import Provider
 from kiro_crew.dashboard.handlers.mcp import _is_valid_mcp_name
 from kiro_crew.sel import sel
+
+logger = logging.getLogger(__name__)
 
 _MAX_RETURN_ADDRESS_BYTES = 8192
 _MAX_REQUEST_TARGET_BYTES = 6144
@@ -268,9 +271,11 @@ async def _mint_request(
 ) -> tuple[dict, Provider] | web.Response:
     """The JSON body and its registry provider, or the error response to return.
 
-    Registry membership is the bound on what a caller can make the gateway spawn: a
-    mint starts a kiro-cli process, so the slug has to resolve to a provider we ship
-    rather than to arbitrary caller-supplied text.
+    Registry membership is the bound on what a caller can make the gateway act on:
+    a mint starts a kiro-cli process and a disconnect deletes stored grant
+    artifacts, so the slug has to resolve to a provider we ship rather than to
+    arbitrary caller-supplied text. Shared by every provider-scoped endpoint so
+    that bound is enforced in one place.
     """
     try:
         body = await request.json()
@@ -433,3 +438,224 @@ async def api_connections_cancel(request: web.Request) -> web.Response:
         )
     )
     return web.json_response({"ok": True, "slug": slug, "dropped": dropped})
+
+
+@dataclass(frozen=True)
+class _DisconnectScope:
+    """What one Disconnect is allowed to remove, decided from a single read."""
+
+    entry_removed: bool
+    grant_shared_with: tuple[str, ...]
+
+
+async def _remove_provider_entry(slug: str, mcp_url: str) -> _DisconnectScope:
+    """Purge ``slug``'s MCP entry, and report whether the grant is ours alone.
+
+    Both questions are answered from ONE pass taken inside the MCP file lock,
+    because they gate different destructive acts and must not disagree:
+
+    * is the entry configured under this slug actually this provider's?
+    * does any OTHER entry share the provider's grant ARTIFACTS?
+
+    They deliberately use DIFFERENT identity functions, because they protect
+    different things. Entry identity is ``normalized_endpoint`` on name AND url --
+    the pair the card matches on and the rule :mod:`kiro_crew.connections.l1_smoke`
+    keeps -- so a user's same-named server at another endpoint is never purged.
+    Grant identity is ``grant_key`` equality, because the artifacts being protected
+    are FILES NAMED BY ``grant_key``, and the two functions disagree in both
+    directions: ``normalized_endpoint`` keeps the query string and strips a
+    trailing slash, ``grant_key`` drops the query and keeps the path verbatim. A
+    ``?workspace=`` variant shares our artifact pair but is a different endpoint;
+    a trailing-slash variant is the same endpoint but a different artifact pair.
+    Testing the credential with the endpoint comparator would delete a shared
+    grant in the first case and strand a live one (reported as a deliberate keep)
+    in the second.
+
+    The sharing sweep reads the RAW scope specs, not the probe view:
+    ``list_servers`` drops disabled entries outside the KiroCrew scope, and a
+    user's switched-off server still owns its grant -- deleting it because its
+    entry is disabled would force a fresh consent the moment they re-enable it.
+    The probe view is unioned in so an agent-config-only row still counts.
+
+    Residuals, stated rather than papered over: the caller revokes AFTER the
+    locked section, so an entry created at the same endpoint in that window loses
+    a grant it has not used yet (holding the lock across the unlinks would stall
+    every config writer for as long as a network-mounted home does); and the
+    entry-identity check sees only each name's priority winner, so a same-named
+    entry in a lower-priority scope with a different URL is still purged unseen.
+
+    Reuses the apply path's own config-side uninstall so a Disconnect and an
+    ``uninstall`` apply remove byte-identical config rather than drifting into two
+    definitions of "removed". A failed agent-config rebuild is logged, not raised:
+    the config write has already landed by then, so failing the request would report
+    a Disconnect that did not happen.
+    """
+    from kiro_crew.connections.mint import grant_key
+    from kiro_crew.connections.tool_aliases import normalized_endpoint
+    from kiro_crew.dashboard.handlers.mcp import (
+        _get_mcp_lock,
+        _offload_config_write,
+        _purge_server_config,
+    )
+    from kiro_crew.mcp_discovery import _load_mcp_json_by_source, list_servers
+
+    wanted = normalized_endpoint(mcp_url)
+    wanted_key = grant_key(mcp_url)
+
+    def _artifact_key(url: object) -> str | None:
+        """``grant_key`` of a validated URL, or None when no pair can exist.
+
+        ONE pipeline: the string that is screened is BYTE-IDENTICAL to the string
+        that is hashed. Round 3 guarded three malformed shapes and round 4 found a
+        fourth (a trailing space after an explicit port -- ``urlsplit`` lstrips
+        only) precisely because ``normalized_endpoint`` parsed ``value.strip()``
+        while ``grant_key`` parsed the raw value, so the screen's guarantee never
+        transferred. Stripping once and handing both functions the same bytes
+        makes that divergence unrepresentable instead of enumerated: any string
+        ``grant_key`` receives has already survived the same ``urlsplit`` and
+        ``parts.port`` reads on the same input.
+
+        An unscreenable URL is SKIPPED, not counted as a sharer: the artifact
+        pair is named by a hash of a successful parse, and every screened-out
+        shape either cannot be hashed at all or hashes away from our key -- while
+        failing closed would let one junk config line permanently disable
+        revocation for every provider under a false "shared" message.
+        """
+        if not isinstance(url, str):
+            return None
+        candidate = url.strip()
+        if normalized_endpoint(candidate) is None:
+            return None
+        return grant_key(candidate)
+
+    def _sharers(configured: list, by_source: dict) -> tuple[str, ...]:
+        """Names of OTHER entries whose URL names the same artifact pair.
+
+        Raw specs first (disabled entries included -- a switched-off server still
+        owns its grant), probe rows unioned in for agent-config-only entries.
+        """
+        names: set[str] = set()
+        for scope_specs in by_source.values():
+            for name, spec in scope_specs.items():
+                if name == slug or not isinstance(spec, dict):
+                    continue
+                if _artifact_key(spec.get("url")) == wanted_key:
+                    names.add(name)
+        for server in configured:
+            if server.name != slug and _artifact_key(server.url) == wanted_key:
+                names.add(server.name)
+        return tuple(sorted(names))
+
+    async with _get_mcp_lock():
+        configured = await asyncio.to_thread(list_servers)
+        by_source = await asyncio.to_thread(_load_mcp_json_by_source)
+        ours = any(
+            server.name == slug and normalized_endpoint(server.url) == wanted
+            for server in configured
+        )
+        shared = _sharers(configured, by_source)
+        if not ours:
+            logger.info(
+                "Disconnect left the %r entry alone: its endpoint is not this provider's", slug
+            )
+            return _DisconnectScope(entry_removed=False, grant_shared_with=shared)
+        # Shielded, not a bare to_thread: a cancelled request task would release the
+        # MCP lock while the worker is still rewriting the store, letting a
+        # concurrent purge interleave with this stale snapshot. mcp.py ships this
+        # helper for exactly that, and its docstring names the hazard.
+        await _offload_config_write(_purge_server_config, slug)
+
+    try:
+        from kiro_crew.agent import rebuild_agent_config
+
+        await asyncio.to_thread(rebuild_agent_config)
+    except Exception:  # noqa: BLE001 — the config write already landed
+        logger.warning("agent config rebuild failed after disconnect", exc_info=True)
+    return _DisconnectScope(entry_removed=True, grant_shared_with=shared)
+
+
+async def api_connections_disconnect(request: web.Request) -> web.Response:
+    """POST /api/connections/disconnect — undo a connection on this machine.
+
+    Body: ``{"slug": "<registry provider>"}``. Three local things, in order: any
+    in-flight mint is torn down, the runtime's stored grant artifacts are unlinked,
+    and the MCP entry is removed from every scope.
+
+    Deleting the artifacts is the whole point of this endpoint. Removing the config
+    entry alone left a usable refresh token on disk, so a later reconnect resumed
+    the old grant silently instead of asking for consent -- while the card had
+    already told the user this machine's connection was gone.
+
+    What it deliberately does NOT do is revoke at the provider. Nothing here can;
+    only the provider can. So the response never claims the upstream grant is dead,
+    and the card keeps sending the user to the provider's revoke page as well.
+
+    ``grantRemoved`` and ``grantSurviving`` are separate answers on purpose: the
+    artifacts are a pair, and "the token went" is not the same fact as "the grant is
+    gone". The caller is told which one happened instead of inferring it from a
+    delete loop's own optimism, and the audit outcome is ``partial`` when anything
+    survived.
+    """
+    parsed = await _mint_request(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    _body, provider = parsed
+    slug = str(provider["slug"])
+    mcp_url = str(provider["mcp_url"])
+
+    # Function-local, same boot-path reason as the mint handlers.
+    from kiro_crew.connections.mint import (
+        cancel_mint,
+        revoke_local_grant,
+        surviving_grant_artifacts,
+    )
+
+    # A pending mint for this provider is now moot, and leaving it live would let
+    # a grant arrive moments after the user asked for the connection to be gone.
+    await cancel_mint(slug, None)
+    # The entry decision comes FIRST, because it is what establishes whether this
+    # provider's grant is ours alone to delete.
+    scope = await _remove_provider_entry(slug, mcp_url)
+    if scope.grant_shared_with:
+        # Endpoint-keyed grant, more than one entry using it. Deleting it would
+        # deauthorize a server this Disconnect was never asked to touch, and the
+        # refresh token is not recoverable locally, so the grant stays.
+        removed: list[str] = []
+        logger.info(
+            "Disconnect kept %r's stored grant: %s still use the same endpoint",
+            slug,
+            ", ".join(scope.grant_shared_with),
+        )
+    else:
+        # Off the loop for the same reason grant_present is: these stat and unlink
+        # paths under the user's home, which stall as long as a network mount does.
+        removed = await asyncio.to_thread(revoke_local_grant, mcp_url)
+    # Asked rather than inferred from ``removed``: a survivor is what decides
+    # whether this Disconnect actually held.
+    surviving = await asyncio.to_thread(surviving_grant_artifacts, mcp_url)
+
+    # Off the loop: the FIRST sel() of a process constructs the log. Same
+    # reasoning as api_connections_cancel above.
+    await asyncio.to_thread(
+        lambda: sel().log_api_access(
+            caller="dashboard",
+            operation="connections_disconnect",
+            outcome="ok" if not surviving or scope.grant_shared_with else "partial",
+            source="dashboard",
+            resources=(
+                f"provider:{slug} artifacts_removed={len(removed)} "
+                f"surviving={len(surviving)} entry_removed={scope.entry_removed} "
+                f"grant_shared={len(scope.grant_shared_with)}"
+            ),
+        )
+    )
+    return web.json_response(
+        {
+            "ok": True,
+            "disconnected": slug,
+            "grantRemoved": bool(removed),
+            "grantSurviving": surviving,
+            "entryRemoved": scope.entry_removed,
+            "grantSharedWith": list(scope.grant_shared_with),
+        }
+    )

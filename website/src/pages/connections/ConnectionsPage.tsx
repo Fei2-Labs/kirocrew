@@ -221,9 +221,10 @@ export function uninstallOnCancel(pending: PendingConnect | undefined): boolean 
 export function disconnectFeedback(
   provider: Pick<ConnectionProvider, 'name' | 'revoke_page_url'>,
   text: string,
+  kind: Feedback['kind'] = 'success',
 ): Feedback {
   return {
-    kind: 'success',
+    kind,
     text,
     revoke: { href: provider.revoke_page_url, provider: provider.name },
   }
@@ -855,17 +856,64 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
   })
 
   const disconnect = async (provider: ConnectionProvider, server: McpServer, cancelled = false) => run(provider, 'disconnect', async () => {
-    await api.mcpApply([{ name: server.name, uninstall: true }])
+    // Cancel must NOT revoke, and this branch is load-bearing. A grant is keyed by
+    // ENDPOINT, not by entry, so a cancelled *new* connect routed through the
+    // revoking endpoint would delete a grant that a user's own separately-named
+    // server at the same URL is still using — silently, because `cancelled`
+    // suppresses the note below. Cancel therefore keeps the entry-only removal it
+    // always had; only a deliberate Disconnect revokes.
+    if (cancelled) {
+      await api.mcpApply([{ name: server.name, uninstall: true }])
+    }
+    // One call does all three local things: dispose any in-flight mint, delete the
+    // stored grant artifacts when they are ours alone, and remove the MCP entry.
+    // This was an mcpApply uninstall, which took the entry out and left a usable
+    // refresh token on disk — so a later reconnect silently resumed a grant this
+    // card had already told the user was gone.
+    const result = cancelled ? undefined : await api.connectionsDisconnect(provider.slug)
     setLocallyWaiting(current => {
       const next = { ...current }
       delete next[provider.slug]
       return next
     })
     await queryClient.invalidateQueries({ queryKey: ['mcp-servers'] })
-    if (!cancelled) {
+    // The grant feed too, mirroring the connect-completed path: a Disconnect that
+    // deletes the grant but keeps the entry would otherwise leave the cached
+    // grantPresent=true rendering "Connected" beside a note saying the grant is
+    // gone, until the next poll.
+    void queryClient.invalidateQueries({ queryKey: ['connections-status'] })
+    if (result) {
+      // Facts are reported INDEPENDENTLY, never as an exclusive chain — two review
+      // rounds landed findings in this span because each single message asserted a
+      // second fact it never tested ("Entry removed." while the entry stayed;
+      // "Disconnected, but…" while the backend declined). The GRANT clause states
+      // only what happened to the grant; the ENTRY clause is appended whenever the
+      // backend left the entry alone. A real survivor is the one alert: a grant
+      // outliving the click is the state this endpoint exists to prevent. A grant
+      // deliberately kept for a sharer is expected, so it stays a status.
+      const shared = result.grantSharedWith.length > 0
+      const survived = !shared && result.grantSurviving.length > 0
+      const entryKept = !result.entryRemoved
+      const grantClause = survived
+        ? t('pages.connectionsPage.disconnect_grant_survived')
+        : shared
+          ? t('pages.connectionsPage.disconnect_grant_shared')
+          : result.grantRemoved && entryKept
+            ? t('pages.connectionsPage.disconnect_entry_not_ours')
+            : entryKept
+              ? '' // no grant existed and the entry stayed: the entry clause is the whole story
+              : t('pages.connectionsPage.disconnected_locally')
+      const entryClause =
+        entryKept && (survived || shared || !result.grantRemoved)
+          ? t('pages.connectionsPage.disconnect_entry_left_alone')
+          : ''
       setFeedback(current => ({
         ...current,
-        [provider.slug]: disconnectFeedback(provider, t('pages.connectionsPage.disconnected_locally')),
+        [provider.slug]: disconnectFeedback(
+          provider,
+          [grantClause, entryClause].filter(Boolean).join(' '),
+          survived ? 'error' : 'success',
+        ),
       }))
     }
   })
