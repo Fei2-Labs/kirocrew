@@ -631,6 +631,8 @@ class TestConservativeShutdown:
     async def test_session_sharing_never_kills_runtime(self):
         """Session-sharing subagent reap → conservative shutdown only, NEVER SIGKILL."""
         from kiro_crew.subagent import SubagentInfo, SubagentManager
+        from kiro_crew.subagent_lifecycle import SubagentLifecycle
+        from kiro_crew.subagent_scheduler import SubagentScheduler
 
         info = SubagentInfo(
             id="agent-001",
@@ -642,15 +644,11 @@ class TestConservativeShutdown:
         )
 
         mgr = SubagentManager.__new__(SubagentManager)
+        mgr._scheduler = SubagentScheduler(max_concurrent=3, stagger_seconds=0.0)
+        mgr._scheduler.running_count = 1
+        mgr._lifecycle = SubagentLifecycle()
         mgr._agents = {"agent-001": info}
         mgr._tasks = {}
-        mgr._report_tasks = set()
-        mgr._report_owners = {}
-        # Fork adaptation: _force_reap pumps the spawn queue after freeing a
-        # slot (a1933a4b, ported earlier in this branch); an empty queue makes
-        # _drain_queue return immediately without touching other attrs.
-        mgr._queue = []
-        mgr._running_count = 1
         mgr._default_timeout = 300
         mgr._default_turn_limit = 100
         mgr._write_tombstone = MagicMock()
@@ -688,6 +686,8 @@ class TestConservativeShutdown:
     async def test_session_sharing_with_co_tenants_still_conservative(self):
         """Even with co-tenants, session-sharing → conservative shutdown (same path)."""
         from kiro_crew.subagent import SubagentInfo, SubagentManager
+        from kiro_crew.subagent_lifecycle import SubagentLifecycle
+        from kiro_crew.subagent_scheduler import SubagentScheduler
 
         shared_pid = 2**22 + 88888
         info_a = SubagentInfo(
@@ -708,13 +708,11 @@ class TestConservativeShutdown:
         )
 
         mgr = SubagentManager.__new__(SubagentManager)
+        mgr._scheduler = SubagentScheduler(max_concurrent=3, stagger_seconds=0.0)
+        mgr._scheduler.running_count = 2
+        mgr._lifecycle = SubagentLifecycle()
         mgr._agents = {"agent-001": info_a, "agent-002": info_b}
         mgr._tasks = {}
-        mgr._report_tasks = set()
-        mgr._report_owners = {}
-        # Fork adaptation: see test_session_sharing_never_kills_runtime.
-        mgr._queue = []
-        mgr._running_count = 2
         mgr._default_timeout = 300
         mgr._default_turn_limit = 100
         mgr._write_tombstone = MagicMock()
