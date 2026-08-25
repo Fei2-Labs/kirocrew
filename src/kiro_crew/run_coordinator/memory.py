@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from .models import (
+    LEGACY_SHADOW_SOURCE_VERSION,
     CommandClaim,
     CommandFence,
     CommandOperation,
@@ -20,9 +21,12 @@ from .models import (
     DeliveryFence,
     DeliveryState,
     DesiredState,
+    LegacyImportReceipt,
+    LegacyRunImport,
     ObservedState,
     OutboxEvent,
     OwnerLease,
+    RecoveryClaim,
     RunCommand,
     RunCompletion,
     RunFence,
@@ -37,6 +41,7 @@ _EXECUTION_COMMANDS = frozenset({CommandOperation.SPAWN, CommandOperation.CONTIN
 _CONTROL_COMMANDS = frozenset(
     {CommandOperation.STEER, CommandOperation.CANCEL, CommandOperation.RELEASE}
 )
+_LEGACY_SHADOW_RECOVERY_GRACE_SECONDS = 60.0
 _STARTABLE_STATES = frozenset({ObservedState.ACCEPTED, ObservedState.QUEUED})
 _COMPLETABLE_STATES = frozenset(
     {
@@ -125,6 +130,7 @@ class MemoryRunCoordinator:
                 created_at=now,
                 updated_at=now,
                 terminal_at=None if accepted else now,
+                source_version=request.source_version,
             )
             command = RunCommand(
                 command_id=request.command_id,
@@ -216,6 +222,98 @@ class MemoryRunCoordinator:
                 )
             return self._result(CoordinatorDecision.APPLIED, CoordinatorReason.CREATED, receipt)
 
+    async def import_legacy(
+        self, request: LegacyRunImport
+    ) -> CoordinatorResult[LegacyImportReceipt]:
+        """Create a legacy-only run without manufacturing an execution command."""
+
+        async with self._lock:
+            terminal = request.observed_state is ObservedState.TERMINAL
+            if terminal != (request.outcome is not None):
+                return self._result(
+                    CoordinatorDecision.REJECTED,
+                    CoordinatorReason.INVALID_TRANSITION,
+                )
+            if bool(request.event_type) != bool(request.delivery_state):
+                return self._result(
+                    CoordinatorDecision.REJECTED,
+                    CoordinatorReason.INVALID_TRANSITION,
+                )
+            existing = self._runs.get(request.run_id)
+            if existing is not None:
+                event_id = self._outbox_by_run_type.get((request.run_id, request.event_type))
+                existing_event = self._outbox.get(event_id) if event_id else None
+                # Legacy files are evidence, not lifecycle authority. A crash
+                # can leave a durable coordinator row before result.txt is
+                # written, so retain that path for the fenced recovery which
+                # follows. Never copy terminal state, outcome, error, owner, or
+                # version from an agent-writable tombstone into an existing row.
+                if (
+                    existing.observed_state is not ObservedState.TERMINAL
+                    and not existing.result_path
+                    and request.result_path
+                ):
+                    existing = replace(existing, result_path=request.result_path)
+                    self._runs[request.run_id] = existing
+                    return self._result(
+                        CoordinatorDecision.APPLIED,
+                        CoordinatorReason.TRANSITIONED,
+                        LegacyImportReceipt(existing, existing_event, created=False),
+                    )
+                return self._result(
+                    CoordinatorDecision.UNCHANGED,
+                    CoordinatorReason.IDEMPOTENT_REPLAY,
+                    LegacyImportReceipt(existing, existing_event, created=False),
+                )
+            run = RunRecord(
+                run_id=request.run_id,
+                parent_session=request.parent_session,
+                agent=request.agent,
+                task=request.task,
+                conversation_key=request.conversation_key,
+                desired_state=DesiredState.RUN,
+                observed_state=request.observed_state,
+                outcome=request.outcome,
+                result_path=request.result_path,
+                error=request.error,
+                attempt=1,
+                version=1,
+                owner_id="",
+                lease_expires_at=0.0,
+                lease_epoch=0,
+                created_at=request.created_at,
+                updated_at=request.updated_at,
+                terminal_at=request.terminal_at,
+                source_version=request.source_version,
+            )
+            self._runs[run.run_id] = run
+            event: OutboxEvent | None = None
+            if request.event_type and request.delivery_state is not None:
+                delivered = request.delivery_state is DeliveryState.DELIVERED
+                event = OutboxEvent(
+                    event_id=self._id_factory(),
+                    run_id=run.run_id,
+                    run_version=run.version,
+                    destination=request.destination,
+                    event_type=request.event_type,
+                    payload_json=request.payload_json,
+                    status=request.delivery_state,
+                    attempts=1 if delivered else 0,
+                    available_at=request.updated_at,
+                    claim_owner="",
+                    claim_expires_at=0.0,
+                    claim_epoch=0,
+                    created_at=request.updated_at,
+                    delivered_at=request.terminal_at if delivered else None,
+                )
+                self._outbox[event.event_id] = event
+                self._outbox_by_run_type[(run.run_id, event.event_type)] = event.event_id
+            return self._result(
+                CoordinatorDecision.APPLIED,
+                CoordinatorReason.CREATED,
+                LegacyImportReceipt(run, event, created=True),
+            )
+
     async def get_command_by_key(self, idempotency_key: str) -> CommandReceipt | None:
         async with self._lock:
             command_id = self._command_by_key.get(idempotency_key)
@@ -256,6 +354,60 @@ class MemoryRunCoordinator:
             acquire_run_lease=acquire_run_lease,
         )
         return claims[0] if claims else None
+
+    async def claim_recovery(
+        self,
+        owner: OwnerLease,
+        limit: int,
+        exclude_run_ids: frozenset[str] = frozenset(),
+    ) -> list[RecoveryClaim]:
+        """Fence expired nonterminal runs without claiming or replaying commands."""
+
+        if limit <= 0:
+            return []
+        async with self._lock:
+            now = self._clock()
+            if owner.lease_expires_at <= now:
+                return []
+            pending_execution_run_ids = {
+                command.run_id
+                for command in self._commands.values()
+                if command.operation in _EXECUTION_COMMANDS
+                and command.status is CommandStatus.PENDING
+                and (
+                    self._runs[command.run_id].source_version != LEGACY_SHADOW_SOURCE_VERSION
+                    or self._runs[command.run_id].created_at
+                    > now - _LEGACY_SHADOW_RECOVERY_GRACE_SECONDS
+                )
+            }
+            claims: list[RecoveryClaim] = []
+            for current in sorted(
+                self._runs.values(), key=lambda item: (item.created_at, item.run_id)
+            ):
+                if len(claims) >= limit:
+                    break
+                if (
+                    current.run_id in exclude_run_ids
+                    or current.run_id in pending_execution_run_ids
+                    or current.observed_state is ObservedState.TERMINAL
+                    or current.lease_expires_at > now
+                ):
+                    continue
+                run = replace(
+                    current,
+                    owner_id=owner.owner_id,
+                    lease_expires_at=owner.lease_expires_at,
+                    lease_epoch=current.lease_epoch + 1,
+                    updated_at=now,
+                )
+                self._runs[run.run_id] = run
+                claims.append(
+                    RecoveryClaim(
+                        run=run,
+                        fence=RunFence(run.run_id, owner.owner_id, run.lease_epoch),
+                    )
+                )
+            return claims
 
     async def _claim_commands(
         self,
@@ -367,6 +519,37 @@ class MemoryRunCoordinator:
             )
             if command.status in (CommandStatus.APPLIED, CommandStatus.REJECTED):
                 if matching:
+                    result_fill = (
+                        command.status is CommandStatus.APPLIED
+                        and status is CommandStatus.APPLIED
+                        and not command.rejection_reason
+                        and not command.result_json
+                        and not rejection_reason
+                        and bool(result_json)
+                    )
+                    if result_fill and command.operation in _EXECUTION_COMMANDS:
+                        run = self._runs.get(command.run_id)
+                        if (
+                            run is None
+                            or run.owner_id != command.owner_id
+                            or run.lease_epoch != command.lease_epoch
+                        ):
+                            return self._result(
+                                CoordinatorDecision.REJECTED,
+                                CoordinatorReason.STALE_FENCE,
+                            )
+                    if result_fill:
+                        command = replace(
+                            command,
+                            result_json=result_json,
+                            updated_at=self._clock(),
+                        )
+                        self._commands[command.command_id] = command
+                        return self._result(
+                            CoordinatorDecision.APPLIED,
+                            CoordinatorReason.TRANSITIONED,
+                            command,
+                        )
                     if (
                         command.status is not status
                         or command.rejection_reason != rejection_reason
@@ -397,19 +580,6 @@ class MemoryRunCoordinator:
                 updated_at=self._clock(),
             )
             self._commands[command.command_id] = command
-            if status is CommandStatus.REJECTED and command.operation in _EXECUTION_COMMANDS:
-                run = self._runs.get(command.run_id)
-                if run is not None and run.observed_state in _STARTABLE_STATES:
-                    now = self._clock()
-                    self._runs[run.run_id] = replace(
-                        run,
-                        observed_state=ObservedState.TERMINAL,
-                        outcome=RunOutcome.FAILED,
-                        error=rejection_reason,
-                        version=run.version + 1,
-                        updated_at=now,
-                        terminal_at=now,
-                    )
             return self._result(
                 CoordinatorDecision.APPLIED,
                 CoordinatorReason.TRANSITIONED,
@@ -417,7 +587,12 @@ class MemoryRunCoordinator:
             )
 
     def _validate_transition(
-        self, run_id: str, fence: RunFence, expected_version: int
+        self,
+        run_id: str,
+        fence: RunFence,
+        expected_version: int,
+        *,
+        allow_expired: bool = False,
     ) -> CoordinatorResult[RunRecord] | RunRecord:
         run = self._runs.get(run_id)
         if run is None:
@@ -426,7 +601,7 @@ class MemoryRunCoordinator:
             fence.run_id != run_id
             or run.owner_id != fence.owner_id
             or run.lease_epoch != fence.lease_epoch
-            or run.lease_expires_at <= self._clock()
+            or (not allow_expired and run.lease_expires_at <= self._clock())
         ):
             return self._result(CoordinatorDecision.REJECTED, CoordinatorReason.STALE_FENCE)
         if run.version != expected_version:
@@ -439,7 +614,15 @@ class MemoryRunCoordinator:
         async with self._lock:
             validated = self._validate_transition(command.run_id, fence, expected_version)
             if isinstance(validated, CoordinatorResult):
-                return validated
+                current = self._runs.get(command.run_id)
+                if not (
+                    validated.reason is CoordinatorReason.VERSION_CONFLICT
+                    and current is not None
+                    and current.version == expected_version + 1
+                    and current.observed_state is ObservedState.STARTING
+                ):
+                    return validated
+                validated = current
             stored = self._commands.get(command.command_id)
             if (
                 stored is None
@@ -465,11 +648,6 @@ class MemoryRunCoordinator:
                 updated_at=self._clock(),
             )
             self._runs[updated.run_id] = updated
-            self._commands[stored.command_id] = replace(
-                stored,
-                status=CommandStatus.APPLIED,
-                updated_at=self._clock(),
-            )
             return self._result(
                 CoordinatorDecision.APPLIED, CoordinatorReason.TRANSITIONED, updated
             )
@@ -480,7 +658,15 @@ class MemoryRunCoordinator:
         async with self._lock:
             validated = self._validate_transition(run_id, fence, expected_version)
             if isinstance(validated, CoordinatorResult):
-                return validated
+                current = self._runs.get(run_id)
+                if not (
+                    validated.reason is CoordinatorReason.VERSION_CONFLICT
+                    and current is not None
+                    and current.version == expected_version + 1
+                    and current.observed_state is ObservedState.RUNNING
+                ):
+                    return validated
+                validated = current
             if validated.observed_state is ObservedState.RUNNING:
                 return self._result(
                     CoordinatorDecision.UNCHANGED, CoordinatorReason.TRANSITIONED, validated
@@ -500,6 +686,67 @@ class MemoryRunCoordinator:
                 CoordinatorDecision.APPLIED, CoordinatorReason.TRANSITIONED, updated
             )
 
+    async def record_process(
+        self,
+        run_id: str,
+        fence: RunFence,
+        expected_version: int,
+        process_id: int,
+        process_start_id: str,
+        process_owned: bool,
+    ) -> CoordinatorResult[RunRecord]:
+        async with self._lock:
+            validated = self._validate_transition(run_id, fence, expected_version)
+            if isinstance(validated, CoordinatorResult):
+                current = self._runs.get(run_id)
+                if not (
+                    validated.reason is CoordinatorReason.VERSION_CONFLICT
+                    and current is not None
+                    and current.version == expected_version + 1
+                    and current.observed_state is ObservedState.RUNNING
+                    and current.process_id is not None
+                ):
+                    return validated
+                # A process record is the only lifecycle write that can advance
+                # a RUNNING row by one version. The SQLite worker may commit that
+                # write after its cancelled await returns no value; the same
+                # execution fence must be able to observe it or replace it for
+                # the manager's one-shot fresh-session recovery.
+                validated = current
+            if (
+                type(process_id) is not int
+                or process_id <= 1
+                or not isinstance(process_start_id, str)
+                or (process_owned and not process_start_id)
+            ):
+                return self._result(
+                    CoordinatorDecision.REJECTED, CoordinatorReason.INVALID_TRANSITION
+                )
+            if validated.observed_state is not ObservedState.RUNNING:
+                return self._result(
+                    CoordinatorDecision.REJECTED, CoordinatorReason.INVALID_TRANSITION
+                )
+            if (
+                validated.process_id == process_id
+                and validated.process_start_id == process_start_id
+                and validated.process_owned is process_owned
+            ):
+                return self._result(
+                    CoordinatorDecision.UNCHANGED, CoordinatorReason.TRANSITIONED, validated
+                )
+            updated = replace(
+                validated,
+                process_id=process_id,
+                process_start_id=process_start_id,
+                process_owned=process_owned,
+                version=validated.version + 1,
+                updated_at=self._clock(),
+            )
+            self._runs[updated.run_id] = updated
+            return self._result(
+                CoordinatorDecision.APPLIED, CoordinatorReason.TRANSITIONED, updated
+            )
+
     async def complete(
         self, completion: RunCompletion, fence: RunFence, expected_version: int
     ) -> CoordinatorResult[OutboxEvent]:
@@ -509,6 +756,15 @@ class MemoryRunCoordinator:
             if existing_id is not None:
                 event = self._outbox[existing_id]
                 run = self._runs[completion.run_id]
+                if (
+                    fence.run_id != run.run_id
+                    or fence.owner_id != run.owner_id
+                    or fence.lease_epoch != run.lease_epoch
+                ):
+                    return self._result(
+                        CoordinatorDecision.REJECTED,
+                        CoordinatorReason.STALE_FENCE,
+                    )
                 if (
                     run.outcome is completion.outcome
                     and run.result_path == completion.result_path
@@ -524,7 +780,15 @@ class MemoryRunCoordinator:
                 return self._result(
                     CoordinatorDecision.REJECTED, CoordinatorReason.OUTCOME_CONFLICT
                 )
-            validated = self._validate_transition(completion.run_id, fence, expected_version)
+            # Expiry makes a run eligible for takeover; the monotonic epoch is
+            # the fence. Let the current epoch commit its terminal result when
+            # no recovery owner won that race, including after host suspend.
+            validated = self._validate_transition(
+                completion.run_id,
+                fence,
+                expected_version,
+                allow_expired=True,
+            )
             if isinstance(validated, CoordinatorResult):
                 return self._result(validated.decision, validated.reason)
             if validated.observed_state not in _COMPLETABLE_STATES:
@@ -559,14 +823,16 @@ class MemoryRunCoordinator:
                 destination=completion.destination,
                 event_type=completion.event_type,
                 payload_json=completion.payload_json,
-                status=DeliveryState.PENDING,
+                status=completion.delivery_state,
                 attempts=0,
                 available_at=now,
                 claim_owner="",
                 claim_expires_at=0.0,
                 claim_epoch=0,
                 created_at=now,
-                delivered_at=None,
+                delivered_at=(
+                    now if completion.delivery_state is DeliveryState.DELIVERED else None
+                ),
             )
             self._outbox[event.event_id] = event
             self._outbox_by_run_type[key] = event.event_id
@@ -601,7 +867,13 @@ class MemoryRunCoordinator:
                     )
             return True
 
-    async def claim_outbox(self, owner: OwnerLease, limit: int) -> list[OutboxEvent]:
+    async def claim_outbox(
+        self,
+        owner: OwnerLease,
+        limit: int,
+        event_id: str = "",
+        acknowledgement: bool = False,
+    ) -> list[OutboxEvent]:
         if limit <= 0:
             return []
         async with self._lock:
@@ -614,7 +886,11 @@ class MemoryRunCoordinator:
             ):
                 if len(claimed) >= limit:
                     break
-                pending = current.status is DeliveryState.PENDING and current.available_at <= now
+                if event_id and current.event_id != event_id:
+                    continue
+                pending = current.status is DeliveryState.PENDING and (
+                    (acknowledgement and bool(event_id)) or current.available_at <= now
+                )
                 expired = (
                     current.status is DeliveryState.CLAIMED and current.claim_expires_at <= now
                 )

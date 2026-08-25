@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
 import pytest
 
+from kiro_crew.run_coordinator import MemoryRunCoordinator
 from kiro_crew.subagent_persistence import (
     create_agent_folder,
     delete_agent_folder,
@@ -652,8 +654,8 @@ class TestTombstoneOnAbnormalExit:
         assert ts["cause"] == "error"
 
     @pytest.mark.asyncio
-    async def test_no_tombstone_on_success(self, agent_root):
-        """Successful completion should NOT write a tombstone."""
+    async def test_no_abnormal_tombstone_on_success(self, agent_root):
+        """Successful completion records only the delivered tombstone."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
@@ -683,14 +685,20 @@ class TestTombstoneOnAbnormalExit:
         ctx.hooks.on_tool_call = MagicMock()
         ctx.hooks.auto_approve_subagent_spawn = True
 
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=ctx,
+            coordinator=MemoryRunCoordinator(),
+        )
 
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             info = manager.spawn("success test", parent_session_key="dashboard:default")
             await manager._tasks[info.id]
+            await asyncio.gather(*manager._report_tasks)
 
         ts_path = agent_root / info.id / "tombstone.json"
-        assert not ts_path.exists()
+        tombstone = json.loads(ts_path.read_text(encoding="utf-8"))
+        assert tombstone["cause"] == "delivered"
 
 
 # ── Slice 6: Folder cleanup on normal completion ─────────────────────

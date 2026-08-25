@@ -435,6 +435,23 @@ def _restore_autonudge_singleton():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_default_run_coordinator(monkeypatch):
+    """Keep unit tests off the bounded production SQLite worker pool.
+
+    Tests that exercise SQLite instantiate that adapter directly. Legacy
+    ``SubagentManager`` tests otherwise share the process-wide two-worker pool,
+    so parallel shards can turn unrelated manager behavior into coordinator
+    submission timeouts.
+    """
+    from kiro_crew.run_coordinator import MemoryRunCoordinator
+
+    monkeypatch.setattr(
+        "kiro_crew.subagent.SQLiteRunCoordinator",
+        MemoryRunCoordinator,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _reset_reasoning_effort_globals():
     """Snapshot + restore the process-global reasoning-effort allowlist around
     each test. The allowlist is union-only/monotonic by design (persistence

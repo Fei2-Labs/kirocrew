@@ -1699,6 +1699,7 @@ class TestInitSubagents:
                 mock_sm.return_value = mock_sm_inst
                 orch._init_subagents()
         assert orch.subagent_mgr is not None
+        mock_sm_inst.start_reaper.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_init_subagents_respects_max_concurrent(self):
@@ -3038,6 +3039,45 @@ class TestSubagentDone:
 
         await on_done(info)
         slot.queue_append.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_recovered_interruption_keeps_neutral_outcome_and_result_path(self):
+        from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY
+        from kiro_crew.subagent import SubagentInfo
+
+        orch, mock_sm = self._setup_orch_with_subagent_mgr()
+        on_done = mock_sm.call_args[1]["on_done"]
+
+        slot = MagicMock()
+        slot.running = True
+        slot.task = asyncio.ensure_future(asyncio.sleep(0))
+        await slot.task
+        slot.key = "busy-slot"
+        slot.mode = ""
+        slot._recovery_chat_triggered = False
+        slot._pending_subagent_failures = []
+        slot._subagents_inline_collected = set()
+        slot.queue_append = MagicMock()
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+
+        info = SubagentInfo(
+            id="recovered-1",
+            task="recover work",
+            parent_session_key="dashboard:busy-slot",
+            done=True,
+            error="interrupted by gateway restart",
+            result_path="/results/recovered-1.txt",
+            result_truncated=True,
+        )
+        info._recovered_outcome = "interrupted"
+
+        await on_done(info)
+
+        announce = slot.queue_append.call_args.args[0]
+        meta = slot.queue_append.call_args.kwargs["meta"][SUBAGENT_COMPLETION_META_KEY]
+        assert "interrupted by gateway restart" in announce
+        assert "/results/recovered-1.txt" in announce
+        assert meta["outcome"] == "interrupted"
 
     @pytest.mark.asyncio
     async def test_cron_parent_injects_result(self):
@@ -6374,6 +6414,7 @@ class TestSlackSubagentCompletionPersistence:
         info.silent = False
         info.elapsed = 5.0
         info.started = time.time() - 5.0
+        info._delivery_event_id = "event-persist"
         return info
 
     @pytest.mark.asyncio
@@ -6402,6 +6443,7 @@ class TestSlackSubagentCompletionPersistence:
         assert user_call[0][0] == info.parent_session_key
         assert user_call[0][1] == "user"
         assert "[Subagent completion event]" in user_call[0][2]
+        assert "Event: `event-persist`" in user_call[0][2]
         # Second call: assistant role (the LLM response)
         assert assistant_call[0][0] == info.parent_session_key
         assert assistant_call[0][1] == "assistant"

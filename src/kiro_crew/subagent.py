@@ -57,6 +57,7 @@ from kiro_crew.context_management import (
     cap_result_file,
     evict_completed_agents,
 )
+from kiro_crew.dashboard.chat_utils import dashboard_slot_key
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.hooks import (
     HOOK_EVENT_POST_TOOL_USE,
@@ -88,12 +89,23 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.resource_status import cached_admission_check
 from kiro_crew.run_coordinator import (
+    LEGACY_SHADOW_SOURCE_VERSION,
     CommandOperation,
+    CommandStatus,
     CoordinatorDecision,
+    LegacyRunImporter,
+    OutboxEvent,
+    OwnerLease,
+    RunCommand,
+    RunCompletion,
     RunCoordinator,
+    RunFence,
+    RunOutcome,
+    RunRecovery,
     SQLiteRunCoordinator,
     SubmitRun,
 )
+from kiro_crew.run_coordinator.delivery import OutboxDeliveryAdapter
 from kiro_crew.security import (
     redact_and_truncate,
     redact_credentials,
@@ -105,7 +117,11 @@ from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.session_workspace import result_path as _ws_result_path
 from kiro_crew.slack.format import extract_options
 from kiro_crew.stats import Stats
-from kiro_crew.subagent_command_authority import SubagentCommandAuthority
+from kiro_crew.subagent_command_authority import (
+    EXECUTION_LEASE_SECONDS,
+    AuthorityOutcomeUncertain,
+    SubagentCommandAuthority,
+)
 from kiro_crew.subagent_completion_meta import (
     OUTCOME_FAILED,
     OUTCOME_INTERRUPTED,
@@ -368,6 +384,7 @@ def _describe_exception(exc: BaseException) -> str:
 
 
 _MAX_DONE_RESULT_LEN = 50_000  # cap subagent_done payload to avoid bloating WS frames
+_OUTBOX_RESULT_SUMMARY_LEN = 4_000
 
 
 def _done_result(text: str) -> str:
@@ -408,6 +425,8 @@ _RECOVERY_SLOT_WAIT_SECS = 60.0
 _REPORT_DRAIN_TIMEOUT = (
     30.0  # max seconds cancel_all() waits for shielded terminal reports to drain
 )
+_TERMINAL_RETRY_SECONDS = 1.0
+_OUTBOX_DRAIN_BATCH_SIZE = 16
 _STARTUP_TIMEOUT_SECS = 120  # max seconds a subagent may sit pre-first-turn with no runtime before the startup watchdog reaps it
 _ON_DONE_TIMEOUT = 1200.0  # outer cap: max total seconds for semaphore wait + injection
 
@@ -1252,10 +1271,25 @@ class SubagentInfo:
     _coordinator_admitted: bool = False
     # True while a keyed run is queued or awaiting approval. The command
     # authority owns its pre-execution lease until `_run` takes over.
+    _coordinator_command: RunCommand | None = None
+    _coordinator_fence: RunFence | None = None
+    _coordinator_version: int = 0
     _coordinator_waiting: bool = False
-    # The durable start result is unknown, so local terminal delivery must wait
-    # for an explicit cancellation retry or fenced recovery.
+    # A durable submission or start result can remain unknown while SQLite's
+    # worker commits. Local terminal delivery waits for cancellation retry or
+    # fenced recovery in that window.
     _coordinator_claim_uncertain: bool = False
+    _coordinator_started: bool = False
+    _coordinator_running: bool = False
+    _delivery_event_id: str = ""
+    _delivery_failed: bool = False
+    _delivery_retry: bool = False
+    _delivery_batch_progress: dict[str, Any] | None = None
+    _delivery_batch_final: bool = False
+    # Coordinator recovery can terminalize a run as interrupted while retaining
+    # an explanatory error and partial result path. Keep that fourth outcome
+    # explicit instead of reclassifying the non-empty error as a failure.
+    _recovered_outcome: str = ""
     # CC-specific overrides (ignored for ACP)
     model: str = ""
     # The model id the live session ACTUALLY resolved to serve, read back from
@@ -1373,7 +1407,7 @@ class SubagentInfo:
 
     @property
     def outcome(self) -> str:
-        """Canonical three-way terminal outcome: 'stopped' | 'failed' | 'completed'.
+        """Canonical terminal outcome, including coordinator recovery interruption.
 
         THE single source of truth for terminal-state classification. Consumers
         MUST use this (or the ``outcome`` field carried on every subagent_done
@@ -1382,11 +1416,29 @@ class SubagentInfo:
         user-stopped agent as completed. ``stopped``/``error`` remain on the
         wire for compatibility.
         """
+        if self._recovered_outcome == OUTCOME_INTERRUPTED:
+            return OUTCOME_INTERRUPTED
         if self.user_stopped:
             return "stopped"
         if self.error:
             return "failed"
         return "completed"
+
+
+@dataclass
+class _OutboxDeliveryContext:
+    info: SubagentInfo
+    source: str
+    injection_timeout_reason: str
+    mark_delivered_on_success: bool
+    settle_digest: bool
+    teardown_done: asyncio.Event | None
+    effects_fired: bool = False
+    callback_started: bool = False
+
+
+class _TerminalCommitRejected(Exception):
+    """The coordinator permanently rejected this executor's terminal fence."""
 
 
 # Callback: (subagent_info) -> None
@@ -1487,7 +1539,26 @@ class SubagentManager:
         # before invoking the compatibility executor. Legacy synchronous
         # callers are still mirrored at async _run entry during migration.
         self._coordinator = coordinator or SQLiteRunCoordinator()
-        self.command_authority = SubagentCommandAuthority(self._coordinator, self)
+        self._coordinator_owner_id = f"gateway:{uuid.uuid4().hex}"
+        self.command_authority = SubagentCommandAuthority(
+            self._coordinator,
+            self,
+            owner_id=self._coordinator_owner_id,
+        )
+        self._outbox_contexts: dict[str, _OutboxDeliveryContext] = {}
+        self._outbox_live_contexts: dict[str, _OutboxDeliveryContext] = {}
+        self._outbox_live_run_batches: dict[str, tuple[str, int]] = {}
+        self._coordinator_shadow_submits: set[asyncio.Task[Any]] = set()
+        self._lease_tasks: dict[str, asyncio.Task[None]] = {}
+        self._outbox_delivery = OutboxDeliveryAdapter(
+            self._coordinator,
+            self._deliver_outbox_event,
+        )
+        self._legacy_run_importer = LegacyRunImporter(self._coordinator)
+        self._run_recovery = RunRecovery(
+            self._coordinator,
+            self._outbox_delivery,
+        )
         self._lifecycle: SubagentLifecycle[SubagentInfo] = SubagentLifecycle()
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
@@ -1532,6 +1603,7 @@ class SubagentManager:
         # finalize_batch alongside _batch_submitted.
         self._batch_progress_ts: dict[str, float] = {}
         self._reaper_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._reconcile_task: asyncio.Task | None = None  # type: ignore[type-arg]
         # Cache global approval_mode at init to avoid disk I/O on every
         # parentless spawn (cron, webhooks).
         try:
@@ -1704,8 +1776,33 @@ class SubagentManager:
         """Start the periodic reaper loop.  Call once after the event loop is running."""
         if self._reaper_task is None:
             self._reaper_task = asyncio.create_task(self._reaper_loop())
-            # One-shot orphan reconciliation on startup
-            self._reconcile_task = asyncio.create_task(self._reconcile_orphans())
+            # Coordinator state is authoritative on restart. Legacy folders are
+            # imported read-only before the same fenced recovery policy runs.
+            self._reconcile_task = asyncio.create_task(self._reconcile_startup())
+
+    def _coordinator_active_run_ids(self) -> frozenset[str]:
+        """Fence live manager tasks and locally queued runs from recovery."""
+
+        active = frozenset(
+            run_id
+            for run_id, task in self._tasks.items()
+            if run_id in self._agents and not task.done()
+        )
+        return active | self._scheduler.queued_run_ids()
+
+    async def _reconcile_startup(self) -> None:
+        """Import legacy-only state, recover expired runs, and drain delivery."""
+
+        try:
+            await self._run_recovery.reconcile(
+                importer=self._legacy_run_importer,
+                exclude_run_ids=self._coordinator_active_run_ids(),
+            )
+        except Exception:
+            logger.exception("Coordinator-first subagent recovery failed")
+            # Legacy folder metadata is not a trusted process-ownership record.
+            # A protected-store failure must never fall back to signalling a
+            # process selected only by state.json.
 
     async def _reconcile_orphans(self) -> None:
         """Scan for orphaned agent folders from a prior gateway run.
@@ -1716,8 +1813,8 @@ class SubagentManager:
         - PID dead + result → tombstone (gateway_restart, delivered)
         - PID dead + no result → tombstone (gateway_restart, notification_pending)
         """
+        await self._drain_pending_outbox()
         try:
-
             orphans = list_orphans()
             if not orphans:
                 return
@@ -1731,7 +1828,11 @@ class SubagentManager:
             dm_pending: list[str] = []
             for state in orphans:
                 agent_id = state.get("id", "")
-                if not agent_id or agent_id in self._agents:
+                durable_delivery_run_ids = {
+                    context.info.id for context in self._outbox_contexts.values()
+                }
+                durable_delivery_run_ids.update(self._outbox_live_contexts)
+                if not agent_id or agent_id in self._agents or agent_id in durable_delivery_run_ids:
                     continue  # tracked in current run, skip
                 try:
                     pid = state.get("pid")
@@ -1825,6 +1926,17 @@ class SubagentManager:
                     logger.debug("Orphan digest DM failed", exc_info=True)
         except Exception:
             logger.warning("Orphan reconciliation failed", exc_info=True)
+
+    async def _drain_pending_outbox(self) -> None:
+        """Retry durable completions without coupling them to legacy folders."""
+
+        try:
+            while True:
+                attempts = await self._outbox_delivery.drain_once(limit=_OUTBOX_DRAIN_BATCH_SIZE)
+                if len(attempts) < _OUTBOX_DRAIN_BATCH_SIZE:
+                    return
+        except Exception:
+            logger.warning("Coordinator outbox delivery failed", exc_info=True)
 
     @staticmethod
     def _is_pid_alive(pid: int) -> bool:
@@ -2099,6 +2211,12 @@ class SubagentManager:
         while True:
             await asyncio.sleep(_REAPER_INTERVAL)
             now = time.time()
+            try:
+                await self._run_recovery.reconcile(
+                    exclude_run_ids=self._coordinator_active_run_ids(),
+                )
+            except Exception:
+                logger.warning("Reaper: coordinator recovery failed", exc_info=True)
             if not self._conv_registry_rebuilt:
                 # First pass after (re)start: re-seed the conversation TTL
                 # registry from state.json so promoted conversations survive
@@ -2533,6 +2651,362 @@ class SubagentManager:
             supersede_recovery=supersede_recovery,
         )
 
+    async def _coordinator_mark_starting(self, info: SubagentInfo) -> None:
+        """Acquire the first durable lifecycle transition before child startup."""
+
+        if info._coordinator_started or info._coordinator_fence is None:
+            return
+        command = info._coordinator_command
+        if command is None:
+            raise RuntimeError("coordinator execution command is missing")
+        try:
+            result = await self._coordinator.mark_starting(
+                command,
+                info._coordinator_fence,
+                info._coordinator_version,
+            )
+        except Exception:
+            result = await self._coordinator.mark_starting(
+                command,
+                info._coordinator_fence,
+                info._coordinator_version,
+            )
+        if result.value is None or result.decision is CoordinatorDecision.REJECTED:
+            raise RuntimeError(f"coordinator start refused: {result.reason.value}")
+        info._coordinator_version = result.value.version
+        info._coordinator_started = True
+
+    async def _coordinator_mark_running(self, info: SubagentInfo) -> None:
+        """Commit that a child session exists before prompting it."""
+
+        if info._coordinator_running or info._coordinator_fence is None:
+            return
+        try:
+            result = await self._coordinator.mark_running(
+                info.id,
+                info._coordinator_fence,
+                info._coordinator_version,
+            )
+        except Exception:
+            result = await self._coordinator.mark_running(
+                info.id,
+                info._coordinator_fence,
+                info._coordinator_version,
+            )
+        if result.value is None or result.decision is CoordinatorDecision.REJECTED:
+            raise RuntimeError(f"coordinator running transition refused: {result.reason.value}")
+        info._coordinator_version = result.value.version
+        info._coordinator_running = True
+
+    async def _coordinator_record_process(
+        self,
+        info: SubagentInfo,
+        process_id: int,
+        process_start_id: str,
+        process_owned: bool,
+    ) -> None:
+        """Persist fenced process identity before it can authorize recovery cleanup."""
+
+        fence = info._coordinator_fence
+        if fence is None:
+            raise RuntimeError("coordinator execution fence is missing")
+        result = await self._coordinator.record_process(
+            info.id,
+            fence,
+            info._coordinator_version,
+            process_id,
+            process_start_id,
+            process_owned,
+        )
+        if result.value is None or result.decision is CoordinatorDecision.REJECTED:
+            raise RuntimeError(f"coordinator process record refused: {result.reason.value}")
+        info._coordinator_version = result.value.version
+
+    async def _record_process_identity(self, info: SubagentInfo, session_key: str) -> None:
+        """Persist protected process identity before any child prompt can run."""
+
+        pid = self._sessions.get_pid(session_key)
+        if not pid:
+            return
+        info._pid = pid
+        pid_start_id = await asyncio.to_thread(
+            platform_compat.process_start_time,
+            pid,
+        )
+        try:
+            update_state(
+                info.id,
+                pid=pid,
+                pid_recorded_at=time.time(),
+                pid_start_id=pid_start_id or "",
+                process_owned=True,
+            )
+        except Exception:
+            logger.debug("Failed to mirror PID for %s", info.id, exc_info=True)
+        await self._coordinator_record_process(
+            info,
+            pid,
+            pid_start_id or "",
+            True,
+        )
+
+    def _start_coordinator_heartbeat(self, info: SubagentInfo) -> None:
+        fence = info._coordinator_fence
+        if fence is None or info.id in self._lease_tasks:
+            return
+
+        async def _renew() -> None:
+            cadence = EXECUTION_LEASE_SECONDS / 3
+            while True:
+                await asyncio.sleep(cadence)
+                try:
+                    renewed = await self._coordinator.renew(
+                        info.id,
+                        fence,
+                        time.time() + EXECUTION_LEASE_SECONDS,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Subagent %s coordinator lease renewal failed",
+                        info.id,
+                        exc_info=True,
+                    )
+                    continue
+                if not renewed:
+                    logger.error("Subagent %s lost its coordinator execution lease", info.id)
+                    return
+
+        task = asyncio.create_task(_renew())
+        self._lease_tasks[info.id] = task
+
+        def _forget(done: asyncio.Task[None]) -> None:
+            if self._lease_tasks.get(info.id) is done:
+                self._lease_tasks.pop(info.id, None)
+
+        task.add_done_callback(_forget)
+
+    async def _stop_coordinator_heartbeat(self, run_id: str) -> None:
+        lease_task = self._lease_tasks.pop(run_id, None)
+        if lease_task is None:
+            return
+        lease_task.cancel()
+        await asyncio.gather(lease_task, return_exceptions=True)
+
+    @staticmethod
+    def _coordinator_outcome(info: SubagentInfo) -> RunOutcome:
+        if info.user_stopped:
+            return RunOutcome.STOPPED
+        if info.error:
+            return RunOutcome.FAILED
+        return RunOutcome.COMPLETED
+
+    @staticmethod
+    def _completion_payload(info: SubagentInfo) -> str:
+        task, _ = redact_exfiltration_urls(info.task)
+        task, _ = redact_credentials(task)
+        error, _ = redact_exfiltration_urls(info.error)
+        error, _ = redact_credentials(error)
+        summary, _ = redact_exfiltration_urls(
+            _done_result(info.result)[:_OUTBOX_RESULT_SUMMARY_LEN]
+        )
+        summary, _ = redact_credentials(summary)
+        return json.dumps(
+            {
+                "id": info.id,
+                "parent_session_key": info.parent_session_key,
+                "agent": info.agent,
+                "task": task[:1000],
+                "outcome": info.outcome,
+                "error": error[:2000],
+                "result_path": info.result_path,
+                "result_summary": summary,
+                "result_truncated": bool(
+                    info.result_truncated or len(info.result) > _OUTBOX_RESULT_SUMMARY_LEN
+                ),
+                "user_stopped": info.user_stopped,
+                "silent": info.silent,
+                "batch_id": info.batch_id,
+                "batch_total": info.batch_total,
+                "elapsed": info.elapsed,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    async def _commit_terminal_event(self, info: SubagentInfo) -> OutboxEvent | None:
+        fence = info._coordinator_fence
+        if fence is None:
+            return None
+        try:
+            result = await self._coordinator.complete(
+                RunCompletion(
+                    run_id=info.id,
+                    outcome=self._coordinator_outcome(info),
+                    result_path=info.result_path,
+                    error=_redact(info.error),
+                    event_type="subagent_completion",
+                    destination=info.parent_session_key,
+                    payload_json=self._completion_payload(info),
+                    terminal_at=time.time(),
+                ),
+                fence,
+                info._coordinator_version,
+            )
+        except Exception:
+            logger.exception("Subagent %s terminal coordinator commit failed", info.id)
+            return None
+        if result.decision is CoordinatorDecision.REJECTED:
+            logger.error(
+                "Subagent %s terminal coordinator commit refused: %s",
+                info.id,
+                result.reason.value,
+            )
+            raise _TerminalCommitRejected(result.reason.value)
+        if result.value is None:
+            return None
+        info._coordinator_version = result.value.run_version
+        info._delivery_event_id = result.value.event_id
+        return result.value
+
+    @staticmethod
+    def _info_from_outbox(event: OutboxEvent) -> SubagentInfo:
+        payload = json.loads(event.payload_json)
+        if not isinstance(payload, dict):
+            raise ValueError("subagent completion payload must be an object")
+        info = SubagentInfo(
+            id=str(payload.get("id") or event.run_id),
+            task=str(payload.get("task") or ""),
+            parent_session_key=str(payload.get("parent_session_key") or event.destination),
+            agent=str(payload.get("agent") or ""),
+            done=True,
+            result=str(payload.get("result_summary") or ""),
+            result_path=str(payload.get("result_path") or ""),
+            result_truncated=bool(payload.get("result_truncated")),
+            error=str(payload.get("error") or ""),
+            user_stopped=bool(payload.get("user_stopped")),
+            silent=bool(payload.get("silent")),
+            elapsed=float(payload.get("elapsed") or 0.0),
+        )
+        if payload.get("outcome") == RunOutcome.INTERRUPTED.value:
+            info._recovered_outcome = OUTCOME_INTERRUPTED
+        # Batch progress lives in the gateway's volatile digest state. After a
+        # restart, replay each stable event independently instead of inventing
+        # a fresh one-member wave from persisted batch labels.
+        info._delivery_event_id = event.event_id
+        return info
+
+    async def _deliver_outbox_event(self, event: OutboxEvent) -> bool:
+        """Hand one claimed event to existing routing, returning acceptance."""
+
+        context = self._outbox_contexts.get(event.event_id)
+        if context is None:
+            context = self._outbox_live_contexts.pop(event.run_id, None)
+            if context is None:
+                info = self._info_from_outbox(event)
+                live_batch = self._outbox_live_run_batches.pop(event.run_id, None)
+                if live_batch is not None:
+                    info.batch_id, info.batch_total = live_batch
+                uncertain = self._agents.get(event.run_id)
+                if uncertain is not None and uncertain._coordinator_claim_uncertain:
+                    self._agents[event.run_id] = info
+                context = _OutboxDeliveryContext(
+                    info=info,
+                    source="Subagent outbox",
+                    injection_timeout_reason="durable completion delivery timed out",
+                    mark_delivered_on_success=True,
+                    settle_digest=True,
+                    teardown_done=None,
+                )
+            else:
+                self._outbox_live_run_batches.pop(event.run_id, None)
+            self._outbox_contexts[event.event_id] = context
+        info = context.info
+        info._delivery_event_id = event.event_id
+        # A deferred destination already accepted this stable event into its
+        # own queue or digest. Exact claims remain available to the eventual
+        # consumer for acknowledgement, but a background drain must not replay
+        # lifecycle callbacks or count the same wave member twice.
+        if info._digest_held or info._delivery_queued:
+            return False
+        info._delivery_failed = False
+        if not context.effects_fired:
+            await self._fire_event(
+                "subagent_done",
+                info,
+                {
+                    "elapsed": info.elapsed,
+                    "error": _redact(info.error) if info.error else None,
+                    "stopped": info.user_stopped,
+                    "outcome": info.outcome,
+                    "task": _redact(info.task),
+                    "agent": _redact(info.agent),
+                    "result": _done_result(info.result),
+                    "event_id": event.event_id,
+                },
+            )
+            context.effects_fired = True
+        if self._on_done:
+            info._delivery_retry = context.callback_started
+            context.callback_started = True
+            try:
+                await asyncio.wait_for(self._on_done(info), timeout=_ON_DONE_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "%s: completion injection timed out for %s after %.0fs",
+                    context.source,
+                    info.id,
+                    _ON_DONE_TIMEOUT,
+                )
+                try:
+                    await self._sessions.reset(info.parent_session_key)
+                except Exception:
+                    logger.debug(
+                        "Failed to reset parent session %s after injection timeout",
+                        info.parent_session_key,
+                        exc_info=True,
+                    )
+                self.notify_injection_failed(
+                    info,
+                    reason=context.injection_timeout_reason,
+                )
+                return False
+            except Exception:
+                logger.exception("%s: announce failed for %s", context.source, info.id)
+                return False
+        if info._delivery_failed:
+            return False
+        info._delivery_retry = False
+        info._delivery_batch_progress = None
+        info._delivery_batch_final = False
+        info._reported_to_parent = True
+        if info._digest_held or info._delivery_queued:
+            return False
+        if context.settle_digest:
+            await self._settle_digest_holds(info)
+        if context.mark_delivered_on_success and info.outcome == "completed":
+            teardown_done = context.teardown_done
+            if teardown_done is not None and not teardown_done.is_set():
+                try:
+                    await asyncio.wait_for(teardown_done.wait(), timeout=_RESET_TIMEOUT + 30)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Subagent %s: teardown did not complete before the "
+                        "delivered tombstone; writing it anyway",
+                        info.id,
+                    )
+            try:
+                await asyncio.to_thread(mark_delivered, info.id)
+            except Exception:
+                logger.debug("Failed to mark subagent %s delivered", info.id, exc_info=True)
+            try:
+                slot_key = dashboard_slot_key(info.parent_session_key)
+                if slot_key:
+                    _ws_result_path(slot_key, info.id).unlink(missing_ok=True)
+            except Exception:
+                logger.debug("Failed to clean workspace result for %s", info.id, exc_info=True)
+        self._outbox_contexts.pop(event.event_id, None)
+        return True
+
     async def _report_terminal(
         self,
         info: SubagentInfo,
@@ -2566,6 +3040,68 @@ class SubagentManager:
         arguments rather than unified away. The WS payload is identical (both
         set ``info.elapsed`` before calling), so it is built from ``info`` here.
         """
+        if info._coordinator_fence is not None:
+            context = _OutboxDeliveryContext(
+                info=info,
+                source=source,
+                injection_timeout_reason=injection_timeout_reason,
+                mark_delivered_on_success=mark_delivered_on_success,
+                settle_digest=settle_digest,
+                teardown_done=teardown_done,
+            )
+            self._outbox_live_contexts[info.id] = context
+            event = None
+            while event is None:
+                try:
+                    event = await self._commit_terminal_event(info)
+                except _TerminalCommitRejected:
+                    if self._outbox_live_contexts.get(info.id) is context:
+                        self._outbox_live_contexts.pop(info.id, None)
+                    await self._stop_coordinator_heartbeat(info.id)
+                    await self.command_authority.stop_execution_heartbeat(info.id)
+                    try:
+                        await asyncio.to_thread(clear_tombstone, info.id)
+                    except Exception:
+                        logger.debug(
+                            "Failed to re-admit stale-fence result %s to recovery",
+                            info.id,
+                            exc_info=True,
+                        )
+                    return
+                if event is None:
+                    await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
+            if self._outbox_live_contexts.get(info.id) is context:
+                self._outbox_live_contexts.pop(info.id, None)
+            if not info._reported_to_parent:
+                self._outbox_contexts.setdefault(event.event_id, context)
+            try:
+                await self._stop_coordinator_heartbeat(info.id)
+            finally:
+                await self.command_authority.stop_execution_heartbeat(info.id)
+            if info._reported_to_parent:
+                return
+            while True:
+                try:
+                    attempts = await self._outbox_delivery.drain_once(event_id=event.event_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Subagent %s durable completion routing failed",
+                        info.id,
+                        exc_info=True,
+                    )
+                else:
+                    # A returned attempt means the fence was durably settled:
+                    # either delivered or released for the periodic outbox
+                    # drainer. The terminal reporter owns only this immediate
+                    # attempt and must not wait through the released lease.
+                    if attempts:
+                        return
+                    if info._reported_to_parent or info._digest_held or info._delivery_queued:
+                        return
+                await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
+
         await self._fire_event(
             "subagent_done",
             info,
@@ -2597,7 +3133,7 @@ class SubagentManager:
                 # _on_done returned without raising, so the wave digest (if this
                 # was the final member) has been handed off. Only NOW settle the
                 # held members' delivery tombstones.
-                self._settle_digest_holds(info)
+                await self._settle_digest_holds(info)
             # Digest-held wave members are NOT marked delivered here: their
             # result has not reached the parent yet (the gateway marks them when
             # the digest fires), so a restart mid-wave leaves them visible to
@@ -2639,7 +3175,7 @@ class SubagentManager:
                 # "delivered" tombstone excludes it from orphan reconciliation;
                 # the reaper prunes it after agent.subagent_result_ttl_secs.
                 try:
-                    mark_delivered(info.id)
+                    await asyncio.to_thread(mark_delivered, info.id)
                 except Exception:
                     logger.debug("Failed to mark subagent %s delivered", info.id, exc_info=True)
                 # Clean up workspace result file (agent-{id}.md in parent dir).
@@ -2677,6 +3213,27 @@ class SubagentManager:
             self.notify_injection_failed(info, reason=injection_timeout_reason)
         except Exception:
             logger.exception("%s: announce failed for %s", source, info.id)
+
+    async def _reject_waiting_before_terminal(self, info: SubagentInfo, error: str) -> None:
+        """Persist a pre-start rejection while its run lease protects terminal delivery."""
+
+        while True:
+            try:
+                await self.command_authority.reject_waiting_execution(
+                    info.id,
+                    error,
+                    stop_heartbeat=False,
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except AuthorityOutcomeUncertain:
+                logger.warning(
+                    "Subagent %s waiting rejection commit failed; retrying",
+                    info.id,
+                    exc_info=True,
+                )
+                await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
 
     async def _run_terminal_report(
         self,
@@ -3031,6 +3588,7 @@ class SubagentManager:
         learns about the failure on the next ``_run_chat`` turn and can read
         the result from disk if needed.
         """
+        info._delivery_failed = True
         try:
             # Lazy: the dashboard layer must not be imported by a core module at
             # import time.
@@ -3177,6 +3735,9 @@ class SubagentManager:
         _from_queue: bool = False,
         _preassigned_id: str = "",
         _coordinator_admitted: bool = False,
+        _coordinator_command: RunCommand | None = None,
+        _coordinator_fence: RunFence | None = None,
+        _coordinator_version: int = 0,
     ) -> SubagentInfo | None:
         """Spawn a subagent for *task*.
 
@@ -3486,6 +4047,9 @@ class SubagentManager:
                     "_agent_prevalidated": _agent_prevalidated,
                     "_preassigned_id": agent_id,
                     "_coordinator_admitted": _coordinator_admitted,
+                    "_coordinator_command": _coordinator_command,
+                    "_coordinator_fence": _coordinator_fence,
+                    "_coordinator_version": _coordinator_version,
                 }
             )
             logger.info(
@@ -3521,6 +4085,9 @@ class SubagentManager:
                 _coordinator_admitted=_coordinator_admitted,
                 _coordinator_waiting=_coordinator_admitted,
             )
+            info._coordinator_command = _coordinator_command
+            info._coordinator_fence = _coordinator_fence
+            info._coordinator_version = _coordinator_version
             return info
 
         # `_agent_prevalidated` skips the on-loop agent-directory scan: a caller
@@ -3574,8 +4141,13 @@ class SubagentManager:
         )
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         info._coordinator_admitted = _coordinator_admitted
+        info._coordinator_command = _coordinator_command
+        info._coordinator_fence = _coordinator_fence
+        info._coordinator_version = _coordinator_version
         self._agents[agent_id] = info
-        self._scheduler.occupy(info, time.monotonic())
+        prior_start = self._scheduler.last_start
+        occupied_at = time.monotonic()
+        self._scheduler.occupy(info, occupied_at)
         # Batch lifecycle: announce the wave ONCE, on its first member to
         # actually start (queued members haven't started yet — the event marks
         # execution begin, and the UI uses it to key batch progress).
@@ -3593,12 +4165,20 @@ class SubagentManager:
             except RuntimeError:
                 pass  # no running loop (sync/test context)
 
-        # Check parent session trust (approval_policy="auto") set by dashboard trust toggle.
-        parent_trusted = (
-            parent_session_key and self._sessions.get_approval_policy(parent_session_key) == "auto"
-        )
+        # These callbacks can fail before any task owns the registered record.
+        # Roll that provisional registration back so it cannot retain a slot or
+        # make the command authority mistake a phantom record for accepted work.
+        try:
+            parent_trusted = (
+                parent_session_key
+                and self._sessions.get_approval_policy(parent_session_key) == "auto"
+            )
+            yolo_enabled = bool(self._is_yolo and self._is_yolo())
+        except BaseException:
+            self._rollback_unstarted_registration(info, prior_start, occupied_at)
+            raise
 
-        if self._is_yolo and self._is_yolo():
+        if yolo_enabled:
             self._tasks[agent_id] = asyncio.create_task(self._run(info))
             self._log_spawned(info)
         elif approval_mode == "auto":
@@ -3675,6 +4255,30 @@ class SubagentManager:
 
         return info
 
+    def _rollback_unstarted_registration(
+        self,
+        info: SubagentInfo,
+        prior_start: float,
+        occupied_at: float,
+    ) -> None:
+        """Release provisional manager state when policy fails before task ownership."""
+
+        if info.id in self._tasks:
+            return
+        self._agents.pop(info.id, None)
+        released = self._scheduler.release(info)
+        if self._scheduler.last_start == occupied_at:
+            self._scheduler.last_start = prior_start
+        if info.batch_id and not any(
+            agent.batch_id == info.batch_id for agent in self._agents.values()
+        ):
+            self._seen_batches.discard(info.batch_id)
+        if released:
+            try:
+                self._drain_queue()
+            except Exception:
+                logger.warning("Failed to drain queue after spawn rollback", exc_info=True)
+
     async def _safe_announce(self, info: SubagentInfo) -> None:
         """Notify completion callback with error handling.
 
@@ -3721,11 +4325,26 @@ class SubagentManager:
                 pass  # no running loop (sync/test context)
         return info
 
-    async def announce_durable_rejection(self, info: SubagentInfo) -> None:
-        """Announce a keyed batch rejection after command settlement succeeds."""
+    def prepare_coordinator_rejection(
+        self,
+        run_id: str,
+        *,
+        batch_id: str = "",
+        batch_total: int = 0,
+    ) -> None:
+        """Prepare live delivery before a rejection event becomes claimable."""
 
-        if info.batch_id and self._on_done:
-            await self._safe_announce(info)
+        for task_key in (f"reject-{run_id}", run_id):
+            report_task = self._tasks.pop(task_key, None)
+            if report_task is not None:
+                report_task.cancel()
+        if batch_id:
+            self._outbox_live_run_batches[run_id] = (batch_id, batch_total)
+
+    async def deliver_coordinator_event(self, event_id: str) -> None:
+        """Route one already-durable completion through the fenced outbox."""
+
+        await self._outbox_delivery.drain_once(event_id=event_id)
 
     def _should_stagger_queue(self, now: float) -> tuple[bool, bool]:
         """Decide whether a spawn arriving at *now* must be queued.
@@ -3901,6 +4520,9 @@ class SubagentManager:
         cwd: str = "",
         _preassigned_id: str = "",
         _coordinator_admitted: bool = False,
+        _coordinator_command: RunCommand | None = None,
+        _coordinator_fence: RunFence | None = None,
+        _coordinator_version: int = 0,
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id*.
 
@@ -4001,6 +4623,9 @@ class SubagentManager:
             task,
             _preassigned_id=_preassigned_id,
             _coordinator_admitted=_coordinator_admitted,
+            _coordinator_command=_coordinator_command,
+            _coordinator_fence=_coordinator_fence,
+            _coordinator_version=_coordinator_version,
             parent_session_key=parent_session_key,
             agent=agent,
             model=model,
@@ -4510,19 +5135,59 @@ class SubagentManager:
         # the queue round-trip — including `_preassigned_id`, which makes the agent
         # start under the id its caller was already told (and, if the gate re-queues
         # it, keeps that id across the second round-trip too).
-        drained = self.spawn(**params, _from_queue=True)
+        spawn_raised = False
+        try:
+            drained = self.spawn(**params, _from_queue=True)
+        except BaseException as exc:
+            spawn_raised = True
+            drained = SubagentInfo(
+                id=queued_id,
+                task=_redact(str(params.get("task") or "")),
+                parent_session_key=str(params.get("parent_session_key") or ""),
+                agent=str(params.get("agent") or ""),
+                done=True,
+                error=_redact(str(exc) or type(exc).__name__),
+                silent=bool(params.get("silent")),
+                batch_id=str(params.get("batch_id") or ""),
+                batch_total=int(params.get("batch_total") or 0),
+            )
         coordinator_rejection = bool(
             drained is not None
             and drained.done
             and drained.error
-            and bool(params.get("_coordinator_admitted"))
+            and params.get("_coordinator_fence") is not None
         )
         if coordinator_rejection and drained is not None:
+            # The synchronous caller that received the original queued record
+            # no longer exists.  Bind the drained rejection back to its durable
+            # fence and report it through the coordinator instead of leaving an
+            # authority heartbeat renewing work that can never start.
+            report_task = self._tasks.pop(f"reject-{drained.id}", None)
+            if report_task is not None:
+                report_task.cancel()
+            drained._coordinator_admitted = True
+            drained._coordinator_command = params.get("_coordinator_command")
+            drained._coordinator_fence = params.get("_coordinator_fence")
+            drained._coordinator_version = int(params.get("_coordinator_version") or 0)
+            try:
+                self._tasks[f"reject-{drained.id}"] = asyncio.ensure_future(
+                    self._finalize_queued_rejection(drained)
+                )
+            except RuntimeError:
+                pass
+        legacy_coordinator_rejection = bool(
+            drained is not None
+            and drained.done
+            and drained.error
+            and bool(params.get("_coordinator_admitted"))
+            and not coordinator_rejection
+        )
+        if legacy_coordinator_rejection and drained is not None:
             # The original HTTP caller returned when this entry was queued.
             # If revalidation now rejects it, no authority call remains on the
             # stack to finish the durable command, so lookup would report an
             # outcome-uncertain claim forever.
-            async def _finish_rejected_command() -> None:
+            async def _finish_legacy_command_rejection() -> None:
                 try:
                     await self.command_authority.reject_waiting_execution(
                         drained.id,
@@ -4545,17 +5210,17 @@ class SubagentManager:
                     await self._safe_announce(drained)
 
             try:
-                task = asyncio.ensure_future(_finish_rejected_command())
+                task = asyncio.ensure_future(_finish_legacy_command_rejection())
                 self._tasks[f"command-reject-{drained.id}"] = task
 
-                def _forget_rejection(done: asyncio.Task[None]) -> None:
+                def _forget_legacy_rejection(done: asyncio.Task[None]) -> None:
                     self._tasks.pop(f"command-reject-{drained.id}", None)
                     if not done.cancelled():
                         done.exception()
 
-                task.add_done_callback(_forget_rejection)
+                task.add_done_callback(_forget_legacy_rejection)
             except RuntimeError:
-                pass  # no running loop (sync/test context)
+                pass
         # A drained spawn has NO synchronous reader: this call site is a timer
         # callback, and the original caller was handed a queued info long ago. So a
         # terminal rejection here — the cwd was deleted while the run waited, the
@@ -4571,9 +5236,10 @@ class SubagentManager:
             drained is not None
             and drained.done
             and drained.error
-            and not coordinator_rejection
-            and not drained.batch_id
             and self._on_done
+            and not coordinator_rejection
+            and not legacy_coordinator_rejection
+            and (spawn_raised or not drained.batch_id)
         ):
             try:
                 self._tasks[f"reject-{drained.id}"] = asyncio.ensure_future(
@@ -4587,6 +5253,18 @@ class SubagentManager:
                 asyncio.get_event_loop().call_later(continuation_delay, self._drain_queue)
             except RuntimeError:
                 pass
+
+    async def _finalize_queued_rejection(self, info: SubagentInfo) -> None:
+        """Reject and deliver a queue entry that cannot start under its durable claim."""
+
+        await self._reject_waiting_before_terminal(info, info.error)
+        await self._report_terminal(
+            info,
+            source="Subagent queue",
+            injection_timeout_reason="queued rejection delivery timed out",
+            mark_delivered_on_success=True,
+            settle_digest=True,
+        )
 
     async def _spawn_with_approval(self, info: SubagentInfo) -> None:
         """Request approval before starting the subagent.
@@ -4617,18 +5295,20 @@ class SubagentManager:
 
         if not approved:
             rejection_error = "spawn rejected"
-            try:
-                await self.command_authority.reject_waiting_execution(
-                    info.id,
-                    rejection_error,
-                )
-            except Exception:
-                logger.warning(
-                    "Subagent %s approval rejection was not durably recorded",
-                    info.id,
-                    exc_info=True,
-                )
-                return
+            if info._coordinator_fence is not None:
+                try:
+                    await self.command_authority.reject_waiting_execution(
+                        info.id,
+                        rejection_error,
+                        stop_heartbeat=False,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Subagent %s approval rejection was not durably recorded",
+                        info.id,
+                        exc_info=True,
+                    )
+                    return
             info.done = True
             info.error = rejection_error
             # Slot accounting through the one-shot token, NOT a bare decrement.
@@ -4650,8 +5330,17 @@ class SubagentManager:
             logger.info("Subagent %s spawn rejected", info.id)
             # Report ownership through the same claim every other terminal path
             # uses, so a concurrent reap/stop cannot also announce.
-            if self._on_done and self._claim_finalize(info):
-                await self._safe_announce(info)
+            if self._claim_finalize(info):
+                if info._coordinator_fence is not None:
+                    await self._report_terminal(
+                        info,
+                        source="Subagent approval",
+                        injection_timeout_reason="approval rejection delivery timed out",
+                        mark_delivered_on_success=True,
+                        settle_digest=True,
+                    )
+                elif self._on_done:
+                    await self._safe_announce(info)
             return
 
         self._log_spawned(info)
@@ -4714,7 +5403,10 @@ class SubagentManager:
         _bs = self._batch_submitted.get(batch_id)
         if _bs is not None and _bs[1] > 0 and _bs[0] < _bs[1]:
             return True  # submissions still in flight
-        if any(a.batch_id == batch_id and not a.done for a in self._agents.values()):
+        if any(
+            a.batch_id == batch_id and (not a.done or a._coordinator_claim_uncertain)
+            for a in self._agents.values()
+        ):
             return True
         return self._scheduler.contains_batch(batch_id)
 
@@ -4946,7 +5638,7 @@ class SubagentManager:
                 "Digest hold flush announce failed for wave %s", info.batch_id, exc_info=True
             )
             return
-        self._settle_digest_holds(info)
+        await self._settle_digest_holds(info)
 
     async def settle_queued_delivery(self, agent_ids: list[str]) -> None:
         """Write the ``delivered`` tombstones for completions consumed from a queue.
@@ -4983,14 +5675,52 @@ class SubagentManager:
                         "delivered tombstone; writing it anyway",
                         agent_id,
                     )
-            try:
-                await asyncio.to_thread(mark_delivered, agent_id)
-            except Exception:
-                logger.debug(
-                    "Failed to mark drained subagent %s delivered", agent_id, exc_info=True
-                )
+            context = self._delivery_context_for_run(agent_id)
+            if context is None or context.info.outcome == "completed":
+                try:
+                    await asyncio.to_thread(mark_delivered, agent_id)
+                except Exception:
+                    logger.debug(
+                        "Failed to mark drained subagent %s delivered",
+                        agent_id,
+                        exc_info=True,
+                    )
+            await self._ack_delivery_for_run(agent_id)
 
-    def _settle_digest_holds(self, info: SubagentInfo) -> None:
+    def _delivery_event_for_run(self, run_id: str) -> str:
+        for event_id, context in self._outbox_contexts.items():
+            if context.info.id == run_id:
+                return event_id
+        return ""
+
+    def _delivery_context_for_run(self, run_id: str) -> _OutboxDeliveryContext | None:
+        for context in self._outbox_contexts.values():
+            if context.info.id == run_id:
+                return context
+        return None
+
+    async def _ack_delivery_for_run(self, run_id: str) -> None:
+        event_id = self._delivery_event_for_run(run_id)
+        if not event_id:
+            return
+        while True:
+            try:
+                delivered = await self._outbox_delivery.acknowledge(event_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Subagent %s: durable delivery acknowledgement failed; retrying",
+                    run_id,
+                    exc_info=True,
+                )
+                await asyncio.sleep(_TERMINAL_RETRY_SECONDS)
+                continue
+            if delivered is not None:
+                self._outbox_contexts.pop(event_id, None)
+            return
+
+    async def _settle_digest_holds(self, info: SubagentInfo) -> None:
         """Settle delivery tombstones for wave members whose injection was
         held for this member's digest. Called ONLY after ``_on_done`` returned
         without raising — the digest has been handed off, so marking the held
@@ -4998,10 +5728,13 @@ class SubagentManager:
         (settling at digest composition, before routing, would).
         """
         for _hid in info._digest_settle_ids:
-            try:
-                mark_delivered(_hid)
-            except Exception:
-                logger.debug("Failed to settle held subagent %s", _hid, exc_info=True)
+            context = self._delivery_context_for_run(_hid)
+            if context is None or context.info.outcome == "completed":
+                try:
+                    await asyncio.to_thread(mark_delivered, _hid)
+                except Exception:
+                    logger.debug("Failed to settle held subagent %s", _hid, exc_info=True)
+            await self._ack_delivery_for_run(_hid)
         info._digest_settle_ids = []
 
     def get(self, agent_id: str) -> SubagentInfo | None:
@@ -5075,6 +5808,16 @@ class SubagentManager:
         """
         try:
             await self._shadow_submit_accepted_run_unchecked(info)
+        except asyncio.TimeoutError:
+            # Submission can commit in SQLite after the bounded await expires.
+            # A local failure would then race durable recovery and report the
+            # same accepted run twice, so only recovery may choose an outcome.
+            info._coordinator_claim_uncertain = True
+            logger.error(
+                "Subagent %s coordinator submission outcome is uncertain; "
+                "deferring terminal ownership to durable recovery",
+                info.id,
+            )
         except Exception:
             # Request construction, injected adapters, and result inspection
             # are all outside the legacy lifecycle contract. None may turn an
@@ -5088,6 +5831,8 @@ class SubagentManager:
     async def _shadow_submit_accepted_run_unchecked(self, info: SubagentInfo) -> None:
         coordinator = self._coordinator
         if coordinator is None:
+            return
+        if info._coordinator_fence is not None:
             return
         operation = CommandOperation.CONTINUE if info.conversation_key else CommandOperation.SPAWN
         raw_task = info._raw_task or info.task
@@ -5129,11 +5874,69 @@ class SubagentManager:
             task=raw_task,
             conversation_key=info.conversation_key,
             operation=operation,
+            source_version=LEGACY_SHADOW_SOURCE_VERSION,
         )
-        result = await asyncio.wait_for(
-            self._coordinator.submit(request),
-            timeout=_COORDINATOR_SHADOW_TIMEOUT_SECS,
-        )
+        submit_task = asyncio.create_task(self._coordinator.submit(request))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(submit_task),
+                timeout=_COORDINATOR_SHADOW_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError:
+            # Keep a strong reference and consume any eventual exception. The
+            # coordinator operation must not be cancelled while queued for its
+            # bounded executor: a late durable commit is the recovery record.
+            self._coordinator_shadow_submits.add(submit_task)
+
+            def resume_legacy_terminal() -> None:
+                settlement_task = asyncio.create_task(
+                    self._resume_legacy_terminal_after_failed_shadow_submit(info)
+                )
+                self._coordinator_shadow_submits.add(settlement_task)
+
+                def consume_settlement(done: asyncio.Task[Any]) -> None:
+                    self._coordinator_shadow_submits.discard(done)
+                    if done.cancelled():
+                        return
+                    try:
+                        done.result()
+                    except Exception:
+                        logger.warning(
+                            "run coordinator late shadow settlement failed for run=%s",
+                            info.id,
+                            exc_info=True,
+                        )
+
+                settlement_task.add_done_callback(consume_settlement)
+
+            def settle_shadow_submit(done: asyncio.Task[Any]) -> None:
+                self._coordinator_shadow_submits.discard(done)
+                if done.cancelled():
+                    return
+                try:
+                    settled = done.result()
+                except Exception:
+                    logger.warning(
+                        "run coordinator shadow submission settled with failure " "for run=%s",
+                        info.id,
+                        exc_info=True,
+                    )
+                    resume_legacy_terminal()
+                    return
+                if (
+                    settled is None
+                    or settled.decision is CoordinatorDecision.REJECTED
+                    or settled.value is None
+                ):
+                    logger.warning(
+                        "run coordinator shadow submission settled without a "
+                        "durable run for run=%s",
+                        info.id,
+                    )
+                    resume_legacy_terminal()
+
+            submit_task.add_done_callback(settle_shadow_submit)
+            raise
 
         if result is None:
             # Injected adapters are expected to honor the typed port. Keep this
@@ -5183,33 +5986,160 @@ class SubagentManager:
                 ",".join(sorted(mismatches)),
             )
 
+        try:
+            claim = await asyncio.wait_for(
+                self._coordinator.claim_command(
+                    command_id,
+                    OwnerLease(
+                        owner_id=self._coordinator_owner_id,
+                        lease_expires_at=time.time() + EXECUTION_LEASE_SECONDS,
+                    ),
+                ),
+                timeout=_COORDINATOR_SHADOW_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError:
+            # ``wait_for`` cancels only the asyncio wrapper. SQLite work that
+            # has already entered the coordinator executor can still commit,
+            # so treating this as a definite missing fence would emit one
+            # local failure and let recovery emit a second interruption. Read
+            # the stable command once: an owned, unexpired committed claim is
+            # safe to resume; every other result stays exclusively recoverable.
+            receipt = None
+            try:
+                receipt = await asyncio.wait_for(
+                    self._coordinator.get_command_by_key(command_id),
+                    timeout=_COORDINATOR_SHADOW_TIMEOUT_SECS,
+                )
+            except Exception:
+                logger.warning(
+                    "run coordinator shadow claim lookup failed for run=%s",
+                    info.id,
+                    exc_info=True,
+                )
+            now = time.time()
+            if (
+                receipt is not None
+                and receipt.run is not None
+                and receipt.command.status is CommandStatus.CLAIMED
+                and receipt.command.owner_id == self._coordinator_owner_id
+                and receipt.command.claim_expires_at > now
+                and receipt.run.owner_id == self._coordinator_owner_id
+                and receipt.run.lease_expires_at > now
+            ):
+                info._coordinator_command = receipt.command
+                info._coordinator_fence = RunFence(
+                    run_id=receipt.run.run_id,
+                    owner_id=receipt.run.owner_id,
+                    lease_epoch=receipt.run.lease_epoch,
+                )
+                info._coordinator_version = receipt.run.version
+                return
+            info._coordinator_claim_uncertain = True
+            logger.error(
+                "Subagent %s coordinator claim outcome is uncertain; "
+                "deferring terminal ownership to durable recovery",
+                info.id,
+            )
+            return
+        if claim is None or claim.fence is None or claim.run is None:
+            raise RuntimeError("coordinator legacy execution claim is unavailable")
+        info._coordinator_command = claim.command
+        info._coordinator_fence = claim.fence
+        info._coordinator_version = claim.run.version
+
+    async def _resume_legacy_terminal_after_failed_shadow_submit(
+        self,
+        info: SubagentInfo,
+    ) -> None:
+        """Report locally when a timed-out submission later proves non-durable."""
+
+        if not info._coordinator_claim_uncertain:
+            return
+        info._coordinator_claim_uncertain = False
+        info.done = True
+        info.error = "run coordinator submission failed after timeout"
+        info.elapsed = time.time() - info.started
+        if not self._claim_finalize(info):
+            return
+        Stats().inc_subagent_failed()
+        await asyncio.to_thread(self._write_tombstone, info, "error")
+        self._record_cost(info)
+        self._spawn_terminal_report(
+            info,
+            source="Subagent",
+            injection_timeout_reason=(
+                f"delivery timed out after {int(_ON_DONE_TIMEOUT)}s "
+                "(late coordinator submission failure)"
+            ),
+            mark_delivered_on_success=False,
+            settle_digest=True,
+        )
+
+    def _retain_recovery_batch(self, info: SubagentInfo) -> None:
+        """Keep live-only wave routing for a run handed to durable recovery."""
+
+        if info.batch_id:
+            self._outbox_live_run_batches[info.id] = (
+                info.batch_id,
+                info.batch_total,
+            )
+
     async def _run(self, info: SubagentInfo) -> None:
         """Execute a subagent task in its own session."""
         session_key = info.conversation_key or f"subagent:{info.id}"
         try:
-            if info._coordinator_admitted:
+            authority_admitted = info._coordinator_admitted
+            if not authority_admitted:
+                await self._shadow_submit_accepted_run(info)
+            if info._coordinator_claim_uncertain:
+                info.done = True
+                info.error = (
+                    "coordinator execution admission outcome is uncertain; "
+                    "awaiting durable recovery"
+                )
+                self._retain_recovery_batch(info)
+                return
+            if info._coordinator_fence is None:
+                raise RuntimeError("coordinator execution fence is missing")
+            try:
+                await self._coordinator_mark_starting(info)
+            except Exception:
+                if not authority_admitted:
+                    raise
+                # A lost lifecycle response is retried inside the transition.
+                # If both attempts fail, command settlement must not run: it
+                # would apply a command whose STARTING state is still unknown.
+                info._coordinator_claim_uncertain = True
+                self._retain_recovery_batch(info)
+                logger.warning(
+                    "Subagent %s starting transition is uncertain",
+                    info.id,
+                    exc_info=True,
+                )
+                return
+            if authority_admitted:
                 try:
+                    # The command fence makes the same result idempotent.
+                    # Reconcile a commit whose response was lost before
+                    # deciding that recovery must own the accepted run.
                     await self.command_authority.execution_started(info.id)
                 except Exception:
                     try:
-                        # The command fence makes the same result idempotent.
-                        # Reconcile a commit whose response was lost before
-                        # deciding that recovery must own the accepted run.
                         await self.command_authority.execution_started(info.id)
                     except Exception:
                         # The claimed command remains the only safe retry path.
                         # Keep the live record cancellable and suppress terminal
                         # delivery until cancellation or recovery settles it.
                         info._coordinator_claim_uncertain = True
+                        self._retain_recovery_batch(info)
                         logger.warning(
                             "Subagent %s start settlement is uncertain",
                             info.id,
                             exc_info=True,
                         )
                         return
-                info._coordinator_waiting = False
-            else:
-                await self._shadow_submit_accepted_run(info)
+            info._coordinator_waiting = False
+            self._start_coordinator_heartbeat(info)
             await asyncio.wait_for(
                 self._run_inner(info, session_key), timeout=self._default_timeout
             )
@@ -5800,6 +6730,9 @@ class SubagentManager:
                 )
             # Detect CC provider to skip permission event loop
             is_cc = self._is_cc_provider(client)
+        await self._coordinator_mark_running(info)
+        if info._session_sharing and info._pid:
+            await self._coordinator_record_process(info, info._pid, "", False)
         # Intentionally check info.agent (not resolved `agent`) so only
         # explicitly requested agents skip _SYSTEM_PREFIX (defense-in-depth).
         named_agent = bool(info.agent and _AGENT_NAME_RE.fullmatch(info.agent))
@@ -5908,15 +6841,9 @@ class SubagentManager:
         )
         # Stream results to disk for orchestrated chat.
 
-        # Record PID for orphan recovery
-        try:
-
-            pid = self._sessions.get_pid(session_key)
-            if pid:
-                info._pid = pid  # make available for _write_tombstone
-                update_state(info.id, pid=pid, pid_recorded_at=time.time())
-        except Exception:
-            logger.debug("Failed to record PID for %s", info.id, exc_info=True)
+        # Protected identity is the only restart authority for terminating this
+        # process tree. Failure must abort before the child receives a prompt.
+        await self._record_process_identity(info, session_key)
 
         # Record session_id and provider type for session file cleanup
         try:
@@ -6671,7 +7598,13 @@ class SubagentManager:
         info._shared_provider = provider
         if runtime.pid:
             info._pid = runtime.pid
-            update_state(info.id, pid=runtime.pid, pid_recorded_at=time.time())
+            update_state(
+                info.id,
+                pid=runtime.pid,
+                pid_recorded_at=time.time(),
+                pid_start_id="",
+                process_owned=False,
+            )
         logger.info(
             "Subagent %s using session sharing on runtime PID %s (session %s, key %s)",
             info.id,
@@ -6767,7 +7700,7 @@ class SubagentManager:
         task.cancel()
 
     def _unqueue(self, agent_id: str) -> list[dict[str, Any]]:
-        """Drop and return matching entries from the stagger queue.
+        """Drop and return not-yet-started entries from the stagger queue.
 
         The queue is the only record of a waiting run — `spawn` returns its queued
         SubagentInfo without registering it in ``_agents`` — so removing the entry
@@ -6788,25 +7721,34 @@ class SubagentManager:
         return dropped
 
     async def _finalize_queued_cancel(self, params: dict[str, Any]) -> None:
-        """Durably reject one coordinator-backed queue entry."""
+        """Commit and deliver a neutral stop for a coordinator-backed queue entry."""
 
-        rejection_error = "spawn cancelled before start"
-        await self.command_authority.reject_waiting_execution(
-            str(params.get("_preassigned_id") or ""),
-            rejection_error,
+        fence = params.get("_coordinator_fence")
+        if fence is None:
+            return
+        raw_task = str(params.get("task") or "")
+        info = SubagentInfo(
+            id=str(params.get("_preassigned_id") or ""),
+            task=_redact(raw_task),
+            parent_session_key=str(params.get("parent_session_key") or ""),
+            agent=str(params.get("agent") or ""),
+            done=True,
+            user_stopped=True,
+            batch_id=str(params.get("batch_id") or ""),
+            batch_total=int(params.get("batch_total") or 0),
         )
-        await self.announce_durable_rejection(
-            SubagentInfo(
-                id=str(params.get("_preassigned_id") or ""),
-                task=_redact(str(params.get("task") or "")),
-                parent_session_key=str(params.get("parent_session_key") or ""),
-                agent=str(params.get("agent") or ""),
-                silent=bool(params.get("silent")),
-                done=True,
-                error=rejection_error,
-                batch_id=str(params.get("batch_id") or ""),
-                batch_total=int(params.get("batch_total") or 0),
-            )
+        info._raw_task = raw_task
+        info._coordinator_admitted = True
+        info._coordinator_command = params.get("_coordinator_command")
+        info._coordinator_fence = fence
+        info._coordinator_version = int(params.get("_coordinator_version") or 0)
+        await self._reject_waiting_before_terminal(info, "run stopped before execution")
+        await self._report_terminal(
+            info,
+            source="Subagent queue",
+            injection_timeout_reason="queued cancellation delivery timed out",
+            mark_delivered_on_success=True,
+            settle_digest=True,
         )
 
     async def cancel(self, agent_id: str) -> bool:
@@ -6885,6 +7827,11 @@ class SubagentManager:
         if self._reaper_task and not self._reaper_task.done():
             self._reaper_task.cancel()
             self._reaper_task = None
+        reconcile_task = self._reconcile_task
+        self._reconcile_task = None
+        if reconcile_task is not None and not reconcile_task.done():
+            reconcile_task.cancel()
+            await asyncio.gather(reconcile_task, return_exceptions=True)
         # follow_up watchers: CANCEL AND GATHER FIRST, announce after (GPT
         # review). The announce awaits — _on_done injection can be slow — and
         # a busy-retry watcher waking during that await could dispatch a
@@ -6934,6 +7881,13 @@ class SubagentManager:
         if tasks_to_await:
             await asyncio.gather(*tasks_to_await, return_exceptions=True)
         self._tasks.clear()
+        # A retained submission can settle by scheduling a local terminal
+        # reporter. Drain the full submission/settlement chain before taking
+        # the report snapshot so shutdown cannot miss that newly created task.
+        while self._coordinator_shadow_submits:
+            shadow_submits = list(self._coordinator_shadow_submits)
+            self._coordinator_shadow_submits.clear()
+            await asyncio.gather(*shadow_submits, return_exceptions=True)
         # Shielded terminal reports keep running after their awaiter is
         # cancelled (that is the point). Drain them with a BOUNDED wait so a
         # report is not orphaned by a closing event loop, without letting a
@@ -7002,4 +7956,10 @@ class SubagentManager:
                             owner.id,
                             exc_info=True,
                         )
+        lease_tasks = list(self._lease_tasks.values())
+        self._lease_tasks.clear()
+        for lease_task in lease_tasks:
+            lease_task.cancel()
+        if lease_tasks:
+            await asyncio.gather(*lease_tasks, return_exceptions=True)
         await self.command_authority.close()

@@ -5,7 +5,7 @@ revision: v1
 author: Kyle Seaman, with Codex
 created: 2026-08-22
 last-audited: 2026-08-22
-audited-at: c8eda3c6f
+audited-at: 09b58e9b4
 doc-pr:
 implementation-prs: []
 tracking-issues: []
@@ -14,15 +14,16 @@ superseded-by: []
 ---
 # RFC: Durable Run Coordinator — typed lifecycle, idempotent commands, and recoverable delivery
 
-- Status: in-progress — PRs 1–5 are implemented locally; PR 5 lives on
-  `codex/run-coordinator-commands`. Keyed spawn/continue admission and control
-  commands are coordinator-authoritative, exact retries reuse durable responses,
-  and transport uncertainty resolves by command lookup. Legacy run files still
-  mirror lifecycle/terminal state; PRs 6–7 are unimplemented.
+- Status: implemented locally — PRs 1–7 are prepared as a stack. Keyed
+  execution carries a renewable run fence through `starting`, `running`, and
+  atomic terminal/outbox commit; fenced delivery retries reuse one stable event
+  identity. Restart recovery imports legacy folders read-only, takes over only
+  expired leases, reports uncertain work as interrupted, and never replays it.
 - Author: Kyle Seaman, with Codex
 - Created: 2026-08-22
-- Audited against: PR 1 commit `c8eda3c6f`, PR 2 commit `53f365a17`, PR 3 commit
-  `4aa0cba4d`, PR 4 commit `3ed006642`, and the PR 5 working tree
+- Audited against: PR 1 commit `09b58e9b4`, PR 2 commit `ffe2b0f76`, PR 3 commit
+  `6db805ec2`, PR 4 commit `458472368`, PR 5 commit `ee198e741`, PR 6 commit
+  `391ccd202`, and local branch `run-coordinator-recovery` for PR 7
 - Related: `docs/system-specs/modules/subagent.md`,
   `docs/system-specs/modules/session.md`, and
   `docs/request-for-change/rfc-orchestrator-chat-sessions.md`
@@ -342,7 +343,13 @@ class RunCoordinator(Protocol):
         self, completion: RunCompletion, fence: RunFence, expected_version: int
     ) -> CoordinatorResult[OutboxEvent]: ...
     async def renew(self, run_id: str, fence: RunFence, until: float) -> bool: ...
-    async def claim_outbox(self, owner: OwnerLease, limit: int) -> list[OutboxEvent]: ...
+    async def claim_outbox(
+        self,
+        owner: OwnerLease,
+        limit: int,
+        event_id: str = "",
+        acknowledgement: bool = False,
+    ) -> list[OutboxEvent]: ...
     async def release_outbox(
         self, fence: DeliveryFence, available_at: float
     ) -> CoordinatorResult[OutboxEvent]: ...
@@ -398,12 +405,21 @@ One transaction:
 
 1. verifies the fence and legal transition;
 2. writes `observed_state=terminal` and the outcome;
-3. inserts a stable pending outbox event; and
+3. inserts a stable outbox event (pending for asynchronous delivery, or already
+   delivered when the synchronous response is the delivery); and
 4. marks the execution command applied.
 
 Repeating the same completion returns the existing event. A conflicting second
 outcome is rejected and recorded as a diagnostic; first durable terminal
 outcome wins, matching the current terminal-record guard.
+
+The execution command's same-fence empty-result fill also verifies the current
+run owner and lease epoch. Recovery takeover therefore fences an old executor
+even when its command claim record still carries the earlier matching epoch.
+Synchronous non-batch admission rejection commits an already-delivered event so
+the counted HTTP error is not followed by a duplicate parent turn. Batch
+rejections keep a pending event with their wave metadata and route through the
+normal completion consumer.
 
 #### Delivery
 
@@ -601,6 +617,14 @@ lost terminal event; redelivery never repeats execution; existing completion
 envelope consumers ignore or use the additive `event_id`; delivery retry and
 fallback remain bounded.
 
+**Local status:** implemented. Exact execution claims acquire a renewable run
+lease while controls retain independent command-only fences. The manager commits
+`starting` before child startup, `running` before prompting, and terminal state
+plus one outbox row before callbacks. Direct acceptance is fenced and
+acknowledged; dashboard-queued and digest-held events stay pending until their
+existing consumption hooks settle the same event. Payloads contain bounded
+summary/routing data and the full-result path.
+
 ### PR 7 — coordinator-first restart recovery and legacy import
 
 Branch: `run-coordinator-recovery`
@@ -616,6 +640,22 @@ terminal commit, destination acceptance, and delivery acknowledgement converges
 to a documented state; a stale owner cannot commit after takeover; uncertain
 execution is reported once without automatic replay; legacy-only installs
 upgrade without losing retained results.
+
+**Local status:** implemented. Schema v4 records the source version on imported
+runs, and schema v5 records process identity and ownership inside the protected
+coordinator store. The importer reads known legacy fields without modifying
+source files and is idempotent against native coordinator rows; agent-writable
+legacy process fields never authorize termination, non-finite timestamps are
+skipped per folder, and legacy destinations never manufacture pending outbox
+work. A dedicated child does not receive a prompt until its fenced process
+identity is durably stored; failure aborts execution while the legacy state
+mirror remains best-effort. Recovery claims expired
+nonterminal leases with a fresh epoch, signals only a coordinator-owned PID with
+an exact fenced start identity, retains partial output, commits `interrupted`,
+emits a SEL termination audit, and drains terminal outbox work separately. The
+periodic reaper retries leases that had not expired at startup while excluding
+locally active run IDs. A hermetic sleeper-process test exercises the real
+takeover/termination path.
 
 ### Deferred cleanup after the compatibility window
 

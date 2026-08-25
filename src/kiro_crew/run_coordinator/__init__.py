@@ -1,7 +1,10 @@
 """Typed run coordination boundary for subagent lifecycle state."""
 
+from .delivery import DeliveryAttempt, OutboxDeliveryAdapter
+from .legacy import LegacyImportReport, LegacyRunImporter
 from .memory import MemoryRunCoordinator
 from .models import (
+    LEGACY_SHADOW_SOURCE_VERSION,
     CommandClaim,
     CommandFence,
     CommandOperation,
@@ -13,9 +16,12 @@ from .models import (
     DeliveryFence,
     DeliveryState,
     DesiredState,
+    LegacyImportReceipt,
+    LegacyRunImport,
     ObservedState,
     OutboxEvent,
     OwnerLease,
+    RecoveryClaim,
     RunCommand,
     RunCompletion,
     RunCoordinator,
@@ -26,6 +32,7 @@ from .models import (
     SubmitReceipt,
     SubmitRun,
 )
+from .recovery import RecoveryReport, RunRecovery
 from .shadow import ShadowRunCoordinator
 from .sqlite import SQLiteRunCoordinator
 
@@ -38,19 +45,29 @@ __all__ = [
     "CoordinatorDecision",
     "CoordinatorReason",
     "CoordinatorResult",
+    "DeliveryAttempt",
     "DeliveryFence",
     "DeliveryState",
     "DesiredState",
+    "LegacyImportReceipt",
+    "LegacyImportReport",
+    "LegacyRunImport",
+    "LEGACY_SHADOW_SOURCE_VERSION",
+    "LegacyRunImporter",
     "MemoryRunCoordinator",
     "ObservedState",
+    "OutboxDeliveryAdapter",
     "OutboxEvent",
     "OwnerLease",
+    "RecoveryClaim",
+    "RecoveryReport",
     "RunCommand",
     "RunCompletion",
     "RunCoordinator",
     "RunFence",
     "RunOutcome",
     "RunRecord",
+    "RunRecovery",
     "SubmitReceipt",
     "SubmitControl",
     "SubmitRun",
