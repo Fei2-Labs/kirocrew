@@ -146,29 +146,60 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
         # Enforced by BOTH the regex tier and the argv-structural floor
         # (``_is_credential_mint``) -- a union, so neither can fail open alone.
         # This pattern is the raw-text half: it still sees inside a nested shell
-        # payload (``bash -c "… token"``) and covers the case where tokenizing
-        # fails outright.  The name must be in COMMAND POSITION -- start of input or
-        # after a separator, optionally quoted or path-qualified -- so the word
-        # merely APPEARING in another command's arguments (``echo kirocrew token``,
-        # ``git commit -m '… token …'``) is not a mint.  The gap then accepts
-        # anything up to a command separator (``; & |``), a comment (``#``), a
-        # redirect (``>``), a path separator (``/``) or a glob (``*``); the last two
-        # keep an ordinary product-named path, and a regex LITERAL quoting this very
-        # rule, from reading as a mint.  ``\btoken\b`` keeps ``tokens`` and
-        # ``token_auth.py`` from matching at all.  The forms this half misses on
-        # purpose (a redirect between name and verb, a quoted verb) are the floor's.
+        # payload (``bash -c "…; kirocrew token"`` -- separators inside quotes
+        # still anchor) and covers the case where tokenizing fails outright.
+        # The name must be in COMMAND POSITION -- start of input or after a
+        # separator -- and may be qualified only by a genuine PATH prefix
+        # (leading ``/``- or ``./``-separated segments), so a hyphenated
+        # identifier that merely CONTAINS the name (a rule id at a line start, a
+        # worktree directory name) no longer anchors.  The name must also be
+        # followed by HORIZONTAL whitespace before anything else -- an
+        # identifier glued to it (``kirocrew-wt-4745``) never reads as a mint.
+        # The gap between the name and the verb is the base rule's own: any run
+        # of characters that is not a command separator (``; & |``), a comment
+        # (``#``), a redirect (``>``), a glob (``*``), or a path character
+        # (``/``) -- with ONE narrowing: it may not cross a newline, so a line
+        # of a multi-line payload can no longer span to a ``token`` word on a
+        # later line.  No attempt is made to enumerate CLI argument grammar in
+        # the gap (subcommands, flags, operand shapes): three successive
+        # attempts each dropped real mint forms (``$X`` expansions, quoted or
+        # punctuation-bearing operands, deep flag runs), and the argv floor is
+        # not a backstop for exactly the multi-line data-consumer shape this
+        # raw half exists to carry.  The verb itself may carry a shell quote
+        # marker (``$'token'`` / ``$"token"`` -- the tokenizer renders those
+        # ``$token``, which the floor's exact-verb check cannot see, so the
+        # regex must).  Structure note: every QUANTIFIED group here is
+        # ``(?:…)?``, never ``(?:…)*`` -- ``_redos_prone`` rejects any
+        # multi-quantified group with an inner quantifier, and this rule must
+        # stay in the regex tier.  ``\btoken\b`` keeps ``tokens`` and
+        # ``token_auth.py`` from matching at all.  The forms this half misses
+        # on purpose are the floor's: a redirect between name and verb, glued
+        # quotes (``kiro""crew``), a path-bearing word in the gap, and a
+        # backslash-newline continuation splitting the invocation.  Known
+        # residual, shared with the pre-#4745 pattern: a single-line prose
+        # mention whose ``token`` word follows the bare product name with no
+        # excluded character between them still matches -- the #4745 fix
+        # targets name-CONTAINING identifiers and cross-line spans, not every
+        # same-line mention.
         pattern=(
             "(?:\\A|[;&|\\n`]|\\$\\()[\\s\"'(]*"
-            "[\\w.:/\\\\-]*kiro[-.]?crew\\b[^|;&#>/*]*\\btoken\\b"
+            "(?:[\\w.:+/\\\\-]*[/\\\\])?"
+            "kiro[-.]?crew(?:\\.\\w+)?\\b[\"']*"
+            "(?:[^\\S\\n][^;&|#>/*\\n]*)?"
+            "[^\\S\\n]\\$?[\"']?token\\b"
         ),
         category="credential-exfil",
         description=(
             "Blocks the `kirocrew token` CLI, which mints a signed dashboard access token an "
-            "attacker could use to authenticate to the gateway. Matches the CLI name and the "
-            "token verb within one command segment -- including nested forms such as `kirocrew "
-            "pod token` and the hyphenated `kiro-crew` spelling -- so an incidental mention of "
-            "the word in a later command, a comment, or a file path is not a mint. The argv "
-            "floor additionally covers `python -m kiro_crew ... token`, which mints the same "
+            "attacker could use to authenticate to the gateway. Matches the CLI name in "
+            "command position -- optionally path-qualified, including the hyphenated "
+            "`kiro-crew` spelling -- followed on the SAME LINE by the token verb, with a "
+            "gap that admits anything except a command separator, comment, redirect, glob, "
+            "or path character, covering forms such as `kirocrew --port 6777 pod token`. "
+            "An identifier that merely contains the name (a "
+            "rule id, or a product-named file path) is not a mint, and a mention on a "
+            "different line of a multi-line text no longer matches. The argv floor "
+            "additionally covers `python -m kiro_crew ... token`, which mints the same "
             "token through the interpreter rather than the console script."
         ),
     ),

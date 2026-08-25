@@ -43,9 +43,9 @@
   },
   {
     "id": "credential-exfil-kirocrew-token",
-    "pattern": "(?:\\A|[;&|\\n`]|\\$\\()[\\s\"'(]*[\\w.:/\\\\-]*kiro[-.]?crew\\b[^|;&#>/*]*\\btoken\\b",
+    "pattern": "(?:\\A|[;&|\\n`]|\\$\\()[\\s\"'(]*(?:[\\w.:+/\\\\-]*[/\\\\])?kiro[-.]?crew(?:\\.\\w+)?\\b[\"']*(?:[^\\S\\n][^;&|#>/*\\n]*)?[^\\S\\n]\\$?[\"']?token\\b",
     "category": "credential-exfil",
-    "description": "Blocks the `kirocrew token` CLI, which mints a signed dashboard access token an attacker could use to authenticate to the gateway. Matches the CLI name and the token verb within one command segment -- including nested forms such as `kirocrew pod token` and the hyphenated `kiro-crew` spelling -- so an incidental mention of the word in a later command, a comment, or a file path is not a mint. The argv floor additionally covers `python -m kiro_crew ... token`, which mints the same token through the interpreter rather than the console script."
+    "description": "Blocks the `kirocrew token` CLI, which mints a signed dashboard access token an attacker could use to authenticate to the gateway. Matches the CLI name in command position -- optionally path-qualified, including the hyphenated `kiro-crew` spelling -- followed on the SAME LINE by the token verb, with a gap that admits anything except a command separator, comment, redirect, glob, or path character, covering forms such as `kirocrew --port 6777 pod token`. An identifier that merely contains the name (a rule id, or a product-named file path) is not a mint, and a mention on a different line of a multi-line text no longer matches. The argv floor additionally covers `python -m kiro_crew ... token`, which mints the same token through the interpreter rather than the console script."
   },
   {
     "id": "credential-exfil-env-grep-aws",
@@ -357,7 +357,7 @@
     "id": "iac-teardown-cdk-destroy",
     "pattern": "cdk destroy.*",
     "category": "iac-teardown",
-    "description": "Blocks `cdk destroy`, which tears down an entire AWS CDK stack and all its provisioned cloud resources — irreversible infrastructure and data loss."
+    "description": "Blocks `cdk destroy`, which tears down an entire AWS CDK stack and all its provisioned cloud resources \u2014 irreversible infrastructure and data loss."
   },
   {
     "id": "local-destructive-chmod-777",
@@ -531,7 +531,7 @@
     "id": "iac-teardown-kubectl-delete-namespace",
     "pattern": "kubectl delete namespace.*",
     "category": "iac-teardown",
-    "description": "Blocks `kubectl delete namespace`, which deletes a Kubernetes namespace and cascades to every workload, service, and volume inside it — irreversible cluster-wide teardown."
+    "description": "Blocks `kubectl delete namespace`, which deletes a Kubernetes namespace and cascades to every workload, service, and volume inside it \u2014 irreversible cluster-wide teardown."
   },
   {
     "id": "local-destructive-mkfs",
@@ -555,7 +555,7 @@
     "id": "iac-teardown-pulumi-destroy",
     "pattern": "pulumi destroy.*",
     "category": "iac-teardown",
-    "description": "Blocks `pulumi destroy`, which deletes all cloud resources managed by a Pulumi stack — irreversible infrastructure teardown."
+    "description": "Blocks `pulumi destroy`, which deletes all cloud resources managed by a Pulumi stack \u2014 irreversible infrastructure teardown."
   },
   {
     "id": "local-destructive-rm-rf-root",
@@ -573,7 +573,7 @@
     "id": "iac-teardown-terraform-destroy",
     "pattern": "terraform destroy.*",
     "category": "iac-teardown",
-    "description": "Blocks `terraform destroy`, which destroys every resource tracked in the Terraform state — irreversible infrastructure and data loss."
+    "description": "Blocks `terraform destroy`, which destroys every resource tracked in the Terraform state \u2014 irreversible infrastructure and data loss."
   },
   {
     "id": "sql-truncate-table",

@@ -167,6 +167,154 @@ class TestCatalog:
                 allowed, denied_regexes=effective
             ), f"false positive on {allowed!r}"
 
+    def test_token_mint_raw_pattern_ignores_incidental_mentions(self):
+        """#4745: the raw-text half must not fire on text that merely CONTAINS the name.
+
+        The old pattern had two widenings, each alone sufficient for a false positive:
+        an arbitrary word/hyphen chain accepted as the program-name prefix (so a rule id
+        or worktree dir name satisfied the command-position anchor), and an unbounded
+        gap between name and verb (so a whole prose/code line spanned to a later
+        ``token`` word, with ``\\n`` making every line a fresh command position).
+
+        Asserted BOTH through ``is_denied`` (the enforcement union) AND against
+        ``rule.pattern`` directly: the union would mask a regex-half regression behind
+        the argv floor, and this rule's raw-text half exists precisely for inputs the
+        floor cannot see (nested payloads, tokenizer failure), so its own behavior
+        needs pinning. Each false-positive case here was verified to MATCH the old
+        pattern (mutation check: restoring the old pattern turns this test red).
+        """
+        from kiro_crew import security
+
+        rule = next(
+            r for r in BUILTIN_DENIED_RULES if r.id == "credential-exfil-kirocrew-token"
+        )
+        effective = list(
+            security.compute_effective_denied(security.BUILTIN_DENIED_RULES, (), False, (), ())
+        )
+
+        false_positives = (
+            # A read-only search whose PATTERN ARGUMENT lands at a line start (wrapped
+            # command): the hyphenated rule id contains the name and ends in the verb.
+            "grep -rn \\\n  'credential-exfil-kirocrew-token' src/kiro_crew/",
+            # A multi-line inline interpreter payload whose lines carry a name-bearing
+            # identifier; ``\n`` puts each line in command position.
+            "python - <<'PY'\nids = '''\ncredential-exfil-kirocrew-token\n'''\nprint(ids)\nPY",
+            # A path-qualified worktree directory name followed later on the same line
+            # by the verb word.
+            "cat <<'EOF' > report.txt\n/workplace/user/kirocrew-wt-4745 token audit pending\nEOF",
+        )
+        for text in false_positives:
+            assert not re.search(
+                rule.pattern, text, re.IGNORECASE
+            ), f"raw pattern false positive on {text!r}"
+            assert not security.is_denied(
+                text, denied_regexes=effective
+            ), f"false positive on {text!r}"
+
+        # The narrowing must not cost the raw half its own coverage: these must match
+        # the PATTERN ALONE (no floor), including the nested-payload reach (a separator
+        # inside quotes still anchors) and genuine path qualification.
+        still_matched_raw = (
+            "kirocrew token",
+            "kirocrew token --port 6777",
+            'kirocrew "token"',
+            "kirocrew -v --no-jail token",
+            "kiro-crew token",
+            "/usr/local/bin/kirocrew token",
+            "./kirocrew token",
+            'bash -c "echo hi; kirocrew token"',
+            "echo done; kirocrew token",
+            # ANSI-C / locale quoting on the verb: bash passes a plain `token`, but the
+            # tokenizer renders `$token`, which the floor's exact-verb check cannot see
+            # -- the regex is the only tier that can carry these (review finding).
+            "kirocrew $'token'",
+            'kirocrew $"token"',
+            # Subcommand and space-separated-operand forms. On a single line the floor
+            # also catches them, but on a later line of a multi-line command whose first
+            # program is a data consumer (`echo`, `cat`, ...) the floor's argv view
+            # attributes the tokens to that program and exempts them -- the regex `\n`
+            # anchor is the only tier left (review finding).
+            "kirocrew pod token mywt",
+            "kirocrew --port 6777 token",
+            "kirocrew -v pod token",
+            "kirocrew pod -v token",
+            # Interleaved flag/operand/subcommand orders and a QUOTED subcommand: real
+            # CLI grammar needs gap words in mixed order, and quoting any of them must
+            # not exempt the line (focused-verifier finding on a two-slot gap grammar
+            # -- each was denied at base and dropped by that grammar).
+            "kirocrew --port 6777 pod token",
+            "kirocrew --config c.yml pod token",
+            "kirocrew 'pod' token",
+            'kirocrew "pod" token',
+            "kirocrew pod mywt extra token",
+            # Shell-expansion and metacharacter-bearing operands, and word counts past
+            # any fixed cap: a review fuzz (1M generated shapes) proved every attempt
+            # to enumerate CLI argument grammar in the gap dropped these -- `$X` is the
+            # sharpest, because with the variable unset the shell hands the CLI exactly
+            # `kirocrew token`. All were denied at base; the gap must not care what
+            # the words look like, only that no separator/redirect/path char and no
+            # newline intervenes.
+            "kirocrew $X token",
+            "kirocrew ${FLAGS} token",
+            "kirocrew a,b token",
+            "kirocrew (a) token",
+            "kirocrew 50% token",
+            "kirocrew -v -v -v -v -v -v -v token",
+            "kirocrew --port 6777 --host 127.0.0.1 --ttl 20h pod token",
+        )
+        for text in still_matched_raw:
+            assert re.search(
+                rule.pattern, text, re.IGNORECASE
+            ), f"raw-text half lost coverage of {text!r}"
+
+        # The multi-line data-consumer shapes end-to-end: the floor exempts these, so
+        # a raw-pattern regression here is an is_denied regression, not a redundancy.
+        for text in (
+            "echo hi\nkirocrew pod token mywt",
+            "echo hi\nkirocrew --port 6777 token",
+            "cat notes.md\nkirocrew pod token",
+            "echo hi\nkirocrew $'token'",
+            # Reviewer-found v2/v3 regressions, end-to-end: the floor exempts every
+            # one of these (first program is a data consumer, so argv attribution
+            # assigns the later-line tokens to it), so the raw pattern is the only
+            # tier -- each was is_denied at the merge base.
+            "echo hi\nkirocrew --port 6777 pod token",
+            "cat a.md\nkirocrew --config c.yml pod token",
+            "echo hi\nkirocrew 'pod' token",
+            "echo hi\nkirocrew pod mywt extra token",
+            "echo hi\nkirocrew $X token",
+            "cat a.md\nkirocrew $@ token",
+            "echo hi\nkirocrew -v -v -v -v -v -v -v token",
+        ):
+            assert security.is_denied(
+                text, denied_regexes=effective
+            ), f"token mint not blocked: {text!r}"
+
+        # The one DELIBERATE narrowing versus the base pattern: the gap may not
+        # cross a newline. A bare `token` word on a LATER line is a different
+        # command (the newline terminated the invocation), so these were base
+        # false positives, not mints -- pinned here so the narrowing is a choice,
+        # not an accident.
+        for text in (
+            "kirocrew --help\ntoken",
+            "kirocrew doctor\ngrep token app.log",
+        ):
+            assert not re.search(
+                rule.pattern, text, re.IGNORECASE
+            ), f"raw pattern crossed a newline in {text!r}"
+
+        # Bounded-gap discipline: a command separator between the name and the verb
+        # ends the invocation, so the verb belongs to a DIFFERENT command and this
+        # rule must not fire (the argv floor sees the same boundary).
+        for text in (
+            "kirocrew --help; token",
+            "kirocrew --help | token",
+            "kirocrew --help # token",
+        ):
+            assert not re.search(
+                rule.pattern, text, re.IGNORECASE
+            ), f"raw pattern crossed a command separator in {text!r}"
+
     def test_rules_are_frozen_dataclass_with_four_fields(self):
         rule = BUILTIN_DENIED_RULES[0]
         assert isinstance(rule, DeniedCommandRule)
