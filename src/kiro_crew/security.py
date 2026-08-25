@@ -5472,6 +5472,80 @@ _WRITE_CMDS = (
 # Matches python/ruby/perl one-liners that open sensitive paths
 _SCRIPT_OPEN = r"(?:python|ruby|perl)\S*\s.*open\s*\("
 
+# ── Windows normalization-equivalent segment spellings (#5265) ──
+# Win32 path normalization strips trailing dots AND trailing spaces from every
+# path segment (``kiro-cli.`` and ``kiro-cli `` both resolve to ``kiro-cli``),
+# and each entry also answers to its 8.3 short name (``KIRO-C~1``). This gate
+# compares SPELLINGS in raw command text, so a fenced segment must admit those
+# equivalent forms or the fence is bypassable by re-spelling alone. The fix is
+# deliberately textual and per-segment: resolving spellings through the
+# filesystem (GetLongPathName) needs a real path tokenizer, a policy for
+# not-yet-existing write targets, and an answer for the non-Windows hosts this
+# gate also runs on — an architecture decision that is out of scope here.
+# Characters 8.3 short-name generation DROPS from the long name (dots, spaces,
+# and the always-illegal quote) versus the 8.3-invalid punctuation it
+# SUBSTITUTES with ``_`` (mirroring ``RtlGenerate8dot3Name``), before
+# truncating to the 6-character stem (found in review: dropping the
+# substituted set produced ``FOOBAR~1`` where Windows generates ``FOO_BA~1``).
+_WIN_83_DROPPED = set('. "')
+_WIN_83_SUBSTITUTED = set("+,;=[]")
+
+
+def _win_83_chars(text: str) -> str:
+    """Uppercase ``text`` the way 8.3 generation renders it (drop/substitute)."""
+    return "".join(
+        "_" if c in _WIN_83_SUBSTITUTED else c
+        for c in text.upper()
+        if c not in _WIN_83_DROPPED
+    )
+
+
+def _win_83_short_pattern(name: str) -> str | None:
+    """Regex (uncompiled; IGNORECASE at compile) for ``name``'s 8.3 short form.
+
+    Mirrors the generator's textual shape: uppercase, drop the characters 8.3
+    names cannot carry, substitute ``_`` for the 8.3-invalid punctuation, keep
+    the first 6 as the stem, append ``~N``; a long extension survives as its
+    first 3 characters (``config.json`` → ``CONFIG~1.JSO``). Collisions vary
+    only the numeric tail, matched as
+    ASCII ``[0-9]+`` (a DOS numeric tail is never a non-ASCII digit, and
+    Python's ``\\d`` would admit those); the rarer hash-collision stem is not
+    enumerable textually and belongs to the resolver-based design above. A
+    stem can coincide with a SIBLING entry sharing its first 6 characters —
+    over-matching is the safe direction for a gate that blocks on naming
+    alone.
+    """
+    base, dot, ext = name.lstrip(".").rpartition(".")
+    if not dot:
+        base, ext = ext, ""
+    stem = _win_83_chars(base)[:6]
+    if not stem:
+        return None
+    pattern = rf"{re.escape(stem)}~[0-9]+"
+    ext_stem = _win_83_chars(ext)[:3]
+    if ext_stem:
+        pattern += rf"\.{re.escape(ext_stem)}"
+    return pattern
+
+
+def _win_segment(name: str) -> str:
+    """One Windows path segment naming ``name``, in any equivalent spelling.
+
+    Alternates the literal with the 8.3 short form, and allows the trailing
+    dots/spaces Win32 normalization strips after either — both characters, or
+    the space spelling becomes the next member of the class to leak. The run
+    is deliberately UNBOUNDED: ``[. ]`` is a flat class with no nested
+    quantifier, so an unbounded repeat over it is linear, while any finite cap
+    is attacker-defeatable by padding one character past it (whether Win32
+    enforces the component-length ceiling before or after stripping is a
+    question this shape never has to answer).
+    """
+    alts = [re.escape(name)]
+    short = _win_83_short_pattern(name)
+    if short is not None:
+        alts.append(short)
+    return rf"(?:{'|'.join(alts)})[. ]*"
+
 
 def _build_sensitive_regex() -> re.Pattern[str]:
     """Build a compiled regex matching bash reads OR writes of sensitive paths.
@@ -5538,13 +5612,36 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # ``Roaming\..`` and the literal segment matches the re-entry). A
     # multi-level ``..`` chain can over-match a path that actually ends
     # elsewhere — the safe direction for this gate, which blocks on naming
-    # alone. The name run is length-capped to bound backtracking.
-    win_gsep = rf"(?:{win_sep}(?:\.|[^\\/\s'\"]{{1,64}}{win_sep}\.\.))*{win_sep}"
+    # alone. The name run is length-capped to bound backtracking. The control
+    # segments themselves tolerate trailing ``[. ]`` runs (``\.. \Roaming``
+    # normalizes to ``\..\Roaming``), or the quirk class re-enters through the
+    # very excursion spellings this separator exists to catch (found in
+    # review, #5265).
+    win_gsep = (
+        rf"(?:{win_sep}(?:\.[. ]*|[^\\/\s'\"]{{1,64}}[. ]*{win_sep}\.\.[. ]*))*"
+        rf"{win_sep}"
+    )
+    # Every fenced segment is rendered through ``_win_segment`` so its
+    # normalization-equivalent spellings (trailing ``[. ]`` runs, the 8.3
+    # short form) name the same store the literal does (#5265). Applied at
+    # EVERY Windows join site below — the home-anchored dirs, the %APPDATA%
+    # remainders, the write-protected prefixes/leaves, and the agents dir —
+    # because the report measured the leak on more than one branch, and a fix
+    # that closes only one reproduces the partial-fix pattern the issue was
+    # filed about.
     win_dirs_pattern = "|".join(
-        win_gsep.join(re.escape(part) for part in d.split("/"))
+        win_gsep.join(_win_segment(part) for part in d.split("/"))
         for d in _SENSITIVE_HOME_DIRS
     )
-    generic_win_home = rf"[A-Za-z]:{win_sep}(?:Users|home){win_sep}[^\\/\s'\"]+"
+    # ``[. ]*`` after the anchor's fixed segment: ``C:\Users.\u\...``
+    # resolves to ``C:\Users\u\...`` under the same trailing-dot/space
+    # stripping, so the anchor must tolerate it too or the class re-enters
+    # one segment to the left. The username segment gets its run from the
+    # ``win_home_alts`` pad below — ``C:\Users\u \.aws`` re-enters one segment
+    # to the RIGHT otherwise (found in review, #5265).
+    generic_win_home = (
+        rf"[A-Za-z]:{win_sep}(?:Users|home)[. ]*{win_sep}[^\\/\s'\"]+"
+    )
     unc_prefix = r"\\\\[^\s'\"]+"
     # cmd.exe and PowerShell spellings of the profile variable both anchor a
     # home-relative fenced path. The cmd.exe form tolerates expansion
@@ -5560,8 +5657,14 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"|{re.escape('$env:HOMEDRIVE$env:HOMEPATH')}"
         rf"|{re.escape('${env:HOMEDRIVE}${env:HOMEPATH}')})"
     )
+    # The trailing ``[. ]*`` pad closes the anchor's own final segment:
+    # ``C:\Users\u \`` (username), ``%USERPROFILE%.\`` (expansion lands the
+    # stripped dot on the home's last segment), and the resolved home literal
+    # all normalize back to the anchor (found in review, #5265). No overlap
+    # with what follows: every use joins ``win_gsep``, which begins ``[\\/]``.
     win_home_alts = (
-        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}|{tilde}|{home_var})"
+        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}|{tilde}"
+        f"|{home_var})[. ]*"
     )
     # Between the anchor and the fenced remainder, accept the same
     # canonical-no-op chains (``\.\``, ``\X\..\``): they are equivalent to a
@@ -5584,14 +5687,19 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"|{re.escape('${env:APPDATA}')})"
     )
     appdata_remainders = "|".join(
-        win_gsep.join(re.escape(part) for part in d.split("/")[2:])
+        win_gsep.join(_win_segment(part) for part in d.split("/")[2:])
         for d in _SENSITIVE_HOME_DIRS
         if d.startswith("AppData/Roaming/")
     )
     # ``%APPDATA%`` ends in ``Roaming`` by definition, so ``\..\Roaming``
-    # right after it is a canonical no-op specific to this anchor.
+    # right after it is a canonical no-op specific to this anchor. The anchor
+    # gets the ``[. ]*`` pad (``%APPDATA%.\`` strips back to the anchor) and
+    # the re-entry segment is rendered like every other fenced segment, or
+    # ``\..\Roaming.\`` re-opens the quirk class here (found in review,
+    # #5265).
     appdata_sensitive_path = (
-        rf"{appdata_var}(?:{win_sep}\.\.{win_sep}Roaming)*"
+        rf"{appdata_var}[. ]*"
+        rf"(?:{win_sep}\.\.[. ]*{win_sep}{_win_segment('Roaming')})*"
         rf"{win_gsep}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\"])"
     )
     # ``%LOCALAPPDATA%`` is the same shape one directory over: it points INTO
@@ -5629,11 +5737,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # generalized separator, so both spellings of every leaf are gated
     # identically and a leaf added to the tuple is covered in both.
     win_wp_prefixes = "|".join(
-        win_gsep.join(re.escape(part) for part in p.split("/"))
+        win_gsep.join(_win_segment(part) for part in p.split("/"))
         for p in _CREW_HOME_PREFIXES
     )
     win_wp_leaves = "|".join(
-        win_gsep.join(re.escape(part) for part in leaf.split("/"))
+        win_gsep.join(_win_segment(part) for part in leaf.split("/"))
         for leaf in _WRITE_PROTECTED_BASH_LEAVES
     )
     win_write_protected_path = (
@@ -5677,7 +5785,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"|{kiro_home_var}/(?:{agents_leaf_alt}))(?:/|\s|$|['\"])"
     )
     win_agents_dir_alt = win_gsep.join(
-        re.escape(part) for part in _KIRO_AGENTS_DIR.split("/")
+        _win_segment(part) for part in _KIRO_AGENTS_DIR.split("/")
     )
     # cmd.exe ``%KIRO_HOME%`` (with expansion modifiers) and the two PowerShell
     # spellings, mirroring ``userprofile``/``appdata_var`` above.
@@ -5688,7 +5796,9 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     )
     win_agents_write_path = (
         rf"(?:{win_home_alts}{win_gsep}(?:{win_agents_dir_alt})"
-        rf"|{win_kiro_home_var}{win_gsep}(?:{agents_leaf_alt}))(?:{win_sep}|\s|$|['\"])"
+        rf"|{win_kiro_home_var}[. ]*{win_gsep}"
+        rf"(?:{_win_segment(_KIRO_HOME_LEAF)}))"
+        rf"(?:{win_sep}|\s|$|['\"])"
     )
     # Bare path-SEGMENT match for the globally distinctive leaves. Both branches
     # above require a home anchor and a crew prefix, so both are defeated by a
