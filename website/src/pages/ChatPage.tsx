@@ -13,7 +13,8 @@ import { isBrowseCommand } from '../utils/browseCommand'
 // importable from here; the implementation lives in `utils/browseCommand` so a
 // pure test need not pull ChatPage's module graph.
 export { isBrowseCommand }
-import { useSwipeEdge } from '../hooks/useSwipeEdge'
+import { useDrawerSwipe, animateDrawer } from '../hooks/useDrawerSwipe'
+import { shouldReplaceSessionUrl } from '../utils/sessionUrlHistory'
 import type { ResizeInfo } from '../utils/resizeImage'
 import { useAppSelector, useAppDispatch, store } from '../store'
 import { useConnected } from '../hooks/useConnected'
@@ -196,7 +197,7 @@ import { FileCard } from '../components/FileCard'
 import SlotTagPopover from '../components/SlotTagPopover'
 import { TagPopoverProvider } from '../hooks/useTagPopover'
 
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useMotionValue, useTransform } from 'framer-motion'
 import DetailPanel from '../components/DetailPanel'
 
 import type { ChatMessage, Artifact } from '../types'
@@ -777,6 +778,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const queryClient = useQueryClient()
   const provider = useProvider()
   const [searchParams, setSearchParams] = useSearchParams()
+  // Declared with the other top-of-component hooks because the ?sid= URL-sync
+  // effect reads it (mobile replaces rather than pushes a session switch), and
+  // that effect is defined well above where the layout hooks start.
+  const isMobile = useIsMobile()
   const slots = useAppSelector(s => s.dashboard.slots)
   // Unified chat view: show default, orchestrator and crew slots together.
   // App-owned worker slots (s.app) are excluded by the sidebar itself.
@@ -3765,13 +3770,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     next.delete('autoSend')
     next.delete('newSession')
     next.delete('msg')
-    // Push a new history entry on a real session switch (already viewing a
-    // different session) so native Back/Forward retraces sessions; replace for
-    // the initial activation (no prior sid) and same-session path normalization.
+    // Push vs replace — see `shouldReplaceSessionUrl` for why mobile never
+    // pushes. Kept as a named predicate rather than an inline boolean so the
+    // reasoning has somewhere to live and a test can pin it.
     const isSessionSwitch = !!current && current !== activeSlot
-    navigate(`${basePath}${slug ? '/' + slug : ''}?${next}`, { replace: !isSessionSwitch })
+    navigate(`${basePath}${slug ? '/' + slug : ''}?${next}`, { replace: shouldReplaceSessionUrl({ isSessionSwitch, isMobile }) })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSlot, filteredSlots, navigate, basePath, location.pathname, embedded, noUrlSync])
+  }, [activeSlot, filteredSlots, navigate, basePath, location.pathname, embedded, noUrlSync, isMobile])
   // Re-fetch slot messages on mount (handles nav away + back).
   // Skip when newSession=1 — createSlot in send() will set the active slot;
   // dispatching switchSlot here would race and overwrite it.
@@ -5150,7 +5155,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // it, so exiting focus mode restores what the user had. null = focus mode is
   // not the reason the list is hidden (the user owns the state).
   const sidebarAutoHidden = useRef<boolean | null>(null)
-  const isMobile = useIsMobile()
   const [sidePanelDock] = useSidePanelDock()
   // Recomputed on every dock flip: the wrapper keeps one React key across the
   // flip, so both axes have to stay named or the flipped-away one gets driven
@@ -6304,12 +6308,66 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // through renderUserContentCb), so they are omitted to keep it stable.
   }, [messages, visibleIndexMap, slotRunning, slotState, lastTextIdx, handleFileOpen, handleArtifactOpen, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, renderUserContentCb, highlightTs, activeSlotTitle, mode, dispatch, handleOpenDiff, handlePlanFromHere, navigate, planTaskId, artifactPaths, autoNudgeLoop, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress])
 
-  const [mobileSessions, setMobileSessions] = useState(false)
-  // Close mobile sessions panel when a session is selected
-  useEffect(() => { if (isMobile) setMobileSessions(false) }, [activeSlot]) // eslint-disable-line react-hooks/exhaustive-deps
-  // Reset mobile sessions state when leaving mobile viewport
-  useEffect(() => { if (!isMobile) setMobileSessions(false) }, [isMobile])
-  // Swipe from left edge to open sidebar, swipe left on backdrop to close
+  /**
+   * Mobile sessions drawer, as ONE value rather than an open flag plus a
+   * mounted flag. `closing` exists because the panel must stay in the DOM while
+   * it slides out — with two booleans that window is exactly where they drift
+   * apart, and the panel either unmounts mid-slide or is left mounted after it.
+   *
+   * `open` is the intent (the toggle reads it, aria reads it); mount is
+   * `phase !== 'closed'`. There is one writer per transition below, and the
+   * gesture reports through `onSettle` rather than writing the phase itself.
+   */
+  const [drawerPhase, setDrawerPhase] = useState<'closed' | 'open' | 'closing'>('closed')
+  const mobileSessions = drawerPhase === 'open'
+  const drawerMounted = drawerPhase !== 'closed'
+  /** Panel offset in px: `-innerWidth` offscreen, `0` at rest. A MotionValue so
+   *  the drag writes it at frame rate without re-rendering this component. */
+  const drawerX = useMotionValue(0)
+  /** The scrim tracks the panel instead of running its own fade, so a half-drag
+   *  is half-dimmed and a cancelled drag un-dims with the finger. */
+  const drawerScrim = useTransform(drawerX, x => {
+    const w = typeof window === 'undefined' ? 1 : window.innerWidth || 1
+    return Math.max(0, Math.min(1, 1 + x / w))
+  })
+  // Read for the transition guards below. The animation each transition starts
+  // is a side effect, so it must not live inside a setState updater — React may
+  // invoke an updater more than once, which would start the settle twice.
+  const drawerPhaseRef = useRef(drawerPhase)
+  drawerPhaseRef.current = drawerPhase
+  const openSidebar = useCallback(() => {
+    if (drawerPhaseRef.current === 'open') return
+    // Seat it offscreen before the mount so the first painted frame is the
+    // closed offset, then let the shared settle carry it in.
+    if (drawerPhaseRef.current === 'closed') drawerX.set(-(window.innerWidth || 0))
+    drawerPhaseRef.current = 'open'
+    setDrawerPhase('open')
+    animateDrawer(drawerX, 0)
+  }, [drawerX])
+  /** Mount the panel for a drag in progress. Deliberately NOT `openSidebar`:
+   *  that one runs the settle to the rest position, which would race the finger
+   *  for the same value and pull the panel out from under it. The gesture has
+   *  already seated the offset and owns it until release. */
+  const beginDrawerDrag = useCallback(() => {
+    drawerPhaseRef.current = 'open'
+    setDrawerPhase('open')
+  }, [])
+  const closeSidebar = useCallback(() => {
+    if (drawerPhaseRef.current !== 'open') return
+    drawerPhaseRef.current = 'closing'
+    setDrawerPhase('closing')
+    animateDrawer(drawerX, -(window.innerWidth || 0), () => {
+      drawerPhaseRef.current = 'closed'
+      setDrawerPhase('closed')
+    })
+  }, [drawerX])
+  // Close the drawer when a session is selected. Routed through closeSidebar so
+  // it slides out — flipping straight to 'closed' would unmount it on the spot.
+  useEffect(() => { if (isMobile) closeSidebar() }, [activeSlot]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Leaving the mobile viewport: drop the panel with no slide. There is no
+  // mobile drawer to animate on the other side of that crossing, and the
+  // desktop sidebar owns its own open state.
+  useEffect(() => { if (!isMobile) setDrawerPhase('closed') }, [isMobile])
   const chatContainerRef = useRef<HTMLDivElement>(null)
   // Measured container height — sizes the sidebar border-box morph (the panel
   // rect the box shrinks from on collapse and grows back to on expand).
@@ -6372,10 +6430,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const inlineSidePanelShowing = !activitySlot
     && shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
     && !isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
-  const openSidebar = useCallback(() => setMobileSessions(true), [])
-  const closeSidebar = useCallback(() => setMobileSessions(false), [])
-  useSwipeEdge(chatContainerRef, { enabled: isMobile && !mobileSessions, edge: 'left', edgeZone: 0.35, onSwipe: openSidebar })
-  useSwipeEdge(chatContainerRef, { enabled: isMobile && mobileSessions, edge: 'right', threshold: 50, edgeZone: 9999, onSwipe: closeSidebar })
+  // ONE binding for both directions: an inward drag from the left band opens the
+  // drawer, a leftward drag anywhere on the open drawer closes it. Which rule
+  // applies is read live from `open` inside the hook, so the opening drag does
+  // not tear its own listeners down when the panel mounts mid-gesture.
+  const drawerDragging = useDrawerSwipe(chatContainerRef, {
+    enabled: isMobile && !embedded,
+    open: mobileSessions,
+    x: drawerX,
+    onGestureOpen: beginDrawerDrag,
+    onSettle: open => { if (!open) { drawerPhaseRef.current = 'closed'; setDrawerPhase('closed') } },
+  })
   /** Reveal a session's pull request / issue in that session's side panel.
    *
    *  Fires from a sidebar chip AFTER ChatSidebar has dispatched the slot switch,
@@ -6422,9 +6487,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // The mobile session drawer covers the panel it would reveal into. The
     // activeSlot effect closes it on a real switch, but a chip on the session
     // already open does not change activeSlot.
-    if (isMobile) setMobileSessions(false)
+    if (isMobile) closeSidebar()
     return true
-  }, [dispatch, isMobile, selectSource])
+  }, [dispatch, isMobile, selectSource, closeSidebar])
   // Web Preview expand mode — broadcast by the Web Preview tab's
   // expand toggle. When on, hide the session list and maximize the side panel
   // (passed to SidePanel), so the preview gets max room and chat shrinks to its
@@ -6451,7 +6516,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       const expanded = !!(e as CustomEvent<{ expanded?: boolean }>).detail?.expanded
       setPreviewExpanded(expanded)
       if (expanded) {
-        setMobileSessions(false)
+        closeSidebar()
         if (sidebarAutoHidden.current === null) sidebarAutoHidden.current = sidebarPinnedRef.current
         setSidebarPinned(false)
         return
@@ -6576,15 +6641,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     <JiraHostsCtx.Provider value={jiraSourceHosts}>
     <div ref={chatContainerRef} className="flex flex-1 min-h-0 h-full overflow-hidden relative">
       <AnimatePresence>
-        {isMobile && mobileSessions && (
+        {isMobile && drawerMounted && (
           <motion.div
             key="sessions-backdrop"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.25 }}
+            style={{ opacity: drawerScrim }}
             className="fixed inset-0 z-[46] bg-black/50 backdrop-blur-sm"
-            onClick={() => setMobileSessions(false)}
+            // Ignored while a drag owns the panel: the release that ends a
+            // close gesture lands here as a click, and treating it as a
+            // tap-to-dismiss would run a second close over the settle.
+            onClick={() => { if (!drawerDragging) closeSidebar() }}
           />
         )}
       </AnimatePresence>
@@ -6654,7 +6719,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           />
         </div>
       ) : (
-      <OverlayDrawer open={sidebarOpen} width={isMobile ? window.innerWidth : sidebarWidth} dragging={sidebarDragging} morph={!isMobile} morphTarget={TOGGLE_RECT} expandFrom={expandFrom} contentH={Math.max(0, containerH - 8)} className={isMobile ? 'mobile-sessions-overlay fixed top-safe-offset-[42px] bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg max-w-[calc(100vw-2.5rem)] [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0' : ''}>
+      <OverlayDrawer open={isMobile ? drawerMounted : sidebarOpen} width={isMobile ? window.innerWidth : sidebarWidth} dragging={sidebarDragging} slideX={isMobile ? drawerX : undefined} morph={!isMobile} morphTarget={TOGGLE_RECT} expandFrom={expandFrom} contentH={Math.max(0, containerH - 8)} className={isMobile ? 'mobile-sessions-overlay fixed top-safe-offset-[42px] bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg max-w-[calc(100vw-2.5rem)] [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0' : ''}>
         <ChatSidebar
           slots={filteredSlots}
           activeSlot={activeSlot}
@@ -6718,7 +6783,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             OVER it — leaving no way to close a panel that covers the whole
             screen. It would also be pointing at a chat pane the panel has
             squeezed to zero width. Sessions stay reachable meanwhile via the
-            left-edge swipe (useSwipeEdge above).
+            left-edge drag (useDrawerSwipe above).
 
             Suppressed when EMBEDDED for the same reason it is suppressed
             behind the side panel: `fixed` anchors it to the VIEWPORT, not to
@@ -6728,7 +6793,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             embeds one scoped conversation has no sessions list to open. */}
         {isMobile && !embedded && !sidebarOpen && !inlineSidePanelShowing && !(activeSlot && (messages.length > 0 || slotRunning)) && (
           <div className="fixed top-safe-offset-[42px] left-safe ml-2 z-10">
-            <button className="p-2 rounded-lg text-muted hover:text-text bg-bg-elevated border border-border shadow-sm cursor-pointer" onClick={() => setMobileSessions(true)} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
+            <button className="p-2 rounded-lg text-muted hover:text-text bg-bg-elevated border border-border shadow-sm cursor-pointer" onClick={openSidebar} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
               {/* Same glyph as the desktop toggle: a control is named by the SURFACE
                   it opens, and this opens the sessions panel. Solid rather than
                   `PanelLeftLight` because this form only renders while that panel is
@@ -6779,7 +6844,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   <span aria-hidden="true" className={`absolute left-[52px] top-[13px] w-px h-5 bg-border transition-opacity ${sidebarOpen ? 'opacity-0 duration-100' : 'opacity-100 duration-150 delay-[90ms]'}`} />
                 )}
                 {embedMode !== 'chat' && isMobile && (
-                  <button className="p-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none pointer-events-auto" onClick={() => setMobileSessions(p => !p)} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
+                  <button className="p-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none pointer-events-auto" onClick={() => mobileSessions ? closeSidebar() : openSidebar()} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
                     {/* Mirrors the desktop toggle exactly, state included: solid
                         while the panel is hidden, light while it is showing. */}
                     {mobileSessions ? <PanelLeftLight size={16} /> : <PanelLeftSolid size={16} />}
@@ -6801,7 +6866,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     // a stored request would outlive the view and fire on
                     // whichever sidebar mounts next.
                     sidebarAutoHidden.current = null
-                    if (isMobile) setMobileSessions(true)
+                    if (isMobile) openSidebar()
                     else if (!sidebarPinned) setSidebarPinned(true)
                     dispatch(requestSlotReveal(activeSlot))
                   } : undefined}
