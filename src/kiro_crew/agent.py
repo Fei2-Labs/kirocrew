@@ -42,6 +42,7 @@ from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_files import (
     AGENT_FILENAME,
 )
+from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME as _CONDUCTOR_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import LITE_AGENT_FILENAME as _LITE_AGENT_FILENAME
@@ -4146,6 +4147,12 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     except Exception:
         logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
 
+    # Install kirocrew-conductor agent (goal decomposition + session-control dispatch)
+    try:
+        _install_conductor_agent()
+    except Exception:
+        logger.debug("kirocrew-conductor agent install failed", exc_info=True)
+
     # Bidirectional sync: ensure packages installed for one provider
     # are also available for the other (agents↔plugins, skills).
     sync_aim_packages()
@@ -4383,6 +4390,128 @@ def _install_research_agent() -> None:
     path = kiro_agents_dir_path() / _RESEARCH_AGENT_FILENAME
     _atomic_json_write(path, config)
     logger.info("Installed research agent config: %s", path)
+
+
+_CONDUCTOR_SYSTEM_PROMPT = """# Kiro Crew Conductor
+
+You are `kirocrew-conductor`. You own a long-horizon goal: you decompose it
+into work items, stand up one top-level session per item, patrol their state,
+and decide each next round until the goal is met or a stop condition fires.
+
+**You never do a work item's work yourself.** If a task needs a file written,
+a build run, or a fix made, it is a work item for a child session — your four
+jobs are decomposition, dispatch, verification, and the next-round decision.
+Shell access exists solely to run the bundled acceptance evaluator
+(`goal-conductor` skill, `scripts/accept_eval.py`); acceptance is its
+deterministic verdict, never your reading of a child session's transcript.
+
+The `goal-conductor` skill carries the full operating procedure — the work-item
+tests, the dispatch steps, the patrol loop, the stop conditions. Read it
+before acting on a goal. The user can message you at any time; apply goal
+changes at the round boundary, except a message that directly invalidates an
+in-flight item, which you handle immediately.
+"""
+
+
+def _install_conductor_agent() -> None:
+    """Generate and install the kirocrew-conductor agent config.
+
+    Derives from the kirocrew agent (resolved MCP invocations, security hooks)
+    but narrows to the conductor's charter: session control + core tools +
+    shell for the bundled acceptance evaluator, and nothing that lets it do a
+    work item's work itself (no ``fs_write``). The ``kirocrew-dashboard``
+    server is the opt-in per-agent set (folder + session-control tools); this
+    installer granting it IS the explicit per-agent assignment that set
+    requires — it is deliberately absent from the default agent's spec.
+
+    ``@kirocrew-dashboard`` is NOT added to ``allowedTools``: its calls must
+    keep passing through ``hooks.on_tool_call`` where the deny floor and
+    governance ceiling apply, so every session-control call prompts. Neither is
+    ``execute_bash``, for the same reason — the evaluator run prompts too, which
+    is what actually bounds what an acceptance spec can execute.
+
+    The operating procedure ships as the ``goal-conductor`` builtin skill, NOT
+    ``conductor``: that skill name is owned by the generated delegation skill
+    (``conductor_skill.generate_conductor_skill``), and two existing code paths
+    delete ``<skills>/conductor/SKILL.md`` when ``agent.conductor_skill`` is
+    false — the default. Sharing the name would let ``kirocrew setup`` erase the
+    packaged skill on a stock install, and quarantine the user's delegation
+    skill when the flag is on.
+    """
+    config = build_agent_config()
+    config["name"] = "kirocrew-conductor"
+    config["description"] = (
+        "Owns a long-horizon goal: decomposes it into work items, stands up "
+        "a top-level session per item, patrols their state, and decides each "
+        "next round. Never does the work itself."
+    )
+    config["prompt"] = _CONDUCTOR_SYSTEM_PROMPT
+    config["tools"] = [
+        "execute_bash",
+        "fs_read",
+        "code",
+        "grep",
+        "glob",
+        "web_fetch",
+        "web_search",
+        "session",
+        "report",
+        "tool_search",
+        "@kirocrew-core",
+        "@kirocrew-dashboard",
+    ]
+    # ``allowedTools`` is the ONE path that never reaches the PreToolUse gate, so
+    # every grant is filtered through the governance ceiling first — the same
+    # predicate ``rebuild_agent_config`` applies to the primary spec's assembled
+    # list, and the entry point ``may_skip_gate_now`` exists precisely so a new
+    # writer cannot re-open the bypass by restating a literal. A governed ref
+    # stays MOUNTED (it is still in ``tools``); it just prompts, and the gate
+    # then applies the ceiling's per-tool rule with the real arguments.
+    config["allowedTools"] = [
+        ref for ref in ("session", "report", "@kirocrew-core") if _may_auto_approve(ref)
+    ]
+    mcp = config.get("mcpServers", {}) or {}
+    core_entry = mcp.get("kirocrew-core")
+    narrowed: dict = {}
+    if core_entry:
+        narrowed["kirocrew-core"] = core_entry
+    dash_cmd, dash_args = _kirocrew_mcp_invocation("mcp-dashboard")
+    dash_entry: dict[str, Any] = {"command": dash_cmd, "args": dash_args}
+    # Same managed-server metadata `build_agent_config` stamps on every entry it
+    # emits, and the reason this entry needs it spelled out is that it is the one
+    # server hand-built here rather than inherited: without `"type": "registry"`
+    # a registry-mode client silently DROPS the entry, so the conductor's
+    # session-control tools never launch and its whole dispatch/patrol purpose is
+    # dead with no local error; without the `KIROCREW_HOME` pin the shim reads the
+    # DEFAULT data home while the gateway runs under an override, so session
+    # control would act on a different session store than the one it reports on.
+    # Both helpers return empty on a default install, so the emitted spec is
+    # unchanged there.
+    if _mcp_registry_mode():
+        dash_entry["type"] = _MCP_REGISTRY_TYPE
+    dash_env = _managed_mcp_env()
+    if dash_env:
+        dash_entry["env"] = dash_env
+    narrowed["kirocrew-dashboard"] = dash_entry
+    config["mcpServers"] = narrowed
+    # Derive the KAS policy from the FILTERED grant list instead of restating it
+    # as a literal: the rules come out byte-identical, a later edit to
+    # ``allowedTools`` carries through, and a ceiling that strips a grant strips
+    # its KAS rule with it (a hand-written ``kirocrew-core/*`` allow would have
+    # survived the filter on the KAS backend). ``{"rules": []}`` when nothing
+    # qualifies — the key's mere PRESENCE is what makes KAS load the spec at all.
+    from kiro_crew.acp.kas_permissions import (  # noqa: PLC0415 - circular import
+        allowed_tools_to_permissions,
+    )
+
+    derived = allowed_tools_to_permissions(
+        config["allowedTools"], agent_id=Path(_CONDUCTOR_AGENT_FILENAME).stem
+    )
+    config["permissions"] = derived if derived is not None else {"rules": []}
+    kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
+    path = kiro_agents_dir_path() / _CONDUCTOR_AGENT_FILENAME
+    _atomic_json_write(path, config)
+    logger.info("Installed conductor agent config: %s", path)
 
 
 _HEARTBEAT_SYSTEM_PROMPT = """# KiroCrew Heartbeat Worker
