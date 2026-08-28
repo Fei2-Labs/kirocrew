@@ -475,12 +475,14 @@ class TestPipInstallChannel:
         monkeypatch.setattr(core_mod.sys, "base_prefix", str(tmp_path / "base"))
         (tmp_path / "EXTERNALLY-MANAGED").write_text("", encoding="utf-8")
         monkeypatch.setattr(core_mod.sysconfig, "get_path", lambda name: str(tmp_path))
+        monkeypatch.setattr(core_mod.importlib.util, "find_spec", lambda name: object())
         assert core_mod._pip_install_channel_available() is True
 
     def test_ordinary_venv_has_a_channel(self, monkeypatch, tmp_path) -> None:
         monkeypatch.setattr(core_mod.sys, "prefix", core_mod.sys.base_prefix)
         monkeypatch.setattr(core_mod.sysconfig, "get_path", lambda name: str(tmp_path))
-        assert core_mod._pip_install_channel_available() is True
+        has_pip = core_mod.importlib.util.find_spec("pip") is not None
+        assert core_mod._pip_install_channel_available() is has_pip
 
 
 class TestAl2023Detection:
@@ -614,9 +616,12 @@ class TestFindSuitablePython:
         monkeypatch.setenv("PYTHONPATH", str(decoy))
         reject = self._capture(monkeypatch)
 
-        # sys.executable (this test venv) has pip and is not free-threaded:
-        # the decoy must not flip its verdict to "unusable".
-        assert reject(sys.executable) is False
+        # The isolated probe must return the same answer regardless of the
+        # caller's PYTHONPATH; this venv may or may not include pip.
+        monkeypatch.delenv("PYTHONPATH")
+        baseline = reject(sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        assert reject(sys.executable) is baseline
 
     def test_a_decoy_pip_package_neither_executes_nor_forges_the_verdict(
         self, monkeypatch, tmp_path
@@ -641,7 +646,10 @@ class TestFindSuitablePython:
         monkeypatch.setenv("PYTHONPATH", str(decoy))
         reject = self._capture(monkeypatch)
 
-        assert reject(sys.executable) is False
+        monkeypatch.delenv("PYTHONPATH")
+        baseline = reject(sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        assert reject(sys.executable) is baseline
         assert not canary.exists(), "decoy pip must never be imported or executed"
 
 
@@ -764,9 +772,12 @@ class TestSttConfigEndpoint:
         assert body["available"] is False
         assert body["prereqs"] == []
         assert body["install_step"] in ("idle", "done", "error")
-        # This test venv has a working pip channel, so the unsupported flag
-        # must be False regardless of installed extras.
-        assert body["transcribe_unsupported"] is False
+        # The flag reflects the actual two-part install contract, including
+        # whether this test environment has a usable pip channel.
+        expected_unsupported = not core_mod._voice_extra_importable() and not (
+            core_mod._pip_install_channel_available()
+        )
+        assert body["transcribe_unsupported"] is expected_unsupported
         # Cause discriminator for the unsupported notice: the desktop bundle
         # needs different guidance than a pip-less/PEP 668 interpreter. A test
         # venv is never the bundled app.

@@ -23,7 +23,7 @@ otherwise.
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import functools
 import json
 import logging
 import os
@@ -389,12 +389,22 @@ def _drop_sandbox_launcher(path: str | None) -> None:
 async def _sandboxed_off_loop(argv: list[str]) -> tuple[list[str], dict[str, str], str | None]:
     """Offload :func:`_sandboxed` to a worker thread without a cancellation leak.
 
-    Delegates to the shared :func:`sandbox.sandboxed_spawn_argv_off_loop` which
-    owns the shield-and-recover pattern for every async caller of the chokepoint.
+    A plain ``asyncio.to_thread`` hop is the leak: cancelling the awaiting
+    coroutine abandons the hop while the worker thread is still inside
+    ``sandboxed_spawn_argv``, the thread goes on to materialize the
+    launcher/profile, and the returned tuple is never bound -- so no ``finally``
+    and no session field can ever reach the cleanup path.
+
+    Delegates to the shared :func:`sandbox.shielded_prepare_off_loop`, which
+    owns the shield-and-recover pattern (worker-thread hop + settle-then-unlink
+    under cancellation, repeat-cancellation safe per #5841) for every async
+    caller of the chokepoint.  Preparation stays behind :func:`_sandboxed` so
+    this module keeps owning its own ``mode="strict"`` + ``_build_env()``
+    policy.  ``SandboxUnavailableError`` still propagates to the caller
+    unchanged -- the shield only intercepts cancellation, and that raise carries
+    no tuple and hence no file to drop.
     """
-    return await sandbox.sandboxed_spawn_argv_off_loop(
-        argv, "strict", env=_build_env()
-    )
+    return await sandbox.shielded_prepare_off_loop(functools.partial(_sandboxed, argv))
 
 
 def _mkstemp_path(suffix: str) -> str:

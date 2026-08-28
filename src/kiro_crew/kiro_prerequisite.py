@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -64,6 +65,7 @@ from kiro_crew.sandbox import (
     SandboxUnavailableError,
     resource_limit_supervisor_argv,
     sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -765,9 +767,7 @@ def _project_identity_database(source: Path, destination: Path) -> bool:
                     if not table_rows:
                         continue
                     placeholders = ",".join("?" * len(table_rows[0]))
-                    staged.executemany(
-                        f'INSERT INTO "{table}" VALUES ({placeholders})', table_rows
-                    )
+                    staged.executemany(f'INSERT INTO "{table}" VALUES ({placeholders})', table_rows)
     except sqlite3.Error:
         with contextlib.suppress(OSError):
             os.unlink(str(destination))
@@ -1146,7 +1146,9 @@ def _ensure_auth_staging_parent(home: Path) -> Path:
             # private directory. Only abort if a non-directory we cannot clear is
             # STILL sitting here; otherwise fall through to the idempotent mkdir.
             # (#561, concurrent-boot race)
-            if staging_parent.is_symlink() or (staging_parent.exists() and not staging_parent.is_dir()):
+            if staging_parent.is_symlink() or (
+                staging_parent.exists() and not staging_parent.is_dir()
+            ):
                 raise OSError(
                     f"Kiro auth staging root {staging_parent} is not a private "
                     "directory and could not be reset"
@@ -1487,12 +1489,14 @@ async def _prepare_sandboxed_spawn(
 ) -> tuple[list[str], dict[str, str], str | None]:
     """Prepare filesystem-heavy sandbox state on a worker thread.
 
-    Cancellation waits for preparation to settle so a launcher/profile created
-    by the worker is still removed instead of becoming an untracked temp file.
+    Delegates to the shared :func:`shielded_prepare_off_loop`, which owns the
+    shield-and-recover pattern (including the repeat-cancellation semantics of
+    #5841) for every async caller of the chokepoint.  The chokepoint call itself
+    stays in this module so the ``mode``/``strip_python_env`` policy — and this
+    module's own seam over ``sandboxed_spawn_argv`` — remain local.
     """
-
-    task = asyncio.create_task(
-        asyncio.to_thread(
+    return await shielded_prepare_off_loop(
+        functools.partial(
             sandboxed_spawn_argv,
             argv,
             mode=mode,
@@ -1502,38 +1506,6 @@ async def _prepare_sandboxed_spawn(
             extra_visible_dirs=extra_visible_dirs,
         )
     )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # A repeat cancellation landing on a bare recovery ``await`` is a
-        # ``BaseException``: it would escape a ``suppress(Exception)`` guard
-        # before the unlink runs, leaking the materialized launcher (#5841).
-        # The settle-then-unlink therefore runs as its own task, shielded
-        # from cancellations aimed at this caller; each absorbed repeat is
-        # ``uncancel()``-ed so an enclosing ``asyncio.timeout`` still reports
-        # ``TimeoutError``, and the ORIGINAL cancellation is re-raised once
-        # the launcher is gone.
-        async def _settle_then_unlink() -> None:
-            cleanup_path: str | None = None
-            with contextlib.suppress(Exception, asyncio.CancelledError):
-                _, _, cleanup_path = await task
-            await _unlink_off_loop(cleanup_path)
-
-        current = asyncio.current_task()
-        recovery = asyncio.create_task(_settle_then_unlink())
-        while not recovery.done():
-            try:
-                await asyncio.shield(recovery)
-            except asyncio.CancelledError:
-                uncancel = getattr(current, "uncancel", None)  # 3.11+
-                if uncancel is not None:
-                    uncancel()
-            except Exception:
-                logger.warning(
-                    "sandbox launcher cleanup failed after cancellation",
-                    exc_info=True,
-                )
-        raise
 
 
 async def _run_process(
@@ -1606,6 +1578,7 @@ async def _run_process(
             spawn_argv = [
                 sys.executable,
                 "-I",
+                "-B",
                 "-c",
                 _PROCESS_GROUP_SUPERVISOR_CODE,
                 *resource_limit_supervisor_argv(),
@@ -2650,11 +2623,7 @@ class KiroPrerequisiteService:
                     )
                     self._stamp_probe(probe_identity)
                     return self._status
-                if (
-                    version_probe is not None
-                    and version_probe.timed_out
-                    and candidate_runnable
-                ):
+                if version_probe is not None and version_probe.timed_out and candidate_runnable:
                     # A probe that never answered is not evidence of absence. The
                     # spawn was accepted and raised no typed failure, so the
                     # sandbox branch above cannot claim it, and falling through to
@@ -2731,9 +2700,7 @@ class KiroPrerequisiteService:
             # cannot even resolve itself without its real-home registry — so the
             # isolated probe reported such CLIs signed-out even though a real
             # session authenticates fine.
-            whoami = await self._audited_identity_probe(
-                self._viable_binary, isolate_home=False
-            )
+            whoami = await self._audited_identity_probe(self._viable_binary, isolate_home=False)
             if whoami.ok:
                 await asyncio.to_thread(self._mark_setup_complete)
             # Acceptance is checked here, on the probe path, because it costs a
@@ -2745,9 +2712,7 @@ class KiroPrerequisiteService:
             rejected: list[str] = []
             rejection_detail = ""
             if whoami.ok:
-                rejected, rejection_detail = await self._probe_spec_acceptance(
-                    self._viable_binary
-                )
+                rejected, rejection_detail = await self._probe_spec_acceptance(self._viable_binary)
             self._status = PrerequisiteStatus(
                 platform=_platform_label(self._platform),
                 installed=True,

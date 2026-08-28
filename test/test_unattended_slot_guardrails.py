@@ -77,9 +77,9 @@ class TestUnattendedApprovalWindow:
         from kiro_crew.dashboard import chat_runner
 
         src = inspect.getsource(chat_runner._run_chat)
-        assert "state.approval_timeout_for(slot)" in src, (
-            "the runner's approval await must take its window from DashboardState"
-        )
+        assert (
+            "state.approval_timeout_for(slot)" in src
+        ), "the runner's approval await must take its window from DashboardState"
         assert "timeout=_approval_window" in src
         assert "timeout=7200.0" not in src, "the hardcoded 2h window is back"
 
@@ -106,9 +106,9 @@ class TestUnattendedApprovalWindow:
         writes = [ln for ln in src.splitlines() if "_human_seen = True" in ln]
         assert len(writes) == 1, "attendance must be recorded in exactly one place"
         gate = src.index("request_app = request.get")
-        assert src.index("_human_seen = True") > gate, (
-            "attendance must be recorded only after the app-ownership gate"
-        )
+        assert (
+            src.index("_human_seen = True") > gate
+        ), "attendance must be recorded only after the app-ownership gate"
 
     def test_trust_is_not_the_detector(self, tmp_path) -> None:
         """Why ``_app`` and not ``_trust``: trust is False wherever this is read.
@@ -492,9 +492,7 @@ class TestIdleCleanupSparesArmedLoops:
         )
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post(
-                "/api/chat/slots/cleanup", json={"max_inactive_days": 3}
-            )
+            resp = await client.post("/api/chat/slots/cleanup", json={"max_inactive_days": 3})
             data = await resp.json()
 
         assert data["keys"] == ["worker-2"], "cleanup archived a slot owning an armed loop"
@@ -515,9 +513,9 @@ class TestIdleCleanupSparesArmedLoops:
             patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
         ):
             assert await orch._fire_dashboard_nudge(_Loop("worker-1")) is True
-        assert rehydrate.await_args.kwargs.get("adopt_closed") is True, (
-            "the nudge fire path must reach a session that idle cleanup closed"
-        )
+        assert (
+            rehydrate.await_args.kwargs.get("adopt_closed") is True
+        ), "the nudge fire path must reach a session that idle cleanup closed"
 
     @pytest.mark.asyncio
     async def test_an_inactive_loop_does_not_pin_a_dead_slot_forever(
@@ -537,9 +535,7 @@ class TestIdleCleanupSparesArmedLoops:
         )
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post(
-                "/api/chat/slots/cleanup", json={"max_inactive_days": 3}
-            )
+            resp = await client.post("/api/chat/slots/cleanup", json={"max_inactive_days": 3})
             data = await resp.json()
 
         assert data["keys"] == ["worker-1"]
@@ -560,9 +556,7 @@ class TestIdleCleanupSparesArmedLoops:
         monkeypatch.setattr("kiro_crew.autonudge.get_instance", _boom)
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post(
-                "/api/chat/slots/cleanup", json={"max_inactive_days": 3}
-            )
+            resp = await client.post("/api/chat/slots/cleanup", json={"max_inactive_days": 3})
             data = await resp.json()
 
         assert data["archived"] == 0
@@ -571,7 +565,7 @@ class TestIdleCleanupSparesArmedLoops:
 
     @pytest.mark.asyncio
     async def test_the_users_close_still_retires_the_loop(self, tmp_path, monkeypatch) -> None:
-        """"Respect the close" survives adopt_closed=True.
+        """ "Respect the close" survives adopt_closed=True.
 
         The rule used to be an emergent property of the fire path's rehydrate
         miss. Now that the fire path adopts a closed session, the ✕ handler has
@@ -598,9 +592,9 @@ class TestIdleCleanupSparesArmedLoops:
             resp = await client.delete("/api/chat/slots/chat-1-1785")
             assert resp.status == 200
 
-        assert removed == ["chat-1-1785"], (
-            "the user's ✕ must retire the slot's current nudge generation"
-        )
+        assert removed == [
+            "chat-1-1785"
+        ], "the user's ✕ must retire the slot's current nudge generation"
 
     @pytest.mark.asyncio
     async def test_the_users_close_tells_the_owning_app(self, tmp_path, monkeypatch) -> None:
@@ -735,17 +729,17 @@ class TestIdleCleanupSparesArmedLoops:
                 return super().pop(key, *a)
 
         state._slots = _WatchedSlots(state._slots)
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.chat_handlers._retire_slot_nudge_loop", _retire
-        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._retire_slot_nudge_loop", _retire)
         monkeypatch.setattr("kiro_crew.autonudge.get_instance", lambda: None)
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.delete("/api/chat/slots/crew-c_1a2b3c4d")
             assert resp.status == 200
 
-        assert order == ["retire", "retire", "pop"], (
-            f"the slot left the registry before both retirement passes finished: {order}"
-        )
+        assert order == [
+            "retire",
+            "retire",
+            "pop",
+        ], f"the slot left the registry before both retirement passes finished: {order}"
 
 
 # ── A SCOPED grant is never cached as a session approval policy ───────────────
@@ -861,7 +855,9 @@ class TestScopedGrantIsNeverPersisted:
         state = _crew_state()
         with patch.object(type(safety_override()), "is_scope_active", return_value=True):
             assert chat_runner._slot_is_trusted(slot) is True
-            assert chat_runner._native_crew_should_auto_approve({"s1": {"done": False}}, state, slot)
+            assert chat_runner._native_crew_should_auto_approve(
+                {"s1": {"done": False}}, state, slot
+            )
 
         src = inspect.getsource(chat_runner._run_chat)
         assert "slot_trusted = _slot_is_trusted(slot)" in src
@@ -870,8 +866,8 @@ class TestScopedGrantIsNeverPersisted:
         # whose command bytes never reached the caches AND whose canonical MCP
         # identity did not resolve either (see chat_runner — a verified
         # identity keeps the unconditional grant honored, including under
-        # configured auto approval).
-        assert "if (slot_trusted or auto_approve_active) and _child_grant_eligible:" in src
+        # explicit YOLO approval).
+        assert "if (slot_trusted or yolo_active) and _child_grant_eligible:" in src
 
     def test_the_runner_writes_the_policy_through_the_helper(self) -> None:
         """Pins the call site, not just the helper.
@@ -882,7 +878,7 @@ class TestScopedGrantIsNeverPersisted:
         """
         src = inspect.getsource(chat_runner._run_chat)
         assert "_persistable_session_policy(" in src
-        assert "state.is_yolo_active() or configured_auto_approve" in src
+        assert "state.is_yolo_active()" in src
         assert "_slot_is_trusted(slot) or state.is_yolo_active()" not in src
         # Assigned unconditionally, so a turn starting after the grant went away
         # clears a policy an earlier turn stored.

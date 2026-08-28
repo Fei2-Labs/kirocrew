@@ -8,6 +8,7 @@ generic ChannelLink mirror map) for bidirectional sync.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import functools
 import json
 import logging
@@ -927,6 +928,29 @@ class SessionMap:
         if not entry:
             return ""
         return entry.get("provider", "")
+
+    def provider_label_for(self, key: str) -> str:
+        """Return the backend identity bound to *key*, or ``""`` if unbound.
+
+        A bare ``SessionMap`` has no live provider (that lives on
+        ``SessionManager``), so this always falls back to the persisted entry.
+        Legacy entries omit their provider field, so an existing entry
+        normalizes to the default label instead of looking like a brand-new
+        slot.
+        """
+        if not self.has_hint(key):
+            return ""
+        return self.get_provider(key) or PROVIDER_LABEL_DEFAULT
+
+    def set_active_dashboard_slots(self, slot_keys: builtins.set[str]) -> None:
+        """No-op on a bare ``SessionMap``.
+
+        Idle-session reaping keyed off active dashboard slots is a
+        ``SessionManager`` concern; a raw ``SessionMap`` (used directly by
+        Slack-only call sites with no live sessions to expire) has nothing to
+        track here.
+        """
+        return
 
     @_guarded
     def clear_sid(self, key: str) -> bool:

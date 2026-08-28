@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from concurrent.futures import Future
 import os
 import sys
 import threading
@@ -24,7 +25,45 @@ import pytest
 # Ensure the source tree is importable without pip install.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from kiro_crew.sandbox import sandboxed_spawn_argv_off_loop  # noqa: E402
+from kiro_crew.sandbox import (  # noqa: E402
+    sandboxed_spawn_argv_off_loop,
+    shielded_prepare_off_loop,
+)
+
+
+class _CapturedExecutor:
+    """Executor test double whose future can be settled by the test."""
+
+    def __init__(self, *, run_first: bool = False):
+        self.future: Future = Future()
+        self.submitted = threading.Event()
+        self._preparation_submitted = False
+        self._run_first = run_first
+
+    def submit(self, function, *args):
+        if not self._preparation_submitted:
+            self._preparation_submitted = True
+            self.submitted.set()
+            if self._run_first:
+                threading.Thread(target=self._run, args=(function, args), daemon=True).start()
+            return self.future
+        result: Future = Future()
+
+        threading.Thread(target=self._run, args=(function, args, result), daemon=True).start()
+        return result
+
+    def _run(self, function, args, result=None) -> None:
+        try:
+            value = function(*args)
+            if result is not None:
+                result.set_result(value)
+            elif not self.future.done():
+                self.future.set_result(value)
+        except BaseException as error:
+            if result is not None:
+                result.set_exception(error)
+            elif not self.future.done():
+                self.future.set_exception(error)
 
 
 class TestSandboxOffLoopCancellation:
@@ -55,12 +94,8 @@ class TestSandboxOffLoopCancellation:
     @pytest.mark.asyncio
     async def test_cancel_during_hop_drops_launcher(self, tmp_path):
         fake, entered, release, created = self._blocking_sandbox(tmp_path)
-        with patch(
-            "kiro_crew.sandbox.sandboxed_spawn_argv", side_effect=fake
-        ):
-            task = asyncio.create_task(
-                sandboxed_spawn_argv_off_loop(["/bin/true"])
-            )
+        with patch("kiro_crew.sandbox.sandboxed_spawn_argv", side_effect=fake):
+            task = asyncio.create_task(sandboxed_spawn_argv_off_loop(["/bin/true"]))
             # Wait for the worker to enter the stub (implies awaiter is
             # suspended at the shielded hop).
             await asyncio.to_thread(entered.wait, 10)
@@ -71,9 +106,72 @@ class TestSandboxOffLoopCancellation:
         # The launcher was created by the worker thread and should have been
         # unlinked by the recovery path in the CancelledError handler.
         assert created, "stub was never called"
-        assert not any(f.exists() for f in created), (
-            "launcher was NOT cleaned up on cancellation"
+        assert not any(f.exists() for f in created), "launcher was NOT cleaned up on cancellation"
+
+
+class TestShieldedPrepareOffLoop:
+    """Pin the shared preparation wrapper's cancellation and cleanup contract."""
+
+    @pytest.mark.asyncio
+    async def test_normal_completion_returns_preparation_result(self):
+        result = (["wrapped"], {"PATH": "/usr/bin"}, None)
+
+        assert await shielded_prepare_off_loop(lambda: result) == result
+
+    @pytest.mark.asyncio
+    async def test_cancellation_after_preparation_settles_still_unlinks(self, tmp_path):
+        cleanup = tmp_path / "launcher"
+        cleanup.write_text("profile")
+        executor = _CapturedExecutor()
+        task = asyncio.create_task(
+            shielded_prepare_off_loop(lambda: (["wrapped"], {}, str(cleanup)), executor=executor)
         )
+
+        # Let the wrapper submit its work, then cancel from the future's done
+        # callback. This makes the cancellation happen after preparation has
+        # settled while the wrapper is still suspended at its shielded await.
+        await asyncio.to_thread(executor.submitted.wait, 10)
+        executor.future.add_done_callback(lambda _future: task.cancel())
+        executor.future.set_result((["wrapped"], {}, str(cleanup)))
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not cleanup.exists()
+
+    @pytest.mark.asyncio
+    async def test_repeated_cancellation_during_recovery_still_unlinks(self, tmp_path):
+        cleanup = tmp_path / "launcher"
+        cleanup.write_text("profile")
+        prepared = threading.Event()
+        release_prepare = threading.Event()
+        entered_unlink = threading.Event()
+        release_unlink = threading.Event()
+        executor = _CapturedExecutor(run_first=True)
+        real_unlink = os.unlink
+
+        def prepare():
+            prepared.set()
+            assert release_prepare.wait(timeout=10)
+            return ["wrapped"], {}, str(cleanup)
+
+        def unlink(path):
+            entered_unlink.set()
+            assert release_unlink.wait(timeout=10)
+            real_unlink(path)
+
+        with patch("kiro_crew.sandbox.os.unlink", side_effect=unlink):
+            task = asyncio.create_task(shielded_prepare_off_loop(prepare, executor=executor))
+            await asyncio.to_thread(prepared.wait, 10)
+            task.cancel()
+            release_prepare.set()
+            await asyncio.to_thread(entered_unlink.wait, 10)
+            task.cancel()
+            task.cancel()
+            release_unlink.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert not cleanup.exists()
 
     @pytest.mark.asyncio
     async def test_normal_return_passes_through(self, tmp_path):
@@ -84,9 +182,7 @@ class TestSandboxOffLoopCancellation:
         def _fake(argv, mode="standard", **_kwargs):
             return ["wrapped"] + argv, {"PATH": "/usr/bin"}, str(launcher)
 
-        with patch(
-            "kiro_crew.sandbox.sandboxed_spawn_argv", side_effect=_fake
-        ):
+        with patch("kiro_crew.sandbox.sandboxed_spawn_argv", side_effect=_fake):
             result = await sandboxed_spawn_argv_off_loop(["/bin/true"])
         assert result == (
             ["wrapped", "/bin/true"],
@@ -104,10 +200,12 @@ class TestNoBareSandboxedSpawnArgvHops:
     """
 
     # Modules with their own cleanup mechanism that are exempt from the guard.
-    _EXEMPT_PATHS = frozenset({
-        # spec_builder shields the cleanup unlink in its own finally block.
-        "spec_builder",
-    })
+    _EXEMPT_PATHS = frozenset(
+        {
+            # spec_builder shields the cleanup unlink in its own finally block.
+            "spec_builder",
+        }
+    )
 
     @staticmethod
     def _src_root() -> Path:
@@ -121,10 +219,7 @@ class TestNoBareSandboxedSpawnArgvHops:
     def _is_run_in_executor_call(node: ast.Call) -> bool:
         """Return True if node is a call to `*.run_in_executor(...)`."""
         func = node.func
-        return (
-            isinstance(func, ast.Attribute)
-            and func.attr == "run_in_executor"
-        )
+        return isinstance(func, ast.Attribute) and func.attr == "run_in_executor"
 
     @staticmethod
     def _references_sandboxed_spawn(node: ast.Call) -> bool:
@@ -137,10 +232,7 @@ class TestNoBareSandboxedSpawnArgvHops:
             for child in ast.walk(arg):
                 if isinstance(child, ast.Name) and child.id == "sandboxed_spawn_argv":
                     return True
-                if (
-                    isinstance(child, ast.Attribute)
-                    and child.attr == "sandboxed_spawn_argv"
-                ):
+                if isinstance(child, ast.Attribute) and child.attr == "sandboxed_spawn_argv":
                     return True
         # Also check the callable itself (2nd positional arg to run_in_executor)
         if len(node.args) >= 2:
@@ -148,10 +240,7 @@ class TestNoBareSandboxedSpawnArgvHops:
             for child in ast.walk(target):
                 if isinstance(child, ast.Name) and child.id == "sandboxed_spawn_argv":
                     return True
-                if (
-                    isinstance(child, ast.Attribute)
-                    and child.attr == "sandboxed_spawn_argv"
-                ):
+                if isinstance(child, ast.Attribute) and child.attr == "sandboxed_spawn_argv":
                     return True
         return False
 
@@ -168,16 +257,11 @@ class TestNoBareSandboxedSpawnArgvHops:
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
-                if (
-                    self._is_run_in_executor_call(node)
-                    and self._references_sandboxed_spawn(node)
-                ):
+                if self._is_run_in_executor_call(node) and self._references_sandboxed_spawn(node):
                     violations.append(
-                        f"{rel}:{node.lineno}: bare run_in_executor "
-                        f"with sandboxed_spawn_argv"
+                        f"{rel}:{node.lineno}: bare run_in_executor " f"with sandboxed_spawn_argv"
                     )
         assert not violations, (
             "Found bare run_in_executor calls to sandboxed_spawn_argv "
-            "(must use sandboxed_spawn_argv_off_loop or a local shield):\n"
-            + "\n".join(violations)
+            "(must use sandboxed_spawn_argv_off_loop or a local shield):\n" + "\n".join(violations)
         )
