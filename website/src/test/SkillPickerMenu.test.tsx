@@ -20,10 +20,11 @@ const SKILLS = [
 /** Harness: gives the menu a real anchored element (it reads getBoundingClientRect)
  *  and a QueryClientProvider (the menu reads the shared ['skills'] cache).
  *  Pass `client` to drive the cache from the test (e.g. trigger a refetch). */
-function Harness({ query, open, onSelect = vi.fn(), onClose = vi.fn(), client, sendOnEnter, slotKey, project, onTrustRequest }: {
+function Harness({ query, open, onSelect = vi.fn(), onClose = vi.fn(), client, sendOnEnter, slotKey, project, agent, onTrustRequest }: {
   query: string; open: boolean; onSelect?: (i: { leaf: string; key: string }) => void; onClose?: () => void
   client?: QueryClient; sendOnEnter?: 'enter' | 'ctrl-enter' | 'enter-ctrl-newline'
-  slotKey?: string; project?: string; onTrustRequest?: (i: { leaf: string; key: string }) => void
+  slotKey?: string; project?: string; agent?: string
+  onTrustRequest?: (i: { leaf: string; key: string }) => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const qc = client ?? new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -33,7 +34,7 @@ function Harness({ query, open, onSelect = vi.fn(), onClose = vi.fn(), client, s
         <div ref={ref} data-testid="anchor">anchor</div>
         <SkillPickerMenu
           query={query} anchorRef={ref} open={open} onSelect={onSelect} onClose={onClose}
-          sendOnEnter={sendOnEnter} slotKey={slotKey} project={project}
+          sendOnEnter={sendOnEnter} slotKey={slotKey} project={project} agent={agent}
           onTrustRequest={onTrustRequest}
         />
       </div>
@@ -59,6 +60,18 @@ describe('SkillPickerMenu', () => {
     expect(await screen.findByText('$oncall-handover')).toBeInTheDocument()
     expect(screen.getByText('$ticket-pull')).toBeInTheDocument()
     expect(screen.getByText('$grill')).toBeInTheDocument()
+  })
+
+  it('forwards the active agent to api.skills() and uses an agent-scoped cache key', async () => {
+    render(<Harness query="" open slotKey="dashboard:chat-1" agent="custom-template" />)
+    await waitFor(() => expect(mockApi.skills)
+      .toHaveBeenLastCalledWith('dashboard:chat-1', 'custom-template'))
+  })
+
+  it('omits the agent argument when none is active', async () => {
+    render(<Harness query="" open slotKey="dashboard:chat-1" />)
+    await waitFor(() => expect(mockApi.skills)
+      .toHaveBeenLastCalledWith('dashboard:chat-1', undefined))
   })
 
   it('filters by leaf-name substring', async () => {
@@ -193,7 +206,7 @@ describe('SkillPickerMenu', () => {
     // never-settling fetch — the mount refetch is the in-flight window.
     mockApi.skills.mockImplementation(() => new Promise(() => {}))
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    qc.setQueryData(['skills', null, null], [])
+    qc.setQueryData(['skills', null, null, null], [])
     await qc.invalidateQueries({ queryKey: ['skills'], refetchType: 'none' })
     const onSelect = vi.fn()
     const onClose = vi.fn()
@@ -246,7 +259,8 @@ describe('SkillPickerMenu — project-skills trust', () => {
 
   it('sends the real slot key so the server resolves THIS chat project', async () => {
     render(<Harness query="" open slotKey="dashboard:chat-7" />)
-    await waitFor(() => expect(mockApi.skills).toHaveBeenCalledWith('dashboard:chat-7'))
+    await waitFor(() => expect(mockApi.skills)
+      .toHaveBeenCalledWith('dashboard:chat-7', undefined))
   })
 
   it('refetches when the same slot switches projects', async () => {

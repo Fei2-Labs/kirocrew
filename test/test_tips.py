@@ -1774,9 +1774,16 @@ class TestCuratedTips:
                     f"use highlight=key:{entry['configKey']} so the highlight "
                     f"survives a translated dashboard"
                 )
-            assert query["tab"][0] == entry["tab"], (
+            # Navigation state lives in the path now (/settings/<tab>), not in
+            # a ?tab= query param — read the tab from the first segment.
+            route_path = urlparse(route).path
+            assert route_path.startswith("/settings/"), (
+                f"{tip['id']} action route {route!r} is not a settings path URL"
+            )
+            route_tab = route_path.split("/")[2]
+            assert route_tab == entry["tab"], (
                 f"{tip['id']} highlights {anchor!r}, which lives on the "
-                f"{entry['tab']!r} tab, not {query['tab'][0]!r}"
+                f"{entry['tab']!r} tab, not {route_tab!r}"
             )
 
     @pytest.mark.asyncio

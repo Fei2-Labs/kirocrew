@@ -463,6 +463,45 @@ export interface WeComConfigSave {
   session_folder?: string
 }
 
+/** Feishu (飞书/Lark) config as returned by GET /api/feishu/config (secrets masked). */
+export interface FeishuConfigData {
+  /** Receiver-thread liveness, not a credential probe — see DashboardState. */
+  connected: boolean
+  connect_error: string
+  configured: boolean
+  read_only: boolean
+  /** Primary secret slot = FEISHU_APP_SECRET. */
+  bot_token_set: boolean
+  bot_token_preview: string
+  /** Second credential slot = FEISHU_APP_ID. */
+  bot_id_set: boolean
+  bot_id_preview: string
+  enabled: boolean
+  /** Stored as feishu.allowed_open_ids; the shared panel's user allow-list. */
+  allowed_user_ids: string[]
+  /** Whether group conversations are served at all (fails closed). */
+  allow_group: boolean
+  allowed_group_ids: string[]
+  soft_threshold_pct: number
+  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
+  session_folder?: string
+}
+
+/** Writable Feishu config fields sent to PUT /api/feishu/config. */
+export interface FeishuConfigSave {
+  bot_token: string
+  bot_token_clear: boolean
+  bot_id: string
+  bot_id_clear: boolean
+  enabled: boolean
+  allowed_user_ids: string[]
+  allow_group: boolean
+  allowed_group_ids: string[]
+  soft_threshold_pct: number
+  /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
+  session_folder?: string
+}
+
 /** Webex config as returned by GET /api/webex/config (secret masked). */
 export interface WebexConfigData {
   connected: boolean
@@ -861,11 +900,12 @@ export interface TailnetStatusData {
  * - `install` / `start_daemon` / `sign_in` / `enable_magicdns` — the four ways
  *   there is no usable tailnet name, kept apart because each is a different
  *   errand for the operator.
+ * - `enable_https` — the tailnet has not granted certificate provisioning for
+ *   that name; this requires one-time tailnet administrator consent.
  * - `trust_off` — a name exists but the gateway will not accept it as an origin
  *   yet, so publishing would yield a reachable dashboard answering 403.
- * - `restart_gateway` — configured and resolvable NOW, but this server resolved
- *   nothing at startup (it booted before tailscaled). Genuinely not trusted
- *   until a restart, so it must not render as ready.
+ * - `restart_gateway` — configured and resolvable NOW, but this server did not
+ *   trust that exact name at startup. The one-click flow restarts and resumes.
  * - `occupied` — serve holds the mount for something that is not this dashboard,
  *   or its state is undeterminable; publishing would REPLACE it.
  * - `publish` — everything in place, one action left.
@@ -877,6 +917,7 @@ export type TailnetMobileStep =
   | 'start_daemon'
   | 'sign_in'
   | 'enable_magicdns'
+  | 'enable_https'
   | 'trust_off'
   | 'restart_gateway'
   | 'occupied'
@@ -904,7 +945,7 @@ export interface TailnetMobileData {
   peers_online: number
   /** `dashboard.tailscale.enabled` — the origin-trust config switch. */
   trusted: boolean
-  /** Whether the RUNNING server resolved a name at startup. */
+  /** Whether the RUNNING server trusted this exact name at startup. */
   startup_trusted: boolean
   /** `null` when serve state could not be determined — never render as false. */
   published: boolean | null
@@ -1924,10 +1965,20 @@ export const api = {
   // means "temporarily unresolvable", never "zero".
   securityStats: () => get('/api/security/stats').then(j) as Promise<{ denied_commands: number | null; suspicious_patterns: number | null; tool_schemas: number | null; redaction_paths: number | null }>,
   securityPosture: () => get('/api/security/posture').then(j) as Promise<SecurityPostureData>,
+  // `sessionKey` MUST carry the active slot's key (`dashboard:<slot>`) when one
+  // is active: the server's restricted-session guard reads X-Session-Key, and
+  // the shared `dashboard:ui` default answers "not restricted" — which would
+  // let an incognito/temporary slot mint a durable any-device credential. Same
+  // cooperative-honesty contract as the tailnet mobile surface.
+  mobileLoginLink: (sessionKey?: string) =>
+    post('/api/auth/mobile-link', undefined, sessionKey).then(j) as Promise<{
+    url: string
+    expires_in: number
+  }>,
   // Tailnet origin (Settings → Security). READ ONLY here: the toggle writes
   // `dashboard.tailscale.enabled` through the generic config PATCH, because the
-  // setting IS a config value and the status endpoint only reports what the
-  // running server resolved from it at startup.
+  // setting IS a config value and the status endpoint reports what the running
+  // server resolved from it at startup.
   tailnetStatus: () => get('/api/tailnet/status').then(j) as Promise<TailnetStatusData>,
   // Mobile access. `tailnetMobile` is a LIVE probe (two daemon round trips
   // server-side), so poll it gently; the three mutations below are user-driven.
@@ -1957,8 +2008,11 @@ export const api = {
   // endpoint returns the full refreshed snapshot so callers can seed the query
   // cache from the mutation response instead of re-fetching.
   listTrustedApps: () => get('/api/security/trusted-apps').then(j) as Promise<TrustedAppsData>,
-  trustApp: (name: string) =>
-    post('/api/security/trusted-apps/' + encodeURIComponent(name)).then(j) as Promise<TrustedAppsData>,
+  trustApp: (name: string, repository?: string) =>
+    post(
+      '/api/security/trusted-apps/' + encodeURIComponent(name),
+      repository ? { repository } : undefined,
+    ).then(j) as Promise<TrustedAppsData>,
   // Returns the snapshot PLUS `disabled` — revoking trust also disables an app
   // that is currently enabled, so its code stops running immediately.
   untrustApp: (name: string) =>
@@ -2273,7 +2327,11 @@ export const api = {
   // `dashboard:ui` placeholder makes the server fall back to "the one project
   // every slot shares", so workspace skills leak between chats on different
   // projects and vanish entirely when two chats disagree (#2457, #3551).
-  skills: (sessionKey?: string) => get('/api/skills', sessionKey).then(j),
+  // agent, when given, scopes the listing to that agent's own skill:// mapping;
+  // an agent with no explicit mapping keeps the unfiltered listing.
+  skills: (sessionKey?: string, agent?: string) =>
+    get('/api/skills' + (agent ? '?agent=' + encodeURIComponent(agent) : ''),
+        sessionKey).then(j),
   /** Project-skills trust: this chat's grant state plus every stored grant. */
   skillTrust: (sessionKey?: string) => get('/api/skills/-/trust', sessionKey).then(j),
   /** Grant trust to THIS chat's project. The server takes the directory from
@@ -2373,6 +2431,8 @@ export const api = {
     put(`/api/mcp/custom/${encodeURIComponent(name)}`, { spec }).then(j) as Promise<{ ok: boolean; name: string }>,
   mcpActive: (agent?: string) => fetch('/api/mcp/active' + (agent ? `?agent=${encodeURIComponent(agent)}` : '')).then(j),
   mcpProbe: () => post('/api/mcp/probe').then(j),
+  mcpResetProbeFailures: (name: string) =>
+    post('/api/mcp/quarantine/clear', { name }).then(j) as Promise<{ ok: boolean; name: string; released: boolean }>,
   mcpSync: () => post('/api/mcp/sync').then(j),
   mcpApply: (changes: McpApplyChange[]) =>
     post('/api/mcp/apply', { changes }).then(j),
@@ -3175,6 +3235,8 @@ export const api = {
   getTelegramConfig: () => get('/api/telegram/config').then(j) as Promise<TelegramConfigData>,
   saveTelegramConfig: (body: Partial<TelegramConfigSave>) => put('/api/telegram/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
   getWeComConfig: () => get('/api/wecom/config').then(j) as Promise<WeComConfigData>,
+  getFeishuConfig: () => get('/api/feishu/config').then(j) as Promise<FeishuConfigData>,
+  saveFeishuConfig: (body: Partial<FeishuConfigSave>) => put('/api/feishu/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
   saveWeComConfig: (body: Partial<WeComConfigSave>) => put('/api/wecom/config', body).then(j) as Promise<{ ok: boolean; restart_required: boolean; verify_warning: string }>,
   // Webex integration config
   getWebexConfig: () => get('/api/webex/config').then(j) as Promise<WebexConfigData>,

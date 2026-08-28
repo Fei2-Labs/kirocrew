@@ -1433,7 +1433,7 @@ The extraction is gated by a **golden-transcript** harness (`test/test_slack_gol
 
 ## Slack settings API
 
-Three dashboard-only endpoints back the `/settings?tab=channels&channel=slack` panel (legacy `?tab=slack` links redirect there). They are
+Three dashboard-only endpoints back the `/settings/channels/slack` panel (legacy `?tab=channels&channel=slack` and `?tab=slack` links redirect there). They are
 registered in the dashboard route block (NOT `_register_mcp_routes`, which is
 also mounted on the token-less API-only server) so they always sit behind
 dashboard token auth.
@@ -1850,7 +1850,7 @@ failure costs one replay window rather than the channel.
 
 ## Telegram settings API
 
-Two dashboard-only endpoints back the `/settings?tab=channels&channel=telegram` panel (legacy `?tab=telegram` links redirect there). Like the
+Two dashboard-only endpoints back the `/settings/channels/telegram` panel (legacy `?tab=channels&channel=telegram` and `?tab=telegram` links redirect there). Like the
 Slack settings API they are registered in the dashboard route block (NOT
 `_register_mcp_routes`) so they always sit behind dashboard token auth.
 

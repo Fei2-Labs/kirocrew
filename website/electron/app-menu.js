@@ -19,7 +19,7 @@ function buildMenuTemplate(deps) {
     isMac,
     appName,
     openSettings, // navigate dashboard to /settings
-    openAbout, // navigate dashboard to /settings?tab=about (version + updates)
+    openAbout, // navigate dashboard to /settings/about (version + updates)
     reload,
     forceReload,
     toggleDevTools,

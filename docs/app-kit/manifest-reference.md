@@ -75,6 +75,13 @@ installed against:
       "cron_expr": "0 9 * * 1-5",
       "message": "Generate daily digest",
       "agent": "digest-agent"
+    },
+    {
+      "name": "market-open",
+      "cron_expr": "30 9 * * 1-5",
+      "message": "Summarise the overnight tape",
+      "timezone": "America/New_York",
+      "skip_dates": ["2026-12-25"]
     }
   ]
 }
@@ -87,6 +94,8 @@ installed against:
 | `cron_expr` | string | Cron expression (mutually exclusive with `every`) |
 | `message` | string | Prompt sent to the agent on each run |
 | `agent` | string | Agent to run (optional, uses default if omitted) |
+| `timezone` | string | IANA zone name the schedule and `skip_dates` are evaluated in, e.g. `America/New_York`. Optional, but an empty value falls back to the gateway config's timezone and then to **UTC** — so `"cron_expr": "0 6 * * *"` without it fires at 06:00 UTC, the wrong calendar day for most users. An unknown zone is rejected at manifest validation. A per-**user** zone is not manifest data: pass `timezone=` to `ctx.cron.add_job` instead |
+| `skip_dates` | string[] | Calendar dates the job must not fire on, evaluated in `timezone`. Must be zero-padded `YYYY-MM-DD` — `2026-1-1` parses but never matches the padded fire-time rendering, so it is rejected at manifest validation rather than silently skipping nothing |
 | `enabled` | boolean | Default `true`. Must be a JSON boolean — any other type is rejected at manifest validation. When `false` the cron is registered **paused** (visible in the Schedule view, resumable) instead of firing on install/enable — for jobs that need user configuration first |
 
 > **Caveat:** disabling an app deletes its registered cron jobs, and re-enabling
@@ -295,6 +304,24 @@ root (validated against `HooksConfig._HOOK_PATH_RE`).
 `hooks.routes` handlers are wired up when the app is enabled (via
 `on_app_enable`, also re-run at gateway startup via `on_gateway_startup`), so
 they go live without waiting for a Gateway restart.
+
+**Importing your own modules.** Hook entry files are loaded from their file path
+into a synthetic package named after the app, never via `sys.path`, so use a
+**relative** import to reach a sibling module:
+
+```python
+# backend/routes.py
+from . import config          # backend/config.py
+from .render import to_html   # backend/render.py
+```
+
+A relative import resolves inside the app's own directory tree and cannot walk
+above the app root (`from ... import x` is refused). It is not a sandbox: app
+Python already runs in the Gateway process with full filesystem access, so a
+symlinked sibling resolves wherever it points. Do not use a bare
+`import config`: `sys.modules["config"]` is process-global, so two apps each
+shipping a `config.py` would end up sharing one module. `from kiro_crew...`
+absolute imports are for built-in apps only.
 
 ## Permissions
 

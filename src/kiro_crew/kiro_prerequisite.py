@@ -63,7 +63,7 @@ from kiro_crew.kiro_cli import (
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     resource_limit_supervisor_argv,
-    sandboxed_spawn_argv_off_loop,
+    sandboxed_spawn_argv,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -1487,17 +1487,53 @@ async def _prepare_sandboxed_spawn(
 ) -> tuple[list[str], dict[str, str], str | None]:
     """Prepare filesystem-heavy sandbox state on a worker thread.
 
-    Delegates to the shared :func:`sandboxed_spawn_argv_off_loop` which owns
-    the shield-and-recover pattern for every async caller of the chokepoint.
+    Cancellation waits for preparation to settle so a launcher/profile created
+    by the worker is still removed instead of becoming an untracked temp file.
     """
-    return await sandboxed_spawn_argv_off_loop(
-        argv,
-        mode=mode,
-        env=env,
-        strip_python_env=True,
-        extra_hidden_dirs=extra_hidden_dirs,
-        extra_visible_dirs=extra_visible_dirs,
+
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            sandboxed_spawn_argv,
+            argv,
+            mode=mode,
+            env=env,
+            strip_python_env=True,
+            extra_hidden_dirs=extra_hidden_dirs,
+            extra_visible_dirs=extra_visible_dirs,
+        )
     )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # A repeat cancellation landing on a bare recovery ``await`` is a
+        # ``BaseException``: it would escape a ``suppress(Exception)`` guard
+        # before the unlink runs, leaking the materialized launcher (#5841).
+        # The settle-then-unlink therefore runs as its own task, shielded
+        # from cancellations aimed at this caller; each absorbed repeat is
+        # ``uncancel()``-ed so an enclosing ``asyncio.timeout`` still reports
+        # ``TimeoutError``, and the ORIGINAL cancellation is re-raised once
+        # the launcher is gone.
+        async def _settle_then_unlink() -> None:
+            cleanup_path: str | None = None
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                _, _, cleanup_path = await task
+            await _unlink_off_loop(cleanup_path)
+
+        current = asyncio.current_task()
+        recovery = asyncio.create_task(_settle_then_unlink())
+        while not recovery.done():
+            try:
+                await asyncio.shield(recovery)
+            except asyncio.CancelledError:
+                uncancel = getattr(current, "uncancel", None)  # 3.11+
+                if uncancel is not None:
+                    uncancel()
+            except Exception:
+                logger.warning(
+                    "sandbox launcher cleanup failed after cancellation",
+                    exc_info=True,
+                )
+        raise
 
 
 async def _run_process(
@@ -1570,7 +1606,6 @@ async def _run_process(
             spawn_argv = [
                 sys.executable,
                 "-I",
-                "-B",
                 "-c",
                 _PROCESS_GROUP_SUPERVISOR_CODE,
                 *resource_limit_supervisor_argv(),

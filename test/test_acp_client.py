@@ -662,6 +662,72 @@ class TestAcpClientSessionKey:
         await _stop_stderr_drain(client)
 
     @pytest.mark.asyncio
+    async def test_spawn_gives_each_process_its_own_browser_session(self, tmp_path):
+        """Two agent processes must not address the same playwright-cli browser.
+
+        Sharing the CLI's ``default`` session lets one process navigate or close
+        the other's page; the name is per PROCESS, so two spawns differ even for
+        the same session key (a pooled process is spawned before it is claimed).
+        """
+        names = []
+        for _ in range(2):
+            client = AcpClient(work_dir=tmp_path, session_key="same-key")
+            with (
+                patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
+                patch(
+                    "kiro_crew.acp.client.wrap_argv",
+                    return_value=(["/usr/bin/kiro-cli", "acp"], None),
+                ),
+                patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+                patch("kiro_crew.session._track_pid"),
+                patch("kiro_crew.session._track_session_pid"),
+            ):
+                mock_proc = MagicMock()
+                mock_proc.pid = 12345
+                mock_proc.returncode = None
+                mock_exec.return_value = mock_proc
+
+                await client._spawn()
+
+                call_kwargs = mock_exec.call_args
+                env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
+                assert env is not None
+                assert env["PLAYWRIGHT_CLI_SESSION"].startswith("kc-")
+                names.append(env["PLAYWRIGHT_CLI_SESSION"])
+
+            await _stop_stderr_drain(client)
+
+        assert names[0] != names[1]
+
+    @pytest.mark.asyncio
+    async def test_spawn_keeps_an_operator_set_browser_session(self, tmp_path, monkeypatch):
+        """An operator who named a session means that one browser."""
+        monkeypatch.setenv("PLAYWRIGHT_CLI_SESSION", "chrome")
+        client = AcpClient(work_dir=tmp_path, session_key="k")
+        with (
+            patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
+            patch(
+                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+            ),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+
+            call_kwargs = mock_exec.call_args
+            env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
+            assert env is not None
+            assert env["PLAYWRIGHT_CLI_SESSION"] == "chrome"
+
+        await _stop_stderr_drain(client)
+
+    @pytest.mark.asyncio
     async def test_spawn_no_channel_id_env_absent(self, tmp_path):
         client = AcpClient(work_dir=tmp_path, session_key="k", channel_id=None)
         with (
@@ -931,7 +997,7 @@ class TestAcpClientBackendSelection:
                     _sent.update(params)
                 return 1
 
-            async def fake_wait(_req_id, timeout=0):
+            async def fake_wait(_req_id, timeout=0, *, method="", expected_mcp=None):
                 return {"protocolVersion": expected, "agentCapabilities": {}}
 
             client._send_request = fake_send_request  # type: ignore[assignment]
@@ -3343,7 +3409,9 @@ class TestDeriveEditDiff:
     def test_create_content_becomes_addition_diff(self):
         from kiro_crew.acp._dispatch import derive_edit_diff
 
-        diff = derive_edit_diff({"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"})
+        diff = derive_edit_diff(
+            {"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"}
+        )
         assert "+x = 1" in diff
         assert "+y = 2" in diff
         assert "+++ /a/new.py" in diff
@@ -3370,8 +3438,16 @@ class TestDeriveEditDiff:
         letting a TypeError out of difflib abort the whole dispatch mid-turn."""
         from kiro_crew.acp._dispatch import derive_edit_diff
 
-        assert derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"}) == ""
-        assert derive_edit_diff({"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}) == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        assert (
+            derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"})
+            == ""
+        )
+        assert (
+            derive_edit_diff(
+                {"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}
+            )
+            == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        )
         assert derive_edit_diff({"path": ["/a"], "command": "create", "fileText": "x"}) == ""
         assert derive_edit_diff({"path": "/a/b", "command": "create", "fileText": 7}) == ""
 
@@ -4252,7 +4328,7 @@ class TestInitializeSession:
             2: {"sessionId": "sess-abc"},
         }
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             return responses.get(req_id, {})
 
         client._wait_for_response = AsyncMock(side_effect=fake_wait)
@@ -4281,7 +4357,7 @@ class TestInitializeSession:
             2: {"modes": ["chat"]},  # load success
         }
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             return responses.get(req_id, {})
 
         client._wait_for_response = AsyncMock(side_effect=fake_wait)
@@ -4309,7 +4385,7 @@ class TestInitializeSession:
 
         call_idx = [0]
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             call_idx[0] += 1
             if call_idx[0] == 1:
                 return {"protocolVersion": "2025-08-22", "agentCapabilities": {"loadSession": True}}
@@ -4341,7 +4417,7 @@ class TestInitializeSession:
 
         call_idx = [0]
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             call_idx[0] += 1
             if call_idx[0] == 1:
                 return {"protocolVersion": "2025-08-22", "agentCapabilities": {"loadSession": True}}
@@ -4363,7 +4439,7 @@ class TestInitializeSession:
 
         send_calls = []
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             if req_id == 1:
                 return {"protocolVersion": "2025-08-22", "agentCapabilities": {}}
             if req_id == 2:
@@ -4394,7 +4470,7 @@ class TestInitializeSession:
 
         send_calls = []
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             if req_id == 1:
                 return {"protocolVersion": "2025-08-22", "agentCapabilities": {}}
             if req_id == 2:
@@ -5386,8 +5462,46 @@ class TestBuildPermissionEvent:
         )
         event = client._build_permission_event(msg)
         assert "rm -rf" in event.tool_input
-        # Cache consumed
-        assert "tc-6" not in client._tool_call_inputs
+        # Retained through same-call re-prompts; per-turn clear owns cleanup.
+        assert "tc-6" in client._tool_call_inputs
+
+    def test_cached_tool_input_carries_redaction_provenance(self):
+        """A secret removed before the permission event must leave a boolean
+        provenance bit; the original bytes must not be copied onto the event."""
+        client = AcpClient()
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        tool = JsonRpcMessage(
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Run Command",
+                    "kind": "execute",
+                    "toolCallId": "tc-secret",
+                    "rawInput": {"command": "echo AKIAIOSFODNN7EXAMPLE"},
+                }
+            }
+        )
+        client._extract_tool_event(tool)
+        assert client._tool_call_input_redacted["tc-secret"] is True
+
+        permission = JsonRpcMessage(
+            id=111,
+            method="session/requestPermission",
+            params={
+                "toolCall": {"title": "Run Command", "toolCallId": "tc-secret"},
+                "options": [{"id": "allow_once", "label": "Allow"}],
+            },
+        )
+        event = client._build_permission_event(permission)
+
+        assert event.tool_input_redacted is True
+        assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_input
+        assert "[REDACTED: credential]" in event.tool_input
+        assert client._tool_call_input_redacted["tc-secret"] is True
+        repeated = client._build_permission_event(permission)
+        assert repeated.tool_input_redacted is True
+        assert repeated.tool_input == event.tool_input
 
     def test_fallback_input_from_tool_call(self):
         client = AcpClient()
@@ -5829,9 +5943,7 @@ class TestFormatCommandResult:
         assert '"key"' in result
 
     def test_agent_model_filtered(self):
-        result = format_command_result(
-            {"data": {"agent": "x", "model": "y"}, "message": ""}
-        )
+        result = format_command_result({"data": {"agent": "x", "model": "y"}, "message": ""})
         # Only agent/model → display is empty → falls through to message
         assert result == ""
 
@@ -7111,6 +7223,34 @@ class TestWaitForResponseDeferral:
         assert m0.method == "session/request_permission"
         assert m1.id == 88
 
+    def test_session_timeout_progress_names_missing_failed_and_oauth_servers(self, tmp_path):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        client = AcpClient(work_dir=tmp_path)
+        client._mcp_notifications = [
+            JsonRpcMessage(
+                method="_kiro.dev/mcp/server_initialized", params={"serverName": "ready"}
+            ),
+            JsonRpcMessage(
+                method="_kiro.dev/mcp/server_init_failure",
+                params={
+                    "serverName": "broken",
+                    "error": "aws_secret_access_key=supersecret connection failed",
+                },
+            ),
+            JsonRpcMessage(method="_kiro.dev/mcp/oauth_request", params={"serverName": "oauth"}),
+        ]
+
+        progress = client._mcp_timeout_progress(
+            [{"name": "ready"}, {"name": "broken"}, {"name": "silent"}]
+        )
+
+        assert "2/3 MCP server(s) reported" in progress
+        assert "no report from silent" in progress
+        assert "failed: broken" in progress
+        assert "supersecret" not in progress
+        assert "awaiting authorization: oauth" in progress
+
 
 class TestWaitForResponseActivityDeadline:
     """Low-A: a steady stream of notifications keeps _wait_for_response alive
@@ -7891,15 +8031,11 @@ class TestIsTransientRawError:
         # Session expiry with a co-occurring 5xx token: the session-expiry
         # branch must win (checked first).
         assert (
-            _is_transient_raw_error(
-                {"data": "DispatchFailure: session expired", "message": ""}
-            )
+            _is_transient_raw_error({"data": "DispatchFailure: session expired", "message": ""})
             is False
         )
         assert (
-            _is_transient_raw_error(
-                {"data": "ConnectionResetError: not logged in", "message": ""}
-            )
+            _is_transient_raw_error({"data": "ConnectionResetError: not logged in", "message": ""})
             is False
         )
         # A bare 401/403 — the shape an expired session actually arrives in.
@@ -8897,7 +9033,7 @@ class TestSubstitutionFollow:
         # _wait_for_response does. Second wait: real session on the substitute.
         calls = {"n": 0}
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 client._last_substitution_model = "global.anthropic.claude-sonnet-4-6[1m]"
@@ -8929,7 +9065,7 @@ class TestSubstitutionFollow:
             sent.append(method)
             return len(sent)
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"sessionId": "sess-ok"}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -8957,7 +9093,7 @@ class TestSubstitutionFollow:
             sent.append(method)
             return len(sent)
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             client._last_substitution_model = None  # unparseable
             return {}
 
@@ -8985,7 +9121,7 @@ class TestSubstitutionFollow:
             sent.append(method)
             return len(sent)
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             client._last_substitution_model = "global.anthropic.claude-sonnet-4-6[1m]"
             return {}
 
@@ -9020,7 +9156,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9051,7 +9187,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9082,7 +9218,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9129,7 +9265,7 @@ class TestSubstitutionWrappersAndRedaction:
 
         wait_calls = {"n": 0}
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             wait_calls["n"] += 1
             if wait_calls["n"] == 1:
                 client._last_substitution_model = url_shaped
@@ -9183,7 +9319,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9242,7 +9378,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9427,6 +9563,129 @@ class TestAcpClientIsShellSignal:
         perm = client._build_permission_event(self._permission_msg())
         assert perm.tool_name == "list_intakes"
         assert perm.mcp_server_name == "beehive:beehive-mcp"
+
+    def test_permission_event_does_not_promote_title_on_identity_cache_miss(self, tmp_path):
+        """Legacy per-session transport fails closed without ``_meta.kiro``."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "mcp__beehive:beehive-mcp__list_intakes",
+                        "kind": "other",
+                        "rawInput": {},
+                    }
+                },
+            )
+        )
+
+        perm = client._build_permission_event(self._permission_msg())
+
+        assert perm.tool_name == ""
+        assert perm.mcp_server_name == ""
+        assert (
+            approval_command(
+                perm.tool_input,
+                is_shell=perm.is_shell,
+                tool_name=perm.tool_name,
+                mcp_server_name=perm.mcp_server_name,
+            )
+            == ""
+        )
+
+    def test_structured_non_shell_reprompt_keeps_argument_provenance(self, tmp_path):
+        """A repeated MCP permission retains both display and raw provenance."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "Looking up the record",
+                        "kind": "other",
+                        "rawInput": {"record_id": "sensitive-record"},
+                        "_meta": {
+                            "kiro": {
+                                "toolName": "read_record",
+                                "mcpServerName": "records:primary",
+                            }
+                        },
+                    }
+                },
+            )
+        )
+
+        first = client._build_permission_event(self._permission_msg())
+        repeated = client._build_permission_event(self._permission_msg())
+
+        assert first.tool_input
+        assert repeated.tool_input == first.tool_input
+        assert repeated.raw_tool_params == {"record_id": "sensitive-record"}
+        assert (
+            approval_command(
+                repeated.tool_input,
+                is_shell=repeated.is_shell,
+                tool_name=repeated.tool_name,
+                mcp_server_name=repeated.mcp_server_name,
+                raw_tool_params=repeated.raw_tool_params,
+            )
+            == ""
+        )
+
+    @pytest.mark.parametrize("raw_input", ["/etc/secret", ["/etc/secret"]])
+    def test_non_dict_non_shell_reprompt_cannot_become_durable_tool_trust(
+        self, tmp_path, raw_input
+    ):
+        """String/list rawInput must not become argument-free after one prompt."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "Reading a path",
+                        "kind": "read",
+                        "rawInput": raw_input,
+                        "_meta": {"kiro": {"toolName": "read_path", "mcpServerName": "files"}},
+                    }
+                },
+            )
+        )
+
+        first = client._build_permission_event(self._permission_msg())
+        repeated = client._build_permission_event(self._permission_msg())
+
+        assert repeated.tool_input == first.tool_input
+        assert repeated.tool_input
+        assert (
+            approval_command(
+                repeated.tool_input,
+                is_shell=repeated.is_shell,
+                tool_name=repeated.tool_name,
+                mcp_server_name=repeated.mcp_server_name,
+                raw_tool_params=repeated.raw_tool_params,
+            )
+            == ""
+        )
 
     def test_end_to_end_long_shell_title_passes_validation(self, tmp_path):
         """The full regression: a 400-char shell title validates only because
@@ -10082,8 +10341,7 @@ class TestMiseNodeInstallsDir:
 
         monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "custom-mise"))
         assert (
-            client_mod._mise_node_installs_dir()
-            == tmp_path / "custom-mise" / "installs" / "node"
+            client_mod._mise_node_installs_dir() == tmp_path / "custom-mise" / "installs" / "node"
         )
 
     def test_xdg_data_home_is_honoured(self, tmp_path, monkeypatch):
@@ -10091,8 +10349,7 @@ class TestMiseNodeInstallsDir:
 
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         assert (
-            client_mod._mise_node_installs_dir()
-            == tmp_path / "xdg" / "mise" / "installs" / "node"
+            client_mod._mise_node_installs_dir() == tmp_path / "xdg" / "mise" / "installs" / "node"
         )
 
     @_POSIX_EXEC_PATHS_ONLY

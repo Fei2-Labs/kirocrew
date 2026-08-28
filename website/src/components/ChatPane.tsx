@@ -21,9 +21,10 @@ import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage, editQueuedMessage, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { tryQuickSend } from '../lib/quickSend'
@@ -35,7 +36,7 @@ import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import { classifyDrop } from '../utils/dropClassify'
-import { serializeDirTokens, spliceDirTokens } from '../utils/fileTokens'
+import { serializeDirTokens, spliceDirTokens, VIDEO_EXT, VIDEO_MAX_BYTES } from '../utils/fileTokens'
 import { displayModel } from '../lib/model'
 
 
@@ -83,7 +84,6 @@ export default function ChatPane({
   const connectionsUiOn = useConnectionsUiEnabled()
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
-  const [uploadError, setUploadError] = useState('')
   const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
   const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
@@ -150,7 +150,7 @@ export default function ChatPane({
   // for the same reason as ChatPage: both would offer the same choices, and
   // only the card can answer the blocked tool call.
   const pendingQuestion = useAppSelector((s) => pendingQuestionFor(s.chat.pendingQuestions, slotKey))
-  const { followUpOptions } = useMemo(
+  const { followUpOptions, followUpIsPlan, followUpSourceKey } = useMemo(
     () => deriveFollowUpOptions(allMessages, busy, !!pendingQuestion),
     [allMessages, busy, pendingQuestion],
   )
@@ -161,6 +161,12 @@ export default function ChatPane({
   // Read by the option handler instead of the state: two clicks landing before
   // a re-render would both see the same set and both take the append branch.
   const followUpPickedRef = useRef(followUpPicked); followUpPickedRef.current = followUpPicked
+  // Orchestrator plan dispatch (#5893) — same mutation ChatPage uses,
+  // targeting THIS pane's slot. The hook owns the latch acknowledgement,
+  // keyed on the derived options-row identity passed here; the ref lets the
+  // click handler see the in-flight state, not the render it closed over.
+  const planActionMutation = usePlanActionMutation(slotKey, followUpSourceKey)
+  const planActionMutationRef = useRef(planActionMutation); planActionMutationRef.current = planActionMutation
   const followUpOptionsKey = followUpOptions.join('\x00')
   useEffect(() => { setFollowUpPicked(new Set()) }, [followUpOptionsKey, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
@@ -316,28 +322,23 @@ export default function ChatPane({
   })
 
   // File upload as a mutation (isPending replaces a manual `uploading` flag).
-  // api.uploadFiles does NOT throw on a non-2xx: it resolves { paths, error }.
-  // Surface res.error the way ChatPage does (issue #5707) so a server refusal
-  // (unsupported type, content-signature mismatch, over-cap) is reported at
-  // the composer instead of the spinner silently stopping with no attachment.
   const uploadMutation = useMutation({
     mutationFn: (files: File[]) => api.uploadFiles(files),
-    onSuccess: (res) => {
-      if (res.error) { setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: res.error })); return }
-      if (res.paths?.length) setPendingFiles((prev) => [...prev, ...res.paths])
-    },
-    // A thrown fetch (network failure, session-expired, resize error) carries
-    // its own message; render it rather than an empty interpolation.
-    onError: (err: unknown) => { setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: (err as Error)?.message || i18nT('api.client.unexpected_server_response') })) },
+    onSuccess: (res) => { if (res.paths?.length) setPendingFiles((prev) => [...prev, ...res.paths]) },
   })
   const uploadFiles = useCallback((files: File[]) => {
-    if (!files.length) return
-    // Client-side refusals are the same silent-failure class as #5707: without
-    // a message a >20-file or >50 MB drop just vanishes. Mirror ChatPage.
-    if (files.length > 20) { setUploadError(i18nT('pages.chatPage.too_many_files_max_20')); return }
-    const big = files.find((f) => f.size > 50 * 1024 * 1024)
-    if (big) { setUploadError(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
-    setUploadError('')
+    if (!files.length || files.length > 20) return
+    // Same video exemption as ChatPage's uploadFiles: the server's video cap is
+    // far higher than 50 MB, and this guard drops the batch SILENTLY, so
+    // applying it to a recording would swallow the attach with no explanation.
+    // But this pane has no error surface at all -- `uploadMutation` renders
+    // nothing on failure -- so it cannot delegate the ceiling to the server's
+    // 413 the way ChatPage does. It pre-checks against the server's own cap
+    // instead: a legal recording gets through, and an over-cap one is dropped
+    // exactly the way this pane already drops every oversized file, rather than
+    // gaining a NEW silent failure mode from this change.
+    const cap = (f: File) => (VIDEO_EXT.test(f.name) ? VIDEO_MAX_BYTES : 50 * 1024 * 1024)
+    if (files.find((f) => f.size > cap(f))) return
     uploadMutation.mutate(files)
   }, [uploadMutation])
 
@@ -529,6 +530,15 @@ export default function ChatPane({
     api.cancelQueuedMessage(slotKey, queueId).catch(() => undefined)
   }, [dispatch, slotKey])
   const onInterruptQueued = useCallback((queueId: string) => { api.interruptSlot(slotKey, queueId).catch(() => undefined) }, [slotKey])
+  const onEditQueued = useCallback((queueId: string, content: string) => {
+    const trimmed = content.trim()
+    if (!trimmed) return
+    // Optimistically update the card; WS event reconciles other clients.
+    // Mirrors ChatPage.handleEditQueued — split view (⌘D) must offer the same
+    // inline edit the single-chat QueueStack does.
+    dispatch(editQueuedMessage({ slot: slotKey, queue_id: queueId, content: trimmed }))
+    api.editQueuedMessage(slotKey, queueId, trimmed).catch(() => undefined)
+  }, [dispatch, slotKey])
   const onReorderQueued = useCallback((queueId: string, direction: 'next' | 'later') => {
     // Build the order from ALL queued messages in the slot, not just the
     // interactive ones QueueStack renders: hidden system deliveries and
@@ -668,7 +678,7 @@ export default function ChatPane({
 
         <SubagentDeliveryProgress count={systemDeliveryCount} />
         {queuedMessages.length > 0 && (
-          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onReorder={onReorderQueued} />
+          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onEdit={onEditQueued} onReorder={onReorderQueued} />
         )}
 
         {/* The pending ask_question card renders per pane: in split mode the
@@ -717,7 +727,6 @@ export default function ChatPane({
           agentName={paneSlot?.agent || 'default'}
           agentSource={installedAgents.find((a) => a.name === (paneSlot?.agent || 'default'))?.source}
           modelName={shownModel}
-          providerLabel={paneSlot?.provider_label}
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
@@ -728,13 +737,39 @@ export default function ChatPane({
           followUpPicked={followUpPicked}
           followUpLayout={chatConfig.followUpLayout}
           quickSend={dashCfg?.quick_send}
-          onFollowUpSelect={(o: string, e: React.MouseEvent) => {
-            // Mirrors ChatPage's toggle wiring, minus the plan-dispatch branch:
-            // panes have no orchestrator plan mutation, so plan options fall
-            // through to the composer like any other option (follow-up: #5870
-            // disposition names this delta). One-click Quick Send takes the
-            // same gate as ChatPage: enabled + no shift + not busy + not
-            // already in multi-select.
+          followUpSourceKey={followUpSourceKey}
+          onFollowUpSelect={(o: string, e: React.MouseEvent, sourceKeyAtClick?: string | null) => {
+            // Mirrors ChatPage's wiring, plan branch included (#5893). Plan
+            // options (Go / Go All / Cancel — the only labels the plan
+            // pipeline emits and the only actions the endpoint accepts)
+            // dispatch directly against THIS pane's slot — no input fill:
+            // the same chip must mean the same thing here as in the main
+            // chat. A plan-SHAPED message carrying non-protocol labels keeps
+            // the composer path — dispatching those would 400 server-side
+            // while also skipping the append, leaving a dead chip.
+            if (followUpIsPlan && isPlanAction(o)) {
+              // Slot record not yet delivered (the first WS slots snapshot
+              // can land after this pane hydrates its transcript from the
+              // detail fetch, e.g. on a reload with a restored grid): the
+              // mode is UNKNOWN, so neither dispatching nor appending is
+              // safe — appending would type an approval label into the
+              // composer, the reported bug. No-op until the record resolves.
+              if (!paneSlot) return
+              if (paneSlot.mode === 'orchestrator') {
+                // No isPending pre-check here: single-flight lives in the
+                // hook's per-slot latch, which drops a duplicate Go/Go All
+                // but must let Cancel through — a render-scoped isPending
+                // check would swallow the stop control while a Go settles.
+                // `sourceKeyAtClick` is the row the user actually clicked on
+                // (the chip debounces 220ms and the row can be replaced by a
+                // byte-identical footer inside that window without remounting
+                // the chip); the hook refuses it if it no longer matches.
+                planActionMutationRef.current.mutate({ slot: slotKey, action: o, clickedSourceKey: sourceKeyAtClick })
+                return
+              }
+            }
+            // One-click Quick Send takes the same gate as ChatPage: enabled +
+            // no shift + not busy + not already in multi-select.
             if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, busy, followUpPickedRef.current.size, (t: string) => doSend(t))) return
             // Regular options: toggle. Click unpicked → append + mark; click
             // picked → try to remove the text + unmark (if the user edited the
@@ -777,17 +812,6 @@ export default function ChatPane({
           onDragOver={dropTargetProps.onDragOver}
           onDragLeave={dropTargetProps.onDragLeave}
         />
-
-        {/* Upload-error surface (issue #5707): a server refusal resolves as
-            { paths: [], error } rather than throwing, so without this the
-            spinner just stops with no attachment and no message. Mirrors the
-            banner ChatPage renders, reusing its existing i18n strings. */}
-        {uploadError && (
-          <div className="mx-3 mb-2 flex items-center gap-2 rounded-lg border border-border bg-bg-elevated px-3 py-2">
-            <span className="text-sm text-text flex-1 min-w-0 break-words">{uploadError}</span>
-            <button onClick={() => setUploadError('')} aria-label={i18nT('pages.chatPage.dismiss_upload_error')} className="text-muted hover:text-text shrink-0"><X className="lucide-inline" /></button>
-          </div>
-        )}
 
         {/* Agent picker portal — anchored to the input-bar agent button. */}
         {agentDD.open && agentBtnRect && createPortal(

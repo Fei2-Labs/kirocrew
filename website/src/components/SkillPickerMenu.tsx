@@ -37,6 +37,10 @@ interface Props {
   // The slot's current project is cache identity: one slot can switch projects
   // while its session key stays constant.
   project?: string
+  // Active agent (session slot's `.agent`, e.g. "default" or a custom
+  // template's name). Scopes the list to that agent's own skill:// mapping
+  // when it has one; omit/undefined falls back to the unfiltered catalog.
+  agent?: string
   // Receives the leaf token to insert (e.g. "oncall-handover") plus the full key.
   onSelect: (info: { leaf: string; key: string }) => void
   // An untrusted project skill was chosen: ask for consent rather than
@@ -63,20 +67,22 @@ function needsTrust(s: SkillItem): boolean {
 }
 
 export default function SkillPickerMenu({
-  query, anchorRef, open, slotKey, project, onSelect, onTrustRequest, onClose,
+  query, anchorRef, open, slotKey, project, agent, onSelect, onTrustRequest, onClose,
   sendOnEnter = 'enter',
 }: Props) {
   const [results, setResults] = useState<SkillItem[]>([])
   const resultsRef = useRef<SkillItem[]>([])
 
-  // Shared skills cache, keyed per slot and project: a slot can switch projects
-  // without changing its session key. Prefix-matching keeps every
-  // existing invalidateQueries({queryKey:['skills']}) call working.
+  // Shared skills cache, keyed per slot, project and agent: a slot can switch
+  // projects without changing its session key, and an active agent template
+  // with its own skill:// mapping serves a real subset rather than the same
+  // data. Agent is the LAST key segment so every existing prefix
+  // invalidateQueries({queryKey:['skills']}) call keeps working.
   // staleTime is long because skills change rarely. `enabled: open` keeps the
   // menu lazy — the focus-prefetch warms the same key separately.
   const { data, isLoading, isFetching, isError } = useQuery<SkillItem[]>({
-    queryKey: ['skills', slotKey ?? null, project ?? null],
-    queryFn: () => api.skills(slotKey),
+    queryKey: ['skills', slotKey ?? null, project ?? null, agent ?? null],
+    queryFn: () => api.skills(slotKey, agent),
     enabled: open,
     staleTime: skillsCacheStaleTime(project),
   })

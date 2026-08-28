@@ -16,16 +16,17 @@ import { useConnected } from '../hooks/useConnected'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent } from '../components/ui/dropdown-menu'
 import { ContextMenu, ContextMenuTrigger, ContextMenuContent } from '../components/ui/context-menu'
 import { offlineProps } from '../utils/offline'
-import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, clearSlotReveal } from '../store/chatSlice'
+import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, clearSlotReveal, selectSidebarSubagentCounts, selectSidebarApprovalCounts } from '../store/chatSlice'
 import { sseSlotTitle, setSidebarOrder } from '../store/dashboardSlice'
-import { useDigitModifierHeld, jumpLabelFor } from '../hooks/useKeyboardShortcuts'
+import { useDigitModifierHeld, jumpLabelFor, IS_MAC } from '../hooks/useKeyboardShortcuts'
 import { api, SEARCH_MIN_CHARS } from '../api/client'
 import { computeReorderedFolders } from '../utils/reorderFolders'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
 import { boardCollapseKey, boardColumnFromDroppableId, loadBoardFolderCollapse, persistBoardOverride, persistClearFolderOverrides, clearFolderOverrides } from '../utils/boardFolderCollapse'
-import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
+import { isChatPageSurface, slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
+import ErrorNotice from '../components/ErrorNotice'
 import { toolStatusLabel } from '../utils/toolStatusLabel'
 import { sessionRefBlockReason, type SessionRefBlockReason } from '../utils/sessionRefs'
 import { SearchInput, Input, Btn, IconButton, IconButtonGroup, Badge } from '../components/ui'
@@ -54,11 +55,11 @@ import SessionMoveUndoBar, { MOVE_UNDO_MS, type MovedSession } from '../componen
 import SessionActionsMenu from '../components/SessionActionsMenu'
 import { ChannelBrandIcon, hasChannelBrandIcon } from '../components/ChannelBrandIcon'
 import TagManagerList from '../components/TagManagerList'
-import { DndDraggable, DndDroppable } from '../components/dnd'
+import { DndDraggable, DndDroppable, pointerWithinDeepest, closestEdge } from '../components/dnd'
 import { collectFolderSubtreeIds } from '../utils/folderTree'
 import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../utils/sanitize'
-import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SubagentActivity, SessionLink } from '../types'
+import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SessionLink } from '../types'
 import { SESSION_LANES, inferLane } from './chat/sessionLane'
 import { decideUnreadDrain } from './unreadDrain'
 import {
@@ -159,8 +160,8 @@ function slotStatusText(detail: { kind?: string; text?: string; toolName?: strin
  * want different collision behavior:
  *  - Dragging a folder: restrict collisions to folder sortable containers so
  *    verticalListSortingStrategy animates cleanly and `over.id` is a folder id.
- *  - Dragging a session: prefer the innermost droppable under the pointer
- *    (folder/root drop target), falling back to closestCenter.
+ *  - Dragging a session: prefer the innermost (DOM-deepest) droppable under
+ *    the pointer (folder/root drop target), falling back to closest-edge.
  */
 // Exported for a call-site unit test (ChatSidebar.folderNestBandCallSite.test.tsx):
 // asserts the collision uses the MEASURED header height, not
@@ -175,11 +176,22 @@ export const sidebarCollision: CollisionDetection = (args) => {
       // Target the innermost folder-drop zone under the pointer (or the root
       // lane to move to top level), excluding the dragged folder's own
       // subtree so it can never be dropped into itself or a descendant.
+      // Innermost = leaf-first by DOM containment: the root lane is every
+      // folder's ancestor with a viewport-sized box, so pointerWithin's
+      // box-size ranking would resolve a pointer on a tall expanded folder to
+      // the LANE and silently un-nest the dragged subfolder instead of
+      // re-parenting it.
       const dropContainers = args.droppableContainers.filter(c => {
         const d = c.data?.current as { type?: string; folderId?: string | null } | undefined
         return d?.type === 'folder-drop' && !(d.folderId && subtree.has(d.folderId))
       })
-      return pointerWithin({ ...args, droppableContainers: dropContainers })
+      const within = pointerWithinDeepest({ ...args, droppableContainers: dropContainers })
+      // A pointer drag outside every drop zone deliberately has NO target
+      // (releasing there keeps the current parent). A drag WITHOUT pointer
+      // coordinates (keyboard / synthetic activation) has no such "outside",
+      // so it degrades to closestCenter rather than resolving to nothing.
+      if (within.length || args.pointerCoordinates) return within
+      return closestCenter({ ...args, droppableContainers: dropContainers })
     }
     // Root folder drag: two gestures share the drag, disambiguated by where
     // the pointer sits on the target — the "thirds" pattern from VS Code /
@@ -232,23 +244,49 @@ export const sidebarCollision: CollisionDetection = (args) => {
     )
     return closestCenter({ ...args, droppableContainers: folderContainers })
   }
-  const within = pointerWithin(args)
-  if (within.length) return within
-  // Session drag that is inside no droppable: fall back to the nearest one, but
-  // NEVER to the chat-pane zone. That zone is a pane-sized rect living outside
-  // the sidebar, so by center-distance it would routinely beat the folder row
-  // the user was actually aiming at and steal near-miss drops. A pointer
-  // genuinely inside it still wins above, via `within`.
-  const fallback = args.droppableContainers.filter(
+  // Session drag. Containment first, leaf-first by DOM containment: the root
+  // lane is the folders' ancestor but its border box is only viewport-sized
+  // while an expanded folder block overflows it, so pointerWithin's box-size
+  // ranking would resolve a pointer on a tall folder's own rows to the LANE —
+  // no highlight on the folder, and the drop unfiles the session.
+  //
+  // Sidebar targets are consulted BEFORE the portaled chat-pane zone: the
+  // pane's rect can geometrically overlap the sidebar in overlay layouts, and
+  // with no DOM relation between the two trees containment cannot arbitrate —
+  // a pointer inside any sidebar droppable belongs to the sidebar, and the
+  // pane wins only when nothing in the sidebar contains the pointer.
+  const sidebarContainers = args.droppableContainers.filter(
     c => (c.data?.current as { type?: string } | undefined)?.type !== CHAT_PANE_DROP_TYPE
   )
-  return closestCenter({ ...args, droppableContainers: fallback })
+  const within = pointerWithinDeepest({ ...args, droppableContainers: sidebarContainers })
+  if (within.length) return within
+  const paneWithin = pointerWithinDeepest(args)
+  if (paneWithin.length) return paneWithin
+  // No pointer coordinates (keyboard / synthetic) and no sidebar droppable at
+  // all: the pane is the only conceivable target, so degrade to closestCenter
+  // over everything rather than resolving to nothing. Pointer drags never take
+  // this path — the pane must not win by mere proximity.
+  if (!args.pointerCoordinates && sidebarContainers.length === 0) return closestCenter(args)
+  // Session drag that is inside no droppable: fall back to the nearest one, but
+  // NEVER to the chat-pane zone. That zone is a pane-sized rect living outside
+  // the sidebar, so by proximity it would routinely beat the folder row the
+  // user was actually aiming at and steal near-miss drops. Nearness is
+  // measured to the rect's EDGE (closestEdge), not its center: a pointer a
+  // fraction of a px outside a tall expanded folder is half that folder's
+  // height from its center, so closestCenter would hand the drop to a small
+  // sibling instead.
+  return closestEdge({ ...args, droppableContainers: sidebarContainers })
 }
 
 /** Droppable `type` for the chat-pane target that stages a session reference in
  *  the composer. Lives outside the sidebar's DOM (portaled into ChatPage's pane)
  *  but inside its DndContext, so React context reaches it while `useDroppable`
  *  measures its real on-screen rect. */
+// Load-bearing invariant: the pane's portal host is never a DOM ancestor of
+// the sidebar lane — that is what keeps containment re-ranking from ever
+// arbitrating between the two trees (they always land in the "unrelated"
+// group). Re-pointing chatDropTarget at a wrapper shared with the sidebar
+// would break it.
 const CHAT_PANE_DROP_TYPE = 'chat-pane-ref'
 
 /**
@@ -523,6 +561,13 @@ interface Slot {
   interrupted?: boolean
   mode?: string
   agent?: string
+  // The agent that will actually answer, when it is NOT `agent`. The backend
+  // stores `agent` verbatim — it is the user's intent, and rewriting it on disk
+  // was destructive — and reports the divergence here instead. "" / absent means
+  // NOTHING TO REPORT, which covers both "the request is honored" and "resolution
+  // is not settled yet" (a cold snapshot during boot). So it must be read as a
+  // positive claim only: a falsy value never means "mismatch".
+  effective_agent?: string
   model?: string  // '' / absent = provider-default ("auto")
   // Message count from the slot payload. Already carried by every ChatSlot
   // (redux seeds it in addSlotOptimistic and SessionGridView renders it); it was
@@ -1190,6 +1235,20 @@ interface ChatSidebarProps {
    *  When provided, this fires AFTER the switchSlot dispatch so consumers
    *  can react to user-driven selection (e.g. to navigate the URL). */
   onSelectSlot?: (key: string) => void
+  /** Open a session as a TAB on the host surface instead of switching to it,
+   *  bound to middle-click, modifier-click and the row menu's "Open in a session
+   *  tab".
+   *
+   *  `background` follows the pointer/menu split every browser and editor uses:
+   *  a middle-click or modifier-click QUEUES the session without moving the user
+   *  (that is what makes triaging three rows in a row useful), while the menu
+   *  item is a deliberate "take me there" and opens in the foreground.
+   *
+   *  Omitted on surfaces with no tab strip (the embed sessions list, a popped-out
+   *  window), and an omitted callback leaves the gestures unbound rather than
+   *  falling back to a plain switch — a middle-click that quietly navigated
+   *  would be indistinguishable from a misfire. */
+  onOpenSlotInNewTab?: (key: string, opts?: { background?: boolean }) => void
   /** Reveal a session's pull request / issue in the side panel instead of
    *  leaving for the provider's website.
    *
@@ -1321,7 +1380,7 @@ interface FilterDimension {
 
 function ChatSidebar({
   slots, activeSlot, unreadSlots, history, historyHasMore,
-  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSource, collapsible,
+  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSlotInNewTab, onOpenSource, collapsible,
   chatDropTarget, onDropSessionRef,
 }: ChatSidebarProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
@@ -1341,6 +1400,16 @@ function ChatSidebar({
   const [seedError, setSeedError] = useState('')
   const [slotFilter, setSlotFilter] = useState('')
   const [historyFilter, setHistoryFilter] = useState('')
+  // A resumed history row whose surface ChatPage cannot display (e.g. a
+  // dashboard session) used to succeed on the wire and then silently bounce
+  // the user back to whatever slot was already open, indistinguishable from a
+  // dead click (#3624). Set right after such a resume resolves; cleared on
+  // dismiss or the next resume attempt.
+  const [unresumableNotice, setUnresumableNotice] = useState<string | null>(null)
+  // Monotonic guard for the resume promise chain below: rapid successive row
+  // clicks each start a resume, and an EARLIER one resolving after a LATER one
+  // must not show (or clear) feedback for a row the user has moved past.
+  const resumeSeqRef = useRef(0)
   // Digest of session keys + titles (NOT status), fed to both searches as their
   // revalidate signal. Sorted+joined so reordering `slots` alone cannot refetch.
   const slotTitleDigest = useMemo(
@@ -1582,75 +1651,12 @@ function ChatSidebar({
   const uiLang = useLanguage().resolved
   // Presence in this map means "this session is in an active goal loop".
   const goalLoops = useAppSelector(s => s.chat.goalLoops)
-  // Live subagent activity per slot, for the sidebar row's "N agents running"
-  // subtitle. Mirrors SubagentProgressBar's source of truth: chatSlice.subagents
-  // for the store's active slot, slotActivity[slot].subagents for background
-  // slots (both populated by the globally-subscribed subagent_spawn/tool/done WS
-  // events). We deliberately do NOT use dashboardSlice.subagentRunning — that
-  // count is only broadcast on the subagent_status "done" event
-  // (gateway._broadcast_subagent_status), never on spawn, so it under-reports
-  // while agents are still running.
-  const storeActiveSlot = useAppSelector(s => s.chat.activeSlot)
-  const activeSlotSubagents = useAppSelector(s => s.chat.subagents)
-  const slotActivity = useAppSelector(s => s.chat.slotActivity)
-  // Queued-but-not-started agents have no entry in the per-slot subagents map,
-  // so a slot whose whole wave is still behind the concurrency cap counted 0
-  // and showed no subtitle at all — the window in which a user is most likely
-  // to wonder whether their spawn did anything. Fold the queue depth in.
+  // NOT dashboardSlice.subagentRunning — that only broadcasts on "done", not spawn.
+  const subagentCounts = useAppSelector(selectSidebarSubagentCounts, shallowEqual)
+  // Spawn approvals (pending + approval_id) — surfaced here since background chats have no inline prompt.
+  const subagentApprovalCounts = useAppSelector(selectSidebarApprovalCounts, shallowEqual)
+  // Queued agents (behind concurrency cap) — ensures subtitle shows even when no agents started yet.
   const subagentQueued = useAppSelector(s => s.chat.subagentQueued)
-  const subagentCounts = useMemo(() => {
-    const countActive = (m?: Record<string, SubagentActivity>) => {
-      if (!m) return 0
-      let n = 0
-      for (const a of Object.values(m)) {
-        if (a.status === 'running' || a.status === 'tool' || a.status === 'pending') n++
-      }
-      return n
-    }
-    const counts: Record<string, number> = {}
-    if (storeActiveSlot) { const n = countActive(activeSlotSubagents); if (n > 0) counts[storeActiveSlot] = n }
-    for (const [slot, act] of Object.entries(slotActivity ?? {})) {
-      // Load-bearing: on switchSlot the active slot's subagents map is aliased
-      // into BOTH state.subagents and slotActivity[active].subagents (same
-      // object reference), so skipping the active slot here is what prevents
-      // double-counting it. Do not drop this guard.
-      if (slot === storeActiveSlot) continue
-      const n = countActive(act.subagents)
-      if (n > 0) counts[slot] = n
-    }
-    for (const [slot, q] of Object.entries(subagentQueued ?? {})) {
-      if (q > 0) counts[slot] = (counts[slot] || 0) + q
-    }
-    return counts
-  }, [storeActiveSlot, activeSlotSubagents, slotActivity, subagentQueued])
-  // Sub-agents blocked on a SPAWN approval, per slot. Mirrors
-  // selectSlotPendingSpawnApprovals (status 'pending' + an approval_id), but
-  // across every slot rather than the viewed one: a spawn approval raised by a
-  // background chat has no inline prompt and no notification, so without this
-  // the sidebar was the only place it could have surfaced and it showed
-  // "N agents running" instead — an owed decision rendered as work in
-  // progress. Counted separately from `subagentCounts` so the running subtitle
-  // can subtract them (an agent waiting on approval is not running).
-  const subagentApprovalCounts = useMemo(() => {
-    const countPending = (m?: Record<string, SubagentActivity>) => {
-      if (!m) return 0
-      let n = 0
-      for (const a of Object.values(m)) {
-        if (a.status === 'pending' && a.approval_id) n++
-      }
-      return n
-    }
-    const counts: Record<string, number> = {}
-    if (storeActiveSlot) { const n = countPending(activeSlotSubagents); if (n > 0) counts[storeActiveSlot] = n }
-    for (const [slot, act] of Object.entries(slotActivity ?? {})) {
-      // Same aliasing guard as countActive above: the active slot's map is the
-      // same object in both places, so skipping it here avoids double-counting.
-      if (slot === storeActiveSlot) continue
-      const n = countPending(act.subagents)
-      if (n > 0) counts[slot] = n
-    }
-    return counts
-  }, [storeActiveSlot, activeSlotSubagents, slotActivity])
   // Live dynamic-workflow runs per slot, for the sidebar row's "workflow
   // running" subtitle. Mirrors WorkflowProgressBar's source of truth:
   // chatSlice.workflowRuns (populated by the globally-subscribed
@@ -3099,6 +3105,9 @@ function ChatSidebar({
       if (a.nested) {
         // Nested subfolder drag = re-parent: into the folder-drop target, or
         // to the top level when dropped on the root lane (folderId null).
+        // moveFolderTo itself no-ops on the folder's current parent, so a
+        // drop resolving to it (easy to hit now that a tall parent's whole
+        // block is a reachable target) costs no write.
         if (o?.type === 'folder-drop') moveFolderTo(active.id as string, o.folderId ?? null)
         return
       }
@@ -3113,7 +3122,7 @@ function ChatSidebar({
       return
     }
     if (a?.type === 'session' && a.key) {
-      // Drop targets, innermost-first via pointerWithin:
+      // Drop targets, innermost-first via pointerWithinDeepest:
       //  chat-pane-ref → stage a LINK to this session in the open chat's composer
       //  folder-drop  → assign to that folder (folderId may be null for root lane)
       //  folder       → sortable folder container (whole block) → assign to its id
@@ -3457,6 +3466,20 @@ function ChatSidebar({
     // Board columns keep the separate native-HTML5 drag (their own scope).
     const dndRow = scope === 'list' || scope === 'flat'
     const agentName = s.agent || defaultAgent || ''
+    // A DIVERGENCE, not a status: the row is advertising `agentName` while a
+    // different agent answers the session — usually an app agent that was
+    // removed, or one whose registration has not landed yet. Shown because the
+    // stored binding is deliberately left verbatim, so without this the sidebar
+    // names an agent that is not running, and the user only finds out turns
+    // later when none of its tools are there.
+    //
+    // Empty is the common case and means "nothing to report", so the marker is
+    // gated on a non-empty value that actually differs from what is displayed —
+    // never on inequality alone, which would fire during the boot window on a
+    // healthy install. The `?? ''` is load-bearing: rows arrive from persisted
+    // and optimistically-added state that predates this field.
+    const effectiveAgent = s.effective_agent ?? ''
+    const agentDiverged = effectiveAgent !== '' && effectiveAgent !== agentName
     const agentMeta = installedAgents.find(a => a.name === agentName)
     const isPackageAgent = agentMeta?.source === 'package'
     const isBuiltin = agentMeta?.source === 'builtin'
@@ -3725,6 +3748,7 @@ function ChatSidebar({
       slotKey: s.key,
       mode,
       onRename: () => { const sl = slots.find(x => x.key === s.key); suppressMenuRestoreRef.current = true; setRenamingSlot(s.key); setRenameScope(scope); setRenameValue(sl?.title && sl.title !== sl.key ? sl.title : '') },
+      onOpenInNewTab: onOpenSlotInNewTab ? () => onOpenSlotInNewTab(s.key) : undefined,
     }
     return (
       <motion.div key={s.key} layout="position" layoutId={`slot-${layoutScope}-${s.key}`}
@@ -3788,6 +3812,23 @@ function ChatSidebar({
             onSelectSlot?.(s.key)
           }}
           onDragStart={!dndRow ? (e => { e.dataTransfer.setData('text/plain', s.key); e.dataTransfer.effectAllowed = 'move' }) : undefined}
+          // Chrome and Edge on Windows enter autoscroll on middle-button
+          // MOUSEDOWN, before `auxclick` fires — so cancelling it in the
+          // auxclick handler alone opens the tab AND leaves the pointer in
+          // autoscroll mode on a scrollable sidebar. This is the only place that
+          // can stop it. Middle button only: the primary button's mousedown
+          // belongs to dnd-kit's drag listeners, spread above.
+          onMouseDownCapture={onOpenSlotInNewTab ? (e => { if (e.button === 1) e.preventDefault() }) : undefined}
+          // Middle-click opens the session as a tab in the BACKGROUND, the way
+          // every browser and editor treats it — a user triaging by
+          // middle-clicking three rows means "queue these up", and yanking them
+          // to each one in turn defeats the gesture. Bound separately from
+          // onClick because a middle press produces no click event.
+          onAuxClick={onOpenSlotInNewTab ? (e => {
+            if (e.button !== 1 || !connected) return
+            e.preventDefault()
+            onOpenSlotInNewTab(s.key, { background: true })
+          }) : undefined}
           onClick={e => {
             if ((e.target as HTMLElement).closest?.('[data-fork]')) { sessionActions.duplicate(s.key); return }
             if ((e.target as HTMLElement).closest?.('[data-close]')) { sessionActions.close(s.key); return }
@@ -3803,6 +3844,15 @@ function ChatSidebar({
             // /forking still works — those are local ops (or short-circuit) that
             // don't depend on gateway state.
             if (!connected) return
+            // Modifier-click = open as a background tab, matching the
+            // editor/browser convention. The platform split is deliberate:
+            // Ctrl+click IS a right-click on macOS, so honouring it there would
+            // fire this and the context menu from one gesture.
+            if (onOpenSlotInNewTab && (IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey) && !e.shiftKey && !e.altKey) {
+              e.preventDefault()
+              onOpenSlotInNewTab(s.key, { background: true })
+              return
+            }
             dispatch(switchSlot(s.key))
             onSelectSlot?.(s.key)
           }}>
@@ -3846,8 +3896,43 @@ function ChatSidebar({
           <div className="flex-1 min-w-0 overflow-hidden">
             <div className={`session-agent-label ${ROW_META_CLS} font-semibold truncate flex items-center gap-1 ${agentColor}`}>
               <AnimatePresence mode="wait">
-                <motion.span key={agentName || 'empty'} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }} className={`truncate shrink-0 ${resolvedSlotTags.length > 0 ? 'max-w-[50%]' : ''}`}>{agentName || '\u00A0'}</motion.span>
+                <motion.span key={agentName || 'empty'} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }} className={`truncate shrink-0 ${resolvedSlotTags.length > 0 || agentDiverged ? 'max-w-[50%]' : ''}`}>{agentName || '\u00A0'}</motion.span>
               </AnimatePresence>
+              {agentDiverged && (
+                // Plain secondary TEXT, deliberately not a badge, a colour or an
+                // icon. It is informational — the session works, it is simply
+                // answered by someone else — so it must not read as an error, and
+                // it must not be the row's loudest element.
+                //
+                // Accessibility follows from being real text: it is in the
+                // accessible name of the meta line, read in document order by a
+                // screen reader, and legible with colour vision ignored (it
+                // inherits the line's muted tone rather than encoding meaning in
+                // a hue). Nothing here is hover-only — the `title` merely repeats
+                // the visible string so a truncated row can still be read in
+                // full, which is why it is not the only carrier of the meaning.
+                //
+                // `font-normal` because the line is `font-semibold` for the agent
+                // name; `shrink-0` because only the tag group owns the truncate
+                // budget on this flex row.
+                <span
+                  data-testid="session-effective-agent"
+                  // Shrinkable and ellipsizing, NOT `shrink-0`. The trailing meta
+                  // group is `ml-auto … shrink-0` (see :4013 below), so an
+                  // unbounded marker here squeezes the timestamp and channel
+                  // glyphs off a minimum-width sidebar. This is the row's least
+                  // important fact, so it is the one that yields: `min-w-0` lets
+                  // flexbox shrink it, `max-w-[45%]` stops it from claiming the
+                  // line before shrinking starts, and `truncate` ellipsizes what
+                  // is left — the same shape as the tag group below, and the
+                  // reason the `title` is worth keeping.
+                  className="min-w-0 max-w-[45%] truncate font-normal text-muted"
+                  title={i18nT('pages.chatSidebar.answered_by', { agent: effectiveAgent })}
+                >
+                  <span aria-hidden>{'\u00A0·\u00A0'}</span>
+                  {i18nT('pages.chatSidebar.answered_by', { agent: effectiveAgent })}
+                </span>
+              )}
               {resolvedSlotTags.length > 0 && (
                 // Every tag, each as `· <name>` tinted with the tag's own colour
                 // and NO border — plain text sitting as context beside the agent
@@ -4253,7 +4338,7 @@ function ChatSidebar({
           onClick={() => toggleReveal(containerKey)}
           aria-expanded={open}
           title={open ? i18nT('pages.chatSidebar.collapse_hidden_folders') : i18nT('pages.chatSidebar.show_hidden_folder', { count: n })}
-          className="w-full flex items-center gap-1.5 py-1 pr-2 text-left text-[11px] text-muted hover:text-fg hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
+          className="w-full flex items-center gap-1.5 py-1 pr-2 text-left text-[11px] text-muted hover:text-text hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
           style={{ paddingLeft: `${8 + depth * 12}px` }}
         >
           <DisclosureChevron open={open} size={11} />
@@ -5078,7 +5163,7 @@ function ChatSidebar({
           // there is nothing for a drop inside the lane to land on. (Order is
           // the reason: a flat lane spans every folder, so a manual position
           // would have no place to be stored.) `sidebarCollision` also keeps the
-          // pane out of its closestCenter fallback, so a release inside the
+          // pane out of its closest-edge fallback, so a release inside the
           // sidebar resolves to no target rather than snapping to the pane.
           <DndContext sensors={dndSensors} collisionDetection={sidebarCollision}
             measuring={dndMeasuring}
@@ -5548,6 +5633,14 @@ function ChatSidebar({
                   <button type="button" className="absolute right-2 top-1/2 -translate-y-1/2 text-muted hover:text-text cursor-pointer bg-transparent border-none p-0 leading-none transition-colors" onClick={() => setHistoryFilter('')} aria-label={i18nT('pages.chatSidebar.clear_search')}><X size={13} /></button>
                 )}
               </div>
+              {unresumableNotice && (
+                <ErrorNotice
+                  message={unresumableNotice}
+                  onDismiss={() => setUnresumableNotice(null)}
+                  variant="block"
+                  className="mt-1.5"
+                />
+              )}
             </div>
             {/* scroll-shadow already fades the top/bottom edge as its
              *  scrollability cue, so the bar itself is redundant here. */}
@@ -5629,8 +5722,34 @@ function ChatSidebar({
                   const remoteInstanceId = (s as { instance_id?: string }).instance_id
                   const remoteInstanceName = (s as { instance_name?: string }).instance_name
                   const activateRow = () => {
+                    // A remote row never resumes here, so it can never produce the
+                    // unresumable notice below — the pane switch IS its outcome.
                     if (remoteInstanceId) { selectInstance(remoteInstanceId); return }
+                    // Resume, then check whether the resolved surface is one ChatPage
+                    // can actually show. The request itself succeeds either way
+                    // (`ok`), so `ok` alone cannot tell a genuinely usable resume
+                    // apart from one that will bounce right back (#3624).
+                    setUnresumableNotice(null)
+                    const seq = ++resumeSeqRef.current
                     dispatch(resumeFromHistory({ key: s.key, title: s.title || s.key }))
+                      .unwrap()
+                      .then(result => {
+                        // Latest-click-wins: an earlier resume resolving late must
+                        // not narrate a row the user has already moved past.
+                        if (seq !== resumeSeqRef.current) return
+                        if (result.ok && !isChatPageSurface(result.surface)) {
+                          // Name the surface from the WIRE answer the check itself
+                          // used. The key-prefix heuristic stays only as the
+                          // localized label for the known dashboard case and as a
+                          // last-resort fallback -- interpolating it for arbitrary
+                          // surfaces mislabels them (e.g. "a Session session").
+                          const noticeSurface = isDashboard ? surfaceLabel : (result.surface || surfaceLabel)
+                          setUnresumableNotice(
+                            i18nT('pages.chatSidebar.this_session_cannot_be_opened_from_the_chat_side', { title: s.title || s.key, surface: noticeSurface }),
+                          )
+                        }
+                      })
+                      .catch(() => { /* resumeFromHistory itself never rejects on an API-level failure; a genuine rejection has nothing more useful to add here. */ })
                   }
                   return (
                     <div className={`group relative flex items-start gap-2.5 pr-4 py-2 rounded-md text-sm transition-all select-none ${!connected ? 'text-muted opacity-50 cursor-not-allowed' : 'text-muted hover:text-text hover:bg-bg-hover cursor-pointer'}`} style={{ paddingLeft: '10px' }} title={s.title || s.key} {...offlineProps(connected, 'resume sessions')} role="button" tabIndex={0} aria-disabled={!connected} onKeyDown={e => {
@@ -5666,7 +5785,7 @@ function ChatSidebar({
                       <div className="flex-1 min-w-0 overflow-hidden">
                         <div className={`session-agent-label text-[11px] font-semibold truncate leading-tight flex items-center gap-1 ${agentColor}`}>
                           <span className="truncate">{agentName || '\u00A0'}</span>
-                          {remoteInstanceName && <span className="shrink-0 text-[10px] px-1 rounded bg-bg-muted text-muted border border-border" title={remoteInstanceName}>{remoteInstanceName}</span>}
+                          {remoteInstanceName && <span className="shrink-0 text-[10px] px-1 rounded bg-bg-elevated text-muted border border-border" title={remoteInstanceName}>{remoteInstanceName}</span>}
                           {s.clean_mode
                             ? <span className="text-accent" title={i18nT('pages.chatSidebar.clean_agent_only_no_kirocrew_context_or_mcp')}><Droplet size={10} /></span>
                             : <>

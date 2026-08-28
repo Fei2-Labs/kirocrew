@@ -140,19 +140,74 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
   },
   // Per-category sound selects render inside CATEGORY_ROWS.map with
   // label={i18nT(CATEGORY_LABEL_KEY[cat])} — a dynamic expression the extractor
-  // skips. The category set is a closed union, so each row is indexed here;
-  // highlighting works because SettingsSelect renders the resolved label as its
-  // own data-setting-label.
-  ...([
-    'all', 'turn', 'cron', 'approval', 'hook', 'heartbeat', 'subagent', 'taskrunner',
-  ] as const).map(cat => ({
-    id: `notifications.sound-category-${cat}`,
-    labelKey: `pages.settings.notificationsPanel.category_${cat}`,
-    descriptionKey: `pages.settings.notificationsPanel.category_${cat}_description`,
+  // skips. The category set is a closed union, so each row is indexed here as an
+  // explicit entry (literal keys, not a template: the i18n added-lines gate
+  // cannot statically verify a computed key). Highlighting works because
+  // SettingsSelect renders the resolved label as its own data-setting-label.
+  {
+    id: 'notifications.sound-category-all',
+    labelKey: 'pages.settings.notificationsPanel.category_all',
+    descriptionKey: 'pages.settings.notificationsPanel.category_all_description',
     tab: 'notifications',
-    type: 'select' as const,
+    type: 'select',
     occurrence: 1,
-  })),
+  },
+  {
+    id: 'notifications.sound-category-turn',
+    labelKey: 'pages.settings.notificationsPanel.category_turn',
+    descriptionKey: 'pages.settings.notificationsPanel.category_turn_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    id: 'notifications.sound-category-cron',
+    labelKey: 'pages.settings.notificationsPanel.category_cron',
+    descriptionKey: 'pages.settings.notificationsPanel.category_cron_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    id: 'notifications.sound-category-approval',
+    labelKey: 'pages.settings.notificationsPanel.category_approval',
+    descriptionKey: 'pages.settings.notificationsPanel.category_approval_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    id: 'notifications.sound-category-hook',
+    labelKey: 'pages.settings.notificationsPanel.category_hook',
+    descriptionKey: 'pages.settings.notificationsPanel.category_hook_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    id: 'notifications.sound-category-heartbeat',
+    labelKey: 'pages.settings.notificationsPanel.category_heartbeat',
+    descriptionKey: 'pages.settings.notificationsPanel.category_heartbeat_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    id: 'notifications.sound-category-subagent',
+    labelKey: 'pages.settings.notificationsPanel.category_subagent',
+    descriptionKey: 'pages.settings.notificationsPanel.category_subagent_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    id: 'notifications.sound-category-taskrunner',
+    labelKey: 'pages.settings.notificationsPanel.category_taskrunner',
+    descriptionKey: 'pages.settings.notificationsPanel.category_taskrunner_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
   {
     // Playwright attach token: a credential field with Save/Clear semantics the
     // SettingsInput primitive has no shape for.

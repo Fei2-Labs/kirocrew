@@ -114,6 +114,30 @@ send time.
   pending synthesis, and the tag is merge-breaking so a nudge is never folded
   into a `[N queued messages merged]` user turn. At `_prompt_depth > 0` the ladder is disabled entirely (terminal
   notice on the first empty) to prevent nested-turn re-queue loops.
+- **Leaked tool-call notice** (dashboard chat runner, depth-0 turns only,
+  issue #6112): a turn that ends normally with an invoke block emitted as
+  TEXT and zero tool calls executed — the model wrote its invocation into the
+  prose channel instead of dispatching it (observed with deferred MCP tools
+  whose schema is not yet bound, and with large nested arguments) — surfaces
+  a visible notice card and is marked un-landed (no success recording, no
+  budget reset, no consolidation), so an unattended monitor/autonudge cycle
+  that leaked never lands silently. Detection is machine-shaped
+  (`chat_utils.has_leaked_tool_call`): an unquoted invoke open tag plus a
+  parameter or close tag, with fenced code blocks and inline code spans
+  stripped first so a pasted transcript or explained example never matches;
+  the gate (`should_notice_leaked_tool_call`) is claimed ahead of the
+  promise-only guard and excludes stage-execution turns (the orchestrator's
+  stage loop reads the turn result for stage accounting). Deliberately **notice-only** — no continuation is
+  queued, because an injected "re-issue that call" would carry runtime
+  authority into sessions where the call auto-approves (slot trust, global
+  yolo, or a static agent tool allowlist, the last invisible at the runner
+  layer, so no fail-closed downgrade condition exists) and the leaked block
+  may be untrusted external content the model merely reproduced. A loop loses
+  one cycle, visibly, and retries on its own schedule. Scope limit: the
+  notice/un-landing applies only to ZERO-tool-call turns — a mixed turn that
+  executed tools and then leaked its final dispatch as text lands normally
+  (un-landing a turn whose earlier calls had real side effects would
+  misdescribe it) and is logged at WARNING as a diagnostic instead.
 - **Context compaction**: at ≥ configured threshold (`session.autocompact_pct`, default 70%, valid 5–90), compacts **in place** on both
   backends: kiro-cli via a `/compact` **prompt** (`session/prompt` +
   `_kiro.dev/compaction/status` watch — never the string form of
@@ -571,7 +595,11 @@ when that exists, so a thread active across the migration keeps one log file.
 opens a DM thread, links the session, and posts the last 5 messages as context.
 
 **Dashboard state:** `ChatSlot.summary()` includes `slack_linked: bool` so
-the frontend can show a link indicator.
+the frontend can show a link indicator. `_ChatSlot.task` publishes ownership through a
+property that increments `_turn_generation` for every new non-null task. The counter is
+process-local and monotonic for the slot lifetime; unlike `task`, normal turn teardown
+does not clear it, so code spanning an await can detect a turn that started and finished
+inside that interval.
 
 **Slash commands** (`slack/events.py`):
 - `/kirocrew sessions` — lists active sessions with Slack link status
@@ -911,7 +939,7 @@ Security properties (enforced in `session_directive.decode` plus the applier):
 - **Native sub-agent calls refused**: they surface as flat events in the parent loop but have no independently bindable slot, so the applier declines them.
 - **SEL audit on every application**: `apply_session_directive` emits a tool-invocation event tagged `source="mcp-directive"` with outcome `success` / `denied` (e.g. a `set_project` sensitive-path block) / `error`, since the effect now runs in the consumer rather than in the tool body or an HTTP endpoint.
 
-The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions").
+The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions"). `set_project` additionally requires structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing. Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
 
 Gateway-off (the default topology this targets), the model's tool result is the tool's OWN returned line delivered over kiro-cli's MCP pipe; the applier's confirmation string and SEL audit are recorded on KiroCrew's own surfaces (transcript / WS / hooks) and do NOT rewrite the model's tool result. Each tool therefore phrases its own message as a *request* that the consumer applies (and may refuse — no interactive session, invalid/sensitive path, capped/paused loop) rather than asserting the effect already landed.
 

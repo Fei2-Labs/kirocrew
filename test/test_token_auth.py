@@ -204,6 +204,41 @@ def test_session_exp_still_valid_after_link_window() -> None:
     assert uid == "user6b"
 
 
+def test_link_window_never_outlives_a_short_session() -> None:
+    """The link-click window clamps to the session TTL, never exceeds it.
+
+    The query-param path validates against ``exp`` alone (the nonce set is
+    membership-only), so an uncapped 5-minute window would let the raw link
+    keep authenticating after ``session_exp`` passed. A token whose session
+    lifetime was capped by its caller's own bounds (the mobile-link and
+    tailnet-QR mints lend the caller's remaining lifetime) would then outlive
+    the session that authorized it by up to the full window — the residual
+    half of the laundering those mints exist to prevent.
+    """
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        token = generate_token("user6c", ttl_seconds=60)
+    # Past the short session but still inside the nominal 5-minute window:
+    # the LINK path must refuse too, not just the cookie path.
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0 + 61
+        link_valid, _, link_reason = validate_token(token)
+        cookie_valid, _, _ = validate_token(token, use_session_exp=True)
+    assert link_valid is False
+    assert "expired" in link_reason
+    assert cookie_valid is False
+    # A full-length session keeps the whole window: the clamp only ever
+    # tightens, so ordinary links are unaffected.
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        long_token = generate_token("user6d", ttl_seconds=3600)
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0 + 299
+        valid, uid, _ = validate_token(long_token)
+    assert valid is True
+    assert uid == "user6d"
+
+
 def test_tampered_token_rejected() -> None:
     token = generate_token("user7")
     tampered = token[:-1] + ("A" if token[-1] != "A" else "B")
@@ -319,6 +354,32 @@ async def test_embed_parent_port_claim_survives_session_exchange() -> None:
     # (server._extra_frame_ancestors) sees it even though the link token is now
     # revoked (PR #129 follow-up — the first-hit blank-pane fix).
     req.__setitem__.assert_any_call("embed_parent_port", "5476")
+
+
+@pytest.mark.asyncio
+async def test_no_refresh_claim_survives_session_exchange() -> None:
+    """The ``no_refresh`` bound must survive the link→cookie exchange like
+    ``boot`` does. The exchange already honors it by never minting the refresh
+    chain, but a downstream consumer that reads the SESSION cookie to learn the
+    caller's bounds (the mobile-link mint) would otherwise see an unbounded
+    session and re-mint an unbounded, refresh-chained credential — laundering
+    the exact ceiling the claim encodes."""
+    import json as _json
+
+    from kiro_crew.dashboard.token_auth import _b64url_decode
+
+    mw = token_auth_middleware()
+    token = generate_token("qruser", ttl_seconds=300, extra={"no_refresh": "1"})
+    req = _make_request(query={"token": token}, remote="10.0.0.1")
+
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+
+    cookie_header = resp.cookies.get("mc_token_5476")
+    assert cookie_header is not None
+    assert cookie_header.value != token
+    claims = _json.loads(_b64url_decode(cookie_header.value.split(".", 1)[0]))
+    assert claims["no_refresh"] == "1"
 
 
 # -- Property 7: Cookie not re-set when already matching --
@@ -1422,6 +1483,8 @@ async def test_non_api_path_gets_html_403() -> None:
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
     assert resp.content_type == "text/html"
+    assert b"Settings \xe2\x86\x92 Security \xe2\x86\x92 Sign in on mobile" in resp.body
+    assert b"kirocrew token" in resp.body
 
 
 # -- Property 12b: SPA shell is public so the app can cold-start refresh --

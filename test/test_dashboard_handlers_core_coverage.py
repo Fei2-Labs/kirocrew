@@ -19,6 +19,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -500,7 +501,14 @@ class TestAl2023Detection:
 
 
 class TestFindSuitablePython:
-    """The reject predicate must SKIP an unusable interpreter, never abort."""
+    """The reject predicate must SKIP an unusable interpreter, never abort.
+
+    Since #5535 both probes run through ``dep_sync._probe_interpreter`` so the
+    verdict describes the CANDIDATE interpreter, never the gateway's
+    environment. The decoy tests run a real child against ``sys.executable``
+    to prove the two attack routes (an inherited ``PYTHONPATH``, and ``-m``'s
+    import-and-execute of a planted ``pip``) stay closed.
+    """
 
     @staticmethod
     def _capture(monkeypatch):
@@ -514,29 +522,38 @@ class TestFindSuitablePython:
         assert core_mod._find_suitable_python() == "/usr/bin/python3"
         return captured["reject"]
 
+    @staticmethod
+    def _fake_probe(monkeypatch, version_rc=0, version_out="3.12.1 (main)", pip_rc=0):
+        """Stub ``dep_sync._probe_interpreter``: find_spec code = pip probe."""
+
+        def _fake(_py, code, timeout=None):
+            assert timeout == 5, "each probe must keep the 5s bound"
+            if "find_spec" in code:
+                return SimpleNamespace(returncode=pip_rc, stdout="", stderr="")
+            return SimpleNamespace(returncode=version_rc, stdout=version_out, stderr="")
+
+        monkeypatch.setattr(core_mod.dep_sync, "_probe_interpreter", _fake)
+
     def test_free_threaded_build_is_rejected(self, monkeypatch) -> None:
         reject = self._capture(monkeypatch)
-        monkeypatch.setattr(
-            subprocess,
-            "check_output",
-            lambda *a, **k: "3.14.0 free-threading build",
-        )
+        self._fake_probe(monkeypatch, version_out="3.14.0 free-threading build")
         assert reject("/usr/bin/python3.14t") is True
 
     def test_interpreter_with_pip_is_accepted(self, monkeypatch) -> None:
         reject = self._capture(monkeypatch)
-        monkeypatch.setattr(subprocess, "check_output", lambda *a, **k: "3.12.1 (main)")
+        self._fake_probe(monkeypatch)
         assert reject("/usr/bin/python3.12") is False
 
     def test_missing_pip_is_rejected(self, monkeypatch) -> None:
         reject = self._capture(monkeypatch)
+        self._fake_probe(monkeypatch, pip_rc=1)
+        assert reject("/usr/bin/python3.12") is True
 
-        def _fake(args, **_k):
-            if "pip" in args:
-                raise subprocess.CalledProcessError(1, args)
-            return "3.12.1 (main)"
-
-        monkeypatch.setattr(subprocess, "check_output", _fake)
+    def test_failed_version_probe_is_rejected(self, monkeypatch) -> None:
+        """_probe_interpreter reports failure via returncode, not an exception:
+        an implicit fall-through would hand the installer a broken target."""
+        reject = self._capture(monkeypatch)
+        self._fake_probe(monkeypatch, version_rc=1, version_out="")
         assert reject("/usr/bin/python3.12") is True
 
     def test_unspawnable_interpreter_is_rejected(self, monkeypatch) -> None:
@@ -544,8 +561,88 @@ class TestFindSuitablePython:
             raise OSError("exec format error")
 
         reject = self._capture(monkeypatch)
-        monkeypatch.setattr(subprocess, "check_output", _boom)
+        monkeypatch.setattr(core_mod.dep_sync, "_probe_interpreter", _boom)
         assert reject("/usr/bin/broken") is True
+
+    def test_hung_probe_is_rejected(self, monkeypatch) -> None:
+        def _hang(*_a, **_k):
+            raise subprocess.TimeoutExpired(cmd="python", timeout=5)
+
+        reject = self._capture(monkeypatch)
+        monkeypatch.setattr(core_mod.dep_sync, "_probe_interpreter", _hang)
+        assert reject("/usr/bin/python3.12") is True
+
+    def test_both_probes_run_isolated_bounded_and_without_dash_m(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Structural pin on the child argv: ``-I`` (no PYTHONPATH / user-site /
+        CWD entry), the 5s bound, a neutral cwd — and never ``-m``, whose
+        import-and-execute is the half of #5535 that runs planted code."""
+        target = tmp_path / "bin" / "python3"
+        target.parent.mkdir(parents=True)
+        seen = []
+
+        def _fake_run(cmd, **kwargs):
+            seen.append((cmd, kwargs))
+            return SimpleNamespace(returncode=0, stdout="3.12.1 (main)", stderr="")
+
+        reject = self._capture(monkeypatch)
+        monkeypatch.setattr(core_mod.dep_sync.subprocess, "run", _fake_run)
+        assert reject(str(target)) is False
+        assert len(seen) == 2, "version probe + pip probe"
+        for cmd, kwargs in seen:
+            assert cmd[0] == str(target)
+            assert cmd[1] == "-I", "probe must run the interpreter isolated"
+            assert "-m" not in cmd, "-m imports and executes; probes must use -c"
+            assert kwargs.get("timeout") == 5, "the per-probe 5s bound must survive"
+            assert kwargs.get("cwd") == target.parent, "probe needs a neutral cwd"
+            assert "env" not in kwargs, "-I owns isolation; no env forwarding"
+
+    def test_a_sitecustomize_decoy_on_pythonpath_cannot_forge_free_threading(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A ``sitecustomize.py`` on the caller's PYTHONPATH edits ``sys.version``
+        in every unisolated child — vetoing all candidates (Whisper reported
+        unavailable) or waving a genuinely free-threaded build through as the
+        install target. ``-I`` drops PYTHONPATH, so the verdict must not move."""
+        decoy = tmp_path / "decoy-path"
+        decoy.mkdir()
+        (decoy / "sitecustomize.py").write_text(
+            "import sys; sys.version += ' free-threading build'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        reject = self._capture(monkeypatch)
+
+        # sys.executable (this test venv) has pip and is not free-threaded:
+        # the decoy must not flip its verdict to "unusable".
+        assert reject(sys.executable) is False
+
+    def test_a_decoy_pip_package_neither_executes_nor_forges_the_verdict(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """``-m pip`` IMPORTS AND EXECUTES the ``pip`` the child resolves, so a
+        decoy package on the caller's PYTHONPATH both runs planted code in the
+        probe child and answers "pip present/absent" regardless of reality.
+        The fixed probe asks ``find_spec`` under ``-I``: the decoy must never
+        run (no canary file) and must not flip the verdict (this interpreter's
+        real pip still wins)."""
+        decoy = tmp_path / "decoy-path"
+        canary = tmp_path / "canary"
+        pkg = decoy / "pip"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text(
+            f"import pathlib, sys\n"
+            f"pathlib.Path({str(canary)!r}).write_text('ran', encoding='utf-8')\n"
+            f"sys.exit(1)\n",
+            encoding="utf-8",
+        )
+        (pkg / "__main__.py").write_text("", encoding="utf-8")
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        reject = self._capture(monkeypatch)
+
+        assert reject(sys.executable) is False
+        assert not canary.exists(), "decoy pip must never be imported or executed"
 
 
 class TestInstallScript:
@@ -657,7 +754,12 @@ class TestSttConfigEndpoint:
         # Streaming capability is served from the backend's own set so the
         # Settings UI gates on a CAPABILITY rather than a provider name.
         assert body["streaming_providers"] == ["transcribe", "apple"]
-        assert body["models"] == {"turbo": "~1.6 GB"}
+        # Tracks _STT_MODEL_SIZES (the PUT allowlist) rather than pinning one
+        # literal: the faster-whisper work widened the enum from `turbo` alone
+        # to the full Whisper size ladder, and a test pinned to yesterday's
+        # ladder fails on every legitimate widening.
+        assert body["models"] == core_mod._STT_MODEL_SIZES
+        assert "turbo" in body["models"]
         assert body["language_codes"][0] == "en-US"
         assert body["available"] is False
         assert body["prereqs"] == []
@@ -672,6 +774,21 @@ class TestSttConfigEndpoint:
         # Served independently of `available` so the UI can flag the .webm
         # remux gap even when the provider reads ready.
         assert isinstance(body["ffmpeg_missing"], bool)
+
+    @pytest.mark.asyncio
+    async def test_get_serves_faster_unsupported_for_pre_click_gating(self, monkeypatch):
+        """Mirrors `transcribe_unsupported`. Without this the Settings card can only
+        learn the platform is unsupported by pressing Install and reading a 400 — the
+        same dead end on every press, which is the failure this flag removes."""
+        monkeypatch.setattr(core_mod.platform_compat, "is_windows_on_arm", lambda: True)
+        resp = await core_mod.api_stt_config(_req())
+        assert json.loads(resp.body)["faster_unsupported"] is True
+
+    @pytest.mark.asyncio
+    async def test_get_reports_faster_supported_elsewhere(self, monkeypatch):
+        monkeypatch.setattr(core_mod.platform_compat, "is_windows_on_arm", lambda: False)
+        resp = await core_mod.api_stt_config(_req())
+        assert json.loads(resp.body)["faster_unsupported"] is False
 
 
 # ── STT install endpoint ────────────────────────────────────────────────
@@ -765,6 +882,130 @@ class TestSttInstall:
         assert "boom" in body["error"]
         assert core_mod._stt_install_status["step"] == "error"
         assert fake_sel.log_api_access.call_args.kwargs["outcome"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_faster_is_refused_on_windows_on_arm(self, monkeypatch, fake_sel, stt_status):
+        """No CTranslate2 wheel exists for win-arm64 and there is no sdist either, so
+        pip fails while RESOLVING — naming a package the user never asked for. Refuse
+        up front with the alternatives instead of letting every press repeat it."""
+        core_mod._stt_install_status = {"step": "idle", "detail": "", "error": ""}
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"stt": {"provider": "faster"}}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        monkeypatch.setattr(core_mod.platform_compat, "is_windows_on_arm", lambda: True)
+        resp = await core_mod.api_stt_install(_req())
+        assert resp.status == 400
+        body = json.loads(resp.body)
+        assert body["code"] == "stt_unsupported_platform"
+        # The alternatives are the whole point — a bare refusal leaves the user stuck.
+        assert "whisper" in body["error"] and "transcribe" in body["error"]
+        # Must not strand the status machine in `starting`, or the 409 gate deadlocks.
+        assert core_mod._stt_install_status["step"] == "idle"
+        assert fake_sel.log_api_access.call_args.kwargs["outcome"] == "denied"
+
+    @pytest.mark.asyncio
+    async def test_windows_arm_refusal_never_spawns_the_shell(
+        self, monkeypatch, fake_sel, stt_status
+    ):
+        """The refusal has to be SERVER-SIDE, not a guard inside the generated script.
+
+        ``api_stt_install`` launches the script through ``bash -c``, which does not
+        exist on a stock native-Windows gateway — the run would die with
+        FileNotFoundError before executing a line. An in-script guard would therefore
+        be unreachable on precisely the platform it exists for, so assert no spawn is
+        even attempted.
+        """
+        core_mod._stt_install_status = {"step": "idle", "detail": "", "error": ""}
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"stt": {"provider": "faster"}}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        monkeypatch.setattr(core_mod.platform_compat, "is_windows_on_arm", lambda: True)
+        spawned = []
+
+        async def _spawn(*a, **_k):
+            spawned.append(a)
+            return _proc([b"Done.\n"])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        resp = await core_mod.api_stt_install(_req())
+        assert resp.status == 400
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_platform_refusal_precedes_the_pip_channel_check(
+        self, monkeypatch, fake_sel, stt_status
+    ):
+        """Ordering is load-bearing: on win-arm a healthy pip channel would pass the
+        sibling gate and let the install proceed to a guaranteed failure. The
+        platform verdict must win, and its message is also the more actionable one."""
+        core_mod._stt_install_status = {"step": "idle", "detail": "", "error": ""}
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"stt": {"provider": "faster"}}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        monkeypatch.setattr(core_mod.platform_compat, "is_windows_on_arm", lambda: True)
+        # A working channel: without correct ordering this would fall through.
+        monkeypatch.setattr(core_mod, "_pip_install_channel_available", lambda: True)
+        resp = await core_mod.api_stt_install(_req())
+        assert json.loads(resp.body)["code"] == "stt_unsupported_platform"
+
+    @pytest.mark.asyncio
+    async def test_other_providers_are_unaffected_on_windows_on_arm(
+        self, monkeypatch, fake_sel, stt_status
+    ):
+        """The gate is scoped to `faster`. `whisper` has no CTranslate2 dependency, so
+        refusing it on win-arm would break a provider that works."""
+        core_mod._stt_install_status = {"step": "idle", "detail": "", "error": ""}
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"stt": {"provider": "whisper"}}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        monkeypatch.setattr(core_mod.platform_compat, "is_windows_on_arm", lambda: True)
+
+        async def _spawn(*_a, **_k):
+            return _proc([b"Done.\n"])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        resp = await core_mod.api_stt_install(_req())
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_faster_install_proceeds_on_a_supported_platform(
+        self, monkeypatch, fake_sel, stt_status
+    ):
+        core_mod._stt_install_status = {"step": "idle", "detail": "", "error": ""}
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"stt": {"provider": "faster"}}) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        monkeypatch.setattr(core_mod.platform_compat, "is_windows_on_arm", lambda: False)
+        monkeypatch.setattr(core_mod, "_pip_install_channel_available", lambda: True)
+        monkeypatch.setattr(core_mod, "_faster_whisper_model", lambda: object())
+
+        async def _spawn(*_a, **_k):
+            return _proc([b"Installing faster-whisper\n", b"Done.\n"])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+        resp = await core_mod.api_stt_install(_req())
+        assert resp.status == 200
+        assert core_mod._stt_install_status["step"] == "done"
 
     @pytest.mark.asyncio
     async def test_install_timeout_kills_the_child(self, monkeypatch, fake_sel, stt_status) -> None:

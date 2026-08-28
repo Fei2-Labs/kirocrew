@@ -177,6 +177,11 @@ const PRIMITIVE_MAP: Record<string, SettingPrimitiveType> = {
 
 const PRIMITIVES = Object.keys(PRIMITIVE_MAP)
 
+/** The extractable tag names, exported (like PANEL_TAB_MAP) for the coverage
+ *  gate: a hand-copied list there would silently miss a ninth primitive added
+ *  here — the exact drift class the gate exists to catch. */
+export const EXTRACTABLE_PRIMITIVE_TAGS: readonly string[] = PRIMITIVES
+
 /** Convert a label to a kebab-case id segment. */
 function toKebab(s: string): string {
   return s

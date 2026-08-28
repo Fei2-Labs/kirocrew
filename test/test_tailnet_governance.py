@@ -121,9 +121,7 @@ class TestGovernancePin:
         _install_policy(monkeypatch, _PIN_DOC)
         assert tailnet.is_governance_pinned_off() is True
 
-    def test_a_transient_profile_race_is_not_an_admin_pin(
-        self, isolated_home, monkeypatch
-    ) -> None:
+    def test_a_transient_profile_race_is_not_an_admin_pin(self, isolated_home, monkeypatch) -> None:
         """A deny-all PROFILE on an UNGOVERNED host must not read as a policy pin.
 
         ``resolve_active_scope`` hands back a synthetic ``_deny_all_unloaded:…``
@@ -532,6 +530,17 @@ class TestBothStartupSitesStash:
         keys = self._app_keys_assigned(self._func(startup))
         assert "tailnet_host" in keys, f"{startup} must stash the startup-resolved host"
         assert "tailnet_resolved_at" in keys, f"{startup} must stash the resolution timestamp"
+
+    @pytest.mark.parametrize("startup", ["start_dashboard", "start_api_server"])
+    def test_startup_site_installs_runtime_recovery(self, startup) -> None:
+        calls = [
+            node
+            for node in ast.walk(self._func(startup))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "install_tailnet_origin_recovery"
+        ]
+        assert len(calls) == 1, f"{startup} must install one tailnet recovery lifecycle"
 
     def test_the_route_is_registered(self) -> None:
         from kiro_crew.dashboard import handlers

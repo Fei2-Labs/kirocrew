@@ -20,7 +20,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
 
 from kiro_crew.acp.liveness import (
     VERDICT_DEAD,
@@ -58,6 +58,7 @@ from kiro_crew.context_management import (
     evict_completed_agents,
 )
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+from kiro_crew.effort import effort_settings_key, model_supports_effort
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.hooks import (
     HOOK_EVENT_POST_TOOL_USE,
@@ -550,6 +551,87 @@ def _subagent_default_effort() -> str:
         return ""
 
 
+def _spawn_effective_model(model: str, agent: str) -> str:
+    """The model the provider factory's effort gate will actually see, or ``""``.
+
+    Not a re-encoding of the factory's precedence — the selection itself is
+    :meth:`KiroCrewConfig.acp_effective_model`, the same function the factory
+    calls, so this verdict cannot drift from the gate it reports on. What this
+    wrapper reproduces is only the CALLER side of the chain, exactly as the
+    spawn path drives ``get_or_create``: the kwarg the spawn passes (explicit
+    per-spawn *model*, else the subagent role pin — see ``_run_inner``, which
+    forwards raw ``info.model`` including an explicit ``"auto"``), and, when no
+    kwarg is passed, ``session._session_model`` for *agent* (a crew's own pin,
+    else non-sentinel global; ``None`` for a named kiro agent so the factory
+    resolves the agent's own JSON pin — which ``acp_effective_model`` then
+    does, identically). Never raises; ``""`` on any resolution failure.
+    """
+    try:
+        # circular imports (config.loader / session import sibling modules at
+        # load time, matching the lazy-import convention of _subagent_default_*)
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.session import _session_model
+
+        # The kwarg the spawn path actually passes (see _run_inner): raw
+        # info.model — an explicit "auto" flows through VERBATIM and the
+        # factory treats it as a truthy override — else the role pin.
+        override: str | None = model or _subagent_default_model() or None
+        cfg = KiroCrewConfig.load()
+        if override is None:
+            # No kwarg: get_or_create resolves the session chain and passes
+            # its result (possibly None) as model_override.
+            override = _session_model(cfg, agent or None)
+        return cfg.acp_effective_model(agent or None, override) or ""
+    except Exception:
+        return ""
+
+
+def effort_drop_reason(model: str, reasoning_effort: str, agent: str = "") -> str:
+    """Why a requested per-spawn effort will not take effect, or ``""``.
+
+    Mirrors the model resolution the provider factory's effort gate actually
+    sees (explicit per-spawn model, else the subagent role pin, else the
+    session-level chain for *agent*: crew pin, else non-sentinel global) — an
+    unresolved model (the provider picks a served one, or a named kiro agent's
+    own pin resolves downstream) cannot carry an effort level through the
+    overlay. Returns a human-readable reason when *reasoning_effort* is set
+    but the resolved model is not effort-capable; ``""`` means the effort will
+    be delivered (or none was requested). Reporting-only: never raises and
+    never influences whether or how a spawn proceeds.
+    """
+    if not reasoning_effort:
+        return ""
+    resolved = _spawn_effective_model(model, agent)
+    if not resolved:
+        return (
+            "no concrete model is pinned — the model resolves to 'auto', which "
+            "does not support effort configuration; pass an effort-capable "
+            "model= to apply the level"
+        )
+    if not model_supports_effort(resolved):
+        return f"model '{resolved}' does not support effort configuration"
+    return ""
+
+
+def effort_applied_note(model: str, reasoning_effort: str, agent: str = "") -> str:
+    """The delivery mirror of :func:`effort_drop_reason`, or ``""``.
+
+    Names the resolved model and the family-specific cli.json settings key the
+    level is delivered under (``reasoning`` for GPT, ``output_config`` for
+    Claude) when a requested per-spawn effort WILL take effect. The key matters
+    because kiro-cli silently ignores a level written under the wrong family
+    key, so a bare "applied" would leave that failure mode unobservable.
+    Complementary with the drop reason over a non-empty request: exactly one of
+    the two is non-empty. Reporting-only, same totality contract.
+    """
+    if not reasoning_effort:
+        return ""
+    resolved = _spawn_effective_model(model, agent)
+    if not resolved or not model_supports_effort(resolved):
+        return ""
+    return f"{resolved} → {effort_settings_key(resolved)}.effort"
+
+
 _STALL_IDLE_SECS = (
     120  # seconds with no stream activity before a running subagent is surfaced as "stalled"
 )
@@ -658,10 +740,13 @@ def check_memory_available(min_gb: float = 4.0, path: str = "/proc/meminfo") -> 
     return (True, -1.0)
 
 
-# Process-subtree RSS readers (relocated from the upstream mcp_gateway pool,
+# Process-subtree readers (relocated from the upstream mcp_gateway pool,
 # which is absent in this fork). Pure-stdlib /proc walkers: on non-Linux hosts
 # every /proc access raises OSError and these degrade to -1 / [] gracefully.
-_RSS_SUBTREE_MAX_PROCS = 256
+# ONE ceiling for every reading. RSS, CPU and the two counts used to be three
+# walks carrying two copies of the same 256, which is how they could have
+# drifted apart.
+_SUBTREE_MAX_PROCS = 256
 
 
 def _single_proc_rss_kb(pid: int) -> int:
@@ -697,80 +782,123 @@ def _proc_children(pid: int) -> list[int]:
     return kids
 
 
-def _proc_rss_kb(pid: Optional[int]) -> int:
-    """Resident set size (KiB) for ``pid`` **and all its descendants**.
+def _parse_cpu_jiffies(stat: bytes) -> int:
+    """Sum utime+stime (clock ticks) from raw ``/proc/<pid>/stat`` bytes.
+
+    Splits after the final ``)`` so a ``comm`` containing spaces/parens is
+    handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
+    post-comm tokens. Returns 0 on any parse error.
+    """
+    try:
+        rparen = stat.rindex(b")")
+        fields = stat[rparen + 2 :].split()
+        return int(fields[11]) + int(fields[12])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _proc_cpu_jiffies(pid: int) -> int:
+    """utime+stime (clock ticks) for a single pid, 0 on error."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return _parse_cpu_jiffies(fh.read())
+    except OSError:
+        return 0
+
+
+class _SubtreeSample(NamedTuple):
+    """Every subtree reading the cost sweep needs, from ONE walk.
+
+    Each field keeps the sentinel its own reader had, because the four readings
+    are unmeasurable in different ways and collapsing any of them into zero is
+    the bug class the count columns were added to fix:
+
+    * ``rss_kb`` — summed KiB, or ``-1`` when the root pid's own status is
+      unreadable (it is gone, or the host has no ``/proc``).
+    * ``jiffies`` — summed utime+stime clock ticks; an unreadable pid
+      contributes 0, since a *delta* of jiffies is what the caller consumes.
+    * ``procs`` / ``stubs`` — how many processes a runtime carries, and how many
+      of them are MCP stubs, matched on ``STUB_MODULE``, the module path the
+      rewriter itself puts on the stub launch line. ``None`` means UNMEASURABLE,
+      never zero. Rendering "0 processes" for a live runtime would be a lie; the
+      surface renders ``None`` as an em dash instead.
+    """
+
+    rss_kb: int
+    jiffies: int
+    procs: Optional[int]
+    stubs: Optional[int]
+
+
+def _proc_subtree_sample(
+    pid: Optional[int],
+    *,
+    rss: bool = True,
+    counts: bool = True,
+) -> _SubtreeSample:
+    """Walk ``pid``'s process subtree ONCE and return every reading from it.
 
     A subagent's kiro-cli process is frequently a thin launcher whose real
-    memory lives in a child process. Counting only ``pid``'s own ``VmRSS``
-    under-reports the true footprint, so we sum the whole subtree.
+    memory lives in a child process, so all four readings describe the whole
+    subtree rather than the root pid alone.
 
-    Returns -1 if ``pid`` is falsy or its own status cannot be read; otherwise
-    the summed KiB (descendants that vanish mid-walk are simply skipped, so the
-    result degrades gracefully to parent-only when ``children`` is unreadable).
+    The point of one pass is not only the ~3x fewer ``/proc`` reads: the three
+    readers this replaced ran at three different instants, so a process that
+    exited between them was counted by one and missed by another. Reading every
+    metric off a single frontier is what makes "the same set of processes" true
+    of the *result* and not merely of the walk rules.
+
+    ``rss`` / ``counts`` let a caller that only needs the CPU total skip those
+    per-process reads, so it costs what it cost before this walk was shared.
+    Skipped metrics come back as their own unmeasurable sentinel.
+
+    Blocking: reads a handful of ``/proc`` entries per process in the subtree,
+    so it belongs on an executor thread, never on the event loop (see
+    ``_reaper_loop`` -> ``_sample_live_costs``).
     """
     if not pid:
-        return -1
-    own = _single_proc_rss_kb(pid)
-    if own < 0:
-        return -1
-    total = own
-    seen = {pid}
-    frontier = [pid]
-    while frontier and len(seen) < _RSS_SUBTREE_MAX_PROCS:
-        nxt: list[int] = []
-        for parent in frontier:
-            for child in _proc_children(parent):
-                if child in seen:
-                    continue
-                seen.add(child)
-                kb = _single_proc_rss_kb(child)
-                if kb > 0:
-                    total += kb
-                nxt.append(child)
-        frontier = nxt
-    return total
-
-
-def _proc_subtree_counts(pid: Optional[int]) -> tuple[Optional[int], Optional[int]]:
-    """``(processes, mcp_stubs)`` in ``pid``'s subtree, or ``(None, None)``.
-
-    The companion to :func:`_proc_rss_kb` for the two count columns of the
-    Sessions surface: how many processes a runtime carries, and how many of them
-    are MCP stubs — matched on ``STUB_MODULE``, the module path the rewriter
-    itself puts on the stub launch line.
-
-    ``None`` means UNMEASURABLE, never zero. A host without ``/proc`` cannot walk
-    a subtree at all, and rendering that as "0 processes" for a live runtime
-    would be a lie — the surface renders ``None`` as an em dash instead.
-
-    Walk order, depth and the ``_RSS_SUBTREE_MAX_PROCS`` ceiling mirror
-    ``_proc_rss_kb`` so both readings describe the same set of processes.
-
-    Blocking: reads one ``/proc`` entry per process in the subtree, so it belongs
-    on an executor thread, never on the event loop (see ``_reaper_loop``).
-    """
-    if not pid or not platform_compat.IS_LINUX:
-        return (None, None)
-    if _single_proc_rss_kb(pid) < 0:
-        return (None, None)  # pid gone or /proc unreadable: nothing to attribute
+        return _SubtreeSample(-1, 0, None, None)
+    # The counts share RSS's liveness probe: a root pid whose own status cannot
+    # be read has nothing to attribute, so there is nothing to count either.
+    own_rss = _single_proc_rss_kb(pid) if (rss or counts) else -1
+    countable = counts and platform_compat.IS_LINUX and own_rss >= 0
+    rss_total = own_rss if (rss and own_rss >= 0) else -1
     needles = (STUB_MODULE,)
+    jiffies = _proc_cpu_jiffies(pid)
     procs = 1
-    stubs = 1 if platform_compat.process_matches(pid, needles) else 0
+    stubs = 1 if countable and platform_compat.process_matches(pid, needles) else 0
     seen = {pid}
     frontier = [pid]
-    while frontier and len(seen) < _RSS_SUBTREE_MAX_PROCS:
+    while frontier and len(seen) < _SUBTREE_MAX_PROCS:
         nxt: list[int] = []
         for parent in frontier:
             for child in _proc_children(parent):
                 if child in seen:
                     continue
                 seen.add(child)
-                procs += 1
-                if platform_compat.process_matches(child, needles):
-                    stubs += 1
+                if rss_total >= 0:
+                    kb = _single_proc_rss_kb(child)
+                    if kb > 0:
+                        rss_total += kb
+                jiffies += _proc_cpu_jiffies(child)
+                if countable:
+                    procs += 1
+                    if platform_compat.process_matches(child, needles):
+                        stubs += 1
                 nxt.append(child)
         frontier = nxt
-    return (procs, stubs)
+    if not countable:
+        return _SubtreeSample(rss_total, jiffies, None, None)
+    return _SubtreeSample(rss_total, jiffies, procs, stubs)
+
+
+def _subtree_cpu_jiffies(pid: int) -> int:
+    """Sum utime+stime across ``pid`` and its descendants (clock ticks).
+
+    Thin wrapper over :func:`_proc_subtree_sample`, so the CPU subtree the
+    Sessions session rows read is the same subtree the task rows describe.
+    """
+    return _proc_subtree_sample(pid, rss=False, counts=False).jiffies
 
 
 def _attributed_count(total: Optional[int], sharers: int, previous: Optional[int]) -> Optional[int]:
@@ -1029,53 +1157,6 @@ def resolve_max_subagents(cfg: KiroCrewConfig) -> int:
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-_CPU_SUBTREE_MAX_PROCS = 256
-
-
-def _parse_cpu_jiffies(stat: bytes) -> int:
-    """Sum utime+stime (clock ticks) from raw ``/proc/<pid>/stat`` bytes.
-
-    Splits after the final ``)`` so a ``comm`` containing spaces/parens is
-    handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
-    post-comm tokens. Returns 0 on any parse error.
-    """
-    try:
-        rparen = stat.rindex(b")")
-        fields = stat[rparen + 2 :].split()
-        return int(fields[11]) + int(fields[12])
-    except (ValueError, IndexError):
-        return 0
-
-
-def _proc_cpu_jiffies(pid: int) -> int:
-    """utime+stime (clock ticks) for a single pid, 0 on error."""
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as fh:
-            return _parse_cpu_jiffies(fh.read())
-    except OSError:
-        return 0
-
-
-def _subtree_cpu_jiffies(pid: int) -> int:
-    """Sum utime+stime across ``pid`` and its descendants (clock ticks).
-
-    Walks the same kernel children list as ``pool._proc_rss_kb`` so the CPU
-    subtree matches the RSS subtree.
-    """
-    total = _proc_cpu_jiffies(pid)
-    seen = {pid}
-    frontier = [pid]
-    while frontier and len(seen) < _CPU_SUBTREE_MAX_PROCS:
-        nxt: list[int] = []
-        for parent in frontier:
-            for child in _proc_children(parent):
-                if child in seen:
-                    continue
-                seen.add(child)
-                total += _proc_cpu_jiffies(child)
-                nxt.append(child)
-        frontier = nxt
-    return total
 
 
 def validate_cwd(cwd: str, allowed_roots: list[str]) -> tuple[str, str]:
@@ -1444,17 +1525,6 @@ class _TerminalCommitRejected(Exception):
 # Callback: (subagent_info) -> None
 AnnounceCallback = Callable[[SubagentInfo], Awaitable[None]]
 
-# Sentinel prefixes the spawn-rejection paths (empty task, memory guard,
-# admission policy, invalid cwd, governance, approval denial, missing approval
-# mechanism, app queue-capacity) write into ``SubagentInfo.error``; none of
-# them ever runs the agent. The injection-failure notice keys on them so a run
-# that was turned away reads as rejected instead of "finished". One rejection
-# cannot carry the prefix: the unknown-agent refusal's wording is
-# startswith-matched by ``mcp_tools.spawn._is_unknown_agent_refusal`` (and
-# pinned by its tests), so it keeps its own spelling and degrades to the
-# generic failure copy here — which stays truthful, just less specific.
-_SPAWN_REJECTION_PREFIXES: tuple[str, ...] = ("spawn rejected", "spawn refused")
-
 
 def _injection_notice_outcome(info: "SubagentInfo") -> str:
     """One-sentence outcome line for the injection-failure fallback notice.
@@ -1463,26 +1533,24 @@ def _injection_notice_outcome(info: "SubagentInfo") -> str:
     injected into the parent — for EVERY terminal state, not just successful
     completion. Asserting "finished" for a run that was stopped or rejected
     before it executed misdescribes the outcome, so the line branches on the
-    record's canonical :attr:`SubagentInfo.outcome` with two before-start
-    refinements: ``_exec_started`` (the marker ``_run_inner`` sets when
-    execution actually begins) distinguishes a stop that landed before the run
-    ever executed, and a rejection-sentinel ``error`` marks a spawn that was
-    turned away. The "no result to deliver" phrasings are guarded on the
-    absence of any output so they can never contradict the result-path
+    record's canonical :attr:`SubagentInfo.outcome` with one before-start
+    refinement per branch: ``_exec_started`` — the marker ``_run_inner`` sets
+    when execution actually begins — is ``None`` exactly when the run never
+    executed, which covers every spawn-rejection site (all of them construct
+    their record without it) with no wording contract between ``error``
+    strings and this notice. The "no result to deliver" phrasings are guarded
+    on the absence of any output so they can never contradict the result-path
     recovery hint. Pure function of the record, unit-tested per branch.
     """
+    never_ran = info._exec_started is None and not info.result and not info.result_path
     outcome = info.outcome
     if outcome == "stopped":
-        if info._exec_started is None and not info.result and not info.result_path:
+        if never_ran:
             return "The run was stopped before it started, so there is no result to deliver."
         return "The run was stopped before it completed."
     if outcome == "failed":
-        if (
-            info.error.startswith(_SPAWN_REJECTION_PREFIXES)
-            and not info.result
-            and not info.result_path
-        ):
-            return "The run was rejected before it started, so there is no result to deliver."
+        if never_ran:
+            return "The run failed before it started, so there is no result to deliver."
         return "The agent failed before a result could be delivered."
     return "The agent finished but result delivery timed out."
 
@@ -2136,24 +2204,22 @@ class SubagentManager:
                 logger.debug("on_orphan_dm raised", exc_info=True)
         logger.warning("Orphan notification (no delivery channel wired): %s", msg[:200])
 
-    def _live_shared_count(
-        self, pid: int | None, agents: "list[SubagentInfo] | None" = None
-    ) -> int:
+    def _live_shared_count(self, pid: int | None, agents: "list[SubagentInfo]") -> int:
         """Count live session-shared subagents sharing runtime *pid* (>= 1).
 
         Used to average the shared AcpRuntime's measured RSS/CPU across the
         sessions currently running inside it, so each shared subagent is charged
         an empirical per-session share rather than the whole process.
 
-        *agents* lets an off-loop caller pass the snapshot it already took, so the
-        count never iterates the live registry from a worker thread (see
-        ``_sample_live_costs``). Omitted, it reads the registry directly, which is
-        correct on the event loop.
+        *agents* is the registry snapshot the caller already took, and is
+        required: the sole caller runs on a worker thread (see
+        ``_sample_live_costs``), where iterating the live registry would raise
+        ``RuntimeError`` the moment the event loop registered or evicted an
+        agent. An on-loop caller passes ``list(self._agents.values())``.
         """
         if not pid:
             return 1
-        pool = agents if agents is not None else list(self._agents.values())
-        n = sum(1 for a in pool if not a.done and a._session_sharing and a._pid == pid)
+        n = sum(1 for a in agents if not a.done and a._session_sharing and a._pid == pid)
         return n if n > 0 else 1
 
     def _sample_live_costs(self) -> None:
@@ -2165,9 +2231,10 @@ class SubagentManager:
         seeds the CPU baseline (no delta yet). Best-effort: a dead/unreadable
         pid is simply skipped.
 
-        BLOCKING, and therefore off-loop: every live agent costs several ``/proc``
-        walks (RSS subtree, CPU jiffies, process+stub counts), so the caller
-        hands this to :func:`maintenance_executor` and the body must stay
+        BLOCKING, and therefore off-loop: every live agent costs ONE ``/proc``
+        subtree walk (:func:`_proc_subtree_sample`, which returns RSS, CPU
+        jiffies and the process/stub counts from a single frontier), so the
+        caller hands this to :func:`maintenance_executor` and the body must stay
         thread-safe. Concretely that means it takes ONE snapshot of the agent
         registry up front and derives everything, sharer counts included, from
         that list: iterating the live dict from a worker thread would raise
@@ -2187,44 +2254,23 @@ class SubagentManager:
             # by the number of concurrently-live shared sessions on that PID — an
             # empirical per-session average, not a guessed constant
             # (dynamic-subagent-sizing.md §session-sharing cost model).
-            if info._session_sharing:
-                shared_n = self._live_shared_count(pid_owner := info._pid, agents=agents)
-                rss_kb = _proc_rss_kb(pid_owner)
-                if rss_kb > 0 and shared_n > 0:
-                    gb = (rss_kb / (1024 * 1024)) / shared_n
-                    info.last_rss_gb = gb
-                    if gb > info.peak_rss_gb:
-                        info.peak_rss_gb = gb
-                procs, stubs = _proc_subtree_counts(pid_owner)
-                info.last_procs = _attributed_count(procs, shared_n, info.last_procs)
-                info.last_stubs = _attributed_count(stubs, shared_n, info.last_stubs)
-                jiffies = _subtree_cpu_jiffies(pid_owner)
-                if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev and shared_n > 0:
-                    dt = now - info._cpu_sample_ts
-                    if dt > 0:
-                        cores = ((jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)) / shared_n
-                        info.last_cpu_cores = cores
-                        if cores > info.peak_cpu_cores:
-                            info.peak_cpu_cores = cores
-                info._cpu_jiffies_prev = jiffies
-                info._cpu_sample_ts = now
-                continue
-            pid = info._pid
-            rss_kb = _proc_rss_kb(pid)
-            if rss_kb > 0:
-                gb = rss_kb / (1024 * 1024)
+            #
+            # Sole tenant of its own process: the subtree reading IS this run's,
+            # which is a share of one.
+            shared_n = self._live_shared_count(info._pid, agents) if info._session_sharing else 1
+            sample = _proc_subtree_sample(info._pid)
+            if sample.rss_kb > 0 and shared_n > 0:
+                gb = (sample.rss_kb / (1024 * 1024)) / shared_n
                 info.last_rss_gb = gb
                 if gb > info.peak_rss_gb:
                     info.peak_rss_gb = gb
-            procs, stubs = _proc_subtree_counts(pid)
-            # Sole tenant of its own process: the subtree reading IS this run's.
-            info.last_procs = _attributed_count(procs, 1, info.last_procs)
-            info.last_stubs = _attributed_count(stubs, 1, info.last_stubs)
-            jiffies = _subtree_cpu_jiffies(pid)
-            if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev:
+            info.last_procs = _attributed_count(sample.procs, shared_n, info.last_procs)
+            info.last_stubs = _attributed_count(sample.stubs, shared_n, info.last_stubs)
+            jiffies = sample.jiffies
+            if info._cpu_sample_ts > 0.0 and jiffies >= info._cpu_jiffies_prev and shared_n > 0:
                 dt = now - info._cpu_sample_ts
                 if dt > 0:
-                    cores = (jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)
+                    cores = ((jiffies - info._cpu_jiffies_prev) / (_CLK_TCK * dt)) / shared_n
                     info.last_cpu_cores = cores
                     if cores > info.peak_cpu_cores:
                         info.peak_cpu_cores = cores
@@ -3160,6 +3206,12 @@ class SubagentManager:
                 # CC/raw path has completed at least one turn, so its
                 # ``_resolved_model_id`` is populated (refreshed in ``_run``).
                 "model": info.resolved_model,
+                # Carry the requested pin on the terminal report too, redacted
+                # like the spawn frame: after a reconnect the completed card is
+                # rebuilt from this event alone, so without it the live-downgrade
+                # amber chip would silently vanish from a downgraded finished run
+                # (Opus/Design/First-Principles review on #5326).
+                "requested_model": _redact(info.requested_model),
                 "result": _done_result(info.result),
             },
         )
@@ -5770,11 +5822,24 @@ class SubagentManager:
     async def _settle_digest_holds(self, info: SubagentInfo) -> None:
         """Settle delivery tombstones for wave members whose injection was
         held for this member's digest. Called ONLY after ``_on_done`` returned
-        without raising — the digest has been handed off, so marking the held
-        members delivered no longer risks the restart-loss window
-        (settling at digest composition, before routing, would).
+        without raising — and it is a real settle only for the routes where
+        that return IS the confirmation. Both dashboard routes hand off
+        asynchronously, so they detach the ids before ``_on_done`` returns and
+        owe them to the parent's consumption instead (the queue branch via
+        ``_defer_queued_delivery``, the direct-injection branch via the same
+        slot ledger), leaving this a no-op there. Marking the held members
+        delivered no longer risks the restart-loss window here (settling at
+        digest composition, before routing, would).
+
+        The ids are taken off ``info`` BEFORE settling, so a re-entry cannot
+        write a second tombstone and a route that detached them first leaves
+        this a no-op.
+
+        A failing tombstone write is logged and skipped, never raised: one
+        unwritable run folder must not strand the rest of the chunk.
         """
-        for _hid in info._digest_settle_ids:
+        ids, info._digest_settle_ids = info._digest_settle_ids, []
+        for _hid in ids:
             context = self._delivery_context_for_run(_hid)
             if context is None or context.info.outcome == "completed":
                 try:
@@ -5782,7 +5847,6 @@ class SubagentManager:
                 except Exception:
                     logger.debug("Failed to settle held subagent %s", _hid, exc_info=True)
             await self._ack_delivery_for_run(_hid)
-        info._digest_settle_ids = []
 
     def get(self, agent_id: str) -> SubagentInfo | None:
         """Get agent info by ID."""
@@ -6696,6 +6760,28 @@ class SubagentManager:
         eff_effort = info.reasoning_effort or _subagent_default_effort()
         if eff_effort:
             extra_kwargs["reasoning_effort_override"] = eff_effort
+        if eff_effort:
+            # Judge the drop warning on the same model the factory's effort
+            # gate will see: the kwarg when pinned, else what the session layer
+            # resolves for this agent (crew pin, else non-sentinel global).
+            # Off the loop — the resolver reads config and ~/.kiro/agents, the
+            # same reason get_or_create runs _session_model in an executor.
+            effective_model = await asyncio.to_thread(
+                _spawn_effective_model, info.model, agent or ""
+            )
+            if not effective_model or not model_supports_effort(effective_model):
+                # The provider factory's effort gate will drop this level: only
+                # a concrete, effort-capable model can carry one. Reporting-only
+                # — the kwarg is still passed and the factory stays the single
+                # dropping authority.
+                logger.warning(
+                    "subagent %s: reasoning effort '%s' (%s) will not be applied — "
+                    "model '%s' does not support effort configuration",
+                    info.id,
+                    eff_effort,
+                    "per-call" if info.reasoning_effort else "role pin",
+                    effective_model or "auto",
+                )
         if info.bare:
             extra_kwargs["bare"] = True
         if info.allowed_tools:
@@ -6884,6 +6970,11 @@ class SubagentManager:
                 "task": _redact(info.task),
                 "agent": agent or "",
                 "model": info.resolved_model,
+                # The requested pin is caller-supplied (spawn_run.model), so it
+                # is redacted like every other free-text field on the frame — an
+                # unavailable/AKIA-shaped pin must never reach the dashboard
+                # socket raw (GPT review on #5326).
+                "requested_model": _redact(info.requested_model),
             },
         )
         # Stream results to disk for orchestrated chat.
@@ -7277,6 +7368,34 @@ class SubagentManager:
                     )
                     continue
                 if event.child_low_fidelity:
+                    # UNCONDITIONAL parent grant + verified canonical MCP
+                    # identity: parent_policy=auto approves regardless of
+                    # event content, and child_mcp_identity_trusted proves a
+                    # real MCP tool_call frame (non-model-authored _meta.kiro
+                    # identity, resolved non-shell) is behind this request —
+                    # only its ARGUMENTS are unverified, which this grant
+                    # never reads. Honor the grant instead of stalling a
+                    # trusted fan-out on an interactive card per call. The
+                    # hook auto-approve below stays fail-closed for these:
+                    # its auto_approve_tools patterns match the agent-authored
+                    # title, which a child could forge.
+                    if parent_policy == "auto" and event.child_mcp_identity_trusted:
+                        await self._approve_and_log(
+                            client,
+                            event.request_id,
+                            session_key,
+                            event,
+                            metadata={
+                                "subagent_id": info.id,
+                                "reason": "parent_policy_auto",
+                                "child_mcp_identity": (
+                                    f"{event.mcp_server_name}/{event.tool_name}"
+                                ),
+                                "child_args_unverified": True,
+                            },
+                            info=info,
+                        )
+                        continue
                     # Backend-internal child origin whose SECURITY context is
                     # absent (structured params missing, unresolved shell
                     # classification, or shell without a recoverable command —

@@ -42,7 +42,6 @@ be called straight from a coroutine without failing the suite.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -52,7 +51,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, TypedDict
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 # ``kiro_crew.agent`` is imported as a MODULE, not as symbols: the agents dir and
@@ -60,11 +58,11 @@ from uuid import uuid4
 # path) can substitute them. ``from ... import f`` would freeze this module's own
 # binding.
 from kiro_crew import agent as _agent
-from kiro_crew import hooks as _hooks
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.agent_files import AGENT_FILENAME, OWNED_KIRO_AGENT_FILES
 from kiro_crew.config.loader import data_home
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.mcp_grant import grant_observed
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.security import oauth_url_contains_credential
 from kiro_crew.sel import sel
@@ -92,20 +90,6 @@ _MINT_SPEC_ORPHAN_SECONDS = _MINT_TTL_SECONDS * 2
 # Serializes this process's manifest read-modify-writes.
 _MINT_MANIFEST_LOCK = threading.Lock()
 
-# kiro-cli's MCP OAuth artifact directory, and the paired suffixes it writes per
-# authorized server.
-_KIRO_OAUTH_CACHE_RELATIVE = (".aws", "sso", "cache")
-_TOKEN_SUFFIX = ".token.json"
-_REGISTRATION_SUFFIX = ".registration.json"
-# Two passes, not a spin: the second exists so a transient unlink failure (a
-# lock, a slow network home) does not strand a survivor, while a third would
-# only delay reporting a failure that is real.
-_GRANT_REVOKE_ATTEMPTS = 2
-_DEFAULT_HTTPS_PORT = 443
-# SEL label for the grant-presence stat, registered in
-# ``hooks._AUDIT_ONLY_READ_IDS``. Emitting with an unregistered id records nothing.
-_GRANT_PRESENCE_READ_ID = "connections_mint.oauth_grant_presence"
-
 
 class MintState(TypedDict, total=False):
     """A mint's row. The holdings are released on teardown, never served."""
@@ -120,6 +104,14 @@ class MintState(TypedDict, total=False):
     agent: str  # ephemeral spec name
     spec_path: str  # the exact file this flow wrote, and the only one it deletes
     pid: int  # sweep-protected for as long as the process is held
+    # Set only by the warm table (:mod:`kiro_crew.connections.warm`). A shared row
+    # owns no ``client``: its URL was minted on a process it shares with every
+    # other card, so redeemability is judged by generation AND activation liveness
+    # instead. Declared here because the table itself is shared, and a row type
+    # that cannot describe half its rows pushes every read through a cast.
+    shared: bool
+    generation: int  # the shared process that holds this row's PKCE verifier
+    activation: int  # the session that owns this row's loopback listener
 
 
 _mints: dict[str, MintState] = {}
@@ -139,179 +131,9 @@ def _new_mint_token() -> str:
     return uuid4().hex
 
 
-def kiro_oauth_cache_dir(*, home: Path | None = None) -> Path:
-    """The directory kiro-cli writes MCP OAuth artifacts into."""
-    return (home or Path.home()).joinpath(*_KIRO_OAUTH_CACHE_RELATIVE)
-
-
-def grant_key(mcp_url: str) -> str:
-    """kiro-cli's cache key for ``mcp_url``.
-
-    Mirrors ``mcp_client::oauth_util::compute_key``: sha256 over the URL's ASCII
-    origin serialization concatenated with its path. The default HTTPS port is
-    omitted and an empty path normalizes to ``/`` -- both are what the Rust
-    ``url`` crate does before hashing, and getting either wrong makes the key
-    miss, which reports a granted provider as ungranted.
-    """
-    parts = urlsplit(mcp_url)
-    origin = f"{parts.scheme.lower()}://{(parts.hostname or '').lower()}"
-    if parts.port is not None and parts.port != _DEFAULT_HTTPS_PORT:
-        origin = f"{origin}:{parts.port}"
-    return hashlib.sha256(f"{origin}{parts.path or '/'}".encode("utf-8")).hexdigest()
-
-
-def grant_artifact_paths(mcp_url: str, *, cache_dir: Path | None = None) -> tuple[Path, Path]:
-    """The paired grant artifact paths for ``mcp_url`` (token, registration).
-
-    The single source of the artifact layout, shared with the status module so
-    its indeterminacy probe cannot drift from what :func:`grant_present` stats.
-    """
-    directory = cache_dir if cache_dir is not None else kiro_oauth_cache_dir()
-    key = grant_key(mcp_url)
-    return (
-        directory / f"{key}{_TOKEN_SUFFIX}",
-        directory / f"{key}{_REGISTRATION_SUFFIX}",
-    )
-
-
-def grant_present(mcp_url: str, *, cache_dir: Path | None = None) -> bool:
-    """Whether kiro-cli holds a persisted grant for ``mcp_url``.
-
-    Presence only: the paired artifacts are stat-ed and never opened, so token
-    material cannot reach this process. Both must exist -- a lone token file also
-    matches the single-file SSO naming this directory mixes in.
-
-    Blocking: the stats are sub-millisecond against a local home but stall for as
-    long as the mount does against a network-mounted one, so async callers run this
-    through ``asyncio.to_thread`` rather than on the event loop.
-    """
-    token, registration = grant_artifact_paths(mcp_url, cache_dir=cache_dir)
-    return token.is_file() and registration.is_file()
-
-
-def _labelled_grant_artifacts(
-    mcp_url: str, *, cache_dir: Path | None = None
-) -> tuple[tuple[str, Path], ...]:
-    """The grant artifacts for ``mcp_url``, each paired with a stable label.
-
-    One place binds a label to a path, so a caller can name *which* artifact
-    survived without publishing the cache key: the filenames are a sha256 over
-    the provider URL and carry nothing a caller needs. Destructures
-    :func:`grant_artifact_paths` explicitly rather than zipping it, so the
-    token/registration pairing is stated rather than positional.
-    """
-    token, registration = grant_artifact_paths(mcp_url, cache_dir=cache_dir)
-    return (("token", token), ("registration", registration))
-
-
-def surviving_grant_artifacts(mcp_url: str, *, cache_dir: Path | None = None) -> list[str]:
-    """Labels of the grant artifacts still on disk for ``mcp_url``.
-
-    Presence only, the same boundary :func:`grant_present` keeps: the paths are
-    stat-ed and never opened. This exists so a caller can *state* whether the
-    local grant is gone instead of inferring it from what a delete loop believed
-    it removed.
-
-    Blocking for the same reason as :func:`grant_present` -- it stalls as long as
-    a network-mounted home does -- so async callers route it off the event loop.
-
-    Uses ``is_file`` for the same reason :func:`grant_present` does, not ``exists``:
-    ``Path.exists`` re-raises an OSError the stat could not ignore, which would turn
-    this probe into a 500 *after* a caller had already disposed state and before it
-    could report anything -- the one moment an answer matters most.
-    """
-    return [
-        label
-        for label, path in _labelled_grant_artifacts(mcp_url, cache_dir=cache_dir)
-        if path.is_file()
-    ]
-
-
-def revoke_local_grant(mcp_url: str, *, cache_dir: Path | None = None) -> list[str]:
-    """Unlink the runtime's stored OAuth artifacts for ``mcp_url``.
-
-    Grant LIFECYCLE management, not credential access: each artifact is removed
-    with ``unlink`` and never opened, so no token or refresh-token byte can enter
-    this process. That is the boundary the rest of this module keeps -- kiro-cli
-    owns the OAuth chain and its store, and the gateway may observe and delete
-    but never read.
-
-    Deleting is what makes Disconnect mean something locally. Taking the entry
-    out of the MCP config alone leaves a usable refresh token on disk, so a later
-    reconnect silently resumes the old grant instead of asking for consent. It
-    does NOT revoke at the provider -- only the provider can do that -- which is
-    why the card still sends the user to the provider's revoke page.
-
-    The artifacts are a PAIR and their removal is verified as one: an artifact
-    that fails to unlink is announced at warning level and the pass is retried,
-    and any survivor is named. Reporting only what came off, with the per
-    -artifact failure buried at debug, is what would let a Disconnect delete the
-    token, leave the registration behind, and still answer "done".
-
-    Returns the labels actually removed, for the audit record.
-    """
-    removed: list[str] = []
-    surviving: list[str] = []
-    for _attempt in range(_GRANT_REVOKE_ATTEMPTS):
-        # The single-file `{sha256}.json` form this directory also holds belongs
-        # to AWS SSO and is deliberately never touched.
-        for label, path in _labelled_grant_artifacts(mcp_url, cache_dir=cache_dir):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError:
-                logger.warning("Could not unlink the %s grant artifact", label, exc_info=True)
-                continue
-            if label not in removed:
-                removed.append(label)
-        surviving = surviving_grant_artifacts(mcp_url, cache_dir=cache_dir)
-        if not surviving:
-            return removed
-    logger.warning(
-        "Grant artifacts survived the revoke and the connection may still be usable: %s",
-        ", ".join(surviving),
-    )
-    return removed
-
-
 def _acp_client_factory() -> Any:
     """Indirection so tests can substitute a fake client class."""
     return AcpClient
-
-
-async def _grant_observed(mcp_url: str) -> bool:
-    """:func:`grant_present` off the loop, SEL-audited when a grant is observed.
-
-    Audited on the TRUE result only, and deliberately NOT once per stat. The
-    watcher polls every ``_MINT_GRANT_POLL_SECONDS`` for up to the TTL, so a
-    per-stat audit would write up to ``_MINT_TTL_SECONDS //
-    _MINT_GRANT_POLL_SECONDS`` events for a single flow, each one synchronous by
-    design (``hooks._emit_internal_read_audit`` marks the event critical so it
-    drains the queue and cannot be silently lost). A negative poll observed
-    nothing and changed nothing; the access that owes a trail is the one a caller
-    ACTS on -- it moves a row to ``granted`` or short-circuits a Connect -- and
-    that one is recorded.
-
-    Best-effort, NOT fail-closed, which is a deliberate departure from
-    :func:`hooks.safe_read_file_internal`. That gate denies on an unrecordable
-    audit because a success there hands back live credential BYTES; nothing
-    sensitive crosses this boundary at all -- the artifacts are stat-ed, never
-    opened -- so denying would convert an SEL outage into a Connect that never
-    completes after the user actually consented. An unaudited boolean is the
-    lesser failure, and it still leaves a warning behind.
-    """
-    present = await asyncio.to_thread(grant_present, mcp_url)
-    if present:
-        recorded = await asyncio.to_thread(
-            _hooks.emit_internal_read_audit, _GRANT_PRESENCE_READ_ID, "success"
-        )
-        if not recorded:
-            logger.warning(
-                "grant-presence audit for %r could not be recorded; proceeding unaudited",
-                mcp_url,
-            )
-    return present
 
 
 def _mint_spec_name(alias: str) -> str:
@@ -642,7 +464,7 @@ async def _mint_watcher(slug: str, mcp_url: str, token: str) -> None:
         deadline = time.monotonic() + _MINT_TTL_SECONDS
         while time.monotonic() < deadline:
             await asyncio.sleep(_MINT_GRANT_POLL_SECONDS)
-            if await _grant_observed(mcp_url):
+            if await grant_observed(mcp_url):
                 doomed: MintState | None = None
                 async with _mints_lock:
                     entry = _mints.get(slug)
@@ -793,7 +615,7 @@ async def start_oauth_mint(
     # aged orphans. Off-loop: it reads and rewrites the manifest, and may unlink.
     await asyncio.to_thread(_sweep_mint_specs)
 
-    if await _grant_observed(mcp_url):
+    if await grant_observed(mcp_url):
         # Consent already exists (a reconnect): no URL is needed.
         async with _mints_lock:
             if _mints.get(slug, {}).get("token") == my_token:

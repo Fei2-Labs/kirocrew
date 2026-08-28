@@ -58,6 +58,14 @@ export interface StatusData {
   update_commits_behind?: number
   update_last_checked_at?: number | null
   update_check_interval_secs?: number
+  /**
+   * Mandatory-update verdict: true when this install sits below either the
+   * enterprise governance pin or the release feed's breaking-change floor.
+   * The proactive update modal drops its snooze/skip affordances while true.
+   */
+  update_required?: boolean
+  /** The floor that made the update mandatory (bare release, '' when none). */
+  update_min_version?: string
   update_progress?: { step: string; detail: string } | null
   version?: string
   /**
@@ -583,12 +591,27 @@ export interface McpServer {
   /** Wall-clock seconds of the probe that produced `status`; 0/absent = never probed. */
   probedAt?: number
   presence?: McpScopePresence
+  /** True when the last probe met a recognisable OAuth challenge. Absent means
+   *  the probe learned nothing about authorization — NOT that none is needed,
+   *  so it must not be rendered as "no sign-in required". */
+  authChallenge?: boolean
+  /** Whether the kiro-cli runtime already holds a grant for this url. Only sent
+   *  alongside `authChallenge`; absent is "unknown", which is why the sign-in
+   *  wording is gated on an explicit `false`. */
+  authGrantPresent?: boolean
   /** Optional status-enrichment fields supplied by newer runtimes. */
   accountLabel?: string
   connectedSince?: string
   /** True when the entry lives in KiroCrew's own mcp.json — the scope the
    *  Edit JSON action reads and writes (consent-disabled rows included). */
   kirocrewManaged?: boolean
+  /** Consecutive failed probes on record. Absent means none — a healthy server
+   *  carries neither this nor `quarantined`. */
+  probeFailures?: number
+  /** True when those failures crossed the threshold and the server is no longer
+   *  mounted into new sessions. Distinct from `enabled`, which is the user's own
+   *  choice and is never overwritten by this. */
+  probeFailing?: boolean
 }
 
 export interface McpApplyChange {
@@ -678,6 +701,12 @@ export interface ConfiguredChannelTarget {
 }
 
 export interface ChatSlot {
+  /** The agent that will actually answer, when it is NOT the requested `agent`;
+   *  "" / absent means nothing to report. The backend stores `agent` verbatim
+   *  (the user's intent) and reports the divergence here instead of rewriting it,
+   *  and it reports "" rather than guessing whenever resolution is unsettled — so
+   *  a consumer must treat absent as "no news", never as a mismatch. */
+  effective_agent?: string
   key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; provider_label?: string; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
@@ -891,6 +920,11 @@ export interface SubagentActivity {
    *  frames; shown beside the agent pill in the Subagents panel so a model-pinned
    *  run's real model is visible (#3582). */
   model?: string
+  /** The model pin the caller REQUESTED for this subagent (the `requested_model`
+   *  field on spawn/snapshot frames). Present only when the caller supplied a pin;
+   *  compared against `model` via `isModelDowngrade` to render the amber chip on
+   *  the live card (#5326). */
+  requestedModel?: string
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
   streaming: string; lastTool: string
   startedAt: number; elapsed: number; error?: string

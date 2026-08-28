@@ -18,15 +18,12 @@ with a name but no published serve means.
 
 Three properties are load-bearing.
 
-**This is a LIVE probe, and the existing status endpoint is not.**
-``GET /api/tailnet/status`` deliberately reports the value resolved once at
-startup, because that is what actually went into the origin allowlist. This
-endpoint reports what the machine can do *next*. The two must stay separate: a
-name that resolves now but was absent at startup is exactly the boot race where
-the origin is NOT trusted, and reporting it as ready would be the
-"checked-but-never-ran shown as a clean result" defect. It gets its own step
-(``restart_gateway``) instead — the first time that race is visible anywhere but
-a log line.
+**This is a LIVE daemon probe, while the existing status endpoint reports the
+live request boundary.**  They must stay separate: a daemon name is not trusted
+merely because it resolves.  The background recovery path first validates and
+adds it to the running Origin/Host set; only then does this endpoint report the
+name as trusted.  Until that happens the existing fail-closed restart step is
+preserved, including for config changes that still require a restart.
 
 **The QR carries a live credential, so it is minted on demand and never cached.**
 The payload is a URL with a session token in its query string. It is not logged,
@@ -54,7 +51,7 @@ from aiohttp import web
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.boot_id import current_boot_id
-from kiro_crew.dashboard.handlers._shared import _is_restricted_session
+from kiro_crew.dashboard.handlers._shared import _caller_bounds, _is_restricted_session
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.token_auth import (
     LINK_WINDOW_SECS,
@@ -90,6 +87,7 @@ Step = Literal[
     "start_daemon",
     "sign_in",
     "enable_magicdns",
+    "enable_https",
     "trust_off",
     "restart_gateway",
     "occupied",
@@ -117,19 +115,22 @@ def _derive_step(
        four ways there is no usable tailnet name, kept apart because "install
        Tailscale", "start it", "sign in" and "turn MagicDNS on" are four
        different errands.
-    3. ``trust_off`` — a name exists, but the gateway is not configured to accept
+    3. ``enable_https`` — the name exists but the tailnet has not granted
+       certificate provisioning for it. This is a tailnet-wide administrator
+       consent and cannot safely be performed by a gateway process.
+    4. ``trust_off`` — a name exists, but the gateway is not configured to accept
        it as an origin, so publishing would produce a reachable dashboard that
        answers 403. Config first.
-    4. ``restart_gateway`` — configured and resolvable NOW, but the running
-       server resolved nothing at startup (it booted before tailscaled). The
-       origin is genuinely not trusted until a restart, so this must not be
-       reported as ready.
-    5. ``occupied`` — serve holds this port/mount for something that is not this
+    5. ``restart_gateway`` — configured and resolvable NOW, but the running
+       server does not trust this exact name (it may have booted before tailscaled
+       or the node name may have changed). The fixed request boundary is rebuilt
+       only by the formal gateway restart path.
+    6. ``occupied`` — serve holds this port/mount for something that is not this
        dashboard, or its state could not be determined. Publishing would REPLACE
        it, so this refuses and the card renders the manual command
        (``kirocrew tailnet up``) for the operator to run deliberately.
-    6. ``publish`` — everything is in place; one action left.
-    7. ``ready`` — published and trusted.
+    7. ``publish`` — everything is in place; one action left.
+    8. ``ready`` — published and trusted.
     """
     if pinned:
         return "pinned"
@@ -141,9 +142,16 @@ def _derive_step(
         return "sign_in"
     if not probe.name:
         return "enable_magicdns"
+    # An already-published mapping is operational evidence stronger than a
+    # possibly stale CertDomains snapshot. This exception also prevents a brief
+    # control-plane propagation delay after first enablement from taking a
+    # working QR away. For a new mapping, however, an explicit False is a hard
+    # stop: the non-interactive gateway cannot grant tailnet-wide HTTPS consent.
+    if published is not True and probe.https_enabled is False:
+        return "enable_https"
     if not trusted:
         return "trust_off"
-    if not startup_host:
+    if startup_host != probe.name:
         return "restart_gateway"
     if published is True:
         return "ready"
@@ -195,6 +203,16 @@ def _audit(request: web.Request, operation: str, outcome: str, resources: str) -
         logger.debug("tailnet mobile audit write failed", exc_info=True)
 
 
+async def _audit_async(
+    request: web.Request,
+    operation: str,
+    outcome: str,
+    resources: str,
+) -> None:
+    """Write SEL records off-loop, including the first cold initialization."""
+    await asyncio.to_thread(_audit, request, operation, outcome, resources)
+
+
 async def api_tailnet_mobile_status(request: web.Request) -> web.Response:
     """GET /api/tailnet/mobile — the guided state for the mobile-access card.
 
@@ -217,7 +235,7 @@ async def api_tailnet_mobile_status(request: web.Request) -> web.Response:
         # someone without owner rights reaching for this machine's network facts,
         # which is exactly the kind of event the SEL exists to carry. Mirrors the
         # denial audits the four mutating handlers already emit.
-        _audit(request, "tailnet.mobile.status", "denied", "not-owner")
+        await _audit_async(request, "tailnet.mobile.status", "denied", "not-owner")
         return web.json_response(
             {"error": "tailnet mobile access is owner-only", "code": "owner_only"},
             status=403,
@@ -239,7 +257,7 @@ async def api_tailnet_mobile_status(request: web.Request) -> web.Response:
             "peer_count": probe.peer_count,
             "peers_online": probe.peers_online,
             "trusted": live.trusted,
-            "startup_trusted": bool(live.startup_host),
+            "startup_trusted": live.startup_host == probe.name,
             "published": live.published,
             "keep_awake": live.keep_awake,
             "governance_pinned": live.pinned,
@@ -318,7 +336,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
             published = state.published
             serve_detail = state.detail
 
-    startup_host = str(request.app.get("tailnet_host") or "")
+    startup_host = tailnet.running_tailnet_origin(request.app)[0]
     step = _derive_step(
         pinned=pinned,
         probe=probe,
@@ -367,8 +385,8 @@ _QR_REFUSALS: dict[Step, tuple[str, str]] = {
     ),
     "restart_gateway": (
         "restart_required",
-        "This server resolved no tailnet name when it started, so it does not "
-        "trust that name yet. Restart Kiro Crew, then scan.",
+        "This running server has not loaded its validated tailnet origin yet. "
+        "Restart Kiro Crew, then scan.",
     ),
     "publish": (
         "not_published",
@@ -384,6 +402,11 @@ _QR_REFUSALS.update(
         "start_daemon": _QR_REFUSALS["install"],
         "sign_in": _QR_REFUSALS["install"],
         "enable_magicdns": _QR_REFUSALS["install"],
+        "enable_https": (
+            "https_not_enabled",
+            "This tailnet has not enabled HTTPS certificate provisioning for "
+            "this machine, so a phone could not open a secure dashboard URL.",
+        ),
         "occupied": _QR_REFUSALS["publish"],
     }
 )
@@ -458,11 +481,11 @@ async def api_tailnet_mobile_publish(request: web.Request) -> web.Response:
     """
     refusal = _guard(request)
     if refusal is not None:
-        _audit(request, "tailnet.mobile.publish", "denied", "restricted-session")
+        await _audit_async(request, "tailnet.mobile.publish", "denied", "restricted-session")
         return refusal
     port = _dashboard_port(request)
     if not port:
-        _audit(request, "tailnet.mobile.publish", "denied", "unknown-port")
+        await _audit_async(request, "tailnet.mobile.publish", "denied", "unknown-port")
         return web.json_response(
             {
                 "ok": False,
@@ -478,7 +501,7 @@ async def api_tailnet_mobile_publish(request: web.Request) -> web.Response:
     result = await asyncio.to_thread(
         tailnet_serve.publish, port, audit_tool="tailnet_mobile_publish"
     )
-    _audit(
+    await _audit_async(
         request,
         "tailnet.mobile.publish",
         "success" if result.ok else "denied",
@@ -510,11 +533,11 @@ async def api_tailnet_mobile_unpublish(request: web.Request) -> web.Response:
     """
     refusal = _guard(request)
     if refusal is not None:
-        _audit(request, "tailnet.mobile.unpublish", "denied", "restricted-session")
+        await _audit_async(request, "tailnet.mobile.unpublish", "denied", "restricted-session")
         return refusal
     port = _dashboard_port(request)
     result = await asyncio.to_thread(tailnet_serve.unpublish, port)
-    _audit(
+    await _audit_async(
         request,
         "tailnet.mobile.unpublish",
         "success" if result.ok else "denied",
@@ -549,14 +572,18 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     backed routes admit, so a bespoke subject would produce a phone session that
     looks fine and is silently denied those routes.
 
-    Refuses unless the derived step is ``ready``. That is the whole precondition
-    set, read from ``_derive_step`` rather than re-checked here: a QR for a URL
-    nothing answers is a support ticket, not a feature, and a QR issued under an
-    administrator's tailnet pin is a credential the ceiling forbids.
+    Refuses unless the derived step is ``ready``. That is the whole machine-state
+    precondition set, read from ``_derive_step`` rather than re-checked here: a
+    QR for a URL nothing answers is a support ticket, not a feature, and a QR
+    issued under an administrator's tailnet pin is a credential the ceiling
+    forbids. On top of the machine state, the CALLER's own session bounds are
+    enforced via ``_shared._caller_bounds`` (the same helper the mobile-link
+    mint uses): the minted token never out-scopes the session authorizing it,
+    and a caller with no lifetime left to lend is refused.
     """
     refusal = _guard(request)
     if refusal is not None:
-        _audit(request, "tailnet.mobile.qr", "denied", "restricted-session")
+        await _audit_async(request, "tailnet.mobile.qr", "denied", "restricted-session")
         return refusal
 
     port = _dashboard_port(request)
@@ -568,7 +595,7 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     # `publish` already refuses at port 0; the two must not disagree about
     # whether an unknown port is safe.
     if not port:
-        _audit(request, "tailnet.mobile.qr", "denied", "unknown-port")
+        await _audit_async(request, "tailnet.mobile.qr", "denied", "unknown-port")
         return web.json_response(
             {
                 "error": (
@@ -596,7 +623,7 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
             # pins that), but a future step must fail CLOSED here rather than mint.
             ("not_ready", "This machine is not ready to hand the dashboard to a phone."),
         )
-        _audit(request, "tailnet.mobile.qr", "denied", f"step={live.step}")
+        await _audit_async(request, "tailnet.mobile.qr", "denied", f"step={live.step}")
         detail = live.serve_detail or live.probe.detail
         return web.json_response(
             {"error": f"{sentence} {detail}".strip() if detail else sentence, "code": code},
@@ -615,9 +642,11 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
             parsed = parse_duration(raw_ttl)
             if parsed:
                 ttl = parsed
-    # Clamped twice on purpose: this endpoint's own ceiling first, then the
-    # global session ceiling, so neither a caller-supplied value nor a future
-    # raise of MAX_QR_TTL_SECS can exceed what token_auth itself allows.
+    # Clamped by this endpoint's own ceiling first, then the global session
+    # ceiling, so neither a caller-supplied value nor a future raise of
+    # MAX_QR_TTL_SECS can exceed what token_auth itself allows. The caller's
+    # own remaining lifetime is applied further down, after the last awaited
+    # step before the mint, so it cannot go stale while this handler waits.
     ttl = min(ttl, MAX_QR_TTL_SECS, MAX_SESSION_TTL_SECS)
 
     state_obj = request.app.get("state")
@@ -644,8 +673,13 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     # lapses. Kept as a supported shape for an operator who wants the credential
     # bounded by a clock regardless of process lifetime.
     #
-    # Mutually exclusive on purpose: carrying both would mean a session that
-    # neither refreshes nor lasts, which is worse than either.
+    # Mutually exclusive as the DEFAULT shapes on purpose: choosing both for an
+    # unbounded caller would mean a session that neither refreshes nor lasts,
+    # which is worse than either. A BOUNDED caller is different — its carried
+    # claims are merged over the configured shape below, and a token carrying
+    # both ``boot`` and ``no_refresh`` is then the honest intersection: the
+    # session ends at whichever bound is hit first, which is exactly what
+    # "never out-scope the caller" requires.
     #
     # The TTL clamp above is untouched under both shapes. Rotation is what
     # extends a boot-bound session, so no ceiling and no security constant moves.
@@ -666,9 +700,49 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
         _until_restart = True
 
     if _until_restart:
-        claims = {"boot": current_boot_id()}
+        shape = {"boot": current_boot_id()}
     else:
-        claims = {"no_refresh": "1"}
+        shape = {"no_refresh": "1"}
+    # The calling session's own bounds cap everything minted below — the same
+    # invariant the sibling mobile-link mint enforces, read through the same
+    # shared helper so the two surfaces cannot drift. A deliberately bounded
+    # owner session (``no_refresh``, or a short remaining ``session_exp``) must
+    # not trade itself for a boot-bound, refresh-chained credential on another
+    # device: behind ``tailscale serve`` every request reaches the gateway from
+    # 127.0.0.1, so the token cannot be device-pinned and its own bounds are the
+    # only limit that holds. A caller with no lifetime left to lend is refused
+    # outright — minting against it would hand out a credential that outlives
+    # the session authorizing it.
+    #
+    # Read AFTER every awaited step above (the request body and the config
+    # load), deliberately: the remaining lifetime is a wall-clock snapshot, and
+    # a client that trickles the request body in controls how long this handler
+    # waits — a snapshot taken before those awaits would let a caller in its
+    # last seconds stretch the mint past its own expiry.
+    carried, ttl_ceiling = _caller_bounds(request)
+    if ttl_ceiling <= 0:
+        await _audit_async(request, "tailnet.mobile.qr", "denied", "caller-session-expired")
+        return web.json_response(
+            {
+                "error": (
+                    "This session has no lifetime left to lend, so no sign-in "
+                    "link can be issued. Sign in again, then scan."
+                ),
+                "code": "caller_session_expired",
+            },
+            status=403,
+        )
+    # The caller's remaining lifetime completes the clamp: a short-lived caller
+    # asking for the default cannot exceed what the authorizing session itself
+    # has left.
+    ttl = min(ttl, ttl_ceiling)
+    # The caller's carried bounds win on conflict and are never dropped: a
+    # ``boot`` claim is carried verbatim rather than re-derived (the same rule
+    # the link→session exchange follows), and a ``no_refresh`` caller stamps the
+    # minted credential ``no_refresh`` regardless of the configured shape, so
+    # the phone session never grows a refresh chain its authorizing session did
+    # not have.
+    claims = {**shape, **carried}
     token = generate_token(owner_id or "local-app", ttl_seconds=ttl, extra=claims)
     url = f"https://{host}/?token={token}"
     try:
@@ -676,7 +750,7 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
         image = await asyncio.to_thread(render_qr_data_uri, url)
     except Exception:
         logger.debug("tailnet mobile QR encode failed", exc_info=True)
-        _audit(request, "tailnet.mobile.qr", "denied", "encode-failed")
+        await _audit_async(request, "tailnet.mobile.qr", "denied", "encode-failed")
         # Detail is in the server log above; the client body (rendered verbatim
         # into a localized UI) gets a generic message.
         return web.json_response(
@@ -686,7 +760,7 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
             },
             status=500,
         )
-    _audit(request, "tailnet.mobile.qr", "success", f"ttl={ttl}")
+    await _audit_async(request, "tailnet.mobile.qr", "success", f"ttl={ttl}")
     return web.json_response(
         {
             "url": url,
@@ -695,8 +769,10 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
             # The window in which the LINK must be opened, which is not the
             # session lifetime and is the thing that surprises people: the token
             # stops being redeemable long before the session it would have
-            # created would have expired.
-            "link_window_secs": LINK_WINDOW_SECS,
+            # created would have expired. generate_token clamps the link-click
+            # ``exp`` to the session TTL, so a short-lived caller's link dies
+            # with the ttl it lent — report the live window, not the constant.
+            "link_window_secs": min(LINK_WINDOW_SECS, ttl),
             "host": host,
         }
     )

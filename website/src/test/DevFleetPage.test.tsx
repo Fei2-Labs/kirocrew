@@ -1169,6 +1169,143 @@ describe('DevFleetPage', () => {
     expect(pop.style.top).toBe('')
   })
 
+  /* ─── Row-actions menu: focus containment (#2533) ─── */
+  // ConfirmBtn's half of #2533 landed separately (see the confirm-dialog
+  // role=dialog/Escape test above); MenuBtn was left with Escape-only
+  // handling, so all three parts — focus entry, Tab containment, and focus
+  // return — are implemented here for the menu.
+
+  it('row-actions menu moves focus onto the first item when it opens, and Tab wraps within it', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    menuItems[menuItems.length - 1].focus()
+    fireEvent.keyDown(menu, { key: 'Tab' })
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'Tab', shiftKey: true })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+  })
+
+  it('row-actions menu ArrowDown/ArrowUp cycle focus through items and wrap at both ends', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    // Down walks forward one item at a time.
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[1]).toHaveFocus()
+    // Down on the last item wraps to the first.
+    menuItems[menuItems.length - 1].focus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[0]).toHaveFocus()
+    // Up on the first item wraps to the last.
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    // Up walks backward one item at a time.
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 2]).toHaveFocus()
+  })
+
+  it('row-actions menu Home/End jump to the first/last item', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'End' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'Home' })
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu declines an arrow that belongs to an IME composition', async () => {
+    // On WebKit the keydown that moves through composition candidates can
+    // arrive AFTER compositionend with `isComposing` already false — an
+    // unguarded arrow branch would move menu focus mid-composition. Menu
+    // items are non-editable today; this pins the claim stays load-bearing
+    // if the menu ever grows a focusable text field.
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.compositionStart(menuItems[0])
+    fireEvent.compositionEnd(menuItems[0])
+    fireEvent.keyDown(document, { key: 'ArrowDown' })
+    // Declined: focus stays put instead of moving to the second item.
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu arrows enter the list when focus is outside it: Down to first, Up to last', async () => {
+    // Reachable edge: the fleet page polls, so an item holding focus can
+    // unmount mid-open and drop activeElement to <body>.
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    document.body.focus()
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    document.body.focus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu lets modified arrows through untouched (OS/browser shortcuts)', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown', metaKey: true })
+    fireEvent.keyDown(menu, { key: 'ArrowDown', ctrlKey: true })
+    fireEvent.keyDown(menu, { key: 'End', altKey: true })
+    // Not the menu's keys: focus did not move.
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('selecting a row-actions menu item returns focus to the trigger', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByLabelText('More actions')
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    fireEvent.click(within(menu).getAllByRole('button')[0])
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
+  it('scroll-closing the row-actions menu restores focus to the trigger instead of orphaning it', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByLabelText('More actions')
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    // Focus-entry put focus inside the menu; a wheel scroll moves no DOM
+    // focus, so without the restore the unmount would drop focus to <body>.
+    expect(within(menu).getAllByRole('button')[0]).toHaveFocus()
+    fireEvent.scroll(window)
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
   /* ─── Provision progress: expandable log panel + failure persistence ─── */
   // 'unprov' is the only non-main has_dist:false row, so it renders the single
   // "Provision" button. Provision polling uses real 2s sleeps, hence the

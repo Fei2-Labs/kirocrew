@@ -1234,6 +1234,106 @@ class TestFileSend:
             out = _call_tool("file_send", {"path": str(src)})
         assert out == "File sent: report.txt (Slack upload failed: not in channel)"
 
+    def test_channel_delivery_takes_precedence_over_slack(self, tmp_path, monkeypatch):
+        # A caller linked to a Telegram chat or Discord DM gets the file THERE;
+        # the Slack owner-DM leg is the fallback, not a second copy.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": True, "channel_type": "telegram"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt (delivered to telegram)"
+        assert all(c[0][0] != "/api/slack/upload-file" for c in m.call_args_list)
+
+    def test_channel_skip_leaves_the_slack_leg_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": False, "skipped": "no_channel_destination"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt"
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+
+    def test_channel_failure_warns_and_falls_back_to_slack(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"error": "telegram api 400"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt (channel upload failed: telegram api 400)"
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+
+    def test_an_explicit_slack_channel_beats_native_delivery(self, tmp_path, monkeypatch):
+        # channel="C…" names a DESTINATION the caller chose; the native leg's
+        # session-link inference must not silently reroute the file to the
+        # linked Telegram chat instead of the named Slack channel.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": True, "channel_type": "telegram"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src), "channel": "C0TRACKED123"})
+        assert all(c[0][0] != "/api/channel/upload-file" for c in m.call_args_list), (
+            "native delivery must not run for an explicitly named channel"
+        )
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+        assert out == "File sent: report.txt"
+
+    def test_an_unidentified_caller_gets_no_native_delivery(self, tmp_path, monkeypatch):
+        # The lenient session resolver includes a /proc ancestor walk, under
+        # which an unidentified subagent resolves to its PARENT slot — and the
+        # file would deliver into the parent's conversation. No strict
+        # identity, no native delivery; the Slack leg keeps its own classifier.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+        with patch.object(mcp_core, "_post", return_value={"ok": True}) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt"
+        assert all(c[0][0] != "/api/channel/upload-file" for c in m.call_args_list)
+
+    def test_native_delivery_pins_the_strict_identity_on_the_wire(self, tmp_path, monkeypatch):
+        # The endpoint resolves the destination from the caller's session map
+        # entry, so the request must carry the VERIFIED key — not whatever the
+        # default resolution would re-derive server-side.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-9")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                assert kw.get("session_key") == "dashboard:chat-9"
+                return {"ok": True, "delivered": True, "channel_type": "discord"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt (delivered to discord)"
+        assert any(c[0][0] == "/api/channel/upload-file" for c in m.call_args_list)
+
 
 # ── argument validation seam ──────────────────────────────────────────────
 

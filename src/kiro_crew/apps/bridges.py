@@ -46,7 +46,7 @@ from kiro_crew.config.loader import (
     schedule_materialized_agents_refresh,
 )
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.cron import CronStoreBusy
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.env import emit_env
 from kiro_crew.executors import maintenance_executor
@@ -1340,6 +1340,8 @@ def _cron_defs_from_manifest(
                 "persistent_session": cron.persistent_session,
                 "silent": cron.silent,
                 "enabled": cron.enabled,
+                "timezone": cron.timezone,
+                "skip_dates": cron.skip_dates,
             }
         )
         registered.append(namespaced)
@@ -1540,6 +1542,12 @@ async def register_app_crons_with_service(app_name: str, cron_service: Any) -> l
                 persistent_session=d.get("persistent_session", False),
                 silent=bool(d.get("silent", False)),
                 enabled=bool(d.get("enabled", True)),
+                # An empty timezone resolves to the config zone and then to UTC
+                # at fire time, so a manifest that pins an hour meaningful only
+                # in one zone must have it threaded here, not corrected by a
+                # second write after the job already exists.
+                timezone=d.get("timezone") or "",
+                skip_dates=d.get("skip_dates") or None,
             )
             if job is None:
                 # Lost the race (or already present): another registrar
@@ -1595,19 +1603,23 @@ async def deregister_app_crons_from_service(app_name: str, cron_service: Any) ->
     Idempotent — safe to call when no jobs are registered (returns ``0``).
     Returns the number of jobs removed.
 
-    Propagates :class:`CronStoreBusy` (re-raised) so a contended cleanup is
-    REPORTED to the disable/uninstall caller as a failure rather than masked as
-    a successful ``0`` while owned jobs stay enabled and keep executing.
+    Propagates :class:`CronStoreBusy` and :class:`CronStoreUnreadable`
+    (re-raised) so a cleanup that could not complete is REPORTED to the
+    disable/uninstall caller as a failure rather than masked as a successful ``0``
+    while owned jobs stay enabled and keep executing. The two are siblings, not
+    subclasses, so each needs naming: an unreadable store degrades to an empty job
+    list, which is indistinguishable HERE from an app that owned nothing.
     """
     if cron_service is None:
         return 0
     sdk = CronSDK(app_name, cron_service)
     try:
         return await sdk.remove_all_async()
-    except CronStoreBusy as exc:
+    except (CronStoreBusy, CronStoreUnreadable) as exc:
         logger.warning(
-            "App %s: cron cleanup could not complete — store busy: %s",
+            "App %s: cron cleanup could not complete (%s): %s",
             app_name,
+            type(exc).__name__,
             exc,
         )
         sel().log_api_access(

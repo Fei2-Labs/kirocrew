@@ -80,6 +80,12 @@ from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self, 
 from kiro_crew.peer_resolve import resolve_peer_identity
 from kiro_crew.sel import sel as _sel_fn
 
+
+def internal_path_matches(path: str, entries: Iterable[str]) -> bool:
+    """Return whether *path* is an exact or child path of an internal route."""
+    return any(path == entry or path.startswith(entry + "/") for entry in entries)
+
+
 logger = logging.getLogger(__name__)
 
 # Alias of bump_revocation_gen: callers elsewhere import the private name
@@ -705,9 +711,12 @@ _403_HTML = (
     "</style></head><body>"
     "<div class='c'>"
     "<div class='logo'>👻</div>"
-    "<h1>403 — {reason}</h1>"
-    "<p>Run <code>kirocrew token</code> in your terminal, then paste the URL below.</p>"
-    "<input id='u' type='text' placeholder='Paste token URL or raw token…' autofocus>"
+    "<h1>Sign in required — {reason}</h1>"
+    "<p>This browser does not have a dashboard session.</p>"
+    "<p>On a device already signed in, open <strong>Settings → Security → Sign in on mobile</strong>, "
+    "then send the sign-in link to this device. Or paste a sign-in link below.</p>"
+    "<p>No other signed-in device? Run <code>kirocrew token</code> in your terminal, then paste the URL below.</p>"
+    "<input id='u' type='text' placeholder='Paste sign-in link or token…' autofocus>"
     "<button onclick='go()'>Connect</button>"
     "<div class='err' id='e'>Invalid URL</div>"
     "</div>"
@@ -749,7 +758,9 @@ def generate_token(
     """Return ``base64url(payload).base64url(signature)``.
 
     The token carries two expiry times:
-    - ``exp``: link click window (5 minutes) — URL must be opened before this
+    - ``exp``: link click window (5 minutes, clamped to the session TTL so the
+      link never authenticates past the session it grants) — URL must be
+      opened before this
     - ``session_exp``: cookie session TTL (capped at 20 hours)
 
     When *app* is provided, the token payload includes ``"app": app`` so
@@ -794,7 +805,14 @@ def generate_token(
 
     payload_dict: dict[str, object] = {
         "sub": user_id,
-        "exp": now + LINK_WINDOW_SECS,
+        # The link-click window never extends past the session the link
+        # grants. The query-param path validates against ``exp`` alone (the
+        # nonce set is membership-only), so an uncapped window would let the
+        # raw link keep authenticating requests after ``session_exp`` passed —
+        # a token whose session lifetime was capped by its caller's own bounds
+        # (the mobile-link and tailnet-QR mints) would outlive the session
+        # that authorized it by up to the full window.
+        "exp": now + min(LINK_WINDOW_SECS, session_ttl),
         "session_exp": now + session_ttl,
         "iat": now,
         "nonce": nonce,
@@ -2069,13 +2087,8 @@ def token_auth_middleware(
         # Internal API paths: loopback + secret grants immediate access.
         # If the secret is missing (browser request), fall through to
         # normal cookie auth so dashboard pages can call these routes.
-        _matches_strict = internal_paths and (
-            path in internal_paths or any(path.startswith(p + "/") for p in internal_paths)
-        )
-        _matches_mixed = mixed_internal_paths and (
-            path in mixed_internal_paths
-            or any(path.startswith(p + "/") for p in mixed_internal_paths)
-        )
+        _matches_strict = internal_path_matches(path, internal_paths)
+        _matches_mixed = internal_path_matches(path, mixed_internal_paths)
         # local_only=False: treat ALL internal paths as mixed (backward compat
         # with mainline's local_only semantics — user opted into remote access)
         if not local_only and _matches_strict and not _matches_mixed:
@@ -2503,6 +2516,16 @@ def token_auth_middleware(
                 _token_boot = str(data.get("boot", ""))
                 if _token_boot:
                     _carried["boot"] = _token_boot
+                # ``no_refresh`` gets the same treatment as ``boot`` and for the
+                # same reason: the claim must survive the exchange or a DOWNSTREAM
+                # consumer that reads the session cookie to learn the caller's
+                # bounds (the mobile-link mint) sees an unbounded session and
+                # re-mints an unbounded credential — the exact laundering the
+                # claim exists to prevent. Validation never acts on it on the
+                # cookie path, so carrying it is inert for auth itself; the
+                # refresh chain is still suppressed below by never being minted.
+                if _no_refresh:
+                    _carried["no_refresh"] = "1"
                 session_token = generate_token(
                     user_id,
                     ttl_seconds=_remaining,

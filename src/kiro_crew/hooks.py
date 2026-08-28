@@ -506,14 +506,31 @@ class HookManager:
         default, or a backend that omits ``_meta.kiro``) fails closed: no match.
 
         ``mcp_tool_name`` is the sibling NON-model-authored tool identity from
-        ``_meta.kiro.toolName`` (``AcpEvent.tool_name``), set by kiro-cli
-        alongside ``mcp_server_name`` for MCP-served calls. It is used to
-        reconstruct the canonical ``mcp__<server>__<tool>`` name and govern the
-        REAL tool before the app-own-server auto-approve — because the ``tool_name``
-        title above is LLM-authored prose (``select_tool_title`` prefers the
-        model's ``description``) and may not carry the canonical form a per-tool
-        MCP policy matches on. Empty (no ``_meta.kiro.toolName``) means the tool
-        cannot be identified for governance, so the own-server auto-approve does
+        ``_meta.kiro.toolName`` (``AcpEvent.tool_name``). Despite the name it is
+        NOT MCP-only: kiro-cli sets it for every tool call it serves, built-ins
+        included, and sets ``mcp_server_name`` only for MCP-served ones. It is
+        therefore evaluated on the deny and governance planes whenever present,
+        server or no server -- otherwise a built-in's real name (``fs_write``)
+        reaches no check at all and a deny/ceiling rule naming it is bypassable
+        behind a benign model-authored title. With both present the
+        gate reconstructs the canonical ``mcp__<server>__<tool>`` name and runs
+        the effective deny set AND the governance ceiling against it as well as
+        against the title — because the ``tool_name`` title above is LLM-authored
+        prose (``select_tool_title`` prefers the model's ``description``) and may
+        not carry the canonical form a per-tool MCP policy matches on. Without
+        this, an ordinary MCP call whose policy-denied tool arrives under a benign
+        description would pass the gate and reach the human prompt, where an
+        "allow" would run a tool the ceiling forbids.
+
+        The canonical name is ADDED to those checks, never SUBSTITUTED for the
+        title: the two carry different security signals. The canonical name is
+        the trusted statement of WHICH MCP tool is being invoked, and is what a
+        per-tool ceiling or deny rule matches. The title and raw command carry
+        the path, command and content signals that a tool identity does not
+        express — ``~/.aws/credentials`` read through an innocuously named MCP
+        tool is denied by the title, not by the identity. Different dimensions,
+        so a deny on EITHER denies the call. Empty (no ``_meta.kiro.toolName``)
+        means the tool cannot be identified, so the own-server auto-approve does
         NOT fire (fall through to interactive approval — fail-closed).
         """
         # Deny-by-default: a shell tool whose command could not be recovered
@@ -573,10 +590,15 @@ class HookManager:
         # trust-root files (security_policy.json / profiles) is blocked even when
         # the title hides it. This is the keystone the governance model leans on
         # (agent-cannot-rewrite-its-own-ceiling), so it must not be title-gated.
+        # EVERY accepted spelling, and a deny on any of them denies: a backend that
+        # sends ``filePath`` (the camel-case form the search plane has always
+        # accepted) reached NEITHER of the two snake_case reads this used to do, so
+        # a write to ~/.ssh under that key was never gated and the human was asked
+        # to approve a path the keystone should have refused outright.
         if raw_params:
-            real_path = raw_params.get("path") or raw_params.get("file_path")
-            if isinstance(real_path, str) and real_path and is_sensitive_path(real_path):
-                return ToolHookResult.deny(f"Blocked: access to sensitive path: {real_path}")
+            for real_path in target_paths(raw_params):
+                if is_sensitive_path(real_path):
+                    return ToolHookResult.deny(f"Blocked: access to sensitive path: {real_path}")
         # Config files are WRITE-protected (reads stay allowed): block the agent's
         # file-EDIT tool from modifying config.json / config.local.json so a
         # prompt-injected agent cannot rewrite its own resource ceilings
@@ -600,11 +622,14 @@ class HookManager:
         # ``edit``); not hard-denying them keeps the two write-gates from drifting
         # into a read regression, and the bash gate covers the shell surface.
         if tool_kind == _EDIT_TOOL_KIND and raw_params:
-            wpath = raw_params.get("path") or raw_params.get("file_path")
-            if isinstance(wpath, str) and wpath and is_sensitive_write_path(wpath):
-                return ToolHookResult.deny(
-                    f"Blocked: modification of write-protected config path: {wpath}"
-                )
+            # Same spelling coverage as the sensitive-path keystone above, for the
+            # same reason: the write-protected tier is worthless if a config edit
+            # can name its target under a key the check never reads.
+            for wpath in target_paths(raw_params):
+                if is_sensitive_write_path(wpath):
+                    return ToolHookResult.deny(
+                        f"Blocked: modification of write-protected config path: {wpath}"
+                    )
         # Built-in security deny list (always enforced).  Route through the
         # active PlatformContext's PolicyAuthority so the Amazon companion's
         # ADD-only deny overlay (+ internal patterns) applies when loaded.  The
@@ -619,6 +644,62 @@ class HookManager:
         denied_regexes = self._effective_denied(ctx)
         denied_notes = self._denied_notes()
         deny_targets = [normalized, tool_name]
+        # The canonical ``mcp__<server>__<tool>`` identity, when kiro-cli supplied
+        # BOTH trusted ``_meta.kiro`` fields. ``select_tool_title`` prefers the
+        # model's prose ``description``, so ``tool_name`` for an MCP call may be
+        # "Look up the weather" rather than the canonical form a per-tool deny
+        # rule or MCP policy matches on. Reconstructing it here — on the COMMON
+        # path, before the deny floor and governance — is what makes a rule keyed
+        # on the real tool identity bind for every consumer of this gate, not
+        # only for the first-party own-server auto-approve below.
+        #
+        # ADDITIVE, never a substitution: the display title and the raw command
+        # stay in every check they were already in. They are not competing
+        # spellings of one fact — the canonical name is the trusted statement of
+        # WHICH tool runs, which is what a per-tool rule matches, while the title
+        # and command carry the path/command/content signals that identity does
+        # not express. Each covers a security dimension the other cannot, so both
+        # are evaluated and a deny on either denies. Both fields empty (a non-MCP
+        # call, or a backend that omits ``_meta.kiro``) leaves every target
+        # exactly as before.
+        canonical_mcp_name = (
+            f"mcp__{mcp_server_name}__{mcp_tool_name}" if mcp_server_name and mcp_tool_name else ""
+        )
+        if canonical_mcp_name:
+            deny_targets.append(canonical_mcp_name)
+        # The trusted tool identity on its own, which is the ONLY form a built-in
+        # carries: kiro-cli sets ``_meta.kiro.toolName`` for every tool call but
+        # ``mcpServerName`` only for MCP-served ones, so the canonical form above
+        # is empty for a built-in and its real name would otherwise reach no check
+        # at all -- leaving ``deny = ["fs_write"]`` bypassable behind a benign
+        # model-authored title. Appended whenever present, MCP or not, because a
+        # deny target can only ever DENY: an identity the model could influence
+        # cannot waive a rule here, at most it matches one it did not need to.
+        if mcp_tool_name and mcp_tool_name not in deny_targets:
+            deny_targets.append(mcp_tool_name)
+        # What the GOVERNANCE plane is asked about, which is NOT the same string,
+        # because that plane has a SERVER level the deny plane does not and it
+        # matches canonical references rather than raw titles.
+        #
+        # The ``mcp__<server>__<tool>`` title is a LOSSY encoding: the parser that
+        # reads it splits on the LAST ``__``, so it can carry any server name but
+        # never a tool name containing ``__``. ``@github`` + ``repo__delete``
+        # encodes to ``mcp__github__repo__delete`` and reads back as server
+        # ``github__repo`` with tool ``delete``, so a ``deny @github/repo__delete``
+        # ceiling never binds and a human is asked to approve a tool the policy
+        # forbids. No spelling of that title fixes it -- the ambiguity is in the
+        # format -- so the trusted fields are composed straight into the canonical
+        # ``@server/tool`` form the matcher documents, where ``/`` separates and
+        # neither segment can contain it. A server with no proven tool asks the
+        # server-level question ``@server``, which a ``@server`` rule matches and
+        # a ``@server/tool`` rule correctly does not.
+        #
+        # Deliberately NOT added to ``deny_targets``: that plane matches raw text
+        # and operator regexes, where a canonical reference is a DIFFERENT string
+        # from the raw identity a rule is written against rather than a broader
+        # form of it, and feeding it there would widen matching by accident
+        # instead of by grammar.
+        governance_mcp_ref = mcp_identity_ref(mcp_server_name, mcp_tool_name)
         if command:
             deny_targets.append(command)
         for target in deny_targets:
@@ -665,13 +746,42 @@ class HookManager:
         # Governance ceiling ∩ active profile (Level 1 ∩ Level 2).  Runs BEFORE
         # the auto-approve loop so a governance deny wins over a user
         # auto-approve and is never bypassed.  This is the layer that denies a
-        # tool/MCP call even when the kiro agent config granted it: the title for
-        # an MCP tool arrives as ``mcp__server__tool`` and is governed by name
-        # here regardless of kiro's allowedTools.  No-op on a standalone host
-        # with no policy and no bound profile (gate_decision permits), so today's
+        # tool/MCP call even when the kiro agent config granted it, by name,
+        # regardless of kiro's allowedTools.  No-op on a standalone host with no
+        # policy and no bound profile (gate_decision permits), so today's
         # behavior is preserved unless governance is configured.
+        #
+        # Governed under BOTH identities for the reason spelled out at
+        # ``canonical_mcp_name``: a ceiling/profile rule naming the real MCP tool
+        # must bind even when the title is model-authored prose, and a rule
+        # naming the title must still bind. Tightest-wins, so evaluating both and
+        # denying on either preserves the governance contract. The MCP identity
+        # is ``governance_mcp_name``, which falls back to the server alone when
+        # that is all the backend proved.
+        # Governance is asked about the display title AND, separately, the trusted
+        # MCP identity. The identity travels as a canonical reference rather than a
+        # title because the title grammar cannot round-trip every name (see
+        # ``mcp_identity_ref``); a deny on either is final. An absent identity
+        # (a non-MCP call) is not asked about at all -- an empty title classifies
+        # to the unprefixed scopes, where it is a queryable item rather than a
+        # no-op, so querying it could deny on a rule it has nothing to do with.
+        # ONE query, every identity. The title, the trusted tool name and the MCP
+        # reference are all asked against a SINGLE resolved profile: asking them
+        # as separate calls re-resolved the active profile each time, so a profile
+        # hot-reloaded mid-call could answer each question from a different
+        # snapshot and permit a tool that both complete profiles deny -- and each
+        # extra call walked ``profiles/`` synchronously on the event loop.
+        # Tightest-wins is preserved: a deny on any identity denies the call.
         gov_reason = _governance_denial(
-            ctx, tool_name, session_key, agent, app, tool_kind, raw_params
+            ctx,
+            tool_name,
+            session_key,
+            agent,
+            app,
+            tool_kind,
+            raw_params,
+            mcp_ref=governance_mcp_ref,
+            extra_titles=(mcp_tool_name,) if mcp_tool_name and mcp_tool_name != tool_name else (),
         )
         if gov_reason:
             return ToolHookResult.deny_policy(gov_reason)
@@ -740,40 +850,21 @@ class HookManager:
             and _is_first_party_app(owner_app)
             and _is_declared_builtin_mcp_server(mcp_server_name)
         ):
-            # Govern the REAL tool by its TRUSTED _meta.kiro identity before
-            # granting the intra-app auto-approve. ``select_tool_title`` prefers
-            # the model's prose ``description``, so ``tool_name`` (and thus the
-            # ``_governance_denial`` above) may not carry the canonical
-            # ``mcp__server__tool`` a per-tool policy matches on — a ceiling /
-            # profile that denies ONE tool of this server would otherwise be
-            # skipped here and the tool auto-executed. Reconstruct the canonical
-            # title from the NON-model-authored server + tool names (mirroring
-            # the ``mcp__<server>__<tool>`` form ``mcp_title_to_ref`` parses) and
-            # re-check governance. A missing trusted tool name (a backend without
-            # ``_meta.kiro.toolName``, or an uncached permission event) means we
-            # cannot prove WHICH tool this is, so we do NOT auto-approve — fall
-            # through to interactive approval (fail-closed), never silent execute.
-            if mcp_tool_name:
-                canonical_mcp_name = f"mcp__{mcp_server_name}__{mcp_tool_name}"
-                # Re-apply the always-on deny floor to the canonical name too:
-                # the top-of-method ``authority.is_denied`` ran against the prose
-                # title / command, so a configured deny rule (``auto_deny_tools``
-                # or a denied regex) keyed on the canonical ``mcp__server__tool``
-                # would have MISSED — and this auto-approve must never re-admit a
-                # tool the deny floor forbids. Mirrors the governance re-check.
-                deny_reason = authority.is_denied(
-                    canonical_mcp_name,
-                    self._config.auto_deny_tools,
-                    denied_regexes=denied_regexes,
-                    reason_notes=denied_notes,
-                )
-                if deny_reason:
-                    return ToolHookResult.deny(deny_reason)
-                gov_reason = _governance_denial(
-                    ctx, canonical_mcp_name, session_key, agent, app, tool_kind, raw_params
-                )
-                if gov_reason:
-                    return ToolHookResult.deny_policy(gov_reason)
+            # The deny floor has already run against ``canonical_mcp_name`` and
+            # governance against ``governance_mcp_name`` on the common path above,
+            # so a ceiling or profile denying ONE tool of this server — or the
+            # server as a whole — has returned a deny and cannot reach this
+            # auto-approve. Those checks live there only, so there is one copy to
+            # keep in step rather than two.
+            #
+            # The identity requirement is what this branch enforces: a missing
+            # trusted tool name (a backend without ``_meta.kiro.toolName``, or an
+            # uncached permission event) leaves ``canonical_mcp_name`` empty,
+            # which means WHICH tool this is cannot be proven — and an
+            # unidentifiable tool must not be auto-approved on the strength of its
+            # server alone. Fall through to interactive approval (fail-closed),
+            # never silent execute.
+            if canonical_mcp_name:
                 return ToolHookResult.auto_approve()
 
         # Auto-approve — match against both the original title (preserves
@@ -1054,8 +1145,16 @@ def _governance_denial(
     app: str,
     tool_kind: str = "",
     raw_params: dict | None = None,
+    mcp_ref: str = "",
+    extra_titles: tuple[str, ...] = (),
 ) -> str | None:
     """Return a denial reason if governance forbids *tool_name*, else None.
+
+    *mcp_ref* is an already-canonical ``@server`` / ``@server/tool`` reference
+    for the trusted MCP identity, evaluated in addition to (or instead of) the
+    display title. It is passed as a reference rather than folded into
+    *tool_name* because the title grammar cannot encode every identity; both are
+    empty for a non-MCP call with no title, which governs nothing.
 
     Resolves the active profile (Level 2) for the calling surface and intersects
     it with the boot-frozen ceiling (Level 1).  Fast no-op when the host has
@@ -1080,10 +1179,20 @@ def _governance_denial(
         if ceiling is None and profile is None:
             return None
         decision = gate_decision(
-            ceiling, profile, tool_name, tool_kind=tool_kind, raw_params=raw_params
+            ceiling,
+            profile,
+            tool_name,
+            tool_kind=tool_kind,
+            raw_params=raw_params,
+            mcp_ref=mcp_ref,
+            extra_titles=extra_titles,
         )
         if not decision.permitted:
-            _audit_governance(session_key, agent, tool_name, decision)
+            # The denied identity when the decision names one -- with the title,
+            # the trusted tool name and the MCP reference all in one query, the
+            # subject is whichever of them the rule matched, not always the title.
+            subject = getattr(decision, "item", "") or tool_name or mcp_ref
+            _audit_governance(session_key, agent, subject, decision)
             return f"Blocked by governance policy: {decision.reason}"
         return None
     except PlatformCompositionError:
@@ -1353,6 +1462,38 @@ _RECURSIVE_SEARCH_OPERATIONS: frozenset[str] = frozenset(
 # number and needs no such treatment.
 _SEARCH_PATH_FIELD = "path"
 
+#: EVERY argument name a tool may carry its target file path under. Public because
+#: it is shared with the consent prompt in ``cli_chat``: a prompt that disclosed a
+#: path the gate did not inspect would let the two disagree about what the target
+#: is, and the surface asking a human would be reading the weaker field. One tuple
+#: is what makes that parity structural instead of a comment claiming it.
+#:
+#: The camel-case spelling is not hypothetical -- ``_SEARCH_DENY_ARG_KEYS`` has
+#: accepted it for the search plane all along, while the sensitive-path keystone
+#: below read only the two snake_case forms.
+TARGET_PATH_KEYS: tuple[str, ...] = ("path", "file_path", "filePath")
+
+
+def target_paths(raw_params: Mapping | None) -> list[str]:
+    """Every non-empty string path in *raw_params*, under any accepted spelling.
+
+    Returns ALL of them rather than the first match, and callers deny if ANY is
+    forbidden. That is deliberately different from "normalize the aliases onto one
+    key and reject conflicts": a conflict rule has to decide which spelling wins,
+    and picking wrong is how a sensitive path slips past. Checking every value
+    present cannot be gamed by adding a second, innocent-looking alias, and needs
+    no adjudication.
+    """
+    if not isinstance(raw_params, Mapping):
+        return []
+    found: list[str] = []
+    for key in TARGET_PATH_KEYS:
+        value = raw_params.get(key)
+        if isinstance(value, str) and value.strip() and value not in found:
+            found.append(value)
+    return found
+
+
 # The SCOPE-bearing arguments of a file search as ``(canonical, accepted spellings)``,
 # in a fixed order so the synthesized target is deterministic. Scope is the root walked
 # and the depth cap — NOT what is being looked for. ``pattern`` and ``include`` are
@@ -1522,6 +1663,30 @@ def _is_search_shaped(raw_params: Mapping) -> bool:
         return True
     operation = raw_params.get("operation")
     return isinstance(operation, str) and operation in _RECURSIVE_SEARCH_OPERATIONS
+
+
+def mcp_identity_ref(mcp_server_name: str, mcp_tool_name: str) -> str:
+    """The canonical MCP reference governance is asked about, or ``""``.
+
+    Composes the trusted fields straight into the ``@server`` / ``@server/tool``
+    form :func:`_match_mcp` documents, instead of encoding them into an
+    ``mcp__<server>__<tool>`` title and having the parser split it back apart.
+    That round trip is lossy in one direction: the split takes the LAST ``__``,
+    so any tool name containing ``__`` re-parses into a different server and
+    tool, and a per-tool ceiling written against the real identity stops binding.
+    Composing the reference directly cannot mis-split, because the segments are
+    joined by ``/`` and neither an MCP server nor an MCP tool name contains one.
+
+    A server with no proven tool yields the server-level ``@server``: a
+    ``@server`` rule covers every tool under it, while a ``@server/tool`` rule
+    does not match it, so an unproven tool is never denied by a rule naming a
+    specific one.
+    """
+    if not mcp_server_name:
+        return ""
+    if not mcp_tool_name:
+        return f"@{mcp_server_name}"
+    return f"@{mcp_server_name}/{mcp_tool_name}"
 
 
 def _search_deny_target(raw_params: dict | None) -> str:
@@ -1882,8 +2047,9 @@ def safe_read_file_bytes_nolink(
     ``st_nlink > 1`` or a non-regular file type is rejected.
 
     When ``within_root`` is given, the OPENED descriptor's real path
-    (via ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS) must resolve
-    inside that root and must not be sensitive. ``O_NOFOLLOW`` only guards the
+    (via ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS, or
+    ``GetFinalPathNameByHandleW`` on Windows) must resolve inside that root and
+    must not be sensitive. ``O_NOFOLLOW`` only guards the
     FINAL path component — a nested directory swapped for a symlink between
     the tree walk and the open would silently escape the approved tree. The
     fd-path check is pinned to the inode actually opened, so no check-to-use
@@ -2686,14 +2852,31 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # reader holds a short cache -- for the same reason as the mint entry below.
     "kiro_prerequisite.identity_fingerprint": ".local/share/kiro-cli/data.sqlite3",
     # Class 2. kiro-cli's MCP OAuth artifact cache under ``~/.aws/sso/cache``.
-    # ``kiro_crew.connections.mint.grant_present`` STATS the paired
+    # ``kiro_crew.mcp_grant.grant_present`` STATS the paired
     # ``<sha256(mcp_url)>.token.json`` / ``.registration.json`` artifacts to learn
-    # whether kiro-cli already holds a grant for ONE provider -- the mint's only
-    # consent-completion signal. The files are never opened, so no token material
-    # can enter the process, and the name is a hex digest of a registry-declared
-    # provider URL, so no other path in that directory is expressible. Audited on
-    # the observation a caller acts on, not per poll; see
-    # ``mint._grant_observed`` for why that boundary is not fail-closed.
+    # whether kiro-cli already holds a grant for ONE endpoint. The files are never
+    # opened, so no token material can enter the process.
+    #
+    # TWO callers, and the second is the wider one: the mint's consent-completion
+    # signal (curated registry providers only), and ``mcp_discovery``'s remote
+    # probe, which asks for ANY url the user configured whenever a probe meets an
+    # OAuth challenge. So the reasoning cannot rest on the url being
+    # registry-declared. What keeps it sound for arbitrary input is the key: the
+    # name is a sha256 over the url's normalized origin and path, so no caller can
+    # express a path outside this directory, name a file it did not derive, or
+    # smuggle a credential from the url into the filename. The digest is also why
+    # the widened caller set adds no read surface -- both callers can only ever
+    # probe for the pair belonging to the url they already hold.
+    #
+    # Audited on the observation a caller acts on, not per poll, and the two
+    # callers differ on which observations those are. The mint polls for a grant
+    # to APPEAR, so only its TRUE is acted on and recorded. The probe reads once
+    # and renders either answer -- an absent pair is what produces "Sign-in
+    # required" -- so it opts into recording the negative too, as ``missing``.
+    # See ``mcp_grant.grant_observed`` for why that boundary is not fail-closed,
+    # and note that neither caller logs the url itself (the probe logs the server
+    # name, the mint warning logs the key) because a user-supplied endpoint can
+    # carry a credential in its userinfo or query string.
     "connections_mint.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
     # Class 2, same artifacts and same posture as the mint entry above: the
     # status module (``kiro_crew.connections.status``) STATS the identical
@@ -2833,6 +3016,89 @@ def validate_hook_fields(
             re.compile(matcher)
         except re.error as exc:
             raise ValueError(f"invalid regex: {exc}") from None
+
+
+# Env keys a script-hook subprocess may inherit from the gateway. A script hook
+# runs an operator/agent-authored command through ``/bin/sh -c`` (POSIX) or
+# ``cmd /c`` (Windows), so it needs only what the shell and an ordinary command
+# require to run — an interpreter/tool on PATH, HOME, locale, TLS trust, and a
+# proxy — plus the two hook-metadata variables injected below. Inheriting the
+# whole gateway environment (``{**os.environ, ...}``) also handed every hook the
+# gateway's AWS keys, model/provider keys, OAuth tokens, and connection strings,
+# which a hostile or careless command could echo straight back through stdout,
+# stderr, or the audit trail. This is the same strict-allowlist boundary the
+# authenticated ``gh``/``glab`` spawns cross (``_PROVIDER_BASE_ENV_KEYS`` in
+# ``dashboard/handlers/source_providers.py``); a variable a hook genuinely needs
+# is added here by name, never by opening the gate to the whole environment. A
+# key absent from the host environment is simply not forwarded — the allowlist
+# is a filter, not a set of required keys — so a minimal container is unaffected.
+_HOOK_BASE_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        # A hook subprocess sees ONLY these ambient keys (plus the two
+        # KIROCREW_HOOK_* metadata vars). A hook that depended on an ambient var
+        # NOT listed here (e.g. VIRTUAL_ENV, PYTHONPATH, JAVA_HOME, AWS_PROFILE,
+        # nvm/pyenv vars) will fail after upgrade with a "works in my terminal,
+        # fails in the hook" symptom — the fix is to add that key here by name.
+        # This fail-closed direction is deliberate: the allowlist is the
+        # secret-egress boundary, so widening it is a per-key security decision.
+        # Shell / command resolution. PATH is what lets ``/bin/sh -c "python …"``
+        # find the interpreter; the Windows spellings mirror it there.
+        "PATH",
+        "PATHEXT",
+        "COMSPEC",
+        "SYSTEMROOT",
+        # Home / user profile — a hook command that reads or writes under ``~``.
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        # Data home — a hook that invokes the ``kirocrew`` CLI (or otherwise
+        # reads the instance's data dir) must resolve the gateway's overridden
+        # home, not the default ``~/.kiro/crew``. It is a path, not a credential,
+        # so preserving it does not widen the secret-egress boundary this env
+        # allowlist exists to close.
+        "KIROCREW_HOME",
+        # Temp dir — a hook that stages a scratch file.
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        # Locale — so a hook's output encoding matches the host.
+        "LANG",
+        "LC_ALL",
+        # TLS trust may be required by network clients. Proxy URLs are omitted:
+        # HTTP(S)_PROXY commonly embeds userinfo credentials, and script hooks
+        # are an untrusted execution boundary. NO_PROXY carries host patterns,
+        # not credentials, and is safe to preserve.
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "NO_PROXY",
+        "no_proxy",
+    }
+)
+
+
+def _hook_subprocess_env(hook: "ScriptHook", context: str) -> dict[str, str]:
+    """Build the environment a script-hook subprocess runs with.
+
+    A strict allowlist over ``os.environ`` (``_HOOK_BASE_ENV_KEYS``) plus the two
+    hook-metadata variables the hook contract exposes — never a copy of the whole
+    gateway environment, which would leak the gateway's credentials to every hook
+    command (see ``_HOOK_BASE_ENV_KEYS``). The metadata variables are set LAST so
+    a same-named ambient variable can never shadow them.
+
+    ``KIROCREW_HOOK_CONTEXT`` is capped for a Stop event only: the env var is
+    bounded by ARG_MAX (~32K on Windows), and a multi-KB Stop segment there can
+    fail subprocess creation. The full context still reaches the hook via the
+    stdin JSON payload (``Stop -> hook_event["assistant_text"]``) and drove
+    matcher evaluation, so the cap loses nothing the hook cannot recover.
+    """
+    env = {k: v for k, v in os.environ.items() if k in _HOOK_BASE_ENV_KEYS}
+    env["KIROCREW_HOOK_EVENT"] = hook.event
+    env["KIROCREW_HOOK_CONTEXT"] = context[:500] if hook.event == HOOK_EVENT_STOP else context
+    return env
 
 
 @dataclass
@@ -3138,18 +3404,13 @@ async def run_script_hook(
 
     try:
         # circular import: sandbox → registry → apps → hooks, so import at call time
-        from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+        from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
 
-        # The env var is bounded by ARG_MAX — a multi-KB Stop segment there can
-        # fail subprocess creation (~32K on Windows). Cap the ENV copy only; the
-        # full context still reaches the hook via the stdin JSON payload
-        # (Stop -> hook_event["assistant_text"]) and drove matcher evaluation.
-        env_context = context[:500] if hook.event == HOOK_EVENT_STOP else context
-        env = {
-            **os.environ,
-            "KIROCREW_HOOK_EVENT": hook.event,
-            "KIROCREW_HOOK_CONTEXT": env_context,
-        }
+        # A script hook inherits only the minimum env its shell + command need
+        # (``_HOOK_BASE_ENV_KEYS``) plus the two hook-metadata variables — NOT a
+        # copy of the whole gateway environment, which would expose the gateway's
+        # AWS/model/OAuth/connection-string credentials to every hook command.
+        env = _hook_subprocess_env(hook, context)
         # Shell per platform: POSIX /bin/sh -c, Windows cmd /c (no /bin/sh there).
         # The argv is what the sandbox/cgroup chokepoints below vet, on BOTH
         # platforms — only the eventual spawn form differs (see the Windows
@@ -3158,8 +3419,14 @@ async def run_script_hook(
             argv = ["cmd", "/c", hook.command]
         else:
             argv = ["/bin/sh", "-c", hook.command]
-        wrapped_argv, cleanup_path = wrap_argv(argv)
-        wrapped_argv = cgroup_scope_argv(wrapped_argv)  # cgroup DoS ceiling
+        # Route argv and the strict hook allowlist through the shared spawn
+        # funnel. Besides filesystem isolation and cgroup limits, this lets an
+        # outer systemd-run wrapper receive its user-bus locators while inserting
+        # an inner `env -u` shim that removes them before the hook command execs.
+        # Calling wrap_argv + cgroup_scope_argv directly would give the wrapper
+        # the child-safe allowlist and make it fail before a PreToolUse policy
+        # hook could run.
+        wrapped_argv, env, cleanup_path = sandboxed_spawn_argv(argv, env=env)
         # Process-group isolation for clean tree-kill on timeout. Pass both flags
         # explicitly (NOT **dict unpack — breaks mypy's Popen overload resolution
         # on the build fleet): start_new_session=True is a no-op on Windows,
@@ -3218,15 +3485,19 @@ async def run_script_hook(
                     pass
         elapsed = int((time.monotonic() - start) * 1000)
         exit_code = proc.returncode or 0
+        # Decode with the upstream byte cap (#5442) so redaction never sees an
+        # unbounded string, THEN redact the full capped streams through the
+        # canonical companion-aware shim before any truncation or return
+        # (#5441). Both fields are returned by the test API, and stdout can also
+        # become model context for prompt/spawn hooks; redacting the capped text
+        # first prevents a credential that straddles a presentation boundary
+        # (e.g. the 500-char stderr cut for last_error, #4708) from leaking as
+        # an unredacted fragment.
         stdout_text = _decode_capped(stdout_b, stdout_trunc).strip()
         stderr_text = _decode_capped(stderr_b, stderr_trunc).strip()
-        # Redact the FULL (capped) stderr through the canonical companion-aware
-        # shim before truncating, so a credential straddling the 500-char
-        # boundary cannot leak as an unredacted fragment. The field surfaces on
-        # the dashboard and must not expose secrets (#4708). Memory is already
-        # bounded upstream by the byte cap (#5442), so redaction never sees an
-        # unbounded string.
-        stderr_safe = redact_via_context(stderr_text)[:500] if stderr_text else ""
+        stdout_safe = redact_via_context(stdout_text) if stdout_text else ""
+        stderr_safe_full = redact_via_context(stderr_text) if stderr_text else ""
+        stderr_safe = stderr_safe_full[:500]
         hook.last_run = time.time()
         if exit_code == 2:
             hook.last_status = "blocked"
@@ -3242,8 +3513,8 @@ async def run_script_hook(
             hook_id=hook.id,
             hook_name=hook.name,
             event=hook.event,
-            stdout=stdout_text,
-            stderr=stderr_text,
+            stdout=stdout_safe,
+            stderr=stderr_safe_full,
             exit_code=exit_code,
             duration_ms=elapsed,
         )
@@ -3283,15 +3554,16 @@ async def run_script_hook(
         )
     except Exception as exc:
         elapsed = int((time.monotonic() - start) * 1000)
+        safe_error = redact_via_context(str(exc))
         hook.last_run = time.time()
         hook.last_status = "error"
-        hook.last_error = str(exc)[:500]
+        hook.last_error = safe_error[:500]
         hook.run_count += 1
         return ScriptHookResult(
             hook_id=hook.id,
             hook_name=hook.name,
             event=hook.event,
-            error=str(exc),
+            error=safe_error,
             duration_ms=elapsed,
         )
 

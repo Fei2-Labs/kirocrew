@@ -52,7 +52,6 @@ single completion path that serves every terminal outcome:
 
 ```
 [Subagent completion event]
-Event: `<stable delivery event id>`
 Agent `<id>` (<agent name>) <status> <emoji>
 Task: <first 100 chars of the task>
 
@@ -60,13 +59,6 @@ Task: <first 100 chars of the task>
 ```
 
 - Prefix `SUBAGENT_COMPLETION_PREFIX = '[Subagent completion event]'`.
-- Coordinator-backed completions include an additive `Event:` line and the same
-  identifier in `meta.subagentCompletion.eventId`. A wave digest includes one
-  line per member and every identifier in the additive
-  `meta.subagentCompletion.eventIds` list; `eventId` retains the flushing
-  member's identifier for compatibility. A delivery retry may repeat stable
-  IDs, but it never repeats execution. Legacy envelopes omit the lines and
-  remain valid.
 - `<status> <emoji>` is one of `completed ✅`, `failed ❌`, or `stopped by user ⏹`.
   The agent-name parenthetical is present only when the sub-agent ran under a named
   agent.
@@ -115,15 +107,16 @@ Use the read tool to retrieve it if needed.
 
 The outcome line reflects the run's actual terminal state instead of asserting
 completion — this path fires for every terminal state, including runs that
-never executed:
+never executed (the never-ran reading comes from the record's execution marker,
+never from its error wording):
 
 - completed: `The agent finished but result delivery timed out.`
-- failed: `The agent failed before a result could be delivered.`
+- failed after execution began: `The agent failed before a result could be delivered.`
+- failed before execution (approval or queued rejection, no output exists):
+  `The run failed before it started, so there is no result to deliver.`
 - stopped before execution began (no output exists):
   `The run was stopped before it started, so there is no result to deliver.`
 - stopped mid-run: `The run was stopped before it completed.`
-- rejected before start (approval or queued rejection):
-  `The run was rejected before it started, so there is no result to deliver.`
 
 The result-path lines are present only when a result file exists. **The result is
 on disk**, so use the `read` tool to retrieve it rather than re-running the work.

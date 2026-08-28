@@ -127,7 +127,7 @@ class WatchdogSettings:
     behaves identically to a default config.
 
     Every idle window must stay strictly inside the turn's own wall-clock
-    ceiling — see :func:`_clamp_to_turn_ceiling` for why and
+    ceiling — see :func:`_clamp_to_prompt_ceiling` for why and
     :data:`_TURN_CEILING_WINDOW_FRACTION` for the enforced headroom."""
 
     check_after_secs: float = 60.0
@@ -544,6 +544,10 @@ class AcpSessionHandle:
         # toolCallId -> redacted input string, written by the shared parser so a
         # later tool result can recover its originating input (mirrors AcpClient).
         self._tool_call_inputs: dict[str, str] = {}
+        # Same-key provenance for ``_tool_call_inputs``.  The cached text is
+        # intentionally redacted; this bit lets an approval surface fail closed
+        # without retaining or forwarding the removed secret bytes.
+        self._tool_call_input_redacted: dict[str, bool] = {}
         # toolCallId -> is_shell, cached from the tool_call notification so the
         # later permission_request event (which carries no trusted kind) can
         # inherit the canonical shell signal. Mirrors AcpClient's cache and is
@@ -801,6 +805,7 @@ class AcpSessionHandle:
         self._retire_liveness_state()
         self._working_logged_ts = _WORKING_NEVER_LOGGED
         self._tool_call_inputs.clear()
+        self._tool_call_input_redacted.clear()
         self._tool_call_is_shell.clear()
         self._tool_call_raw_params.clear()
         self._tool_call_mcp_server.clear()
@@ -1652,6 +1657,17 @@ class AcpSessionHandle:
             avail = models.get("availableModels", [])
             if isinstance(avail, list):
                 self._available_models = self._normalize_models(avail)
+            # A backend may advertise its model list without echoing
+            # ``currentModelId`` (it is best-effort in the ACP shape). When it
+            # names exactly one model that IS the served model unambiguously, so
+            # adopt it as the resolved id — otherwise ``served_model`` reports
+            # ``""`` for the whole session on an unpinned run (no ``set_model``,
+            # no ``currentModelId``), which is why the panel's model chip stays
+            # blank until completion fills it from a different source. With two
+            # or more advertised and no ``currentModelId`` the served choice is
+            # genuinely unknown, so leave it empty rather than guess.
+            if not self._resolved_model_id and len(self._available_models) == 1:
+                self._resolved_model_id = self._available_models[0]["modelId"]
         elif isinstance(models, list):
             self._available_models = self._normalize_models(models)
 
@@ -1897,10 +1913,15 @@ class AcpSessionHandle:
                     # ── Verdict-driven watchdogs ──
                     # Wellness (the liveness oracle) is the detector; timeouts
                     # govern only the UNKNOWN class. Idle clocks: the stale clock
-                    # folds in the runtime's stderr/keepalive clock (_last_activity
-                    # — kiro streams thinking_tokens on STDERR during reasoning);
-                    # the tool clock keys off session-queue frames only (keepalive
-                    # and progress frames for the session reset last_data_ts, so a
+                    # folds in the runtime's activity clock (_last_activity —
+                    # advanced by stdout lines, outbound requests and
+                    # notifications, and the /api/session-keepalive touch, but
+                    # NOT by a response or error we send back, and NOT by
+                    # stderr: AcpRuntime's stderr drain only rings the
+                    # _stderr_lines buffer, so a kiro-cli reasoning burst on
+                    # stderr does not move this clock); the tool clock keys off
+                    # session-queue frames only (keepalive and progress frames
+                    # for the session reset last_data_ts, so a
                     # legitimately-streaming tool keeps the watchdog satisfied).
                     if self._cancelled:
                         continue
@@ -2810,6 +2831,7 @@ class AcpSessionHandle:
         event, recorded = build_permission_event(
             msg,
             tool_input_cache=self._tool_call_inputs,
+            tool_input_redacted_cache=self._tool_call_input_redacted,
             shell_cache=self._tool_call_is_shell,
             raw_params_cache=self._tool_call_raw_params,
             mcp_server_name_cache=self._tool_call_mcp_server,
@@ -3097,6 +3119,7 @@ class AcpSessionHandle:
             child_events = parse_session_update(
                 update,
                 tool_input_cache=self._tool_call_inputs,
+                tool_input_redacted_cache=self._tool_call_input_redacted,
                 shell_cache=self._tool_call_is_shell,
                 raw_params_cache=self._tool_call_raw_params,
                 mcp_server_name_cache=self._tool_call_mcp_server,
@@ -3192,6 +3215,7 @@ class AcpSessionHandle:
                     parse_session_update(
                         update,
                         tool_input_cache=self._tool_call_inputs,
+                        tool_input_redacted_cache=self._tool_call_input_redacted,
                         shell_cache=self._tool_call_is_shell,
                         raw_params_cache=self._tool_call_raw_params,
                         mcp_server_name_cache=self._tool_call_mcp_server,
@@ -3213,6 +3237,7 @@ class AcpSessionHandle:
         events = parse_session_update(
             update,
             tool_input_cache=self._tool_call_inputs,
+            tool_input_redacted_cache=self._tool_call_input_redacted,
             shell_cache=self._tool_call_is_shell,
             raw_params_cache=self._tool_call_raw_params,
             mcp_server_name_cache=self._tool_call_mcp_server,

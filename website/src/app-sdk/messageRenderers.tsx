@@ -6,15 +6,18 @@
  * or replace one (its own approval UI, its own tool row) without forking the
  * transcript. A host passes extra entries; they win over the defaults.
  *
- * This module must stay free of any store, router, or `pages/`-level import: the
+ * This module must stay free of any store, router, or selector reach: the
  * consumers that most need a shared transcript run outside the dashboard's React
  * root and have no Redux store at all, so a renderer that reaches for a selector
- * is unusable to them. Anything that genuinely needs live app state is supplied
- * BY the host as a registry entry instead.
+ * is unusable to them. Presentational components from `pages/chat/` are fine
+ * (this module already imports several); anything that genuinely needs live app
+ * state is supplied BY the host as a registry entry instead.
  */
 import React, { memo } from 'react'
 import { Clock, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { i18nT } from '../i18n/t'
+import { isNoteRow } from '../lib/noteContract'
+import { parseOptions } from './protocol'
 import { extractToolFilePath } from '../utils/toolFilePath'
 import { isSafePath } from '../utils/safePath'
 import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage'
@@ -22,6 +25,8 @@ import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
 import NudgeCard from '../pages/chat/NudgeCard'
+import NoticeCard from '../pages/chat/NoticeCard'
+import { ErrorCard } from '../pages/chat/ErrorCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
@@ -302,13 +307,16 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     roles: ['inject'],
     render: (m, ctx) => {
       const cronLabel = (m.meta?.cronLabel as string) || ''
-      const cleanContent = cronLabel
+      const stripped = cronLabel
         ? m.content.replace(/^\[Cron notification from ".*"\]\n/, '').replace(/\n\[End of cron notification\]$/, '')
         : m.content
+      // A note's marker is consumed into the pill row, so rendering it too would show the
+      // same choices twice. Non-note inject rows keep it: there it is prose, not syntax.
+      const cleanContent = isNoteRow(m) ? parseOptions(stripped).text : stripped
       return ctx.wrapper(
         <>
           {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
-          <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warning-subtle text-fg ring-1 ring-inset forced-colors:border ring-warning/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+          <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
             <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} /></MessageErrorBoundary>
           </div>
         </>,
@@ -318,20 +326,15 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
   {
     id: 'error',
     roles: ['error'],
-    render: (m, ctx) => ctx.row(
-      <div className="bg-danger-subtle text-danger text-[13px] leading-5 px-3 py-2 rounded-md ring-1 ring-inset forced-colors:border ring-danger/15 self-center animate-scale-in">
-        {m.content}
-      </div>,
-    ),
+    // The shared ErrorCard, deliberately without `onContinue`: omitting the
+    // handler selects its settled (non-continuable) shape, and the app-sdk
+    // surface has no turn to resume, so it must never grow the affordance.
+    render: (m, ctx) => ctx.row(<ErrorCard content={m.content} />),
   },
   {
     id: 'notice',
     roles: ['notice'],
-    render: (m, ctx) => ctx.row(
-      <div className="bg-card text-muted text-[13px] leading-5 px-3 py-2 rounded-md ring-1 ring-inset forced-colors:border ring-border self-center animate-scale-in">
-        {m.content}
-      </div>,
-    ),
+    render: (m, ctx) => ctx.row(<NoticeCard content={m.content} />),
   },
   {
     // Grouped and lifecycle-only roles have no row of their own: a thinking or

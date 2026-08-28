@@ -3,7 +3,8 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Hourglass, Info, Package } from 'lucide-react'
 import { SettingsCard, SettingsToggle, SettingsSelect, SettingsInput, SettingsButtonGroup, SettingsStepper } from '../../components/settings'
 import { Badge, Btn, FormSkeleton } from '../../components/ui'
-import { api } from '../../api/client'
+import { api, ApiError } from '../../api/client'
+import { RestartGatewayButton } from './AboutPanel'
 import { listMicrophones, getPreferredMicId, setPreferredMicId, acquireMicStream, reportIfMicDenied } from '../../hooks/mic'
 import { isEmbeddedPane } from '../../lib/embedded'
 import { PttTestStrip } from '../../components/PttTestStrip'
@@ -49,6 +50,7 @@ interface SttConfig {
   install_error: string
   prereqs: string[]
   transcribe_unsupported?: boolean
+  faster_unsupported?: boolean
   bundled_interpreter?: boolean
   ffmpeg_missing?: boolean
 }
@@ -63,7 +65,7 @@ interface SttConfig {
  * full literal keys indexed inline at the `i18nT()` call — the only shape
  * `scripts/check-i18n-keys.mjs` can resolve statically.
  */
-const STEP_LABEL_KEY: Record<string, string> = {
+export const STEP_LABEL_KEY: Record<string, string> = {
   starting: 'pages.settings.sttSettings.step_starting',
   checking: 'pages.settings.sttSettings.step_checking',
   installing_xcode: 'pages.settings.sttSettings.step_installing_xcode',
@@ -72,6 +74,7 @@ const STEP_LABEL_KEY: Record<string, string> = {
   installing_ffmpeg: 'pages.settings.sttSettings.step_installing_ffmpeg',
   installing_whisper: 'pages.settings.sttSettings.step_installing_whisper',
   installing_mlx: 'pages.settings.sttSettings.step_installing_mlx',
+  installing_faster: 'pages.settings.sttSettings.step_installing_faster',
   done: 'pages.settings.sttSettings.step_done',
   error: 'pages.settings.sttSettings.step_error',
 }
@@ -92,12 +95,22 @@ function stepLabel(step: string): string {
  * The provider *names* (Whisper, MLX, Transcribe) are DNT — only the
  * parenthetical qualifier is copy.
  */
-const PROVIDER_LABEL_KEY: Record<string, string> = {
+export const PROVIDER_LABEL_KEY: Record<string, string> = {
   whisper: 'pages.settings.sttSettings.provider_whisper',
   mlx: 'pages.settings.sttSettings.provider_mlx',
   apple: 'pages.settings.sttSettings.provider_apple',
   transcribe: 'pages.settings.sttSettings.provider_transcribe',
+  faster: 'pages.settings.sttSettings.provider_faster',
 }
+
+/**
+ * Providers that name their model with a Whisper size (`turbo`, `small`, …) and so
+ * share the `model` field and its picker. `mlx` is excluded: it takes a
+ * HuggingFace repo id in `mlx_model` instead, which is a different control.
+ *
+ * File scope so `check-i18n-keys.mjs` can resolve it, same as `PROVIDER_LABEL_KEY`.
+ */
+export const WHISPER_MODEL_PROVIDERS = ['whisper', 'faster']
 
 /** Localised dropdown label for a provider id, falling back to the raw id. */
 function providerLabel(provider: string): string {
@@ -350,6 +363,17 @@ export default function SttSettings({ cardIndex }: {
     },
     onError: (e: Error) => setErr(e.message || i18nT('pages.settings.sttSettings.install_failed')),
   })
+  const [restarting, setRestarting] = useState(false)
+  const restartMut = useMutation({
+    mutationFn: () => api.restartGateway(),
+    onSuccess: () => setRestarting(true),
+    onError: (e: unknown) => {
+      // Restarting normally resets the connection before a response arrives.
+      // Only a structured server rejection is a real failure.
+      if (e instanceof ApiError) setErr(e.message || i18nT('pages.settings.aboutPanel.restart_failed'))
+      else setRestarting(true)
+    },
+  })
 
   const stt = sttQ.data
   if (!stt) return (
@@ -364,6 +388,11 @@ export default function SttSettings({ cardIndex }: {
   const installing = isInstalling(stt)
   const isTranscribe = stt.provider === 'transcribe'
   const provider = stt.provider || 'whisper'
+  // `faster` on a platform with no CTranslate2 wheel: the Install button can only
+  // ever fail here (the backend refuses the request outright), so it is hidden and
+  // replaced with the alternatives — the same reasoning that hides it for
+  // Transcribe, whose requirement the button also cannot satisfy.
+  const fasterUnsupported = provider === 'faster' && !!stt.faster_unsupported
   const providerOptions = stt.providers?.length ? stt.providers : ['whisper', 'transcribe']
   // Gate the streaming controls on the CAPABILITY, not on a provider name. The
   // backend owns the list (`stt_stream._STREAMING_PROVIDERS`) and serves it, so
@@ -430,7 +459,7 @@ export default function SttSettings({ cardIndex }: {
 
         <SettingsSelect label={i18nT('pages.settings.sttSettings.provider')} description={i18nT('pages.settings.sttSettings.whisper_and_mlx_run_locally_transcribe_calls_aws')} value={provider} options={providerOptions} optionLabels={providerOptions.map(providerLabel)} onChange={handleProvider} disabled={saving} />
 
-        {provider === 'whisper' && (
+        {WHISPER_MODEL_PROVIDERS.includes(provider) && (
           <SettingsSelect label={i18nT('pages.settings.sttSettings.model')} description={i18nT('pages.settings.sttSettings.larger_models_are_more_accurate_but_slower_to_ru')} value={stt.model} options={Object.keys(stt.models)} optionLabels={Object.entries(stt.models).map(([n, s]) => `${n} (${s})`)} onChange={v => set({ model: v })} disabled={saving} />
         )}
 
@@ -479,6 +508,18 @@ export default function SttSettings({ cardIndex }: {
                 </p>
               </div>
             )}
+            {fasterUnsupported && (
+              // No CTranslate2 wheel exists for this platform and there is no
+              // sdist to build from, so pip cannot resolve the dependency at all.
+              // Nothing the user does to this machine changes that, so name the
+              // providers that DO work instead of leaving an Install button whose
+              // every press returns the same 400.
+              <div className="mb-3 bg-warn-subtle border border-border rounded-lg p-3 animate-rise">
+                <p className="text-sm text-text">
+                  {i18nT('pages.settings.sttSettings.faster_unsupported_windows_arm')}
+                </p>
+              </div>
+            )}
             {stt.prereqs?.length > 0 && !installing && (
               <div className="mb-3 bg-accent/10 border border-accent/20 rounded-lg p-3 animate-rise">
                 <p className="text-sm text-text font-medium mb-2">{i18nT('pages.settings.sttSettings.run_these_commands_in_your_terminal_first')}</p>
@@ -495,7 +536,15 @@ export default function SttSettings({ cardIndex }: {
                     button the default trailer points at is hidden. */}
                 {isTranscribe ? (
                   stt.prereqs.some(c => c.includes('kirocrew[voice]')) && (
-                    <p className="text-muted text-[13px] mt-2">{i18nT('pages.settings.sttSettings.then_restart_the_gateway_so_it_can_import_the_ne')}</p>
+                    <div className="flex flex-wrap items-center gap-2 mt-2">
+                      <p className="text-muted text-[13px]">{i18nT('pages.settings.sttSettings.then_restart_the_gateway_so_it_can_import_the_ne')}</p>
+                      <RestartGatewayButton
+                        pending={restartMut.isPending}
+                        restarting={restarting}
+                        onConfirm={() => restartMut.mutate()}
+                        testId="stt-restart-gateway"
+                      />
+                    </div>
                   )
                 ) : (
                   <p className="text-muted text-[13px] mt-2">{i18nT('pages.settings.sttSettings.then_click_install_below')}</p>
@@ -511,24 +560,31 @@ export default function SttSettings({ cardIndex }: {
                 {stt.install_detail && <p className="text-muted text-[13px] font-mono truncate">{stt.install_detail}</p>}
                 <div className="mt-2 h-1.5 bg-border rounded-full overflow-hidden">
                   <div className="h-full bg-accent rounded-full transition-all duration-500 animate-pulse"
-                    style={{ width: stt.install_step === 'checking' ? '10%' : stt.install_step === 'installing_xcode' ? '15%' : stt.install_step === 'installing_brew' ? '25%' : stt.install_step === 'installing_python' ? '35%' : stt.install_step === 'installing_ffmpeg' ? '50%' : stt.install_step === 'installing_whisper' ? '70%' : '5%' }} />
+                    style={{ width: stt.install_step === 'checking' ? '10%' : stt.install_step === 'installing_xcode' ? '15%' : stt.install_step === 'installing_brew' ? '25%' : stt.install_step === 'installing_python' ? '35%' : stt.install_step === 'installing_ffmpeg' ? '50%' : stt.install_step === 'installing_whisper' || stt.install_step === 'installing_faster' ? '70%' : '5%' }} />
                 </div>
               </div>
-            ) : !isTranscribe && (
+            ) : !isTranscribe && !fasterUnsupported && (
               // Hidden for Transcribe: the button installs a local Whisper
               // runtime, which cannot change Transcribe's availability — its
               // requirement is the `voice` extra surfaced in the prereq block
               // above, and the backend rejects the install for this provider.
+              // Hidden for an unsupported `faster` platform for the same reason:
+              // the backend refuses that request too, so the button could only
+              // ever produce the notice already shown above.
               <>
                 <Btn onClick={() => installMut.mutate()}>
                   {provider === 'mlx'
                     ? <><Package className="lucide-inline" /> {i18nT('pages.settings.sttSettings.install_mlx_whisper')}</>
-                    : <><Package className="lucide-inline" /> {i18nT('pages.settings.sttSettings.install_whisper')}</>}
+                    : provider === 'faster'
+                      ? <><Package className="lucide-inline" /> {i18nT('pages.settings.sttSettings.install_faster_whisper')}</>
+                      : <><Package className="lucide-inline" /> {i18nT('pages.settings.sttSettings.install_whisper')}</>}
                 </Btn>
                 <p className="text-muted text-[13px] mt-2">
                   {provider === 'mlx'
                     ? i18nT('pages.settings.sttSettings.installs_mlx_whisper_via_pipx_ffmpeg_apple_silic')
-                    : i18nT('pages.settings.sttSettings.installs_openai_whisper_ffmpeg_uses_system_pytho')}
+                    : provider === 'faster'
+                      ? i18nT('pages.settings.sttSettings.installs_faster_whisper_no_ffmpeg_needed')
+                      : i18nT('pages.settings.sttSettings.installs_openai_whisper_ffmpeg_uses_system_pytho')}
                 </p>
               </>
             )}

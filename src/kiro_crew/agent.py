@@ -463,8 +463,12 @@ def _resolve_kirocrew_bin() -> str:
        whose bundled interpreter is a python-build-standalone tree exposing a
        launcher at its root, reached by this walk from the bundle's
        ``site-packages``.
-    3. ``shutil.which('kirocrew')`` — respects PATH order.
-    4. Bare ``"kirocrew"`` — last resort, may fail but surfaces the problem
+    3. The running interpreter's own install prefix (``sys.exec_prefix``). Same
+       intent as step 2 — the install this process belongs to — for layouts
+       where the console script is not an ancestor-sibling of the package and
+       the parent walk therefore cannot reach it.
+    4. ``shutil.which('kirocrew')`` — respects PATH order.
+    5. Bare ``"kirocrew"`` — last resort, may fail but surfaces the problem
        instead of caching a known-bad absolute path.
 
     Every candidate is validated with ``is_file()`` and ``os.access(X_OK)``
@@ -519,13 +523,43 @@ def _resolve_kirocrew_bin() -> str:
     except Exception:
         logger.debug("kirocrew bin walk failed", exc_info=True)
 
-    # 3. PATH lookup (also validated)
+    # 3. The running interpreter's own install prefix.
+    #
+    #    Step 2 asks "which install does this process belong to?" but answers it
+    #    by walking the package's PARENTS, so it only sees a console script that
+    #    sits above ``site-packages``. Layouts that put the two in sibling trees
+    #    are invisible to it — a prefix-style runtime can have the package at
+    #    ``<root>/lib/python3.12/site-packages/kiro_crew`` and the script at
+    #    ``<root>/python3.12/bin/kirocrew``, which is not an ancestor of the
+    #    package dir at all. The walk then finds nothing and resolution falls
+    #    through to PATH, where an unrelated ``kirocrew`` from some earlier
+    #    install wins and gets written into ``kirocrew.json`` as the command for
+    #    the built-in MCP servers.
+    #
+    #    ``sys.exec_prefix`` IS the install root for the interpreter actually
+    #    running — the venv root inside a venv, the runtime root otherwise — so
+    #    handing it to :func:`_kirocrew_bin_subpath` yields the same directory
+    #    ``sysconfig.get_path("scripts")`` would, and keeps the per-OS naming
+    #    and the Windows ``.cmd``-over-``.exe`` ranking in one place. Derived
+    #    from ``sys`` (already imported, and immune to import shadowing) rather
+    #    than by importing ``sysconfig`` here: this module is imported during
+    #    ``kiro_crew`` package init, which can run with a user project on
+    #    ``sys.path``, and a project-local ``sysconfig.py`` would then execute.
+    try:
+        candidate = _kirocrew_bin_subpath(Path(sys.exec_prefix))
+        if _usable(candidate):
+            _KIROCREW_BIN = str(candidate)
+            return _KIROCREW_BIN
+    except Exception:
+        logger.debug("kirocrew exec-prefix bin check failed", exc_info=True)
+
+    # 4. PATH lookup (also validated)
     found = shutil.which("kirocrew")
     if found and _usable(found):
         _KIROCREW_BIN = found
         return _KIROCREW_BIN
 
-    # 4. Last resort — don't cache, so a future call can retry
+    # 5. Last resort — don't cache, so a future call can retry
     logger.warning(
         "Could not resolve kirocrew binary to an existing file; "
         "falling back to bare 'kirocrew' (MCP probes may fail)"
@@ -624,7 +658,7 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
 
     A resolved ``bin\\kirocrew.cmd`` (the Windows bundle's relocatable shim,
     see :func:`_kirocrew_bin_subpath`) is unwrapped to the sibling
-    interpreter — ``<root>\\python.exe -B -P -s -m kiro_crew <sub>`` — instead of
+    interpreter — ``<root>\\python.exe -P -s -m kiro_crew <sub>`` — instead of
     being emitted verbatim. This mirrors ``website/electron/main.js``, which
     refuses to spawn the shim it resolved (Node's ``spawn()`` rejects
     ``.cmd``/``.bat`` without ``shell:true``, CVE-2024-27980 hardening) and
@@ -650,7 +684,7 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
             # generic ``sys.executable`` fallbacks below and above stay
             # ``-P``-free because the project still supports Python 3.10,
             # which lacks the flag.
-            return str(interpreter), ["-B", "-P", "-s", "-m", "kiro_crew", subcommand]
+            return str(interpreter), ["-P", "-s", "-m", "kiro_crew", subcommand]
         return sys.executable, ["-m", "kiro_crew", subcommand]
     return bin_path, [subcommand]
 
@@ -3722,6 +3756,13 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         for srv, srv_spec in scope.items()
         if isinstance(srv_spec, dict) and srv_spec.get("disabled")
     }
+    # A server the probe has failed N consecutive times is COUNTED and surfaced,
+    # but not unmounted here. The unmount has no safe lever in this file: the
+    # generated agent config is simultaneously the mount decision and the only
+    # home for agent-only configuration, so dropping an entry destroys whatever
+    # lives only there and stamping ``disabled`` makes ``list_servers`` delete the
+    # server's own row. See the follow-up issue linked from
+    # docs/system-specs/features/mcp-probe-quarantine.md.
     for name, spec in itertools.chain(
         extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items()
     ):
@@ -4401,16 +4442,137 @@ and decide each next round until the goal is met or a stop condition fires.
 **You never do a work item's work yourself.** If a task needs a file written,
 a build run, or a fix made, it is a work item for a child session — your four
 jobs are decomposition, dispatch, verification, and the next-round decision.
-Shell access exists solely to run the bundled acceptance evaluator
-(`goal-conductor` skill, `scripts/accept_eval.py`); acceptance is its
+You hold **no tool that can write a file** — that is a property of your spec,
+not a rule you are being asked to follow.
+Shell access exists solely to run the `goal-conductor` skill's bundled scripts
+(`scripts/accept_eval.py` for acceptance verdicts, `scripts/ledger_entry.py`
+for the durable ledger item-entry format); acceptance is the evaluator's
 deterministic verdict, never your reading of a child session's transcript.
+
+**Patrol with `monitor_start`, never with `wait`.** A round of child work runs
+for tens of minutes, so an in-turn `wait` + re-poll loop spends the turn's whole
+budget on latency and dies mid-round at the turn cap — losing the loop, not the
+work. `monitor_start` re-injects the round into THIS session as a fresh turn, so
+every round gets its own budget and the loop survives a tab close or a gateway
+restart. Arm it with the full cycle instructions AND the exit condition, then
+END THE TURN, and call `autonudge_stop` when you stop. A successful arm can only
+ever come back as *requested* — arming happens after this turn ends — so treat
+that as success and do NOT retry it or fall back on it. Only a synchronous
+refusal (no dashboard/Slack/Discord session to host a loop) means no loop is
+running: say so, and only then drive the round with an in-turn `wait` loop.
+
+Your session-control tools are DEFERRED: `session_create`, `session_send`,
+`session_read_message`, `session_stop`, `chat_folder_*`, `session_ledger_*`,
+`monitor_start` and `autonudge_stop` are not in your tool list until you load
+them with `tool_search(tool_id="<server>::<name>")`. A first direct call
+failing with "a tool with the name ... does not exist" means DEFERRED, not
+missing — load it and repeat the call. That is what `tool_search` is mounted for.
 
 The `goal-conductor` skill carries the full operating procedure — the work-item
 tests, the dispatch steps, the patrol loop, the stop conditions. Read it
 before acting on a goal. The user can message you at any time; apply goal
 changes at the round boundary, except a message that directly invalidates an
 in-flight item, which you handle immediately.
+
+{{VERBOSITY_BLOCK}}
 """
+
+
+#: The dashboard verbs the conductor may call WITHOUT an approval prompt, named one
+#: by one rather than as the whole ``@kirocrew-dashboard`` server.
+#:
+#: THE INVARIANT, so a later reader extends this by rule and not by taste. A
+#: granted verb must satisfy BOTH halves:
+#:
+#: 1. It may CREATE something new or READ. It may never MUTATE user-visible
+#:    workspace state that already exists and is not the conductor's own — a
+#:    session's contents or liveness, or the arrangement the person made of their
+#:    sessions and folders.
+#: 2. Its worst case, called in a loop, must be BOUNDED BY THE SERVER — and
+#:    bounded so the resource stays reachable by everyone else.
+#:
+#: The conductor ingests untrusted text by design — its charter's worked example is
+#: "resolve this repo's open issues", and it holds ``web_fetch`` for exactly that —
+#: so every granted verb is reachable by content it read, with no human in the loop
+#: on a nudge-driven patrol cycle. Per-call approval was the only thing
+#: rate-limiting a granted verb, and ``allowedTools`` has no argument or rate
+#: matching to replace it, so the bound cannot live in this list: it has to live in
+#: the endpoint. Half 2 is not a restatement of half 1 — an unbounded create is how
+#: a create does damage without mutating anything.
+#:
+#: Half 1 names user-visible workspace state deliberately, rather than "any
+#: pre-existing resource", because a create ALWAYS writes some shared bookkeeping —
+#: the slot table, the folder index, the session-pulse counter below — and a literal
+#: reading would forbid every create and decide nothing. What it protects is state
+#: the person arranged and would have to reconstruct by hand. Creation is otherwise
+#: recoverable clutter; mutation of what the user arranged is not.
+#:
+#: Both granted creation verbs earn half 2 from a server ceiling, and BOTH ceilings
+#: were added by this change — neither verb was safe to auto-approve as the code
+#: stood:
+#:
+#: * ``chat_folder_create`` had no bound at all, so a loop grew durable on-disk
+#:   state without limit. Now ``MAX_CHAT_FOLDERS``, tested under the folder lock.
+#: * ``session_create`` had a GLOBAL ceiling (``MAX_LIVE_SLOTS``) but no
+#:   distribution: one caller could hold all 500, and every later create — the
+#:   person opening a chat tab included — got the 429. A bounded resource that one
+#:   caller can exhaust is not bounded from anybody else's point of view. Now
+#:   ``MAX_SLOTS_PER_CREATOR`` bounds what a single caller holds, leaving 450 slots
+#:   reachable no matter what the conductor does.
+#:
+#: Every verb this server exposes, against that rule:
+#:
+#: * ``chat_folder_tree`` — READ of the caller's visible tree. GRANTED.
+#: * ``chat_folder_create`` — creates a NEW folder, and
+#:   ``_refuse_tree_shaping_if_unverifiable`` refuses an unverifiable caller and
+#:   keeps an app agent out of the person's own folders. Touches nothing that
+#:   already existed, and bounded by ``MAX_CHAT_FOLDERS``. GRANTED.
+#: * ``session_create`` — creates a NEW session in the caller's workspace, bounded
+#:   both globally (``MAX_LIVE_SLOTS``, 429 on breach) and per caller
+#:   (``MAX_SLOTS_PER_CREATOR``), and visible in the sidebar. GRANTED.
+#:   One known side effect, recorded because it is the closest thing to an
+#:   exception here: ``create_session`` mints its slot with
+#:   ``origin=SlotOrigin.USER`` (it is a first-class user-owned session, which is
+#:   what keeps it correctly private), and ``get_or_create_slot`` increments the
+#:   session-pulse counter on exactly that origin — so conductor-created sessions
+#:   count toward the feedback survey's "10 genuine user chats" window. That is a
+#:   pre-existing conflation in the counter, not something this grant introduces:
+#:   the counter uses the ownership tag as a proxy for "a person started a chat",
+#:   and it miscounts for every caller of the session-control create verb. Filed
+#:   as issue #6139 rather than point-fixed here, because the correct fix is a
+#:   fail-open/fail-closed decision about which call sites opt in, inside the
+#:   session-pulse surface. Consequence if it drifts: a survey prompt appears
+#:   earlier than the product intended. No workspace state is altered.
+#: * ``session_read_message`` — read-only, and the verb the patrol loop actually
+#:   needs on a cycle with nobody at the keyboard. GRANTED.
+#: * ``chat_folder_move_session`` — WITHHELD. It writes another session's
+#:   ``folder_id``: the PATCH goes to ``/api/chat/slots/<target>/folder`` where the
+#:   target is the session named in the ARGUMENTS, and the strictly-resolved
+#:   caller key is only the authority header. ``mcp_dashboard`` calls it "the one
+#:   tool here that writes to a session OTHER than the caller's". Auto-approving it
+#:   would let ingested content silently refile or unfile any persistent
+#:   same-workspace session, losing filing the user did by hand.
+#: * ``chat_folder_move`` — WITHHELD. Reparents an existing folder tree, and no
+#:   conductor step needs it.
+#: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
+#:   under that target's own grants. The server-side gates bound WHICH target is
+#:   reachable; nothing bounds WHAT is sent.
+#: * ``session_stop`` — WITHHELD. Ends another session's in-flight turn and
+#:   DISCARDS its work (``stop_target``: "A first call cancels cooperatively;
+#:   calling again while that is pending escalates to a hard kill").
+#:
+#: Every withheld verb stays MOUNTED (``@kirocrew-dashboard`` is still in
+#: ``tools``) — it just passes through ``hooks.on_tool_call`` like any ungranted
+#: tool. The cost is an approval when a round files a session, seeds a child, or
+#: stops one; all three happen right after a human approved the plan, while the
+#: unattended patrol cycle needs none of them. Issue #6118 (a ``folder`` argument
+#: on ``session_create``) would remove the filing call altogether.
+_CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
+    "@kirocrew-dashboard/chat_folder_tree",
+    "@kirocrew-dashboard/chat_folder_create",
+    "@kirocrew-dashboard/session_create",
+    "@kirocrew-dashboard/session_read_message",
+)
 
 
 def _install_conductor_agent() -> None:
@@ -4418,17 +4580,38 @@ def _install_conductor_agent() -> None:
 
     Derives from the kirocrew agent (resolved MCP invocations, security hooks)
     but narrows to the conductor's charter: session control + core tools +
-    shell for the bundled acceptance evaluator, and nothing that lets it do a
-    work item's work itself (no ``fs_write``). The ``kirocrew-dashboard``
-    server is the opt-in per-agent set (folder + session-control tools); this
-    installer granting it IS the explicit per-agent assignment that set
-    requires — it is deliberately absent from the default agent's spec.
+    shell for the bundled skill scripts (acceptance evaluator + ledger entry
+    codec), and **no tool that can write a
+    file** — not ``fs_write``, and not ``code`` either, which governance classes
+    under ``filesystem.write`` because it writes files and can shell out. That
+    is what makes "never does a work item's work itself" a property of the spec
+    rather than of the prompt. The ``kirocrew-dashboard`` server is the opt-in
+    per-agent set (folder + session-control tools); this installer granting it IS
+    the explicit per-agent assignment that set requires — it is deliberately
+    absent from the default agent's spec.
 
-    ``@kirocrew-dashboard`` is NOT added to ``allowedTools``: its calls must
-    keep passing through ``hooks.on_tool_call`` where the deny floor and
-    governance ceiling apply, so every session-control call prompts. Neither is
-    ``execute_bash``, for the same reason — the evaluator run prompts too, which
-    is what actually bounds what an acceptance spec can execute.
+    ``@kirocrew-dashboard`` is MOUNTED whole but auto-approved only verb by verb,
+    via ``_CONDUCTOR_DASHBOARD_GRANTS`` (see its comment for the per-verb
+    reasoning). Both backends honour a per-tool reference, so the narrowing is
+    real rather than cosmetic: kiro-cli's ``is_tool_in_allowlist`` checks
+    ``@server`` and then ``@server/<tool>``, and ``allowed_tools_to_permissions``
+    maps the same entry to an exact KAS ``server/tool`` resource match.
+
+    The line the split follows is stated as an invariant on that tuple, not as a
+    taste call: a granted verb may CREATE or READ, never MUTATE something that
+    already exists and is not the conductor's own. Reads and creates are granted
+    because the patrol loop is nudge-driven and must not block on an approval
+    nobody is there to give. ``session_stop`` (discards a peer's in-flight turn),
+    ``session_send`` (runs text as a peer's turn) and ``chat_folder_move_session``
+    (writes a peer session's ``folder_id``) are withheld, because the conductor
+    ingests untrusted content by design and the server-side gates bound which
+    target is reachable, not what is done to it.
+
+    ``execute_bash`` is withheld for a different reason that is worth keeping
+    distinct: ``allowedTools`` is name-scoped with no argument matching, so
+    trusting the two bundled scripts cannot be told apart from trusting arbitrary
+    shell. There is no per-argument form of that grant the way there is a per-tool
+    form of the MCP one.
 
     The operating procedure ships as the ``goal-conductor`` builtin skill, NOT
     ``conductor``: that skill name is owned by the generated delegation skill
@@ -4449,13 +4632,20 @@ def _install_conductor_agent() -> None:
     config["tools"] = [
         "execute_bash",
         "fs_read",
-        "code",
-        "grep",
-        "glob",
+        # ``web_fetch`` serves the charter's own worked example (reading an issue
+        # list during triage). Deliberately NOT mounted: ``web_search`` (nothing
+        # names it), ``grep``/``glob`` (``fs_read`` covers every read the charter
+        # describes), and above all ``code`` — governance classes it under
+        # ``filesystem.write`` because it "writes files AND can shell out", so
+        # mounting it would make this spec's whole no-write property false.
+        # An unused grant is surface the charter cannot account for.
         "web_fetch",
-        "web_search",
         "session",
         "report",
+        # Load-bearing, not decoration: with MCP Tool Search active the
+        # session-control specs are deferred, so the conductor cannot reach
+        # ``session_create`` / ``chat_folder_*`` / ``monitor_start`` at all until
+        # it loads them by id. Named in the prompt for that reason.
         "tool_search",
         "@kirocrew-core",
         "@kirocrew-dashboard",
@@ -4467,9 +4657,33 @@ def _install_conductor_agent() -> None:
     # writer cannot re-open the bypass by restating a literal. A governed ref
     # stays MOUNTED (it is still in ``tools``); it just prompts, and the gate
     # then applies the ceiling's per-tool rule with the real arguments.
-    config["allowedTools"] = [
-        ref for ref in ("session", "report", "@kirocrew-core") if _may_auto_approve(ref)
-    ]
+    granted: list[str] = []
+    withheld: list[str] = []
+    for ref in ("session", "report", "@kirocrew-core", *_CONDUCTOR_DASHBOARD_GRANTS):
+        (granted if _may_auto_approve(ref) else withheld).append(ref)
+    config["allowedTools"] = granted
+    if withheld:
+        # Withholding a grant is a permission DECISION, and every other writer of
+        # an ``allowedTools`` list emits this same event for it — see
+        # ``strip_ungoverned_auto_approve``, whose comment names a silent pop as
+        # the one withhold path with no audit trail. Filtering silently here would
+        # make this installer exactly that path: on a governed host a ref loses its
+        # grant and the operator has no record of why the conductor now prompts.
+        # Same operation name so it lands in one feed, and the audit must never
+        # break the install.
+        try:
+            sel().log_api_access(
+                caller="system",
+                operation="mcp_auto_approve_withheld",
+                outcome="ok",
+                source="_install_conductor_agent",
+                resources=(
+                    f"{', '.join(withheld)} mounted without auto-approve "
+                    "(governance ceiling); calls go through the approval gate"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — the audit must not break the install
+            logger.debug("SEL audit unavailable for withheld auto-approve", exc_info=True)
     mcp = config.get("mcpServers", {}) or {}
     core_entry = mcp.get("kirocrew-core")
     narrowed: dict = {}

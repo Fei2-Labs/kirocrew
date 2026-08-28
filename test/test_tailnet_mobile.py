@@ -20,10 +20,9 @@ the wrong thing would be destructive rather than merely unhelpful.
   holds the mount. So an undeterminable state must land on ``occupied`` (refuse,
   print the manual command), never on ``publish``. Rendering "could not tell" as
   "free" is how an operator's own serve mapping gets silently overwritten.
-* :class:`TestRestartGatewayIsNotReady` pins the boot race the logs already knew
-  about and the UI never showed: a name resolvable NOW, absent at startup, is
-  genuinely NOT in the live origin allowlist. Reporting it as ready would be the
-  checked-but-never-ran defect.
+* :class:`TestRestartIsNotReady` pins the boot race the logs already knew
+  about and the UI never showed: a name resolvable NOW, absent from the running
+  allowlist, is genuinely not trusted. It must be activated before it is ready.
 * :class:`TestQrRefusals` pins that a credential is never minted for a URL
   nothing answers, and that the TTL cannot be talked upward past either ceiling.
 * :class:`TestRestrictedSessionRefused` pins that an app-scoped session cannot
@@ -36,6 +35,9 @@ the wrong thing would be destructive rather than merely unhelpful.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import get_args
@@ -46,9 +48,20 @@ import pytest
 from kiro_crew.dashboard import tailnet
 from kiro_crew.dashboard.handlers import tailnet_mobile
 from kiro_crew.dashboard.tailnet import DaemonProbe
+from kiro_crew.dashboard.token_auth import (
+    LINK_WINDOW_SECS,
+    MAX_SESSION_TTL_SECS,
+    _b64url_encode,
+    generate_token,
+)
 
 _PORT = 5476
 _HOST = "desk.tail-abc.ts.net"
+
+
+def _owner_session_token(*, ttl_seconds: int = MAX_SESSION_TTL_SECS, **extra: str) -> str:
+    """A real caller credential, as the auth middleware would have validated it."""
+    return generate_token(_OWNER, ttl_seconds=ttl_seconds, extra=extra or None)
 
 
 def _probe(
@@ -57,6 +70,7 @@ def _probe(
     installed: bool = True,
     reachable: bool = True,
     logged_in: bool = True,
+    https_enabled: bool | None = True,
     detail: str = "",
 ) -> DaemonProbe:
     return DaemonProbe(
@@ -65,6 +79,7 @@ def _probe(
         reachable=reachable,
         logged_in=logged_in,
         detail=detail,
+        https_enabled=https_enabled,
     )
 
 
@@ -139,6 +154,48 @@ class TestProbeDistinguishesCauses:
             p = tailnet.probe_daemon()
         assert p.name == _HOST
         assert p.detail == ""
+
+    def test_matching_cert_domain_reports_https_enabled(self) -> None:
+        with (
+            patch.object(tailnet, "_cli_path", return_value="/usr/bin/tailscale"),
+            patch.object(
+                tailnet,
+                "_run_json_detail",
+                return_value=(
+                    {"BackendState": "Running", "CertDomains": [_HOST]},
+                    False,
+                ),
+            ),
+            patch.object(tailnet, "self_dns_name", return_value=_HOST),
+        ):
+            p = tailnet.probe_daemon()
+        assert p.https_enabled is True
+
+    def test_explicit_empty_cert_domains_reports_https_disabled(self) -> None:
+        with (
+            patch.object(tailnet, "_cli_path", return_value="/usr/bin/tailscale"),
+            patch.object(
+                tailnet,
+                "_run_json_detail",
+                return_value=({"BackendState": "Running", "CertDomains": []}, False),
+            ),
+            patch.object(tailnet, "self_dns_name", return_value=_HOST),
+        ):
+            p = tailnet.probe_daemon()
+        assert p.https_enabled is False
+
+    @pytest.mark.parametrize("cert_domains", [None, {}, "unexpected"])
+    def test_missing_or_malformed_cert_domains_stays_unknown(self, cert_domains: object) -> None:
+        status = {"BackendState": "Running"}
+        if cert_domains is not None:
+            status["CertDomains"] = cert_domains
+        with (
+            patch.object(tailnet, "_cli_path", return_value="/usr/bin/tailscale"),
+            patch.object(tailnet, "_run_json_detail", return_value=(status, False)),
+            patch.object(tailnet, "self_dns_name", return_value=_HOST),
+        ):
+            p = tailnet.probe_daemon()
+        assert p.https_enabled is None
 
 
 class TestPeerCounting:
@@ -243,6 +300,15 @@ class TestStepPrecedence:
     def test_no_name_while_signed_in_asks_for_magicdns(self) -> None:
         assert _step(probe=_probe(name="")) == "enable_magicdns"
 
+    def test_explicit_missing_cert_domain_requires_https_consent(self) -> None:
+        assert _step(probe=_probe(https_enabled=False), published=False) == "enable_https"
+
+    def test_unknown_cert_capability_defers_to_the_serve_write(self) -> None:
+        assert _step(probe=_probe(https_enabled=None), published=False) == "publish"
+
+    def test_existing_publication_is_stronger_than_a_stale_cert_snapshot(self) -> None:
+        assert _step(probe=_probe(https_enabled=False), published=True) == "ready"
+
     def test_trust_off_precedes_publishing(self) -> None:
         """Publishing an untrusted origin yields a reachable dashboard that answers
         403 — the confusing state this feature removes, so config comes first."""
@@ -265,16 +331,19 @@ class TestUndeterminedIsNotFree:
         assert _step(published=None) != "ready"
 
 
-class TestRestartGatewayIsNotReady:
-    """The boot race: resolvable now, absent at startup, so NOT trusted yet."""
+class TestRestartIsNotReady:
+    """The boot race: resolvable now, absent from the startup allowlist."""
 
     def test_missing_startup_host_blocks_ready(self) -> None:
         assert _step(startup_host="") == "restart_gateway"
 
     def test_restart_step_beats_the_serve_state(self) -> None:
         """Even an already-published dashboard is not reachable if the running
-        server never put the name in its origin allowlist."""
+        server has not put the name in its origin allowlist."""
         assert _step(startup_host="", published=True) == "restart_gateway"
+
+    def test_a_changed_name_requires_a_restart(self) -> None:
+        assert _step(startup_host="old.tail-abc.ts.net") == "restart_gateway"
 
 
 _OWNER = "owner@example.com"
@@ -288,6 +357,8 @@ def _request(
     app_identity: str | None = "",
     user: str | None = _OWNER,
     tailnet_host: str = "",
+    query_token: str = "",
+    cookie_token: str = "",
 ):
     """Minimal stand-in for the aiohttp request these handlers actually touch.
 
@@ -301,11 +372,12 @@ def _request(
     configured owner so the success paths read normally; pass a different id to
     model a NON-owner dashboard user (a messaging-channel user who was handed a
     presigned dashboard link), and ``None`` for no resolved subject at all.
-    ``tailnet_host`` models ``app["tailnet_host"]`` — the name the RUNNING server
-    resolved at startup. Empty (the default) is a server that resolved none, which
-    ``_derive_step`` reports as ``restart_gateway``: the origin genuinely is not
-    trusted yet, however resolvable the name is now. The ``ready`` paths must set
-    it.
+    ``tailnet_host`` models the name the RUNNING server trusted at startup. Empty
+    (the default) means the fixed allowlist does not carry the resolvable name,
+    so ``_derive_step`` reports ``restart_gateway``. Ready paths must set it.
+    ``query_token`` / ``cookie_token`` model the credential the middleware
+    authenticated with, which the QR mint reads its caller bounds from. Both
+    empty (the default) exercises the fail-closed no-readable-token path.
     """
 
     class _Req:
@@ -314,9 +386,14 @@ def _request(
                 "port": port,
                 "state": SimpleNamespace(owner_id="owner@example.com"),
                 "tailnet_host": tailnet_host,
+                "tailnet_resolved_at": 1 if tailnet_host else 0,
             }
             self.remote = "127.0.0.1"
             self.headers: dict[str, str] = {}
+            self.query: dict[str, str] = {"token": query_token} if query_token else {}
+            self.cookies: dict[str, str] = (
+                {f"mc_token_{port}": cookie_token} if cookie_token else {}
+            )
             self._items: dict[str, object] = {}
             if app_identity is not None:
                 self._items["app"] = app_identity
@@ -367,6 +444,7 @@ def _machine(
     installed: bool = True,
     reachable: bool = True,
     logged_in: bool = True,
+    https_enabled: bool | None = True,
     published: bool | None = True,
     trusted: bool = True,
     qr_session_until_restart: bool = True,
@@ -392,6 +470,7 @@ def _machine(
         reachable=reachable,
         logged_in=logged_in,
         detail=detail,
+        https_enabled=https_enabled,
     )
     with (
         patch.object(tailnet_mobile.KiroCrewConfig, "load", classmethod(lambda cls: cfg)),
@@ -467,11 +546,10 @@ class TestQrRefusals:
         assert b"origin_not_trusted" in resp.body
 
     @pytest.mark.asyncio
-    async def test_server_that_resolved_no_name_at_startup_refuses(
+    async def test_server_without_a_startup_origin_refuses(
         self, _unrestricted, _quiet_audit
     ) -> None:
-        """Resolvable now, but this process booted before tailscaled, so it does not
-        trust the name yet — the link would 403 until a restart."""
+        """Resolvable now, but the startup boundary does not trust the name yet."""
         with _machine(published=True):
             resp = await tailnet_mobile.api_tailnet_mobile_qr(_request(tailnet_host=""))
         assert resp.status == 409
@@ -513,7 +591,9 @@ class TestQrRefusals:
                     tailnet_mobile, "render_qr_data_uri", return_value="data:image/png;base64,x"
                 ),
             ):
-                resp = await tailnet_mobile.api_tailnet_mobile_qr(_request(tailnet_host=_HOST))
+                resp = await tailnet_mobile.api_tailnet_mobile_qr(
+                    _request(tailnet_host=_HOST, cookie_token=_owner_session_token())
+                )
         assert resp.status == 200
         assert captured["extra"] == {"boot": current_boot_id()}
         assert "no_refresh" not in (captured["extra"] or {})
@@ -538,7 +618,9 @@ class TestQrRefusals:
                     tailnet_mobile, "render_qr_data_uri", return_value="data:image/png;base64,x"
                 ),
             ):
-                resp = await tailnet_mobile.api_tailnet_mobile_qr(_request(tailnet_host=_HOST))
+                resp = await tailnet_mobile.api_tailnet_mobile_qr(
+                    _request(tailnet_host=_HOST, cookie_token=_owner_session_token())
+                )
         assert resp.status == 200
         assert captured["extra"] == {"no_refresh": "1"}
         assert "boot" not in (captured["extra"] or {})
@@ -591,7 +673,9 @@ class TestQrRefusals:
                     tailnet_mobile, "render_qr_data_uri", return_value="data:image/png;base64,x"
                 ),
             ):
-                resp = await tailnet_mobile.api_tailnet_mobile_qr(_request(tailnet_host=_HOST))
+                resp = await tailnet_mobile.api_tailnet_mobile_qr(
+                    _request(tailnet_host=_HOST, cookie_token=_owner_session_token())
+                )
         assert resp.status == 200
         assert loads["n"] >= 2, "the handler must do its own read, not reuse _live_state's"
         assert captured["extra"] == {"boot": current_boot_id()}
@@ -640,6 +724,179 @@ class TestQrRefusals:
         assert resp.status == 200
         for call in audit.call_args_list:
             assert "SECRET-TOKEN-VALUE" not in " ".join(str(a) for a in call.args)
+
+
+class TestQrCallerBounds:
+    """The QR-minted token never out-scopes the session that authorized it.
+
+    Mirrors the coverage of the sibling mobile-link mint
+    (``test_mobile_login_link.py``): the mint reads the CALLER's own token
+    bounds through the shared ``_caller_bounds`` helper and carries them into
+    the credential. Behind ``tailscale serve`` every request reaches the
+    gateway from 127.0.0.1, so the token cannot be device-pinned — its own
+    bounds are the only limit that holds, which is what made this surface the
+    laundering path: one POST from a deliberately bounded owner session used to
+    mint a boot-bound, refresh-chained credential that outlived it.
+    """
+
+    @staticmethod
+    def _capture(captured: dict):
+        def _fake_mint(_sub, ttl_seconds=0, **kw):
+            captured["ttl"] = ttl_seconds
+            captured["extra"] = kw.get("extra")
+            return "tok"
+
+        return _fake_mint
+
+    async def _mint(self, captured: dict, **request_kw):
+        with _machine():
+            with (
+                patch.object(tailnet_mobile, "generate_token", side_effect=self._capture(captured)),
+                patch.object(
+                    tailnet_mobile, "render_qr_data_uri", return_value="data:image/png;base64,x"
+                ),
+            ):
+                return await tailnet_mobile.api_tailnet_mobile_qr(
+                    _request(tailnet_host=_HOST, **request_kw)
+                )
+
+    @pytest.mark.asyncio
+    async def test_a_no_refresh_caller_mints_a_no_refresh_credential(
+        self, _unrestricted, _quiet_audit
+    ) -> None:
+        """A caller whose session never grows a refresh chain must not mint a
+        credential that does — that is the laundering this gate closes."""
+        captured: dict[str, object] = {}
+        resp = await self._mint(
+            captured, cookie_token=_owner_session_token(ttl_seconds=600, no_refresh="1")
+        )
+        assert resp.status == 200
+        extra = captured["extra"]
+        assert isinstance(extra, dict) and extra["no_refresh"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_a_short_lived_caller_caps_the_qr_ttl(self, _unrestricted, _quiet_audit) -> None:
+        """The default QR TTL is above this caller's remaining lifetime, so the
+        remaining lifetime wins — a short-lived session cannot lend more time
+        than it has."""
+        captured: dict[str, object] = {}
+        resp = await self._mint(captured, cookie_token=_owner_session_token(ttl_seconds=600))
+        assert resp.status == 200
+        assert isinstance(captured["ttl"], int)
+        assert 0 < captured["ttl"] <= 600 < tailnet_mobile.DEFAULT_QR_TTL_SECS
+
+    @pytest.mark.asyncio
+    async def test_the_reported_link_window_never_exceeds_the_lent_ttl(
+        self, _unrestricted, _quiet_audit
+    ) -> None:
+        """``link_window_secs`` reports the clamped click window, not the
+        constant — generate_token clamps the link-click ``exp`` to the session
+        TTL, so a caller lending less than the nominal window mints a QR whose
+        link dies with the ttl it lent, and the UI countdown must say so."""
+        captured: dict[str, object] = {}
+        resp = await self._mint(captured, cookie_token=_owner_session_token(ttl_seconds=120))
+        assert resp.status == 200
+        payload = json.loads(resp.body)
+        assert 0 < payload["link_window_secs"] <= 120
+        assert payload["link_window_secs"] == min(payload["ttl_secs"], LINK_WINDOW_SECS)
+
+    @pytest.mark.asyncio
+    async def test_a_caller_with_nothing_left_is_refused(self, _unrestricted, _quiet_audit) -> None:
+        """An exhausted remaining lifetime refuses BEFORE minting, never rounds
+        up — a floor of one second would let a dead session walk its expiry
+        forward indefinitely, one mint at a time."""
+        expired = _b64url_encode(json.dumps({"session_exp": time.time() - 100}).encode()) + ".sig"
+        with _machine():
+            with patch.object(tailnet_mobile, "generate_token") as mint:
+                resp = await tailnet_mobile.api_tailnet_mobile_qr(
+                    _request(tailnet_host=_HOST, cookie_token=expired)
+                )
+        assert resp.status == 403
+        assert b"caller_session_expired" in resp.body
+        mint.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_caller_expiring_during_a_slow_body_read_is_refused(
+        self, _unrestricted, _quiet_audit
+    ) -> None:
+        """The bounds are read AFTER every awaited step, so a stale snapshot
+        cannot authorize the mint. A client controls how long ``request.json()``
+        takes (it can trickle the body byte by byte), so a remaining-lifetime
+        snapshot taken before that await would let a session in its last
+        seconds stretch the mint past its own expiry — the wall clock moves
+        while the handler waits, the snapshot does not."""
+        caller = _owner_session_token(ttl_seconds=60)
+        req = _request(tailnet_host=_HOST, cookie_token=caller)
+        clock = patch(
+            "kiro_crew.dashboard.handlers._shared.time.time",
+            return_value=time.time() + 120,
+        )
+
+        async def _slow_body():
+            # The caller's session expires while the body trickles in: from
+            # here on, the shared helper's clock reads past ``session_exp``.
+            clock.start()
+            return {}
+
+        req.json = _slow_body
+        try:
+            with _machine():
+                with patch.object(tailnet_mobile, "generate_token") as mint:
+                    resp = await tailnet_mobile.api_tailnet_mobile_qr(req)
+        finally:
+            clock.stop()
+        assert resp.status == 403
+        assert b"caller_session_expired" in resp.body
+        mint.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unbounded_owner_session_is_unaffected(
+        self, _unrestricted, _quiet_audit
+    ) -> None:
+        """The ordinary case must not regress: a full-length owner session mints
+        the configured default shape at the default TTL."""
+        from kiro_crew.dashboard.boot_id import current_boot_id
+
+        captured: dict[str, object] = {}
+        resp = await self._mint(captured, cookie_token=_owner_session_token())
+        assert resp.status == 200
+        assert captured["extra"] == {"boot": current_boot_id()}
+        assert captured["ttl"] == tailnet_mobile.DEFAULT_QR_TTL_SECS
+
+    @pytest.mark.asyncio
+    async def test_a_callers_boot_claim_is_carried_verbatim(
+        self, _unrestricted, _quiet_audit
+    ) -> None:
+        """Carried, never re-derived — the same rule the link→session exchange
+        follows, so a bound is copied from the credential that authorized the
+        mint rather than re-invented from process state."""
+        captured: dict[str, object] = {}
+        resp = await self._mint(
+            captured, cookie_token=_owner_session_token(boot="boot-from-caller")
+        )
+        assert resp.status == 200
+        extra = captured["extra"]
+        assert isinstance(extra, dict) and extra["boot"] == "boot-from-caller"
+
+    @pytest.mark.asyncio
+    async def test_bounds_come_from_the_query_token_not_a_stray_cookie(
+        self, _unrestricted, _quiet_audit
+    ) -> None:
+        """Bounds must be read from the credential the middleware validated. It
+        prefers ``?token=`` over the cookie, so a bounded query token beside a
+        permissive (unverified, attacker-settable) cookie must still bound the
+        mint — reading the cookie first would drop ``no_refresh`` and raise the
+        TTL ceiling back to the maximum."""
+        captured: dict[str, object] = {}
+        resp = await self._mint(
+            captured,
+            query_token=_owner_session_token(ttl_seconds=600, no_refresh="1"),
+            cookie_token=_owner_session_token(),
+        )
+        assert resp.status == 200
+        extra = captured["extra"]
+        assert isinstance(extra, dict) and extra["no_refresh"] == "1"
+        assert isinstance(captured["ttl"], int) and captured["ttl"] <= 600
 
 
 class TestRestrictedSessionRefused:
@@ -949,6 +1206,23 @@ class TestStatusIsOwnerOnly:
         assert resp.status == 403
         assert audit.call_args is not None
         assert audit.call_args.args[2] == "denied"
+
+    @pytest.mark.asyncio
+    async def test_cold_denial_audit_is_offloaded(self, _unrestricted) -> None:
+        """SEL initialization and DACL work must never run on aiohttp's loop."""
+        real_to_thread = asyncio.to_thread
+        with (
+            patch.object(tailnet_mobile, "_audit") as audit,
+            patch.object(
+                tailnet_mobile.asyncio,
+                "to_thread",
+                side_effect=real_to_thread,
+            ) as offload,
+        ):
+            resp = await self._status(user="telegram-11893")
+
+        assert resp.status == 403
+        assert any(call.args and call.args[0] is audit for call in offload.call_args_list)
 
     @pytest.mark.asyncio
     async def test_successful_read_is_not_audited(self, _unrestricted) -> None:

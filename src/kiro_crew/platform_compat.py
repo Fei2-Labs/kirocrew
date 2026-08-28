@@ -17,6 +17,8 @@ import io
 import logging
 import ntpath
 import os
+import pathlib
+import platform
 import shutil
 import signal
 import stat
@@ -41,6 +43,27 @@ IS_LINUX: bool = sys.platform == "linux"
 IS_MACOS: bool = sys.platform == "darwin"
 
 
+_UTF8_PROCESS_ENV = {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8:backslashreplace",
+}
+
+
+def _ensure_utf8_process_environment() -> None:
+    """Pin UTF-8 for Python successors and child processes on every platform.
+
+    ``sys.stdout.reconfigure`` can repair the current process, but Windows
+    implements ``os.execv`` by creating a successor process.  Its standard
+    streams are constructed before Kiro Crew code runs, so the encoding must be
+    present in the environment at interpreter startup.  POSIX ``execv`` keeps
+    the current environment, where an inherited ``PYTHONIOENCODING`` can also
+    override the platform's normal UTF-8 defaults.  Overwrite inherited settings
+    deliberately: Kiro Crew's process tree emits Unicode as part of its normal
+    protocols and boot output.
+    """
+    os.environ.update(_UTF8_PROCESS_ENV)
+
+
 def reexec_python_module(module: str, args: Sequence[str]) -> None:
     """Replace this process with ``sys.executable -m module``.
 
@@ -50,6 +73,11 @@ def reexec_python_module(module: str, args: Sequence[str]) -> None:
     executable path passed separately to ``execv`` still selects the exact
     interpreter; only its display name needs to be space-free.
     """
+    # Publish UTF-8 before exec so in-app gateway restarts (Tailnet, update,
+    # stale-assets, explicit restart) cannot create a successor that inherits a
+    # Windows ANSI stream or a hostile POSIX PYTHONIOENCODING and crashes on the
+    # first emoji printed during boot.
+    _ensure_utf8_process_environment()
     executable = sys.executable
     argv0 = ntpath.basename(executable) if IS_WINDOWS else executable
     os.execv(executable, [argv0, "-m", module, *args])
@@ -80,6 +108,29 @@ if IS_LINUX or IS_MACOS:
         _RENAME_NOREPLACE_FN = None
 
 RENAME_NOREPLACE_AVAILABLE: bool = _RENAME_NOREPLACE_FN is not None
+
+#: ARM machine strings as ``platform.machine()`` spells them on Windows.
+#: ``ARM64`` is what a native arm64 interpreter reports; ``AARCH64`` is accepted
+#: because that spelling reaches Windows through cross-built and MSYS/Cygwin
+#: Pythons. Compared case-folded, so the casing here is documentation only.
+_WINDOWS_ARM_MACHINES: frozenset[str] = frozenset({"arm64", "aarch64"})
+
+
+def is_windows_on_arm() -> bool:
+    """True when this interpreter is a NATIVE ARM64 process on Windows.
+
+    Deliberately a property of the running PROCESS, not of the host CPU, because
+    every caller cares about which wheel tags pip will accept here. Windows on ARM
+    runs x86-64 processes under emulation, and in one of those ``platform.machine()``
+    reports ``AMD64`` — correctly, since such an interpreter installs ``win_amd64``
+    wheels and works fine. A host-architecture probe would report ARM for that same
+    process and wrongly refuse a package that installs.
+
+    Keyed off :data:`IS_WINDOWS` rather than ``platform.system()`` so there is one
+    canonical Windows predicate in this module instead of two that can drift.
+    """
+    return IS_WINDOWS and platform.machine().casefold() in _WINDOWS_ARM_MACHINES
+
 
 # Portable signal constants — signal.SIGKILL is undefined on Windows.
 SIGKILL: int = getattr(signal, "SIGKILL", 9)
@@ -339,20 +390,28 @@ def tcc_prune_walk_dirs(root: str, dirpath: str, dirnames: list[str]) -> list[st
 
 
 def ensure_utf8_console() -> None:
-    """Make stdout/stderr UTF-8 on Windows so KiroCrew's emoji output can't crash it.
+    """Keep Kiro Crew's process tree UTF-8 and repair current Windows streams.
 
     KiroCrew prints non-ASCII glyphs throughout its CLI/gateway output. On
     Windows the default console code page is cp1252, and when stdout is a pipe
     (e.g. the gateway launched detached with redirected output, or under the
     KiroCrewHub client) Python encodes prints as cp1252 — so the FIRST non-ASCII
     print raises ``UnicodeEncodeError: 'charmap' codec can't encode character``
-    and the process dies before the gateway binds. POSIX defaults to UTF-8, so
-    this is a no-op there. Best-effort: reconfigure (Python 3.7+) the streams to
-    UTF-8 with backslashreplace so a stray un-encodable char degrades to an
-    escape instead of crashing. Idempotent and safe to call once at startup.
+    and the process dies before the gateway binds.  On every platform, publish
+    the encoding contract for later re-exec and child processes; an inherited
+    ``PYTHONIOENCODING`` can otherwise override POSIX UTF-8 defaults too.  On
+    Windows, best-effort reconfigure (Python 3.7+) the current streams to UTF-8
+    with backslashreplace so a stray un-encodable char degrades to an escape
+    instead of crashing. Idempotent and safe to call once at startup.
     """
+    _ensure_utf8_process_environment()
     if not IS_WINDOWS:
         return
+    # Repair the current streams below, and separately make the invariant
+    # inheritable by MCP/session children and any later re-exec.  Environment
+    # variables affect the next interpreter at construction time; setting them
+    # here is intentional even though they cannot retroactively rebuild the
+    # current process's streams.
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)
         if stream is None:  # pythonw / fully detached — no stream to fix
@@ -3061,6 +3120,82 @@ async def kill_process_tree_async(pid: int, sig: int = SIGTERM) -> bool:
     return await loop.run_in_executor(subprocess_executor(), kill_process_tree, pid, sig)
 
 
+#: Ceiling on waiting for a killed process tree. A descendant that ignores the
+#: signal must not turn cleanup into a hang while the caller is already
+#: handling a timeout or a cancellation — often on the shutdown path, where an
+#: unbounded reap would wedge the whole teardown.
+REAP_TIMEOUT_SECS: float = 10
+
+
+async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | None = None) -> None:
+    """Kill *proc* AND its descendants, then wait for it under a bound.
+
+    The shared cleanup for a PIPE-stdio child whose ``communicate()`` was
+    abandoned by ``asyncio.wait_for`` — used on BOTH the timeout and the
+    cancellation path. Cancellation matters as much as timeout: a gateway
+    shutdown cancels the owning task, and without this the child keeps
+    running after the process that started it is gone.
+
+    The whole TREE is signalled, not just the direct child. A spawned command
+    is often a shell line (``curl … | sh``, ``pip … | tee log``), so killing
+    only the shell leaves the pipeline members running and can leave
+    ``communicate()`` waiting on pipes those survivors still hold. A child
+    sharing the caller's own process group (spawned without
+    ``start_new_session``) has no tree of its own to signal — the group kill
+    is skipped for it and the pid-scoped ``kill()`` below covers it, instead
+    of tripping :func:`kill_process_tree`'s broadcast guard on every routine
+    timeout.
+
+    The reap goes through ``communicate()`` rather than ``wait()`` so the
+    pipes are drained: ``wait_for`` already cancelled the original
+    ``communicate()``, and a killed child blocked writing into a full pipe
+    would make a bare ``wait()`` hang the calling task forever. The reap is
+    bounded by *timeout* (default :data:`REAP_TIMEOUT_SECS`). Both the kill
+    and the reap are best-effort, since the caller is already handling a
+    timeout or a cancellation and must not have it masked by a cleanup error.
+
+    The whole sequence runs in a shielded inner task: a (repeat) cancellation
+    of the caller landing mid-cleanup must not abandon the kill or leave the
+    child un-reaped — the cancellation is absorbed until cleanup finishes and
+    then re-delivered once.
+    """
+
+    async def _cleanup() -> None:
+        same_group = False
+        if IS_POSIX:
+            with contextlib.suppress(Exception):
+                same_group = os.getpgid(proc.pid) == _OWN_PGID
+        if not same_group:
+            # Bare-name lookup resolves through this module's namespace at
+            # call time, so tests patching ``kiro_crew.platform_compat.
+            # kill_process_tree_async`` still intercept the tree kill.
+            with contextlib.suppress(Exception):
+                await kill_process_tree_async(proc.pid, SIGKILL)
+        with contextlib.suppress(Exception):
+            proc.kill()
+        with contextlib.suppress(Exception, asyncio.TimeoutError):
+            await asyncio.wait_for(
+                proc.communicate(),
+                timeout=REAP_TIMEOUT_SECS if timeout is None else timeout,
+            )
+
+    cleanup = asyncio.ensure_future(_cleanup())
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(cleanup)
+            break
+        except asyncio.CancelledError:
+            # Either the CALLER was (re-)cancelled while the shield kept the
+            # cleanup running, or the cleanup itself ended cancelled. Absorb
+            # until the cleanup has genuinely finished, then re-deliver.
+            cancelled = True
+            if cleanup.done():
+                break
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def descendant_termination_handles_async(
     pid: int,
     retained_handles: Mapping[int, int] | None = None,
@@ -3232,6 +3367,34 @@ def is_link_or_junction(path: str | os.PathLike) -> bool:
         except (OSError, ValueError):
             return False
     return _is_junction_fallback(path)
+
+
+def first_linked_ancestor(path: str | os.PathLike) -> str | None:
+    r"""First ANCESTOR of *path* that is a symlink/junction, or None.
+
+    :func:`is_link_or_junction` tests one path, so a caller that checks only
+    the path it was handed still resolves through a linked PARENT. That gap is
+    not cosmetic on Windows: an ancestor link whose target is ``\\host\share``
+    turns the first innocent-looking ``is_dir()`` on a LOCAL-looking path into
+    an outbound SMB connection that authenticates as this process. A lexical
+    UNC screen cannot catch it, because the path being probed is not itself
+    UNC-shaped -- only the link's target is.
+
+    Ancestors are tested ROOT-FIRST and the walk stops at the first hit. That
+    order is the safety property, not a detail: each ``lstat`` runs only after
+    every ancestor above it is known not to be a link, so the probe itself
+    never traverses one. Returns the offending ancestor for logging; callers
+    deciding whether to REJECT should not put it in a user-facing message,
+    since which ancestor is a link is filesystem layout the caller supplied a
+    path to guess at.
+
+    The leaf is deliberately excluded -- pair this with
+    :func:`is_link_or_junction` on the path itself.
+    """
+    for ancestor in reversed(pathlib.Path(os.fspath(path)).parents):
+        if is_link_or_junction(ancestor):
+            return str(ancestor)
+    return None
 
 
 def unlink_link_or_junction(path: str | os.PathLike) -> None:
@@ -4192,9 +4355,7 @@ def count_open_fds() -> int | None:
         ]
         kernel32.GetProcessHandleCount.restype = wintypes.BOOL
         handle_count = wintypes.DWORD()
-        if kernel32.GetProcessHandleCount(
-            kernel32.GetCurrentProcess(), ctypes.byref(handle_count)
-        ):
+        if kernel32.GetProcessHandleCount(kernel32.GetCurrentProcess(), ctypes.byref(handle_count)):
             return int(handle_count.value)
         return None
     except Exception:

@@ -232,7 +232,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
  * Rendered at two call sites with the same behaviour and different emphasis, so
  * the confirm step cannot drift between them.
  */
-function RestartGatewayButton({
+export function RestartGatewayButton({
   primary,
   pending,
   restarting,
@@ -339,7 +339,7 @@ export function AboutPanel() {
   // as the install is DISPATCHED, and on macOS the platform installer then works
   // for several more seconds before the app quits. Keying `disabled` on
   // isPending alone lets the button re-arm during that window, so the user sees
-  // a clickable "Restart & Update" followed by an unexplained quit -- which reads
+  // a clickable install-and-restart action followed by an unexplained quit -- which reads
   // as a crash.
   const installDispatched = installMutation.isPending || installMutation.isSuccess
   // Channel switcher (stable ⇄ insider opt-in). Switching persists the
@@ -439,6 +439,7 @@ export function AboutPanel() {
   const showUpdateCard = !checking && (cardState === 'found' || cardState === 'available' || cardState === 'downloading' || cardState === 'downloaded' || cardFailed)
   const cardBusy = cardState === 'available' || cardState === 'downloading'
   const cardReady = cardState === 'downloaded'
+  const showsWindowsInstaller = updateState?.installHandoff === 'windows-installer'
   // Determinate only once a progress event has arrived; before that the label
   // stays indeterminate, since `percent` is optional in the emit.
   const cardPercent = cardState === 'downloading' && typeof updateState?.percent === 'number'
@@ -469,7 +470,7 @@ export function AboutPanel() {
             <Btn primary onClick={() => installMutation.mutate()} disabled={installDispatched}>
               <RefreshCw size={13} className={`lucide-inline ${installDispatched ? 'animate-spin' : ''}`} /> {installMutation.isSuccess
                 ? i18nT('pages.settings.aboutPanel.restarting')
-                : i18nT('pages.settings.aboutPanel.restart_update')}
+                : i18nT('pages.settings.aboutPanel.install_update_restart_app')}
             </Btn>
           ) : (
             <Btn primary onClick={() => downloadMutation.mutate()} disabled={cardBusy || downloadMutation.isPending}>
@@ -505,11 +506,12 @@ export function AboutPanel() {
       {cardReady && (
         <span className="text-[12px] text-muted">
           {/* Once dispatched, the gateway goes down ON PURPOSE and the dashboard
-              disconnects for the ~1-2 min Squirrel handoff. This line is the last
-              thing the card says, so it must explain the coming silence. */}
+              disconnects during the platform installer handoff. This line is the
+              last thing the card says, so it must explain what happens next. */}
           {installDispatched
             ? i18nT('pages.settings.aboutPanel.installing_quiet_note')
             : i18nT('pages.settings.aboutPanel.downloaded_and_verified_the_app_restarts_to_fini')}
+          {showsWindowsInstaller && ` ${i18nT('components.updateModal.windows_installer_handoff')}`}
         </span>
       )}
       {showManualFallback && (
@@ -1357,7 +1359,7 @@ export function AboutPanel() {
             pages/settings/ReleasesPanel.tsx. */}
         <div className="mt-3 pt-3 border-t border-border">
           <Link
-            to="?tab=releases"
+            to="/settings/releases"
             className="text-[13px] text-accent hover:underline inline-flex items-center gap-1.5"
           >
             <History size={13} className="lucide-inline" aria-hidden="true" />

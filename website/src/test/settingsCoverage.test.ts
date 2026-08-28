@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest'
 import * as fs from 'fs'
 import * as path from 'path'
 
-import { extractFromSource, PANEL_TAB_MAP } from '../../scripts/settingsExtract'
+import { extractFromSource, EXTRACTABLE_PRIMITIVE_TAGS, PANEL_TAB_MAP } from '../../scripts/settingsExtract'
+import { SETTINGS_MANUAL } from '../components/commandPalette/settingsManual'
 
 /**
  * Settings-search coverage gate.
@@ -27,6 +28,12 @@ import { extractFromSource, PANEL_TAB_MAP } from '../../scripts/settingsExtract'
  * settingsManual.ts entry, or updating the accounting below with a reason a
  * reviewer can judge. Counts are pinned exactly (===): an unexplained increase
  * is a coverage regression, and a decrease means the accounting is stale.
+ *
+ * Residual path this gate does NOT close: a NEW shared composite control
+ * defined under components/ (TagListEditor's own history) matches neither the
+ * extractor's primitive list nor BARE_CONTROL_TAGS below, so its settings are
+ * unindexed with no red until someone teaches the extractor the tag AND adds
+ * it to BARE_CONTROL_TAGS. When introducing a shared labeled control, do both.
  */
 
 const SETTINGS_DIR = path.resolve(__dirname, '../pages/settings')
@@ -57,10 +64,12 @@ const UNMAPPED_PANELS: Record<string, string> = {
   'ChannelsPanel.tsx': 'list-detail shell routing to per-channel panels; carries no controls of its own',
   'DiscordPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=discord',
   'TelegramPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=telegram',
+  'FeishuPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=feishu',
   'WeComPanel.tsx': 'thin BotChannelSpec wrapper; BotChannelPanel fans its entries out to channel=wecom',
   'ImportPanel.tsx': 'single action button launching the import wizard; no persistent settings',
   'InstanceFormFields.tsx': 'per-instance CRUD form fields (add/edit crew), not global settings',
   'McpManagement.tsx': 'mounted only on the standalone Developer page — a settings deep link would be dead',
+  'MobileLoginCard.tsx': 'mint-a-sign-in-link action card; the link it returns is a one-time credential, not a persistent setting',
   'PostureDisclosure.tsx': "read-only disclosure rows for SecurityPanel's posture section (manual entry security.live-security-posture)",
   'ReleasesPanel.tsx': 'read-only changelog viewer, zero persistent settings',
   'ReportProblemCard.tsx': 'feedback action card, no settings',
@@ -69,12 +78,6 @@ const UNMAPPED_PANELS: Record<string, string> = {
   'ThemeDroppedRulesNotice.tsx': 'informational notice, zero controls',
   'WebhooksPanel.tsx': 'status summary card; the real controls live on the /webhooks page',
 }
-
-/** Tag names the extractor indexes — a file containing any of these MUST be mapped. */
-const EXTRACTABLE_TAGS = [
-  'SettingsToggle', 'SettingsSelect', 'SettingsCombobox', 'SettingsInput',
-  'SettingsStepper', 'SettingsButtonGroup', 'SecretField', 'TagListEditor',
-]
 
 describe('settings coverage gate — PANEL_TAB_MAP completeness', () => {
   it('every panel file is either mapped or explicitly waived', () => {
@@ -98,7 +101,7 @@ describe('settings coverage gate — PANEL_TAB_MAP completeness', () => {
     for (const file of Object.keys(UNMAPPED_PANELS)) {
       if (!fs.existsSync(path.join(SETTINGS_DIR, file))) continue
       const source = readPanel(file)
-      for (const tag of EXTRACTABLE_TAGS) {
+      for (const tag of EXTRACTABLE_PRIMITIVE_TAGS) {
         if (new RegExp(`<${tag}\\b`).test(source)) offenders.push(`${file}: <${tag}>`)
       }
     }
@@ -169,6 +172,10 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
   'McpManagement.tsx': {
     counts: { Switch: 2 },
     reason: 'Developer-page-only surface, deliberately outside settings search',
+  },
+  'MobileLoginCard.tsx': {
+    counts: { Input: 1 },
+    reason: 'read-only display of the freshly minted sign-in link (select-on-focus for manual copy) — transient, not a persistent setting',
   },
   'NotificationsPanel.tsx': {
     counts: { Toggle: 1, Select: 1, input: 1 },
@@ -256,7 +263,7 @@ describe('settings coverage gate — bare controls', () => {
  */
 const EXPECTED_DYNAMIC_SKIPS: Record<string, { count: number; reason: string }> = {
   'BotChannelPanel.tsx': {
-    count: 14,
+    count: 16,
     reason:
       'labels arrive through BotChannelSpec props (per-channel copy decided by the ' +
       'mounting wrapper); the static-label primitives in the same file fan out per channel',
@@ -293,6 +300,48 @@ describe('settings coverage gate — dynamic-label skips', () => {
     expect(
       Object.keys(EXPECTED_DYNAMIC_SKIPS).filter(f => !files.has(f) || !(f in PANEL_TAB_MAP)),
       'EXPECTED_DYNAMIC_SKIPS entry for a file that is missing or unmapped — prune it.',
+    ).toEqual([])
+  })
+})
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* 4. Manual entries stay anchored to real panel source                       */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('settings coverage gate — manual entries anchor to panel source', () => {
+  it("every manual entry's labelKey appears in a panel file mapped to its tab", () => {
+    // A settingsManual entry deep-links by resolving its labelKey and querying
+    // the DOM for a matching data-setting-label anchor. Nothing else ties the
+    // entry to the panel, so a refactor that renames or drops the key silently
+    // kills both the highlight and (eventually) the row itself while the
+    // registry keeps offering the ghost entry. Requiring the key to appear in
+    // the tab's panel source (as an anchor attribute or a rendered label)
+    // fails the build the moment they drift apart.
+    const filesByTab = new Map<string, string[]>()
+    for (const [file, target] of Object.entries(PANEL_TAB_MAP)) {
+      const targets = Array.isArray(target) ? target : [target]
+      for (const t of targets) {
+        const tab = typeof t === 'string' ? t : t.tab
+        filesByTab.set(tab, [...(filesByTab.get(tab) ?? []), file])
+      }
+    }
+    const sourceCache = new Map<string, string>()
+    const src = (f: string) => {
+      if (!sourceCache.has(f)) sourceCache.set(f, readPanel(f))
+      return sourceCache.get(f)!
+    }
+    const orphans: string[] = []
+    for (const entry of SETTINGS_MANUAL) {
+      const candidates = filesByTab.get(entry.tab) ?? []
+      if (!candidates.some(f => src(f).includes(entry.labelKey))) {
+        orphans.push(`${entry.id}: labelKey '${entry.labelKey}' not found in any ${entry.tab}-tab panel`)
+      }
+    }
+    expect(
+      orphans,
+      "A settingsManual entry's labelKey no longer appears in its tab's panel " +
+      'source — the deep-link anchor is gone or renamed. Restore the ' +
+      'data-setting-label anchor (or update/remove the manual entry).',
     ).toEqual([])
   })
 })

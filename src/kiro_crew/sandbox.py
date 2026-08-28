@@ -1580,6 +1580,36 @@ if _libc.prctl:
     _libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
     _libc.prctl.restype = ctypes.c_int
 
+def _mount_or_die(source, target, flags, what):
+    """``mount(2)`` or refuse to exec, naming *what* and the errno.
+
+    Every mount in this launcher IS a security control -- each one hides a
+    credential path, or (for ``/``) pins mount propagation so the hiding
+    cannot escape. Discarding the return value makes those controls fail
+    OPEN: the path stays visible and the agent runs anyway, believing it is
+    hidden. Nothing downstream notices -- there is no post-mount emptiness
+    check, the launcher has no logger, and the pre-exec hardlink scan only
+    fires when a credential happens to carry an extra link.
+
+    So these refuse, matching what the rest of this launcher already does
+    when a control cannot be established: both ``unshare`` calls, the
+    seccomp-BPF install, and the hardlink scan all ``sys.exit``. The
+    degrade-open decisions nearby are deliberately narrower -- the tmpfs
+    source-dir fallback and the hardlink scan's budget ceiling -- and
+    neither concerns the hiding itself.
+
+    ``sandbox_level`` is the explicit opt-out for a host that cannot mount;
+    a silent unhidden credential is not.
+    """
+    if _libc.mount(source, target, None, flags, None) != 0:
+        _err = ctypes.get_errno()
+        sys.exit(
+            "sandbox: BLOCKED -- %s failed: errno %d (%s). The sandbox could not "
+            "establish this control, so the agent would run with the path "
+            "visible. Lower sandbox_level to run without it deliberately."
+            % (what, _err, os.strerror(_err))
+        )
+
 REAL_UID = {uid}
 REAL_GID = {gid}
 SENSITIVE_DIRS = {dirs_json}
@@ -1645,7 +1675,8 @@ def main():
             sys.exit(f"sandbox: unshare(NEWNS) failed: errno {{ctypes.get_errno()}}")
 
         # Private mount propagation
-        _libc.mount(None, b"/", None, _MS_REC | _MS_PRIVATE, None)
+        _mount_or_die(None, b"/", _MS_REC | _MS_PRIVATE,
+                      "making mount propagation private on /")
 
         # Pick a tmpfs-backed source dir for bind-mount empty files/dirs. Same-fs
         # binds (e.g. /tmp on ext4 over ~/.kiro/crew/.env on ext4) can corrupt the
@@ -1688,7 +1719,8 @@ def main():
             target = d.encode()
             if os.path.isdir(target):
                 per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src).encode()
-                _libc.mount(per_dir_empty, target, None, _MS_BIND, None)
+                _mount_or_die(per_dir_empty, target, _MS_BIND,
+                              "hiding credential directory %s" % d)
 
         # Restore selectively exposed files into the now-empty mounts
         for src_path, filename in EXPOSE_FILES:
@@ -1713,7 +1745,8 @@ def main():
             if os.path.isfile(target):
                 fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src)
                 os.close(fd)
-                _libc.mount(empty_path.encode(), target, None, _MS_BIND, None)
+                _mount_or_die(empty_path.encode(), target, _MS_BIND,
+                              "hiding sensitive file %s" % f)
 
         # .ssh: hide keys but expose known_hosts content (strict only)
         if HIDE_SSH and os.path.isdir(SSH_DIR):
@@ -1724,7 +1757,8 @@ def main():
             # Cross-fs source for the same kernel-race reason as SENSITIVE_DIRS
             # (line 371) and SENSITIVE_FILES (line 389).
             ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src).encode()
-            _libc.mount(ssh_tmp, SSH_DIR.encode(), None, _MS_BIND, None)
+            _mount_or_die(ssh_tmp, SSH_DIR.encode(), _MS_BIND,
+                          "hiding ssh key directory %s" % SSH_DIR)
             if kh_data:
                 with open(os.path.join(SSH_DIR, "known_hosts"), "wb") as fh:
                     fh.write(kh_data)
@@ -2272,6 +2306,7 @@ def _delegate_to_kiro_internal_sandbox(
     part of kiro's own sandbox mechanism on this path, so bypassing it here
     would defeat the delegated layer.
     """
+
     global _kiro_delegation_warned
     try:
         # circular import (pre-emptive, layering): sandbox.py is a low-level
@@ -2285,7 +2320,7 @@ def _delegate_to_kiro_internal_sandbox(
             session_key="sandbox",
             agent="system",
             source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
+            tool_name=_command_log_label(argv),
             tool_kind="subprocess",
             outcome="delegated",
             resources=(
@@ -2963,6 +2998,37 @@ def _warn_no_isolation(mode: str) -> None:
     )
 
 
+def _command_log_label(argv: list[str]) -> str:
+    """Return a fixed, non-sensitive executable class for diagnostics.
+
+    ``wrap_argv`` is a generic boundary: later argv elements routinely contain
+    user-controlled paths, URLs, and occasionally transport capabilities. Static
+    analysis also correctly treats a list element as able to reach any other
+    element. Never send a value taken from that container to a log or SEL event,
+    even when the runtime expression selects ``argv[0]``. The fixed labels retain
+    enough operational signal without exposing executable paths or arguments.
+    """
+
+    if not argv:
+        return "unknown"
+    name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name == "git":
+        return "git"
+    if name in {"python", "python3", "pythonw", "pythonw3"}:
+        return "python"
+    if name in {"node", "npm", "npx"}:
+        return "node"
+    if name in {"kiro", "kiro-cli", "kirocrew"}:
+        return "kiro"
+    if name in {"bash", "sh", "zsh", "cmd", "powershell", "pwsh"}:
+        return "shell"
+    if name in {"env", "bwrap", "sandbox-exec", "systemd-run"}:
+        return "sandbox-helper"
+    return "other"
+
+
 def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
     """Emit a once-per-process SECURITY warning when mode='off' results in
     no OS-level isolation and no verified delegation.
@@ -2978,7 +3044,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             logger.info(
                 "agent.sandbox='off' with no active delegation; operator opted "
                 "in via sandbox_allow_no_isolation. Command: %s",
-                argv[0] if argv else "unknown",
+                _command_log_label(argv),
             )
         return
 
@@ -2997,7 +3063,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "security.py checks remain. Set agent.sandbox='auto' or enable "
             "kiro-cli's internal sandbox to restore OS-level confinement. "
             "Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     elif sys.platform.startswith("linux"):
         if "linux" in _warned_set:
@@ -3010,7 +3076,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "secrets are readable by it and only the bypassable app-level "
             "security.py checks remain. Set agent.sandbox='auto' to engage "
             "namespace isolation. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     elif sys.platform == "win32":
         if "win32" in _warned_set:
@@ -3020,7 +3086,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "SECURITY: agent.sandbox='off' on Windows — no OS-level sandbox "
             "backend exists on this platform. The agent subprocess runs with "
             "full filesystem access. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     else:
         if "other" in _warned_set:
@@ -3030,7 +3096,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "SECURITY: agent.sandbox='off' for a non-kiro-cli subprocess — "
             "running without OS-level confinement. Set agent.sandbox='auto' "
             "to engage seatbelt isolation. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
 
     _warn_mode_off_unconfined._warned_set = _warned_set  # type: ignore[attr-defined]
@@ -3054,7 +3120,7 @@ def _warn_first_party_unconfined_once(argv: list[str]) -> None:
         "Hostile-input spawn paths are unaffected: they keep failing closed "
         "and still require agent.sandbox_allow_unsandboxed_exec=true. "
         "Command: %s",
-        argv[0] if argv else "unknown",
+        _command_log_label(argv),
     )
 
 
@@ -3091,7 +3157,7 @@ def _first_party_no_backend_passthrough(
             session_key="sandbox",
             agent="system",
             source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
+            tool_name=_command_log_label(argv),
             tool_kind="subprocess",
             outcome="unconfined",
             resources="first-party fixed argv, no sandbox backend (issue #1563 carve-out)",
@@ -3102,7 +3168,7 @@ def _first_party_no_backend_passthrough(
             "unaudited: the argv is package-derived and denying the spawn "
             "would brick built-in tooling whenever SEL hiccups (matches the "
             "mode=off delegation posture). Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
             exc_info=True,
         )
     # Same env scrub as the seatbelt / delegation paths, via the trusted
@@ -3434,7 +3500,7 @@ def wrap_argv(
                     session_key="sandbox",
                     agent="system",
                     source="sandbox.wrap_argv",
-                    tool_name=argv[0] if argv else "unknown",
+                    tool_name=_command_log_label(argv),
                     tool_kind="subprocess",
                     outcome="delegated",
                     resources=(
@@ -3451,7 +3517,7 @@ def wrap_argv(
                 logger.warning(
                     "SECURITY: SEL audit failed for mode=off delegation; "
                     "proceeding with env scrub but no seatbelt. Command: %s",
-                    argv[0] if argv else "unknown",
+                    _command_log_label(argv),
                     exc_info=True,
                 )
             unset_args = _sandbox_env_unset_args("standard", strip_python_env)
@@ -3510,7 +3576,7 @@ def wrap_argv(
                 "Applying the stricter tier's env scrub to the passthrough.",
                 requested_level,
                 active_level,
-                argv[0] if argv else "unknown",
+                _command_log_label(argv),
             )
         # Emit an SEL audit event for this security-relevant passthrough so the
         # decision to spawn without a *fresh* wrap is tamper-evidently recorded,
@@ -3541,7 +3607,7 @@ def wrap_argv(
                 session_key="sandbox",
                 agent="system",
                 source="sandbox.wrap_argv",
-                tool_name=argv[0] if argv else "unknown",
+                tool_name=_command_log_label(argv),
                 tool_kind="subprocess",
                 outcome="allowed",
                 metadata={
@@ -3847,7 +3913,7 @@ def wrap_argv(
                     session_key="sandbox",
                     agent="system",
                     source="sandbox.wrap_argv",
-                    tool_name=argv[0] if argv else "unknown",
+                    tool_name=_command_log_label(argv),
                     tool_kind="subprocess",
                     outcome="denied",
                     error=(f"{sel_reason} (probe: {probe_reason})"),

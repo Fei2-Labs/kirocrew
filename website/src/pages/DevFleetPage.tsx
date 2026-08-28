@@ -291,22 +291,112 @@ function MenuBtn({ items }: { items: (MenuItemDef | null)[] }) {
   const [rect, setRect] = useState<DOMRect | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  // One ref per VISIBLE item (index-aligned with `visible`, not `items`), so
+  // focus-entry and Tab containment below can skip disabled rows without
+  // reasoning about the gaps a filtered/disabled mix would otherwise leave.
+  const itemRefs = useRef<(HTMLDivElement | null)[]>([])
   const visible = items.filter(Boolean) as MenuItemDef[]
+  // Composition latch shared with the sibling ConfirmBtn trap: a Tab or
+  // Escape the IME owns is choosing/cancelling a candidate, not navigating
+  // the menu (native-event contract in useImeGuard.ts). Menu items are
+  // non-editable today, so no composition can start on them — the latch pins
+  // that this stays safe if the menu ever grows a focusable text field.
+  const imeLatch = useDocumentImeLatch(open)
+
+  // Explicit dismissal (Escape, an item click) restores focus to the trigger.
+  // Outside-click closes WITHOUT moving focus, deliberately: the browser
+  // routes focus per the click target after the handler, so the user's focus
+  // is already elsewhere by their own action (#2533). Scroll/resize closes
+  // restore focus only when it would otherwise be orphaned — see
+  // onScrollOrResize below.
+  const close = useCallback(() => { setOpen(false); triggerRef.current?.focus() }, [])
+
+  // Enabled item elements, index-aligned filter over itemRefs/visible.
+  const focusableItems = useCallback(
+    () => itemRefs.current.filter((el, i) => !visible[i]?.disabled && el) as HTMLDivElement[],
+    [visible],
+  )
 
   useEffect(() => {
     if (!open) return
+    // role="menu" tells assistive technology that focus is managed here —
+    // move it onto the first enabled item so a keyboard user lands inside
+    // the menu they were just told is open, not still on the trigger.
+    focusableItems()[0]?.focus()
     // The menu is portaled to <body>, so it is not a DOM descendant of
     // the trigger — the outside-click guard must exclude BOTH the trigger and
     // the menu (a plain trigger.contains() check would close on every menu
-    // click). Escape closes and returns focus to the trigger.
+    // click).
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node
       if (!triggerRef.current?.contains(t) && !menuRef.current?.contains(t)) setOpen(false)
     }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { setOpen(false); triggerRef.current?.focus() } }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        // An Escape the IME owns is cancelling a candidate, not the menu —
+        // and close() also yanks focus back to the trigger. Same claim, same
+        // reason as the sibling ConfirmBtn trap.
+        if (!imeLatch.claimKey(e)) return
+        close()
+        return
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
+        // role="menu" promises arrow-key item navigation (WAI-ARIA menu
+        // pattern) — screen-reader users reach for arrows first (#5851).
+        // Wrap at both ends; Home/End jump to the boundary items.
+        // preventDefault stops the page scrolling behind the open menu.
+        // Modified arrows (Cmd/Ctrl/Alt) are OS/browser shortcuts the menu
+        // pattern assigns no behavior to — let them through untouched.
+        if (e.altKey || e.ctrlKey || e.metaKey) return
+        // An arrow the IME owns is moving through composition candidates,
+        // not menu items — same claim, same reason as the Tab branch below,
+        // and the claim runs BEFORE the preventDefault() and focus move.
+        // (useListKeyboardNav deliberately lets composition arrows through
+        // because its list coexists with a text input; this menu holds no
+        // editable target, so it takes the stricter side.)
+        const focusable = focusableItems()
+        if (focusable.length === 0) return
+        if (!imeLatch.claimKey(e)) return
+        e.preventDefault()
+        if (e.key === 'Home') { focusable[0].focus(); return }
+        if (e.key === 'End') { focusable[focusable.length - 1].focus(); return }
+        const idx = focusable.indexOf(document.activeElement as HTMLDivElement)
+        // Focus outside the item list (edge: it never entered) — treat the
+        // arrow as entry: Down lands on the first item, Up on the last.
+        const next = idx === -1
+          ? (e.key === 'ArrowDown' ? 0 : focusable.length - 1)
+          : (idx + (e.key === 'ArrowDown' ? 1 : -1) + focusable.length) % focusable.length
+        focusable[next].focus()
+        return
+      }
+      if (e.key !== 'Tab') return
+      // Contain Tab/Shift-Tab within the menu's enabled items — a Tab out of
+      // a still-open menu would drop a keyboard user behind it with no
+      // obvious way back (#2533). A boundary Tab the IME owns must not cycle
+      // focus: the claim runs BEFORE the preventDefault() and focus move.
+      const focusable = focusableItems()
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (e.shiftKey && document.activeElement === first) {
+        if (!imeLatch.claimKey(e)) return
+        e.preventDefault(); last.focus()
+      } else if (!e.shiftKey && document.activeElement === last) {
+        if (!imeLatch.claimKey(e)) return
+        e.preventDefault(); first.focus()
+      }
+    }
     // position:fixed desyncs from any scrolling ancestor — close on scroll
-    // (capture phase catches nested scrollers) and on resize.
-    const onScrollOrResize = () => setOpen(false)
+    // (capture phase catches nested scrollers) and on resize. A wheel scroll
+    // moves no DOM focus, so with focus-entry above the unmount would orphan
+    // focus to <body> — restore it to the trigger, but only when focus is
+    // still inside the menu, and without scrolling: a default focus() would
+    // yank the viewport back to the trigger, hijacking the very scroll that
+    // dismissed the menu.
+    const onScrollOrResize = () => {
+      if (menuRef.current?.contains(document.activeElement)) triggerRef.current?.focus({ preventScroll: true })
+      setOpen(false)
+    }
     document.addEventListener('mousedown', onDown)
     document.addEventListener('keydown', onKey)
     window.addEventListener('scroll', onScrollOrResize, true)
@@ -317,7 +407,13 @@ function MenuBtn({ items }: { items: (MenuItemDef | null)[] }) {
       window.removeEventListener('scroll', onScrollOrResize, true)
       window.removeEventListener('resize', onScrollOrResize)
     }
-  }, [open])
+    // `focusableItems` is a new function identity every render (it closes
+    // over `visible`, itself a new array every render); including it would
+    // re-run this effect (and re-steal focus onto the first item) on every
+    // unrelated parent re-render while the menu is open, not just on
+    // open/close.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, close, imeLatch])
 
   const toggle = () => {
     if (!open && triggerRef.current) setRect(triggerRef.current.getBoundingClientRect())
@@ -361,7 +457,8 @@ function MenuBtn({ items }: { items: (MenuItemDef | null)[] }) {
           {visible.map((item, i) => (
             <Clickable
               key={'mi' + i}
-              onClick={() => { setOpen(false); item.onClick() }}
+              ref={(el) => { itemRefs.current[i] = el }}
+              onClick={() => { close(); item.onClick() }}
               disabled={!!item.disabled}
               style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left' as const, background: 'none', border: 'none', borderRadius: 7, padding: '7px 10px', fontSize: 12, color: item.danger ? 'var(--danger)' : 'var(--text)', cursor: item.disabled ? 'default' : 'pointer', opacity: item.disabled ? 0.5 : 1 } as CSSProperties}
             >

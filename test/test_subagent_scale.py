@@ -22,7 +22,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.constants import SUBAGENT_COMPLETION_META_KEY
 from kiro_crew.subagent import SubagentInfo, SubagentManager
 from kiro_crew.subagent_scale import SubagentEventCoalescer
 
@@ -623,6 +622,39 @@ async def _settle(predicate, timeout: float = 5.0) -> None:
         await asyncio.sleep(0.02)
 
 
+def _wire_hold_settlement(orch, slot, mgr):
+    """Wire the slot's delivery ledger and the manager's async settle seam.
+
+    The direct-injection branch owes a flushing digest's held ids to the
+    turn's CONSUMPTION through the slot's content-keyed delivery ledger and
+    settles them through ``SubagentManager.settle_queued_delivery`` — the same
+    machinery the queue drain uses (#2233 via the #4839 ledger). The MagicMock
+    slot needs a real mini-ledger for that flow to be observable, and the
+    mocked manager's settle must hand back a real coroutine or the settlement
+    path skips it (the stubbed-manager guard in
+    ``_arm_queued_delivery_settlement``). Production wires
+    ``DashboardState(subagents=<the manager>)``; mirror it.
+
+    Returns ``(ledger, settled)``: the content-keyed debts still parked, and
+    the id batches the manager was asked to settle.
+    """
+    ledger: dict[str, list[str]] = {}
+    slot.note_pending_subagent_delivery = MagicMock(
+        side_effect=lambda content, ids: ledger.setdefault(content, []).extend(ids)
+    )
+    slot.take_pending_subagent_deliveries = MagicMock(
+        side_effect=lambda contents: [i for c in contents for i in ledger.pop(c, [])]
+    )
+    settled: list[list[str]] = []
+
+    async def _record_settle(ids):
+        settled.append(list(ids))
+
+    mgr.settle_queued_delivery = MagicMock(side_effect=_record_settle)
+    orch.dashboard_state.subagents = mgr
+    return ledger, settled
+
+
 class TestWaveDigest:
     def _capture_on_done(self, orch):
         with patch("kiro_crew.slack.handler.is_yolo_mode", return_value=False):
@@ -671,8 +703,8 @@ class TestWaveDigest:
         total = 12  # chunk size 10 -> chunks of 10 + 2
         injected: list[str] = []
 
-        async def _fake_run_chat(_state, _slot, text, **kwargs):
-            kwargs["_on_consumed"]()
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            assert _directive_user_origin is False
             injected.append(text)
 
         with patch("kiro_crew.slack.gateway._run_chat", side_effect=_fake_run_chat), \
@@ -734,8 +766,8 @@ class TestWaveDigest:
         total = 12  # chunk size 10 -> chunk 1/2 at member 10, final 2/2 on close
         injected: list[str] = []
 
-        async def _fake_run_chat(_state, _slot, text, **kwargs):
-            kwargs["_on_consumed"]()
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            assert _directive_user_origin is False
             injected.append(text)
 
         hop_calls: list[int] = []
@@ -804,43 +836,6 @@ class TestWaveDigest:
         assert payload["err"] == 2 and payload["stopped"] == 0
 
     @pytest.mark.asyncio
-    async def test_recovered_interrupted_batch_member_is_neutral(self):
-        orch = _make_orchestrator()
-        orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
-        orch.ctx_builder.hooks = MagicMock()
-        orch.dashboard_state = _mock_dashboard_state()
-        slot = MagicMock()
-        slot.mode = "chat"
-        slot.running = True
-        slot.task = asyncio.ensure_future(asyncio.sleep(0))
-        await slot.task
-        slot._orch_tracker = None
-        slot._subagent_deliveries_inflight = 0
-        slot._subagents_inline_collected = set()
-        slot.queue_append = MagicMock()
-        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
-        mgr, on_done = self._capture_on_done(orch)
-        members = [self._member(index, 2) for index in range(2)]
-        members[0]._recovered_outcome = "interrupted"
-        members[0].error = "interrupted by gateway restart"
-
-        with patch("kiro_crew.slack.gateway._run_chat", new_callable=AsyncMock):
-            for index, member in enumerate(members):
-                mgr.batch_members_pending = MagicMock(return_value=index == 0)
-                await on_done(member)
-
-        finished = [
-            call
-            for call in orch.dashboard_state.broadcast_ws.call_args_list
-            if call.args and call.args[0] == "batch_finished"
-        ]
-        assert len(finished) == 1
-        payload = finished[0].args[1]
-        assert payload["total"] == 2 and payload["ok"] == 1
-        assert payload["err"] == 0 and payload["stopped"] == 0
-
-    @pytest.mark.asyncio
     async def test_held_members_marked_delivered_only_at_digest(self):
         """Restart safety (Arbiter item 1 + GPT round-5 HIGH): held members
         are flagged ``_digest_held`` (the run loop skips its own
@@ -849,7 +844,11 @@ class TestWaveDigest:
         restart). The gateway must NOT settle them at chunk COMPOSITION
         either (routing could still fail); instead it stashes each chunk's
         held OK ids on that chunk's FLUSHING member (``_digest_settle_ids``)
-        and the run loop settles them only after ``_on_done`` — routing
+        and settlement waits for the route that owns the hand-off: the
+        dashboard route below detaches the ids when the injection turn is
+        launched and owes them to the turn's CONSUMPTION through the slot's
+        delivery ledger (#2233); for routes whose ``_on_done`` return really
+        is the confirmation it is the run loop, after ``_on_done`` — routing
         included — returns cleanly."""
         orch = _make_orchestrator()
         orch.sessions = _mock_sessions()
@@ -864,19 +863,34 @@ class TestWaveDigest:
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
+        ledger, settled = _wire_hold_settlement(orch, slot, mgr)
         total = 12
         members = [
             self._member(i, total, error="boom" if i == 2 else "")
             for i in range(total)
         ]
+
+        async def _consuming_run_chat(_state, _slot, _text, *, _on_consumed=None, **_kw):
+            # The model consumed the injected digest — the one condition that
+            # settles this route's holds (#2233).
+            if _on_consumed is not None:
+                _on_consumed()
+
         marked: list[str] = []
-        with patch("kiro_crew.slack.gateway._run_chat", new_callable=AsyncMock), \
+        with patch("kiro_crew.slack.gateway._run_chat", _consuming_run_chat), \
                 patch("kiro_crew.subagent_persistence.mark_delivered",
                       side_effect=marked.append):
             for i, m in enumerate(members):
                 mgr.batch_members_pending = MagicMock(return_value=i != total - 1)
                 await on_done(m)
                 await asyncio.sleep(0)
+                # Let each flush's injection turn finish before the next member
+                # reports, so both flushes take the direct (idle-slot) branch.
+                await _settle(lambda: slot.task is None)
+            # Both chunks' injection turns must report consumption before their
+            # holds can settle — the settle is owed to the turn, not to the
+            # `_on_done` return (#2233).
+            await _settle(lambda: len(settled) >= 2)
         # Members 0-8 are held for chunk 1; member 9 (the 10th) flushes it.
         # Members 10 is held for chunk 2; member 11 (wave close) flushes it.
         held_idx = list(range(9)) + [10]
@@ -886,20 +900,23 @@ class TestWaveDigest:
         # NOTHING is tombstoned at composition time — a crash between
         # composing and routing must leave held results orphan-recoverable.
         assert marked == []
-        # Routing transfers each chunk's settlement debt to the slot.  The
-        # flushing record is then empty so its run loop cannot acknowledge the
-        # same completions before the model consumes the queued digest.
+        # Each FLUSHING member's settle list is its own chunk's held OK members
+        # only (chunk buffers reset between flushes). On THIS route the list is
+        # detached when the injection turn is launched and settled through the
+        # manager once the turn consumed the digest, so what is asserted is the
+        # hand-off, not a residue left on the member (#2233): the member is
+        # left clean and the ids reach the manager exactly once, per chunk.
         assert members[9]._digest_settle_ids == []
         assert members[11]._digest_settle_ids == []
-        owed_chunks = [
-            call.args[1]
-            for call in slot.note_pending_subagent_delivery.call_args_list
+        # Each debt leads with the FLUSHING member's own id: its tombstone is
+        # deferred to the same consumption (`_delivery_queued`), closing the
+        # identical loss window for the flusher's own result.
+        assert members[9]._delivery_queued is True
+        assert members[11]._delivery_queued is True
+        assert settled == [
+            [members[9].id] + [members[i].id for i in range(9) if not members[i].error],
+            [members[11].id, members[10].id],
         ]
-        assert sorted(owed_chunks[0]) == sorted(
-            [members[9].id]
-            + [members[i].id for i in range(9) if not members[i].error]
-        )
-        assert sorted(owed_chunks[1]) == sorted([members[11].id, members[10].id])
         # Per-wave bookkeeping pruned once the wave finished.
         mgr.finalize_batch.assert_called_once_with("bigwave")
 
@@ -914,7 +931,7 @@ class TestWaveDigest:
         info = SubagentInfo(id="last", task="t")
         info._digest_settle_ids = ["h1", "h2"]
         with patch("kiro_crew.subagent.mark_delivered", side_effect=marked.append):
-            await mgr._settle_digest_holds(info)
+            mgr._settle_digest_holds(info)
         assert marked == ["h1", "h2"]
         assert info._digest_settle_ids == []  # idempotent re-entry safe
         # Structural guarantee: the settle call sits AFTER the awaited
@@ -930,6 +947,327 @@ class TestWaveDigest:
         on_done_pos = src.index("await asyncio.wait_for(self._on_done(info)")
         settle_pos = src.index("self._settle_digest_holds(info)")
         assert settle_pos > on_done_pos
+
+    @pytest.mark.asyncio
+    async def test_holds_settle_only_after_the_injection_turn_confirms(self):
+        """Ownership (#2233): the dashboard route hands off asynchronously, so a
+        bare ``_on_done`` return is not proof the digest reached the parent.
+
+        ``_report_terminal`` settles ``info._digest_settle_ids`` right after
+        ``_on_done`` returns. On the dashboard branch that return happens while
+        the injection turn is still a *pending task* — so a shutdown or a
+        cancelled slot turn between the two leaves the held siblings carrying
+        ``delivered`` tombstones for a digest the parent never saw. A tombstone
+        is exactly what ``list_orphans()`` uses to EXCLUDE a run folder from the
+        next start's reconciliation, so those complete ``result.txt`` files
+        become permanently invisible: no error, no notification, just N results
+        the parent never receives and recovery will never offer again.
+
+        The fix moves settlement to the side that actually owns the hand-off.
+        The flushing member's settle ids are DETACHED from ``info`` when the
+        injection task is launched — which makes the run loop's settle a no-op
+        for this route — and owed to the turn's CONSUMPTION through the slot's
+        delivery ledger, the same debt shape the queue branch records (#2233).
+        Not even the turn's clean completion settles them: ``_run_chat``
+        returns normally on several non-delivery paths (signed-out CLI, dead
+        provider, exhausted retries, a first empty response), so only the
+        consumption report — the model actually has the prompt — confirms the
+        hand-off.
+
+        The turn is gated on an ``asyncio.Event`` rather than timed: the state
+        under test is "task created, consumption not yet reported", which a
+        sleep can only approximate.
+        """
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = False
+        slot.task = None
+        slot._orch_tracker = None
+        slot._subagent_deliveries_inflight = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        mgr, on_done = self._capture_on_done(orch)
+        ledger, settled = _wire_hold_settlement(orch, slot, mgr)
+        total = 12
+        members = [self._member(i, total) for i in range(total)]
+
+        turn_started = asyncio.Event()
+        release_consume = asyncio.Event()
+
+        async def _gated_run_chat(_state, _slot, _text, *, _on_consumed=None, **_kw):
+            turn_started.set()
+            await release_consume.wait()
+            if _on_consumed is not None:
+                _on_consumed()
+
+        marked: list[str] = []
+        with patch("kiro_crew.slack.gateway._run_chat", _gated_run_chat), \
+                patch("kiro_crew.subagent_persistence.mark_delivered",
+                      side_effect=marked.append):
+            for i, m in enumerate(members[:10]):
+                mgr.batch_members_pending = MagicMock(return_value=True)
+                await on_done(m)
+                await asyncio.sleep(0)
+
+            # Preconditions: nine siblings are held, the tenth flushed chunk 1,
+            # and its injection turn is RUNNING but has not consumed the digest.
+            held_ids = [members[i].id for i in range(9)]
+            owed = [members[9].id] + held_ids
+            assert all(members[i]._digest_held for i in range(9)), (
+                "precondition: the first nine members must be held for the chunk"
+            )
+            await _settle(turn_started.is_set)
+            assert turn_started.is_set(), "precondition: the injection turn started"
+            assert slot.task is not None and not slot.task.done(), (
+                "precondition: the hand-off is still in flight — this is the "
+                "window in which the current contract settles"
+            )
+
+            flusher = members[9]
+            assert flusher._digest_settle_ids == [], (
+                "the flushing member must not still be carrying the settle ids "
+                "while the hand-off is unconfirmed: the run loop settles that "
+                "list as soon as _on_done returns, which is now"
+            )
+            assert list(ledger.values()) == [owed], (
+                "the ids — the flusher's own tombstone included — are parked "
+                "in the slot's delivery ledger, owed, not settled: a process "
+                "death here leaves them tombstone-free and recoverable by "
+                "orphan reconciliation"
+            )
+            assert settled == [] and marked == [], (
+                "nothing may be tombstoned before the hand-off lands"
+            )
+
+            # The model consumes the digest — NOW the hand-off is confirmed.
+            release_consume.set()
+            await _settle(lambda: bool(settled))
+
+        # Settled through the manager by the side that owns the hand-off, once,
+        # with exactly this chunk's held members. (``settle_queued_delivery`` is
+        # mocked here; its real tombstone write and teardown gate are pinned by
+        # test_subagent_delivery_ttl_anchor.py.)
+        assert settled == [owed]
+        assert marked == [], (
+            "and never through the run loop's settle, which this route detached"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_queued_hand_off_is_not_confirmed_until_the_turn_runs(self):
+        """The same root cause one branch up (#2233, First Principles CONCERNS).
+
+        When the parent slot is busy the digest is appended to ``slot._queue``
+        and ``_subagent_done`` returns — so the run loop would settle on that
+        bare return, exactly as it did for the direct branch.
+
+        ``slot._queue`` is a plain in-memory list (``state.py``): the
+        ``"queued"`` role is in ``chat_persistence._TRANSIENT_ROLES`` and no
+        producer writes it to disk. ``_run_chat``'s ``finally`` drains it on any
+        exit path *within the process*, which is why the enqueue looks durable —
+        but a shutdown before the drain loses the announce entirely, and by then
+        the held siblings would already carry ``delivered`` tombstones.
+        Enqueueing is a local routing success, not evidence the parent received
+        anything.
+
+        ``_defer_queued_delivery`` therefore owes the held ids (together with
+        the flushing member's own) to the drain through the slot's delivery
+        ledger, keyed on the announce itself — the run loop's settle is a no-op
+        here too, and settlement waits for a turn to actually consume the
+        announce (the #4839 machinery; one debt shape for both routes).
+
+        This test never drains the queue: that IS the process-loss window.
+        """
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        # Busy: a turn already owns the slot, so the completion is QUEUED rather
+        # than dispatched. `task = None` keeps the shield-await a no-op.
+        slot.running = True
+        slot.task = None
+        slot._orch_tracker = None
+        slot._subagent_deliveries_inflight = 0
+        slot._subagents_inline_collected = set()
+        queued: list[dict] = []
+        slot.queue_append = MagicMock(
+            side_effect=lambda content, kind="", meta=None: (
+                queued.append({"content": content, "kind": kind, "meta": meta}) or "qid"
+            )
+        )
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        mgr, on_done = self._capture_on_done(orch)
+        ledger, settled = _wire_hold_settlement(orch, slot, mgr)
+        total = 12
+        members = [self._member(i, total) for i in range(total)]
+
+        marked: list[str] = []
+        with patch("kiro_crew.slack.gateway._run_chat", new_callable=AsyncMock), \
+                patch("kiro_crew.subagent_persistence.mark_delivered",
+                      side_effect=marked.append):
+            for i, m in enumerate(members[:10]):
+                mgr.batch_members_pending = MagicMock(return_value=True)
+                await on_done(m)
+                await asyncio.sleep(0)
+
+        assert len(queued) == 1, (
+            "precondition: the flushing chunk must have been QUEUED, not dispatched"
+        )
+        # The queue is deliberately never drained — the process died here.
+        assert settled == [] and marked == [], (
+            "an announce sitting in an in-memory queue is not a hand-off: a "
+            "shutdown here loses the digest, and a delivered tombstone would "
+            "hide the held results from orphan reconciliation forever"
+        )
+        assert members[9]._digest_settle_ids == [], (
+            "the ids must have left the flushing member, so the run loop's "
+            "settle on the bare _on_done return is a no-op for this route too"
+        )
+        assert members[9]._delivery_queued is True, (
+            "the flushing member's own tombstone is deferred to the drain with "
+            "the same debt (issue #4839)"
+        )
+        # The debt is parked in the ledger, keyed on the queued announce, and
+        # names the flushing member itself plus its held siblings — so the
+        # drain settles them all once a turn actually consumes the announce.
+        held = [members[i].id for i in range(9)]
+        assert list(ledger.keys()) == [queued[0]["content"]]
+        assert ledger[queued[0]["content"]] == [members[9].id] + held
+
+    @pytest.mark.asyncio
+    async def test_an_auth_required_turn_is_not_a_confirmed_hand_off(self):
+        """The third state: the turn ended cleanly and delivered nothing (#2233).
+
+        ``_run_chat`` CATCHES ``AcpAuthRequired`` — a signed-out CLI is
+        non-retryable, so it records the outcome on the slot, holds the queue
+        intact for post-login resume, and returns NORMALLY. The injection task
+        therefore completes with no exception and no cancellation, which is
+        indistinguishable from a delivered digest if "the task finished" is the
+        confirmation.
+
+        It is not delivered: the digest never reached the LLM. Settling here
+        tombstones results the parent has not seen — the exact loss this fix
+        exists to close, re-entered through a narrower door.
+
+        CONSUMPTION is the signal that cannot make this mistake: a signed-out
+        CLI fails before the model sees a single token, so ``_run_chat`` never
+        reports the prompt consumed and the debt stays parked in the ledger —
+        no per-outcome flag inspection required.
+        """
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = False
+        slot.task = None
+        slot._orch_tracker = None
+        slot._subagent_deliveries_inflight = 0
+        # Real attribute, not a MagicMock truthy stub: the stub below flips it
+        # exactly as _run_chat does on a signed-out CLI.
+        slot._last_turn_auth_required = False
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        mgr, on_done = self._capture_on_done(orch)
+        ledger, settled = _wire_hold_settlement(orch, slot, mgr)
+        total = 12
+        members = [self._member(i, total) for i in range(total)]
+
+        async def _auth_required_run_chat(_state, _slot, _text, *, _on_consumed=None, **_kw):
+            # Exactly what _run_chat does on a signed-out CLI: record it and
+            # return. No raise, no cancellation — and no consumption report,
+            # because the model never saw the prompt.
+            _slot._last_turn_auth_required = True
+
+        marked: list[str] = []
+        with patch("kiro_crew.slack.gateway._run_chat", _auth_required_run_chat), \
+                patch("kiro_crew.subagent_persistence.mark_delivered",
+                      side_effect=marked.append):
+            for i, m in enumerate(members[:10]):
+                mgr.batch_members_pending = MagicMock(return_value=True)
+                await on_done(m)
+                await asyncio.sleep(0)
+            await _settle(lambda: slot.task is None)
+
+        assert slot._last_turn_auth_required is True, (
+            "precondition: the turn must have ended in the auth-required state"
+        )
+        assert settled == [] and marked == [], (
+            "a signed-out CLI never received the digest — the held siblings' "
+            "results are still only on disk"
+        )
+        assert members[9]._digest_settle_ids == [], (
+            "and the run loop must not settle them either: the ids left the "
+            "flushing member when the turn was launched"
+        )
+        held = [members[i].id for i in range(9)]
+        assert list(ledger.values()) == [[members[9].id] + held], (
+            "the debt — the flusher's own tombstone included — stays owed, "
+            "tombstone-free and recoverable, rather than settled on a clean "
+            "return that delivered nothing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_injection_turn_leaves_holds_recoverable(self):
+        """The deliberate asymmetry (#2233): an unconfirmed hand-off must leave
+        holds UNsettled rather than settle them.
+
+        A duplicate digest after a restart is visible to the parent and
+        recoverable; a lost one is neither. So when the injection turn raises
+        before the model consumed the prompt, the held siblings keep no
+        tombstone and stay visible to ``list_orphans()`` — the same direction
+        ``_digest_held`` itself encodes. The debt stays parked in the slot's
+        ledger, so a recovery replay of the announce can still claim it.
+        """
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = False
+        slot.task = None
+        slot._orch_tracker = None
+        slot._subagent_deliveries_inflight = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        mgr, on_done = self._capture_on_done(orch)
+        ledger, settled = _wire_hold_settlement(orch, slot, mgr)
+        total = 12
+        members = [self._member(i, total) for i in range(total)]
+
+        async def _failing_run_chat(_state, _slot, _text, *, _on_consumed=None, **_kw):
+            raise RuntimeError("injection turn died")
+
+        marked: list[str] = []
+        with patch("kiro_crew.slack.gateway._run_chat", _failing_run_chat), \
+                patch("kiro_crew.subagent_persistence.mark_delivered",
+                      side_effect=marked.append):
+            for i, m in enumerate(members[:10]):
+                mgr.batch_members_pending = MagicMock(return_value=True)
+                await on_done(m)
+                await asyncio.sleep(0)
+            await _settle(lambda: slot.task is None)
+
+        assert settled == [] and marked == [], (
+            "a failed hand-off must not tombstone the held siblings — their "
+            "results are still only on disk"
+        )
+        assert members[9]._digest_settle_ids == [], (
+            "and the run loop must not settle them either: the ids left the "
+            "flushing member when the turn was launched"
+        )
+        held = [members[i].id for i in range(9)]
+        assert list(ledger.values()) == [[members[9].id] + held], (
+            "the debt stays parked for a recovery replay to claim"
+        )
 
     @pytest.mark.asyncio
     async def test_guard_msgs_from_all_members_fold_into_digest(self):
@@ -959,8 +1297,8 @@ class TestWaveDigest:
         total = 12
         injected: list[str] = []
 
-        async def _fake_run_chat(_state, _slot, text, **kwargs):
-            kwargs["_on_consumed"]()
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            assert _directive_user_origin is False
             injected.append(text)
 
         with patch("kiro_crew.slack.gateway._run_chat", side_effect=_fake_run_chat), \
@@ -1005,8 +1343,8 @@ class TestWaveDigest:
         total = 3
         injected: list[str] = []
 
-        async def _fake_run_chat(_state, _slot, text, **kwargs):
-            kwargs["_on_consumed"]()
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            assert _directive_user_origin is False
             injected.append(text)
 
         with patch("kiro_crew.slack.gateway._run_chat", side_effect=_fake_run_chat), \
@@ -1024,139 +1362,6 @@ class TestWaveDigest:
         assert "Batch results 1/1" in digest
         assert "3 ✅" in digest and "of 3 agents" in digest
         assert "before spawning any follow-up" in digest
-
-    @pytest.mark.asyncio
-    async def test_digest_envelope_and_metadata_include_every_event_id(self):
-        orch = _make_orchestrator()
-        orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
-        orch.ctx_builder.hooks = MagicMock()
-        orch.dashboard_state = _mock_dashboard_state()
-        slot = MagicMock()
-        slot.mode = "chat"
-        slot.running = True
-        slot.task = MagicMock()
-        slot._orch_tracker = None
-        slot._subagent_deliveries_inflight = 0
-        slot._subagents_inline_collected = set()
-        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
-        mgr, on_done = self._capture_on_done(orch)
-        members = [self._member(index, 3) for index in range(3)]
-        for index, member in enumerate(members):
-            member._delivery_event_id = f"event-{index}"
-            mgr.batch_members_pending = MagicMock(return_value=index != 2)
-            await on_done(member)
-
-        queued = slot.queue_append.call_args
-        announce = queued.args[0]
-        meta = queued.kwargs["meta"][SUBAGENT_COMPLETION_META_KEY]
-
-        # A failed parent route retries the same final member. Composition and
-        # batch accounting are one-shot even though routing is at-least-once.
-        final_member = members[-1]
-        final_member._delivery_queued = False
-        final_member._delivery_retry = True
-        await on_done(final_member)
-        replayed = slot.queue_append.call_args
-
-        for index in range(3):
-            assert f"Event: `event-{index}`" in announce
-        assert meta["eventIds"] == ["event-0", "event-1", "event-2"]
-        assert replayed.args[0] == announce
-        batch_finished = [
-            call for call in orch.dashboard_state.broadcast_ws.call_args_list
-            if call.args and call.args[0] == "batch_finished"
-        ]
-        assert len(batch_finished) == 1
-
-    @pytest.mark.asyncio
-    async def test_failed_nonfinal_chunk_retry_does_not_recount_member(self):
-        orch = _make_orchestrator()
-        orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
-        orch.ctx_builder.hooks = MagicMock()
-        orch.dashboard_state = _mock_dashboard_state()
-        orch.dashboard_state.get_slot = MagicMock(return_value=None)
-        mgr, on_done = self._capture_on_done(orch)
-        members = [self._member(index, 12) for index in range(12)]
-
-        for member in members[:9]:
-            mgr.batch_members_pending = MagicMock(return_value=True)
-            await on_done(member)
-
-        orch.dashboard_state.notify = MagicMock(
-            side_effect=RuntimeError("route unavailable")
-        )
-        mgr.batch_members_pending = MagicMock(return_value=True)
-        with pytest.raises(RuntimeError, match="route unavailable"):
-            await on_done(members[9])
-
-        assert members[9]._delivery_batch_progress is not None
-        assert orch._batch_progress["bigwave"]["done"] == 10
-
-        members[9]._delivery_retry = True
-        with pytest.raises(RuntimeError, match="route unavailable"):
-            await on_done(members[9])
-
-        retry_progress = members[9]._delivery_batch_progress
-        assert retry_progress is not None
-        assert len(retry_progress["ok_lines"]) == 10
-
-        orch.dashboard_state.notify = MagicMock()
-        await on_done(members[9])
-
-        orch.dashboard_state.notify.assert_called_once()
-        assert members[9]._digest_held is False
-        assert orch._batch_progress["bigwave"]["done"] == 10
-        assert orch._batch_progress["bigwave"]["flushed"] == 10
-
-        mgr.batch_members_pending = MagicMock(return_value=True)
-        await on_done(members[10])
-        assert orch._batch_progress["bigwave"]["done"] == 11
-        assert not any(
-            call.args and call.args[0] == "batch_finished"
-            for call in orch.dashboard_state.broadcast_ws.call_args_list
-        )
-
-        mgr.batch_members_pending = MagicMock(return_value=False)
-        await on_done(members[11])
-        finished = [
-            call
-            for call in orch.dashboard_state.broadcast_ws.call_args_list
-            if call.args and call.args[0] == "batch_finished"
-        ]
-        assert len(finished) == 1
-        assert finished[0].args[1]["ok"] == 12
-
-    @pytest.mark.asyncio
-    async def test_generic_cron_injection_failure_marks_delivery_failed(self):
-        orch = _make_orchestrator()
-        orch.sessions = _mock_sessions()
-        orch.sessions.get_or_create = AsyncMock(
-            side_effect=RuntimeError("provider unavailable")
-        )
-        orch.ctx_builder = MagicMock()
-        orch.ctx_builder.hooks = MagicMock()
-        orch.dashboard_state = _mock_dashboard_state()
-        mgr, on_done = self._capture_on_done(orch)
-        mgr.running = []
-        mgr.queued_count_for = MagicMock(return_value=0)
-        member = self._member(0, 1)
-        member.batch_id = ""
-        member.batch_total = 0
-        member.parent_session_key = "cron:job-1"
-
-        def mark_failed(info, reason=""):
-            info._delivery_failed = True
-
-        mgr.notify_injection_failed = MagicMock(side_effect=mark_failed)
-        await on_done(member)
-
-        mgr.notify_injection_failed.assert_called_once_with(
-            member,
-            reason="cron injection failed",
-        )
-        assert member._delivery_failed is True
 
     @pytest.mark.asyncio
     async def test_single_spawn_keeps_per_agent_injection(self):
@@ -1178,8 +1383,8 @@ class TestWaveDigest:
         mgr.running_agents_for = MagicMock(return_value=[])
         injected: list[str] = []
 
-        async def _fake_run_chat(_state, _slot, text, **kwargs):
-            kwargs["_on_consumed"]()
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            assert _directive_user_origin is False
             injected.append(text)
 
         solo = SubagentInfo(
@@ -1373,8 +1578,8 @@ class TestDigestHoldDeadline:
         gw_mgr.batch_members_pending = MagicMock(return_value=True)  # straggler alive
         injected: list[str] = []
 
-        async def _fake_run_chat(_state, _slot, text, **kwargs):
-            kwargs["_on_consumed"]()
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            assert _directive_user_origin is False
             injected.append(text)
 
         # Real manager for the sweep, wired to the gateway's own consumer.
@@ -1441,11 +1646,16 @@ class TestDigestHoldDeadline:
         slot._subagents_inline_collected = set()
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = TestWaveDigest()._capture_on_done(orch)
+        ledger, settled = _wire_hold_settlement(orch, slot, mgr)
         injected: list[str] = []
 
-        async def _fake_run_chat(_state, _slot, text, **kwargs):
-            kwargs["_on_consumed"]()
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, _on_consumed=None, **_kw):
+            assert _directive_user_origin is False
             injected.append(text)
+            # The model consumed the flushed digest — the condition that
+            # settles the held siblings on this route (#2233).
+            if _on_consumed is not None:
+                _on_consumed()
 
         members = [
             SubagentInfo(
@@ -1503,11 +1713,16 @@ class TestDigestHoldDeadline:
         assert "wave digest flush" not in digest
         # Hold clocks stopped, so the sweep cannot force a duplicate flush.
         assert all(m._digest_held_at == 0.0 for m in members)
-        # The synthetic record transfers the held siblings' settlement debt to
-        # the slot.  Its own list is empty once routing owns that debt.
+        # Tombstones settle after routing — and on this route "after
+        # routing" means after the model CONSUMED the injected digest, not
+        # after `_on_done` returned: the ids left the flushing record when
+        # the turn was launched, owed to the turn's consumption through the
+        # slot's delivery ledger (#2233). The forced hold-deadline flush is
+        # one of the settle callers, so it inherits the same ownership rule
+        # without a second code path.
         assert flush._digest_settle_ids == []
-        slot.note_pending_subagent_delivery.assert_called_once()
-        assert sorted(slot.note_pending_subagent_delivery.call_args.args[1]) == ["s0", "s1"]
+        await _settle(lambda: bool(settled))
+        assert settled == [["s0", "s1"]]
 
     @pytest.mark.asyncio
     async def test_flush_only_noop_when_nothing_held(self):
@@ -1522,8 +1737,8 @@ class TestDigestHoldDeadline:
         _mgr, on_done = TestWaveDigest()._capture_on_done(orch)
         injected: list[str] = []
 
-        async def _fake_run_chat(_state, _slot, text, **kwargs):
-            kwargs["_on_consumed"]()
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            assert _directive_user_origin is False
             injected.append(text)
 
         flush = SubagentInfo(

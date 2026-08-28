@@ -66,7 +66,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getAppMenuItems: (id) => ipcRenderer.invoke("app-menu:items", id),
   executeAppMenuItem: (id, index) => ipcRenderer.send("app-menu:execute", id, index),
   // App-menu navigation: main.js sends an in-app path ("/settings",
-  // "/settings?tab=about") when the user picks Settings…/About from the
+  // "/settings/about") when the user picks Settings…/About from the
   // native application menu; the SPA routes to it (see App.tsx).
   onNavigate: (cb) => {
     const handler = (_e, path) => cb(path);

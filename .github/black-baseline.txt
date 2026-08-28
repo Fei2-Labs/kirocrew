@@ -8,8 +8,6 @@
 # Refresh (after formatting something listed here):
 #   python3 scripts/check_black_formatting.py --update-baseline
 src/kiro_crew/_process_group_supervisor.py
-src/kiro_crew/acp/_dispatch.py
-src/kiro_crew/acp/client.py
 src/kiro_crew/acp/kas_wire.py
 src/kiro_crew/acp/liveness.py
 src/kiro_crew/acp/runtime.py
@@ -172,7 +170,6 @@ src/kiro_crew/apps/teardown.py
 src/kiro_crew/artifact_source.py
 src/kiro_crew/artifacts.py
 src/kiro_crew/atomic_write.py
-src/kiro_crew/autonudge_authz.py
 src/kiro_crew/beacon.py
 src/kiro_crew/builtin_skills/browser-recording/scripts/record_browser.py
 src/kiro_crew/builtin_skills/ios-simulator-preview/scripts/sim_mirror.py
@@ -213,7 +210,6 @@ src/kiro_crew/dashboard/chat_folder_suggest.py
 src/kiro_crew/dashboard/chat_folders.py
 src/kiro_crew/dashboard/chat_fork.py
 src/kiro_crew/dashboard/chat_nav.py
-src/kiro_crew/dashboard/chat_orchestrator.py
 src/kiro_crew/dashboard/chat_persistence.py
 src/kiro_crew/dashboard/chat_slack.py
 src/kiro_crew/dashboard/chat_title.py
@@ -272,7 +268,6 @@ src/kiro_crew/dashboard/ws_event_scope.py
 src/kiro_crew/deploy/__init__.py
 src/kiro_crew/deploy/engine.py
 src/kiro_crew/deploy/handlers.py
-src/kiro_crew/deploy/iam.py
 src/kiro_crew/deploy/pricing.py
 src/kiro_crew/deploy/profiles.py
 src/kiro_crew/deploy/render.py
@@ -355,7 +350,6 @@ src/kiro_crew/mcp_gateway/verdict_cache.py
 src/kiro_crew/mcp_shared.py
 src/kiro_crew/mcp_tools/apps.py
 src/kiro_crew/mcp_tools/artifacts.py
-src/kiro_crew/mcp_tools/browser.py
 src/kiro_crew/mcp_tools/control.py
 src/kiro_crew/mcp_tools/knowledge.py
 src/kiro_crew/mcp_tools/skills.py
@@ -435,15 +429,12 @@ test/metrics/test_telemetry_titles.py
 test/metrics/test_turn_metric.py
 test/metrics/test_watchdog_metrics.py
 test/test_acp_backend_kas.py
-test/test_acp_client.py
 test/test_acp_dynamic_config.py
 test/test_acp_error_surface.py
 test/test_acp_liveness.py
 test/test_acp_metadata_fields.py
 test/test_acp_offload.py
 test/test_acp_prompt_blocks.py
-test/test_acp_runtime.py
-test/test_acp_set_mode_all_agents.py
 test/test_acp_spawn_offload.py
 test/test_acp_stale_recovery.py
 test/test_acp_tool_identity.py
@@ -466,7 +457,6 @@ test/test_ai_spine_driver_coverage.py
 test/test_api_agent_config_put_succeeds.py
 test/test_api_agents_order.py
 test/test_api_file_diff.py
-test/test_api_health.py
 test/test_api_hook_test_stop_payload.py
 test/test_api_input_validation.py
 test/test_api_kiro_hooks.py
@@ -543,8 +533,6 @@ test/test_bench_scorers.py
 test/test_bench_windows_symlink.py
 test/test_bootstrap.py
 test/test_brand_name_gate.py
-test/test_browser_cli_auto_approve.py
-test/test_browser_cli_journeys.py
 test/test_browser_cli_launch.py
 test/test_browser_cli_snapshots.py
 test/test_browser_cli_view.py
@@ -580,7 +568,6 @@ test/test_chat_folder_app_isolation.py
 test/test_chat_folder_suggest.py
 test/test_chat_nav.py
 test/test_chat_regenerate_cov80.py
-test/test_chat_runner_coverage.py
 test/test_chat_slot_create_folder.py
 test/test_chat_slot_end_wait.py
 test/test_chat_slot_interrupt.py
@@ -592,12 +579,10 @@ test/test_chat_turn_timeout_consistency.py
 test/test_chat_voice.py
 test/test_ci_surface_tests.py
 test/test_cli.py
-test/test_cli_commands_coverage.py
 test/test_cli_desktop.py
 test/test_cli_doctor.py
 test/test_cli_lazy_imports.py
 test/test_cli_logging.py
-test/test_cli_manifest_signature.py
 test/test_cli_server_more_coverage.py
 test/test_close_guard_parity.py
 test/test_cloud_connect.py
@@ -799,7 +784,6 @@ test/test_governance_chokepoints.py
 test/test_governance_policy.py
 test/test_governance_policy_viewer.py
 test/test_handler_cron_list.py
-test/test_handler_link_intercept.py
 test/test_handlers_channel_clear_context.py
 test/test_handlers_channel_presets.py
 test/test_handlers_files_upload.py
@@ -901,7 +885,6 @@ test/test_mcp_apps_e2e.py
 test/test_mcp_apps_render.py
 test/test_mcp_artifact_folders.py
 test/test_mcp_artifacts.py
-test/test_mcp_browser_tool.py
 test/test_mcp_call_site_auth_coverage.py
 test/test_mcp_caller.py
 test/test_mcp_core.py
@@ -1047,13 +1030,11 @@ test/test_project_alias.py
 test/test_project_git.py
 test/test_project_git_status_log.py
 test/test_prompt_timeout_follows_ceiling.py
-test/test_prompts.py
 test/test_provider_dispatch.py
 test/test_publish_feed_contract.py
 test/test_publish_providers.py
 test/test_publish_sync.py
 test/test_queue_during_subagents.py
-test/test_queue_edit.py
 test/test_queue_receipt.py
 test/test_quick_send.py
 test/test_read_bounded_json.py
@@ -1154,9 +1135,7 @@ test/test_slack_dashboard_live_sync.py
 test/test_slack_events_coverage.py
 test/test_slack_gateway.py
 test/test_slack_gateway_coverage.py
-test/test_slack_handler_coverage.py
 test/test_slack_handler_coverage_branches.py
-test/test_slack_handler_more_coverage.py
 test/test_slack_home_tab.py
 test/test_slack_inline_stop.py
 test/test_slack_interactions_coverage.py
@@ -1184,7 +1163,6 @@ test/test_source_providers_comment_guard.py
 test/test_source_summary.py
 test/test_spawn_followup.py
 test/test_spawn_list_redaction.py
-test/test_spec_builder_routes_coverage.py
 test/test_stable_release_gate.py
 test/test_stale_asset_watchdog.py
 test/test_steering_api.py
@@ -1214,7 +1192,6 @@ test/test_tag_session.py
 test/test_tail_fork_config.py
 test/test_tailnet_cli.py
 test/test_tailnet_e2e.py
-test/test_tailnet_governance.py
 test/test_tailnet_origin.py
 test/test_tailnet_serve.py
 test/test_tailnet_session_url.py
@@ -1263,7 +1240,6 @@ test/test_voice_reply.py
 test/test_wait_countdown_keepalive.py
 test/test_watchdog.py
 test/test_web_verify_downscale.py
-test/test_web_verify_skill.py
 test/test_webapp_preview.py
 test/test_webapp_teardown_card_reset.py
 test/test_webhooks_api.py

@@ -94,6 +94,7 @@ import UpdateModal from './components/UpdateModal'
 import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
 import { toggleBottomTerminal, useBottomTerminalOpen, useTerminalPosition } from './hooks/useBottomTerminal'
+import { toggleTerminalByChord } from './lib/terminalChordFocus'
 import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './utils/terminalPopout'
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
 import AppsPage from './pages/AppsPage'
@@ -628,8 +629,8 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
   // offers to re-collapse rather than reveal "0 more".
   const showsCollapse = expanded || hiddenCount === 0
   const Icon = showsCollapse ? ChevronUp : MoreHorizontal
-  const labelText = showsCollapse ? i18nT('app.show_less') : `${hiddenCount} more`
-  const titleText = showsCollapse ? i18nT('app.show_fewer_apps') : `Show ${hiddenCount} more app${hiddenCount === 1 ? '' : 's'}`
+  const labelText = showsCollapse ? i18nT('app.show_less') : i18nT('app.n_more', { count: hiddenCount })
+  const titleText = showsCollapse ? i18nT('app.show_fewer_apps') : i18nT('app.show_more_apps', { count: hiddenCount })
   return (
     <button ref={rowRef}
       className="group/nav relative flex items-center rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none w-full"
@@ -644,7 +645,10 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
       // click), so it also clears a label that focus had just re-armed.
       onClick={() => { dismissTip(); onClick() }}
       aria-expanded={expanded}
-      aria-label={titleText}
+      // WCAG 2.5.3 Label in Name: while the text label is visible the accessible
+      // name must contain it, so the name IS the label; collapsed (icon-only)
+      // mode uses the fuller title instead.
+      aria-label={collapsed ? titleText : labelText}
       title={titleText}
       onMouseEnter={showTip}
       onMouseLeave={hideTip}
@@ -804,7 +808,7 @@ function NotificationsBellButton() {
         ref={bellRef}
         className={`flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 relative ${open ? 'text-accent' : 'text-muted hover:text-text'}`}
         onClick={() => { if (open) closePanel(); else openPanel() }}
-        title={unacked.length > 0 ? `${unacked.length} notification${unacked.length === 1 ? '' : 's'}` : i18nT('app.notifications')}
+        title={unacked.length > 0 ? i18nT('app.notification_count', { count: unacked.length }) : i18nT('app.notifications')}
         aria-label={i18nT('app.notifications')}
         aria-haspopup="dialog"
         aria-expanded={open}
@@ -1825,6 +1829,22 @@ export default function App() {
     onToggleLeftSidebar: () => toggleNav(),
     onToggleSessionPanel: () => window.dispatchEvent(new Event('toggle-pin-chat-sidebar')),
     onToggleSidePanel: () => window.dispatchEvent(new Event('toggle-activity-panel')),
+    // Same command as the nav rail's Terminal row: focus the popped-out window
+    // when the panel lives there, otherwise toggle the docked panel with the
+    // active session's project as the shell's cwd. Left undefined when the
+    // terminal is disabled, which the hook reads as UNBOUND: the chord is not
+    // claimed at all, so it falls through to the browser rather than being
+    // swallowed on behalf of a panel the rest of the UI hides.
+    //
+    // Also unbound in a popout or embedded pane, which render no docked terminal
+    // of their own. `useBottomTerminal`'s state is localStorage-backed AND
+    // cross-window synced (it listens for `storage` on `mc-bottom-terminal`), so
+    // a chord fired in a popout would not be a local no-op — it would open or
+    // close the terminal in the MAIN window, out of sight of the person pressing
+    // the key.
+    onToggleTerminal: terminalEnabled && !isPopout && !isEmbed
+      ? () => { if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
+      : undefined,
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,
   // 2=first remote, … — matching the InstanceTabBar left-to-right tab order.
@@ -2198,7 +2218,7 @@ export default function App() {
   const isChat = activePath === '/chat' || activePath.startsWith('/chat/') || activePath === '/'
   // /webhooks is a full-height rail-and-detail shell (like /capabilities), so it
   // owns its own scrolling and must not sit inside <main>'s scroll container.
-  const needsFixedHeight = isChat || activePath === '/settings' || activePath === '/developer' || activePath === '/capabilities' || activePath === '/webhooks'
+  const needsFixedHeight = isChat || activePath === '/settings' || activePath.startsWith('/settings/') || activePath === '/developer' || activePath === '/capabilities' || activePath === '/webhooks'
 
   // Render one standard nav row (used by the top-fixed mains, the Apps list,
   // and the bottom-fixed section). Active-state, mobile close, chat pin
@@ -2429,7 +2449,7 @@ export default function App() {
           <button
             type="button"
             onClick={commandPalette.openPalette}
-            className="h-7 flex-1 min-w-0 px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-hover transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
+            className="h-7 flex-1 min-w-0 px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-strong transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
             /* The trigger has to describe the surface it actually opens. While an app
                owns the quick-search slot the gesture opens a launcher -- typing runs
                commands and does not search the corpora this label promises -- so
@@ -3208,7 +3228,7 @@ export default function App() {
                 path={s.path}
                 label={surfaceLabel(s)}
                 icon={s.icon}
-                active={activePath === s.path}
+                active={activePath === s.path || activePath.startsWith(s.path + '/')}
                 collapsed={effectiveCollapsed}
                 onClick={closeMobileNav}
                 badge={updateAvailable ? <span title={i18nT('app.update_available')} role="status" aria-label={i18nT('app.update_available_2')} className={effectiveCollapsed ? 'absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10' : 'absolute top-1/2 -translate-y-1/2 right-2 w-2 h-2 bg-accent rounded-full z-10'} /> : undefined}
@@ -3378,7 +3398,7 @@ export default function App() {
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />
             <Route path="/notifications" element={<ErrorBoundary><NotificationsPage /></ErrorBoundary>} />
             <Route path="/knowledge" element={<ErrorBoundary><KnowledgePage /></ErrorBoundary>} />
-            <Route path="/overview" element={<Navigate to="/settings?tab=overview" replace />} />
+            <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
             <Route path="/schedule" element={<SchedulePage />} />
             {/* Agents and Connections live in the Agent Capabilities panel. */}
             <Route path="/agents" element={<Navigate to="/capabilities" replace />} />
@@ -3390,12 +3410,15 @@ export default function App() {
             <Route path="/webhooks" element={<ErrorBoundary><WebhooksPage /></ErrorBoundary>} />
             <Route path="/capabilities" element={<CapabilitiesPage />} />
             {/* Instances setup moved into Settings; switching happens via the header tab strip. */}
-            <Route path="/instances" element={<Navigate to="/settings?tab=instances" replace />} />
+            <Route path="/instances" element={<Navigate to="/settings/instances" replace />} />
             <Route path="/apps" element={<AppsPage />} />
             <Route path="/apps/detail/:name" element={<AppDetailPage />} />
             <Route path="/apps/migrate/:name" element={<MigrationPage />} />
             <Route path="/apps/:name" element={<AppPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
+            {/* Splat route: SettingsPage parses the trailing segments itself
+                (segment[0] = tab, segment[1] = sub; deeper segments reserved).
+                Matches bare /settings too (empty splat). */}
+            <Route path="/settings/*" element={<SettingsPage />} />
             <Route path="/developer" element={<DeveloperPage />} />
             <Route path="/artifacts" element={<ArtifactsPage />} />
             <Route path="/artifacts/deploy" element={<Navigate to="/deploy" replace />} />

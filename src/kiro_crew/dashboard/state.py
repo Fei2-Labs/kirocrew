@@ -20,13 +20,18 @@ import uuid
 from collections.abc import Coroutine, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, TypeVar
 
 from aiohttp import web
 
 from kiro_crew.acp.types import STOP_REASON_CANCELLED
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import DASHBOARD_PORT, _raw_config, config_dir
+from kiro_crew.config.loader import (
+    DASHBOARD_PORT,
+    _raw_config,
+    config_dir,
+    resolve_effective_agent,
+)
 from kiro_crew.constants import (
     OPTIONS_RE_LINE,
     SUBAGENT_BATCH_COMPLETION_PREFIX,
@@ -91,6 +96,23 @@ logger = logging.getLogger(__name__)
 #: against this one number, so raising the ceiling is a single edit and no entry
 #: point can silently drift to a different limit.
 MAX_LIVE_SLOTS = 500
+
+#: The most live slots ONE creator may hold, as a sub-ceiling under
+#: :data:`MAX_LIVE_SLOTS`. The global ceiling alone bounds the total but not the
+#: distribution, so a single automated creator working through a nudge loop can
+#: reach 500 on its own and every later create -- including the person opening a
+#: new chat tab -- gets the 429. That is the availability half of the cap: a
+#: bounded resource that one caller may exhaust entirely is not bounded from
+#: anybody else's point of view.
+#:
+#: Deliberately far above real use and far below the global ceiling: a decomposed
+#: goal runs on the order of ten concurrent sessions, so 50 never binds honest
+#: work, while 450 slots stay reachable by everyone else no matter what one
+#: caller does. Enforced in ``session_control.create_session``, which is the only
+#: entry point that creates on some OTHER caller's behalf; a person's own new tab
+#: and a fork are attributed to nobody and so are bounded by the global ceiling
+#: alone.
+MAX_SLOTS_PER_CREATOR = 50
 
 #: Return type of a mutate_folders callback.
 _T = TypeVar("_T")
@@ -361,245 +383,6 @@ _UNSAFE_SHELL_RE = re.compile(r">|`|\$\(|<\(|(?<!&)&(?!&)")
 # without it, `>/dev/nullx` or `>/dev/null/../etc/passwd` would be scrubbed as
 # a sink, smuggling a real-file write past the unsafe-shell check.
 _DEVNULL_REDIR_RE = re.compile(r"(?:\d*>>?|&>)\s*/dev/null(?![\w./-])|\d*>&\d+")
-
-# A trailing `--help` is only meaningful for a program that treats it as
-# "print usage and exit". These programs instead treat their operands as code
-# or a target to act on, so `--help` lands as a positional argument and the
-# real work still happens: `sh evil.sh --help` runs evil.sh with $1=--help.
-# The classifier cannot know which behaviour a given program has, so the
-# executors are named explicitly and the shape of the command is constrained
-# below.
-_HELP_PROBE_DENIED_PROGRAMS: frozenset[str] = frozenset(
-    (
-        # Shell builtins that run their operand in the current shell. These are
-        # not programs on PATH, so the PATH-name requirement below does not
-        # reach them on its own: `source payload --help` reads `payload` from
-        # the workspace and executes it, with `--help` landing as $1.
-        "source",
-        ".",
-        "exec",
-        "eval",
-        "command",
-        "builtin",
-        "trap",
-        # Shells and interpreters — operands are code.
-        "sh",
-        "bash",
-        "zsh",
-        "dash",
-        "ksh",
-        "fish",
-        "csh",
-        "tcsh",
-        "ash",
-        "busybox",
-        "python",
-        "python2",
-        "python3",
-        "perl",
-        "ruby",
-        "node",
-        "deno",
-        "bun",
-        "php",
-        "lua",
-        "tclsh",
-        "osascript",
-        "pwsh",
-        "powershell",
-        "cmd",
-        # Wrappers that hand off to another program.
-        "env",
-        "sudo",
-        "doas",
-        "nohup",
-        "setsid",
-        "nice",
-        "ionice",
-        "time",
-        "timeout",
-        "xargs",
-        "watch",
-        "script",
-        "stdbuf",
-        "unbuffer",
-        "ssh",
-        "scp",
-        "rsync",
-        "docker",
-        "podman",
-        "kubectl",
-        "make",
-        "cmake",
-        # Package managers that run a project-defined script. The subcommand form
-        # reads as `<program> <subcommand> --help`, but the "subcommand" is a name
-        # from the project's own manifest: `yarn clean --help` runs the `clean`
-        # script (deleting `dist` and `node_modules` in this repo) and passes
-        # `--help` to it. There is no way to tell a real subcommand from a script
-        # name from here, so the whole program is refused.
-        "yarn",
-        "yarnpkg",
-        "npm",
-        "npx",
-        "pnpm",
-        "bunx",
-        # Network tools — operands establish a connection.
-        "nc",
-        "ncat",
-        "netcat",
-        "socat",
-        "curl",
-        "wget",
-        "telnet",
-        "ftp",
-    )
-)
-
-# Only the unambiguous long spellings. `-v` and `-V` are excluded: for many
-# programs they mean verbose, not version, so `rm victim -v` would read as a
-# probe and delete the operand. `-h` is excluded: it collides with real options
-# (`head -h`, `ln -h`) and for shutdown/halt/reboot it means HALT, not help.
-# `java -version` and `python --version` keep working through their explicit
-# `_READ_ONLY_BASH_PREFIXES` entries rather than the probe rule.
-_HELP_FLAGS: frozenset[str] = frozenset(("--help", "--version"))
-
-# A subcommand between the program and the flag, e.g. `git log --help`. Bare
-# words only: no path separator, no dot, no leading dash. This is what keeps
-# `sh /tmp/evil.sh --help` (path) and `rm -rf ./proj --help` (option) out,
-# while `docker compose --help` and `git rev-parse --help` stay in.
-_HELP_PROBE_SUBCOMMAND_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-# Programs whose `<program> <subcommand> --help` really is a usage probe.
-#
-# An ALLOWLIST, because the three-token form is the dangerous one: the middle
-# token is indistinguishable from an operand here, so a program that treats it as
-# a script RUNS it (`python3.12 payload --help`). The denied-program table cannot
-# answer that — it matches exactly, and the spellings a real system installs
-# (`python3.12`, `perl5.36`, `node20`, `sh.exe`, `g++-13`) are unbounded.
-#
-# Membership means: this program's subcommands are a fixed vocabulary it parses
-# itself, so an unknown one is an error rather than a file to execute. A program
-# missing from here is not blocked — its two-token probe still works, and the
-# three-token form falls through to the human prompt.
-_HELP_PROBE_SUBCOMMAND_PROGRAMS: frozenset[str] = frozenset(
-    (
-        "git",
-        "cargo",
-        "go",
-        "terraform",
-        "gh",
-        "glab",
-        "aws",
-        "gcloud",
-        "az",
-        "brew",
-        "apt",
-        "apt-get",
-        "dnf",
-        "yum",
-        "pacman",
-        "pip",
-        "pip3",
-        "poetry",
-        "uv",
-        "rustup",
-        "systemd-analyze",
-        # NOT archivers or `openssl`: their "subcommand" is a mode letter whose
-        # operands are files it reads or WRITES, so the three-token form is not a
-        # usage probe at all — `tar xf …` extracts, `zip …` creates, and `openssl
-        # <cmd>` reads a key. Membership here has to mean "an unknown subcommand
-        # is an error", and for these it means "a file to act on".
-    )
-)
-
-# The program must BE a bare command name, stated positively. The denied-program
-# table only knows the executors it lists, so anything it cannot recognise must
-# not be vouched for — and a rejection list cannot express that, because the
-# spellings the shell resolves at run time are unbounded:
-#
-#     $SHELL payload --help      ${SHELL} payload --help      $0 payload --help
-#
-# all name a shell that then RUNS `payload`, and all of them satisfied the
-# previous rule, which only asked "does the token contain a path separator?".
-# Requiring `[A-Za-z0-9][A-Za-z0-9._+-]*` refuses every one of them by
-# construction, along with `./payload`, `/tmp/x` and `../build/tool` that the
-# separator check was there for — a name this pattern accepts has to resolve
-# through PATH to something installed. Dots are allowed because real programs
-# carry them (`python3.12`, `apt-get`, `g++`).
-_HELP_PROBE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
-
-
-def _is_help_probe(segment: str) -> bool:
-    """True only when *segment* is a genuine usage/version probe.
-
-    Accepts ``<program> --help`` and ``<program> <subcommand> --help``. The
-    check is deliberately shaped as "only vouch for what is recognisably a
-    probe" rather than "reject the executors we know about": the denied-program
-    table cannot enumerate an arbitrary binary, so anything it does not
-    recognise must fail on the shape instead.
-
-    Rejected, each for its own reason:
-
-    * a flag other than ``--help`` / ``--version``, so ``rm victim -v``
-      is an operand plus verbose, not a probe;
-    * a program named by path (``./payload``, ``/tmp/x``), which the table has
-      no knowledge of and which may ignore ``--help`` entirely;
-    * a known code executor or hand-off wrapper (``sh``, ``python``, ``sudo``);
-    * a ``VAR=value`` prefix, which assigns into the command's environment;
-    * anything but a bare word between program and flag, which keeps file paths
-      and options out;
-    * unbalanced quotes, where argv cannot be established at all.
-
-    A rejected segment falls through to the read-only allowlist and, failing
-    that, to the human approval prompt — nothing is newly blocked.
-
-    The old rule was ``segment.endswith("--help")``, which auto-approved any
-    command at all once the token was appended.
-    """
-    try:
-        tokens = shlex.split(segment)
-    except ValueError:
-        # Unbalanced quotes: cannot establish the argv, so do not vouch for it.
-        return False
-    if len(tokens) < 2 or len(tokens) > 3:
-        return False
-    flag = tokens[-1]
-    if flag not in _HELP_FLAGS:
-        return False
-    program_token = tokens[0]
-    # A `VAR=value cmd --help` prefix assigns into the command's environment;
-    # shlex keeps it as one token, and it is not a usage probe.
-    if "=" in program_token:
-        return False
-    # Must BE a bare command name. Anything carrying a path separator, a shell
-    # expansion, or any other punctuation the shell resolves at run time is a
-    # program this classifier cannot identify, so it is not vouched for.
-    if not _HELP_PROBE_NAME_RE.match(program_token):
-        return False
-    if not program_token or program_token in _HELP_PROBE_DENIED_PROGRAMS:
-        return False
-    if len(tokens) == 3:
-        # The subcommand form only accepts the long spellings — short flags like
-        # `-h` collide with real options when an operand is present.
-        if flag not in _HELP_FLAGS:
-            return False
-        if not _HELP_PROBE_SUBCOMMAND_RE.match(tokens[1]):
-            return False
-        # The three-token form is ALLOWLISTED, not merely un-denied. In this shape
-        # the middle token is an operand as far as this classifier can tell, so an
-        # interpreter reached by a spelling the denylist does not carry runs it:
-        #
-        #     python3.12 payload --help      perl5.36 payload --help
-        #     node20 payload --help          g++-13 payload --help
-        #
-        # `_HELP_PROBE_DENIED_PROGRAMS` matches EXACTLY, and the variants a real
-        # system installs — version suffixes, `.exe`, `-13` — are unbounded, so no
-        # list of rejects closes this. Naming the programs whose subcommand form is
-        # known to be a usage probe does, and costs only that a program not yet
-        # listed falls through to the human prompt.
-        if program_token not in _HELP_PROBE_SUBCOMMAND_PROGRAMS:
-            return False
-    return True
-
 
 # ── Side effects reached through an allowlisted read-only verb ──
 #
@@ -1899,10 +1682,7 @@ def _classify_bash(cmd: str) -> str:
         # `file -c` only prints one).
         head = pipe_parts[0].strip()
         first = head.lower()
-        if not (
-            _is_help_probe(first)
-            or any(first == p or first.startswith(p + " ") for p in _READ_ONLY_BASH_PREFIXES)
-        ):
+        if not any(first == p or first.startswith(p + " ") for p in _READ_ONLY_BASH_PREFIXES):
             base = first.split()[0] if first.split() else first
             return f"command '{base}' is not on the read-only allowlist"
         # Clearing the allowlist only settles which program runs. The rest of
@@ -2882,7 +2662,8 @@ class _ChatSlot:
         "created_at",
         "messages",
         "total_messages",
-        "task",
+        "_task",
+        "_turn_generation",
         "event",
         "_pending",
         "_pending_consumers",
@@ -2905,6 +2686,7 @@ class _ChatSlot:
         "_summary_turn_mark",
         "_detail_render_lock",
         "_last_stop_reason",
+        "_created_by",
         "_artifact",
         "_channel_folder_filed",
         "_resumed_count",
@@ -2923,6 +2705,7 @@ class _ChatSlot:
         "_dirty_flag",
         "_dirty_gen",
         "_orch_tracker",
+        "_plan_cancelled",
         "_auto_run",
         "_in_stage_execution",
         "_last_turn_auth_required",
@@ -3041,7 +2824,11 @@ class _ChatSlot:
         self._source_links_revision = 0
         self._source_links_cache: tuple[tuple[int, int], list[dict]] | None = None
         self.total_messages: int = 0  # lifetime count (survives trimming)
-        self.task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._task: asyncio.Task[Any] | None = None
+        # Monotonic publication history for turn ownership. ``task`` returns to
+        # None after teardown, so consumers that span awaits cannot distinguish
+        # "stayed idle" from "ran and finished" by comparing task references.
+        self._turn_generation: int = 0
         self.event = asyncio.Event()
         self._pending: list[dict[str, str]] = []
         # Number of readers currently treating ``_pending`` as their delivery
@@ -3053,7 +2840,7 @@ class _ChatSlot:
         # purge never runs again for that slot, so the rows it declined to drop
         # outlive every consumer and the leak survives its own fix.
         self._pending_release_deferred: bool = False
-        self._queue: list[dict[str, str]] = []  # [{"id": uuid, "content": str}, ...]
+        self._queue: list[dict[str, Any]] = []  # [{"id": uuid, "content": str}, ...]
         # Newest enqueue instant, read only while ``_queue`` is non-empty — see
         # ``_note_enqueue``.
         self._last_enqueue_ts: str = ""
@@ -3113,6 +2900,11 @@ class _ChatSlot:
         # finish, and deriving anything from it would describe work that was
         # interrupted mid-flight as if it had concluded.
         self._last_stop_reason: str = ""
+        #: The resolved slot key of the caller that asked for this session via the
+        #: session-control create verb, or "" for a slot nobody asked for -- a
+        #: person's own tab, a fork, a restore. Read by
+        #: ``DashboardState.creator_slot_count`` for ``MAX_SLOTS_PER_CREATOR``.
+        self._created_by: str = ""
         # Artifact companion binding: set when this slot is a
         # companion chat session for an artifact (slug). At most one
         # non-archived slot per slug by convention — the frontend flow
@@ -3188,6 +2980,16 @@ class _ChatSlot:
         # "the True I started this save under" from "a NEW True set during it".
         self._dirty_gen: int = 0
         self._orch_tracker: Any = None  # OrchestrationTracker, set by gateway
+        # Plan-cancel latch closing the cancel/Go race (#6046): the Cancel
+        # handler can only stop a tracker that exists, but _stage_loop creates
+        # the tracker lazily, so a cancel processed between a Go POST being
+        # accepted and its _stage_loop coroutine starting would no-op on the
+        # tracker and the plan would advance anyway. The handler sets this flag
+        # unconditionally; _stage_loop checks it before creating a tracker and
+        # exits without advancing. Cleared ONLY when a new plan is armed
+        # (_reset_auto_run_for_new_plan) — never on Go, so a Go on a cancelled
+        # plan cannot resurrect it (that would just invert the race).
+        self._plan_cancelled: bool = False
         self._auto_run: bool = False  # "Go All" — skip stage gates
         # True only while _stage_loop is driving a stage-execution turn. Gates
         # the end-of-turn plan detector so a stage turn whose output happens to
@@ -4179,7 +3981,14 @@ class _ChatSlot:
 
     # ── Queue helpers (dict-based queue items) ──
 
-    def queue_append(self, content: str, kind: str = "", meta: dict | None = None) -> str:
+    def queue_append(
+        self,
+        content: str,
+        kind: str = "",
+        meta: dict | None = None,
+        *,
+        directive_user_origin: bool = False,
+    ) -> str:
         """Append a message to the queue. Returns the generated queue ID.
 
         ``kind`` is a structural origin tag (e.g. ``"synthetic_recovery"`` for
@@ -4192,6 +4001,10 @@ class _ChatSlot:
         row whose facts were computed at enqueue time (a sub-agent completion's
         structured header — see gateway ``_subagent_done``) keeps them instead of
         forcing the drain to re-derive them from the prose.
+
+        ``directive_user_origin`` is fail-closed provenance for effects that may
+        mutate the owning session. Only authenticated human entry points set it;
+        absent and automation-created entries remain false through queue merges.
         """
         qid = uuid.uuid4().hex[:12]
         # dict[str, Any]: the base entry is all strings, but ``meta`` adds a dict
@@ -4199,6 +4012,8 @@ class _ChatSlot:
         item: dict[str, Any] = {"id": qid, "content": content, "kind": kind}
         if meta:
             item["meta"] = meta
+        if directive_user_origin:
+            item["_directive_user_origin"] = True
         self._queue.append(item)
         self._note_enqueue()
         return qid
@@ -4225,6 +4040,9 @@ class _ChatSlot:
         kind: str = "",
         payload: str = "",
         meta: dict | None = None,
+        on_consumed: Callable[[bool], None] | None = None,
+        on_irreversibly_consumed: Callable[[], Awaitable[None] | None] | None = None,
+        directive_user_origin: bool = False,
     ) -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
@@ -4232,16 +4050,33 @@ class _ChatSlot:
         is the orthogonal question of whether the TEXT is runner-authored, read by
         ``is_synthetic_payload_item``; a recovery entry that replays the user's own
         message shares the recovery kind but is not machine speech.
+
+        The consumption callbacks and directive provenance are process-local state
+        for an automatic retry. They follow the exact queue entry through reordering
+        and repeated retries, but queue snapshots expose only id/content and gateway
+        restart deliberately drops them so the durable producer can recover the
+        still-pending delivery.
         """
         qid = uuid.uuid4().hex[:12]
-        entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind, "payload": payload}
+        item: dict[str, Any] = {
+            "id": qid,
+            "content": content,
+            "kind": kind,
+            "payload": payload,
+        }
         if meta:
-            entry["meta"] = dict(meta)
-        self._queue.insert(index, entry)
+            item["meta"] = dict(meta)
+        if on_consumed is not None:
+            item["_on_consumed"] = on_consumed
+        if on_irreversibly_consumed is not None:
+            item["_on_irreversibly_consumed"] = on_irreversibly_consumed
+        if directive_user_origin:
+            item["_directive_user_origin"] = True
+        self._queue.insert(index, item)
         self._note_enqueue()
         return qid
 
-    def queue_pop(self, index: int = 0) -> dict[str, str]:
+    def queue_pop(self, index: int = 0) -> dict[str, Any]:
         """Pop a queue item by index. Returns {"id": ..., "content": ...}."""
         return self._queue.pop(index)
 
@@ -4312,14 +4147,30 @@ class _ChatSlot:
                 return item["content"]
         return None
 
-    def queue_edit_by_id(self, queue_id: str, content: str) -> bool:
+    def queue_edit_by_id(
+        self,
+        queue_id: str,
+        content: str,
+        *,
+        directive_user_origin: bool = False,
+    ) -> bool:
         """Replace the content of a queue item by ID. Returns True if found.
 
-        Order is preserved — only the content of the matching item changes.
+        Order and identity are preserved. Directive provenance follows the
+        editor because replacement text may contain a directive that the
+        original author never supplied. Automatic recovery entries are immutable:
+        their consumption callbacks settle the exact content that failed, so moving
+        those callbacks onto replacement text would settle the wrong delivery.
         """
         for item in self._queue:
             if item["id"] == queue_id:
+                if "_on_consumed" in item or "_on_irreversibly_consumed" in item:
+                    return False
                 item["content"] = content
+                if directive_user_origin:
+                    item["_directive_user_origin"] = True
+                else:
+                    item.pop("_directive_user_origin", None)
                 return True
         return False
 
@@ -4337,6 +4188,16 @@ class _ChatSlot:
                 self._queue.insert(0, self._queue.pop(i))
                 return True
         return False
+
+    @property
+    def task(self) -> asyncio.Task[Any] | None:
+        return self._task
+
+    @task.setter
+    def task(self, value: asyncio.Task[Any] | None) -> None:
+        if value is not None and value is not self._task:
+            self._turn_generation += 1
+        self._task = value
 
     @property
     def running(self) -> bool:
@@ -4409,7 +4270,14 @@ class _ChatSlot:
         ``running == False`` within a single loop iteration.
         """
         if self.running:
-            self.queue_append(prompt)
+            # circular import: session_control imports this module at module level.
+            from kiro_crew.dashboard.session_control import containment_meta
+
+            # Stamp the containment constraints holding at ADMISSION, so the
+            # queue drain can re-assert them at delivery (issue #5911): a target
+            # that gains a channel/mirror link while this prompt waits must not
+            # execute it under the weaker constraints that admitted it.
+            self.queue_append(prompt, meta=containment_meta(state, self))
             return False
         self.append("user", prompt, "msg msg-u")
         task = asyncio.create_task(run_chat_coro(state, self, prompt))
@@ -4758,6 +4626,19 @@ class _ChatSlot:
             "key": self.key,
             "title": _redact(self.display_title),
             "agent": self.agent,
+            # The REQUESTED binding, verbatim and never rewritten — see the note
+            # in `chat_handlers` on why normalizing it on disk was destructive.
+            #
+            # `effective_agent` is the non-destructive other half of that
+            # decision: the name that will actually answer, and ONLY when it
+            # differs from the request. "" means nothing to report — either the
+            # request is honored, or resolution is not settled (a cold snapshot
+            # during boot). A false "your agent was substituted" marker is worse
+            # than no marker, so the resolver fails closed to "" rather than
+            # guessing, and it reads only in-memory snapshots so this stays free
+            # of filesystem work on the event loop. See
+            # `config.loader.resolve_effective_agent`.
+            "effective_agent": resolve_effective_agent(self.agent, self.project or None),
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "mode": self.mode,
@@ -4975,6 +4856,22 @@ class DashboardState:
         # error, immediate close on bad credentials, or server kick), empty
         # when connected or never attempted. Read by the settings badge.
         self.wecom_connect_error: str = ""
+        # True only while the Feishu (飞书/Lark) channel's WebSocket receiver
+        # thread is alive (kept truthful by LarkClient.on_state_change, wired in
+        # maybe_start_feishu). Read by the Feishu settings status badge.
+        #
+        # Receiver-liveness, NOT a credential probe: lark-oapi owns the socket
+        # and exposes no connect/subscribe transition to hook, and a REST
+        # tenant-token probe would have to pick a domain (open.feishu.cn vs
+        # open.larksuite.com), reporting a false failure for whichever tenant it
+        # guessed wrong. Liveness still catches rejected credentials, because
+        # lark's ws.start() RETURNS within seconds when the app is refused —
+        # which flips this to False with the reason attached.
+        self.feishu_connected: bool = False
+        # Short reason the Feishu channel is not running — a missing lark-oapi
+        # extra, rejected app credentials, or a receiver thread that died. Empty
+        # when connected or never attempted. Read by the settings badge.
+        self.feishu_connect_error: str = ""
         # True only while the Teams channel's credentials validated this
         # session (kept truthful by TeamsClient.on_state_change). Read by the
         # Teams settings status badge.
@@ -5053,6 +4950,13 @@ class DashboardState:
         # lifecycle matches the gateway instance.
         self.resource_pressure_notifier = ResourcePressureNotifier(self.notification_bus)
         self._slots: dict[str, _ChatSlot] = {}
+        # Process-local Spec Builder outbox claims, keyed by directory + delivery.
+        # Directory scope matters because aliases use different slots for the same
+        # files; durable status remains owned by the app's decision ledger.
+        self._spec_decision_deliveries_inflight: set[tuple[str, str]] = set()
+        # Consumed claims whose durable finalization failed remain blocked from
+        # redispatch while a later Spec Builder detail poll retries the ledger write.
+        self._spec_decision_deliveries_consumed: set[tuple[str, str]] = set()
         # Slot keys that EXIST but are deliberately absent from ``_slots`` while
         # they are being built (see ``session_transfer``'s import path, which
         # retracts a slot so it is unreachable until its transcript and context
@@ -5128,6 +5032,14 @@ class DashboardState:
         # Sidebar columns — flat list of {id, name, tag_ids, mode, order, include_untagged}
         self._tag_boards: list[dict[str, Any]] = []
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Gateway replacement is process-wide, not an ordinary repeatable
+        # background mutation.  The task latch coalesces duplicate /api/restart
+        # clicks during the response-drain window; the in-progress latch also
+        # serializes restart requests arriving through update and other server
+        # paths.  Both are cleared when a mocked/failed exec returns, while a
+        # successful exec replaces this state with the successor process.
+        self._gateway_restart_task: asyncio.Task[None] | None = None
+        self._gateway_restart_in_progress: bool = False
         # FIX 2: unattended-turn concurrency cap. Semaphore is created lazily
         # (see _background_turn_sema) because this object outlives / predates
         # the event loop in some hosts. The counters exist so a queued fleet is
@@ -5523,6 +5435,8 @@ class DashboardState:
         update_commits_behind: int = 0,
         update_last_checked_at: float | None = None,
         update_check_interval_secs: int = 43200,
+        update_required: bool = False,
+        update_min_version: str = "",
     ) -> dict[str, Any]:
         """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
         uptime = int(time.time() - self.start_time)
@@ -5584,6 +5498,14 @@ class DashboardState:
             "update_commits_behind": update_commits_behind,
             "update_last_checked_at": update_last_checked_at,
             "update_check_interval_secs": update_check_interval_secs,
+            # Mandatory-update verdict (enterprise governance pin OR the release
+            # feed's breaking-change floor) plus the floor that triggered it.
+            # The proactive update modal reads these off the status frame and
+            # drops its snooze/skip affordances while required — it must not
+            # depend on the user opening Settings to learn the update is
+            # mandatory.
+            "update_required": update_required,
+            "update_min_version": update_min_version,
             "no_crons": self.no_crons,
             "branch": branch,
             "commit": commit,
@@ -6888,6 +6810,19 @@ class DashboardState:
         linked_session_key: str = "",
         channel_origin: bool = False,
         origin: str | None = None,
+        *,
+        # Opt-in for the survey's "new user" session counter, DISTINCT from the
+        # origin tag: ``SlotOrigin.USER`` carries the ``slots:user`` privacy
+        # semantics and is deliberately set by non-human paths too (the
+        # session-control create verb mints USER slots so agent-created
+        # sessions stay app-invisible), so origin alone cannot mean "a person
+        # started this chat". Only the human request-layer paths (chat-send
+        # auto-create, new-chat tab, fork) pass True. Default False is the
+        # chosen fail direction, matching
+        # the counter's own philosophy below: a future missed opt-in only
+        # delays the survey (lost signal); defaulting to count would let
+        # unattended agent activity satisfy the gate (corrupted signal).
+        count_user_session: bool = False,
     ) -> _ChatSlot:
         """Return existing slot or create a new one.
 
@@ -6970,12 +6905,18 @@ class DashboardState:
         # SlotOrigin.USER), so a caller that forgets to declare loses
         # visibility instead of leaking — the direction this has to fail in.
         slot._origin = origin or (SlotOrigin.APP if app else "")
-        if minted_new and slot._origin == SlotOrigin.USER:
+        if minted_new and count_user_session and slot._origin == SlotOrigin.USER:
             # Count only genuine, newly-minted user chats toward the survey's
             # "new user" window (session_pulse_counter). `minted_new` excludes
             # restore/rehydrate (which passes the persisted key as name) and
-            # get-existing, so a restart never re-counts already-seen sessions;
-            # only the request layer ever supplies origin=USER. Best-effort:
+            # get-existing, so a restart never re-counts already-seen sessions.
+            # `count_user_session` carries the human-started signal: only the
+            # request-layer paths a person actually drives (chat-send
+            # auto-create, new-chat tab, fork) opt in, so agent-minted USER
+            # slots (the session-control create verb) do not satisfy the
+            # survey gate on their own (#6139). The
+            # origin conjunct stays as the invariant floor: a caller can never
+            # count a non-USER slot, flag or not. Best-effort:
             # the helper swallows its own I/O errors and never raises into
             # slot creation.
             #
@@ -7092,6 +7033,26 @@ class DashboardState:
         each slip past a cap that is already full.
         """
         return len(self._slots) + len(self._slots_under_construction)
+
+    def creator_slot_count(self, creator_key: str) -> int:
+        """Live slots that *creator_key* asked for, for :data:`MAX_SLOTS_PER_CREATOR`.
+
+        Counts only slots carrying the attribution ``create_session`` writes, so a
+        person's own tab and a fork -- which name no creator -- are never charged to
+        anyone and stay bounded by :data:`MAX_LIVE_SLOTS` alone.
+
+        Unlike :meth:`live_slot_count` this does NOT add the under-construction set:
+        attribution is written just after the slot is minted, with no suspension
+        between the caller's cap test and that write, so a slot mid-construction has
+        no creator to compare and adding the set would charge one caller for
+        another's in-flight create. An empty ``creator_key`` counts nothing rather
+        than matching every unattributed slot.
+        """
+        if not creator_key:
+            return 0
+        return sum(
+            1 for slot in self._slots.values() if getattr(slot, "_created_by", "") == creator_key
+        )
 
     def begin_slot_construction(self, key: str) -> None:
         """Mark *key* as allocated-but-unpublished.
