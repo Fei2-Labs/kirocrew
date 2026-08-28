@@ -126,12 +126,14 @@ describe('ChatPane — upload error surface (#5707)', () => {
   it('reports an oversized file (client refusal) without calling the server', async () => {
     renderPane('pane-upload-big')
     const fileInput = await screen.findByLabelText(/attach files/i)
-    const big = new File(['x'], 'huge.mp4', { type: 'video/mp4' })
+    // Not a video: the pane exempts videos up to VIDEO_MAX_BYTES (512 MB), so
+    // this must be a non-video extension to exercise the flat 50 MB cap.
+    const big = new File(['x'], 'huge.png', { type: 'image/png' })
     Object.defineProperty(big, 'size', { value: 60 * 1024 * 1024 })
     Object.defineProperty(fileInput, 'files', { value: [big], configurable: true })
     fireEvent.change(fileInput)
     // pages.chatPage.file_too_large === "File too large: {{name}} (max 50 MB)"
-    await waitFor(() => expect(screen.getByText(/File too large: huge\.mp4/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/File too large: huge\.png/)).toBeInTheDocument())
     expect(api.uploadFiles).not.toHaveBeenCalled()
   })
 
