@@ -497,8 +497,8 @@ async def _remove_provider_entry(slug: str, mcp_url: str) -> _DisconnectScope:
     the config write has already landed by then, so failing the request would report
     a Disconnect that did not happen.
     """
-    from kiro_crew.connections.mint import grant_key
     from kiro_crew.connections.tool_aliases import normalized_endpoint
+    from kiro_crew.mcp_grant import grant_key
     from kiro_crew.dashboard.handlers.mcp import (
         _get_mcp_lock,
         _offload_config_write,
@@ -611,11 +611,8 @@ async def api_connections_disconnect(request: web.Request) -> web.Response:
     mcp_url = str(provider["mcp_url"])
 
     # Function-local, same boot-path reason as the mint handlers.
-    from kiro_crew.connections.mint import (
-        cancel_mint,
-        revoke_local_grant,
-        surviving_grant_artifacts,
-    )
+    from kiro_crew.connections.mint import cancel_mint
+    from kiro_crew.mcp_grant import revoke_local_grant, surviving_grant_artifacts
 
     # A pending mint for this provider is now moot, and leaving it live would let
     # a grant arrive moments after the user asked for the connection to be gone.
