@@ -181,9 +181,7 @@ OPENCODE_ACP_SUBCMD = "acp"
 # An OpenCode model id is a provider name plus one or more safe path segments.
 # The same form reaches `session/set_model`, never a shell, but validation keeps a
 # user-edited config from turning the model picker into an arbitrary string source.
-_OPENCODE_MODEL_ID_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
-)
+_OPENCODE_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*$")
 _OPENCODE_CONFIG_FILE = "opencode.json"
 
 CLAUDE_ACP_BIN = "claude-agent-acp"
@@ -362,9 +360,11 @@ def _resolve_copilot_bin() -> str | None:
     if on_path:
         return on_path
 
-    sdk_root = Path(
-        os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
-    ) / "github-copilot-sdk" / "cli"
+    sdk_root = (
+        Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        / "github-copilot-sdk"
+        / "cli"
+    )
     if sdk_root.is_dir():
         exe_name = "copilot.exe" if platform_compat.IS_WINDOWS else "copilot"
         candidates = sorted(
@@ -412,7 +412,9 @@ def _configured_opencode_models() -> list[dict[str, str]]:
             models.append(
                 {
                     "modelId": full_id,
-                    "name": str(model.get("name") or model_id) if isinstance(model, dict) else model_id,
+                    "name": (
+                        str(model.get("name") or model_id) if isinstance(model, dict) else model_id
+                    ),
                     "description": "",
                 }
             )
@@ -439,8 +441,11 @@ def _resolve_opencode_bin() -> str | None:
     # The opencode install script's default target, present even when the
     # user's shell profile (which adds it to PATH) never ran — e.g. a
     # non-login launchd/systemd gateway.
-    install_dir_bin = Path.home() / ".opencode" / "bin" / (
-        "opencode.exe" if platform_compat.IS_WINDOWS else "opencode"
+    install_dir_bin = (
+        Path.home()
+        / ".opencode"
+        / "bin"
+        / ("opencode.exe" if platform_compat.IS_WINDOWS else "opencode")
     )
     if install_dir_bin.is_file():
         return str(install_dir_bin)
@@ -2473,6 +2478,22 @@ class AcpClient:
         """
         return pooled_session_servers(self._mcp_gateway_overlay, self._agent, self._channel_id)
 
+    def _external_session_mcp_servers(self) -> list[dict[str, Any]]:
+        """Load the resolved agent MCP entries for ACP backends that need them."""
+        if self._is_kiro:
+            return []
+        from kiro_crew.mcp_gateway.session_servers import agent_session_servers
+
+        return agent_session_servers(self._agent)
+
+    def _session_mcp_servers(self) -> list[dict[str, Any]]:
+        """Merge agent entries with pooled stubs; injected names win."""
+        entries = [*self._claude_session_mcp_servers(), *self._external_session_mcp_servers()]
+        by_name = {str(entry["name"]): entry for entry in entries if "name" in entry}
+        for entry in self._pooled_mcp_servers():
+            by_name[str(entry["name"])] = entry
+        return [by_name[name] for name in sorted(by_name)]
+
     def _claude_session_mcp_servers(self) -> list:
         """MCP server array passed to a claude ``session/new`` / ``session/load``.
 
@@ -3105,11 +3126,15 @@ class AcpClient:
         _spawn_label = (
             "claude-agent-acp"
             if self._is_claude
-            else f"{COPILOT_BIN} {COPILOT_ACP_ARG}"
-            if self._is_copilot
-            else f"{OPENCODE_BIN} {OPENCODE_ACP_SUBCMD}"
-            if self._is_opencode
-            else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+            else (
+                f"{COPILOT_BIN} {COPILOT_ACP_ARG}"
+                if self._is_copilot
+                else (
+                    f"{OPENCODE_BIN} {OPENCODE_ACP_SUBCMD}"
+                    if self._is_opencode
+                    else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
+                )
+            )
         )
         # Everything from here to the end of _spawn runs with a LIVE subprocess
         # that nothing has recorded yet, so every step must be guarded. Without
@@ -3241,11 +3266,11 @@ class AcpClient:
             _bin_label = (
                 "claude-acp"
                 if self._is_claude
-                else COPILOT_BIN
-                if self._is_copilot
-                else OPENCODE_BIN
-                if self._is_opencode
-                else KIRO_CLI_BIN
+                else (
+                    COPILOT_BIN
+                    if self._is_copilot
+                    else OPENCODE_BIN if self._is_opencode else KIRO_CLI_BIN
+                )
             )
             logger.warning("%s stderr: %s", _bin_label, redacted)
         if suppressed:
@@ -3507,10 +3532,7 @@ class AcpClient:
             # Pooled broker stubs are appended for kiro-cli: a session-injected
             # server outranks the same-named entry in the agent spec, which is
             # how pooling takes effect without writing a spec anywhere.
-            "mcpServers": [
-                *self._claude_session_mcp_servers(),
-                *(await asyncio.to_thread(self._pooled_mcp_servers)),
-            ],
+            "mcpServers": await asyncio.to_thread(self._session_mcp_servers),
         }
         if self._is_claude:
             new_params["_meta"] = {"claudeCode": {"options": {}}}
@@ -3631,10 +3653,7 @@ class AcpClient:
                         # unchanged; a companion overrides the hook (see
                         # session/new above). Pooled stubs are re-declared so a
                         # resumed session keeps talking to the broker.
-                        "mcpServers": [
-                            *self._claude_session_mcp_servers(),
-                            *(await asyncio.to_thread(self._pooled_mcp_servers)),
-                        ],
+                        "mcpServers": await asyncio.to_thread(self._session_mcp_servers),
                     }
                     if self._is_claude:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}

@@ -1472,9 +1472,9 @@ Examples:
     tel_sub.add_parser("disable", help="Turn the anonymous beacon off permanently")
     tel_sub.add_parser("enable", help="Turn the anonymous beacon back on")
 
-    byok_parser = sub.add_parser(
+    byok_parser = cli_help.add_command(
+        sub,
         "byok",
-        help="Manage bring-your-own-key provider API keys for BYOK backends",
         epilog="""
 Examples:
   kirocrew byok list

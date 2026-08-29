@@ -587,6 +587,185 @@ class TestModelAndConfigGuards:
         assert client.acp_config_options == []
 
 
+# ── session/new MCP-server injection for backends without a kiro-config reader ──
+
+
+class TestSessionSpecMcpInjection:
+    """OpenCode never reads ``~/.kiro/agents/<agent>.json`` itself, so the
+    resolved agent spec's MCP servers (kirocrew-core/cron, and
+    kirocrew-computer when its spec gate emitted it) must be carried in the
+    ``session/new`` ``mcpServers`` param — otherwise an OpenCode ACP session
+    has none of KiroCrew's MCP tools at all."""
+
+    @staticmethod
+    def _write_spec(agents_dir: Path, servers: dict, name: str = "kirocrew") -> None:
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / f"{name}.json").write_text(
+            json.dumps({"name": name, "mcpServers": servers}), encoding="utf-8"
+        )
+
+    @staticmethod
+    async def _session_new_mcp(client: AcpClient) -> list:
+        client._send_request = AsyncMock(return_value=7)
+        client._wait_for_response = AsyncMock(return_value={"sessionId": "s1"})
+        await client._new_session_following_substitution()
+        method, params = client._send_request.await_args.args
+        assert method == "session/new"
+        return params["mcpServers"]
+
+    @pytest.mark.asyncio
+    async def test_opencode_session_new_carries_the_agent_spec_servers(
+        self, tmp_path, monkeypatch
+    ):
+        agents_dir = tmp_path / "agents"
+        self._write_spec(
+            agents_dir,
+            {
+                "kirocrew-computer": {
+                    "command": "/usr/bin/kirocrew",
+                    "args": ["mcp-computer"],
+                    "env": {"A": "b"},
+                },
+                "kirocrew-core": {"command": "/usr/bin/kirocrew", "args": ["mcp-core"]},
+                "switched-off": {"command": "/bin/x", "disabled": True},
+                "remote-docs": {"type": "http", "url": "https://docs.example/mcp"},
+            },
+        )
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_OPENCODE, agent="kirocrew")
+
+        servers = await self._session_new_mcp(client)
+
+        by_name = {entry["name"]: entry for entry in servers}
+        assert "kirocrew-computer" in by_name, (
+            "OpenCode session/new must carry kirocrew-computer from the agent spec"
+        )
+        assert by_name["kirocrew-computer"]["command"] == "/usr/bin/kirocrew"
+        assert by_name["kirocrew-computer"]["args"] == ["mcp-computer"]
+        # ACP env shape is an array of {name, value} pairs, not a mapping.
+        assert by_name["kirocrew-computer"]["env"] == [{"name": "A", "value": "b"}]
+        assert "kirocrew-core" in by_name
+        assert "switched-off" not in by_name  # disabled entries stay off
+        assert by_name["remote-docs"] == {
+            "name": "remote-docs",
+            "type": "http",
+            "url": "https://docs.example/mcp",
+            "headers": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_kiro_session_new_stays_spec_free(self, tmp_path, monkeypatch):
+        # kiro-cli loads servers itself via --agent; injecting the spec there
+        # would launch every server twice (injection outranks the spec entry).
+        agents_dir = tmp_path / "agents"
+        self._write_spec(
+            agents_dir,
+            {"kirocrew-computer": {"command": "/usr/bin/kirocrew", "args": ["mcp-computer"]}},
+        )
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        client = _client(tmp_path, agent="kirocrew")  # default kiro backend
+
+        assert await self._session_new_mcp(client) == []
+
+    @pytest.mark.asyncio
+    async def test_opencode_missing_spec_degrades_to_no_servers(self, tmp_path, monkeypatch):
+        # No agent spec on disk: session/new must still be issued (fail-soft),
+        # with no MCP servers rather than an exception.
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path / "agents")
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_OPENCODE, agent="kirocrew")
+
+        assert await self._session_new_mcp(client) == []
+
+    @pytest.mark.asyncio
+    async def test_opencode_malformed_spec_degrades_to_no_servers(self, tmp_path, monkeypatch):
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "kirocrew.json").write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_OPENCODE, agent="kirocrew")
+
+        assert await self._session_new_mcp(client) == []
+
+    @pytest.mark.asyncio
+    async def test_pooled_stub_outranks_the_spec_entry(self, tmp_path, monkeypatch):
+        # A pooled broker stub and the spec's own copy of the same server must
+        # not both launch: the stub wins, matching kiro-cli's
+        # injection-outranks-spec precedence.
+        from kiro_crew.mcp_gateway.rewriter import _WRAPPER_MARKER
+
+        agents_dir = tmp_path / "agents"
+        self._write_spec(
+            agents_dir,
+            {
+                "kirocrew-core": {"command": "/usr/bin/kirocrew", "args": ["mcp-core"]},
+                "kirocrew-computer": {
+                    "command": "/usr/bin/kirocrew",
+                    "args": ["mcp-computer"],
+                },
+            },
+        )
+        overlay_dir = tmp_path / "overlay"
+        overlay_dir.mkdir()
+        (overlay_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "command": "/stub/python",
+                            "args": ["-m", "kiro_crew.mcp_gateway.stub"],
+                            "env": {},
+                            _WRAPPER_MARKER: True,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        client = _client(
+            tmp_path,
+            acp_backend=ACP_BACKEND_OPENCODE,
+            agent="kirocrew",
+            mcp_gateway_overlay=overlay_dir,
+        )
+
+        servers = await self._session_new_mcp(client)
+
+        names = [entry["name"] for entry in servers]
+        assert names.count("kirocrew-core") == 1
+        core = next(e for e in servers if e["name"] == "kirocrew-core")
+        assert core["command"] == "/stub/python"  # the stub, not the spec copy
+        assert "kirocrew-computer" in names  # non-poolable spec entry still rides along
+
+    @pytest.mark.asyncio
+    async def test_session_load_carries_the_same_servers(self, tmp_path, monkeypatch):
+        agents_dir = tmp_path / "agents"
+        self._write_spec(
+            agents_dir,
+            {"kirocrew-computer": {"command": "/usr/bin/kirocrew", "args": ["mcp-computer"]}},
+        )
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        client = _client(tmp_path, acp_backend=ACP_BACKEND_OPENCODE, agent="kirocrew")
+        client._can_load_session = True
+        client.set_resume_session_id("prior-sid")
+        client._send_request = AsyncMock(return_value=9)
+        client._wait_for_response = AsyncMock(return_value={"modes": {}})
+        client._apply_startup_model = AsyncMock()
+        client._drain_notifications = AsyncMock()
+        # Step 1 (initialize) is stubbed: return a response advertising
+        # loadSession so step 2 issues session/load.
+        first = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+        client._wait_for_response = AsyncMock(side_effect=[first, {"modes": {}}])
+
+        await client._initialize_session()
+
+        load_call = client._send_request.await_args_list[1]
+        method, params = load_call.args
+        assert method == "session/load"
+        assert [e["name"] for e in params["mcpServers"]] == ["kirocrew-computer"]
+
+
 # ── stderr drain ──
 
 
