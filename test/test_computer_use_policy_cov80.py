@@ -72,7 +72,7 @@ class TestTitleIsDenied:
             pid=9,
             bundle_id="com.google.Chrome",
             # brand-ok: the joined spelling is the `title_substrings` row under test.
-            window_title="KiroCrew dashboard",  # brand-ok
+            window_title="Kiro Crew dashboard",  # brand-ok
         )
         rule = policy.denied_rule_for(app)
         assert rule is not None

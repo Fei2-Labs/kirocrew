@@ -2198,6 +2198,46 @@ def _safe_native_crew_debug_title(title: str) -> str:
     return safe
 
 
+async def _name_grant_refusal_off_loop(command: str) -> Refusal | None:
+    """The ONE place this module's tiers reach the name-grant check.
+
+    It resolves names against ``PATH`` and digests the file behind each one, so
+    it runs on a worker thread: the gateway's loop must not stat a stalled
+    network mount or read a large binary. Every tier goes through here rather
+    than calling ``asyncio.to_thread`` itself, so there is a single place to
+    reason about (and, for the rung tests, a single place to stub -- three tiers
+    each spawning their own thread is what crashed the Windows xdist workers).
+    """
+
+    if not command:
+        return None
+    return await asyncio.to_thread(name_grant_refusal, command)
+
+
+async def _name_grant_refusal_for(event: object) -> Refusal | None:
+    """Why a shell *event* may not be auto-approved by program NAME, or ``None``.
+
+    Every auto-approve tier is a statement about a PROGRAM, and the shell
+    resolves the name itself afterwards through a ``PATH`` that legitimately
+    leads with directories the agent can write.
+
+    This lives here rather than inside ``HookManager.on_tool_call``, which is
+    synchronous and called ON the loop. The hook layer decides its own tiers and
+    this downgrades an auto-approve it granted, so a refusal costs one
+    interactive prompt and never blocks.
+
+    ``None`` for a non-shell tool or an unrecoverable command: there is no
+    program name to vouch for, and those tiers are unchanged.
+    """
+
+    if not getattr(event, "is_shell", False):
+        return None
+    command = getattr(event, "shell_command", None)
+    if not command:
+        return None
+    return await _name_grant_refusal_off_loop(command)
+
+
 def _session_principal(session_key: str) -> str:
     """The platform user id a DIRECT session key names, or ``""``.
 
@@ -5031,7 +5071,6 @@ async def _run_chat(
         # guards (`is_claude_backend`, the advertised list) rather than trusting a
         # provider name that could not be read.
         provider_name = ""
-        configured_auto_approve = False
         # Canonical crew identity for watchdog overrides — same seeding rule
         # as the eager-spawn path (the two must agree): slot value until the
         # resolver supplies its alias, which covers the default crew on an
@@ -5044,7 +5083,6 @@ async def _run_chat(
         try:
             cfg = KiroCrewConfig.load()
             provider_name = cfg.agent.provider
-            configured_auto_approve = cfg.agent.approval_mode == "auto"
             # Warm the project agent index OFF the loop, then resolve inline. Only
             # the warm is offloaded: resolve_agent_bindings can raise StopIteration
             # on a malformed config, and StopIteration cannot be delivered through a
@@ -5278,9 +5316,7 @@ async def _run_chat(
         # after a grant went away clears any policy an earlier turn stored.
         state.sessions.set_approval_policy(
             session_key,
-            _persistable_session_policy(
-                slot, state.is_yolo_active() or configured_auto_approve
-            ),
+            _persistable_session_policy(slot, state.is_yolo_active()),
         )
 
         # Drain MCP OAuth requests captured during session init. kiro-cli
@@ -6829,14 +6865,14 @@ async def _run_chat(
                         if _tp_command
                         else None
                     )
-                    if matched and _tp_cmd:
+                    if matched and _tp_command:
                         # The user granted a PROGRAM NAME. Do not honour it when
                         # that name no longer identifies the program it appears
                         # to name — the shell resolves it again, through a PATH
                         # that can lead with directories the agent writes.
                         # Declining costs one interactive prompt; the command is
                         # neither blocked nor rewritten.
-                        _tp_shim = await _name_grant_refusal_off_loop(_tp_cmd)
+                        _tp_shim = await _name_grant_refusal_off_loop(_tp_command)
                         if _tp_shim:
                             # The CODE, not the detail and not the pattern: both
                             # are derived from user/agent input, and a log sink is
@@ -6908,7 +6944,6 @@ async def _run_chat(
                 # Detect bash tools by tool_input content (title is human-readable)
                 cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                 yolo_active = state.is_yolo_active()
-                auto_approve_active = configured_auto_approve or yolo_active
                 # Evaluated ONCE for both branches below. Two separate calls could
                 # straddle a scoped grant's expiry and disagree with each other, and
                 # a scope check is not a pure read — it retires a lapsed grant and
@@ -6958,8 +6993,8 @@ async def _run_chat(
                             metadata={"reason": "trust_reads"},
                         )
                         continue
-                # Trust mode (per-slot), configured auto approval, or YOLO mode
-                # (global) — auto-approve. All three are UNCONDITIONAL grants:
+                # Trust mode (per-slot) or YOLO mode (global) — auto-approve.
+                # Both are UNCONDITIONAL grants:
                 # the decision consumes no agent-authored event data, so a
                 # low-fidelity child event with a VERIFIED canonical MCP
                 # identity still qualifies (_child_grant_eligible —
@@ -6968,7 +7003,7 @@ async def _run_chat(
                 # falls through to the interactive card; children WITH cached
                 # bytes take these branches exactly like the main agent (mode
                 # parity).
-                if (slot_trusted or auto_approve_active) and _child_grant_eligible:
+                if (slot_trusted or yolo_active) and _child_grant_eligible:
                     try:
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
@@ -7036,11 +7071,7 @@ async def _run_chat(
                         request_id=event.request_id,
                         # Provenance, so an auditor can separate a human's session
                         # trust from an unattended worker's expiring scoped grant.
-                        metadata={
-                            "reason": _auto_approve_reason(slot, yolo_active)
-                            if not auto_approve_active or yolo_active
-                            else "approval_mode_auto",
-                        },
+                        metadata={"reason": _auto_approve_reason(slot, yolo_active)},
                     )
                     continue
                 # Auto-reject remaining tools after one rejection in a batch

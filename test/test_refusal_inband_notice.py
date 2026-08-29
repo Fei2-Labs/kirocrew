@@ -241,7 +241,7 @@ class TestFloorDenialExplainsItself:
     in-band, a bare misleading identifier misdirects the agent's next attempt.
     """
 
-    MINT_PATTERN_TAIL = "\\btoken\\b"
+    MINT_PATTERN_TAIL = "token\\b"
 
     def _deny(self, command: str) -> str:
         from kiro_crew.security import is_denied

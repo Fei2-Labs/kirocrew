@@ -914,6 +914,14 @@ function ChatInput({
     || (pendingApproval?.content || '').match(/^(?:🔧\s*)?\[([a-z_]+)\]/)?.[1]
     || ''
   const approvalIsUnattended = UNATTENDED_APPROVAL_SOURCES.has(approvalSource)
+  /** Offer trust verbs ONLY when the slot-backed resolve path that records
+   *  standing trust (api.approveChatSlot) is available and a human is attached.
+   *  FAIL-CLOSED, same class invariant as #5400/#5434: a surface must not offer
+   *  a trust verb its resolve path does not honor. Without a slot the resolve
+   *  would fall back to the one-shot api.resolveApproval, which has no trust
+   *  verb — the composer would report a standing grant that was never created
+   *  (#5486). */
+  const approvalCanTrust = !approvalIsUnattended && !!activeSlot
   const simplified = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
   const approvalLabelRaw = sanitizeLlmOutput(pendingApproval?.content || '').replace(/^🔧\s*/, '')
@@ -2918,8 +2926,8 @@ function ChatInput({
                   )}
                   <div className="flex gap-1.5 flex-wrap items-center">
                       <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('approved')}><CheckCircle size={12} className="shrink-0" />{i18nT('components.chatInput.allow_once')}</button>
-                      {approvalIsReadOnly && !approvalIsUnattended && <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('trust_reads')}><BookOpen size={12} className="shrink-0" />{i18nT('components.chatInput.trust_reads')}</button>}
-                      {!approvalIsUnattended && approvalTrustCommandGrantable && (
+                      {approvalIsReadOnly && approvalCanTrust && <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('trust_reads')}><BookOpen size={12} className="shrink-0" />{i18nT('components.chatInput.trust_reads')}</button>}
+                      {approvalCanTrust && approvalTrustCommandGrantable && (
                         <TrustDropdown
                             fullCommand={approvalFullCommand}
                             baseCommand={approvalBaseCommand}

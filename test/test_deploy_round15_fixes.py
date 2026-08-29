@@ -97,9 +97,9 @@ class TestDeploySkillsCopyNotSymlink:
         assert "symlink_to" not in DEPLOY_INIT
 
     def test_symlink_migration_replaces_with_copy(self):
-        """Existing symlinks are unlinked and replaced with copies."""
-        assert "link.is_symlink()" in DEPLOY_INIT
-        assert "link.unlink()" in DEPLOY_INIT
+        """Existing symlinks/junctions are unlinked and replaced with copies."""
+        assert "is_link_or_junction(link)" in DEPLOY_INIT
+        assert "unlink_link_or_junction(link)" in DEPLOY_INIT
 
     def test_managed_marker_written_on_copy(self):
         assert "_MANAGED_MARKER" in DEPLOY_INIT

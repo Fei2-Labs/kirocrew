@@ -673,10 +673,16 @@ class TestPidAgeSeconds:
         assert abs(age - age_desired) < 1.0
 
     def test_non_linux_returns_none(self) -> None:
-        """On non-Linux, _pid_age_seconds returns None immediately."""
+        """On non-Linux, an unresolvable pid's age comes back None."""
         from kiro_crew.session_pid import _pid_age_seconds
 
-        with patch("kiro_crew.session_pid.sys.platform", "darwin"):
+        with (
+            patch("kiro_crew.session_pid.sys.platform", "darwin"),
+            patch(
+                "kiro_crew.session_pid.platform_compat.get_process_start_id",
+                return_value=None,
+            ),
+        ):
             assert _pid_age_seconds(1234) is None
 
 
