@@ -50,6 +50,43 @@ conflict_policy:
     keystone: true
     note: "agent.provider stays enum=['acp']; CONTRACT_VERSION pinned at 1."
 
+  - glob: "src/kiro_crew/acp/@(client|runtime|_dispatch|session_handle).py"
+    policy: fork_wins
+    keystone: true
+    note: |
+      Carries the fc48cd48a MCP-injection divergence (_session_mcp_servers must
+      COMPOSE with upstream's acp/spec_servers.py, never duplicate it) plus the
+      opencode/copilot spawn+handshake wiring. Adopt upstream's structure where
+      it does not touch those two things.
+
+  # ── operator-local config: the fork's own values, not upstream's ──
+  - glob: ".kiro/settings/cli.json"
+    policy: fork_wins
+    note: "Local ACP/model configuration for this install."
+
+  # ── CI workflows: take upstream; dependabot re-bumps action versions ──
+  - glob: ".github/workflows/**"
+    policy: upstream_wins
+    note: |
+      The only fork-side edits here are dependabot action-version bumps, which
+      dependabot re-opens if the merge drops them. Do NOT hand-carry them.
+      EXCEPT sync-upstream.yml, which is fork-only (see the next rule).
+  - glob: ".github/workflows/sync-upstream.yml"
+    policy: fork_wins
+    note: "Fork-only: upstream has no such workflow."
+
+  # ── fork-only exemption lists: both sides append entries ──
+  - glob: "website/.jscpd.json"
+    policy: union
+    note: "Fork adds its own capture-harness exemptions; upstream adds others."
+
+  - glob: "website/scripts/check-bundle-size.mjs"
+    policy: upstream_wins
+    note: |
+      Both sides raise chunk budgets. Upstream's number is the FRESHER
+      measurement against a bigger tree, so it is the safer ceiling — take it,
+      then re-measure locally (analyze build) and only lower it if it is wrong.
+
   # ── generated: regenerate, never hand-merge ──
   - glob: "@(config-baseline|error-code-baseline).json"
     policy: upstream_then_regen
@@ -63,6 +100,12 @@ conflict_policy:
     policy: upstream_wins
     note: "Re-apply fork messaging/approval fixes on top."
   - glob: "src/kiro_crew/apps/builtins/**"
+    policy: upstream_wins
+
+  # Remaining first-party modules with no recorded fork divergence: upstream's
+  # version is authoritative. If a resolution here turns out to need judgment,
+  # promote the path to its own rule above rather than deciding it twice.
+  - glob: "src/kiro_crew/**"
     policy: upstream_wins
   - glob: "website/src/**"
     policy: upstream_wins
