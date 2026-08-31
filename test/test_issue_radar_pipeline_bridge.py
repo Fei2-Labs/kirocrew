@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.issue_radar.backend import crew_store, pipeline_bridge
 
 OWNER, REPO = "acme", "demo-repo"
@@ -962,20 +963,16 @@ class TestReplayRefusesAPopulatedRoot(unittest.TestCase):
         across the whole operation the inner call blocks on the same lock rather
         than racing, so a non-blocking probe of the lock file must find it held.
         """
-        import fcntl
-
         held: list[bool] = []
         real_ensure = pipeline_bridge._ensure_crew
 
         def probe(owner, repo, pipeline, number, root):
             path = pipeline_bridge._replay_lock_path(owner, repo, pipeline, root)
             with open(path, "w") as fd:
-                try:
-                    fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    held.append(False)  # acquired => NOT held by replay
-                    fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    held.append(True)  # already held => serialized
+                acquired = platform_compat.try_acquire_lock(fd.fileno(), exclusive=True)
+                held.append(not acquired)  # acquired => NOT held by replay
+                if acquired:
+                    platform_compat.release_lock(fd.fileno())
             return real_ensure(owner, repo, pipeline, number, root)
 
         with mock.patch.object(pipeline_bridge, "_ensure_crew", probe):
