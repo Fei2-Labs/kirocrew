@@ -352,7 +352,12 @@ def test_both_agent_spawn_paths_name_their_browser_session() -> None:
     from kiro_crew.acp import client, runtime
 
     for module in (client, runtime):
-        assert "env.update(browser_session_env(env))" in inspect.getsource(module)
+        source = inspect.getsource(module)
+        assert "browser_env = browser_session_env(env)" in source
+        assert "env.update(browser_env)" in source
+        assert "if browser_env:" in source
+        assert "lifecycle_env = {**os.environ, **browser_env}" in source
+        assert "browser_socket_env" in source
 
 
 def test_the_session_name_does_not_travel_as_extra_env() -> None:
@@ -374,3 +379,110 @@ def test_the_session_name_does_not_travel_as_extra_env() -> None:
         source = inspect.getsource(module)
         assert "extra_env.update(browser_session_env" not in source
         assert "browser_session_env" in source
+
+
+def test_browser_socket_env_prepares_stable_owner_only_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sockets = tmp_path / "sockets"
+    daemons = tmp_path / "daemons"
+    prepared: list[Path] = []
+    monkeypatch.setattr(mod, "socket_dir", lambda _session, _base=None: sockets)
+    monkeypatch.setattr(mod, "daemon_dir", lambda _session, _base=None: daemons)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(
+        mod.platform_compat, "make_owner_only_dir", lambda path: prepared.append(Path(path))
+    )
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+
+    assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {
+        mod.SOCKETS_ENV: str(sockets),
+        mod.DAEMON_DIR_ENV: str(daemons),
+    }
+    assert prepared == [sockets, daemons]
+
+
+def test_browser_socket_env_namespaces_configured_bases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    own_socket_base = tmp_path / "operator-sockets"
+    own_daemon_base = tmp_path / "daemons"
+    prepared: list[Path] = []
+    monkeypatch.setattr(
+        mod.platform_compat, "make_owner_only_dir", lambda path: prepared.append(Path(path))
+    )
+    monkeypatch.setattr(mod.platform_compat, "restrict_dir_to_owner", lambda _path: None)
+    monkeypatch.setattr(mod, "_UNIX_SOCKET_PATH_MAX_BYTES", 10_000)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+
+    env = {
+        mod.SESSION_ENV: "kc-a1b2c3d4",
+        mod.SOCKETS_ENV: str(own_socket_base),
+        mod.DAEMON_DIR_ENV: str(own_daemon_base),
+    }
+    assert mod.browser_socket_env(env) == {
+        mod.SOCKETS_ENV: str(own_socket_base / "a1b2c3d4" / "s"),
+        mod.DAEMON_DIR_ENV: str(own_daemon_base / "a1b2c3d4" / "d"),
+    }
+    assert prepared == [
+        own_socket_base / "a1b2c3d4" / "s",
+        own_daemon_base / "a1b2c3d4" / "d",
+    ]
+
+
+def test_browser_socket_env_fails_without_partial_additions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fail(_path: Path) -> None:
+        raise OSError("no space")
+
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod.platform_compat, "make_owner_only_dir", _fail)
+
+    assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
+
+
+def test_browser_socket_env_refuses_an_overlong_unix_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    long_root = tmp_path / ("x" * 100)
+    monkeypatch.setattr(mod, "socket_dir", lambda _session, _base=None: long_root)
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
+
+    assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
+
+
+def test_browser_socket_env_refuses_non_generated_session() -> None:
+    assert mod.browser_socket_env({mod.SESSION_ENV: "chrome"}) == {}
+
+
+def test_browser_socket_env_fails_back_when_upstream_contract_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: False)
+    # No lifecycle directory may be created when the installed CLI does not
+    # prove it honors both environment variables.
+    called: list[Path] = []
+    monkeypatch.setattr(
+        mod.platform_compat,
+        "make_owner_only_dir",
+        lambda path: called.append(Path(path)),
+    )
+
+    assert mod.browser_socket_env({mod.SESSION_ENV: "kc-a1b2c3d4"}) == {}
+    assert called == []
+
+
+def test_browser_socket_env_refuses_relative_configured_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "cli_lifecycle_env_supported", lambda: True)
+    env = {
+        mod.SESSION_ENV: "kc-a1b2c3d4",
+        mod.SOCKETS_ENV: "relative/sockets",
+        mod.DAEMON_DIR_ENV: "relative/daemons",
+    }
+
+    assert mod.browser_socket_env(env) == {}

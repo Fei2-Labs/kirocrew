@@ -11,12 +11,12 @@ import chatReducer from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 
-/* #5707: api.uploadFiles does NOT throw on a non-2xx — it resolves
- * { paths: [], error }. Before the fix ChatPane's mutation had only an
- * onSuccess reading res.paths, so a server refusal (bad type, signature
- * mismatch, over-cap) was silent: the spinner stopped with no attachment
- * and no message. ChatPane must now surface res.error the way ChatPage
- * does, reusing the existing pages.chatPage.upload_failed_error string. */
+/* #5707: a server-refused upload (unsupported type, signature mismatch,
+ * over-cap) resolves as `{ paths: [], error }` — api.uploadFiles does NOT
+ * throw — so ChatPane's upload mutation used to land in onSuccess, find no
+ * paths, and do nothing: the spinner stopped and the user saw no attachment
+ * and no message. ChatPane now surfaces res.error the way ChatPage does, and
+ * reports its client-side refusals too. No silent refusal path is left. */
 
 vi.mock('react-virtuoso', () => ({
   Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (index: number, item: unknown) => ReactNode }) => (
@@ -82,7 +82,7 @@ function makeStore(slotKey: string) {
 function renderPane(slotKey: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const store = makeStore(slotKey)
-  return Object.assign(render(
+  return render(
     <Provider store={store}>
       <QueryClientProvider client={qc}>
         <ThemeProvider>
@@ -92,58 +92,133 @@ function renderPane(slotKey: string) {
         </ThemeProvider>
       </QueryClientProvider>
     </Provider>,
-  ), { store })
-}
-
-function pickFile(input: HTMLElement, file: File) {
-  Object.defineProperty(input, 'files', { value: [file], configurable: true })
-  fireEvent.change(input)
+  )
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
 })
 
-describe('ChatPane — upload error surface (#5707)', () => {
-  it('renders the server refusal message when uploadFiles resolves { paths: [], error }', async () => {
-    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ paths: [], error: 'unsupported file type' })
-    renderPane('pane-upload-refused')
-    const fileInput = await screen.findByLabelText(/attach files/i)
-    pickFile(fileInput, new File(['x'], 'evil.exe', { type: 'application/octet-stream' }))
-    // pages.chatPage.upload_failed_error === "Upload failed: {{error}}"
-    await waitFor(() => expect(screen.getByText(/Upload failed: unsupported file type/)).toBeInTheDocument())
-  })
-
-  it('shows no error banner and no message when the upload succeeds', async () => {
-    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ paths: ['/tmp/ok.png'] })
-    renderPane('pane-upload-ok')
-    const fileInput = await screen.findByLabelText(/attach files/i)
-    pickFile(fileInput, new File(['x'], 'ok.png', { type: 'image/png' }))
-    await waitFor(() => expect(api.uploadFiles).toHaveBeenCalledTimes(1))
-    expect(screen.queryByText(/Upload failed/)).not.toBeInTheDocument()
-  })
-
-  it('reports an oversized file (client refusal) without calling the server', async () => {
-    renderPane('pane-upload-big')
-    const fileInput = await screen.findByLabelText(/attach files/i)
-    // Not a video: the pane exempts videos up to VIDEO_MAX_BYTES (512 MB), so
-    // this must be a non-video extension to exercise the flat 50 MB cap.
-    const big = new File(['x'], 'huge.png', { type: 'image/png' })
-    Object.defineProperty(big, 'size', { value: 60 * 1024 * 1024 })
-    Object.defineProperty(fileInput, 'files', { value: [big], configurable: true })
+describe('ChatPane upload — a refused upload is surfaced, not silent (#5707)', () => {
+  it('renders the server error when uploadFiles resolves { paths: [], error }', async () => {
+    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      paths: [], error: 'Unsupported file type: application/x-msdownload',
+    })
+    const { container } = renderPane('pane-refused')
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File(['x'], 'evil.exe', { type: 'application/x-msdownload' })
+    Object.defineProperty(fileInput, 'files', { value: [file] })
     fireEvent.change(fileInput)
-    // pages.chatPage.file_too_large === "File too large: {{name}} (max 50 MB)"
+
+    await waitFor(() => expect(api.uploadFiles).toHaveBeenCalled())
+    // Before the fix this text never appeared — onSuccess ignored res.error.
+    await waitFor(() =>
+      expect(screen.getByText(/Unsupported file type: application\/x-msdownload/)).toBeInTheDocument(),
+    )
+  })
+
+  it('renders the pane\'s connectivity copy when the upload fetch rejects (onError path)', async () => {
+    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const { container } = renderPane('pane-threw')
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File(['x'], 'clip.png', { type: 'image/png' })
+    Object.defineProperty(fileInput, 'files', { value: [file] })
+    fireEvent.change(fileInput)
+
+    await waitFor(() => expect(api.uploadFiles).toHaveBeenCalled())
+    // A transport reject must not leak "Failed to fetch" to the user, and must
+    // not claim a 50 MB ceiling either.
+    await waitFor(() => expect(screen.getByText(/Connection error/i)).toBeInTheDocument())
+    expect(screen.queryByText(/Failed to fetch/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/max 50 MB/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /dismiss/i })).toBeInTheDocument()
+  })
+
+  it('passes a non-transport error\'s own message through (resize / session expiry)', async () => {
+    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('Session expired'))
+    const { container } = renderPane('pane-threw-msg')
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File(['x'], 'clip.png', { type: 'image/png' })
+    Object.defineProperty(fileInput, 'files', { value: [file] })
+    fireEvent.change(fileInput)
+
+    await waitFor(() => expect(screen.getByText(/Session expired/)).toBeInTheDocument())
+  })
+
+  it('reports a >20-file drop at the banner without calling the server', async () => {
+    const { container } = renderPane('pane-toomany')
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const files = Array.from({ length: 21 }, (_, i) => new File(['x'], `f${i}.png`, { type: 'image/png' }))
+    Object.defineProperty(fileInput, 'files', { value: files })
+    fireEvent.change(fileInput)
+
+    // This guard used to `return` silently: 21 files vanished with no message.
+    await waitFor(() => expect(screen.getByText(/Too many files/i)).toBeInTheDocument())
+    expect(api.uploadFiles).not.toHaveBeenCalled()
+  })
+
+  it('reports an oversized document, and exempts video so its own 413 reports the real cap', async () => {
+    const bigDoc = new File(['x'], 'huge.png', { type: 'image/png' })
+    Object.defineProperty(bigDoc, 'size', { value: 60 * 1024 * 1024 })
+    const { container, unmount } = renderPane('pane-bigdoc')
+    let fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    Object.defineProperty(fileInput, 'files', { value: [bigDoc] })
+    fireEvent.change(fileInput)
+
+    // Was silent before; 50 MB is the true ceiling for a document, so the
+    // message can state it.
     await waitFor(() => expect(screen.getByText(/File too large: huge\.png/)).toBeInTheDocument())
     expect(api.uploadFiles).not.toHaveBeenCalled()
+    unmount()
+
+    // A recording is exempt from the client guard at ANY size, so it reaches
+    // the server and an over-cap one is refused by its own 413 -- which states
+    // the real video ceiling instead of this message's 50 MB.
+    const bigVideo = new File(['x'], 'screencap.mp4', { type: 'video/mp4' })
+    Object.defineProperty(bigVideo, 'size', { value: 600 * 1024 * 1024 })
+    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      paths: [], error: 'Video exceeds the 512 MB limit',
+    })
+    const second = renderPane('pane-bigvideo')
+    fileInput = second.container.querySelector('input[type="file"]') as HTMLInputElement
+    Object.defineProperty(fileInput, 'files', { value: [bigVideo] })
+    fireEvent.change(fileInput)
+    await waitFor(() => expect(api.uploadFiles).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByText(/Video exceeds the 512 MB limit/)).toBeInTheDocument())
+    expect(screen.queryByText(/max 50 MB/)).not.toBeInTheDocument()
   })
 
-  it('reports too many files (client refusal) without calling the server', async () => {
-    renderPane('pane-upload-many')
-    const fileInput = await screen.findByLabelText(/attach files/i)
-    const files = Array.from({ length: 21 }, (_, i) => new File(['x'], `f${i}.png`, { type: 'image/png' }))
-    Object.defineProperty(fileInput, 'files', { value: files, configurable: true })
+  it('clears a previous refusal on the next attempt, so it cannot misattribute', async () => {
+    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ paths: [], error: 'Unsupported file type' })
+    const { container } = renderPane('pane-stale')
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const bad = new File(['x'], 'evil.exe', { type: 'application/x-msdownload' })
+    Object.defineProperty(fileInput, 'files', { value: [bad], configurable: true })
     fireEvent.change(fileInput)
-    await waitFor(() => expect(screen.getByText(/Too many files/)).toBeInTheDocument())
-    expect(api.uploadFiles).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByText(/Unsupported file type/)).toBeInTheDocument())
+
+    // A SUCCEEDING upload is the case nothing else clears: onSuccess appends
+    // paths and sets no message, so without the clear at entry the previous
+    // refusal keeps standing over a completed attach.
+    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ paths: ['/tmp/ok.png'] })
+    const ok = new File(['x'], 'ok.png', { type: 'image/png' })
+    Object.defineProperty(fileInput, 'files', { value: [ok], configurable: true })
+    fireEvent.change(fileInput)
+
+    await waitFor(() => expect(api.uploadFiles).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByText(/Unsupported file type/)).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument()
+  })
+
+  it('shows no error banner on a successful upload', async () => {
+    ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ paths: ['/tmp/ok.png'] })
+    const { container } = renderPane('pane-ok')
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File(['x'], 'ok.png', { type: 'image/png' })
+    Object.defineProperty(fileInput, 'files', { value: [file] })
+    fireEvent.change(fileInput)
+
+    await waitFor(() => expect(api.uploadFiles).toHaveBeenCalled())
+    expect(screen.queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument()
   })
 })

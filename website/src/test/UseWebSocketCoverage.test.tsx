@@ -660,6 +660,8 @@ describe('useWebSocket frame router', () => {
       ws.simulateMessage({ type: 'subagent_chunk', data: { slot: ACTIVE, id: 'ag-1', text: 'partial ' } })
       ws.simulateMessage({ type: 'subagent_tool', data: { slot: ACTIVE, id: 'ag-1', tool: 'fs_read', tool_count: 2 } })
     })
+    // Subagent chunks are now buffered and flushed per animation frame (PR #5945).
+    act(() => { const pending = rafCbs; rafCbs = []; pending.forEach(cb => cb(0)) })
     expect(chat().subagents['ag-1']?.streaming).toBe('partial ')
     expect(chat().subagents['ag-1']?.lastTool).toBe('fs_read')
 
@@ -774,6 +776,20 @@ describe('useWebSocket frame router', () => {
     // A status frame with no text is ignored rather than clearing the detail.
     act(() => { ws.simulateMessage({ type: 'chat_status', data: { slot: ACTIVE } }) })
     expect(chat().slotStatusDetail[ACTIVE]?.text).toBe('Compacting…')
+  })
+
+  it('forwards the plan rate limit riding the context-usage frame', () => {
+    // The quota travels on the context frame rather than an event of its own, so
+    // a dispatch that dropped the field would leave the popover's quota section
+    // permanently empty with nothing else looking wrong.
+    const { ws } = mount()
+    act(() => {
+      ws.simulateMessage({
+        type: 'context_usage',
+        data: { slot: ACTIVE, pct: 42, rate_limit: { status: 'allowed_warning', limit_type: 'five_hour', utilization: 81 } },
+      })
+    })
+    expect(chat().slotRateLimit[ACTIVE]).toEqual({ status: 'allowed_warning', limit_type: 'five_hour', utilization: 81 })
   })
 
   it('re-reads the transcript when a variant switch names a slot', () => {

@@ -82,7 +82,6 @@ provide and are not labelled differently.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import logging
 import os
@@ -101,6 +100,7 @@ from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
     sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 
 logger = logging.getLogger(__name__)
@@ -785,21 +785,10 @@ async def _run_probe(argv: list[str], cwd: str | None) -> str | None:
         #   escapes the route as an HTTP 500 on a keystroke — for a tier whose
         #   entire contract is "no completions is a normal answer", the right
         #   degradation is no menu, not an error the client must special-case.
-        task = asyncio.create_task(
-            asyncio.to_thread(_prepare_probe, argv),
+        wrapped, env, cleanup = await shielded_prepare_off_loop(
+            functools.partial(_prepare_probe, argv),
+            executor=discovery_executor(),
         )
-        try:
-            wrapped, env, cleanup = await asyncio.shield(task)
-        except asyncio.CancelledError:
-            cleanup_path: str | None = None
-            with contextlib.suppress(BaseException):
-                _, _, cleanup_path = await task
-            if cleanup_path:
-                try:
-                    os.unlink(cleanup_path)
-                except OSError:
-                    pass
-            raise
     except (SandboxUnavailableError, OSError, RuntimeError):
         return None
     async with _gate():

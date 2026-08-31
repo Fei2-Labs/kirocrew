@@ -383,6 +383,28 @@ def record_observed(server_name: str, code: str, identity: str = "") -> bool:
     return _sink.record(server_name, code, identity)
 
 
+def observed_codes(server_name: str, identity: str = "") -> tuple[str, ...]:
+    """Codes observed for *server_name* under *identity*, off the process sink.
+
+    The read half of ``record_observed``, and the reason :meth:`codes_for` had no
+    caller on the serve path: the observation sites reach the sink through these
+    module functions, and until now only the writers existed. Recording a hazard
+    could therefore change a label on the MCP page and nothing else.
+
+    Identity-checked deliberately -- see :meth:`HazardLedger.codes_for`. A caller
+    that ACTS on this (refusing to pool) must not strand a server on evidence
+    about the build it replaced, so an upgrade or a config edit reads as
+    unobserved and re-earns pooling.
+
+    In-memory and IO-free, so it is safe on the event loop. Returns empty when no
+    sink is installed, which is the truth for a process that never observes
+    anything (the stub, and unit tests).
+    """
+    if _sink is None:
+        return ()
+    return _sink.codes_for(server_name, identity)
+
+
 def clear_observed(server_name: str) -> bool:
     """Drop every observation for *server_name* from the process sink.
 

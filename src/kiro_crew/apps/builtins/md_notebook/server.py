@@ -423,7 +423,7 @@ def _write_pat_sync(pat: str) -> None:
     # owner-only DACL there and chmod 0600 on POSIX, and atomic_write applies it
     # to the temp BEFORE any payload byte — narrower than the previous
     # write-then-restrict here, which left the token in a parent-inherited-DACL
-    # file for the duration of the icacls subprocess. restrict_on_error="warn"
+    # file until the lockdown landed. restrict_on_error="warn"
     # keeps the original policy: a chmod failure warns rather than losing the
     # credential. Written 0600 and never echoed back (only a boolean).
     atomic_write(target, pat, fsync=True, restrict_to_owner=True, restrict_on_error="warn")

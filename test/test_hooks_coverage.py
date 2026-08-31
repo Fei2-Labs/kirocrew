@@ -403,6 +403,47 @@ class TestSafeReadFile:
         with pytest.raises(FileNotFoundError):
             safe_read_file(str(tmp_path / "nope.txt"))
 
+    def test_sensitive_refusal_message_escapes_the_path(self, monkeypatch):
+        """The refused path is caller/attacker influenced and the message reaches
+        log records via ``exc_info``; a raw newline in it would forge a second
+        record (refs #6371, the #6281/#6315 log-forgery class).
+        """
+        forged = "/tmp/pods/wt-evil\nWARNING forged: reclaim authorized"
+        # The message carries the RESOLVED path (drive-lettered and
+        # backslashed on Windows), so compute the expectation the same way
+        # production does.
+        resolved = os.path.realpath(os.path.expanduser(forged))
+        monkeypatch.setattr(hooks_mod, "is_sensitive_path", lambda p: True)
+        with pytest.raises(PermissionError, match="sensitive path") as excinfo:
+            safe_read_file(forged)
+        message = str(excinfo.value)
+        assert "\n" not in message
+        assert repr(resolved) in message
+
+    def test_symlink_refusal_message_escapes_the_path(self, tmp_path, monkeypatch):
+        """The ELOOP arm keeps the pre-race resolved path — including any
+        newline-bearing directory name — so its message must escape it too.
+        """
+        import errno as _errno
+
+        f = tmp_path / "map.json"
+        f.write_text("{}", encoding="utf-8")
+        resolved = os.path.realpath(str(f))
+
+        real_open = os.open
+
+        def _eloop(path, flags, *args, **kwargs):
+            if str(path) == resolved:
+                raise OSError(_errno.ELOOP, "symlink swapped in")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", _eloop)
+        with pytest.raises(PermissionError, match="refusing to follow symlink") as excinfo:
+            safe_read_file(str(f))
+        message = str(excinfo.value)
+        assert "\n" not in message
+        assert repr(resolved) in message
+
 
 class TestSafeReadFileBytes:
     def test_reads_bytes(self, tmp_path):

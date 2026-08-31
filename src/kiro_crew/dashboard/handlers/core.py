@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hmac
-import importlib.util
 import json
 import logging
 import math
@@ -16,7 +15,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import sysconfig
 from pathlib import Path
 
 from aiohttp import web
@@ -24,7 +22,6 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
 from kiro_crew import beacon, dep_sync, platform_compat
-from kiro_crew.acp.types import ACP_BACKENDS_SELECTABLE
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
 from kiro_crew.computer_use.types import MIN_SCREENSHOT_MAX_PX as _CU_MIN_SCREENSHOT_MAX_PX
@@ -39,6 +36,11 @@ from kiro_crew.config.loader import (
     config_path,
 )
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
+from kiro_crew.dashboard.handlers._shared import (
+    _pip_install_channel_available,
+    pip_extra_install_command,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.origin import check_host, is_direct_local_request
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.stt_stream import _STREAMING_PROVIDERS
@@ -765,37 +767,6 @@ def _voice_extra_importable() -> bool:
     return True
 
 
-def _pip_install_channel_available() -> bool:
-    """True when ``<gateway python> -m pip install`` can plausibly succeed.
-
-    Three environments make that command a guaranteed dead end, and surfacing
-    it there recreates the press-and-nothing-changes failure this surface
-    exists to avoid:
-
-    - the desktop app's bundled interpreter (see
-      :func:`platform_compat.is_bundled_interpreter`): pip may exist, but a
-      pip install writes into the code-signed bundle — breaking launches and
-      updates — and is discarded on every app update;
-    - an interpreter without the ``pip`` module (uv tool installs, some
-      pipx layouts);
-    - a PEP 668 externally-managed interpreter (distro/brew pythons), where
-      pip refuses to install. Checked only outside a venv: inside one, pip
-      works and deliberately ignores the marker, so a venv returns True.
-    """
-    if platform_compat.is_bundled_interpreter():
-        return False
-    if importlib.util.find_spec("pip") is None:
-        return False
-    # PEP 668 applies to the environment pip would install into. Inside a venv
-    # pip deliberately ignores the marker, and `sysconfig.get_path("stdlib")`
-    # resolves to the BASE interpreter's directory — where distro/brew pythons
-    # place it — so checking it from a venv would misfire on the recommended
-    # install layout (venv on a Debian/Ubuntu/Homebrew python).
-    if sys.prefix != sys.base_prefix:
-        return True
-    return not (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").exists()
-
-
 def _ffmpeg_install_commands() -> list[str]:
     """Platform command(s) that put ffmpeg on PATH, or ``[]`` when it already is."""
     ensure_ffmpeg_in_path()
@@ -852,28 +823,7 @@ def _stt_prereq_commands(provider: str = "whisper") -> list[str]:
             # The command targets the gateway's own interpreter: the import
             # happens in-process, so a system python or ``--user`` install is
             # not importable here.
-            if os.name == "nt":
-                # The user's shell is unknowable here (they may paste this into
-                # PowerShell OR cmd), so the form must be SILENT-CORRUPTION-FREE
-                # in both, and PowerShell is the harder shell: a double-quoted
-                # string still expands ``$name`` and honours backtick escapes,
-                # and so does a bare unquoted token — both are legal path
-                # characters, so either form silently rewrites an interpreter
-                # under e.g. ``C:\tools\$python\...`` into a path that does not
-                # exist. Single quotes are PowerShell's LITERAL form (no
-                # expansion, no escapes, spaces included), with ``&`` invoking
-                # the quoted path, so the interpreter reaches pip byte-for-byte
-                # — including the all-users ``C:\Program Files\...`` layout an
-                # unquoted form cannot express. cmd performs no ``$`` or
-                # backtick processing at all and rejects the leading ``&``
-                # loudly ("... was unexpected"), so a cmd user gets a clear
-                # error to re-quote for, never a corrupted install. A literal
-                # single quote in the path is escaped by doubling, PowerShell's
-                # own rule.
-                exe = sys.executable.replace("'", "''")
-                cmds.append(f"& '{exe}' -m pip install kirocrew[voice]")
-            else:
-                cmds.append(f"{shlex.quote(sys.executable)} -m pip install 'kirocrew[voice]'")
+            cmds.append(pip_extra_install_command("voice"))
         # The non-streaming path remuxes the browser's .webm through ffmpeg, and
         # is_available() only logs a warning when ffmpeg is absent — this list
         # is the one user-visible surface for that gap.
@@ -1833,11 +1783,8 @@ def _active_advertised_ids(request: web.Request) -> list[str] | None:
     except (KeyError, AttributeError):
         return None
     for provider in providers:
-        getter = getattr(provider, "available_models", None)
-        if not callable(getter):
-            continue
         try:
-            ids = advertised_model_ids(getter())
+            ids = advertised_model_ids(provider.available_models())
         except Exception:
             continue
         if ids:
@@ -1892,17 +1839,25 @@ _MOVED_CONFIG_FIELDS: dict[str, str] = {
 }
 
 
+def _selectable_acp_backend_values() -> list[str]:
+    from kiro_crew.acp import backends as acp_backends
+
+    return sorted(acp_backends.selectable_ids())
+
+
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
-    # Which ACP agent binary actually drives sessions: "" (kiro-cli, the
-    # default), "copilot" (GitHub Copilot CLI's own `--acp` server mode),
-    # "opencode" (OpenCode's `acp` server mode — the BYOK seam for
-    # OpenAI-compatible endpoints), or "kas" (kiro-agent). Editable here
-    # because switching it is a config-only
-    # change with no destructive side effect — the next spawned session simply
-    # launches a different binary (see acp.client._spawn / acp.types
-    # ACP_BACKENDS_SELECTABLE, the single source of truth for this set).
-    "agent.acp_backend": {"type": "enum", "values": sorted(ACP_BACKENDS_SELECTABLE)},
+    # Which harness serves a session. Validated against ACP_BACKENDS_SELECTABLE
+    # rather than a literal list, so the allowlist cannot drift from the set the
+    # rest of the process honours — a value accepted here but refused by
+    # _normalize_acp_backend would be silently degraded back to kiro after a
+    # save that reported success.
+    "agent.acp_backend": {
+        "type": "str",
+        "max_len": 128,
+        "pattern": r"^[A-Za-z0-9._-]*$",
+        "values_fn": _selectable_acp_backend_values,
+    },
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live backend advertises.
     # OpenCode BYOK ids are provider/model paths (and a model segment may itself
@@ -2055,10 +2010,12 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # Local OTEL metric collection — the Privacy panel's recording switch. Safe
     # to expose where beacon_endpoint is not: turning this on writes JSONL under
     # ~/.kiro/crew/metrics. It is NOT unconditionally local, though —
-    # `_build_recorder` attaches an OTLP reader when `telemetry.otlp_endpoint` is
-    # set — so the gate below refuses the ENABLE on a host that configured an
-    # endpoint, which is what keeps the switch's local-only promise true for every
-    # state it can reach. The endpoint itself stays config-file-only, so a
+    # `_build_recorder` attaches an OTLP reader for every destination the active
+    # telemetry provider supplies (the default provider supplies one when
+    # `telemetry.otlp_endpoint` is set) — so the gate below refuses the ENABLE on a
+    # host where egress would start, which is what keeps the switch's local-only
+    # promise true for every state it can reach. The endpoint itself stays
+    # config-file-only, so a
     # dashboard caller can neither choose a destination nor start sending to one.
     "telemetry.enabled": {"type": "bool"},
     # SSO login flags for an edition that supplies a real sso_login_handler.
@@ -2200,6 +2157,13 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             return _deny(_MOVED_CONFIG_FIELDS[path_key], f"{path_key}={value}")
         return _deny(f"field not editable: {path_key}", f"{path_key}={value}")
 
+    if path_key == "agent.acp_backend":
+        owner_denied = await require_owner_dashboard_request(
+            request, "config.patch.agent.acp_backend"
+        )
+        if owner_denied is not None:
+            return owner_denied
+
     # Validate value
     if spec["type"] == "enum":
         if value not in spec["values"]:
@@ -2236,9 +2200,20 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         pattern = spec.get("pattern")
         if pattern and not re.fullmatch(pattern, value):
             return _deny(f"invalid value for {path_key}", f"{path_key}={value}")
+        if path_key == "agent.acp_backend":
+            from kiro_crew.acp.backends import canonical_backend_id
+            from kiro_crew.acp.types import ACP_BACKEND_KIRO
+
+            value = canonical_backend_id(value)
         values_fn = spec.get("values_fn")
-        if values_fn and value not in values_fn():
-            return _deny(f"invalid value for {path_key}", f"{path_key}={value}")
+        if values_fn:
+            # Dynamic ACP values may parse the operator-owned registry cache.
+            # Keep that filesystem I/O off aiohttp's event loop; unlike the
+            # static ``values`` rows, this callable is deliberately live so a
+            # newly discovered adapter can be selected without a restart.
+            allowed_values = await asyncio.to_thread(values_fn)
+            if value not in allowed_values:
+                return _deny(f"invalid value for {path_key}", f"{path_key}={value}")
         validate_fn = spec.get("validate_fn")
         if validate_fn:
             reason = validate_fn(value, request)
@@ -2344,9 +2319,11 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
 
     # Local metric collection is offered as local-only ("Nothing is exported"), and
     # that promise has to hold for every state this route can reach. It would not:
-    # `_build_recorder` attaches an OTLP reader whenever `telemetry.otlp_endpoint`
-    # is set (see metrics/provider.py), so on a host that already configured an
-    # endpoint, enabling collection from the dashboard would start network egress
+    # `_build_recorder` attaches an OTLP reader for every destination the active
+    # telemetry provider supplies (see metrics/provider.py), so on a host where
+    # egress is configured — through `telemetry.otlp_endpoint` for the default
+    # provider, or an edition's own collector — enabling collection from the
+    # dashboard would start network egress
     # under a switch that says it does not. Refuse the ENABLE there and let the
     # config file — which is where the endpoint was chosen — be where that decision
     # is made. Disabling stays writable for the same reason as the beacon above: a
@@ -2357,17 +2334,33 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             # state, but a full read plus schema validation (~14ms) when the file
             # changed — and this handler runs on the event loop.
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
-            endpoint = str(getattr(cfg.telemetry, "otlp_endpoint", "") or "")
+            # Resolved posture, not the raw endpoint string: the DEFAULT provider
+            # derives its one destination from telemetry.otlp_endpoint, but an
+            # edition may supply its own collector with that key empty. Asking the
+            # same resolver _build_recorder uses is what keeps this refusal and
+            # the actual egress from disagreeing. It RAISES when posture cannot be
+            # established, which the handler below turns into a refusal: reading a
+            # transient provider error as "no egress" would permit an enable that
+            # the recovered provider then turns into egress.
+            egress = await asyncio.to_thread(_metrics_provider.otlp_egress_active, cfg.telemetry)
         except Exception:
-            # Unreadable config: fail closed rather than enabling collection whose
-            # egress posture cannot be established.
-            logger.warning("telemetry config unreadable; refusing to enable", exc_info=True)
-            return _deny("could not read the telemetry configuration", f"{path_key}={value}", 409)
-        if endpoint.strip():
+            # Unreadable config, or egress posture that could not be resolved:
+            # fail closed rather than enabling collection whose egress posture
+            # cannot be established.
+            logger.warning(
+                "telemetry config or egress posture unreadable; refusing to enable",
+                exc_info=True,
+            )
             return _deny(
-                "telemetry.otlp_endpoint is set, so enabling collection here would "
-                "also export metrics off this machine. Enable it in the config file "
-                "instead, where the endpoint is configured.",
+                "could not establish the telemetry egress posture",
+                f"{path_key}={value}",
+                409,
+            )
+        if egress:
+            return _deny(
+                "this host is configured to export metrics off the machine, so "
+                "enabling collection here would also start that export. Enable it "
+                "in the config file instead, where the destination is configured.",
                 f"{path_key}={value}",
                 409,
             )
@@ -2396,6 +2389,19 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     cfg_path = config_path()
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
+    # Model ids healed by a backend switch, reported so the caller can tell the
+    # operator their selection was reset rather than silently changing it.
+    healed_models: list[str] = []
+    # Non-empty when this PATCH actually moved agent.acp_backend to a new value.
+    backend_switched: list[bool] = []
+    backend_rollback: dict[str, tuple[bool, object]] = {}
+    backend_written: dict[str, tuple[bool, object]] = {}
+    backend_role_model_rollback: dict[str, object] = {}
+    backend_role_model_written: dict[str, object] = {}
+    backend_agent_model_rollback: dict[str, tuple[bool, object]] = {}
+    backend_agent_model_written: dict[str, tuple[bool, object]] = {}
+    verified_cfg: KiroCrewConfig | None = None
+
     async with _get_config_lock():
         parts = path_key.split(".")
 
@@ -2412,7 +2418,73 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 if not isinstance(nxt, dict):
                     raise ValueError(f"config section '{part}' is not an object")
                 section = nxt
+            previous = section.get(parts[-1])
+            backend_changed = False
+            if path_key == "agent.acp_backend":
+                previous_backend = (
+                    canonical_backend_id(previous)
+                    if isinstance(previous, str)
+                    else ACP_BACKEND_KIRO
+                )
+                backend_changed = previous_backend != value
+            if backend_changed:
+                agent_section_before = data.get("agent")
+                if isinstance(agent_section_before, dict):
+                    for field in ("acp_backend", "model"):
+                        backend_rollback[field] = (
+                            field in agent_section_before,
+                            copy.deepcopy(agent_section_before.get(field)),
+                        )
+                agents_before = data.get("agents")
+                if isinstance(agents_before, dict):
+                    for name, agent_before in agents_before.items():
+                        if isinstance(agent_before, dict):
+                            backend_agent_model_rollback[name] = (
+                                "model" in agent_before,
+                                copy.deepcopy(agent_before.get("model")),
+                            )
             section[parts[-1]] = value
+
+            if backend_changed:
+                backend_switched.append(True)
+                from kiro_crew.acp.client import DEFAULT_MODEL  # noqa: F811
+
+                agent_section = data.get("agent")
+                if isinstance(agent_section, dict):
+                    if agent_section.get("model") not in (None, "", DEFAULT_MODEL):
+                        healed_models.append(f"agent.model={agent_section['model']}")
+                        agent_section["model"] = DEFAULT_MODEL
+                    roles = agent_section.get("role_models")
+                    if isinstance(roles, dict):
+                        for role, pinned in list(roles.items()):
+                            if pinned not in (None, "", DEFAULT_MODEL):
+                                healed_models.append(f"agent.role_models.{role}={pinned}")
+                                backend_role_model_rollback[role] = copy.deepcopy(pinned)
+                                roles[role] = DEFAULT_MODEL
+                                backend_role_model_written[role] = copy.deepcopy(roles[role])
+                agents_section = data.get("agents")
+                if isinstance(agents_section, dict):
+                    for name, agent_config in agents_section.items():
+                        if not isinstance(agent_config, dict):
+                            continue
+                        pinned = agent_config.get("model")
+                        if pinned not in (None, "", DEFAULT_MODEL):
+                            healed_models.append(f"agents.{name}.model={pinned}")
+                            agent_config["model"] = ""
+                if isinstance(agent_section, dict):
+                    for field in backend_rollback:
+                        backend_written[field] = (
+                            field in agent_section,
+                            copy.deepcopy(agent_section.get(field)),
+                        )
+                if isinstance(agents_section, dict):
+                    for name in backend_agent_model_rollback:
+                        agent_config = agents_section.get(name)
+                        if isinstance(agent_config, dict):
+                            backend_agent_model_written[name] = (
+                                "model" in agent_config,
+                                copy.deepcopy(agent_config.get("model")),
+                            )
             return data
 
         try:
@@ -2427,9 +2499,69 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             _log_sel("error", f"{path_key}=write_failed")
             return web.json_response({"error": "failed to write config file"}, status=500)
 
+        if backend_switched:
+            verified_cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        if verified_cfg is not None and verified_cfg.agent.acp_backend != value:
+
+            def _rollback_backend_switch(data: dict) -> dict | None:
+                agent_section = data.get("agent")
+                if not isinstance(agent_section, dict):
+                    return data
+                # Another process that replaced this value owns the newer
+                # decision; never overwrite it with this request's snapshot.
+                if agent_section.get("acp_backend") == value:
+                    for field, (was_present, prior_value) in backend_rollback.items():
+                        written_present, written_value = backend_written[field]
+                        if (field in agent_section) != written_present or (
+                            written_present and agent_section.get(field) != written_value
+                        ):
+                            continue
+                        if was_present:
+                            agent_section[field] = copy.deepcopy(prior_value)
+                        else:
+                            agent_section.pop(field, None)
+                    roles = agent_section.get("role_models")
+                    if isinstance(roles, dict):
+                        for role, prior_value in backend_role_model_rollback.items():
+                            if roles.get(role) == backend_role_model_written[role]:
+                                roles[role] = copy.deepcopy(prior_value)
+                    agents_section = data.get("agents")
+                    if isinstance(agents_section, dict):
+                        for name, (
+                            was_present,
+                            prior_value,
+                        ) in backend_agent_model_rollback.items():
+                            agent_config = agents_section.get(name)
+                            if not isinstance(agent_config, dict):
+                                continue
+                            written_present, written_value = backend_agent_model_written[name]
+                            if ("model" in agent_config) != written_present or (
+                                written_present and agent_config.get("model") != written_value
+                            ):
+                                continue
+                            if was_present:
+                                agent_config["model"] = copy.deepcopy(prior_value)
+                            else:
+                                agent_config.pop("model", None)
+                return data
+
+            await asyncio.to_thread(
+                update_config_locked,
+                cfg_path,
+                mutate=_rollback_backend_switch,
+            )
+            _log_sel("denied", f"{path_key}=normalized_after_write")
+            return web.json_response(
+                {
+                    "error": "ACP backend became unavailable while saving; previous settings restored",
+                    "code": "acp_backend_changed_during_save",
+                },
+                status=409,
+            )
+
     _log_sel("success", f"{path_key}={value}")
 
-    cfg = KiroCrewConfig.load()
+    cfg = verified_cfg or KiroCrewConfig.load()
 
     # If provider changed, reload the factory so new sessions use the new provider
     if path_key == "agent.provider":
@@ -2459,6 +2591,40 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             "Provider switched to %s — config rebuilt, factory reloaded, slot models cleared", value
         )
 
+    # A backend switch is the same hazard as the provider switch above, one level
+    # down: a model id is namespaced to the harness that advertised it, so a slot
+    # still holding kiro's `gpt-5.6-sol` would apply it to the new backend and be
+    # refused at the wire. The provider block clears slot models for exactly this
+    # reason; `agent.acp_backend` needs it too. The provider factory captures
+    # `agent.acp_backend` when it is built, so refresh it and drain prewarmed
+    # providers before any new session can inherit the old adapter. Live sessions
+    # stay on the adapter they started with, matching the Settings disclosure.
+    if backend_switched:
+        state_after_switch: DashboardState = request.app["state"]
+        await state_after_switch.sessions.refresh_defaults()
+        # Best-effort by design: the config write has ALREADY committed by this
+        # point, so a problem clearing in-memory slot state must not turn a
+        # successful save into a 500 and leave the operator believing the switch
+        # did not happen. The stale slot model is re-cleared on the next switch
+        # and is refused harmlessly at the wire meanwhile.
+        try:
+            for slot in state_after_switch._slots.values():
+                if slot.model:
+                    slot.model = ""
+                    # Match the provider-switch path above: a fallback restore
+                    # probe that started before this clear must not repopulate
+                    # the previous backend's model after the switch commits.
+                    slot._model_pick_gen += 1
+            state_after_switch.push_slots_update()
+        except Exception:
+            logger.warning("Could not clear slot models after backend switch", exc_info=True)
+        if healed_models:
+            logger.info(
+                "ACP backend switched to %s — reset namespaced model selection(s): %s",
+                value or "kiro",
+                ", ".join(healed_models),
+            )
+
     # The default model and default reasoning effort are captured when the
     # provider factory is built (at gateway startup), so a config write alone
     # would not reach new sessions until a restart. refresh_defaults() rebuilds
@@ -2466,9 +2632,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     # reload_provider_factory() must NOT be used here: it clears _sessions and
     # shuts every provider down, which is correct for a provider switch but
     # would kill in-flight turns just because a default changed.
-    if path_key in ("agent.model", "agent.reasoning_effort") or path_key.startswith(
-        "agent.role_efforts."
-    ):
+    if path_key in (
+        "agent.model",
+        "agent.reasoning_effort",
+    ) or path_key.startswith("agent.role_efforts."):
         state = request.app["state"]
         await state.sessions.refresh_defaults()
         logger.info("%s set to %r — session defaults refreshed", path_key, value)

@@ -189,10 +189,14 @@ around.
   delivery path resolves it back to that slot (rehydrating it from history if
   the tab was closed). Armed headless, delivery degrades to a bell
   notification.
-- **Wake brief**: names the PR, head, reason, and the caller-supplied `note`
-  (worktree/branch orientation), and directs the woken turn to read the
-  session work ledger when one exists — pairing with the session-ledger
-  feature so a cold wake resumes from durable state.
+- **Wake brief**: each observation's line names the PR, head and reason. The
+  caller-supplied `note` (worktree/branch orientation) and the direction to read
+  the session work ledger are the WAKE's footer, not each observation's, so the
+  kernel appends them once per delivery through `Probe.wake_suffix()` — a
+  coalesced wake carrying six signals used to repeat both of them six times,
+  measured at 56% of the delivered bytes. A conversation signal also omits the
+  `(head ...)` tag, because a comment belongs to the pull request rather than to
+  any one commit.
 - Check names are attacker-influenceable text (a workflow names its jobs);
   they are charset-folded before entering state keys or the wake brief.
 

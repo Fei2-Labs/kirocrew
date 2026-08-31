@@ -352,9 +352,8 @@ async def weixin_qr_status(request: web.Request) -> web.Response:
         # BOTH — otherwise a concurrent channel save can interleave and silently
         # drop one side's write.
         #
-        # The whole block runs OFF the loop: besides the file I/O,
-        # restrict_to_owner() shells out to whoami/icacls on Windows, which would
-        # freeze the gateway for seconds on the first confirmation.
+        # The whole block runs OFF the loop: the file I/O plus, on Windows,
+        # the owner-only DACL restrict_to_owner() applies.
         async with _get_config_lock():
             await asyncio.to_thread(_persist)
     except Exception as exc:

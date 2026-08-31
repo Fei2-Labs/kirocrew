@@ -25,10 +25,18 @@ def _request(
     dashboard_url: str = "",
     cookie_token: str = "",
     query_token: str = "",
+    auth_token: str | None = None,
     state: object | None = None,
 ) -> MagicMock:
     request = MagicMock(spec=web.Request)
-    request.get.side_effect = {"user": user, "app": app}.get
+    # ``auth_token`` is what token_auth publishes: the credential it ACTUALLY
+    # validated. Defaults to the one the middleware would have picked for a
+    # request carrying these credentials (query token preferred when it is
+    # valid), so a test only sets it explicitly to model the case where the two
+    # diverge — i.e. the middleware fell back to the cookie because the query
+    # token was invalid.
+    published = auth_token if auth_token is not None else (query_token or cookie_token)
+    request.get.side_effect = {"user": user, "app": app, "auth_token": published}.get
     request.app = {"dashboard_url": dashboard_url, "port": 7777}
     if state is not None:
         request.app["state"] = state
@@ -173,6 +181,59 @@ def test_mobile_link_fails_closed_on_an_unreadable_caller_token():
     assert response.status == 200
     claims = _minted_claims(json.loads(response.text))
     assert claims["no_refresh"] == "1"
+
+
+def test_mobile_link_bounds_come_from_the_validated_credential_not_the_query_token():
+    """The cookie-fallback case: bounds must follow what the middleware VALIDATED.
+
+    When the query token is invalid, token_auth falls back to the session cookie
+    and publishes the COOKIE as request["auth_token"]. A bounded cookie session
+    must keep its bounds even though the URL still carries a permissive
+    (unverified, attacker-settable) query token — re-deriving with a fixed
+    query-then-cookie order would read that unverified value, drop
+    ``no_refresh`` and raise the TTL ceiling to the full maximum: the
+    ceiling-escape this endpoint exists to prevent.
+    """
+    permissive_query = _caller_token()  # unverified: no bounds, full-length TTL
+    bounded_cookie = generate_token(
+        "alice", ttl_seconds=600, extra={"boot": "boot-abc", "no_refresh": "1"}
+    )
+
+    response = _call(
+        _request(
+            dashboard_url="https://dashboard.example",
+            query_token=permissive_query,
+            cookie_token=bounded_cookie,
+            auth_token=bounded_cookie,  # what the middleware validated
+        )
+    )
+
+    assert response.status == 200
+    claims = _minted_claims(json.loads(response.text))
+    assert claims["no_refresh"] == "1"
+    assert claims["boot"] == "boot-abc"
+    remaining = claims["session_exp"] - time.time()
+    assert 0 < remaining <= 600 + 5
+
+
+def test_mobile_link_bounds_fail_closed_when_no_credential_was_published():
+    """No published credential means no verified claims to lend: bound the mint.
+
+    Trusting a re-extracted token here is exactly the unverified read the
+    published-credential contract removes, so the mint is bounded instead.
+    """
+    response = _call(
+        _request(
+            dashboard_url="https://dashboard.example",
+            cookie_token=_caller_token(boot="boot-abc"),
+            auth_token="",  # middleware published nothing
+        )
+    )
+
+    assert response.status == 200
+    claims = _minted_claims(json.loads(response.text))
+    assert claims["no_refresh"] == "1"
+    assert "boot" not in claims
 
 
 def test_mobile_link_bounds_come_from_the_query_token_not_a_stray_cookie():

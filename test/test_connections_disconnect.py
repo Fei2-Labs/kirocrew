@@ -132,6 +132,7 @@ import pytest_asyncio  # noqa: E402  (imported for its marker plugin)
 from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
+from dashboard_owner_helpers import as_owner  # noqa: E402
 from kiro_crew import agent as agent_mod  # noqa: E402
 from kiro_crew import mcp_discovery  # noqa: E402
 from kiro_crew.connections import get_provider  # noqa: E402
@@ -212,6 +213,7 @@ def _wire(
 async def _client() -> TestClient:
     app = web.Application()
     app.router.add_post("/api/connections/disconnect", connections.api_connections_disconnect)
+    as_owner(app)
     client = TestClient(TestServer(app))
     await client.start_server()
     return client

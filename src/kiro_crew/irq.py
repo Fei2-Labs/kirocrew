@@ -304,6 +304,27 @@ class Probe:
         """
         return {}
 
+    def wake_suffix(self) -> str:
+        """Optional text appended ONCE per wake, after every brief.
+
+        A brief describes ONE observation; this describes the WAKE. Standing
+        instructions to the woken agent ("the watch stays armed", "read the
+        ledger first") and the operator's own context note belong here, because
+        they are true of the delivery rather than of any single signal.
+
+        Putting them in the brief instead is what the split exists to prevent:
+        the kernel joins N briefs into one body, so per-observation text is
+        repeated N times, and the better coalescing works the more it repeats.
+        Measured on a real six-observation wake, that duplication was 56% of the
+        delivered bytes -- context the woken agent pays for and cannot use.
+
+        Called after :meth:`identity`, so a probe may derive it from its own
+        cron message. A value that is not a string, or one that raises, is
+        dropped rather than allowed to kill the tick: a wake with no footer is
+        recoverable, a watch that raises every tick is auto-paused.
+        """
+        return ""
+
 
 def _state_dir() -> Path:
     home = os.environ.get("KIROCREW_HOME")
@@ -538,6 +559,25 @@ def run(
         bounds[name] = _usable_bound(name, raw, defaults[name])
     coalesce_secs = bounds["coalesce_secs"]
     coalesce_max_secs = bounds["coalesce_max_secs"]
+
+    # The per-wake footer, read once here for the same reason tuning() is: after
+    # identity(), so a probe may derive it from its cron message. Guarded the
+    # same way too -- a footer is not worth a crash loop, and a probe that
+    # returns a non-string would otherwise blow up inside the join.
+    try:
+        raw_suffix = probe.wake_suffix()
+    except Exception:
+        logger.warning("irq: probe wake_suffix() raised; wake has no footer", exc_info=True)
+        raw_suffix = ""
+    wake_suffix = raw_suffix if isinstance(raw_suffix, str) else ""
+
+    def body(briefs: list[str]) -> str:
+        """The delivered wake: every brief, then the footer ONCE."""
+        joined = _coalesced_brief(briefs)
+        if not wake_suffix:
+            return joined
+        return f"{joined}\n\n{wake_suffix}" if joined else wake_suffix
+
     realert_secs = bounds["realert_secs"]
     max_consecutive_errors = int(bounds["max_consecutive_errors"])
 
@@ -695,13 +735,13 @@ def run(
     terminal = [o for o in tick.observations if o.severity is Severity.TERMINAL]
     if terminal:
         persist()
-        raise Done(with_warning(_coalesced_brief([o.brief for o in terminal if o.brief])))
+        raise Done(with_warning(body([o.brief for o in terminal if o.brief])))
 
     for obs in tick.observations:
         if obs.severity is Severity.NMI and should_alert(_dedupe_key(obs)):
             alerted[_dedupe_key(obs)] = now
             persist()
-            raise Report(with_warning(obs.brief))
+            raise Report(with_warning(body([obs.brief])))
 
     fresh_wakes = {
         _dedupe_key(o): o.brief
@@ -714,7 +754,7 @@ def run(
             for key in fresh_wakes:
                 alerted[key] = now
             persist()
-            raise Report(with_warning(_coalesced_brief(list(fresh_wakes.values()))))
+            raise Report(with_warning(body(list(fresh_wakes.values()))))
         persist()
         raise Skip(tick.detail or f"{tick.pending} pending")
 
@@ -782,13 +822,49 @@ def run(
     # plus a pending count that never drains meant the cap could never be
     # reached first, and the guarantee it exists to make -- a delayed wake
     # rather than a dropped one -- was quietly void for those values.
-    if (elapsed >= coalesce_secs and converged) or elapsed >= coalesce_max_secs:
-        for key in window:
+    if elapsed >= coalesce_max_secs:
+        fire = dict(window)
+    elif elapsed >= coalesce_secs and converged:
+        fire = dict(window)
+    elif elapsed >= coalesce_secs:
+        # The floor is reached but checks are still draining. ``pending`` counts
+        # CHECKS, which makes it the right gate for an epoch-scoped anomaly -- a
+        # draining check is exactly what can still resolve one. It is the wrong
+        # gate for a STICKY signal: a comment is complete the moment it is posted
+        # and does not become truer when a check finishes, so gating it on that
+        # count buys nothing and costs up to ``coalesce_max_secs``. Measured on a
+        # real pull request with 18 checks in flight, a fresh review comment was
+        # held the full 30 minutes for no observation it could have gained.
+        #
+        # So each population fires on its OWN readiness. Firing the whole window
+        # here instead would announce an epoch-scoped `ready` before the new
+        # head's checks existed -- the convergence-that-never-happened the floor
+        # was added to prevent.
+        fire = {k: v for k, v in window.items() if k.startswith(_STICKY_SENTINEL)}
+    else:
+        fire = {}
+    # `persist_ok` gates the partial fire, and the reason is the fallback below.
+    # Withholding the epoch-scoped half is only a DELAY while the window can be
+    # remembered; with an unwritable state directory the next tick reloads an
+    # empty window, so withholding becomes a LOSS -- the exact hazard the
+    # persistence fallback exists to close, reintroduced for the half this branch
+    # holds back. When the write failed, fall through and deliver everything now.
+    if fire and persist_ok:
+        for key in fire:
             alerted[key] = now
-        state.pop("coalescing", None)
-        state.pop("coalesce_started_at", None)
+        remaining = {k: v for k, v in window.items() if k not in fire}
+        if remaining:
+            # Keep the START STAMP, not merely the entries: those have been
+            # waiting since it, and restarting the clock on every partial fire
+            # would push them out by a fresh floor each time a sticky signal
+            # arrives -- turning a talkative pull request into an indefinite
+            # delay for the check anomaly sitting beside it.
+            state["coalescing"] = remaining
+        else:
+            state.pop("coalescing", None)
+            state.pop("coalesce_started_at", None)
         persist()
-        raise Report(with_warning(_coalesced_brief(list(window.values()))))
+        raise Report(with_warning(body(list(fire.values()))))
 
     if not persist_ok:
         # A window needs to REMEMBER when it opened, so an unwritable state
@@ -799,7 +875,7 @@ def run(
         # operator is about to see repeats. Without coalescing this hazard did
         # not exist (an unwritable directory only caused duplicate wakes), so it
         # arrived with the window and is guarded where the window is.
-        raise Report(with_warning(_coalesced_brief(list(window.values()))))
+        raise Report(with_warning(body(list(window.values()))))
 
     persist()
     raise Skip(

@@ -795,6 +795,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
+    "id": "chat.agent-backend",
+    "label": "Agent Backend",
+    "labelKey": "pages.settings.chatPanel.agent_backend",
+    "description": "Which command-line agent actually drives your sessions. Kiro CLI is the default; GitHub Copilot CLI, KAS, and OpenCode are alternate backends — switching requires that CLI to already be installed and signed in on this machine. OpenCode serves any OpenAI-compatible endpoint you configure in it (BYOK).",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "chat.auto-compact-threshold",
     "label": "Auto-Compact Threshold",
     "labelKey": "pages.settings.chatPanel.auto_compact_threshold",

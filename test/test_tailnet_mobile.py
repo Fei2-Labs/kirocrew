@@ -359,6 +359,7 @@ def _request(
     tailnet_host: str = "",
     query_token: str = "",
     cookie_token: str = "",
+    auth_token: str | None = None,
 ):
     """Minimal stand-in for the aiohttp request these handlers actually touch.
 
@@ -375,9 +376,14 @@ def _request(
     ``tailnet_host`` models the name the RUNNING server trusted at startup. Empty
     (the default) means the fixed allowlist does not carry the resolvable name,
     so ``_derive_step`` reports ``restart_gateway``. Ready paths must set it.
-    ``query_token`` / ``cookie_token`` model the credential the middleware
-    authenticated with, which the QR mint reads its caller bounds from. Both
-    empty (the default) exercises the fail-closed no-readable-token path.
+    ``query_token`` / ``cookie_token`` model the raw credential material.
+    ``auth_token`` models what the middleware published as the VALIDATED
+    credential (``request["auth_token"]``): defaults to ``query_token or
+    cookie_token`` (the normal middleware-prefer-query behaviour), but pass
+    ``auth_token=cookie_token`` explicitly to model the fallback path where the
+    query token was invalid and the middleware fell back to the cookie. Both
+    ``query_token`` and ``cookie_token`` empty (the default) exercises the
+    fail-closed no-readable-token path.
     """
 
     class _Req:
@@ -399,6 +405,10 @@ def _request(
                 self._items["app"] = app_identity
             if user is not None:
                 self._items["user"] = user
+            # Publish the validated credential, mirroring token_auth middleware.
+            _auth = auth_token if auth_token is not None else (query_token or cookie_token)
+            if _auth:
+                self._items["auth_token"] = _auth
 
         def get(self, key: str, default: object = None) -> object:
             return self._items.get(key, default)
@@ -448,6 +458,9 @@ def _machine(
     published: bool | None = True,
     trusted: bool = True,
     qr_session_until_restart: bool = True,
+    qr_session_persist_across_restart: bool = False,
+    trust_identity: bool = False,
+    allowed_logins: tuple[str, ...] = (),
     detail: str = "",
 ):
     """Stub the four probes the REAL derivation reads, and let it run.
@@ -460,8 +473,14 @@ def _machine(
     """
     cfg = SimpleNamespace(
         dashboard=SimpleNamespace(
-            tailscale=SimpleNamespace(enabled=trusted, keep_awake=True),
+            tailscale=SimpleNamespace(
+                enabled=trusted,
+                keep_awake=True,
+                trust_identity=trust_identity,
+                allowed_logins=list(allowed_logins),
+            ),
             qr_session_until_restart=qr_session_until_restart,
+            qr_session_persist_across_restart=qr_session_persist_across_restart,
         )
     )
     probe = tailnet.DaemonProbe(
@@ -624,6 +643,104 @@ class TestQrRefusals:
         assert resp.status == 200
         assert captured["extra"] == {"no_refresh": "1"}
         assert "boot" not in (captured["extra"] or {})
+
+    @pytest.mark.asyncio
+    async def test_persistent_shape_drops_the_boot_bound(self, _unrestricted, _quiet_audit) -> None:
+        """Opted in WITH identity trust: no ``boot``, so one scan outlives a restart.
+
+        The refresh chain is still issued (no ``no_refresh``), so what bounds the
+        session is the chain's own lifetime rather than this process's.
+        """
+        captured: dict[str, object] = {}
+
+        def _fake_mint(_sub, ttl_seconds=0, **kw):
+            captured["extra"] = kw.get("extra")
+            return "tok"
+
+        with _machine(
+            qr_session_persist_across_restart=True,
+            trust_identity=True,
+            allowed_logins=("someone@example.com",),
+        ):
+            with (
+                patch.object(tailnet_mobile, "generate_token", side_effect=_fake_mint),
+                patch.object(
+                    tailnet_mobile, "render_qr_data_uri", return_value="data:image/png;base64,x"
+                ),
+            ):
+                resp = await tailnet_mobile.api_tailnet_mobile_qr(
+                    _request(tailnet_host=_HOST, cookie_token=_owner_session_token())
+                )
+        assert resp.status == 200
+        extra = captured["extra"] or {}
+        assert "boot" not in extra
+        assert "no_refresh" not in extra
+        # The identity bound that replaces the process bound. Without it the
+        # chain would rotate for any caller, which is the whole point of not
+        # having a boot claim being safe.
+        assert extra["require_peer"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_persistent_shape_refused_without_identity_trust(
+        self, _unrestricted, _quiet_audit
+    ) -> None:
+        """Opted in but identity trust off: stays boot-bound, and says so.
+
+        Behind ``tailscale serve`` every request arrives from 127.0.0.1, so
+        without a daemon-verified peer the cookie is a bearer credential any
+        tailnet peer could replay - a session that outlives the process must not
+        be handed out on that basis. Silently honouring the flag would leave the
+        operator believing their phone survives restarts.
+        """
+        from kiro_crew.dashboard.boot_id import current_boot_id
+
+        captured: dict[str, object] = {}
+
+        def _fake_mint(_sub, ttl_seconds=0, **kw):
+            captured["extra"] = kw.get("extra")
+            return "tok"
+
+        with _machine(qr_session_persist_across_restart=True):
+            with (
+                patch.object(tailnet_mobile, "generate_token", side_effect=_fake_mint),
+                patch.object(
+                    tailnet_mobile, "render_qr_data_uri", return_value="data:image/png;base64,x"
+                ),
+            ):
+                resp = await tailnet_mobile.api_tailnet_mobile_qr(
+                    _request(tailnet_host=_HOST, cookie_token=_owner_session_token())
+                )
+        assert resp.status == 200
+        assert captured["extra"] == {"boot": current_boot_id()}
+
+    @pytest.mark.asyncio
+    async def test_persistent_shape_refused_when_timed_shape_is_in_force(
+        self, _unrestricted, _quiet_audit
+    ) -> None:
+        """Persist + opted-out is contradictory: there is no chain to carry over."""
+        captured: dict[str, object] = {}
+
+        def _fake_mint(_sub, ttl_seconds=0, **kw):
+            captured["extra"] = kw.get("extra")
+            return "tok"
+
+        with _machine(
+            qr_session_until_restart=False,
+            qr_session_persist_across_restart=True,
+            trust_identity=True,
+            allowed_logins=("someone@example.com",),
+        ):
+            with (
+                patch.object(tailnet_mobile, "generate_token", side_effect=_fake_mint),
+                patch.object(
+                    tailnet_mobile, "render_qr_data_uri", return_value="data:image/png;base64,x"
+                ),
+            ):
+                resp = await tailnet_mobile.api_tailnet_mobile_qr(
+                    _request(tailnet_host=_HOST, cookie_token=_owner_session_token())
+                )
+        assert resp.status == 200
+        assert captured["extra"] == {"no_refresh": "1"}
 
     @pytest.mark.asyncio
     async def test_unreadable_config_falls_back_to_the_default(

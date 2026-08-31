@@ -889,12 +889,14 @@ def spawn_steer(name: str, args: dict[str, Any]) -> str:
         return _unknown_command_outcome(d)
     if d.get("error"):
         return f"Error: {d['error']}"
-    if mode == "follow_up":
+    if mode == "follow_up" or d.get("status") == "follow_up_queued":
+        reason = str(d.get("reason") or "").strip()
+        extra = f" ({reason})" if reason else ""
         return (
-            f"Queued follow-up for run {agent_id}: it will be delivered as "
-            "a continuation on the run's conversation after its current "
-            "turn completes. The continuation's result arrives as a "
-            "separate [Subagent completion event] — after this run's own."
+            f"Queued follow-up for run {agent_id}{extra}: it will be "
+            "delivered as a continuation on the run's conversation after "
+            "its current turn completes. The continuation's result arrives "
+            "as a separate [Subagent completion event] — after this run's own."
         )
     return (
         f"Steered run {agent_id}: the message was injected into its "

@@ -32,6 +32,7 @@ from ctypes import wintypes  # type aliases only; imports cleanly on every platf
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, NamedTuple, Optional, Sequence
 
+from kiro_crew import windows_acl
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -64,8 +65,13 @@ def _ensure_utf8_process_environment() -> None:
     os.environ.update(_UTF8_PROCESS_ENV)
 
 
-def reexec_python_module(module: str, args: Sequence[str]) -> None:
-    """Replace this process with ``sys.executable -m module``.
+def reexec_python_module(module: str, args: Sequence[str], executable: str | None = None) -> None:
+    """Replace this process with ``<executable> -m module``.
+
+    ``executable`` defaults to ``sys.executable``. A caller restarting after a
+    managed-venv promotion passes the STABLE-LINK interpreter instead: the
+    cached ``sys.executable`` resolves into the superseded versioned tree
+    (still on disk), so exec'ing it would silently resurrect the old version.
 
     Windows reconstructs an ``execv`` command line from ``argv`` and reparses
     it in the child.  A full ``argv[0]`` containing spaces is split before the
@@ -78,9 +84,9 @@ def reexec_python_module(module: str, args: Sequence[str]) -> None:
     # Windows ANSI stream or a hostile POSIX PYTHONIOENCODING and crashes on the
     # first emoji printed during boot.
     _ensure_utf8_process_environment()
-    executable = sys.executable
-    argv0 = ntpath.basename(executable) if IS_WINDOWS else executable
-    os.execv(executable, [argv0, "-m", module, *args])
+    resolved = executable or sys.executable
+    argv0 = ntpath.basename(resolved) if IS_WINDOWS else resolved
+    os.execv(resolved, [argv0, "-m", module, *args])
 
 
 # Python's os.rename() replaces an existing empty directory on POSIX. Directory
@@ -159,7 +165,7 @@ DETACHED_PROCESS: int = getattr(subprocess, "DETACHED_PROCESS", 0)
 # caller can OR it into ``creationflags`` unconditionally.
 CREATE_SUSPENDED: int = 0x00000004 if os.name == "nt" else 0
 # For the short-lived helper tools this module shells out to on Windows
-# (whoami / netstat / taskkill / icacls / powershell): a console-less parent
+# (whoami / netstat / taskkill / powershell): a console-less parent
 # (gateway respawned with DETACHED_PROCESS, or pythonw) would otherwise
 # allocate a NEW visible console per spawn — a black-window flash on the
 # user's desktop for every status poll / secret write / kill. 0 on POSIX.
@@ -1992,6 +1998,36 @@ def close_process_handle(handle: int) -> None:
         kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
+def process_image_name(pid: int) -> str:
+    """Return *pid*'s executable image basename, or ``""`` on failure.
+
+    This is the exact-identity companion to :func:`process_matches`. It is
+    intentionally basename-only: short executable names such as ``pi`` are
+    unsafe substring needles because they occur inside unrelated command lines
+    (for example ``pytest`` and ``pid_lifecycle.py``).
+    """
+    if type(pid) is not int or pid <= 0:
+        return ""
+    try:
+        if sys.platform == "linux":
+            return Path(os.readlink(f"/proc/{pid}/exe")).name
+        if sys.platform == "darwin":
+            ps_bin = trusted_system_bin("ps")
+            if ps_bin is None:
+                return ""
+            out = subprocess.check_output(
+                [ps_bin, "-o", "comm=", "-p", str(pid)],
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return Path(out.decode(errors="replace").strip()).name
+        if IS_WINDOWS:
+            return _win_process_image_name(pid) or ""
+    except Exception:
+        return ""
+    return ""
+
+
 def process_matches(pid: int, needles: tuple[str, ...]) -> bool:
     """Return True iff *pid*'s command line / image name contains any *needle*.
 
@@ -2587,9 +2623,9 @@ def process_start_time(pid: int) -> str | None:
       requested: this value is what decides whether a kill may happen at all, so
       demanding the right to kill in order to read it would refuse the guard for
       exactly the processes a caller must be most careful about.
-    * **macOS / other POSIX** -- ``ps -o lstart=`` (1s resolution, locale/TZ
-      formatted). Coarser, so a format or resolution drift can only make the
-      guard decline to act, never act on the wrong process.
+    * **macOS** -- ``libproc.proc_pidinfo`` start seconds + microseconds. The
+      microsecond half is required because same-second PID reuse must not alias.
+    * **other POSIX** -- ``ps -o lstart=`` as the best available opaque token.
     """
     if sys.platform == "linux":
         try:
@@ -2614,6 +2650,8 @@ def process_start_time(pid: int) -> str | None:
         # (pid, creation_time, exit_time) -- only the creation half is an
         # identity; exit_time moves as the process dies.
         return str(identity[1]) if identity is not None else None
+    if sys.platform == "darwin":
+        return get_process_start_id(pid)
     ps_bin = trusted_system_bin("ps")
     if ps_bin is None:
         return None
@@ -3419,31 +3457,7 @@ def unlink_link_or_junction(path: str | os.PathLike) -> None:
 # with inheritance stripped, S-1-3-4 grants access to whoever currently owns
 # the file. See:
 # https://learn.microsoft.com/en-us/windows/win32/secauthz/well-known-sids
-_OWNER_RIGHTS_SID = "*S-1-3-4"
-
-
-# icacls inheritance flags for a DIRECTORY grant: (OI) object-inherit
-# propagates the ACE to files created inside, (CI) container-inherit propagates
-# it to subdirectories. Neither sets (IO), so the ACE also applies to the
-# directory itself and traversal is preserved.
-#
-# Without these flags a grant applies to the named object ALONE. That is
-# correct and complete for a file, and silently wrong for a directory: a file
-# created inside an "owner-only" directory would carry no explicit ACE at all
-# and fall back to whatever the creating process's token grants by default
-# (typically owner + SYSTEM + Administrators) — a default rather than the
-# guarantee the caller asked for. The flags are meaningless on a file, which is
-# why this is a directory-only rights prefix and not something
-# :func:`restrict_to_owner` can pass unconditionally.
-_ICACLS_DIR_INHERIT = "(OI)(CI)"
-
-
-# Success-only memo for _current_user_sid. NOT functools.lru_cache: lru_cache
-# would memoize a *failure* (None) permanently, so one transient whoami
-# timeout at first call (AV scan, system pressure) would poison every later
-# restrict_to_owner for the process lifetime. A None result must stay
-# retryable; only a resolved SID is cached.
-_USER_SID_CACHE: list[str] = []
+_OWNER_RIGHTS_SID = "S-1-3-4"
 
 
 _TOKEN_QUERY = 0x0008
@@ -3622,90 +3636,30 @@ def process_owner_sid(pid: int) -> str | None:
         return None
 
 
-def _current_user_sid() -> str | None:
-    """Return the current user's SID, ``*``-prefixed for icacls, or None.
-
-    Resolved from this process's access token when possible, falling back to
-    ``whoami /user /fo csv``.
-
-    Used by :func:`restrict_to_owner` on Windows to grant the invoking user
-    Full Control even when the file is owned by a different principal (e.g.
-    the file was created by a prior elevated / SYSTEM run, or restored from a
-    backup that preserved another owner). Granting only S-1-3-4 (Owner Rights)
-    in that scenario locks the current user out entirely on next read.
-    Best-effort: on any failure returns None (uncached, so the next call
-    retries) and the caller refuses the DACL write.
-
-    Success is cached at module scope: the user's SID is constant for the
-    process lifetime, so one lookup covers every restrict_to_owner call (six
-    secret-write sites). That matters for the whoami fallback specifically --
-    this is called on the event loop under token_secret._SECRET_LOCK's
-    first-token-verify path, so the memo bounds that stall to one spawn even
-    when the token read is unavailable.
-    """
-    if IS_POSIX:
-        return None
-    if _USER_SID_CACHE:
-        return _USER_SID_CACHE[0]
-    # Own access token first: no spawn, so it survives a stripped PATH, a
-    # hermetic test harness and load that would time the whoami call out.
-    from_token = _process_token_sid()
-    if from_token:
-        result = "*" + from_token
-        _USER_SID_CACHE.append(result)
-        return result
-    whoami = shutil.which("whoami") or r"C:\Windows\System32\whoami.exe"
-    try:
-        r = subprocess.run(
-            [whoami, "/user", "/fo", "csv", "/nh"],
-            check=False,
-            capture_output=True,
-            timeout=5,
-            creationflags=_SUBPROCESS_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if r.returncode != 0:
-        return None
-    # csv row: "DOMAIN\\user","S-1-5-21-..."
-    text = r.stdout.decode("utf-8", "replace").strip().strip('"')
-    parts = text.split('","')
-    if len(parts) < 2:
-        return None
-    sid = parts[-1].strip('"').strip()
-    if not sid.startswith("S-1-"):
-        return None
-    result = "*" + sid
-    _USER_SID_CACHE.append(result)
-    return result
-
-
-#: Memo for :func:`current_user_sid`. Separate from ``_USER_SID_CACHE``, which
-#: holds the ``*``-prefixed icacls form and is populated by a path that may
-#: spawn; this one only ever holds a token-derived bare SID.
+#: Memo for :func:`current_user_sid`. Only ever holds a token-derived bare SID.
 _TOKEN_SID_CACHE: list[str] = []
 
 
 def current_user_sid() -> str | None:
     """Return the invoking user's bare SID (``S-1-5-...``), or ``None``.
 
-    Read from this process's own access token and nothing else. Deliberately
-    NOT :func:`_current_user_sid`, which falls back to a ``whoami`` subprocess
-    with a 5 s timeout: every caller of this function runs on the event loop --
-    the gatewayd admission check, the client-side server check, and the pipe
-    DACL builder, which runs once per pipe instance and therefore sits on the
-    accept path. A token-lookup failure there would stall accepts for seconds
-    at a time, repeatedly. :func:`restrict_to_owner` keeps the fallback because
-    it is always invoked through ``asyncio.to_thread``.
+    Read from this process's own access token and nothing else -- there is no
+    subprocess fallback anywhere in this path. Every caller runs on the event
+    loop: the gatewayd admission check, the client-side server check, the pipe
+    DACL builder (once per pipe instance, so on the accept path), and now the
+    owner-only lockdown itself. A ``whoami`` fallback would stall any of them for
+    seconds at a time on a host where the token read fails, which is why this
+    function refuses instead.
 
     Failing closed is correct for every caller: each treats ``None`` as
     "principal unverifiable" and refuses the connection, which degrades to a
     per-session MCP server rather than admitting an unattributable peer.
+    :func:`restrict_to_owner` likewise raises rather than applying a
+    half-configured DACL.
 
-    SDDL and the Win32 security APIs want the bare SID, so the ``*`` prefix the
-    icacls form carries is stripped here rather than in each consumer. Memoised:
-    the SID is constant for the process lifetime and this is on a hot path.
-    Returns ``None`` on POSIX and on any lookup failure.
+    SDDL and the Win32 security APIs want the bare SID, which is what this
+    returns. Memoised: the SID is constant for the process lifetime and this is
+    on a hot path. Returns ``None`` on POSIX and on any lookup failure.
     """
     if _TOKEN_SID_CACHE:
         return _TOKEN_SID_CACHE[0]
@@ -3857,21 +3811,29 @@ def restrict_to_owner(path: str | os.PathLike) -> None:
     including the fail-loud ``OSError`` propagation the security-sensitive
     callers rely on to reach their warn-and-continue handlers.
 
-    Windows: strip inheritance and apply an owner-only DACL via
-    ``icacls <path> /inheritance:r /grant:r "*S-1-3-4:F" /grant:r "*<user-sid>:F"``.
-    S-1-3-4 (Owner Rights) covers the file's current owner; the invoking-user
-    grant covers the caller by explicit SID, so a file created by another
-    principal (elevated first-run, backup restore, SYSTEM-context service)
-    remains readable by the caller that is trying to lock it down — otherwise
-    the current user would be denied their own token signing key on the next
-    read and every issued auth cookie / refresh token would be invalidated on
-    each restart. When ``_current_user_sid()`` cannot resolve the SID
-    (whoami missing / fails / unparseable), we raise ``OSError`` BEFORE
-    invoking icacls: an Owner-Rights-only DACL would recreate the exact
+    Windows: strip inheritance and apply an owner-only DACL in-process via
+    :func:`windows_acl.apply_owner_only`. S-1-3-4 (Owner Rights) covers the
+    file's current owner; the invoking-user grant covers the caller by explicit
+    SID, so a file created by another principal (elevated first-run, backup
+    restore, SYSTEM-context service) remains readable by the caller that is
+    trying to lock it down — otherwise the current user would be denied their
+    own token signing key on the next read and every issued auth cookie /
+    refresh token would be invalidated on each restart. When the SID cannot be
+    resolved from the process token we raise ``OSError`` BEFORE applying
+    anything: an Owner-Rights-only DACL would recreate the exact
     ownership-lockout regression the dual grant exists to prevent, so we
     refuse to apply a half-configured lockdown. Any failure raises
     ``OSError`` so callers hit the same warn-and-continue path they use on
     POSIX.
+
+    A caller that runs INLINE ON THE ASYNCIO EVENT LOOP and so cannot afford the
+    unbounded SMB round-trip a DACL write to a UNC or mapped-drive path costs must
+    ask :func:`windows_acl.volume_is_local` FIRST and skip the lockdown itself.
+    That decision is deliberately not a parameter here: by the time this function
+    is reached the caller has already done whatever filesystem work it took to get
+    here, so a refusal at this depth would come after the cost it was meant to
+    avoid. ``config/loader.py``'s ``write_config_atomically`` is the one such
+    caller today.
     """
     if IS_POSIX:
         os.chmod(path, 0o600)
@@ -3899,7 +3861,7 @@ def restrict_to_owner(path: str | os.PathLike) -> None:
             )
     except OSError:
         pass
-    _icacls_owner_only(path, inherit=False)
+    _apply_owner_only_dacl(path, inherit=False)
 
 
 def restrict_dir_to_owner(path: str | os.PathLike) -> None:
@@ -3938,62 +3900,63 @@ def restrict_dir_to_owner(path: str | os.PathLike) -> None:
         # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501
         os.chmod(path, 0o700)
         return
-    _icacls_owner_only(path, inherit=True)
+    _apply_owner_only_dacl(path, inherit=True)
 
 
-def _icacls_owner_only(path: str | os.PathLike, *, inherit: bool) -> None:
-    """Apply an owner-only DACL to *path* via icacls. Windows-only.
+def _apply_owner_only_dacl(path: str | os.PathLike, *, inherit: bool) -> None:
+    """Apply an owner-only DACL to *path* in-process. Windows-only.
 
     Shared by :func:`restrict_to_owner` (``inherit=False``, file shape) and
     :func:`restrict_dir_to_owner` (``inherit=True``, directory shape). The only
-    difference between the two argv forms is the rights prefix, so they are one
-    function: an owner-only DACL that two call paths could drift apart on is
+    difference between the two is whether the grants are inheritable, so they are
+    one function: an owner-only DACL that two call paths could drift apart on is
     the defect this consolidation exists to prevent.
+
+    This used to shell out to ``icacls /inheritance:r /grant:r ...``. It now
+    builds the same descriptor through ``advapi32`` directly, which is what
+    removed the "must not run on the event loop" constraint this helper used to
+    impose on every one of its callers: measured on a local NTFS volume, the
+    subprocess cost 313 ms per call and this costs 0.24 ms. Callers that already
+    offload it are still free to -- a filesystem call can block on a slow volume,
+    so offloading remains good practice -- but it is no longer mandatory, and a
+    caller on the loop is no longer parking the gateway for a third of a second
+    per secret written.
+
+    Resolve the invoking user's SID BEFORE writing anything, and resolve it
+    WITHOUT the possibility of a spawn: :func:`current_user_sid` reads the
+    process's own access token and nothing else. The ``whoami``-fallback helper
+    this used while the lockdown was itself a subprocess is gone -- it would have
+    put a blocking spawn back on the event loop on any host where the token read
+    fails, defeating the whole point of removing the icacls call, and once this
+    was its last caller it was dead code.
+
+    If the SID cannot be resolved we CANNOT safely apply the DACL: an
+    Owner-Rights-only descriptor (S-1-3-4 alone) would lock the current user out
+    of their own file whenever the file was created by a different principal
+    (elevated first-run, SYSTEM-context service, backup-restored tarball
+    preserving foreign ownership -- the exact scenarios the dual grant exists to
+    prevent). Fail loud with ``OSError``, the same shape callers already handle,
+    so the security-warning path fires instead of silently re-introducing the
+    ownership-lockout regression. Note the consequence of the token-only rule:
+    on a host whose token read fails we now refuse rather than spawning
+    ``whoami``. That is the safe direction -- a caller that must not fail passes
+    ``restrict_on_error="warn"`` and gets a warning instead of a stall.
     """
-    icacls = shutil.which("icacls") or r"C:\Windows\System32\icacls.exe"
-    # Resolve the invoking user's SID BEFORE building the argv. If whoami is
-    # unavailable (missing from PATH under a stripped-down profile, subprocess
-    # exception, unparseable output), we CANNOT safely apply the DACL: the
-    # Owner-Rights-only fallback (S-1-3-4 alone) would lock the current user
-    # out of their own file when the file was created by a different principal
-    # (elevated first-run, SYSTEM-context service, backup-restored tarball
-    # preserving foreign ownership — the exact scenarios the dual-grant
-    # exists to prevent). Fail loud (raise OSError, same shape callers see on
-    # icacls non-zero rc) so the security-warning handler fires instead of
-    # silently re-introducing the ownership-lockout regression.
-    user_sid = _current_user_sid()
+    user_sid = current_user_sid()
     if user_sid is None:
         raise OSError(
             f"{'restrict_dir_to_owner' if inherit else 'restrict_to_owner'}: "
-            "cannot resolve current user SID via whoami; "
+            "cannot resolve current user SID from this process's access token; "
             "refusing to apply Owner-Rights-only DACL (would lock non-owner "
-            f"users out of {path!s} — see _current_user_sid docstring)."
+            f"users out of {path!s} — see current_user_sid docstring)."
         )
-    rights = f"{_ICACLS_DIR_INHERIT}F" if inherit else "F"
-    argv: list[str] = [
-        icacls,
-        os.fspath(path),
-        "/inheritance:r",
-        "/grant:r",
-        f"{_OWNER_RIGHTS_SID}:{rights}",
-    ]
-    if user_sid != _OWNER_RIGHTS_SID:
-        argv += ["/grant:r", f"{user_sid}:{rights}"]
+    sids = (_OWNER_RIGHTS_SID,) if user_sid == _OWNER_RIGHTS_SID else (_OWNER_RIGHTS_SID, user_sid)
     try:
-        r = subprocess.run(
-            argv,
-            check=False,
-            capture_output=True,
-            timeout=10,
-            creationflags=_SUBPROCESS_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise OSError(f"icacls invocation failed for {path}: {exc}") from exc
-    if r.returncode != 0:
-        raise OSError(
-            f"icacls failed for {path} (rc={r.returncode}): "
-            f"{(r.stderr or r.stdout).decode('utf-8', 'replace').strip()}"
-        )
+        windows_acl.apply_owner_only(path, inherit=inherit, sids=sids)
+    except (windows_acl.AclWriteFailed, windows_acl.AclUnavailable) as exc:
+        # Translated to OSError so both platforms raise the same type: every
+        # caller's handler is written against the POSIX chmod's OSError.
+        raise OSError(f"owner-only DACL could not be applied to {path}: {exc}") from exc
 
 
 # Hook-script extensions treated as runnable on Windows (where there is no

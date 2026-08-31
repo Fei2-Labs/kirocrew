@@ -105,6 +105,17 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "CLI wheel-update failures",
+        "cli_server.py",
+        "The failure text `kirocrew update` prints when a managed-venv shadow "
+        "update fails, plus the fallback installer one-liner printed next to it. "
+        "The engine's error quotes the URL it tried and the fallback command "
+        "embeds the artifact CDN base -- with a token-bearing "
+        "KIROCREW_CDN_BASE either would land credentials in terminal "
+        "scrollback and shell history, so both strings run the shared "
+        "credential + exfiltration-URL chain immediately before print.",
+    ),
+    (
         "AWS identity-probe failures",
         "aws_consent.py",
         "The stderr of a failed `aws sts get-caller-identity`, run to show the "
@@ -116,6 +127,15 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "role ARN, and an endpoint override can carry an inline-credential URL -- "
         "so the first stderr line goes through the shared credential + "
         "exfiltration-URL chain at the source, before it is put on an `Identity`.",
+    ),
+    (
+        "Event backfill report samples",
+        "events/backfill.py",
+        "One serialized sample event per kind in the backfill validator's "
+        "report, printed to CLI stdout. Store fields folded into samples "
+        "(subagent task previews, cron names) can carry tokens the operator "
+        "pasted into a task, so each sample passes the shared two-pass "
+        "redaction before leaving the process.",
     ),
     (
         "Browser CLI install failures",
@@ -141,6 +161,40 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "reaches `az devops invoke`, rather than trusting each caller to have "
         "redacted; the crew path already redacts and loses nothing, because both "
         "passes are idempotent.",
+    ),
+    (
+        "Off-host backup uploads (opt-in)",
+        "snapshot_redact.py",
+        "The copy of a backup bundle that leaves the machine for object storage. The "
+        "destination is not this module's business: the AWS Control app owns the bucket, "
+        "its hardening, the consent grant and the transport, and refuses to send at all "
+        "if that posture is missing or unreadable. What lives here is the one thing a "
+        "hardened destination does not do -- rewriting the bytes that leave -- because a "
+        "private bucket still holds whatever was put in it, and the operator's own "
+        "account is not the only place a restored bundle can end up. An operator opts IN "
+        "to rewriting the outbound copy through the credential + exfiltration-URL chain; "
+        "it is OFF by default because substituting a tag changes length, which "
+        "invalidates any format that depends on byte offsets. When it is on, databases "
+        "are rewritten value-by-value through SQL rather than over their bytes, and every "
+        "outbound database is rebuilt so no old value survives in page slack. A pass that "
+        "cannot complete refuses the send rather than falling through to an unredacted "
+        "one. The LOCAL archive is never redacted either way: it does not cross the "
+        "boundary, and rewriting it would damage the only copy that restores complete.",
+    ),
+    (
+        "Off-host backup pushes (the boundary itself)",
+        "apps/builtins/aws_control/backend/backup.py",
+        "Where a bundle actually leaves the machine. This module runs no scanner itself: "
+        "the only redaction it performs is the call into `snapshot.prepare_redacted_copy`, "
+        "which runs the full credential + exfiltration-URL chain in `snapshot_redact.py` "
+        "(the row above). It is named here anyway because the call ORDER is the control -- "
+        "redaction runs before the upload is authorized and before any bytes reach the "
+        "transport, so a redaction that raises stops the push instead of letting it "
+        "proceed unredacted, and this module pushes whatever the seam returns: the "
+        "redacted copy when the operator opted in, the original when they did not. "
+        "Reversing those two steps would leave the guarantee intact on paper while "
+        "sending the secrets anyway, which is why the boundary gets its own row rather "
+        "than being left implicit in the module that computes the copy.",
     ),
     (
         "Session intent summaries",
@@ -178,6 +232,14 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "conversation content read straight off a transcript, so either can carry a "
         "key someone pasted into a chat — the same output-boundary reason as the "
         "session-memory titles below.",
+    ),
+    (
+        "Workflow management responses",
+        "dashboard/handlers/workflows.py",
+        "Authored workflow source, reusable definitions, revision lineage, and run output "
+        "served to the Agent Capabilities panel or returned through the workflow MCP tools. "
+        "These values can contain model-authored text or tool results, so every nested key and "
+        "value passes through the credential + exfiltration-URL chain before egress.",
     ),
     (
         "Chat pin previews",
@@ -1117,6 +1179,12 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
 # catches an omission.
 NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
     {
+        # Drives the backup redaction pass and reports what it did, but applies no
+        # redactor itself: the outbound bytes are rewritten in `snapshot_redact.py`,
+        # which is the registered sink. What matches the call-site scan here are the
+        # orchestration and reporting names (`_redacted_upload_copy`,
+        # `_report_redaction`, `_report_redacted_bundle`).
+        "snapshot.py",
         # Inbound / gate-side: redacts what comes IN or what a gate logs, not what
         # goes out to a human.
         "context.py",
@@ -1278,12 +1346,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/handlers/themes.py",
         "dashboard/handlers/updates.py",
         "dashboard/handlers/webapp_preview.py",
-        "dashboard/handlers/workflows.py",
         "dashboard/handlers_project.py",
         "knowledge/agent_fetch.py",
         "knowledge/agent_source.py",
         "knowledge/artifact_ingest.py",
         "knowledge/ingestion.py",
+        "workflows/library.py",
         "mcp_core.py",
         "mcp_cron.py",
         # Same class as mcp_core.py: an MCP stdio server redacts tool RESULTS and

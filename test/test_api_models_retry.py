@@ -101,14 +101,17 @@ class _FakeProc:
 
 def test_opencode_models_come_from_the_matching_live_provider(tmp_path):
     opencode = MagicMock()
+    opencode.backend = ACP_BACKEND_OPENCODE
     opencode._client = SimpleNamespace(backend=ACP_BACKEND_OPENCODE)
     opencode.available_models.return_value = [
         {"modelId": "opencode/hy3-free", "name": "HY3 Free"}
     ]
     stale_kiro = MagicMock()
+    stale_kiro.backend = ACP_BACKEND_KIRO
     stale_kiro._client = SimpleNamespace(backend=ACP_BACKEND_KIRO)
     stale_kiro.available_models.return_value = [{"modelId": "claude-sonnet-4-6"}]
     request = _kiro_request(tmp_path)
+    request.query = {}
     request.app["state"] = SimpleNamespace(
         sessions=SimpleNamespace(active_providers=lambda: [stale_kiro, opencode])
     )
@@ -117,13 +120,17 @@ def test_opencode_models_come_from_the_matching_live_provider(tmp_path):
         resp = _run(agents.api_models(request))
 
     assert resp.status == 200
-    assert _body(resp) == [
-        {
-            "model_name": "opencode/hy3-free",
-            "display_name": "HY3 Free",
-            "description": "",
-        }
-    ]
+    assert _body(resp) == {
+        "models": [
+            {
+                "model_name": "opencode/hy3-free",
+                "display_name": "HY3 Free",
+                "description": "",
+            }
+        ],
+        "backend": ACP_BACKEND_OPENCODE,
+        "serves_auto": False,
+    }
 
 
 def test_kiro_binary_unresolved_returns_503(tmp_path):

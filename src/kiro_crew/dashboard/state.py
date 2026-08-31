@@ -17,7 +17,7 @@ import threading
 import time
 import traceback
 import uuid
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, TypeVar
@@ -1966,9 +1966,29 @@ def stuck_turn_notice(parked_secs: float) -> str:
 
 _MAX_SLOT_MESSAGES = 10000  # Keep all messages — virtual scrolling handles performance
 
+#: Transient/streaming roles that are never persisted by the save path
+#: (``chat_persistence._build_message_entry`` returns ``None`` for them) and are
+#: skipped by durable readers. Defined here — beside the trim path that must
+#: count the durable rows it folds into the frozen prefix — and re-exported by
+#: ``chat_persistence`` as ``_TRANSIENT_ROLES`` for its readers, so there is one
+#: definition rather than two that can drift.
+_TRANSIENT_ROLES = frozenset({"chunk", "done", "streaming", "queued", "permission"})
+
+
+def durable_row_count(rows: Iterable[dict]) -> int:
+    """How many of *rows* a durable read returns: everything non-transient.
+
+    The one shared counting rule for the durable-only frozen-prefix counter
+    (``_disk_older_durable_count``): every site that sets or advances it counts
+    with this, so the restore paths, the channel restore and the trim path can
+    never disagree about which rows are durable.
+    """
+    return sum(1 for m in rows if m.get("role") not in _TRANSIENT_ROLES)
+
+
 #: Roles that exist only on the wire: appended so a reader/flush can see them,
 #: never broadcast as a `chat_message` and never persisted (the mirror of
-#: ``chat_persistence._TRANSIENT_ROLES`` minus the rows that ARE broadcast).
+#: ``_TRANSIENT_ROLES`` above minus the rows that ARE broadcast).
 #: They get no ``meta.mid`` — see ``_ChatSlot.append``.
 _WIRE_ONLY_ROLES = frozenset({"chunk", "done", "streaming"})
 
@@ -2772,6 +2792,7 @@ class _ChatSlot:
         "_tab_id",
         "_channel_window_mtime",
         "_disk_older_count",
+        "_disk_older_durable_count",
         "_disk_window_len",
         "_disk_tail_ts",
         "_frozen_prefix_cache",
@@ -3211,6 +3232,17 @@ class _ChatSlot:
         self._disk_older_count: int = (
             0  # count of disk messages OLDER than in-memory window (stable, set at restore/resume)
         )
+        # Durable-only frozen-prefix counter: how many durable rows (role not
+        # in ``_TRANSIENT_ROLES``) have LEFT the in-memory window off the front.
+        # Absolute message positions (``session_control.read_messages``) are
+        # built over durable rows, so they base on THIS counter;
+        # ``_disk_older_count`` keeps its save-model contract (the frozen
+        # prefix saves must not rewrite) untouched. The two also draw the
+        # unpersisted-overflow line differently — see the trim path below.
+        # Maintained at every site that sets or advances ``_disk_older_count``,
+        # always via :func:`durable_row_count`. Never persisted — every restore
+        # path recomputes it from the messages on disk.
+        self._disk_older_durable_count: int = 0
         # Count of in-memory window messages the LAST save persisted to disk
         # (the on-disk window region). Trimming may only fold a leading window
         # message into the frozen prefix once it is known to be on disk; this
@@ -3613,15 +3645,29 @@ class _ChatSlot:
         # Trim old messages to bound memory usage
         if len(self.messages) > _MAX_SLOT_MESSAGES:
             excess = len(self.messages) - _MAX_SLOT_MESSAGES
-            del self.messages[:excess]
-            self._resumed_count = max(0, self._resumed_count - excess)
             # A trimmed leading window message may only join the frozen prefix
             # once it is actually on disk. Credit _disk_older_count only
             # for the persisted portion; the unpersisted overflow (should not
             # happen between 5s flushes) is logged rather than silently counted
             # as on-disk, which would have stranded those turns.
             persisted_trim = min(excess, self._disk_window_len)
+            # The durable counter counts the WHOLE evicted slice, including the
+            # unpersisted overflow the disk counter excludes. The two draw
+            # different lines because they answer different questions:
+            # ``_disk_older_count`` claims on-disk lines (its save contract), so
+            # counting a row that never reached disk would corrupt the frozen
+            # prefix. ``_disk_older_durable_count`` is a POSITION base with no
+            # disk contract — if a durable row leaves the window uncounted,
+            # every later absolute position shifts down and a poller's cursor
+            # silently skips rows. Counting the lost rows instead makes a cursor
+            # that pointed at them refuse loudly (``since < base``), which is
+            # the recoverable outcome. Counted BEFORE the ``del`` below —
+            # afterwards the slice is gone.
+            durable_trim = durable_row_count(self.messages[:excess])
+            del self.messages[:excess]
+            self._resumed_count = max(0, self._resumed_count - excess)
             self._disk_older_count += persisted_trim
+            self._disk_older_durable_count += durable_trim
             self._disk_window_len = max(0, self._disk_window_len - excess)
             if persisted_trim < excess:
                 logger.warning(
@@ -5009,6 +5055,11 @@ class DashboardState:
         # could not parse (mirrors the hooks store's unparsed-entry preservation).
         self._unparsed_cron_folder_entries: list[Any] = []
         self._chat_pins: list[dict[str, Any]] = []  # pinned chat messages
+        # Malformed chat_pins.json entries dropped at load time, kept verbatim
+        # so save_chat_pins round-trips them back instead of erasing bytes a
+        # hand-edit left in a shape the loader could not validate (mirrors the
+        # cron-folder unparsed-entry preservation, #5768/#5792).
+        self._unparsed_chat_pin_entries: list[Any] = []
         # Serializes pin mutation + persistence so concurrent requests cannot
         # interleave snapshots and replace chat_pins.json out of order.
         # LoopBoundLock, not asyncio.Lock (#4800): DashboardState outlives any
@@ -5023,6 +5074,13 @@ class DashboardState:
         self._folders_lock = LoopBoundLock()
         # Tag vocabulary: list of {id, name, color, order}. User-managed.
         self._tags: list[dict[str, Any]] = []
+        # Malformed tags.json entries dropped at load time, kept verbatim so a
+        # save round-trips them back instead of erasing bytes a hand-edit left
+        # in a shape the loader could not validate. This store's save path runs
+        # DURING load (seed/back-fill), so without preservation a single
+        # hand-edited-but-malformed row is wiped at boot with no user action
+        # (#5792, the worst of the sibling cases).
+        self._unparsed_tag_entries: list[Any] = []
         # True once load_tags() parsed tags.json successfully (or seeded a
         # fresh install). False means the vocabulary state is UNKNOWN (parse
         # or I/O failure) — restore-time pruning must fail open then, because
@@ -5031,6 +5089,10 @@ class DashboardState:
         self._tags_authoritative: bool = False
         # Sidebar columns — flat list of {id, name, tag_ids, mode, order, include_untagged}
         self._tag_boards: list[dict[str, Any]] = []
+        # Malformed tag-board (sidebar column) entries dropped at load time,
+        # kept verbatim so a save round-trips them back rather than erasing a
+        # hand-edited-but-typo'd column (#5792).
+        self._unparsed_tag_board_entries: list[Any] = []
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         # Gateway replacement is process-wide, not an ordinary repeatable
         # background mutation.  The task latch coalesces duplicate /api/restart
@@ -5437,10 +5499,12 @@ class DashboardState:
         update_check_interval_secs: int = 43200,
         update_required: bool = False,
         update_min_version: str = "",
+        update_can_arm: bool = False,
     ) -> dict[str, Any]:
         """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
         uptime = int(time.time() - self.start_time)
         branch, commit = self._build_info
+        harness = _harness_status(active_acp_backend(self.sessions))
         return {
             "uptime": _fmt_duration(uptime),
             "start_time": self.start_time,
@@ -5496,6 +5560,7 @@ class DashboardState:
             # tell the two apart. 0/0 on non-git layouts and before any check.
             "update_commits_ahead": update_commits_ahead,
             "update_commits_behind": update_commits_behind,
+            "update_can_arm": update_can_arm,
             "update_last_checked_at": update_last_checked_at,
             "update_check_interval_secs": update_check_interval_secs,
             # Mandatory-update verdict (enterprise governance pin OR the release
@@ -5509,6 +5574,16 @@ class DashboardState:
             "no_crons": self.no_crons,
             "branch": branch,
             "commit": commit,
+            # The harness NEW sessions run on, as the header capsule shows it:
+            # ``{backend, label, kiro_credits}``, or null when it cannot be read.
+            # Null means UNKNOWN and is deliberately not folded into the kiro
+            # spelling (``""``), because every consumer gates a readout on it and
+            # "we could not tell" has to leave that readout as it was. Carried on
+            # THIS payload because it is already fetched on mount and re-pushed
+            # every 5s, so the readout follows a harness switch without its own
+            # poll; ``kiro_credits`` is the gateway's own answer so no frontend
+            # carries a copy of the membership set.
+            "harness": harness,
             # Which release lane these bytes came from: "nightly", "insider" or
             # "stable". Shipped as a RESOLVED ANSWER rather than leaving the
             # dashboard to parse `version` itself, because the rule is not
@@ -6857,6 +6932,26 @@ class DashboardState:
                     f"Slot {name!r} already exists with memory_mode={existing.memory_mode!r}"
                 )
             return existing
+        # member-* keys are RESERVED: a member DM thread is born ONLY through
+        # the member-thread endpoint, which is the one caller passing
+        # mode="member". Enforced HERE — at the single constructor — rather
+        # than at each creation surface (send auto-create, slot-create,
+        # openai-compat, resume, channels), because a squatter minted by ANY
+        # of them lands an ordinary unpinned slot on the member key: every pin
+        # guard conditions on mode=="member", so the squatter bypasses all of
+        # them and 409s the real thread opener forever. ValueError is the
+        # constructor's established refusal (memory_mode above); the HTTP
+        # callers already map it to 409.
+        #
+        # casefold(): transcript filenames derive from the slot key, and on a
+        # case-insensitive filesystem (Windows, default macOS) "Member-radar"
+        # and "member-radar" alias the SAME file — a mixed-case squatter that
+        # slipped a case-sensitive prefix check would corrupt or read the
+        # pinned member thread's history through the alias. Canonical member
+        # keys are always lowercase (member_slot_key builds them from a
+        # validated lowercase slug), so no legitimate caller is affected.
+        if name and name.casefold().startswith("member-") and mode != "member":
+            raise ValueError("member thread slots are created only via the member thread endpoint")
         # A brand-new chat arrives with no name and is auto-minted here; restore
         # and rehydrate always pass the persisted key as ``name`` (and
         # get-existing returns above). Only the mint path is a genuine new
@@ -7288,15 +7383,9 @@ class DashboardState:
                         and not isinstance(f.get("order"), bool)
                     )
 
-                valid = [f for f in loaded if _is_valid(f)]
-                unparsed = [f for f in loaded if not _is_valid(f)]
-                if unparsed:
-                    logger.warning(
-                        "Preserving %d malformed entr(ies) while loading %s "
-                        "(kept verbatim, not active)",
-                        len(unparsed),
-                        self._CRON_FOLDERS_FILE,
-                    )
+                valid, unparsed = self._partition_preserving(
+                    loaded, _is_valid, "entr(ies)", self._CRON_FOLDERS_FILE
+                )
                 self._cron_folders = valid
                 self._unparsed_cron_folder_entries = unparsed
         except Exception:
@@ -7421,6 +7510,11 @@ class DashboardState:
         Legacy pins (pre-mid era) may lack the ``mid`` field — they are preserved
         for backward compatibility; new pins always carry ``mid``.
 
+        Individual malformed entries are dropped from the active list but kept
+        verbatim in ``_unparsed_chat_pin_entries`` so the next ``save_chat_pins``
+        round-trips them back to disk rather than silently erasing a user's
+        hand-edited-but-typo'd pin (mirrors the cron-folder contract, #5792).
+
         Error classification:
         - Missing file: normal (first run) → empty list.
         - Malformed JSON / invalid shape: tolerated for compatibility → empty list.
@@ -7431,12 +7525,16 @@ class DashboardState:
         try:
             if not path.exists():
                 self._chat_pins = []
+                self._unparsed_chat_pin_entries = []
                 return
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
             # Malformed content — treat as empty (data corruption).
             logger.warning("chat_pins.json has malformed content: %s", exc)
             self._chat_pins = []
+            # Whole-file parse failure: nothing was parsed, so there are no
+            # per-entry bytes to preserve. Do NOT clear a prior load's
+            # preserved entries against an unreadable read.
             return
         except OSError:
             # Transient I/O error — do NOT clobber valid in-memory state.
@@ -7448,28 +7546,44 @@ class DashboardState:
             self._chat_pins = []
             return
 
-        valid = [
-            pin
-            for pin in raw
-            if isinstance(pin, dict)
-            and all(isinstance(pin.get(key), str) and pin.get(key) for key in ("id", "slot_key"))
-            # Require at least one identity field: mid or message_ts
-            and (
-                (isinstance(pin.get("mid"), str) and pin.get("mid"))
-                or (isinstance(pin.get("message_ts"), str) and pin.get("message_ts"))
+        def _is_valid(pin: Any) -> bool:
+            return (
+                isinstance(pin, dict)
+                and all(
+                    isinstance(pin.get(key), str) and pin.get(key) for key in ("id", "slot_key")
+                )
+                # Require at least one identity field: mid or message_ts
+                and bool(
+                    (isinstance(pin.get("mid"), str) and pin.get("mid"))
+                    or (isinstance(pin.get("message_ts"), str) and pin.get("message_ts"))
+                )
+                and isinstance(pin.get("preview"), str)
+                and isinstance(pin.get("pinned_at"), str)
+                and bool(pin.get("pinned_at"))
             )
-            and isinstance(pin.get("preview"), str)
-            and isinstance(pin.get("pinned_at"), str)
-            and pin.get("pinned_at")
-        ]
-        if len(valid) != len(raw):
-            logger.warning("Dropped %d malformed chat pin record(s) on load", len(raw) - len(valid))
+
+        valid, unparsed = self._partition_preserving(
+            raw, _is_valid, "chat pin record(s)", self._CHAT_PINS_FILE
+        )
         self._chat_pins = valid
+        self._unparsed_chat_pin_entries = unparsed
 
     def save_chat_pins(self) -> None:
-        """Persist pinned chat messages with an atomic, owner-only file replacement."""
+        """Persist pinned chat messages with an atomic, owner-only file replacement.
+
+        Writes the active pins plus any malformed entries preserved at load
+        time (``_unparsed_chat_pin_entries``), so a save triggered by an
+        unrelated pin operation cannot erase bytes a hand-edit left in a shape
+        this loader could not validate.
+        """
         path = config_dir() / self._CHAT_PINS_FILE
-        atomic_write(path, json.dumps(self._chat_pins), fsync=True, mode=0o600)
+        unparsed = getattr(self, "_unparsed_chat_pin_entries", [])
+        atomic_write(
+            path,
+            json.dumps([*self._chat_pins, *unparsed]),
+            fsync=True,
+            mode=0o600,
+        )
 
     async def remove_chat_pins_for_slots(self, slot_keys: set[str]) -> int:
         """Remove pins when their persisted history sessions are permanently deleted."""
@@ -7620,7 +7734,17 @@ class DashboardState:
             if file_existed:
                 raw = json.loads(tags_path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
-                    self._tags = [t for t in raw if isinstance(t, dict) and t.get("id")]
+                    # Keep rows the active list dropped verbatim so the seed/
+                    # back-fill save below (and every later save) round-trips
+                    # them back instead of erasing a hand-edited-but-typo'd row
+                    # at boot with no user action (#5792).
+                    self._tags, unparsed = self._partition_preserving(
+                        raw,
+                        lambda t: isinstance(t, dict) and bool(t.get("id")),
+                        "tag entr(ies)",
+                        self._TAGS_FILE,
+                    )
+                    self._unparsed_tag_entries = unparsed
                 else:
                     # Valid JSON but not a list (e.g. {}): the vocabulary
                     # state is UNKNOWN, same as a parse failure — do not let
@@ -7659,7 +7783,16 @@ class DashboardState:
             if columns_path.exists():
                 raw = json.loads(columns_path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
-                    self._tag_boards = [c for c in raw if isinstance(c, dict) and c.get("id")]
+                    # Preserve dropped columns verbatim so a later save
+                    # round-trips them rather than erasing a hand-edited-but-
+                    # typo'd column (#5792).
+                    self._tag_boards, unparsed_cols = self._partition_preserving(
+                        raw,
+                        lambda c: isinstance(c, dict) and bool(c.get("id")),
+                        "sidebar column(s)",
+                        self._TAG_BOARDS_FILE,
+                    )
+                    self._unparsed_tag_board_entries = unparsed_cols
                     # Prune column tag_ids missing from the vocabulary: tag
                     # deletion commits the vocab write first (crash-atomic),
                     # so a crash mid-delete can leave dangling ids here. The
@@ -7678,8 +7811,15 @@ class DashboardState:
             logger.warning("Failed to load sidebar columns", exc_info=True)
 
     def save_tags(self) -> None:
-        """Persist tag vocabulary to disk (atomic write)."""
-        self._atomic_write_json(config_dir() / self._TAGS_FILE, self._tags)
+        """Persist tag vocabulary to disk (atomic write).
+
+        Appends any malformed entries preserved at load time
+        (``_unparsed_tag_entries``) so a save — including the seed/back-fill
+        save that runs during ``load_tags`` itself — cannot erase bytes a
+        hand-edit left in a shape the loader could not validate (#5792).
+        """
+        unparsed = getattr(self, "_unparsed_tag_entries", [])
+        self._atomic_write_json(config_dir() / self._TAGS_FILE, [*self._tags, *unparsed])
 
     def save_tags_snapshot(self, snapshot: list[dict]) -> None:
         """Persist a pre-captured tag snapshot to disk (strict -- raises on failure).
@@ -7690,14 +7830,27 @@ class DashboardState:
         location resolves through this module's ``config_dir`` exactly like
         ``save_tags`` -- keeping tests that patch it working unchanged.
 
+        Malformed entries preserved at load time (``_unparsed_tag_entries``)
+        are appended so this write path preserves them too (#5792).
+
         Raises on I/O failure so callers can roll back in-memory state and
         surface HTTP 5xx rather than silently losing data.
         """
-        self._atomic_write_json_strict(config_dir() / self._TAGS_FILE, snapshot)
+        unparsed = getattr(self, "_unparsed_tag_entries", [])
+        self._atomic_write_json_strict(config_dir() / self._TAGS_FILE, [*snapshot, *unparsed])
 
     def save_tag_boards(self) -> None:
-        """Persist sidebar column layout to disk (atomic write)."""
-        self._atomic_write_json(config_dir() / self._TAG_BOARDS_FILE, self._tag_boards)
+        """Persist sidebar column layout to disk (atomic write).
+
+        Appends any malformed columns preserved at load time
+        (``_unparsed_tag_board_entries``) so a save cannot erase bytes a
+        hand-edit left in a shape the loader could not validate (#5792).
+        """
+        unparsed = getattr(self, "_unparsed_tag_board_entries", [])
+        self._atomic_write_json(
+            config_dir() / self._TAG_BOARDS_FILE,
+            [*self._tag_boards, *unparsed],
+        )
 
     def save_tag_boards_snapshot(self, snapshot: list[dict]) -> None:
         """Persist a pre-captured boards snapshot to disk (strict -- raises on failure).
@@ -7708,10 +7861,51 @@ class DashboardState:
         resolves through this module's ``config_dir`` exactly like
         ``save_tag_boards`` -- keeping tests that patch it working unchanged.
 
+        Malformed columns preserved at load time
+        (``_unparsed_tag_board_entries``) are appended so this write path
+        preserves them too (#5792).
+
         Raises on I/O failure so callers can roll back in-memory state and
         surface HTTP 5xx rather than silently losing data.
         """
-        self._atomic_write_json_strict(config_dir() / self._TAG_BOARDS_FILE, snapshot)
+        unparsed = getattr(self, "_unparsed_tag_board_entries", [])
+        self._atomic_write_json_strict(config_dir() / self._TAG_BOARDS_FILE, [*snapshot, *unparsed])
+
+    @staticmethod
+    def _partition_preserving(
+        raw: list[Any],
+        predicate: Callable[[Any], bool],
+        noun: str,
+        source_file: str,
+    ) -> tuple[list[Any], list[Any]]:
+        """Split ``raw`` into ``(active, unparsed)`` by ``predicate``.
+
+        The shared "partition malformed rows at load, keep them verbatim so a
+        later save round-trips them back" mechanic behind ``load_cron_folders``,
+        ``load_chat_pins``, ``load_tags`` and the tag-board load (all #5792).
+        A row is active when ``predicate`` returns truthy; every other row is
+        collected into ``unparsed`` so the caller's save path can re-append it
+        (``[*active, *unparsed]``) at write time rather than silently erasing
+        bytes a hand-edit left in a shape the loader could not validate.
+
+        When any row is preserved, logs the shared preserving-N warning at
+        WARNING level. ``noun`` supplies the per-store wording (``"entr(ies)"``,
+        ``"chat pin record(s)"``, ``"tag entr(ies)"``, ``"sidebar column(s)"``)
+        and ``source_file`` names the file, so the emitted messages stay
+        identical to the hand-rolled copies this replaced.
+        """
+        active: list[Any] = []
+        unparsed: list[Any] = []
+        for row in raw:
+            (active if predicate(row) else unparsed).append(row)
+        if unparsed:
+            logger.warning(
+                "Preserving %d malformed %s while loading %s " "(kept verbatim, not active)",
+                len(unparsed),
+                noun,
+                source_file,
+            )
+        return active, unparsed
 
     @staticmethod
     def _atomic_write_json_strict(path: Path, data: Any) -> None:
@@ -8022,6 +8216,12 @@ class DashboardState:
                 "provider_label": self._resolve_provider_label(slot),
             }
         )
+        # Live harness, not the configured default: an open chat keeps the
+        # backend it started with, and the model picker must follow that.
+        # Omitted when no provider is bound (a new tab has not spawned yet).
+        live_backend = self._live_slot_acp_backend(slot)
+        if live_backend is not None:
+            payload["acp_backend"] = live_backend
         return payload
 
     def _resolve_provider_label(self, slot: _ChatSlot) -> str:
@@ -8039,6 +8239,50 @@ class DashboardState:
 
         label = self.sessions.provider_label_for(effective_session_key(slot))
         return label if isinstance(label, str) else ""
+
+    def _live_slot_acp_backend(self, slot: _ChatSlot) -> str | None:
+        """Backend the live provider is driving, or ``None`` if none is bound.
+
+        ``""`` is kiro. Distinguishing omit-vs-empty lets the picker treat a
+        still-open kiro session as kiro after the default harness moved on.
+        """
+        try:
+            from kiro_crew.dashboard.chat_utils import _history_key_for
+
+            sessions = getattr(self, "sessions", None)
+            getter = getattr(sessions, "get_provider", None)
+            if not callable(getter):
+                return None
+            provider = getter(_history_key_for(slot.key))
+        except Exception:
+            return None
+        if provider is None:
+            return None
+        try:
+            backend = provider.backend
+        except (AttributeError, TypeError):
+            return None
+        return backend if isinstance(backend, str) else None
+
+    def _live_slot_acp_client(self, slot: _ChatSlot) -> Any | None:
+        """The live ACP client bound to this slot, or ``None`` if unbound."""
+        try:
+            from kiro_crew.dashboard.chat_utils import _history_key_for
+
+            sessions = getattr(self, "sessions", None)
+            getter = getattr(sessions, "get_provider", None)
+            if not callable(getter):
+                return None
+            provider = getter(_history_key_for(slot.key))
+        except Exception:
+            return None
+        if provider is None:
+            return None
+        for holder_name in ("client", "_client"):
+            holder = getattr(provider, holder_name, None)
+            if holder is not None:
+                return holder
+        return provider
 
     def serialize_slots(self, *, include_check_status: bool = False) -> list:
         """Serialize slots, optionally including owner-only provider status.
@@ -9282,6 +9526,52 @@ def _governance_status() -> str:
         return governance_status()
     except Exception:
         return "unknown"
+
+
+def active_acp_backend(sessions: object) -> str | None:
+    """The harness id NEW sessions run on, or ``None`` when it cannot be read.
+
+    ``None`` means UNKNOWN, and is deliberately not folded into ``""`` (kiro):
+    every caller here gates a readout on the answer, and "we could not tell" has
+    to leave that readout as it was rather than assert a harness. A session store
+    double, or one built before this property existed, is exactly that case.
+    """
+    backend = getattr(sessions, "acp_backend", None)
+    return backend if isinstance(backend, str) else None
+
+
+def _harness_status(backend: str | None) -> dict[str, object] | None:
+    """The active harness as the dashboard header shows it, or ``None``.
+
+    Three fields, and the third is the reason this is served rather than derived
+    in the browser: ``kiro_credits`` is the gateway's own answer to "does this
+    harness draw on the Kiro credit plan", so the header does not carry a second
+    copy of the membership set — a copy that would keep rendering a credit pill
+    for the next adapter someone adds. ``label`` comes from the descriptor for the
+    same reason.
+
+    Never raises: an id with no cached descriptor (a registry adapter whose
+    registry cache has since been dropped) still names itself, and any other
+    failure omits the block entirely so the header falls back to its
+    harness-unaware rendering instead of blanking the whole status payload.
+    """
+    if backend is None:
+        return None
+    try:
+        from kiro_crew.acp import backends as acp_backends
+
+        try:
+            label = acp_backends.descriptor_for(backend).label
+        except Exception:
+            label = backend
+        return {
+            "backend": backend,
+            "label": label,
+            "kiro_credits": acp_backends.bills_kiro_credits(backend),
+        }
+    except Exception:
+        logger.debug("Harness status unavailable", exc_info=True)
+        return None
 
 
 def _cached_check_status(url: str) -> dict | None:

@@ -4,7 +4,11 @@
  *
  * The resume branch already has that fallback: it swallows a "the slot is gone"
  * rejection and falls through to the create path. What it could not do was
- * RECOGNISE one. The rejection arrives from `dispatch(switchSlot(k)).unwrap()`,
+ * RECOGNISE one. The rejection now arrives from the pre-flight slot probe rather
+ * than from `dispatch(switchSlot(k)).unwrap()` -- the resume asks whether the slot
+ * exists BEFORE touching the chat store -- but the shape it must classify is
+ * unchanged, and RTK's serialized form is still covered below because the same
+ * helper reads both surfaces,
  * and Redux Toolkit does not rethrow the original error — `createAsyncThunk`
  * stores `miniSerializeError(err)` on the rejected action and `unwrap()` throws
  * THAT: a plain `{ name, message, stack }` object, not an `Error` instance. The
@@ -32,14 +36,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook } from '@testing-library/react'
 
-const { dispatch, apiMock, saveInvestigation } = vi.hoisted(() => ({
+const { dispatch, apiMock, saveInvestigation, getInvestigation } = vi.hoisted(() => ({
   dispatch: vi.fn(),
   apiMock: {
     chatFolders: vi.fn(),
     createChatFolder: vi.fn(),
     sendChat: vi.fn(),
+    chatSlotDetail: vi.fn(),
   },
   saveInvestigation: vi.fn(),
+  getInvestigation: vi.fn(),
 }))
 
 vi.mock('../store', () => ({ useAppDispatch: () => dispatch }))
@@ -50,7 +56,7 @@ vi.mock('../store/chatSlice', () => ({
 }))
 vi.mock('react-router-dom', () => ({ useNavigate: () => vi.fn() }))
 vi.mock('../api/client', () => ({ api: apiMock }))
-vi.mock('../apps/issue-radar/api', () => ({ issueRadarApi: { saveInvestigation } }))
+vi.mock('../apps/issue-radar/api', () => ({ issueRadarApi: { saveInvestigation, getInvestigation } }))
 
 import { useAgentSession } from '../apps/issue-radar/lib/agentSession'
 import { errMessage, isMissingSlotError } from '../utils/thunkError'
@@ -64,18 +70,18 @@ const serializedError = (message: string) => ({
   stack: 'ApiError: ' + message,
 })
 
-/** Reject `switchSlot` for the ALREADY-EXISTING slot with *rejection*, while the
+/** Reject the PROBE for the ALREADY-EXISTING slot with *rejection*, while the
  *  create path (and the switch to the newly created slot) succeeds. */
 function harness(rejection: unknown) {
   dispatch.mockImplementation((action: { type: string; arg?: unknown }) => ({
     unwrap: () => {
       if (action.type === 'createSlot') return Promise.resolve({ key: 'slot-new' })
-      if (action.type === 'switchSlot' && action.arg === 'slot-closed') {
-        return Promise.reject(rejection)
-      }
       return Promise.resolve(undefined)
     },
   }))
+  apiMock.chatSlotDetail.mockImplementation((key: string) =>
+    key === 'slot-closed' ? Promise.reject(rejection) : Promise.resolve({ messages: [] }))
+  getInvestigation.mockResolvedValue({ investigation: null })
   apiMock.chatFolders.mockResolvedValue([{ id: 'f1', name: 'Issue Radar - demo-repo' }])
   apiMock.sendChat.mockResolvedValue({ status: 200, ok: true } as unknown as Response)
   saveInvestigation.mockResolvedValue({ investigation: { slot_key: 'slot-new' } })

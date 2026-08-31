@@ -25,6 +25,7 @@
         "mcp_registry_mode": false,
         "mcp_quarantine_after_failures": 3,
         "acp_backend": "",
+        "acp_backend_allow_ungated_tools": false,
         "default_agent": "",
         "sweep_agents_backups": false,
         "sandbox": "auto",
@@ -267,15 +268,24 @@
       "sensitive": false,
       "tags": [],
       "label": "ACP Backend",
-      "help": "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, 'copilot' = GitHub Copilot CLI, 'opencode' = OpenCode (BYOK: serves any OpenAI-compatible endpoint configured in opencode.json). KAS runs chat but has no native subagent progress reporting yet. Must admit every ACP_BACKENDS_SELECTABLE member (acp/types.py — pinned both ways by test_harness_parity's H4 test): a value missing here is DELETED by jsonschema validation before the loader's degrade log can fire, so the backend silently never engages.",
+      "help": "Which admitted ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, 'copilot' = GitHub Copilot CLI, 'opencode' = OpenCode (BYOK: serves any OpenAI-compatible endpoint configured in opencode.json). Registry adapters can be discovered before admission but cannot be persisted until they join the selectable set.",
       "hasChildren": false,
-      "enumValues": [
-        "",
-        "kas",
-        "copilot",
-        "opencode"
-      ],
+      "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "agent.acp_backend_allow_ungated_tools",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Allow Ungated Tools",
+      "help": "Start a session on an experimental ACP backend even when its tool decisions cannot be shown to reach Kiro Crew's PreToolUse gate. OFF by default, and leaving it off is the safe choice: with it on, the bundled denied-command rules, the sensitive-path block and the governance ceiling are not consulted for tool calls the backend auto-approves on its own.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "agent.default_agent",
@@ -5655,6 +5665,7 @@
         },
         "restore_sessions": false,
         "qr_session_until_restart": true,
+        "qr_session_persist_across_restart": false,
         "restore_window_minutes": 30,
         "surface_channel_sessions": true,
         "bot_name": "",
@@ -5848,6 +5859,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "dashboard.qr_session_persist_across_restart",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Phone Sign-In Survives A Gateway Restart",
+      "help": "REQUIRES BOTH: \"Phone Sign-In Lasts Until Restart\" must also be ON, and tailnet identity trust must be configured (`dashboard.tailscale.trust_identity` with a non-empty `allowed_logins`). Without either one this setting is ignored and a warning naming the missing prerequisite is logged. Note the first requirement is NOT a contradiction: \"Lasts Until Restart\" is what issues the renewable credential, and this setting then removes the restart bound from it -- turning that one OFF instead leaves a session that expires on a fixed clock, with nothing to renew. What it does: let a scanned phone stay signed in across gateway restarts, so one scan lasts until the refresh credential's own 30-day lifetime lapses. OFF by default because a restart is otherwise a hard sign-out that needs no recorded state. The identity requirement is not optional bookkeeping: behind `tailscale serve` every request reaches the gateway from 127.0.0.1, so without a daemon-verified peer identity the session is a bearer credential any tailnet peer could replay, and outliving the process is exactly what makes that matter.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.restore_window_minutes",

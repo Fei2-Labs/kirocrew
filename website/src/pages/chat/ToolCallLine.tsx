@@ -5,7 +5,7 @@ import { useAppSelector, useAppDispatch } from '../../store'
 import { clearFocusToolCallId, mcpAppKey } from '../../store/chatSlice'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../../i18n/LanguageProvider'
-import { pickToolLabel } from '../../utils/toolLabel'
+import { DERIVE_LABEL_THRESHOLD_CHARS, deriveShellSummary, pickToolLabel } from '../../utils/toolLabel'
 import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
@@ -656,6 +656,27 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     const stripped = toolLabel.split(filePath).join('').replace(/\s+/g, ' ').trim()
     return stripped || toolLabel
   }, [showFileOpen, filePath, toolLabel])
+  // A purpose-less shell call's label is the raw command. The collapsed row's
+  // `truncate` (LABEL_COLLAPSED_CLASS) already bounds how much of it is
+  // visible, but a clipped wall of quoting says nothing — in simplified mode a
+  // flood-length shell label is substituted with a derived command digest
+  // (binaries + redirect target), so the visible line is meaningful. Short
+  // labels pass through untouched, and raw mode always shows the exact command.
+  const pillLabelText = useMemo(() => {
+    if (!simplified) return displayLabel
+    if (displayLabel.length <= DERIVE_LABEL_THRESHOLD_CHARS && !displayLabel.includes('\n')) {
+      return displayLabel
+    }
+    return deriveShellSummary(displayLabel, { bareCommand: isShell }) ?? displayLabel
+  }, [displayLabel, simplified, isShell])
+  // Hover reveals the verbatim command whenever the pill shows a substitute.
+  const pillLabelTitle = pillLabelText === displayLabel ? undefined : displayLabel
+  // Keep transcript-sized shell payloads out of accessibility announcements,
+  // matching the visible summary while ordinary rows retain their raw label.
+  const ariaToolLabel = isShell
+    && (label.length > DERIVE_LABEL_THRESHOLD_CHARS || label.includes('\n'))
+    ? pillLabelText
+    : label
   // Both running and pending-approval pills shimmer — the highlight color
   // tracks the status so pending shimmers warn-yellow (matching the approval
   // bar) and running shimmers accent.
@@ -804,11 +825,12 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         ref={pillButtonRef}
         className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
         aria-expanded={effectivelyExpanded}
+        title={pillLabelTitle}
         aria-label={hasPendingPerm
-          ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label })
+          ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label: ariaToolLabel })
           : effectivelyExpanded
-            ? i18nT('pages.chat.toolCallLine.aria_hide_details', { label })
-            : i18nT('pages.chat.toolCallLine.aria_show_details', { label })}
+            ? i18nT('pages.chat.toolCallLine.aria_hide_details', { label: ariaToolLabel })
+            : i18nT('pages.chat.toolCallLine.aria_show_details', { label: ariaToolLabel })}
         onClick={onToggle}
       >
         {/* Deterministic vertical centering: the label spans pin leading-5
@@ -828,9 +850,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             }}
             animate={{ backgroundPosition: ['100% 0%', '-50% 0%'] }}
             transition={{ duration: 2.4, repeat: Infinity, ease: 'linear' }}
-          >{displayLabel}</motion.span>
+          >{pillLabelText}</motion.span>
         ) : (
-          <span data-testid="tool-pill-label" className={`${labelWrapClass} min-w-0 leading-5 text-muted hover:text-text transition-colors`}>{displayLabel}</span>
+          <span data-testid="tool-pill-label" className={`${labelWrapClass} min-w-0 leading-5 text-muted hover:text-text transition-colors`}>{pillLabelText}</span>
         )}
       </button>
 
@@ -962,7 +984,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             transition={{ duration: 0.35, ease: [0.4, 0.0, 0.2, 1] /* Material standard */ }}
             style={{ overflow: 'hidden' }}
           >
-            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
+            <ToolDetails purpose={purpose} pillLabel={displayLabel} toolName={label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
           </motion.div>
         )}
       </AnimatePresence>

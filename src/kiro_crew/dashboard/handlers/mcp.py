@@ -1692,8 +1692,8 @@ def _atomic_write(path: Path, data: dict) -> None:
     directory's inherited permissions.  The writer's default fail-closed
     policy is kept deliberately: a store this surface cannot protect is not
     written, and the caller's request fails visibly rather than publishing a
-    credential another OS user could read.  On Windows the lockdown shells
-    out to ``icacls``, so async callers must hand the whole write to a worker
+    credential another OS user could read.  On Windows the lockdown rewrites
+    the file's DACL, so async callers hand the whole write to a worker
     thread rather than call this on the event loop.  Other paths (the shared
     global file, agent files) keep the mode-preserving helper — their
     lifecycles are owned by other tools.

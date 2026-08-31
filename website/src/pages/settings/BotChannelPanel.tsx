@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, Check, AlertTriangle, Lock } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsInput, SettingsSelect, SettingsToggle } from '../../components/settings'
 import { SecretField } from '../../components/SecretField'
+import { CopyCommandButton } from '../../components/settingRef/CopyCommandButton'
 import { Btn } from '../../components/ui'
 import { TagListEditor } from './SlackPanel'
 
@@ -47,6 +48,18 @@ export interface BotChannelConfigData {
   forum_activation?: string
   /** Sidebar folder this channel's sessions are filed into ("" = off). */
   session_folder?: string
+  /**
+   * Optional-SDK state (only a channel declaring ``sdkExtra`` sends these).
+   * ``sdk_installed`` false means the client library is not importable by the
+   * gateway process, so the channel is skipped at boot however complete the rest
+   * of the config is; ``sdk_install_supported`` false marks the environments
+   * where a pip install cannot work at all (bundled desktop interpreter, no pip
+   * module, PEP 668 externally-managed); ``sdk_install_command`` names the
+   * gateway's OWN interpreter and is empty whenever it would not help.
+   */
+  sdk_installed?: boolean
+  sdk_install_supported?: boolean
+  sdk_install_command?: string
 }
 
 /** Writable fields shared by every bot-token channel save endpoint. */
@@ -241,6 +254,18 @@ export interface BotChannelSpec {
     thinkingDescription: string
     /** Config path the thinking toggle writes, for `<SettingRef>` deep-links. */
     thinkingConfigKey: string
+  }
+  /**
+   * Optional SDK extra. Present only for a channel whose client library ships
+   * outside core (Feishu: lark-oapi), which is the one case where a fully
+   * configured channel still cannot start. All the COPY lives in this shared
+   * namespace parameterised on the channel and package names, so a channel
+   * adopting the card adds no translation keys of its own — an object rather
+   * than a bare string so a later field is not a breaking change.
+   */
+  sdkExtra?: {
+    /** Distribution name as the user would type it, e.g. "lark-oapi". */
+    packageLabel: string
   }
   /** API calls. */
   getConfig: () => Promise<BotChannelConfigData>
@@ -516,6 +541,44 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
           </div>
         </SettingsCard>
       </SettingsSection>
+
+      {/* ── Missing optional SDK ── */}
+      {/*
+        Strictly `=== false`: an older gateway omits the field entirely, and
+        treating undefined as "missing" would tell every user of one to install a
+        package they may already have.
+      */}
+      {spec.sdkExtra && data.sdk_installed === false && (
+        <SettingsSection title={i18nT('pages.settings.botChannelPanel.sdk_missing', { channel: spec.name })}>
+          <SettingsCard>
+            {data.sdk_install_supported && data.sdk_install_command ? (
+              <>
+                <p className="text-[13px] text-text m-0">
+                  {i18nT('pages.settings.botChannelPanel.sdk_missing_body', { channel: spec.name, package: spec.sdkExtra.packageLabel })}
+                </p>
+                {/*
+                  The command names the gateway's own interpreter rather than a
+                  bare `pip`, because installing into a different environment is
+                  the failure this card exists to prevent — so it must stay
+                  copyable verbatim: break-all, never truncated.
+                */}
+                <div className="flex items-start gap-2 mt-2 rounded-md border border-border bg-bg-elevated px-3 py-2">
+                  <code className="flex-1 text-[12px] font-mono text-text break-all">{data.sdk_install_command}</code>
+                  <CopyCommandButton text={data.sdk_install_command} />
+                </div>
+                <p className="text-[12px] text-muted mt-2 mb-0">
+                  {i18nT('pages.settings.botChannelPanel.sdk_restart_after_install', { channel: spec.name })}
+                </p>
+              </>
+            ) : (
+              <p className="text-[13px] text-warn m-0 flex items-start gap-1.5">
+                <AlertTriangle size={13} className="flex-none mt-0.5" />
+                {i18nT('pages.settings.botChannelPanel.sdk_install_unsupported', { package: spec.sdkExtra.packageLabel })}
+              </p>
+            )}
+          </SettingsCard>
+        </SettingsSection>
+      )}
 
       {/* ── Required ── */}
       <SettingsSection title={i18nT('pages.settings.botChannelPanel.required')}>

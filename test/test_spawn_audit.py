@@ -199,6 +199,24 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
         "acp/runtime.py::_get_rss_mb",
+        # The shadow-venv update engine's four spawns. None is agent-influenced
+        # and none can route through sandboxed_spawn_argv, because the engine's
+        # whole job is to build the NEXT gateway install outside the agent
+        # sandbox: (1) _verify_signature runs the openssl binary resolved via
+        # trusted_system_bin (never PATH) over files it just wrote into its own
+        # mkstemp workdir; (2) _run spawns `sys.executable -m venv <tree>` and
+        # `<shadow python> -m pip install <wheel>` where the tree name is
+        # composed from the SIGNED manifest's validated version string and the
+        # wheel path from the same workdir; (3) build_shadow_venv's best-effort
+        # pip self-upgrade in the shadow tree; (4) verify_shadow_venv's `-I`
+        # isolated import probe against the shadow interpreter. The update flow
+        # is reachable only from the CLI on the operator's terminal or the
+        # gateway's approve endpoint behind the OQ7 host-local step-up — the
+        # agent's own bash path is closed by the self-update denied rule.
+        "platform/wheel_engine.py::_run",
+        "platform/wheel_engine.py::_verify_signature",
+        "platform/wheel_engine.py::build_shadow_venv",
+        "platform/wheel_engine.py::verify_shadow_venv",
         # The userns probe child: ONE fixed argv, `sys.executable -I -S -c <shim>`,
         # no shell, no cwd, stdin/stdout are the two handshake pipes. Nothing is
         # agent-influenced -- the shim is a module-level string constant and takes
@@ -239,16 +257,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # version into versions.txt. The binary name is a module constant; a
         # resource ceiling / sandbox adds nothing to a `--version` call.
         "diagnostics.py::_kiro_cli_version",
-        # KAS auth callback token fetch (--auth=acp-callback): a single fixed
-        # argv ``[<kiro-cli>, "chat", "_", "get-kas-token"]`` with a 20s timeout,
-        # no shell and no agent-influenced arguments — the subcommand tail is a
-        # module constant and the binary is the same kiro-cli Crew already spawns
-        # as its agent runtime (``resolve_kiro_cli``). Deliberately NOT
-        # sandbox-routed: kiro-cli must reach its OWN auth/token store to mint the
-        # KAS access token (same reason ``gh`` is not routed), which a sandbox
-        # would hide and break the callback. The child is SIGKILLed on timeout or
-        # task cancellation, so it never orphans.
-        "acp/kas_auth.py::resolve_kas_access_token",
         # Tailnet origin derivation + forwarded-peer whois (RFC:
         # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",
         # "status", "--json"]`` or ``["<tailscale>", "whois", "--json",
@@ -791,12 +799,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # fetch, no mutation. Same classification as the other fixed-argv
         # doctor probes (``_detect_userspace_oom_killer``, ``_detect_linger``).
         "cli_doctor.py::_git_line",
-        # NOT a subprocess spawn here: the AST heuristic matches ``asyncio.run``
-        # (attr ``run`` on base ``asyncio``), used only to drive the async KAS
-        # token probe from the synchronous doctor. The actual child process is
-        # spawned inside ``acp/kas_auth.py::resolve_kas_access_token``, which is
-        # allowlisted separately above (kiro-cli reaching its own token store).
-        "cli_doctor.py::_report_kas_backend",
+        # ``<kiro-cli> acp --help`` readiness probe for the KAS backend: fixed
+        # argv (subcommand and flag are module constants), 15s-capped, no shell,
+        # no agent-influenced arguments, and no credential involved — it reads
+        # help text to confirm this kiro-cli can select the KAS engine at all.
+        # Crew no longer mints a KAS token anywhere; the relay resolves tokens
+        # from kiro-cli's own store (see ``acp/kas_transport.py``), so the former
+        # ``chat _ get-kas-token`` spawn is gone rather than moved.
+        "cli_doctor.py::_kas_relay_help",
         # ``systemctl is-active <unit>`` probes for the memory-pressure
         # preparedness check: argv is hardcoded (systemd-oomd/earlyoom unit
         # names), no agent influence, 5s-capped, read-only query.
@@ -1025,7 +1035,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # only caller-supplied element is the path being revealed — which is
         # passed as a later argv element, never as the command.
         "platform_compat.py::open_with_default_app",
-        "platform_compat.py::_current_user_sid",
         "platform_compat.py::_posix_process_parent_map",
         "platform_compat.py::find_port_listeners",
         "platform_compat.py::find_python_interpreter",
@@ -1038,6 +1047,11 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # with a fixed argv containing only an int-coerced pid. It cannot route
         # through the sandbox helper because sandbox imports platform_compat.
         "platform_compat.py::process_owner_uid",
+        # Exact executable-basename companion to process_matches. On macOS it
+        # runs fixed-argv ``ps -o comm= -p <int pid>`` through the trusted
+        # absolute system binary; Linux and Windows use in-process OS probes.
+        # It cannot route through sandbox because sandbox imports this module.
+        "platform_compat.py::process_image_name",
         "platform_compat.py::process_matches",
         # Same class as process_matches: a read-only process-attribute query
         # (macOS ``ps -ww -o command= -p <pid>``; Linux reads /proc without
@@ -1047,11 +1061,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # forwarder pid, and cannot route through the sandbox helper because
         # sandbox imports platform_compat.
         "platform_compat.py::process_argv_matches_exact",
-        # The single icacls chokepoint shared by restrict_to_owner (file shape)
-        # and restrict_dir_to_owner (directory shape, inheritable grants). Both
-        # public helpers delegate here, so this one entry covers the owner-only
-        # DACL spawn for every caller; neither public name spawns directly.
-        "platform_compat.py::_icacls_owner_only",
         # OS keep-awake helper for the prevent-sleep feature (power.py). FIXED
         # argv — `caffeinate -i -w <pid>` on macOS, `systemd-inhibit
         # --what=idle:sleep --mode=block … /bin/sh -c 'while kill -0 <pid> …'`

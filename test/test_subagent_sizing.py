@@ -799,12 +799,23 @@ class TestAvailableMemoryClamp:
         monkeypatch.setattr(sub, "_macos_available_memory_gb", lambda: 42.0)
         assert sub._available_memory_gb() == 42.0
 
-    def test_unsupported_platform_fails_open(self, monkeypatch) -> None:
-        """A platform with no probe yet (e.g. Windows) fails open to -1.0."""
+    def test_windows_reads_the_shared_host_probe(self, monkeypatch) -> None:
+        """Windows reads memory through ``platform_compat.host_available_mib``."""
         import kiro_crew.subagent as sub
 
         monkeypatch.setattr(sub.platform_compat, "IS_LINUX", False)
         monkeypatch.setattr(sub.platform_compat, "IS_MACOS", False)
+        monkeypatch.setattr(sub.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(sub.platform_compat, "host_available_mib", lambda: 16384)
+        assert sub._available_memory_gb() == 16.0
+
+    def test_unsupported_platform_fails_open(self, monkeypatch) -> None:
+        """A platform with no probe yet fails open to -1.0."""
+        import kiro_crew.subagent as sub
+
+        monkeypatch.setattr(sub.platform_compat, "IS_LINUX", False)
+        monkeypatch.setattr(sub.platform_compat, "IS_MACOS", False)
+        monkeypatch.setattr(sub.platform_compat, "IS_WINDOWS", False)
         assert sub._available_memory_gb() == -1.0
 
 

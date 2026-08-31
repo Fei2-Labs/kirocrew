@@ -327,11 +327,10 @@ class AcpSessionProvider(LLMProvider):
     async def approve_tool(
         self, request_id: str | int, option_id: str | None = None, *, always: bool = False
     ) -> None:
-        """Approve a pending tool permission request. Accepts an explicit
-        option_id (signature parity with AcpClient.approve_tool); falls back to
-        allow_always/allow_once from `always`."""
-        resolved = option_id or ("allow_always" if always else "allow_once")
-        await self._guarded(self._handle.approve_tool(request_id, option_id=resolved))
+        """Approve only an optionId the pending request advertised."""
+        await self._guarded(
+            self._handle.approve_tool(request_id, option_id=option_id, always=always)
+        )
 
     async def reject_tool(self, request_id: str | int) -> None:
         """Reject a pending tool permission request."""
@@ -586,10 +585,23 @@ class AcpSessionProvider(LLMProvider):
         Raises :class:`AcpModelUnavailable` so the caller surfaces it as a user
         error instead of recovering with a session reset — a reset here would
         destroy the live conversation and still land on a different model.
+
+        A refusal is never issued on the session-init snapshot alone. That
+        snapshot is one answer, captured at one instant, and a lookup racing a
+        token refresh can answer with the default tier — freezing a
+        false "not entitled" verdict into the session for its whole life. So a
+        would-be refusal first revalidates against a fresh backend probe
+        (:meth:`AcpSessionHandle.refresh_available_models`) and only stands if
+        the fresh answer ALSO lacks the model. A failed probe keeps the stale
+        verdict (fail-safe: no evidence, no entitlement granted).
         """
         advertised = advertised_model_ids(self._handle.available_models)
         if model_is_unusable(model_id, advertised):
-            raise AcpModelUnavailable(model_id, advertised)
+            fresh = advertised_model_ids(
+                await self._guarded(self._handle.refresh_available_models())
+            )
+            if model_is_unusable(model_id, fresh or advertised):
+                raise AcpModelUnavailable(model_id, fresh or advertised)
         await self._guarded(self._handle.set_model(model_id))
 
     async def set_mode(self, agent_name: str) -> None:

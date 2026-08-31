@@ -160,6 +160,11 @@ def _approval_superseded(error: str, code: str) -> web.Response:
 
 async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     """POST /api/mcp/oauth/relay — deliver a failed browser redirect locally."""
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "mcp_oauth_relay")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -296,6 +301,11 @@ async def api_connections_mint(request: web.Request) -> web.Response:
     Returns as soon as the mint is scheduled. The URL is not ready yet: the
     caller polls :func:`api_connections_mint_state` for it.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_mint")
+    if owner_denied is not None:
+        return owner_denied
     parsed = await _mint_request(request)
     if isinstance(parsed, web.Response):
         return parsed
@@ -328,7 +338,8 @@ async def api_connections_mint(request: web.Request) -> web.Response:
 
     # Off the loop: only the append is queued to SEL's writer thread. The FIRST
     # sel() of a process CONSTRUCTS the log -- trust-dir creation, key validation,
-    # and on Windows an icacls subprocess -- and this handler runs BEFORE the audit
+    # and on Windows the owner-only DACL on the key file -- and this handler runs
+    # BEFORE the audit
     # middleware's own call (that one logs the response), so on a fresh gateway
     # whose first state-changing request is a Connect click it would land here and
     # stall every other request. Same reasoning as server._audit_denied.
@@ -413,6 +424,11 @@ async def api_connections_cancel(request: web.Request) -> web.Response:
     keeps the working connection. Idempotent -- cancelling a provider with no
     live mint answers ``dropped=false``.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_cancel")
+    if owner_denied is not None:
+        return owner_denied
     parsed = await _mint_request(request)
     if isinstance(parsed, web.Response):
         return parsed
@@ -433,7 +449,7 @@ async def api_connections_cancel(request: web.Request) -> web.Response:
     dropped = await cancel_mint(slug, token)
 
     # Off the loop: the FIRST sel() of a process constructs the log (trust-dir
-    # creation, key validation, on Windows an icacls subprocess). Same reasoning
+    # creation, key validation, on Windows the owner-only DACL). Same reasoning
     # as api_connections_mint above.
     await asyncio.to_thread(
         lambda: sel().log_api_access(
@@ -603,6 +619,11 @@ async def api_connections_disconnect(request: web.Request) -> web.Response:
     delete loop's own optimism, and the audit outcome is ``partial`` when anything
     survived.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_disconnect")
+    if owner_denied is not None:
+        return owner_denied
     parsed = await _mint_request(request)
     if isinstance(parsed, web.Response):
         return parsed

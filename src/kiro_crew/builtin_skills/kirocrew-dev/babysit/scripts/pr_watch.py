@@ -559,10 +559,29 @@ class PrWatchProbe(Probe):
             return None
         return data if isinstance(data, dict) else None
 
+    def wake_suffix(self) -> str:
+        """The operator's note and the standing instructions, ONCE per wake.
+
+        Both describe the delivery, not any one signal: the note is what this
+        watch was armed for, and the tail tells the woken agent what to do with
+        a wake in general. Emitting them per observation is what made a
+        well-coalesced wake expensive -- six observations meant six copies, 56%
+        of the delivered bytes on a measured real wake.
+        """
+        lines = []
+        if self.note:
+            lines.append(f"Context: {self.note}")
+        lines.append(_WAKE_TAIL)
+        return "\n".join(lines)
+
     def _brief(self, head: str, reason: str, detail: str) -> str:
         # A conversation signal has no head -- it is about the pull request, not
         # about a commit -- and passes "" so the parenthetical is dropped rather
         # than rendered empty.
+        #
+        # This describes ONE observation and nothing else. The note and the
+        # standing instructions moved to wake_suffix(), because the kernel joins
+        # N of these into one body and anything per-observation is paid N times.
         subject = f"{self.repo}#{self.pr}"
         if head:
             subject += f" (head {head[:9]})"
@@ -570,9 +589,6 @@ class PrWatchProbe(Probe):
             f"PR watch signal on {subject}: {reason}",
             detail,
         ]
-        if self.note:
-            lines.append(f"Context: {self.note}")
-        lines.append(_WAKE_TAIL)
         return "\n".join(line for line in lines if line)
 
 

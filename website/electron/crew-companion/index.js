@@ -54,11 +54,48 @@ let fetchLocalToken = null;
 let log = () => {};
 let timer = null;
 let reconciling = false;
+/**
+ * The token this poll reuses across ticks.
+ *
+ * Minting one per tick is what this cache exists to stop. Every mint is a full
+ * link->session exchange on the gateway: it registers a nonce in a bounded
+ * 50-slot ring (so at this cadence the ring turned over every few minutes and
+ * evicted OTHER pending one-time links — a phone-access QR among them, before
+ * its own window had even lapsed), issued a fresh 30-day refresh chain, and
+ * appended the consumed nonce to a persisted denylist. It also meant dozens of
+ * live, full-privilege sign-in links existed at any moment purely as a
+ * side-effect of asking whether an app is enabled.
+ *
+ * The token outlives the tick by hours, so reuse is the normal path and a
+ * re-mint is the exception: only an actual auth refusal invalidates it.
+ */
+let cachedToken = "";
+
+/**
+ * The token to probe with, minting only when there is nothing usable cached.
+ *
+ * @param {boolean} forceMint Re-mint even if a token is cached — for the one
+ *   retry after the gateway refused the cached one.
+ * @returns {Promise<string>}
+ */
+async function tokenForProbe(forceMint) {
+  if (!forceMint && cachedToken) return cachedToken;
+  try {
+    cachedToken = (fetchLocalToken && (await fetchLocalToken())) || "";
+  } catch {
+    cachedToken = "";
+  }
+  return cachedToken;
+}
 
 /**
  * Ask the gateway whether the app is enabled.
  *
- * @returns {Promise<"enabled"|"disabled"|"unknown">}
+ * ``unauthorized`` is split out from ``unknown`` so a cached token that the
+ * gateway has stopped accepting can be re-minted exactly once, instead of
+ * either wedging the poll forever or going back to minting every tick.
+ *
+ * @returns {Promise<"enabled"|"disabled"|"unauthorized"|"unknown">}
  */
 function probeEnabled(token) {
   return new Promise((resolve) => {
@@ -67,6 +104,11 @@ function probeEnabled(token) {
       let body = "";
       res.on("data", (c) => (body += c));
       res.on("end", () => {
+        // The credential, not the answer, is what went stale — say so, so the
+        // caller re-mints rather than treating it as "cannot tell".
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          return resolve("unauthorized");
+        }
         if (res.statusCode !== 200) return resolve("unknown");
         try {
           const parsed = JSON.parse(body);
@@ -94,12 +136,7 @@ async function reconcileOnce() {
   if (reconciling) return;
   reconciling = true;
   try {
-    let token = "";
-    try {
-      token = (fetchLocalToken && (await fetchLocalToken())) || "";
-    } catch {
-      token = "";
-    }
+    let token = await tokenForProbe(false);
     if (!token) {
       // No credential means we cannot ask, which is unknown — not disabled.
       return;
@@ -108,7 +145,24 @@ async function reconcileOnce() {
     setOverlayTarget(backendUrl, token);
     setPanelTarget(backendUrl, token);
     setGalleryTarget(backendUrl, token);
-    const state = await probeEnabled(token);
+    let state = await probeEnabled(token);
+
+    if (state === "unauthorized") {
+      // The cached token was refused. Re-mint ONCE and retry; a second refusal
+      // is left as unknown rather than retried in a loop, so a genuinely broken
+      // credential path cannot turn this poll back into a mint-per-tick.
+      cachedToken = "";
+      token = await tokenForProbe(true);
+      if (!token) return;
+      setOverlayTarget(backendUrl, token);
+      setPanelTarget(backendUrl, token);
+      setGalleryTarget(backendUrl, token);
+      state = await probeEnabled(token);
+      if (state === "unauthorized") {
+        cachedToken = "";
+        return;
+      }
+    }
 
     if (state === "unknown") return; // leave every window exactly as it is
     if (state === "disabled") {
@@ -196,6 +250,10 @@ function shutdownCrewCompanion() {
     clearInterval(timer);
     timer = null;
   }
+  // Drop the reused credential with the poll that reused it, so a later
+  // initCrewCompanion starts from a fresh mint instead of a token that may have
+  // been minted against a gateway that is no longer the one we will talk to.
+  cachedToken = "";
   stopHitboxPoll();
   closePetWindow();
 }

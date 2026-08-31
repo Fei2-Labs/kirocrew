@@ -21,6 +21,7 @@ from chat_test_helpers import (
     _make_folder_app,
     _make_ready_kiro_prerequisite,
     _make_state,
+    stub_acp_identity,
 )
 
 from kiro_crew.acp.types import TurnUsage
@@ -120,6 +121,69 @@ class TestChatSlot:
             slot.append("user", f"msg {i}")
         assert slot.messages[0]["content"] == "msg 50"
         assert slot.messages[-1]["content"] == f"msg {count - 1}"
+
+    def test_trim_advances_the_durable_counter_by_durable_rows_only(self):
+        """Transient rows folded into the frozen prefix advance ONLY the all-rows counter.
+
+        ``_disk_older_count`` credits every persisted trimmed row (its contract
+        with the save model), while ``_disk_older_durable_count`` counts only
+        the rows a durable read returns — the base absolute message positions
+        are built over. Counting them together is the cursor-skew defect.
+
+        Mutation guards: advancing the durable counter by ``persisted_trim``
+        re-introduces the skew; counting the slice AFTER the ``del`` counts the
+        wrong (surviving) rows — the leading transient rows here make both
+        mutants visibly wrong.
+        """
+        slot = _ChatSlot("s1")
+        # The five oldest window rows: 2 transient, 3 durable.
+        slot.append("permission", "approve?", "")
+        slot.append("queued", "queued prompt", "")
+        for i in range(3):
+            slot.append("user", f"old {i}")
+        for i in range(_MAX_SLOT_MESSAGES - 5):
+            slot.append("user", f"fill {i}")
+        # Pretend the whole window was flushed, as a 5s save would have.
+        slot._disk_window_len = len(slot.messages)
+        assert slot._disk_older_count == 0
+        assert slot._disk_older_durable_count == 0
+
+        # Cross the cap by 5: the trimmed slice is exactly the 5 rows above.
+        for i in range(5):
+            slot.append("user", f"new {i}")
+
+        assert slot._disk_older_count == 5, "all persisted trimmed rows are credited"
+        assert (
+            slot._disk_older_durable_count == 3
+        ), "only the durable trimmed rows advance the durable counter"
+
+    def test_trim_counts_evicted_durable_rows_even_when_unpersisted(self):
+        """Durable rows lost to the unpersisted overflow still advance the durable counter.
+
+        ``_disk_older_count`` excludes the overflow (its save contract: it
+        claims on-disk lines, and these rows never reached disk). The durable
+        counter is a POSITION base with no disk contract: if evicted durable
+        rows were uncounted, every later absolute position would shift down and
+        a poller's ``since`` guard would pass while rows were silently skipped
+        — the silent failure the deleted blanket refusal used to make loud.
+        Counting them makes such a cursor refuse loudly (``since < base``).
+
+        Mutation guard: restricting the durable count to the persisted slice
+        (``messages[:persisted_trim]``) yields 2 here instead of 5.
+        """
+        slot = _ChatSlot("s1")
+        for i in range(_MAX_SLOT_MESSAGES):
+            slot.append("user", f"old {i}")
+        # Only the first 2 window rows ever reached disk.
+        slot._disk_window_len = 2
+
+        for i in range(5):
+            slot.append("user", f"new {i}")
+
+        assert slot._disk_older_count == 2, "the disk counter keeps its persisted-only contract"
+        assert (
+            slot._disk_older_durable_count == 5
+        ), "every evicted durable row advances the position base"
 
     def test_to_dict(self):
         slot = _ChatSlot("s1", title="Test Chat", mode="orchestrator")
@@ -685,6 +749,22 @@ class TestBroadcastCompactionResultBackoff:
         assert msg is not None
         assert "x in a row" in msg
         assert "too large to" in msg or "unknown error" in msg
+
+    def test_enriched_title_replaces_unknown_error(self, tmp_path, monkeypatch):
+        """The notice reads the event title. kiro-cli sends no summary on
+        failure, so the ACP layer now carries the notification's own reason
+        there (issue #3583) — the row must name it instead of collapsing to
+        "unknown error"."""
+        from kiro_crew.dashboard.chat_utils import _broadcast_compaction_result
+
+        state, slot = self._make_slot_and_state(tmp_path, monkeypatch)
+
+        msg = _broadcast_compaction_result(
+            state, slot, self._failed_event("context window exceeded")
+        )
+        assert msg is not None
+        assert "context window exceeded" in msg
+        assert "unknown error" not in msg
 
     def test_success_resets_streak_and_cooldown(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.chat_utils import (
@@ -5454,14 +5534,15 @@ class TestTokenPersistenceBackfill:
         slot = state.get_or_create_slot("s1")
         slot.model = ""  # CC has not yet emitted init when _run_chat begins
 
-        # This simulates a claude_code session, so the backfill must run under
-        # provider=claude_code for canonicalize_for_provider to map 'opus' ->
-        # 'opus-4.8-1m'. The default test config is provider=acp, under which the
-        # backfill (correctly) leaves a kiro/acp model unchanged — so force a CC
-        # config here. _run_chat reads only cfg.agent.provider (+ dashboard.
-        # merge_queued_messages) on this path, so a MagicMock cfg suffices.
+        # This simulates a Claude ACP adapter session, so the backfill must use
+        # the live provider identity for canonicalize_for_provider to map
+        # 'opus' -> 'opus-4.8-1m'. A MagicMock config suffices for the few
+        # settings this path reads.
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
         _cc_cfg = MagicMock()
-        _cc_cfg.agent.provider = "claude_code"
+        _cc_cfg.agent.provider = "acp"
+        _cc_cfg.agent.acp_backend = ACP_BACKEND_CLAUDE
         _cc_cfg.dashboard.merge_queued_messages = False
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: _cc_cfg)
 
@@ -5469,7 +5550,10 @@ class TestTokenPersistenceBackfill:
         # branch (chat_runner.py:471-476) finds nothing and leaves slot.model
         # blank. Then mutate inner._model mid-stream — just before yielding
         # EVENT_COMPLETE — so only the late backfill branch can populate it.
-        client = AsyncMock()
+        from kiro_crew.providers.acp import AcpProvider
+
+        client = AsyncMock(spec=AcpProvider)
+        client.backend = ACP_BACKEND_CLAUDE
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
         inner._model = ""  # empty at session-create time
@@ -10681,6 +10765,141 @@ class TestFolderCRUD:
             assert resp.status == 200
             data = await resp.json()
             assert data["project_dir"] == os.path.realpath(str(proj))
+
+    @pytest.mark.asyncio
+    async def test_slot_create_inherits_nearest_folder_project(self, tmp_path, monkeypatch):
+        """The server owns folder inheritance when the client cache omits project."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        root_project = tmp_path / "root-project"
+        parent_project = tmp_path / "parent-project"
+        root_project.mkdir()
+        parent_project.mkdir()
+        state._folders = [
+            {
+                "id": "root",
+                "name": "Root",
+                "order": 0,
+                "parent_id": "",
+                "project_dir": str(root_project),
+            },
+            {
+                "id": "parent",
+                "name": "Parent",
+                "order": 1,
+                "parent_id": "root",
+                "project_dir": str(parent_project),
+            },
+            {
+                "id": "child",
+                "name": "Child",
+                "order": 2,
+                "parent_id": "parent",
+                "project_dir": "",
+            },
+        ]
+        mock_cfg = MagicMock()
+        mock_cfg.dashboard.default_project = ""
+        # A bare MagicMock leaks into the slot: the handler stamps
+        # cfg.default_agent (a truthy MagicMock) as the slot's agent when the
+        # request names none, and the coalesced slots broadcast then dies in
+        # json.dumps ("Object of type MagicMock is not JSON serializable"),
+        # 500ing the create. Pin it to a string like the sibling cfg mocks.
+        mock_cfg.default_agent = ""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", lambda: mock_cfg
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.default_project_dir",
+            lambda _workspace: str(root_project),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.schedule_eager_spawn",
+            lambda *_args, **_kwargs: None,
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "folder-project", "folder_id": "child"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["folder_id"] == "child"
+        assert data["project"] == os.path.realpath(str(parent_project))
+        assert state._slots["folder-project"].project == data["project"]
+
+    @pytest.mark.asyncio
+    async def test_slot_create_rejects_invalid_inherited_project(self, tmp_path, monkeypatch):
+        """A stale folder path fails before a partially configured slot is created."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state._folders = [
+            {
+                "id": "folder",
+                "name": "Folder",
+                "order": 0,
+                "parent_id": "",
+                "project_dir": str(tmp_path / "missing"),
+            }
+        ]
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "invalid-folder-project", "folder_id": "folder"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["code"] == "folder_project_invalid"
+        assert state._slots == {}
+
+    @pytest.mark.asyncio
+    async def test_slot_create_does_not_rescope_existing_named_slot(self, tmp_path, monkeypatch):
+        """Folder inheritance initializes new slots; explicit project changes stay explicit."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        old_project = tmp_path / "old-project"
+        folder_project = tmp_path / "folder-project"
+        old_project.mkdir()
+        folder_project.mkdir()
+        slot = state.get_or_create_slot("existing")
+        slot.project = str(old_project)
+        slot.append("user", "existing conversation")
+        slot.drain()
+        state._folders = [
+            {
+                "id": "folder",
+                "name": "Folder",
+                "order": 0,
+                "parent_id": "",
+                "project_dir": str(folder_project),
+            }
+        ]
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.schedule_eager_spawn",
+            lambda *_args, **_kwargs: None,
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "existing", "folder_id": "folder"},
+            )
+
+        assert resp.status == 200
+        assert slot.project == str(old_project)
+
+    def test_resolve_folder_project_dir_terminates_on_cycle(self):
+        from kiro_crew.dashboard.chat_folders import _resolve_folder_project_dir
+
+        folders = [
+            {"id": "a", "parent_id": "b", "project_dir": ""},
+            {"id": "b", "parent_id": "a", "project_dir": ""},
+        ]
+        assert _resolve_folder_project_dir(folders, "a") == ("", None)
 
     @pytest.mark.asyncio
     async def test_update_folder_empty_name_rejected(self, tmp_path, monkeypatch):
@@ -16195,6 +16414,28 @@ class TestBulkModelSwitch:
         state.push_slots_update.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_codex_composite_switch_persists_effort_for_cold_start(
+        self, tmp_path, monkeypatch
+    ):
+        cfg = MagicMock()
+        cfg.agent.provider = "acp"
+        cfg.agent.acp_backend = "codex"
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        slot = state.get_or_create_slot("a", model="gpt-5.2[low]")
+        slot.reasoning_effort = "low"
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/model", json={"model": "gpt-5.2[high]"})
+
+        assert resp.status == 200
+        assert slot.model == "gpt-5.2[high]"
+        assert slot.reasoning_effort == "high"
+        state.sessions.reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_skips_running_slot_by_default(self, tmp_path):
         state = _make_state(tmp_path)
         state.sessions.reset = AsyncMock()
@@ -16489,22 +16730,37 @@ class TestSlotModelLiveSwitch:
     def _provider(
         *,
         claude: bool = False,
+        codex: bool = False,
         active_turn: bool = False,
         models=("auto",),
         supports_effort: bool = False,
         change_effort: bool = True,
     ):
-        """A live AcpProvider double. ``spec=`` keeps isinstance() working."""
+        """A live AcpProvider double. ``spec=`` keeps isinstance() working.
+
+        The identity is stubbed as a whole SET from one backend id: an unstubbed
+        ``spec=`` property answers a truthy Mock, so setting only the claude flag
+        would leave this double claiming every other harness identity too, and
+        dispatch keyed on any of them would take the wrong branch.
+        """
+        from kiro_crew.acp.types import (
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_KIRO,
+        )
         from kiro_crew.providers.acp import AcpProvider
 
         provider = MagicMock(spec=AcpProvider)
-        provider.is_claude_backend = claude
+        backend = ACP_BACKEND_CODEX if codex else ACP_BACKEND_CLAUDE if claude else ACP_BACKEND_KIRO
+        stub_acp_identity(provider, backend)
+        provider.backend = backend
         provider.has_active_turn.return_value = active_turn
         provider.available_models.return_value = [{"modelId": m} for m in models]
         provider.supports_effort.return_value = supports_effort
         provider.change_effort = AsyncMock(return_value=change_effort)
         provider.clear_effort = AsyncMock(return_value=False)
         provider.client = MagicMock()
+        provider.client.backend = backend
         provider.client.set_model = AsyncMock()
         return provider
 
@@ -16709,6 +16965,26 @@ class TestSlotModelLiveSwitch:
 
         assert resp.status == 200
         provider.change_effort.assert_awaited_once_with("high")
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_codex_composite_pick_applies_and_persists_its_effort(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(codex=True, supports_effort=True)
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        slot = state.get_or_create_slot("a", model="gpt-5.2[low]")
+        slot.reasoning_effort = "low"
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/a/model", json={"model": "gpt-5.2[xhigh]"})
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("gpt-5.2")
+        provider.change_effort.assert_awaited_once_with("xhigh")
+        assert slot.model == "gpt-5.2[xhigh]"
+        assert slot.reasoning_effort == "xhigh"
         state.sessions.reset.assert_not_awaited()
 
     @pytest.mark.asyncio

@@ -114,7 +114,7 @@ import SessionGridView from '../components/SessionGridView'
 import SessionTabStrip from '../components/SessionTabStrip'
 import { useSessionTabs } from '../hooks/useSessionTabs'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
-import { modelSupportsEffort } from '../lib/effort'
+import { showEffortControl } from '../lib/effort'
 import { isEmbeddedPane } from '../lib/embedded'
 import { countCompletedTurns } from '../lib/completedTurns'
 import { displayModel, pinIsWithheld } from '../lib/model'
@@ -154,7 +154,7 @@ import SubagentProgressBar from './chat/SubagentProgressBar'
 import TaskProgressBar from './chat/TaskProgressBar'
 import SidePanel, { CHAT_PANE_MIN_W, sidePanelFillWidth } from './chat/SidePanel'
 import { useSidePanelDock } from '../hooks/useSidePanelDock'
-import { groupDisplayItems, applyRunningState } from './chat/groupDisplayItems'
+import { groupDisplayItems, applyRunningState, hasReasoningContent, isReasoningRole } from './chat/groupDisplayItems'
 import { setSessionPreviewPending, normalizeUrl, PREVIEW_EXPAND_EVENT, PREVIEW_SNIP_EVENT } from '../components/WebPreviewPanel'
 import { detectPreviewUrl, previewFeedDecision } from '../utils/detectPreviewUrl'
 import { fileLandingSlot } from '../utils/uploadRouting'
@@ -1019,6 +1019,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const slotState = useAppSelector(s => s.chat.slotState)
   const contextPct = useAppSelector(s => s.chat.slotContextPct[s.chat.activeSlot ?? ''] ?? 0)
   const contextTokens = useAppSelector(s => s.chat.slotContextTokens?.[s.chat.activeSlot ?? ''])
+  // Plan quota for whatever harness this slot runs on — undefined for the ones
+  // that report none, which is most of them.
+  const rateLimit = useAppSelector(s => s.chat.slotRateLimit?.[s.chat.activeSlot ?? ''])
   // Length only. The two arrays themselves are mutated per streamed sub-agent /
   // tool chunk, and their only consumer is the Activity panel (SidePanel), which
   // is closed by default and now subscribes to them itself. Subscribing to the
@@ -1138,7 +1141,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(installedAgents)
   const filteredAgents = filteredAgentsByName
-  const availableModels = useAvailableModels()
+  const harnessBackend = useAppSelector(s => s.dashboard.status?.harness?.backend ?? '')
+  const slotBackend = useAppSelector(s => {
+    const key = s.chat.activeSlot
+    if (!key) return undefined
+    return s.dashboard.slots.find(sl => sl.key === key)?.acp_backend
+  })
+  const sessionBackend = slotBackend !== undefined ? slotBackend : harnessBackend
+  const availableModels = useAvailableModels({
+    slot: activeSlot || undefined,
+    backend: sessionBackend,
+  })
+  const { data: advertisedEffort } = useQuery({
+    queryKey: ['effort-levels', activeSlot ?? ''],
+    queryFn: () => api.effortLevels(activeSlot || undefined),
+    enabled: !!activeSlot,
+  })
   const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(availableModels)
   // Roving-focus keyboard nav for the agent + model dropdowns (shared with StyledSelect/AgentSelector).
   const { onListKeyDown: onAgentListKeyDown } = useListboxKeyboard({
@@ -1397,7 +1415,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       errorHandoffActiveDurableRef.current = true
       persistErrorHandoffClaims()
       try {
-        await dispatch(switchSlot(slotKey)).unwrap()
+        // `keepTargetOnMissing`: this slot was JUST created, so a 404 from its
+        // detail fetch is a create/fetch race on a slot that exists -- the
+        // reducer keeps it selected (with the seeded composer) atomically
+        // instead of unwinding to the previous chat (#6309), and this catch
+        // stays a no-op rather than patching state back from the caller.
+        await dispatch(switchSlot({ key: slotKey, keepTargetOnMissing: true })).unwrap()
       } catch {
         // switchSlot.pending already activated the fresh slot. Its detail fetch
         // may fail independently; keep the seeded composer usable in that slot.
@@ -4688,7 +4711,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const currentSlot = slots.find(s => s.key === activeSlot)
   // One source for both same-meaning markers in the agent pop-up: the row's check and
   // the default-agent row's label. Reading the slot twice let them disagree.
-  const activeAgentName = currentSlot?.agent || 'default'
+  const activeAgentName = currentSlot?.agent || defaultAgent || 'default'
   // Refs so the "run in terminal" listener (registered once) always sees the
   // live panel controller + this chat's working directory.
   const tabsCtlRef = useRef(tabsCtl); tabsCtlRef.current = tabsCtl
@@ -5133,7 +5156,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const title = currentSlot?.title && currentSlot.title !== currentSlot.key ? currentSlot.title : activeSlot || ''
   const displayMode = approvalMode === 'yolo' ? 'yolo' : currentSlot?.trust ? 'trust' : currentSlot?.trust_reads ? 'trust_reads' : 'normal'
   // Resolve model for existing slots that don't have one stored
-  const _slotAgentName = (currentSlot && !currentSlot.model) ? (currentSlot.agent || 'default') : ''
+  const _slotAgentName = (currentSlot && !currentSlot.model) ? (currentSlot.agent || defaultAgent || 'default') : ''
   const { data: _slotResolvedModel } = useQuery({
     queryKey: ['resolved-model', _slotAgentName, provider.id],
     queryFn: () => provider.resolveModel(_slotAgentName),
@@ -5183,6 +5206,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     currentSlot?.model || resolvedModel || '',
     availableModels,
     _modelsDegraded,
+  )
+  const hasEffort = !!(
+    activeSlot
+    && provider.capabilities.reasoningEffort
+    && showEffortControl(
+      advertisedEffort,
+      shownModel === 'auto' ? '' : shownModel,
+      sessionBackend,
+    )
   )
   // True when the pin row would be a no-op: the agent already stores exactly
   // the model the composer is showing. 'auto' is the inherit spelling, never a
@@ -6293,7 +6325,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // Key identity rules (clientTs preference + streaming→assistant role
     // normalization) live in messageRowKey — see its doc comment.
     const key = messageRowKey(m, i)
-    if (m.role === 'thinking') return m.content ? <ThinkingBlock key={key} content={m.content} disclosureKey={key} /> : null
+    // Shared with the wrap gate and fold — see hasReasoningContent in
+    // groupDisplayItems.ts for why there is ONE definition of this condition.
+    if (hasReasoningContent(m)) return <ThinkingBlock key={key} content={m.content} disclosureKey={key} />
+    if (isReasoningRole(m)) return null
     if (m.role === 'tool') {
       // Skip ✅/🚫 completion messages — completion shown via CircleCheckBig icon
       if (!m.content.startsWith('🔧')) return null
@@ -7648,8 +7683,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onVoiceStart={voiceInputSupported ? startVoice : undefined}
               onVoiceStop={voiceInputSupported ? stopVoice : undefined}
               voiceCaptureActive={voice.recording}
-              agentName={currentSlot?.agent || 'default'}
-              agentSource={installedAgents.find(a => a.name === (currentSlot?.agent || 'default'))?.source}
+              agentName={activeAgentName}
+              agentSource={installedAgents.find(a => a.name === activeAgentName)?.source}
               modelName={shownModel}
               providerLabel={currentSlot?.provider_label}
               onAgentClick={provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); setAgentDropdown(!agentDropdown) } : undefined}
@@ -7661,6 +7696,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               contextPct={contextPct}
               contextUsedTokens={contextTokens?.used}
               contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
+              rateLimit={rateLimit}
               showContextPct={chatConfig.showContextPct}
               showContextTokens={chatConfig.showContextTokens}
               isRunning={composerBusy}
@@ -7711,7 +7747,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               approvalMode={displayMode}
               providerId={provider.id}
               reasoningEffort={effectiveEffort}
-              onReasoningEffortClick={provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) ? (rect) => { setReasoningEffortBtnRect(rect); setReasoningEffortDropdown(!reasoningEffortDropdown) } : undefined}
+              onReasoningEffortClick={hasEffort ? (rect) => { setReasoningEffortBtnRect(rect); setReasoningEffortDropdown(!reasoningEffortDropdown) } : undefined}
               onAutoNudgeClick={setAutoNudgeOpen}
               autoNudgeLoop={autoNudgeLoop}
               autoNudgeOpen={autoNudgeOpen}
@@ -7821,7 +7857,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 filter={modelFilter}
                 setFilter={setModelFilter}
                 onClose={() => setModelDropdown(false)}
-                hasEffort={!!(activeSlot && provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel))}
+                hasEffort={hasEffort}
                 slot={activeSlot}
                 currentEffort={currentSlot?.reasoning_effort || ''}
                 defaultEffort={defaultEffort}
@@ -7854,7 +7890,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onSelect={path => { setProject(path); setProjectPickerOpen(false) }}
             />
             {/* Reasoning effort dropdown portal */}
-            {reasoningEffortDropdown && reasoningEffortBtnRect && activeSlot && provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) && createPortal(
+            {reasoningEffortDropdown && reasoningEffortBtnRect && activeSlot && hasEffort && createPortal(
               <div ref={reasoningEffortDropdownRef} className="fixed z-[9999] animate-slide-up" style={(() => { const left = Math.max(8, Math.min(reasoningEffortBtnRect.left, window.innerWidth - 220)); return { bottom: window.innerHeight - reasoningEffortBtnRect.top + 4, left: isMobile ? 8 : left, ...(isMobile ? { right: 8, maxWidth: 'calc(100vw - 16px)' } : {}) } })()}>
                 <ReasoningEffortDropdown slot={activeSlot} currentEffort={currentSlot?.reasoning_effort || ''} defaultEffort={defaultEffort} onClose={() => setReasoningEffortDropdown(false)} />
               </div>,
@@ -7974,4 +8010,3 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     </RowDisclosureProvider>
   )
 }
-
