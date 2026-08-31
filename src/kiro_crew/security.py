@@ -5630,9 +5630,7 @@ _WIN_83_SUBSTITUTED = set("+,;=[]")
 def _win_83_chars(text: str) -> str:
     """Uppercase ``text`` the way 8.3 generation renders it (drop/substitute)."""
     return "".join(
-        "_" if c in _WIN_83_SUBSTITUTED else c
-        for c in text.upper()
-        if c not in _WIN_83_DROPPED
+        "_" if c in _WIN_83_SUBSTITUTED else c for c in text.upper() if c not in _WIN_83_DROPPED
     )
 
 
@@ -5754,8 +5752,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # very excursion spellings this separator exists to catch (found in
     # review, #5265).
     win_gsep = (
-        rf"(?:{win_sep}(?:\.[. ]*|[^\\/\s'\"]{{1,64}}[. ]*{win_sep}\.\.[. ]*))*"
-        rf"{win_sep}"
+        rf"(?:{win_sep}(?:\.[. ]*|[^\\/\s'\"]{{1,64}}[. ]*{win_sep}\.\.[. ]*))*" rf"{win_sep}"
     )
     # Every fenced segment is rendered through ``_win_segment`` so its
     # normalization-equivalent spellings (trailing ``[. ]`` runs, the 8.3
@@ -5766,8 +5763,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # that closes only one reproduces the partial-fix pattern the issue was
     # filed about.
     win_dirs_pattern = "|".join(
-        win_gsep.join(_win_segment(part) for part in d.split("/"))
-        for d in _SENSITIVE_HOME_DIRS
+        win_gsep.join(_win_segment(part) for part in d.split("/")) for d in _SENSITIVE_HOME_DIRS
     )
     # ``[. ]*`` after the anchor's fixed segment: ``C:\Users.\u\...``
     # resolves to ``C:\Users\u\...`` under the same trailing-dot/space
@@ -5775,9 +5771,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # one segment to the left. The username segment gets its run from the
     # ``win_home_alts`` pad below — ``C:\Users\u \.aws`` re-enters one segment
     # to the RIGHT otherwise (found in review, #5265).
-    generic_win_home = (
-        rf"[A-Za-z]:{win_sep}(?:Users|home)[. ]*{win_sep}[^\\/\s'\"]+"
-    )
+    generic_win_home = rf"[A-Za-z]:{win_sep}(?:Users|home)[. ]*{win_sep}[^\\/\s'\"]+"
     unc_prefix = r"\\\\[^\s'\"]+"
     # cmd.exe and PowerShell spellings of the profile variable both anchor a
     # home-relative fenced path. The cmd.exe form tolerates expansion
@@ -5799,8 +5793,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # all normalize back to the anchor (found in review, #5265). No overlap
     # with what follows: every use joins ``win_gsep``, which begins ``[\\/]``.
     win_home_alts = (
-        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}|{tilde}"
-        f"|{home_var})[. ]*"
+        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}|{tilde}" f"|{home_var})[. ]*"
     )
     # Between the anchor and the fenced remainder, accept the same
     # canonical-no-op chains (``\.\``, ``\X\..\``): they are equivalent to a
@@ -5871,8 +5864,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # generalized separator, so both spellings of every leaf are gated
     # identically and a leaf added to the tuple is covered in both.
     win_wp_prefixes = "|".join(
-        win_gsep.join(_win_segment(part) for part in p.split("/"))
-        for p in _CREW_HOME_PREFIXES
+        win_gsep.join(_win_segment(part) for part in p.split("/")) for p in _CREW_HOME_PREFIXES
     )
     win_wp_leaves = "|".join(
         win_gsep.join(_win_segment(part) for part in leaf.split("/"))
@@ -5918,9 +5910,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"(?:{home_alts}/(?:{agents_dir_alt})"
         rf"|{kiro_home_var}/(?:{agents_leaf_alt}))(?:/|\s|$|['\"])"
     )
-    win_agents_dir_alt = win_gsep.join(
-        _win_segment(part) for part in _KIRO_AGENTS_DIR.split("/")
-    )
+    win_agents_dir_alt = win_gsep.join(_win_segment(part) for part in _KIRO_AGENTS_DIR.split("/"))
     # cmd.exe ``%KIRO_HOME%`` (with expansion modifiers) and the two PowerShell
     # spellings, mirroring ``userprofile``/``appdata_var`` above.
     win_kiro_home_var = (

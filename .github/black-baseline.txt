@@ -285,7 +285,6 @@ src/kiro_crew/heartbeat.py
 src/kiro_crew/history.py
 src/kiro_crew/image_artifacts.py
 src/kiro_crew/imaging.py
-src/kiro_crew/kiro_prerequisite.py
 src/kiro_crew/knowledge/agent_fetch.py
 src/kiro_crew/knowledge/agent_source.py
 src/kiro_crew/knowledge/artifact_ingest.py
@@ -325,7 +324,6 @@ src/kiro_crew/mcp_gateway/manager.py
 src/kiro_crew/mcp_gateway/prewarm.py
 src/kiro_crew/mcp_gateway/rewriter.py
 src/kiro_crew/mcp_gateway/seed.py
-src/kiro_crew/mcp_gateway/session_servers.py
 src/kiro_crew/mcp_gateway/shareability.py
 src/kiro_crew/mcp_gateway/socketsec.py
 src/kiro_crew/mcp_gateway/spill.py
@@ -851,7 +849,6 @@ test/test_mcp_core_audit_e.py
 test/test_mcp_core_more_coverage.py
 test/test_mcp_core_set_project.py
 test/test_mcp_core_spawn_sub_agents.py
-test/test_mcp_core_wait.py
 test/test_mcp_cron_list_compact.py
 test/test_mcp_cron_orphan_validation.py
 test/test_mcp_cron_persistent_session.py
@@ -1176,7 +1173,6 @@ test/test_turn_duration_slack.py
 test/test_turn_duration_task_runner.py
 test/test_turn_duration_workflow.py
 test/test_turn_stats.py
-test/test_unattended_slot_guardrails.py
 test/test_update_venv_detection.py
 test/test_use_builtin_browser_config.py
 test/test_user_resolution_fallback.py
