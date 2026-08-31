@@ -1,0 +1,215 @@
+# Upstream-sync manifest for the Fei2-Labs/kirocrew fork of kirodotdev/KiroCrew.
+# Procedure: the `fork-upstream-sync` skill. Driver: scripts/sync-upstream.sh.
+#
+# This file is the fork's MEMORY. Every sync that teaches something adds an entry.
+# Derived from AGENTS.md, the CI gate scripts, and .trellis/handoffs/INDEX.md's
+# durable-decisions list.
+
+upstream:
+  remote: upstream
+  url: https://github.com/kirodotdev/KiroCrew.git
+  branch: main
+  fork_branch: main
+  sync_branch: "sync/upstream-{date}"
+
+conflict_policy:
+  # ── keystone security surfaces: the fork's hardening is the point ──
+  - glob: "src/kiro_crew/security.py"
+    policy: fork_wins
+    keystone: true
+    note: |
+      Keep _SENSITIVE_HOME_DIRS coverage, the _win_segment quirk-tolerant Windows
+      matcher (#5265), _PROTECTED_BRANCHES, and AKIA/ASIA redaction. Both sides
+      routinely ADD entries to _CREW_SECRET_LEAVES / _SENSITIVE_HOME_DIRS — take
+      the UNION of entries while keeping the fork's matcher implementation.
+
+  - glob: "src/kiro_crew/@(sandbox|hooks|name_grant|session_pid).py"
+    policy: fork_wins
+    keystone: true
+    note: |
+      sandbox.py: keep BOTH sandboxed_spawn_argv_off_loop (3 call sites depend on
+      it by name) and shielded_prepare_off_loop. name_grant.py: upstream's
+      hardening here is usually a strict superset — prefer it, it over-refuses
+      which is the safe direction.
+
+  - glob: "src/kiro_crew/dashboard/chat_runner.py"
+    policy: fork_wins
+    keystone: true
+    note: |
+      NEVER let configured_auto_approve return as a grant source (see
+      divergences/auth-grant-sources). Watch for the merge duplicating
+      _name_grant_refusal_off_loop — keep the platform-aware copy.
+
+  - glob: "src/kiro_crew/acp/types.py"
+    policy: fork_wins
+    keystone: true
+    note: "ACP_BACKENDS_SELECTABLE carries the fork's admitted adapters."
+
+  - glob: "src/kiro_crew/config/loader.py"
+    policy: fork_wins
+    keystone: true
+    note: "agent.provider stays enum=['acp']; CONTRACT_VERSION pinned at 1."
+
+  # ── generated: regenerate, never hand-merge ──
+  - glob: "@(config-baseline|error-code-baseline).json"
+    policy: upstream_then_regen
+  - glob: ".github/black-baseline.txt"
+    policy: upstream_then_regen
+  - glob: "website/src/components/commandPalette/settingsRegistry.gen.ts"
+    policy: upstream_then_regen
+
+  # ── structure churns upstream: take theirs, re-apply fork fixes ──
+  - glob: "src/kiro_crew/dashboard/**"
+    policy: upstream_wins
+    note: "Re-apply fork messaging/approval fixes on top."
+  - glob: "src/kiro_crew/apps/builtins/**"
+    policy: upstream_wins
+  - glob: "website/src/**"
+    policy: upstream_wins
+    note: "Keep fork-only i18n/glossary additions (union within this policy)."
+  - glob: "test/**"
+    policy: upstream_wins
+    note: |
+      EXCEPT a test pinning a fork divergence (see divergences below) — that
+      failure is the test doing its job; update the expected value, keep the
+      assertion.
+
+  - glob: "docs/**"
+    policy: union
+  - glob: "*.md"
+    policy: union
+
+  - glob: "website/electron/package.json"
+    policy: fork_wins
+    note: "Fork keeps its own version cadence (matches CHANGELOG.md)."
+
+divergences:
+  - id: auth-grant-sources
+    what: "Only explicit slot trust or global YOLO auto-approves a tool call."
+    why: |
+      Upstream treated `approval_mode: "auto"` (the DEFAULT) as an unconditional
+      grant, silently auto-approving every tool call on a fresh install. Removing
+      configured_auto_approve was a security fix, not a preference.
+    pinned_by: "test/test_promise_only_autoapprove_parity.py, test/test_unattended_slot_guardrails.py"
+    decided: 2026-08-28
+
+  - id: protected-branches
+    what: "security._PROTECTED_BRANCHES = {main, mainline, master}"
+    why: |
+      An earlier session cleared this to set() with the comment 'agent is trusted
+      to push to any branch'. It broke 9 pinned tests and the AGENTS.md
+      keep-generic-security-controls invariant. Reverted; do not re-clear.
+    pinned_by: "test/test_push_branch_gate.py, test/test_security.py"
+    decided: 2026-08-23
+
+  - id: opencode-copilot-selectable
+    what: "opencode and copilot are in ACP_BACKENDS_SELECTABLE; upstream withholds both."
+    why: |
+      Unlike claude, these are not dormant seams — the fork's core resolves and
+      spawns `opencode acp` / `copilot --acp` directly and both were driven end
+      to end here. Upstream's staged admission withholds everything but kiro/kas.
+    pinned_by: "test/test_harness_parity.py::test_initial_adapter_selection_is_limited_to_reviewed_backends, test/test_acp_backend_opencode_pi.py::test_opencode_is_known_and_admitted"
+    decided: 2026-08-31
+
+  - id: copilot-backend-identity
+    what: "is_copilot_backend predicate + 'copilot' in session_pid._MANAGED_AGENT_MARKERS."
+    why: |
+      Any backend the fork admits beyond upstream's set needs BOTH: a positive
+      identity predicate (harness parity H5) and a process marker, or its
+      processes become unreapable orphans. The marker was missed once already.
+    pinned_by: "test/test_acp_backend_kas.py::test_exactly_one_predicate_holds_for_every_known_backend, test/test_acp_backend_labels.py::TestManagedAgentMarkers"
+    decided: 2026-08-31
+
+  - id: mcp-injection-composition
+    what: "Crew's managed MCP servers reach spec adapters via _session_mcp_servers."
+    why: |
+      kiro stays spec-free (--agent loads its own, injecting would double-launch);
+      pooled stub outranks spec entry; fail-soft on malformed spec. Must COMPOSE
+      with upstream's acp/spec_servers.py, never duplicate it.
+    pinned_by: "test/test_acp_spec_mcp_delivery.py, test/test_acp_runtime.py (builder-consultation guard)"
+    decided: 2026-08-29
+
+  - id: connections-disconnect-owner-gate
+    what: "api_connections_disconnect requires require_owner_dashboard_request."
+    why: |
+      It deletes stored OAuth grant artifacts. Its sibling mint endpoint was
+      gated; this one was not, so a non-owner could trigger revocation.
+    pinned_by: "test/test_agent_config_owner_gate_invariant.py::test_every_gated_route_refuses_non_owner"
+    decided: 2026-08-31
+
+  - id: de-amazoned
+    what: "No Brazil, CodeArtifact, SSO, MCS, enterprise auth, internal markers."
+    why: "Public OSS fork. Re-introducing any of it is a publish-safety failure."
+    pinned_by: "scripts/scrub-lint.sh (CI: De-Amazon Scrub Lint)"
+    decided: 2026-08-19
+
+  - id: fork-ux-removals
+    what: "Channels app hidden from the App Store; Board app removed."
+    why: "Deliberate fork UX divergence; an upstream sync must not restore them."
+    pinned_by: null   # TODO: no test defends this — write one, or it will come back
+    decided: 2026-08-19
+
+toolchain:
+  python: ".venv/bin/python3"
+  node: "npm"
+  typecheck_extra_args: "--platform linux"   # AGENTS.md: CI types on Linux
+
+gates:
+  - name: "no conflict markers"
+    run: "! git grep -n '^<<<<<<<' -- ':!*.md' ':!.fork-sync.yml'"
+  - name: "black (baselined)"
+    run: "{python} scripts/check_black_formatting.py"
+  - name: "subprocess encoding"
+    run: "{python} scripts/check_subprocess_encoding.py"
+  - name: "harness parity"
+    run: "HARNESS_BASE_REF=origin/{fork_branch} python3 scripts/check_harness_parity.py"
+  - name: "brand name"
+    run: "BRAND_BASE_REF=origin/{fork_branch} python3 scripts/check_brand_name.py"
+  - name: "docs lint"
+    run: "bash scripts/docs-lint.sh"
+
+baselines:
+  - path: "config-baseline.json"
+    regen: "{python} scripts/generate_config_baseline.py"
+  - path: "error-code-baseline.json"
+    regen: "{python} test/test_error_code_contract.py --update"
+  - path: ".github/black-baseline.txt"
+    regen: "{python} scripts/check_black_formatting.py --update-baseline"
+  - path: "website/src/components/commandPalette/settingsRegistry.gen.ts"
+    regen: "cd website && npm run gen:settings"
+
+tests:
+  focused: "{python} -m pytest test/test_security.py test/test_harness_parity.py test/test_acp_backend_kas.py test/test_acp_backend_labels.py test/test_acp_backend_opencode_pi.py test/test_acp_spec_mcp_delivery.py test/test_agent_config_owner_gate_invariant.py test/test_promise_only_autoapprove_parity.py test/test_unattended_slot_guardrails.py test/test_push_branch_gate.py -q"
+  full: "{python} -m pytest -q --timeout=180 -k 'not pty_integration'"
+  frontend: "cd website && npx tsc -b && npm run build && npx vitest run --coverage=false"
+
+known_red:
+  - check: "Dependency License Gate"
+    reason: "Dependency review needs the repo's Dependency graph enabled."
+    fix: "Repo Settings → Code security & analysis → enable Dependency graph."
+  - check: "Design Review / First Principles Review / GPT 5.6 Review / Opus 4.8 Review"
+    reason: "Fork has no AWS Bedrock credentials; these gates fail CLOSED by design."
+    fix: "Configure Bedrock OIDC/secrets, or exempt upstream-sync PRs from them."
+  - check: "scripts/scrub-lint.sh — git-history scan"
+    reason: |
+      Flags ~1100 @amazon.com-authored commits already in history from earlier
+      upstream syncs. Working-tree scan passes; only the history step fails.
+    fix: "Not fixable without rewriting history. Read the working-tree result only."
+
+environmental_failures:
+  - pattern: "test/test_tailnet_e2e.py"
+    reason: "Needs tailscale + network the runner denies; fails on the merge base."
+  - pattern: "*@pty_integration"
+    reason: "Known-flaky pty/websocket timeouts; fail on the merge base."
+  - pattern: "test/test_ensure_python_symlink.py"
+    reason: "dyld @rpath/libpython resolution in scratch venvs."
+  - pattern: "test/test_stop_hook_continuation.py::TestRealHookProcess"
+    reason: "Spawned hook exits rc=126 in this sandbox."
+  - pattern: "test/test_deploy_web_profiles.py::test_create_aws_profile_writes_only_allowlisted_keys"
+    reason: "shlex.split breaks on this checkout's space-containing path ('My Apps')."
+  - pattern: "test/test_ci_surface_tests.py::test_explicit_cli_target_bypasses_collect_ignore"
+    reason: "Asserts a pytest-version behavior; unrelated to Kiro Crew code."
+  - pattern: "website/src/i18n/style/hiStyle.test.ts"
+    reason: |
+      Ratchet ceiling vs actual violation count. Bumped 118→119 on 2026-08-31;
+      if it fails again the catalog grew — bump the ceiling, do not silence it.
