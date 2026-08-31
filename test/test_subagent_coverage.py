@@ -506,9 +506,25 @@ class TestAvailableMemoryGb:
         monkeypatch.setattr(sa, "_macos_available_memory_gb", lambda: 3.5)
         assert sa._available_memory_gb() == 3.5
 
+    def test_windows_branch_delegates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(sa.platform_compat, "IS_LINUX", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_MACOS", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_WINDOWS", True, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "host_available_mib", lambda: 8192)
+        assert sa._available_memory_gb() == 8.0
+
+    def test_windows_unreadable_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``host_available_mib`` answers 0 for "cannot read", never "no memory"."""
+        monkeypatch.setattr(sa.platform_compat, "IS_LINUX", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_MACOS", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_WINDOWS", True, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "host_available_mib", lambda: 0)
+        assert sa._available_memory_gb() == -1.0
+
     def test_unsupported_platform_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(sa.platform_compat, "IS_LINUX", False, raising=False)
         monkeypatch.setattr(sa.platform_compat, "IS_MACOS", False, raising=False)
+        monkeypatch.setattr(sa.platform_compat, "IS_WINDOWS", False, raising=False)
         assert sa._available_memory_gb() == -1.0
 
 
@@ -1979,12 +1995,13 @@ class TestAnnounceDigestFlush:
         mark.assert_not_called()
         assert info._digest_settle_ids == ["m1"]
 
-    def test_settle_swallows_tombstone_failure(self) -> None:
+    @pytest.mark.asyncio
+    async def test_settle_swallows_tombstone_failure(self) -> None:
         mgr = _manager()
         info = _info()
         info._digest_settle_ids = ["m1"]
         with patch.object(sa, "mark_delivered", side_effect=OSError):
-            mgr._settle_digest_holds(info)
+            await mgr._settle_digest_holds(info)
         assert info._digest_settle_ids == []
 
 
@@ -2175,9 +2192,28 @@ class TestSteerRun:
         mgr = _manager()
         info = _info("a")
         info._session_sharing = True
-        info._shared_provider = MagicMock(steer=AsyncMock(return_value=False))
+        info._shared_provider = MagicMock(steer=AsyncMock(return_value=False), supports_steer=True)
         mgr._agents["a"] = info
         assert await mgr.steer_run("a", "hi") == (False, "steer rejected by provider")
+
+    @pytest.mark.asyncio
+    async def test_spec_adapter_degrades_to_follow_up_without_hanging(self) -> None:
+        mgr = _manager()
+        info = _info("a")
+        info._session_sharing = True
+        provider = MagicMock()
+        provider.supports_steer = False
+        provider.backend = "goose"
+        provider.steer = AsyncMock(side_effect=AssertionError("must not send _session/steer"))
+        info._shared_provider = provider
+        mgr._agents["a"] = info
+        mgr.follow_up_run = AsyncMock(return_value=(True, "queued"))
+        ok, detail = await mgr.steer_run("a", "correct the approach")
+        assert ok is True
+        assert detail.startswith("follow_up:")
+        assert "goose" in detail.lower() or "does not implement mid-turn steer" in detail
+        mgr.follow_up_run.assert_awaited_once_with("a", "correct the approach")
+        provider.steer.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_audit_failure_does_not_change_the_verdict(self) -> None:

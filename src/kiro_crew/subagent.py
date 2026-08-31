@@ -17,7 +17,7 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
@@ -518,6 +518,93 @@ def _resolved_model_of(client: object) -> str:
     return "" if model == DEFAULT_MODEL else model
 
 
+def parent_live_harness(sessions: object, session_key: str) -> tuple[str | None, list[str]]:
+    """Read ``live_harness`` only when the store returns a real ``(backend, ids)``.
+
+    Unit-test stubs pass a ``MagicMock`` SessionManager. Calling the auto-
+    generated ``live_harness`` returns another mock, which unpacks as an
+    empty iterable. Treat that as no parent so cron / test stubs keep the
+    factory snapshot instead of crashing the spawn.
+    """
+    reader = getattr(sessions, "live_harness", None)
+    if not callable(reader):
+        return None, []
+    result = reader(session_key)
+    if not isinstance(result, tuple) or len(result) != 2:
+        return None, []
+    backend, advertised = result
+    if backend is not None and not isinstance(backend, str):
+        return None, []
+    if not isinstance(advertised, (list, tuple)):
+        return backend, []
+    return backend, [item for item in advertised if isinstance(item, str)]
+
+
+def _harness_label(provider: LLMProvider) -> str:
+    """Operator-facing harness name for a typed refusal, or ``this harness``."""
+    backend = provider.backend
+    if not isinstance(backend, str):
+        return "this harness"
+    try:
+        from kiro_crew.acp.backends import descriptor_for
+
+        return descriptor_for(backend).label
+    except Exception:
+        return backend or "this harness"
+
+
+def _resume_failed_message(client: LLMProvider, conversation_key: str) -> str:
+    """Fail-closed spawn_continue text; names a harness with no native resume."""
+    backend = client.backend
+    reason = (
+        "session/load did not restore conversation "
+        f"{conversation_key} — refusing to execute the follow-up without "
+        "its prior context. The conversation may be locked by a live "
+        "process or its files corrupt; re-spawn with a fresh task "
+        "carrying a summary."
+    )
+    if isinstance(backend, str):
+        try:
+            from kiro_crew.acp.backends import CAP_NATIVE_RESUME, descriptor_for, supports
+
+            if not supports(backend, CAP_NATIVE_RESUME):
+                label = descriptor_for(backend).label
+                reason = (
+                    f"{label} does not support native resume (session/load) "
+                    f"for conversation {conversation_key} — refusing to "
+                    "execute the follow-up without its prior context. "
+                    "Re-spawn with a fresh task carrying a summary."
+                )
+        except Exception:
+            pass
+    return f"resume_failed: {reason}"
+
+
+def dedicated_child_factory_kwargs(
+    *,
+    parent_backend: str | None,
+    advertised: Sequence[str],
+    preferred_model: str,
+) -> dict[str, Any]:
+    """Factory kwargs that keep a dedicated child on the parent's harness.
+
+    When there is no live parent, returns ``{}`` so cron / parentless spawns
+    keep using the factory snapshot. When there is a parent, ``acp_backend``
+    is always set (including ``""`` for kiro). A preferred model is sent only
+    when ``resolve_usable_model`` says the parent advertised it — otherwise
+    the child inherits the session default rather than a kiro id or ``"auto"``.
+    """
+    if parent_backend is None:
+        return {}
+    from kiro_crew.acp.client import resolve_usable_model
+
+    kwargs: dict[str, Any] = {"acp_backend": parent_backend}
+    resolved = resolve_usable_model(preferred_model, advertised)
+    if resolved:
+        kwargs["model"] = resolved
+    return kwargs
+
+
 def _subagent_default_model() -> str:
     """Explicit sub-agent model pin (``agent.role_models['subagent']``), or ``""``.
 
@@ -551,7 +638,13 @@ def _subagent_default_effort() -> str:
         return ""
 
 
-def _spawn_effective_model(model: str, agent: str) -> str:
+def _spawn_effective_model(
+    model: str,
+    agent: str,
+    acp_backend: str | None = None,
+    *,
+    model_pin_resolved: bool = False,
+) -> str:
     """The model the provider factory's effort gate will actually see, or ``""``.
 
     Not a re-encoding of the factory's precedence — the selection itself is
@@ -564,29 +657,62 @@ def _spawn_effective_model(model: str, agent: str) -> str:
     kwarg is passed, ``session._session_model`` for *agent* (a crew's own pin,
     else non-sentinel global; ``None`` for a named kiro agent so the factory
     resolves the agent's own JSON pin — which ``acp_effective_model`` then
-    does, identically). Never raises; ``""`` on any resolution failure.
+    does, identically). ``acp_backend`` is the live-parent override; ``None``
+    uses the factory's configured snapshot. Never raises; ``""`` on any
+    resolution failure.
     """
     try:
         # circular imports (config.loader / session import sibling modules at
         # load time, matching the lazy-import convention of _subagent_default_*)
+        from kiro_crew.acp.backends import CAP_REGISTRY_MODEL_IDS, supports
         from kiro_crew.config.loader import KiroCrewConfig
         from kiro_crew.session import _session_model
 
-        # The kwarg the spawn path actually passes (see _run_inner): raw
-        # info.model — an explicit "auto" flows through VERBATIM and the
-        # factory treats it as a truthy override — else the role pin.
-        override: str | None = model or _subagent_default_model() or None
         cfg = KiroCrewConfig.load()
+        configured_backend = cfg.agent.acp_backend
+        if not isinstance(configured_backend, str):
+            configured_backend = ""
+        backend = configured_backend if acp_backend is None else acp_backend
+        backend_crossover = acp_backend is not None and backend != configured_backend
+        registry_model_ids = supports(backend, CAP_REGISTRY_MODEL_IDS)
+        # A resolved pin has already passed through the live parent's advertised
+        # model filter. Do not reintroduce a role pin that filter deliberately
+        # removed.
+        preferred = model if model_pin_resolved else model or _subagent_default_model()
+        override: str | None = preferred or None
+        if override is None and backend_crossover:
+            # The live parent predates a Settings switch. The launcher tells
+            # its factory to inherit the parent's backend default, so no model
+            # from the current config participates in the effort receipt.
+            return ""
         if override is None:
             # No kwarg: get_or_create resolves the session chain and passes
             # its result (possibly None) as model_override.
-            override = _session_model(cfg, agent or None)
-        return cfg.acp_effective_model(agent or None, override) or ""
+            override = _session_model(
+                cfg,
+                agent or None,
+                registry_model_ids=registry_model_ids,
+            )
+        return (
+            cfg.acp_effective_model(
+                agent or None,
+                override,
+                registry_model_ids=registry_model_ids,
+            )
+            or ""
+        )
     except Exception:
         return ""
 
 
-def effort_drop_reason(model: str, reasoning_effort: str, agent: str = "") -> str:
+def effort_drop_reason(
+    model: str,
+    reasoning_effort: str,
+    agent: str = "",
+    acp_backend: str | None = None,
+    *,
+    model_pin_resolved: bool = False,
+) -> str:
     """Why a requested per-spawn effort will not take effect, or ``""``.
 
     Mirrors the model resolution the provider factory's effort gate actually
@@ -601,7 +727,12 @@ def effort_drop_reason(model: str, reasoning_effort: str, agent: str = "") -> st
     """
     if not reasoning_effort:
         return ""
-    resolved = _spawn_effective_model(model, agent)
+    resolved = _spawn_effective_model(
+        model,
+        agent,
+        acp_backend,
+        model_pin_resolved=model_pin_resolved,
+    )
     if not resolved:
         return (
             "no concrete model is pinned — the model resolves to 'auto', which "
@@ -613,7 +744,14 @@ def effort_drop_reason(model: str, reasoning_effort: str, agent: str = "") -> st
     return ""
 
 
-def effort_applied_note(model: str, reasoning_effort: str, agent: str = "") -> str:
+def effort_applied_note(
+    model: str,
+    reasoning_effort: str,
+    agent: str = "",
+    acp_backend: str | None = None,
+    *,
+    model_pin_resolved: bool = False,
+) -> str:
     """The delivery mirror of :func:`effort_drop_reason`, or ``""``.
 
     Names the resolved model and the family-specific cli.json settings key the
@@ -626,7 +764,12 @@ def effort_applied_note(model: str, reasoning_effort: str, agent: str = "") -> s
     """
     if not reasoning_effort:
         return ""
-    resolved = _spawn_effective_model(model, agent)
+    resolved = _spawn_effective_model(
+        model,
+        agent,
+        acp_backend,
+        model_pin_resolved=model_pin_resolved,
+    )
     if not resolved or not model_supports_effort(resolved):
         return ""
     return f"{resolved} → {effort_settings_key(resolved)}.effort"
@@ -953,6 +1096,8 @@ def _available_memory_gb() -> float:
         • macOS  — reclaimable memory via Mach ``host_statistics64`` (ctypes,
                    in-process, no subprocess); see ``_macos_available_memory_gb``.
                    No cgroups.
+        • Windows — ``GlobalMemoryStatusEx`` through
+                   ``platform_compat.host_available_mib``. No cgroups.
         • other  — no probe yet → ``-1.0`` (fail open).
 
     NOTE (adding a new OS): implement a ``_<os>_available_memory_gb()`` helper
@@ -970,8 +1115,28 @@ def _available_memory_gb() -> float:
         return min(host_gb, cg_gb)
     if platform_compat.IS_MACOS:
         return _macos_available_memory_gb()
-    # Unsupported platform (e.g. Windows): no probe yet → fail open.
+    if platform_compat.IS_WINDOWS:
+        return _windows_available_memory_gb()
+    # Unsupported platform: no probe yet → fail open.
     return -1.0
+
+
+def _windows_available_memory_gb() -> float:
+    """Available memory (GB) on Windows, or ``-1.0`` when it cannot be read.
+
+    Delegates to ``platform_compat.host_available_mib`` instead of calling
+    ``GlobalMemoryStatusEx`` here. That shim is the single place the MiB unit
+    and the "0 means unreadable, never zero memory" contract are defined, and a
+    second reader would have to restate both to stay correct.
+
+    Without this branch the cap loses its memory term on Windows entirely and
+    falls open to ``_LEGACY_DEFAULT_MAX``, so a host with tens of GB free is
+    held to the same three concurrent sub-agents as an unmeasurable one.
+    """
+    available_mib = platform_compat.host_available_mib()
+    if available_mib <= 0:
+        return -1.0  # unreadable → caller fails open
+    return available_mib / 1024.0
 
 
 def _macos_vm_reclaimable_pages() -> Optional[int]:
@@ -2683,8 +2848,9 @@ class SubagentManager:
     def _record_slow_command(info: SubagentInfo, idle: float) -> None:
         """Best-effort append of a stalled subagent's slow command for analysis.
 
-        Writes to ``~/.kiro/crew/subagents/slow_commands.jsonl`` (append-only,
-        survives per-agent folder cleanup). Deliberately separate from the
+        Writes to ``~/.kiro/crew/subagents/slow_commands.jsonl`` (rotated at
+        1 MiB keeping one previous generation, survives per-agent folder
+        cleanup). Deliberately separate from the
         tombstone path, which marks an agent dead — a stalled agent is still
         running.
         """
@@ -3201,6 +3367,10 @@ class SubagentManager:
                 "outcome": info.outcome,
                 "task": _redact(info.task),
                 "agent": _redact(info.agent),
+                # The sub-agent's own session key (see build_subagent_snapshot):
+                # lets a client fetch this node's own context-trace even after
+                # it has finished.
+                "child_session": info.conversation_key or f"subagent:{info.id}",
                 # The model actually served (issue #3582). By the terminal
                 # report this is the authoritative value on every provider — the
                 # CC/raw path has completed at least one turn, so its
@@ -4805,14 +4975,14 @@ class SubagentManager:
         if info.done:
             return False, "not_running: run finished — use spawn_continue"
 
-        def _resolve_provider() -> Any:
+        def _resolve_provider() -> LLMProvider | None:
             if info._session_sharing and info._shared_provider is not None:
                 return info._shared_provider
             session_key = info.conversation_key or f"subagent:{info.id}"
             return self._sessions.get_provider(session_key)
 
-        provider: Any = _resolve_provider()
-        if provider is None or not hasattr(provider, "steer"):
+        provider = _resolve_provider()
+        if provider is None:
             # Bounded wait for session registration on a run that is still
             # alive. Re-checks done-ness each tick: a run finishing while we
             # wait flips the answer to not_running, never a stale inject.
@@ -4822,7 +4992,7 @@ class SubagentManager:
                 if info.done:
                     return False, "not_running: run finished — use spawn_continue"
                 provider = _resolve_provider()
-                if provider is not None and hasattr(provider, "steer"):
+                if provider is not None:
                     break
             else:
                 return False, (
@@ -4830,6 +5000,19 @@ class SubagentManager:
                     f"not registered within {_STEER_STARTUP_WAIT_SECS}s — "
                     "retry in a few seconds"
                 )
+        if not provider.supports_steer:
+            # Spec adapters (and any harness not in ACP_BACKENDS_STEER) have
+            # no ``_session/steer``. Sending the method looks like success
+            # (fire-and-forget) and then hangs or no-ops. Queue as follow_up
+            # so the correction is not dropped and the reason names the
+            # harness.
+            label = _harness_label(provider)
+            ok, detail = await self.follow_up_run(agent_id, message)
+            if ok:
+                return True, (
+                    f"follow_up: {label} does not implement mid-turn steer " "(_session/steer)"
+                )
+            return ok, detail
         try:
             ok = await provider.steer(message)
         except Exception as exc:  # pragma: no cover - provider-specific
@@ -6752,7 +6935,15 @@ class SubagentManager:
         # off the bare per-spawn ``model`` would miss a config-pinned run served a
         # different model (Design review on #3582).
         info.requested_model = eff_model
-        if eff_model:
+        parent_backend, advertised = parent_live_harness(self._sessions, info.parent_session_key)
+        child_kw = dedicated_child_factory_kwargs(
+            parent_backend=parent_backend,
+            advertised=advertised,
+            preferred_model=eff_model,
+        )
+        if parent_backend is not None:
+            extra_kwargs.update(child_kw)
+        elif eff_model:
             extra_kwargs["model"] = eff_model
         # Sub-agent reasoning effort (per-call override -> role_efforts['subagent']
         # -> chat default). Passed as an override so it wins over the factory's
@@ -6760,28 +6951,6 @@ class SubagentManager:
         eff_effort = info.reasoning_effort or _subagent_default_effort()
         if eff_effort:
             extra_kwargs["reasoning_effort_override"] = eff_effort
-        if eff_effort:
-            # Judge the drop warning on the same model the factory's effort
-            # gate will see: the kwarg when pinned, else what the session layer
-            # resolves for this agent (crew pin, else non-sentinel global).
-            # Off the loop — the resolver reads config and ~/.kiro/agents, the
-            # same reason get_or_create runs _session_model in an executor.
-            effective_model = await asyncio.to_thread(
-                _spawn_effective_model, info.model, agent or ""
-            )
-            if not effective_model or not model_supports_effort(effective_model):
-                # The provider factory's effort gate will drop this level: only
-                # a concrete, effort-capable model can carry one. Reporting-only
-                # — the kwarg is still passed and the factory stays the single
-                # dropping authority.
-                logger.warning(
-                    "subagent %s: reasoning effort '%s' (%s) will not be applied — "
-                    "model '%s' does not support effort configuration",
-                    info.id,
-                    eff_effort,
-                    "per-call" if info.reasoning_effort else "role pin",
-                    effective_model or "auto",
-                )
         if info.bare:
             extra_kwargs["bare"] = True
         if info.allowed_tools:
@@ -6812,7 +6981,7 @@ class SubagentManager:
         # dedicated process path so the override in extra_kwargs actually reaches
         # get_or_create -> the provider factory; otherwise a configured sub-agent
         # model/effort would silently no-op on the default (session-sharing) path.
-        if eff_model or eff_effort:
+        if extra_kwargs.get("model") or extra_kwargs.get("reasoning_effort_override"):
             use_session_sharing = False
         if use_session_sharing:
             try:
@@ -6854,13 +7023,7 @@ class SubagentManager:
             # to (re-spawn with a summary). conversation_key is only set by
             # continue_conversation, so first spawns are unaffected.
             if info.conversation_key and not _resumed:
-                raise RuntimeError(
-                    "resume_failed: session/load did not restore conversation "
-                    f"{info.conversation_key} — refusing to execute the "
-                    "follow-up without its prior context. The conversation "
-                    "may be locked by a live process or its files corrupt; "
-                    "re-spawn with a fresh task carrying a summary."
-                )
+                raise RuntimeError(_resume_failed_message(client, info.conversation_key))
             # Detect CC provider to skip permission event loop
             is_cc = self._is_cc_provider(client)
         await self._coordinator_mark_running(info)
@@ -6971,10 +7134,13 @@ class SubagentManager:
                 "agent": agent or "",
                 "model": info.resolved_model,
                 # The requested pin is caller-supplied (spawn_run.model), so it
-                # is redacted like every other free-text field on the frame — an
+                # is redacted like every other free-text field on the frame -- an
                 # unavailable/AKIA-shaped pin must never reach the dashboard
                 # socket raw (GPT review on #5326).
                 "requested_model": _redact(info.requested_model),
+                # The sub-agent's own session key (see build_subagent_snapshot):
+                # lets a client fetch this node's own context-trace.
+                "child_session": info.conversation_key or f"subagent:{info.id}",
             },
         )
         # Stream results to disk for orchestrated chat.
@@ -7318,9 +7484,14 @@ class SubagentManager:
                 # increment is parent-scoped.
                 info.last_tool = event.title or ""
                 self._note_tool_dispatch(info, event)
-                # Persist turn state for orphan recovery diagnostics
+                # Persist turn state for orphan recovery diagnostics.
+                # Off-loop (to_thread): update_state does a synchronous
+                # fsync, so a slow/NFS FS must not freeze the gateway
+                # heartbeat on every tool-call event (#6288).
                 try:
-                    update_state(info.id, turns=turns, last_tool=event.title or "")
+                    await asyncio.to_thread(
+                        update_state, info.id, turns=turns, last_tool=event.title or ""
+                    )
                 except Exception:
                     pass
                 await self._fire_event(
@@ -7361,6 +7532,7 @@ class SubagentManager:
                     is_shell=event.is_shell,
                     mcp_server_name=event.mcp_server_name,
                     mcp_tool_name=event.tool_name,
+                    mcp_identity_ambiguous=event.mcp_identity_ambiguous,
                 )
                 if tool_result.action == TOOL_DENY:
                     await self._reject_and_log(
@@ -7368,18 +7540,19 @@ class SubagentManager:
                     )
                     continue
                 if event.child_low_fidelity:
-                    # UNCONDITIONAL parent grant + verified canonical MCP
-                    # identity: parent_policy=auto approves regardless of
-                    # event content, and child_mcp_identity_trusted proves a
-                    # real MCP tool_call frame (non-model-authored _meta.kiro
-                    # identity, resolved non-shell) is behind this request —
-                    # only its ARGUMENTS are unverified, which this grant
-                    # never reads. Honor the grant instead of stalling a
-                    # trusted fan-out on an interactive card per call. The
-                    # hook auto-approve below stays fail-closed for these:
-                    # its auto_approve_tools patterns match the agent-authored
-                    # title, which a child could forge.
-                    if parent_policy == "auto" and event.child_mcp_identity_trusted:
+                    # UNCONDITIONAL parent grant: parent_policy=auto approves
+                    # regardless of event content, so it may honor a request
+                    # that is grant-eligible (see
+                    # AcpEvent.child_unconditional_grant_eligible — inside
+                    # this low-fidelity branch that means the canonical MCP
+                    # identity is verified and only the ARGUMENTS are
+                    # unverified, which this grant never reads). Honor the
+                    # grant instead of stalling a trusted fan-out on an
+                    # interactive card per call. The hook auto-approve below
+                    # stays fail-closed for these: its auto_approve_tools
+                    # patterns match the agent-authored title, which a child
+                    # could forge.
+                    if parent_policy == "auto" and event.child_unconditional_grant_eligible:
                         await self._approve_and_log(
                             client,
                             event.request_id,

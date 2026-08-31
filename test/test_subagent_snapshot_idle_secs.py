@@ -89,6 +89,22 @@ def test_the_rest_of_the_frame_is_unchanged():
     assert data["slot"]
 
 
+def test_the_frame_carries_the_childs_own_session_key():
+    """The Session Breakdown tree fetches each node's OWN context-trace by this
+    key, so the snapshot must name where the sub-agent writes its ctx_blocks:
+    ``subagent:<id>`` when it has no explicit conversation key."""
+    data = build_subagent_snapshot(_agent(id="x9"), now=1000.0)
+    assert data["child_session"] == "subagent:x9"
+
+
+def test_an_explicit_conversation_key_wins_for_the_child_session():
+    """A sub-agent given a conversation key writes its rows there, so the frame
+    must report that key rather than the ``subagent:<id>`` fallback -- mirroring
+    the run key ``conversation_key or subagent:<id>`` in SubagentManager."""
+    data = build_subagent_snapshot(_agent(id="x9", conversation_key="chat-7"), now=1000.0)
+    assert data["child_session"] == "chat-7"
+
+
 def test_the_frame_still_redacts_credentials():
     """The extraction must not drop the redaction the inline builder applied."""
     a = _agent(stalled=True, task="curl -H 'Authorization: Bearer sk-ant-api03-SECRETVALUE'")

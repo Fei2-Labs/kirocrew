@@ -5858,17 +5858,17 @@ async def _make_live(path: str, dry_run: bool = False,
             return ok
 
         async def _unwind() -> bool:
-            # Both halves block: restore() ends in restrict_to_owner, which shells
-            # out to icacls on Windows, and svc.rollback() rewrites the service
+            # Both halves block: restore() ends in restrict_to_owner, which
+            # rewrites a DACL on Windows, and svc.rollback() rewrites the service
             # definition. Offload them for the same reason the write below is
             # offloaded — an unwind must not stall every other gateway request for
-            # the duration of a subprocess.
+            # the duration of blocking filesystem work.
             return await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), _unwind_sync
             )
 
         try:
-            # write_target ends in restrict_to_owner, which shells out to icacls
+            # write_target ends in restrict_to_owner, which rewrites a DACL
             # on Windows. Run it off the loop so a cutover cannot stall every
             # other gateway request for the duration of that subprocess.
             loop = asyncio.get_running_loop()

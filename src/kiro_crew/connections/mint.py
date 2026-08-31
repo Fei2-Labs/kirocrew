@@ -502,8 +502,8 @@ def _log_mint_outcome(slug: str, outcome: str, detail: str) -> None:
 
     Blocking on FIRST use: the append itself is queued to SEL's writer thread, but
     the first ``sel()`` of a process constructs the log -- trust-dir creation, key
-    validation, a backward scan of the existing log, and on Windows an ``icacls``
-    subprocess. Async callers go through ``asyncio.to_thread``.
+    validation, a backward scan of the existing log, and on Windows the owner-only
+    DACL on the key file. Async callers go through ``asyncio.to_thread``.
     """
     sel().log_api_access(
         caller="dashboard",

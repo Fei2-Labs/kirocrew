@@ -36,7 +36,7 @@ import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import { classifyDrop } from '../utils/dropClassify'
-import { serializeDirTokens, spliceDirTokens, VIDEO_EXT, VIDEO_MAX_BYTES } from '../utils/fileTokens'
+import { serializeDirTokens, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
 import { displayModel } from '../lib/model'
 
 
@@ -64,6 +64,7 @@ export default function ChatPane({
   onSplitRight,
   onSplitDown,
   onOpenFull,
+  agentLocked,
 }: {
   slotKey: string
   focused?: boolean
@@ -75,6 +76,10 @@ export default function ChatPane({
    *  the earlier-messages row is hidden rather than shown inert. The optional ts
    *  anchors the destination near the pane's oldest message, not the newest. */
   onOpenFull?: (slot: string, anchorTs?: string, anchorMid?: string) => void
+  /** The host declares the slot's agent server-pinned (member DM threads):
+   *  the agent picker is not offered at all, instead of offering a control
+   *  whose every selection the backend 409s. */
+  agentLocked?: boolean
 }) {
   // One instance covers both dropdown filter inputs (never open at once).
   const dispatch = useAppDispatch()
@@ -84,6 +89,7 @@ export default function ChatPane({
   const connectionsUiOn = useConnectionsUiEnabled()
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
+  const [uploadError, setUploadError] = useState('')
   const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
   const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
@@ -102,10 +108,10 @@ export default function ChatPane({
   // Prefer the warm's value: this pane's own query is staleTime:Infinity, so its
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
+  // Plan quota for whatever harness this slot runs on — undefined for the ones
+  // that report none, which is most of them.
+  const rateLimit = useAppSelector((s) => s.chat.slotRateLimit?.[slotKey])
   const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
-  // One source for both same-meaning markers in the agent pop-up: the row's check and
-  // the default-agent row's label.
-  const paneAgentName = paneSlot?.agent || 'default'
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
   // streaming OR sub-agents running (dual signal). Drives the queue affordance
   // and skips the optimistic user bubble (the backend returns a "queued"
@@ -192,6 +198,11 @@ export default function ChatPane({
   // it scopes which project-local agents exist, so a project change must refetch.
   const paneProject = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined)
   const { agents: installedAgents, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
+  // One source for every same-meaning marker: the composer chip, the row's
+  // check, and the default-agent row's label. An agent-less slot resolves to
+  // the configured default (matching what dispatch runs) before the literal
+  // 'default' placeholder.
+  const paneAgentName = paneSlot?.agent || defaultAgent || 'default'
   const navigate = useNavigate()
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Same contract as ChatPage: set-only, clearing lives on the Templates page.
@@ -202,7 +213,12 @@ export default function ChatPane({
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
   const agentDD = useFilteredDropdown(installedAgents)
-  const availableModels = useAvailableModels()
+  const harnessBackend = useAppSelector((s) => s.dashboard.status?.harness?.backend ?? '')
+  const paneBackend = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.acp_backend)
+  const availableModels = useAvailableModels({
+    slot: slotKey,
+    backend: paneBackend !== undefined ? paneBackend : harnessBackend,
+  })
   const modelDD = useFilteredDropdown(availableModels)
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The degraded flag gates it — a cached list served while
@@ -322,23 +338,47 @@ export default function ChatPane({
   })
 
   // File upload as a mutation (isPending replaces a manual `uploading` flag).
+  // api.uploadFiles does NOT throw on a non-2xx: it resolves { paths, error }.
+  // Surface res.error the way ChatPage does (issue #5707) so a server refusal
+  // (unsupported type, content-signature mismatch, over-cap) is reported at
+  // the composer instead of the spinner silently stopping with no attachment.
   const uploadMutation = useMutation({
     mutationFn: (files: File[]) => api.uploadFiles(files),
-    onSuccess: (res) => { if (res.paths?.length) setPendingFiles((prev) => [...prev, ...res.paths]) },
+    // api.uploadFiles does NOT throw on a server refusal (unsupported type,
+    // signature mismatch, over-cap): it resolves with { paths: [], error }.
+    // So a refusal lands here in onSuccess, not onError — surface res.error
+    // (matching ChatPage) instead of silently doing nothing.
+    onSuccess: (res) => {
+      if (res.error) { setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: res.error })); return }
+      if (res.paths?.length) setPendingFiles((prev) => [...prev, ...res.paths])
+    },
+    // api.uploadFiles throws for three distinct reasons: a client-side image
+    // resize failure, a session expiry, and a transport reject. The first two
+    // carry a message worth showing. A fetch reject arrives as a TypeError
+    // reading "Failed to fetch", which is not user-facing copy, so that case
+    // gets the pane's shared connectivity string instead.
+    onError: (err: unknown) => {
+      const message = (err as Error)?.message
+      const reason = (!message || err instanceof TypeError)
+        ? i18nT('pages.chatPage.connection_error')
+        : message
+      setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: reason }))
+    },
   })
   const uploadFiles = useCallback((files: File[]) => {
-    if (!files.length || files.length > 20) return
-    // Same video exemption as ChatPage's uploadFiles: the server's video cap is
-    // far higher than 50 MB, and this guard drops the batch SILENTLY, so
-    // applying it to a recording would swallow the attach with no explanation.
-    // But this pane has no error surface at all -- `uploadMutation` renders
-    // nothing on failure -- so it cannot delegate the ceiling to the server's
-    // 413 the way ChatPage does. It pre-checks against the server's own cap
-    // instead: a legal recording gets through, and an over-cap one is dropped
-    // exactly the way this pane already drops every oversized file, rather than
-    // gaining a NEW silent failure mode from this change.
-    const cap = (f: File) => (VIDEO_EXT.test(f.name) ? VIDEO_MAX_BYTES : 50 * 1024 * 1024)
-    if (files.find((f) => f.size > cap(f))) return
+    if (!files.length) return
+    // Clear FIRST, so a refusal from the previous attempt cannot stay on
+    // screen and read as the reason this one failed.
+    setUploadError('')
+    if (files.length > 20) { setUploadError(i18nT('pages.chatPage.too_many_files_max_20')); return }
+    // Video is deliberately exempt from this pre-check, exactly as in
+    // ChatPage: the server's video ceiling is far higher than 50 MB, so the
+    // figure this message states would be a lie for a recording. An over-cap
+    // recording's own 413 carries the real cap and surfaces through the
+    // res.error branch above -- the route every other server-side refusal
+    // already takes, and the one this change just wired to the banner.
+    const big = files.find((f) => !VIDEO_EXT.test(f.name) && f.size > 50 * 1024 * 1024)
+    if (big) { setUploadError(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
     uploadMutation.mutate(files)
   }, [uploadMutation])
 
@@ -717,6 +757,13 @@ export default function ChatPane({
           }}
         />
 
+        {uploadError && (
+          <div className="mx-4 mt-2 mb-0 bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--danger) 45%, transparent)' }}>
+            <span className="text-sm text-text flex-1 min-w-0 break-words">{uploadError}</span>
+            <button onClick={() => setUploadError('')} aria-label={i18nT('pages.chatPage.dismiss_upload_error')} className="text-muted hover:text-text leading-none p-0.5 shrink-0"><X className="w-4 h-4" /></button>
+          </div>
+        )}
+
         <ChatInput
           value={input}
           onChange={setInput}
@@ -724,13 +771,14 @@ export default function ChatPane({
           isRunning={busy}
           onStop={onStop}
           autoFocusKey={slotKey}
-          agentName={paneSlot?.agent || 'default'}
-          agentSource={installedAgents.find((a) => a.name === (paneSlot?.agent || 'default'))?.source}
+          agentName={paneAgentName}
+          agentSource={installedAgents.find((a) => a.name === paneAgentName)?.source}
           modelName={shownModel}
           contextPct={contextPct}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
-          onAgentClick={provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); agentDD.setOpen(!agentDD.open) } : undefined}
+          rateLimit={rateLimit}
+          onAgentClick={!agentLocked && provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); agentDD.setOpen(!agentDD.open) } : undefined}
           onModelClick={(rect) => { setModelBtnRect(rect); modelDD.setOpen(!modelDD.open) }}
           approvalMode={displayMode}
           followUpOptions={followUpOptions}

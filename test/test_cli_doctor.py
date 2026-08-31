@@ -478,7 +478,13 @@ class TestMemoryPressure:
 
 
 class TestDoctorKas:
-    """`kirocrew doctor` KAS backend section — gated on acp_backend == kas."""
+    """`kirocrew doctor` KAS backend section — gated on acp_backend == kas.
+
+    KAS is served by kiro-cli's ACP relay, so the section reports the relay
+    invocation and whether this kiro-cli can select the KAS engine. It probes no
+    credential: the relay resolves tokens from kiro-cli's own store, which the
+    sign-in check already covers.
+    """
 
     class _Cfg:
         def __init__(self, backend: str) -> None:
@@ -489,13 +495,6 @@ class TestDoctorKas:
             cli_doctor.KiroCrewConfig, "load", classmethod(lambda cls: self._Cfg(backend))
         )
 
-    def test_version_label_from_bundle_path(self) -> None:
-        script = Path("/home/u/.local/share/kiro-cli/kas/2.18.0-abc123/nm/acp-server.js")
-        assert cli_doctor._kas_version_label(script) == "2.18.0-abc123"
-
-    def test_version_label_unknown_for_unexpected_layout(self) -> None:
-        assert cli_doctor._kas_version_label(Path("/opt/foo/acp-server.js")) == "unknown"
-
     def test_silent_when_backend_not_kas(self, monkeypatch, capsys) -> None:
         self._patch_cfg(monkeypatch, "")
         issues: list[str] = []
@@ -503,48 +502,127 @@ class TestDoctorKas:
         assert "KAS backend" not in capsys.readouterr().out
         assert issues == []
 
-    def test_selected_but_assets_missing_appends_issue(self, monkeypatch, capsys) -> None:
+    def test_selected_but_no_kiro_cli_appends_issue(self, monkeypatch, capsys) -> None:
         self._patch_cfg(monkeypatch, "kas")
-        from kiro_crew.acp import kas_assets, kas_auth
-
-        monkeypatch.setattr(kas_assets, "find_kas_node", lambda: None)
-        monkeypatch.setattr(kas_assets, "find_kas_server_script", lambda: None)
-
-        async def _raise(*, timeout: float = 8.0):
-            raise kas_auth.KasAuthCallbackError("kiro-cli not found; cannot obtain a KAS token")
-
-        monkeypatch.setattr(kas_auth, "resolve_kas_access_token", _raise)
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: None)
         issues: list[str] = []
         cli_doctor._doctor_kas(issues)
         out = capsys.readouterr().out
         assert "KAS backend" in out
-        assert "❌ not found" in out
-        assert "KAS backend selected but assets missing" in issues
-        # Token bytes never printed; only the advisory line.
-        assert "not obtainable" in out
+        assert "KAS backend selected but kiro-cli is not installed" in issues
+        # No engine probe is attempted when there is no binary to probe.
+        assert "engine:" not in out
 
-    def test_token_ok_prints_expiry_not_token(self, monkeypatch, capsys) -> None:
+    def test_engine_supported_prints_the_relay_argv(self, monkeypatch, capsys) -> None:
         self._patch_cfg(monkeypatch, "kas")
-        from kiro_crew.acp import kas_assets, kas_auth
-
-        monkeypatch.setattr(kas_assets, "find_kas_node", lambda: Path("/x/node"))
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
         monkeypatch.setattr(
-            kas_assets,
-            "find_kas_server_script",
-            lambda: Path("/x/kas/9.9.9-hash/nm/acp-server.js"),
+            cli_doctor,
+            "_kas_relay_help",
+            lambda _binary: "--agent-engine <ENGINE>  v1, v2 (default), or v3",
         )
-
-        async def _ok(*, timeout: float = 8.0):
-            return {"accessToken": "SECRET-DO-NOT-PRINT", "expiresAt": "2099-01-01T00:00:00Z"}
-
-        monkeypatch.setattr(kas_auth, "resolve_kas_access_token", _ok)
         issues: list[str] = []
         cli_doctor._doctor_kas(issues)
         out = capsys.readouterr().out
-        assert "9.9.9-hash" in out
-        assert "2099-01-01T00:00:00Z" in out
-        assert "SECRET-DO-NOT-PRINT" not in out
+        # The exact invocation, so a reader can reproduce it by hand.
+        assert "acp --agent-engine v3 --auth-method cli" in out
+        assert "✅ v3 supported" in out
         assert issues == []
+
+    def test_engine_missing_appends_issue(self, monkeypatch, capsys) -> None:
+        """A kiro-cli that offers engines but not ours cannot serve KAS."""
+        self._patch_cfg(monkeypatch, "kas")
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        monkeypatch.setattr(
+            cli_doctor,
+            "_kas_relay_help",
+            lambda _binary: "--agent-engine <ENGINE>  v1, v2 (default)",
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "does not offer engine v3" in out
+        assert any("does not support the KAS engine" in i for i in issues)
+
+    def test_help_without_the_flag_is_a_failure_not_unknown(
+        self, monkeypatch, capsys
+    ) -> None:
+        """A kiro-cli predating engine selection must FAIL the check.
+
+        Reporting it as "unknown" would let a configuration that cannot work
+        pass readiness and fail later at session-create time instead.
+        """
+        self._patch_cfg(monkeypatch, "kas")
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        monkeypatch.setattr(
+            cli_doctor,
+            "_kas_relay_help",
+            lambda _binary: "Usage: kiro-cli acp [OPTIONS]\n  -a, --trust-all-tools",
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "no --agent-engine flag" in out
+        assert "engine support unknown" not in out
+        assert any("too old to select the KAS engine" in i for i in issues)
+
+    def test_unreadable_help_is_reported_unknown_not_failed(
+        self, monkeypatch, capsys
+    ) -> None:
+        """Only a FAILED probe is unknown; a diagnostic must not invent a verdict.
+
+        ``None`` now means the subprocess did not run, which is the one case
+        where nothing is established either way.
+        """
+        self._patch_cfg(monkeypatch, "kas")
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        monkeypatch.setattr(cli_doctor, "_kas_relay_help", lambda _binary: None)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "engine support unknown" in out
+        assert issues == []
+
+    def test_probe_returns_help_text_even_without_the_flag(
+        self, monkeypatch
+    ) -> None:
+        """The probe must not swallow ran-but-lacks-the-flag into None.
+
+        Pins the split directly: the previous implementation returned None for
+        both a failed spawn and help text missing the selector, which is what
+        let an unsupported kiro-cli pass.
+        """
+
+        class _Proc:
+            stdout = "Usage: kiro-cli acp [OPTIONS]"
+            stderr = ""
+
+        monkeypatch.setattr(cli_doctor.subprocess, "run", lambda *a, **k: _Proc())
+        got = cli_doctor._kas_relay_help("/x/kiro-cli")
+        assert got is not None
+        assert "--agent-engine" not in got
+
+    def test_probe_returns_none_when_the_spawn_fails(self, monkeypatch) -> None:
+        def _boom(*_a, **_k):
+            raise OSError("no such binary")
+
+        monkeypatch.setattr(cli_doctor.subprocess, "run", _boom)
+        assert cli_doctor._kas_relay_help("/x/kiro-cli") is None
+
+    def test_no_credential_probe_is_performed(self, monkeypatch, capsys) -> None:
+        """The relay owns auth, so the doctor must not reach for a token.
+
+        Pinned as an assertion because the previous implementation DID shell out
+        for one, and re-adding that would put Crew back in the credential path.
+        """
+        self._patch_cfg(monkeypatch, "kas")
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        monkeypatch.setattr(cli_doctor, "_kas_relay_help", lambda _binary: "v3")
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        out = capsys.readouterr().out
+        assert "owned by kiro-cli" in out
+        assert not hasattr(cli_doctor, "_kas_version_label")
 
 
 class TestPathLauncherOwnership:

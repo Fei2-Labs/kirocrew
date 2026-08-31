@@ -50,7 +50,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "engine": _vc.default_engine,
                 "rate": _vc.default_rate,
                 "pitch": _vc.default_pitch,
-                "autoSpeak": _vc.global_enabled,
+                "autoSpeak": _vc.auto_speak,
                 "aws_profile": _vc.aws_profile,
                 "region": _vc.region,
                 "piper_binary": _vc.piper_binary,
@@ -84,7 +84,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
     if "enabled" in body:
         _vc.global_enabled = bool(body["enabled"])
     if "autoSpeak" in body:
-        _vc.global_enabled = bool(body["autoSpeak"])
+        _vc.auto_speak = bool(body["autoSpeak"])
     if "aws_profile" in body:
         _vc.aws_profile = str(body["aws_profile"]).strip()
     if "region" in body:
@@ -115,6 +115,7 @@ async def api_voice_config(request: web.Request) -> web.Response:
         vr.update(
             {
                 "enabled": _vc.global_enabled,
+                "auto_speak": _vc.auto_speak,
                 "provider": _vc.provider,
                 "voice_id": _vc.default_voice,
                 "engine": _vc.default_engine,

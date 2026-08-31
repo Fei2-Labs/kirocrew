@@ -204,3 +204,89 @@ describe('FeishuPanel', () => {
     expect(payload).not.toHaveProperty('allowed_group_ids')
   })
 })
+
+/**
+ * lark-oapi ships as the optional [feishu] extra, so a fully credentialed channel
+ * still cannot start without it. The card is the only surface that says so before
+ * a restart -- the connection badge cannot, because `maybe_start_feishu` returns
+ * at its first line when the channel is disabled and the ImportError branch that
+ * records the missing SDK sits after that return.
+ */
+describe('FeishuPanel missing-SDK card', () => {
+  const CMD = "/opt/venv/bin/python -m pip install 'kirocrew[feishu]'"
+
+  const base = {
+    connected: false, connect_error: '', configured: true, read_only: false,
+    bot_token_set: true, bot_token_preview: 'AbC…89cd',
+    bot_id_set: true, bot_id_preview: 'cli…6g7h',
+    enabled: true, allowed_user_ids: [OPEN_ID],
+    allow_group: false, allowed_group_ids: [], soft_threshold_pct: 80,
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.saveConfig.mockResolvedValue({ ok: true, restart_required: true, verify_warning: '' })
+  })
+
+  it('shows the command naming the gateway interpreter when the SDK is missing', async () => {
+    mocks.getConfig.mockResolvedValue({
+      ...base, sdk_installed: false, sdk_install_supported: true, sdk_install_command: CMD,
+    })
+    renderPanel()
+    // The full command must be present verbatim: a truncated or re-wrapped copy
+    // would defeat the one thing this card exists to get right.
+    expect(await screen.findByText(CMD)).toBeInTheDocument()
+    // The card's own restart line, matched exactly: the connection hint
+    // ("Configuration is saved but the channel is not running. Restart the
+    // gateway to connect.") also mentions a restart, so a loose /restart the
+    // gateway/ would pass on that instead of on this card.
+    expect(
+      screen.getByText('Then restart the gateway to start the Feishu channel.'),
+    ).toBeInTheDocument()
+  })
+
+  it('stays hidden once the SDK is importable', async () => {
+    mocks.getConfig.mockResolvedValue({
+      ...base, sdk_installed: true, sdk_install_supported: true, sdk_install_command: '',
+    })
+    renderPanel()
+    await screen.findByText('Feishu')
+    expect(screen.queryByText(/Install the Feishu SDK/i)).not.toBeInTheDocument()
+  })
+
+  it('stays hidden against a gateway that does not report the field', async () => {
+    // Strictly `=== false`: an older gateway omits it, and treating undefined as
+    // "missing" would tell every user of one to install a package they may have.
+    mocks.getConfig.mockResolvedValue({ ...base })
+    renderPanel()
+    await screen.findByText('Feishu')
+    expect(screen.queryByText(/Install the Feishu SDK/i)).not.toBeInTheDocument()
+  })
+
+  it('offers no command where a pip install cannot work', async () => {
+    mocks.getConfig.mockResolvedValue({
+      ...base, sdk_installed: false, sdk_install_supported: false, sdk_install_command: '',
+    })
+    renderPanel()
+    expect(await screen.findByText(/cannot install extra packages/i)).toBeInTheDocument()
+    expect(screen.queryByText(CMD)).not.toBeInTheDocument()
+  })
+
+  it('renders no card for a channel that declares no SDK extra', async () => {
+    // WeCom's client is in core, so its spec omits `sdkExtra` entirely and the
+    // shared panel must not grow a card from the shared fields alone.
+    mocks.getConfig.mockResolvedValue({
+      ...base, sdk_installed: false, sdk_install_supported: true, sdk_install_command: CMD,
+    })
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <MemoryRouter>
+        <QueryClientProvider client={queryClient}>
+          <WeComPanel />
+        </QueryClientProvider>
+      </MemoryRouter>,
+    )
+    await screen.findByText('WeCom')
+    expect(screen.queryByText(CMD)).not.toBeInTheDocument()
+  })
+})

@@ -157,7 +157,7 @@ def save_byok_keys(keys: MutableMapping[str, str]) -> None:
     # final path so a pre-existing world-readable file (from an older write) is
     # tightened too.
     try:
-        platform_compat.restrict_to_owner(path)
+        platform_compat.restrict_to_owner(path)  # lockdown-ok: re-assert; tmp already locked down
     except OSError:
         logger.warning("could not restrict BYOK store permissions", exc_info=True)
 

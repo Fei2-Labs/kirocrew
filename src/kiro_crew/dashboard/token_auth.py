@@ -185,9 +185,10 @@ class RevokedNonceStore:
                 self._state_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._state_path.with_suffix(self._state_path.suffix + ".tmp")
                 # Create the temp file EMPTY, lock it down, and only then write
-                # the nonces. On Windows restrict_to_owner shells out to icacls,
-                # so writing first would leave the denylist under the
-                # parent-inherited DACL for the length of that call. O_TRUNC also
+                # the nonces. Writing first would leave the denylist under the
+                # parent-inherited DACL for the length of the lockdown call —
+                # brief now that it is in-process, but still a window on a file
+                # whose contents are security state. O_TRUNC also
                 # empties a stale temp file an earlier crash left behind, so the
                 # lockdown never applies on top of someone else's contents.
                 os.close(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
@@ -970,6 +971,32 @@ def validate_token_with_app(
     return valid, user_id, reason, app_name
 
 
+def claims_an_app_unverified(token: str) -> bool:
+    """Whether *token* CLAIMS an ``app`` identity, without verifying its signature.
+
+    Used only to REFUSE — never to grant. The cookie fallback in the middleware
+    treats an invalid ``?token=`` as absent so a dead link token cannot veto a
+    live session cookie, but that must not apply to an APP token: an app token
+    and a dashboard-user cookie can legitimately arrive together (an installed
+    app's UI is served from this same origin, so the browser attaches the user's
+    cookie), and adopting the cookie there would swap an app-scoped identity for
+    the user's own and skip ``_enforce_app_scope`` entirely.
+
+    Reading an unverified claim is sound in exactly this direction. The claim can
+    only ever make the decision STRICTER, so a forged ``app`` value buys an
+    attacker a refusal, not a grant — and an unparseable payload answers ``False``
+    because such a token carries no app scope to protect in the first place (it
+    is refused on its own merits by ``validate_token`` regardless). It is NEVER
+    correct to read this to decide what a caller may reach: use the ``app_name``
+    that ``validate_token_with_app`` returns, which is signature-checked.
+    """
+    try:
+        data = json.loads(_b64url_decode(token.split(".")[0]))
+    except Exception:
+        return False
+    return bool(isinstance(data, dict) and data.get("app"))
+
+
 def extract_prompt_from_token(token: str) -> str:
     """Extract the ``prompt`` field from a validated token payload.
 
@@ -1095,10 +1122,10 @@ def write_app_secret(app_name: str, secret: str) -> None:
     secret_path = secret_dir / ".app_secret"
     # os.O_TRUNC truncates any pre-existing file BEFORE the DACL tightens,
     # then restrict_to_owner locks it down while it is still empty, then we
-    # write the secret bytes. This ordering matters on Windows because
-    # restrict_to_owner shells out to icacls (subprocess) — if we wrote first
-    # the secret would sit under the parent-inherited DACL during the icacls
-    # window. On failure we unlink the just-created empty file (mirroring
+    # write the secret bytes. This ordering matters on Windows because the
+    # lockdown replaces the file's DACL rather than being set at create time —
+    # if we wrote first the secret would sit under the parent-inherited DACL
+    # until that call landed. On failure we unlink the just-created empty file (mirroring
     # dashboard/server.py:_write_secret_file) so we don't leave a zero-byte
     # .app_secret under the default DACL that a later successful write
     # (which does not re-inherit on O_TRUNC) could then populate.
@@ -1107,7 +1134,7 @@ def write_app_secret(app_name: str, secret: str) -> None:
         # restrict_to_owner (fail-loud), NOT fchmod_safe: fchmod_safe swallows
         # OSError, which would defeat the cleanup-and-reraise below for this
         # app secret. On POSIX applies chmod 0o600 by path; on
-        # Windows an owner-only DACL via icacls (fchmod doesn't exist on
+        # Windows an owner-only DACL (fchmod doesn't exist on
         # Windows, where an IS_POSIX no-op would let per-app secrets
         # land readable by other local users).
         platform_compat.restrict_to_owner(secret_path)
@@ -1472,7 +1499,7 @@ async def warm_auth_singletons() -> None:
 
     Both ``_get_secret()`` and ``_get_revoked_store()`` do blocking file I/O on
     first use (read/create ``token_signing.key`` + read the persisted nonce
-    denylist; on Windows an ``icacls`` subprocess to lock the key file's DACL).
+    denylist; on Windows also the owner-only DACL on the key file).
     Calling them lazily from the request path — or synchronously inside the
     ``token_auth_middleware()`` factory, which runs on the loop via the async
     ``start_dashboard()`` / ``start_api_server()`` — would land that I/O on the
@@ -1961,8 +1988,8 @@ def token_auth_middleware(
     # NOTE: the signing-secret and revoked-nonce singletons are NOT warmed
     # here anymore. This factory is invoked from `start_dashboard()` /
     # `start_api_server()`, which are `async def` and therefore run ON the
-    # event loop — a synchronous warm-up here (blocking key-file read + a
-    # Windows `icacls` subprocess on first create) would block the loop during
+    # event loop — a synchronous warm-up here (blocking key-file read plus, on
+    # Windows, an owner-only DACL on first create) would block the loop during
     # startup (no-blocking-call-on-event-loop). The async startup paths instead
     # `await warm_auth_singletons()` (which offloads to a worker thread) BEFORE
     # constructing this middleware chain, so the first auth op still hits the
@@ -1981,11 +2008,28 @@ def token_auth_middleware(
         accepts a session pin the main flow would refuse.
         """
         cookie_name = f"mc_token_{_cookie_port_from_host(request, _port)}"
-        token = request.query.get("token") or request.cookies.get(cookie_name, "")
-        if not token:
+        query_token = request.query.get("token") or ""
+        cookie_token = request.cookies.get(cookie_name, "")
+        if not query_token and not cookie_token:
             return False, "", "no token", "", ""
-        valid, uid, reason, app = validate_token_with_app(token, use_session_exp=True)
-        return valid, uid, reason, app, token
+        if query_token:
+            valid, uid, reason, app = validate_token_with_app(query_token, use_session_exp=True)
+            # A stale ``?token=`` must not veto a still-valid session cookie
+            # (same rule as the main flow): fall through to the cookie only
+            # when the query token failed AND a cookie exists; otherwise the
+            # query token's verdict (and its failure reason) stands.
+            #
+            # An APP token is excluded from the fallback. An app's UI is served
+            # from this same origin, so the browser attaches the dashboard
+            # user's cookie alongside the app's own ``?token=``; adopting that
+            # cookie when the app token has expired would replace an app-scoped
+            # identity with the user's own and skip the ``_enforce_app_scope``
+            # gate below. An expired app token must be refused as an expired
+            # app token, so the caller re-exchanges its app secret.
+            if valid or not cookie_token or claims_an_app_unverified(query_token):
+                return valid, uid, reason, app, query_token
+        valid, uid, reason, app = validate_token_with_app(cookie_token, use_session_exp=True)
+        return valid, uid, reason, app, cookie_token
 
     @web.middleware
     async def middleware(request: web.Request, handler: object) -> web.StreamResponse:
@@ -2231,6 +2275,8 @@ def token_auth_middleware(
             # Expose identity so downstream handlers (and app-scope) see it.
             request["user"] = _uid
             request["app"] = _app
+            # The credential actually validated (see the main path's note).
+            request["auth_token"] = _tok
             # POSITIVE dashboard-user signal for the WS scope gate: the WS
             # layer must never infer trust from a falsy app claim (CWE-269).
             request["is_dashboard_user"] = not _app
@@ -2315,6 +2361,8 @@ def token_auth_middleware(
                 # (same rationale as the loopback branch above).
                 request["user"] = _uid
                 request["app"] = _app
+                # The credential actually validated (see the main path's note).
+                request["auth_token"] = _tok
                 # POSITIVE dashboard-user signal for the WS scope gate (see
                 # the loopback branch above).
                 request["is_dashboard_user"] = not _app
@@ -2419,6 +2467,45 @@ def token_auth_middleware(
         valid, user_id, reason, app_name = validate_token_with_app(
             token, use_session_exp=from_cookie
         )
+        if not valid and not from_cookie:
+            # A stale ``?token=`` must not veto a still-valid session cookie.
+            # Re-opening a bookmarked / previously-scanned link replays the
+            # long-expired link token in the URL; the browser ALSO sends the
+            # session cookie that link was exchanged for, and that cookie is
+            # the current credential. Treat the invalid query token as absent
+            # and validate the cookie instead — this grants nothing a
+            # cookie-only request would not already get (the cookie runs the
+            # full validation + the peer-pin check below), it only stops a
+            # dead historical token from being a one-vote veto. When the
+            # cookie is missing or also invalid, the original query-token
+            # failure stands so the denial reason names the credential the
+            # caller actually presented.
+            #
+            # An APP token never takes this path. An installed app's UI is
+            # served from this same origin, so the browser attaches the
+            # dashboard user's session cookie alongside the app's own
+            # ``?token=``. Falling back there would swap the app's scoped
+            # identity for the user's own — ``app_name`` would come back empty,
+            # ``_enforce_app_scope`` below would become a no-op, and an app
+            # whose token merely EXPIRED would silently gain the user's full
+            # API reach. An expired app token must be refused as such, so the
+            # app re-exchanges its secret at ``/api/apps/<name>/token``. The
+            # claim is read unverified, which is sound because it can only make
+            # this decision stricter (see ``claims_an_app_unverified``).
+            _cookie_token = request.cookies.get(cookie_name, "")
+            if _cookie_token and not claims_an_app_unverified(token):
+                _c_valid, _c_uid, _c_reason, _c_app = validate_token_with_app(
+                    _cookie_token, use_session_exp=True
+                )
+                if _c_valid:
+                    token = _cookie_token
+                    from_cookie = True
+                    valid, user_id, reason, app_name = (
+                        _c_valid,
+                        _c_uid,
+                        _c_reason,
+                        _c_app,
+                    )
         if not valid:
             # Cold-start variant: an expired/forged token is present (cookie
             # survived but its token lapsed). Same rationale — serve the shell
@@ -2516,6 +2603,14 @@ def token_auth_middleware(
                 _token_boot = str(data.get("boot", ""))
                 if _token_boot:
                     _carried["boot"] = _token_boot
+                # Carried for the same reason ``boot`` is: the session token is a
+                # fresh mint, so a claim not named here is silently dropped — and
+                # dropping this one would turn an identity-bound persistent
+                # session into an ordinary rotating one, which is exactly the
+                # binding it was minted to keep.
+                _token_require_peer = str(data.get("require_peer", ""))
+                if _token_require_peer:
+                    _carried["require_peer"] = _token_require_peer
                 # ``no_refresh`` gets the same treatment as ``boot`` and for the
                 # same reason: the claim must survive the exchange or a DOWNSTREAM
                 # consumer that reads the session cookie to learn the caller's
@@ -2604,6 +2699,16 @@ def token_auth_middleware(
         # Expose authenticated identity to handlers (deny-by-default)
         request["user"] = user_id
         request["app"] = app_name
+        # The credential this request was ACTUALLY authenticated with. Handlers
+        # that read signed claims out of the caller's own token (the mobile-link
+        # mint's bounds, the frame-ancestors parent port) must read THIS, not
+        # re-extract with their own query-then-cookie order: only the credential
+        # validated here has a verified signature, and since the cookie fallback
+        # above can adopt the cookie over an invalid query token, re-extraction
+        # is no longer guaranteed to pick the same one. Reading the other
+        # credential would let a bounded caller have its bounds read from an
+        # unverified, attacker-settable value.
+        request["auth_token"] = token
         # POSITIVE dashboard-user signal for the WS scope gate (see above).
         request["is_dashboard_user"] = not app_name
 
@@ -2705,7 +2810,9 @@ def token_auth_middleware(
                     # re-minted a fresh session on the next visit, and "ends at
                     # restart" would be false by one rotation.
                     refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(
-                        user_id, boot=str(data.get("boot", ""))
+                        user_id,
+                        boot=str(data.get("boot", "")),
+                        require_peer=str(data.get("require_peer", "")) == "1",
                     )
                     refresh_remaining = int(refresh_exp - time.time())
                     if refresh_remaining > 0:

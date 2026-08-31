@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from kiro_crew import mcp_apps_render, model_registry, session_directive
+from kiro_crew import mcp_apps_render, model_registry, platform_compat, session_directive
 from kiro_crew.acp.client import (
     AcpAuthRequired,
     AcpError,
@@ -32,6 +32,7 @@ from kiro_crew.acp.types import (
     EVENT_MCP_SERVER_INITIALIZED,
     EVENT_STEER_CONSUMED,
     STOP_REASON_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_END_TURN,
     STOP_REASON_REFUSAL,
     STOP_REASON_STALE_RECOVER,
@@ -93,6 +94,7 @@ from kiro_crew.dashboard.chat_utils import (
     is_harness_slash_command,
     is_system_injection_item,
     mirror_is_paused,
+    parse_workflow_command,
     remember_slack_options,
     slack_mirror_is_paused,
     slot_history_key,
@@ -199,7 +201,7 @@ from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.name_grant import Refusal, name_grant_refusal, pin_human_approval
 from kiro_crew.platform import redact_via_context
-from kiro_crew.providers.acp import is_claude_backend
+from kiro_crew.providers.acp import is_claude_backend, provider_label
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -212,6 +214,7 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
     LLMEvent,
+    LLMProvider,
 )
 from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.safety_override import safety_override
@@ -553,8 +556,8 @@ async def _steer_policy_notice(
     Opt-in by positive capability, never by harness identity: a backend outside
     ``ACP_BACKENDS_STEER`` has no ``_session/steer``, reports
     ``supports_steer`` False, and keeps the recovery-continuation behaviour
-    unchanged. ``getattr`` guards the attribute because the reject paths also run
-    against minimal test doubles.
+    unchanged. Only a conforming provider may advertise the capability; minimal
+    test doubles take the safe unsupported arm.
 
     Appends the notice to *notices* (the turn's pending list, settled later by the
     ``steering_consumed`` echo) and returns whether it was written. Best-effort:
@@ -565,7 +568,7 @@ async def _steer_policy_notice(
     :func:`build_refusal_steer_notice`. Every deny path that reaches a model runs
     through here, so a new one states its cause rather than inheriting "policy".
     """
-    if not getattr(client, "supports_steer", False):
+    if not isinstance(client, LLMProvider) or not client.supports_steer:
         return False
     notice = build_refusal_steer_notice(title, reason, cause=cause)
     if not notice:
@@ -1088,6 +1091,25 @@ def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
         payload["window_tokens"] = window
     else:
         payload["reset"] = True
+    # Plan rate limit (claude-agent-acp's `_meta["_claude/rateLimit"]`), attached
+    # to this frame rather than given its own event: it rides the same
+    # usage_update the context counts come from, refreshes on the same cadence,
+    # and lands in the same popover. Omitted entirely when the provider reports
+    # none, so the key's PRESENCE is the frontend's "this harness has a quota"
+    # signal — an empty dict would render a header over no rows. The `reset`
+    # branch above does not clear it: a compaction changes the transcript, not
+    # the account's quota.
+    #
+    # Read through the ABC-declared accessor on a positive isinstance check, not
+    # a `hasattr` capability probe (H8): the method exists on every conforming
+    # provider with a None default, so a probe would be testing whether `client`
+    # is a provider at all — which is what the isinstance actually asks. The dict
+    # check then keeps an unspecced test double's Mock return (truthy, and not
+    # JSON-serializable) out of a live WS frame.
+    if isinstance(client, LLMProvider):
+        rate_limit = client.rate_limit_payload()
+        if isinstance(rate_limit, dict) and rate_limit:
+            payload["rate_limit"] = rate_limit
     return payload
 
 
@@ -2233,6 +2255,87 @@ def _session_principal(session_key: str) -> str:
     if parsed is None or parsed.chat_type != CHAT_TYPE_DIRECT or len(parsed.scope) != 1:
         return ""
     return parsed.scope[0]
+
+
+async def _name_grant_refusal_off_loop(command: str) -> Refusal | None:
+    """The ONE place this module's tiers reach the name-grant check.
+
+    It resolves names against ``PATH`` and digests the file behind each one, so
+    it runs on a worker thread: the gateway's loop must not stat a stalled
+    network mount or read a large binary. Every tier goes through here rather
+    than calling ``asyncio.to_thread`` itself, so there is a single place to
+    reason about (and, for the rung tests, a single place to stub -- three tiers
+    each spawning their own thread is what crashed the Windows xdist workers).
+
+    Windows is answered ON the loop, because there the verdict needs no
+    filesystem access at all: the check declines every name-based grant outright
+    (neither ``cmd.exe`` search order nor POSIX-mode tokenization is modelled),
+    so the thread would do nothing but hand back a constant. Paying a hop for it
+    is not merely waste -- the worker can outlive a caller's event loop, which is
+    what crashes an xdist worker rather than merely failing its test.
+    """
+
+    if not command:
+        return None
+    if platform_compat.IS_WINDOWS:
+        return name_grant_refusal(command)
+    return await asyncio.to_thread(name_grant_refusal, command)
+
+
+async def _name_grant_refusal_for(event: object) -> Refusal | None:
+    """Why a shell *event* may not be auto-approved by program NAME, or ``None``.
+
+    Every auto-approve tier is a statement about a PROGRAM, and the shell
+    resolves the name itself afterwards through a ``PATH`` that legitimately
+    leads with directories the agent can write.
+
+    This lives here rather than inside ``HookManager.on_tool_call``, which is
+    synchronous and called ON the loop. The hook layer decides its own tiers and
+    this downgrades an auto-approve it granted, so a refusal costs one
+    interactive prompt and never blocks.
+
+    ``None`` for a non-shell tool or an unrecoverable command: there is no
+    program name to vouch for, and those tiers are unchanged.
+    """
+
+    if not getattr(event, "is_shell", False):
+        return None
+    command = getattr(event, "shell_command", None)
+    if not command:
+        return None
+    return await _name_grant_refusal_off_loop(command)
+
+
+def _audit_name_grant_refusal(
+    *, session_key: str, slot: Any, event: Any, refusal: Refusal, tier: str
+) -> None:
+    """Record that a name-based auto-approve was DECLINED, and on which tier.
+
+    Declining is a security decision, so it belongs in the audit log beside the
+    approvals and denials. Without it the log shows a command arriving at the
+    interactive card and never says that a grant was withheld, or why.
+
+    The CODE, never the ``detail``: the detail names the program and the resolved
+    paths, and an audit sink is exactly where that becomes a disclosure. Both
+    ``code`` and ``log_text`` are constants read out of a module table.
+
+    Not ``critical=True``. That flag is for audit-or-deny, where a caller must
+    refuse rather than run something unaudited. Nothing runs unaudited here:
+    declining sends the request to the approval card, and the human's own answer
+    is audited in turn.
+    """
+
+    sel().log_tool_invocation(
+        session_key=session_key,
+        agent=slot.agent or "kirocrew",
+        source="dashboard",
+        tool_name=_redact_display_text(event.title),
+        tool_kind=getattr(event, "tool_kind", ""),
+        outcome="auto_approve_declined",
+        request_id=event.request_id,
+        error=refusal.log_text,
+        metadata={"reason": "name_grant", "code": refusal.code, "tier": tier},
+    )
 
 
 def _resolve_channel_target(
@@ -3403,6 +3506,66 @@ async def _prefetch_ttl(state: "DashboardState", slot: "_ChatSlot", session_key:
         logger.warning("Prefetch TTL failed for slot %s", slot.key, exc_info=True)
 
 
+async def _handle_workflow_command(
+    state: "DashboardState", slot: "_ChatSlot", message: str, session_key: str
+) -> None:
+    """List saved workflows or run one exactly from ``/workflow``."""
+    parsed = parse_workflow_command(message)
+    if parsed is None:
+        return
+    workflow_ref, input_text = parsed
+    workflow_service = getattr(state, "workflow_service", None)
+    outcome = "ok"
+    if workflow_service is None:
+        text = "Saved workflows are not available in this runtime."
+        outcome = "unavailable"
+    elif not workflow_ref:
+        definitions = await asyncio.to_thread(workflow_service.list_definitions)
+        if not definitions:
+            text = "No saved workflows yet. Create one under Agent Capabilities > Workflows."
+            outcome = "empty"
+        else:
+            lines = ["**Saved workflows** — run one with `/workflow <name> [input]`\n"]
+            for definition in definitions:
+                description = definition.get("description") or ""
+                suffix = f" — {description}" if description else ""
+                lines.append(
+                    f"- `/workflow {definition.get('slug')}` "
+                    f"(revision {definition.get('revision')}){suffix}"
+                )
+            text = "\n".join(lines)
+    else:
+        started = await workflow_service.start_definition(
+            workflow_ref,
+            input_text=input_text,
+            author=session_key,
+            session_key=session_key,
+        )
+        if "run_id" not in started:
+            text = str(started.get("error") or "Could not start the saved workflow.")
+            outcome = "error"
+        else:
+            text = (
+                f"Started `/workflow {started.get('slug') or workflow_ref}` as "
+                f"`{started.get('run_id')}` from revision {started.get('revision')}. "
+                "Its result will appear here when it finishes."
+            )
+    text, _ = redact_credentials(text)
+    text, _ = redact_exfiltration_urls(text)
+    slot.append("assistant", text, "msg msg-a")
+    sel().log_tool_invocation(
+        session_key=session_key,
+        agent=slot.agent or "kirocrew",
+        source="dashboard",
+        tool_name="/workflow",
+        tool_kind="slash_command",
+        outcome=outcome,
+        metadata={"slot": slot.key, "workflow": workflow_ref},
+    )
+    state.push_slots_update()
+    slot.append("done", "", "done")
+
+
 async def _handle_goal_command(state: "DashboardState", slot: "_ChatSlot", message: str) -> None:
     """Handle the ``/goal`` slash command (v0 self-verdict loop).
 
@@ -4385,6 +4548,21 @@ class _AppAgentNotLoaded(Exception):
     """
 
 
+def _chat_turn_backend(state: object, slot: object) -> str:
+    """Return the live or configured backend without config I/O on the event loop."""
+
+    from kiro_crew.acp.types import ACP_BACKEND_KIRO
+
+    live_getter = getattr(state, "_live_slot_acp_client", None)
+    live_client = live_getter(slot) if callable(live_getter) else None
+    live_backend = getattr(live_client, "backend", None) if live_client is not None else None
+    if isinstance(live_backend, str):
+        return live_backend
+    sessions = getattr(state, "sessions", None)
+    selected_backend = getattr(sessions, "acp_backend", ACP_BACKEND_KIRO)
+    return selected_backend if isinstance(selected_backend, str) else ACP_BACKEND_KIRO
+
+
 async def _run_chat(
     state: DashboardState,
     slot: _ChatSlot,
@@ -4804,7 +4982,9 @@ async def _run_chat(
 
     # ── Slash commands: detect early, before session acquisition ──
     first_word = message.split()[0] if message.strip() else ""
-    _is_cc_provider = KiroCrewConfig.load().agent.provider == "claude_code"
+    from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
+    _is_cc_provider = _chat_turn_backend(state, slot) == ACP_BACKEND_CLAUDE
     # Named rather than inlined so the quick-prompt exception is one testable rule
     # instead of a condition only reachable by driving this whole function: a macro
     # must NOT be forwarded to the harness as a command.
@@ -4836,6 +5016,10 @@ async def _run_chat(
     # met.
     if first_word == "/goal":
         await _handle_goal_command(state, slot, message)
+        return
+
+    if first_word == "/workflow":
+        await _handle_workflow_command(state, slot, message, session_key)
         return
 
     # ── /prompts: handle locally instead of forwarding to kiro-cli ──
@@ -5031,7 +5215,6 @@ async def _run_chat(
         # guards (`is_claude_backend`, the advertised list) rather than trusting a
         # provider name that could not be read.
         provider_name = ""
-        configured_auto_approve = False
         # Canonical crew identity for watchdog overrides — same seeding rule
         # as the eager-spawn path (the two must agree): slot value until the
         # resolver supplies its alias, which covers the default crew on an
@@ -5044,7 +5227,6 @@ async def _run_chat(
         try:
             cfg = KiroCrewConfig.load()
             provider_name = cfg.agent.provider
-            configured_auto_approve = cfg.agent.approval_mode == "auto"
             # Warm the project agent index OFF the loop, then resolve inline. Only
             # the warm is offloaded: resolve_agent_bindings can raise StopIteration
             # on a malformed config, and StopIteration cannot be delivered through a
@@ -5142,6 +5324,10 @@ async def _run_chat(
             reasoning_effort_override=slot.reasoning_effort or None,
         )
         _acquired = True
+        # agent.provider is intentionally single-valued ("acp"). Context,
+        # branding, resume metadata, and usage attribution need the concrete
+        # harness that actually serves this session.
+        provider_name = provider_label(client)
         # Member activity pointer — once per SESSION, not per turn: the log
         # answers "which sessions did this member take part in", so a per-turn
         # append would inflate every count taken from it. `slot.agent` is the
@@ -5278,9 +5464,7 @@ async def _run_chat(
         # after a grant went away clears any policy an earlier turn stored.
         state.sessions.set_approval_policy(
             session_key,
-            _persistable_session_policy(
-                slot, state.is_yolo_active() or configured_auto_approve
-            ),
+            _persistable_session_policy(slot, state.is_yolo_active()),
         )
 
         # Drain MCP OAuth requests captured during session init. kiro-cli
@@ -5611,7 +5795,7 @@ async def _run_chat(
                 compressed_history=compressed,
                 mode=slot.mode,
                 blocks_reads=slot.blocks_reads,
-                provider_type=cfg.agent.provider,
+                provider_type=provider_name,
                 runtime_source="dashboard",
                 exclude_last_n=1,
                 folder_path=folder_path,
@@ -6276,9 +6460,11 @@ async def _run_chat(
                 # tool's own return over the MCP pipe — this does NOT rewrite the
                 # model's tool result, which is why the tool's own message is
                 # written to not over-claim the (consumer-applied) effect.
-                # Gated on _pending_dir_tool — the CANONICAL _meta.kiro tool name
-                # for a genuine MCP call, NOT model-authored result/title text —
-                # so a forged marker under a shell/non-directive tool is ignored.
+                # Gated on _pending_dir_tool — the CANONICAL tool name for a
+                # genuine MCP call (kiro ``_meta.kiro`` or a non-shell
+                # spec-adapter ``mcp__`` title), NOT model-authored result
+                # text — so a forged marker under a shell/non-directive tool
+                # is ignored.
                 # A native sub-agent's tool calls DO surface here (flat events
                 # tagged in _native_tc_card) but have no independently bindable
                 # slot, so they are refused rather than applied to the parent —
@@ -6468,17 +6654,11 @@ async def _run_chat(
                 # to the interactive card. A child WITH full context takes the
                 # same branches as the main agent (mode parity).
                 _child_low_fidelity = event.child_low_fidelity
-                # Verified-identity half of the fidelity split (see
-                # AcpEvent.child_mcp_identity_trusted): a remote MCP server's
-                # tool_call frame streams no rawInput, so args provenance is
-                # unrecoverable — but the _meta.kiro server/tool identity DID
-                # arrive and is non-model-authored. UNCONDITIONAL grant paths
-                # below (trust-all / YOLO / native crew), whose approve decision
-                # consumes no agent-authored event data, honor the grant for
-                # such events; content-matching paths (trusted patterns,
-                # trust-reads) stay gated on the composite fidelity because the
-                # agent-authored title/params ARE their matched input.
-                _child_grant_eligible = not _child_low_fidelity or event.child_mcp_identity_trusted
+                # Verified-identity half of the fidelity split — see
+                # AcpEvent.child_unconditional_grant_eligible for which grant
+                # paths may honor it (unconditional grants: trust-all / YOLO /
+                # native crew) and which must not (content-matching paths).
+                _child_grant_eligible = event.child_unconditional_grant_eligible
                 if _child_low_fidelity:
                     # Diagnostic for a path that is otherwise invisible in
                     # logs: without it a trust-all session watching its
@@ -6530,6 +6710,7 @@ async def _run_chat(
                         is_shell=event.is_shell,
                         mcp_server_name=event.mcp_server_name,
                         mcp_tool_name=event.tool_name,
+                        mcp_identity_ambiguous=event.mcp_identity_ambiguous,
                         # The RESOLVED agent (what actually served the turn), not
                         # slot.agent — that is an alias resolve_agent_bindings
                         # maps to a concrete kiro agent, so it must never decide
@@ -6623,6 +6804,13 @@ async def _run_chat(
                                 "declining a hook auto-approve: %s; the request "
                                 "falls through to interactive approval",
                                 _hook_shim.log_text,
+                            )
+                            _audit_name_grant_refusal(
+                                session_key=session_key,
+                                slot=slot,
+                                event=event,
+                                refusal=_hook_shim,
+                                tier="hook_auto_approve",
                             )
                             slot.append(
                                 "system",
@@ -6829,20 +7017,33 @@ async def _run_chat(
                         if _tp_command
                         else None
                     )
-                    if matched and _tp_cmd:
+                    if matched and event.is_shell and _tp_command:
                         # The user granted a PROGRAM NAME. Do not honour it when
                         # that name no longer identifies the program it appears
                         # to name — the shell resolves it again, through a PATH
                         # that can lead with directories the agent writes.
                         # Declining costs one interactive prompt; the command is
                         # neither blocked nor rewritten.
-                        _tp_shim = await _name_grant_refusal_off_loop(_tp_cmd)
+                        #
+                        # `is_shell` is tested explicitly because `_tp_command`
+                        # is non-empty for a non-shell grant too, where it is a
+                        # canonical `mcp-trust:v1:...` identity rather than a
+                        # command. There is no program name to vouch for there,
+                        # so that tier stays unchanged.
+                        _tp_shim = await _name_grant_refusal_off_loop(_tp_command)
                         if _tp_shim:
                             # The CODE, not the detail and not the pattern: both
                             # are derived from user/agent input, and a log sink is
                             # where that becomes a disclosure. The detail still
                             # reaches the person, on the card below.
                             logger.warning("trusted pattern not applied: %s", _tp_shim.log_text)
+                            _audit_name_grant_refusal(
+                                session_key=session_key,
+                                slot=slot,
+                                event=event,
+                                refusal=_tp_shim,
+                                tier="trusted_pattern",
+                            )
                             slot.append(
                                 "system",
                                 "🛡️ Trusted pattern not applied — "
@@ -6908,7 +7109,6 @@ async def _run_chat(
                 # Detect bash tools by tool_input content (title is human-readable)
                 cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                 yolo_active = state.is_yolo_active()
-                auto_approve_active = configured_auto_approve or yolo_active
                 # Evaluated ONCE for both branches below. Two separate calls could
                 # straddle a scoped grant's expiry and disagree with each other, and
                 # a scope check is not a pure read — it retires a lapsed grant and
@@ -6921,7 +7121,19 @@ async def _run_chat(
                     and cmd
                     and not _child_low_fidelity
                 ):
-                    if is_read_only_bash(cmd) and (await _name_grant_refusal_off_loop(cmd)) is None:
+                    _tr_shim = (
+                        await _name_grant_refusal_off_loop(cmd) if is_read_only_bash(cmd) else None
+                    )
+                    if _tr_shim is not None:
+                        logger.warning("trust-reads not applied: %s", _tr_shim.log_text)
+                        _audit_name_grant_refusal(
+                            session_key=session_key,
+                            slot=slot,
+                            event=event,
+                            refusal=_tr_shim,
+                            tier="trust_reads",
+                        )
+                    if is_read_only_bash(cmd) and _tr_shim is None:
                         try:
                             validated_tool = _validate_tool_name(
                                 event.title, is_shell=event.is_shell
@@ -6958,8 +7170,8 @@ async def _run_chat(
                             metadata={"reason": "trust_reads"},
                         )
                         continue
-                # Trust mode (per-slot), configured auto approval, or YOLO mode
-                # (global) — auto-approve. All three are UNCONDITIONAL grants:
+                # Trust mode (per-slot) or YOLO mode (global) — auto-approve.
+                # Both are UNCONDITIONAL grants:
                 # the decision consumes no agent-authored event data, so a
                 # low-fidelity child event with a VERIFIED canonical MCP
                 # identity still qualifies (_child_grant_eligible —
@@ -6968,7 +7180,7 @@ async def _run_chat(
                 # falls through to the interactive card; children WITH cached
                 # bytes take these branches exactly like the main agent (mode
                 # parity).
-                if (slot_trusted or auto_approve_active) and _child_grant_eligible:
+                if (slot_trusted or yolo_active) and _child_grant_eligible:
                     try:
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
@@ -7036,11 +7248,7 @@ async def _run_chat(
                         request_id=event.request_id,
                         # Provenance, so an auditor can separate a human's session
                         # trust from an unattended worker's expiring scoped grant.
-                        metadata={
-                            "reason": _auto_approve_reason(slot, yolo_active)
-                            if not auto_approve_active or yolo_active
-                            else "approval_mode_auto",
-                        },
+                        metadata={"reason": _auto_approve_reason(slot, yolo_active)},
                     )
                     continue
                 # Auto-reject remaining tools after one rejection in a batch
@@ -7414,7 +7622,26 @@ async def _run_chat(
                         # is what starts execution, so a file swapped in that
                         # window would be the one pinned -- recording a file the
                         # human never saw. Off-loop because it digests the file.
-                        if cmd:
+                        #
+                        # Scope kept to `cmd`, the command the tiers above already
+                        # extracted. Round 18 widened this to fall back to
+                        # `event.shell_command` so a structured approval of a
+                        # non-system program stopped re-prompting; round 20 called
+                        # the wider form an undisclosed persistent grant, and
+                        # between "prompts once more than it needs to" and "records
+                        # an identity from a surface the human may not read as
+                        # durable", the extra prompt is the safe side. The narrower
+                        # form is the one that ships.
+                        #
+                        # `is_shell` is tested explicitly (round 21) because
+                        # `extract_bash_command` reads a `command` key out of ANY
+                        # structured input and falls back to the raw string, so a
+                        # NON-shell MCP call carrying `{"command": "gh ..."}` would
+                        # otherwise mint a witness for the shell program `gh` --
+                        # a durable grant from an approval that was never about
+                        # running `gh` at all. Same reason the trusted-pattern tier
+                        # above tests it.
+                        if event.is_shell and cmd:
                             await asyncio.to_thread(pin_human_approval, cmd)
                         await client.approve_tool(event.request_id)
                         _approved_title = _redact_display_text(event.title)
@@ -7515,7 +7742,63 @@ async def _run_chat(
             elif event.kind == EVENT_AGENT_SWITCHED:
                 new_agent, _ = redact_credentials(event.text)
                 new_agent, _ = redact_exfiltration_urls(new_agent)
-                if new_agent:
+                if new_agent and slot.mode == "member" and new_agent != slot.agent:
+                    # Member DM threads are pinned to their crew, and this is
+                    # the one writer the HTTP guards cannot reach: kiro-cli has
+                    # ALREADY switched its own session's agent by the time this
+                    # event arrives. Veto by keeping slot.agent (no broadcast —
+                    # nothing changed for the UI) and forcing a session reset,
+                    # so the next turn cold-starts from the slot's bindings on
+                    # the pinned crew instead of continuing on the switched one.
+                    logger.warning(
+                        "agent switch to %r vetoed on member thread %s (pinned to %r)",
+                        new_agent,
+                        slot.key,
+                        slot.agent,
+                    )
+                    # SEL: this veto is a permission denial — the one pin
+                    # enforcement site the HTTP guards cannot reach (kiro-cli
+                    # already switched) — so it must land in the immutable
+                    # audit chain like every other member-pin refusal, not
+                    # only in the mutable process log above.
+                    sel().log_api_access(
+                        caller=f"slot={slot.key}",
+                        operation="chat_runner.agent_switch",
+                        outcome="denied",
+                        source="member_pin",
+                        resources=f"slot={slot.key} agent={new_agent}",
+                        error=f"member thread pinned to {slot.agent}",
+                    )
+                    # The veto must be VISIBLE: kiro-cli has already switched,
+                    # so the remainder of this turn executes as the foreign
+                    # agent — on a thread whose whole value is identity, a
+                    # silent veto reads as the pinned member speaking. Role
+                    # "notice" (the same channel the runner's other inline
+                    # banners use) keeps it out of the transcript the model
+                    # replays as its own prior output.
+                    slot.append(
+                        "notice",
+                        f"📌 Agent switch to {new_agent} was blocked — this thread is "
+                        f"pinned to {slot.agent}. The next turn restarts on the pinned crew.",
+                        "msg msg-info",
+                    )
+                    needs_session_reset = True
+                    # The vetoed turn DID produce visible output (the notice
+                    # above) — and more importantly, tool calls completed
+                    # BEFORE the switch event may have had real side effects.
+                    # Without this flag the empty-response recovery would
+                    # requeue the prompt and replay those non-idempotent
+                    # actions on the reset session.
+                    _produced_visible_output = True
+                    # Terminate the stream NOW: kiro-cli has already switched,
+                    # so every further event of this turn — text and tool
+                    # calls alike — would execute as the foreign agent inside
+                    # the pinned thread. Breaking stops consumption and the
+                    # finally block's session reset tears the switched session
+                    # down, the same way the tool-rejection paths above bail
+                    # out of a turn that must not continue.
+                    break
+                elif new_agent:
                     slot.agent = new_agent
                     assistant_text = ""
                     _wsred.reset()
@@ -7646,10 +7929,7 @@ async def _run_chat(
                 # unattributable turn stays "" and the footer omits the field.
                 _turn_model = read_turn_model(client)
                 if _u.input_tokens or _u.output_tokens or _u.credits:
-                    try:
-                        _provider_name = cfg.agent.provider  # type: ignore[possibly-undefined]
-                    except (NameError, AttributeError):
-                        _provider_name = ""
+                    _provider_name = provider_label(client)
                     # Late backfill: CC reports model only via the `init`
                     # system event which arrives after the run starts, so
                     # slot.model may still be empty here even though the
@@ -7761,6 +8041,10 @@ async def _run_chat(
                     and _stop_reason != STOP_REASON_CANCELLED
                     and _stop_reason != STOP_REASON_STALE_RECOVER
                     and _stop_reason != STOP_REASON_TOOL_STALL
+                    # An abandoned post-compaction-failure turn is an EXPECTED
+                    # terminal state (the compaction notice already told the
+                    # user); no retry, so it must not log as unexpected.
+                    and _stop_reason != STOP_REASON_COMPACTION_FAILED
                 ):
                     logger.warning(
                         "Unexpected stop_reason %r for slot %s",
@@ -7872,6 +8156,22 @@ async def _run_chat(
                 _emit_stall("Session stuck — please start a new chat.")
             else:
                 _emit_stall("⟳ Tool appeared stalled — please retry.")
+            return
+
+        # Automatic compaction failed and the backend then abandoned the turn.
+        # Returning HERE is load-bearing: this reason is in the "error:" family,
+        # and the branch below is pipe-death recovery — it would re-queue the
+        # message and label it "Connection lost", neither of which is true. A
+        # retry would also just hit the same over-threshold context and fail
+        # again. No message to add either: the compaction-status path already
+        # appended the visible notice naming the failure. The session reset IS
+        # needed, though — this completion is synthetic (the client stopped
+        # reading; the backend never sent end_turn), so the backend still
+        # counts the turn as in progress and the next prompt would collide
+        # with "prompt already in progress". The finally's reset tears that
+        # runtime down and session/load-resumes, WITHOUT re-queuing anything.
+        if _stop_reason == STOP_REASON_COMPACTION_FAILED:
+            needs_session_reset = True  # checked in finally block (reset, no re-queue)
             return
 
         # CC process died mid-turn: re-queue message for automatic retry

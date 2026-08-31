@@ -203,11 +203,11 @@ def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
 
 @pytest.fixture(autouse=True)
 def _windows_restrict_to_owner_stub(request, monkeypatch):
-    """On Windows, no-op the icacls secret lockdown for hermetic tests.
+    """On Windows, no-op the secret lockdown for hermetic tests.
 
-    Many tests stub ``subprocess.run`` (or strip PATH) for hermeticity;
-    ``restrict_to_owner``'s whoami/icacls spawns then fail and its
-    DELIBERATE fail-loud OSError cascades into hundreds of unrelated
+    Many tests stub ``subprocess.run`` (or strip PATH) for hermeticity, or
+    monkeypatch the SID resolver; ``restrict_to_owner``'s DELIBERATE fail-loud
+    OSError then cascades into hundreds of unrelated
     tests. The real Windows implementation keeps direct coverage in
     test_platform_compat / test_spawn_audit (exempted here) and the
     POSIX chmod path keeps full coverage on the Linux matrix. Product
@@ -218,10 +218,23 @@ def _windows_restrict_to_owner_stub(request, monkeypatch):
     ``restrict_dir_to_owner`` is stubbed alongside it and must stay that
     way: it is the directory twin that ``make_owner_only_dir`` routes
     through, so stubbing only the file helper would leave every test that
-    creates an owner-only directory spawning a real icacls.
+    creates an owner-only directory writing a real DACL.
+
+    Note the lockdown no longer spawns anything -- it applies the DACL through
+    ``advapi32`` in-process -- so the subprocess-stub collision this fixture was
+    built for is mostly gone. The stub is kept because a hermetic test that
+    patches the SID resolver or the writer seam can still trip the fail-loud
+    OSError, and narrowing it is a change to hundreds of tests' blast radius
+    rather than part of the DACL swap.
     """
     if not platform_compat.IS_WINDOWS or request.module.__name__ in (
         "test_platform_compat",
+        # Exempted for the same reason as test_platform_compat: these modules own
+        # the direct Windows-branch coverage for the owner-only lockdown, so a
+        # stub would make their assertions vacuous. They were passing on Linux
+        # (where the fixture is inert) and silently asserting nothing on Windows.
+        "test_platform_compat_coverage",
+        "test_config_rmw_preserves_settings",
         "test_spawn_audit",
     ):
         yield

@@ -6,6 +6,7 @@ import asyncio
 import functools
 import hashlib
 import hmac
+import importlib.util
 import json
 import logging
 import os
@@ -51,7 +52,11 @@ from kiro_crew.dashboard.chat_utils import (
     remember_slack_options,
     slack_options_owner_key,
 )
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.handlers._shared import (
+    _pip_install_channel_available,
+    pip_extra_install_command,
+    read_bounded_json,
+)
 from kiro_crew.dashboard.origin import is_direct_local_request, is_proxied_request
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_END,
@@ -78,7 +83,13 @@ from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exf
 from kiro_crew.slack.format import build_options_blocks, extract_options
 from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
 from kiro_crew.spawn_warm import warm_project_agents_for_spawn
-from kiro_crew.subagent import effort_applied_note, effort_drop_reason
+from kiro_crew.subagent import (
+    _subagent_default_model,
+    dedicated_child_factory_kwargs,
+    effort_applied_note,
+    effort_drop_reason,
+    parent_live_harness,
+)
 from kiro_crew.subagent_command_authority import (
     AuthorityConflict,
     AuthorityOutcomeUncertain,
@@ -343,17 +354,44 @@ async def api_spawn(request: web.Request) -> web.Response:
     # a non-sentinel global). Additive, optional key — reporting only, never
     # changes whether the spawn happened.
     if reasoning_effort:
+        sessions = getattr(state, "sessions", None)
         # Mirror _run_inner's agent inheritance so the verdict judges the same
         # agent the session will actually use.
         verdict_agent = agent or (
-            state.sessions.get_agent(parent_session) if parent_session else ""
+            sessions.get_agent(parent_session) if parent_session and sessions else ""
+        )
+        verdict_backend, advertised = parent_live_harness(
+            sessions,
+            parent_session or "",
         )
 
         def _effort_verdict() -> tuple[str, str]:
-            d = effort_drop_reason(model, reasoning_effort, verdict_agent)
+            preferred_model = model or _subagent_default_model()
+            if verdict_backend is None:
+                verdict_model = preferred_model
+            else:
+                child_kwargs = dedicated_child_factory_kwargs(
+                    parent_backend=verdict_backend,
+                    advertised=advertised,
+                    preferred_model=preferred_model,
+                )
+                verdict_model = str(child_kwargs.get("model", "") or "")
+            d = effort_drop_reason(
+                verdict_model,
+                reasoning_effort,
+                verdict_agent,
+                verdict_backend,
+                model_pin_resolved=True,
+            )
             if d:
                 return d, ""
-            return "", effort_applied_note(model, reasoning_effort, verdict_agent)
+            return "", effort_applied_note(
+                verdict_model,
+                reasoning_effort,
+                verdict_agent,
+                verdict_backend,
+                model_pin_resolved=True,
+            )
 
         # The resolvers read config and glob ~/.kiro/agents — file I/O that
         # must not run on the gateway event loop (the same reason
@@ -535,10 +573,13 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
                 headers={"Retry-After": "5"},
             )
         return web.json_response({"error": detail, "code": "steer_failed"}, status=502)
+    queued = mode == "follow_up" or detail.startswith("follow_up")
     response: dict[str, object] = {
         "id": agent_id,
-        "status": "follow_up_queued" if mode == "follow_up" else "steered",
+        "status": "follow_up_queued" if queued else "steered",
     }
+    if queued and detail.startswith("follow_up"):
+        response["reason"] = detail
     if command_identity is not None:
         response["command_id"] = command_identity[0]
         response["idempotency_key"] = command_identity[1]
@@ -3019,9 +3060,9 @@ def _deny_non_owner_browser_request(request: web.Request, operation: str) -> web
     """
     # Deferred import: source_providers imports chat state helpers from this
     # module's sibling, so a top-level import would close a cycle.
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
     from kiro_crew.dashboard.handlers.source_providers import (
         is_owner_dashboard_request,
-        stale_owner_session_response,
     )
 
     if is_owner_dashboard_request(request):
@@ -3058,13 +3099,7 @@ def _deny_non_owner_browser_request(request: web.Request, operation: str) -> web
     )
     # Deny decision made above; only the response label changes for a signed
     # pre-owner bootstrap subject (see stale_owner_session_response).
-    stale = stale_owner_session_response(request)
-    if stale is not None:
-        return stale
-    return web.json_response(
-        {"error": "dashboard user required", "code": "dashboard_user_required"},
-        status=403,
-    )
+    return _owner_denial_response(request, "dashboard user required", "dashboard_user_required")
 
 
 async def api_browser_token_put(request: web.Request) -> web.Response:
@@ -6334,6 +6369,50 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
 # group, which is why the panel shows a hint rather than silently doing nothing.
 
 
+# Channels whose SDK ships as an optional extra rather than in core. Maps the
+# channel to (import name, extra name) so the panel can report BOTH whether the
+# SDK is importable by this gateway process and the exact command that installs
+# it into this interpreter. Teams (PyJWT) and WhatsApp (neonize) have the same
+# shape and are one entry each when their panels adopt the card.
+_CHANNEL_SDK_EXTRA: dict[str, tuple[str, str]] = {
+    "feishu": ("lark_oapi", "feishu"),
+}
+
+
+def _channel_sdk_status(channel: str) -> tuple[bool, bool, str]:
+    """``(installed, install_supported, install_command)`` for *channel*'s extra.
+
+    Computed HERE rather than read off the connection badge, because the badge
+    cannot answer it in the case that matters. ``maybe_start_feishu`` returns at
+    its first line when the channel is disabled, and the ``ImportError`` branch
+    that records the missing SDK sits after that return — so a user who has not
+    yet flipped the enable toggle gets no hint at all, and one who has must
+    restart the gateway before the hint appears. This endpoint answers either
+    way and without a restart.
+
+    ``install_command`` is empty when it would be useless or actively wrong: the
+    SDK is already importable, or no install channel exists in this
+    build/interpreter (see :func:`_pip_install_channel_available` — on the
+    bundled desktop interpreter a pip install writes into the code-signed bundle
+    and is discarded on the next app update, so naming the command there is bad
+    advice rather than merely unhelpful).
+
+    Blocking: ``find_spec`` and the PEP 668 marker check both touch the
+    filesystem, so call it from a worker thread on an async path.
+    """
+    entry = _CHANNEL_SDK_EXTRA.get(channel)
+    if entry is None:
+        # No optional extra for this channel: nothing is ever missing, so the
+        # panel renders no card.
+        return True, False, ""
+    import_name, extra = entry
+    if importlib.util.find_spec(import_name) is not None:
+        return True, True, ""
+    if not _pip_install_channel_available():
+        return False, False, ""
+    return False, True, pip_extra_install_command(extra)
+
+
 def _is_valid_feishu_id(v: str, prefix: str) -> bool:
     """Feishu opaque-id shape check (linear string ops, no regex).
 
@@ -6368,11 +6447,15 @@ async def api_feishu_config_get(request: web.Request) -> web.Response:
     # rather than just this request. Read as ONE unit of work: the credential
     # read is a method on the config object, and splitting them into two hops
     # would let the two files be read either side of a concurrent save.
-    def _read() -> "tuple[KiroCrewConfig, dict]":
+    def _read() -> "tuple[KiroCrewConfig, dict, tuple[bool, bool, str]]":
         loaded = KiroCrewConfig.load()
-        return loaded, loaded.load_credentials()
+        # The SDK probe joins this same unit of work: find_spec and the PEP 668
+        # marker are filesystem reads, and the panel polls this endpoint every
+        # 15s, so giving them their own thread hop would double the cost of a
+        # poll for no isolation benefit.
+        return loaded, loaded.load_credentials(), _channel_sdk_status("feishu")
 
-    cfg, creds = await asyncio.to_thread(_read)
+    cfg, creds, (sdk_installed, sdk_supported, sdk_command) = await asyncio.to_thread(_read)
     app_id = creds.get(CRED_FEISHU_APP_ID, "")
     app_secret = creds.get(CRED_FEISHU_APP_SECRET, "")
     fs = cfg.feishu
@@ -6403,6 +6486,20 @@ async def api_feishu_config_get(request: web.Request) -> web.Response:
             "allowed_group_ids": list(fs.allowed_group_ids),
             "soft_threshold_pct": int(fs.soft_threshold_pct),
             "session_folder": fs.session_folder,
+            # The channel needs lark-oapi, which ships as the optional [feishu]
+            # extra. False means the gateway process cannot import it and the
+            # channel will be skipped at boot no matter how complete the rest of
+            # this config is.
+            "sdk_installed": sdk_installed,
+            # False in the three environments where a pip install cannot work
+            # (bundled desktop interpreter, no pip module, PEP 668
+            # externally-managed): the panel shows an unsupported notice instead
+            # of a command that would silently achieve nothing.
+            "sdk_install_supported": sdk_supported,
+            # Names THIS gateway's interpreter, because installing into the
+            # wrong environment is the actual failure mode. Empty when the SDK is
+            # present or no install channel exists.
+            "sdk_install_command": sdk_command,
         }
     )
 

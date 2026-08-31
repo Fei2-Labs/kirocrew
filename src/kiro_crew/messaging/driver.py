@@ -336,6 +336,9 @@ class TurnDriver:
         # EVENT_TOOL_RESULT for a tool call whose trusted ``_meta.kiro``
         # identity was recorded at EVENT_TOOL_CALL — the forgery gate.
         self.directive_consumer = directive_consumer
+        # Terminal stop reason of the last run() — read by the dispatcher's
+        # post-turn bookkeeping (e.g. COMPACTION_FAILED -> session reset).
+        self.last_stop_reason: str = ""
 
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text."""
@@ -599,6 +602,11 @@ class TurnDriver:
                     OutputEvent(kind=COMPACTION, context_usage_pct=event.context_usage_pct)
                 )
             elif kind == EVENT_COMPLETE:
+                # Exposed for the dispatcher's post-turn bookkeeping: a
+                # COMPACTION_FAILED terminal is synthetic (the backend never
+                # sent end_turn) and needs a session reset the driver cannot
+                # perform itself (it holds no session key).
+                self.last_stop_reason = event.stop_reason or ""
                 pending = compaction_filter.flush()
                 if pending:
                     await dispatch_frames(steering_filter.feed(pending))

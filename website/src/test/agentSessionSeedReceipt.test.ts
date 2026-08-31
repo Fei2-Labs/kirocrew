@@ -17,7 +17,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, waitFor } from '@testing-library/react'
 
-const { dispatch, apiMock, saveInvestigation } = vi.hoisted(() => ({
+const { dispatch, apiMock, saveInvestigation, getInvestigation } = vi.hoisted(() => ({
   dispatch: vi.fn(),
   apiMock: {
     chatFolders: vi.fn(),
@@ -26,6 +26,7 @@ const { dispatch, apiMock, saveInvestigation } = vi.hoisted(() => ({
     sendChat: vi.fn(),
   },
   saveInvestigation: vi.fn(),
+  getInvestigation: vi.fn(),
 }))
 
 vi.mock('../store', () => ({ useAppDispatch: () => dispatch }))
@@ -36,7 +37,7 @@ vi.mock('../store/chatSlice', () => ({
 }))
 vi.mock('react-router-dom', () => ({ useNavigate: () => vi.fn() }))
 vi.mock('../api/client', () => ({ api: apiMock }))
-vi.mock('../apps/issue-radar/api', () => ({ issueRadarApi: { saveInvestigation } }))
+vi.mock('../apps/issue-radar/api', () => ({ issueRadarApi: { saveInvestigation, getInvestigation } }))
 
 import { useAgentSession } from '../apps/issue-radar/lib/agentSession'
 
@@ -69,7 +70,8 @@ describe('Issue Radar seed — the receipt decides, not the status alone', () =>
           ? Promise.resolve({ key: 'slot-1' })
           : Promise.resolve(undefined),
     }))
-    apiMock.chatFolders.mockResolvedValue([{ id: 'repo-1', name: 'Issue Radar - demo-repo' }])
+    getInvestigation.mockResolvedValue({ investigation: null })
+  apiMock.chatFolders.mockResolvedValue([{ id: 'repo-1', name: 'Issue Radar - demo-repo' }])
     saveInvestigation.mockResolvedValue({ investigation: { slot_key: 'slot-1' } })
   })
 

@@ -562,20 +562,30 @@ this is what closes the torn-read window for everyone else. Mode-preserving
 because tmp+rename creates a NEW inode, so the umask default (typically `0644`)
 would silently replace an operator's tightened `0600`; `config.json` can hold
 inline credentials, so a settings write must never widen who can read it. An
-existing file's mode carries over and a newly created one is owner-only. It
-deliberately does NOT call `platform_compat.restrict_to_owner`: that helper shells
-out to `icacls` on Windows, and this function runs inside async request handlers
-and `save()`, so calling it would put a blocking subprocess on the gateway event
-loop (`no-blocking-call-on-event-loop`). Omitting it is no worse than the
-truncate-then-write it replaced, which applied no DACL either.
+existing file's mode carries over and a newly created one is owner-only. On
+Windows it also applies a real owner-only DACL via
+`platform_compat.restrict_to_owner` (`restrict_on_error="warn"`, so a DACL that
+cannot be applied warns rather than making the config unwritable).
+
+That is a reversal of an earlier ruling recorded here, and the reason it changed
+is worth keeping: the lockdown used to shell out to `icacls`, a blocking
+subprocess this function could not afford because it runs inside async request
+handlers and `save()` (`no-blocking-call-on-event-loop`). It is now applied
+in-process through `advapi32` (measured 0.24 ms against 313 ms for the
+subprocess), so the cost that forced the omission is gone and `config.json` --
+which can hold inline provider tokens -- is no longer left under whatever DACL it
+inherits from its parent. Follow-up work that touches the other owner-only call
+sites should treat this as settled rather than re-deriving the old constraint.
 
 **Mode preservation is POSIX-only.** `atomic_write`'s `mode` routes through
 `fchmod_safe`, a documented no-op on Windows, where access is carried by the DACL
-instead. Applying one would mean an `icacls` subprocess, which this function must
-not run (above) — so on Windows the replacement file inherits the directory's ACL,
-exactly as the `write_text` it replaced did. The three mode/symlink tests in
+instead. The two guarantees therefore do not collide -- they apply on different
+platforms -- which is why the writer branches on `IS_POSIX` rather than passing
+both to `atomic_write`, which refuses `restrict_to_owner=True` alongside a wider
+explicit `mode`. The three mode/symlink tests in
 `test_config_rmw_preserves_settings.py` are `skipif(not IS_POSIX)` for this reason;
-the data-loss and AST-guard tests are platform-independent and run everywhere.
+its Windows counterpart asserts the DACL by reading the descriptor back, and the
+data-loss and AST-guard tests are platform-independent and run everywhere.
 
 **Symlinks are followed, not replaced.** `os.replace` renames over the link
 itself, so a symlinked `config.json` would become a regular file and its target

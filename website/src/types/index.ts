@@ -46,6 +46,7 @@ export interface StatusData {
    */
   update_channel?: string
   update_managed_by?: string
+  update_can_arm?: boolean
   /**
    * Commit distance from a git checkout's upstream, both directions. Diverged
    * (both > 0) reports `update_available: false` exactly like a current
@@ -82,6 +83,18 @@ export interface StatusData {
   release_channel?: 'nightly' | 'insider' | 'stable'
   branch?: string
   commit?: string
+  /**
+   * The agent harness NEW sessions run on, resolved by the gateway. `label` is
+   * the harness's display name ("Kiro CLI", "Claude Code", …) and `backend` its
+   * id (`""` is kiro-cli). `kiro_credits` says whether a turn on it draws down
+   * the signed-in Kiro account's credit plan — the gateway owns that membership
+   * rule, so never mirror it here.
+   *
+   * Absent or `null` means UNKNOWN: an older gateway, or one that could not read
+   * the config. Treat that as "behave as before" — leave a readout as it was
+   * rather than asserting a harness or hiding a real balance.
+   */
+  harness?: { backend: string; label: string; kiro_credits: boolean } | null
   platform?: string
   yolo?: boolean
   /** ISO timestamp when the current timed auto-approve grant expires ("" when none). */
@@ -714,6 +727,10 @@ export interface ChatSlot {
    * task-runner slot, or an app/cron-minted session (which can share the
    * `chat-<n>-<ts>` key shape) never triggers it. */
   origin?: string
+  /** Live ACP harness this slot's provider is driving (``''`` = kiro).
+   *  Omitted when no provider is bound yet. Distinct from `status.harness`,
+   *  which is the default for *new* sessions. */
+  acp_backend?: string
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
    * binding survives a gateway restart and a History-page resume. */
@@ -925,6 +942,12 @@ export interface SubagentActivity {
    *  compared against `model` via `isModelDowngrade` to render the amber chip on
    *  the live card (#5326). */
   requestedModel?: string
+  /** The sub-agent's OWN session key, where it writes its per-turn context
+   *  rows. Carried on the `subagent_spawn`/`subagent_done`/snapshot frames
+   *  (backend `conversation_key or subagent:<id>`). The Session Breakdown tree
+   *  uses it to fetch this node's own context-trace so each node shows the
+   *  composition of ITS window, not the parent's. Absent for native cards. */
+  childSession?: string
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
   streaming: string; lastTool: string
   startedAt: number; elapsed: number; error?: string
@@ -1366,6 +1389,13 @@ export interface WorkflowRunSummary {
   error?: string | null;
   /** Originating chat session, `""` for a UI-launched run that belongs to no chat. */
   session_key?: string;
+  source_format?: 'python' | 'task-plan';
+  driver?: 'workflow' | 'taskrunner' | string;
+  task_id?: string;
+  capabilities?: string[];
+  workflow_id?: string;
+  workflow_slug?: string;
+  workflow_revision?: number;
   /** Title of the most recent `phase_started` event. */
   phase?: string;
   /** Most recent narrator `log` message. */

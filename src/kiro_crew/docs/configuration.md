@@ -82,19 +82,19 @@ use KAS's `_kiro/session/list` (which returns the full `sessions[]` to search by
 id); that is deferred to the session-lifecycle work, not the display path.
 
 
-**KAS gets its token from kiro-cli.** Kiro Crew launches KAS with
-`--auth=acp-callback`, so KAS keeps no credential of its own: whenever it needs
-an access token it calls back over ACP (`_kiro/auth/getAccessToken`) and Kiro
-Crew answers by shelling out to `kiro-cli chat _ get-kas-token`, which
-resolves-and-refreshes the token. The refresh token never leaves kiro-cli's own
-store, and this process only ever holds a short-lived access token in transit —
-never cached, never logged. This works on any machine where `kiro-cli login` has
-succeeded; a machine that is not signed in gets an auth error on the first
-prompt (the session still starts cleanly). Sign in with kiro-cli before
-switching.
+**KAS is served by kiro-cli's own ACP relay.** Kiro Crew spawns
+`kiro-cli acp --agent-engine v3 --auth-method cli` and speaks ordinary ACP to it;
+the relay forwards frames to KAS in both directions. Two consequences worth
+knowing:
 
-It also needs a KAS bundle already extracted on the machine by kiro-cli; set
-`KIROCREW_KAS_NODE` / `KIROCREW_KAS_SCRIPT` to point elsewhere.
+- **Credentials stay in kiro-cli.** `--auth-method cli` makes the relay resolve
+  access tokens from kiro-cli's own store, so Kiro Crew never handles a KAS
+  token. This works on any machine where `kiro-cli login` has succeeded; sign in
+  with kiro-cli before switching.
+- **No KAS assets to locate.** Kiro Crew does not read kiro-cli's extracted KAS
+  bundle or its Node runtime, so there is nothing to point at and no override to
+  set. What it does need is a kiro-cli new enough to offer `--agent-engine v3`;
+  `kirocrew doctor` reports that when `agent.acp_backend` is `kas`.
 
 An unrecognized value logs a warning and falls back to the default backend, so a
 typo costs you a line in the log rather than a gateway that will not start.

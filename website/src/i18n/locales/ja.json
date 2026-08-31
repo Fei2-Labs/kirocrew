@@ -34,8 +34,6 @@
     "dismiss": "閉じる",
     "dsk": "DSK",
     "expand_sidebar": "サイドバーを展開",
-    "explore": "探索",
-    "explore_apps": "アプリを探索",
     "gateway_connected": "ゲートウェイに接続済み",
     "gateway_offline": "ゲートウェイがオフライン",
     "gateway_offline_reconnecting": "ゲートウェイがオフライン — 再接続中",
@@ -45,7 +43,6 @@
     "iam_identity_center": "IAM Identity Center",
     "installing_packages": "パッケージをインストール中",
     "k_search_for_anything": "⌘K — 何かを検索…",
-    "kiro_credit_usage_api_key": "Kiro クレジット使用状況 — API キー認証では利用不可",
     "kiro_credit_usage_checking": "Kiro クレジット使用状況 — 確認中…",
     "kiro_credit_usage_checking_2": "Kiro クレジット使用状況 — 確認中",
     "kiro_credit_usage_unavailable": "Kiro クレジット使用状況 — 利用不可",
@@ -112,7 +109,10 @@
     "open_command_bar": "Command Bar を開く",
     "focus_mode": "フォーカスモード",
     "focus_mode_title": "フォーカスモード · Alt+Shift+M",
-    "focus_mode_title_mac": "フォーカスモード · ⌥⇧M"
+    "focus_mode_title_mac": "フォーカスモード · ⌥⇧M",
+    "kiro_credit_usage_api_key": "Kiro クレジット使用状況 — API キー認証では利用不可",
+    "active_harness": "エージェントハーネス: {{label}}",
+    "harness_new_sessions": "新しいセッション"
   },
   "appSdk": {
     "chatEmbed": {
@@ -448,6 +448,10 @@
         "header_resolved": "解決済み"
       },
       "global": {
+        "unattributed_label": "リポジトリのないイベント",
+        "unattributed_note": "イベントがリポジトリを示すようになる前に記録されたため、どのリポジトリにも帰属できません。",
+        "repos_label": "リポジトリ",
+        "repos_note": "このボードはそれらをまとめて集計し、個別の表示にはまだ対応していません。",
         "tab_pipeline": "パイプライン",
         "tab_lanes": "項目レーン",
         "tablist_label": "自動トリアージパイプラインのビュー",
@@ -1720,8 +1724,10 @@
       },
       "components": {
         "agentSessionButton": {
+          "already_finished_its_session_was_closed": "すでに完了。記録は「以前のセッション」にあります。",
           "couldn_t_start": "開始できませんでした",
-          "resume": "再開"
+          "resume": "再開",
+          "start_over": "やり直す"
         },
         "aiSummaryCard": {
           "ai_summary": "AI要約",
@@ -4540,7 +4546,6 @@
         "workflows": "Workflows"
       },
       "workflowsRuns": {
-        "background_runs": "バックグラウンド実行",
         "budget": "予算",
         "cancel": "キャンセル",
         "cancelling": "キャンセル中…",
@@ -4567,8 +4572,6 @@
       },
       "console": {
         "crumb_accounts": "アカウント",
-        "connected": "接続済み",
-        "not_connected": "未接続",
         "copy": "コピー",
         "copied": "コピーしました",
         "close": "閉じる",
@@ -4580,17 +4583,25 @@
         "download_failed": "ダウンロードを開始できませんでした。何も送信されていません。もう一度お試しください。",
         "delete_confirm_action": "ファイルを削除",
         "delete_confirm": "「{{name}}」を削除しますか？ファイルはドライブから削除されます。",
+        "col_name": "名前",
+        "col_kind": "種類",
+        "col_size": "サイズ",
+        "col_modified": "更新日時",
+        "col_actions": "アクション",
+        "kind_folder": "フォルダー",
+        "folder_new": "新しいフォルダー",
+        "folder_name": "フォルダー名",
+        "folder_delete_confirm": "「{{name}}」とその中のすべてを削除しますか？",
+        "folder_delete_action": "フォルダーを削除",
+        "folder_delete_failed": "フォルダーを削除できませんでした。",
+        "folder_create_failed": "フォルダーを作成できませんでした。",
+        "folder_bad_name": "このフォルダー名には S3 が受け付けない文字が含まれています。英数字、スペース、および . _ - ( ) + @ = は使用できます。",
+        "folder_deleted": "{{objects}} 個のオブジェクトを削除しました。",
         "cancel": "キャンセル",
         "load_more": "さらに読み込む",
-        "connects_later": "後で接続します",
         "stat_this_month": "今月",
-        "more_actions": "その他の操作",
         "storage_consent_needed": "このアカウントのクラウドストレージはまだ確認されていません。下で確認してから更新してください。",
-        "stat_stored": "保存容量",
         "stat_stored_value": "{{size}} · {{objects}} 個のオブジェクト",
-        "stat_sites": "サイト",
-        "stat_tasks": "タスク",
-        "guard_line": "ガードは有効です。新たな支出が発生する操作は必ず先に確認を求めます · すべての変更が記録されます。",
         "costs_as_of": "{{date}} 時点のキャッシュされた数値です。",
         "costs_consent_missing": "このアカウントの支出を表示するには、以下でコストレポートを有効にしてください。",
         "costs_unavailable": "現在、請求情報を読み取れません。",
@@ -4620,12 +4631,12 @@
         "kind_webapp": "ウェブアプリ",
         "kind_image": "画像",
         "drive_title": "ドライブ",
-        "drive_root": "ドライブ",
         "drive_upload": "アップロード",
         "drive_uploading": "アップロード中…",
         "drive_bad_name": "そのファイル名には、ドライブが保存できない文字が含まれています。名前を変更してもう一度お試しください。",
         "drive_empty": "このフォルダーは空です。",
         "section_drive": "ドライブ",
+        "section_files": "ファイル",
         "section_library": "ライブラリー",
         "section_backup": "バックアップ",
         "share_title": "このファイルを共有",
@@ -4661,27 +4672,20 @@
         "access_expires_in": "有効期限 {{when}}",
         "access_forget": "リストから削除",
         "access_footer": "リストからリンクを削除しても無効にはなりません。共有リンクは期限切れまで機能し続けます。",
-        "ghost_tasks": "タスク",
-        "ghost_sites": "サイト",
-        "general": "概要",
-        "name": "名前",
-        "account_id": "アカウント ID",
-        "region": "リージョン",
-        "connection": "接続",
-        "keys": "キー",
         "keys_count_other": "キー {{count}} 個",
         "connections": "接続",
-        "copy_id": "アカウント ID をコピー",
         "key_healthy": "正常",
         "key_failed": "失敗",
+        "parent_folders": "上位フォルダー",
         "connection_connected": "接続済み",
         "connection_degraded": "劣化",
         "connection_unknown": "不明",
-        "parent_folders": "上位フォルダー"
+        "copy_id": "アカウント ID をコピー",
+        "folder_actions": "フォルダーの操作",
+        "file_actions": "ファイルの操作"
       },
       "page": {
         "title": "AWS Control",
-        "subtitle": "Kiro Crew が利用できる各 AWS アカウントと、各接続がまだ有効かどうか。",
         "refresh": "更新",
         "health_ok": "正常",
         "health_degraded": "要確認",
@@ -4707,9 +4711,6 @@
         "retry": "再試行",
         "disabled_title": "AWS Control は無効です",
         "disabled_body": "アカウントを表示するには、App Store でこのアプリを有効にしてください。",
-        "paid_services_title": "有料サービス",
-        "paid_services_intro": "これらのサービスはアカウントに課金される場合があるため、最初の課金対象の呼び出しの前にそれぞれ確認を求めます。",
-        "paid_services_scope": "以下の各カードは、そのカードに記載されている 1 つの接続にのみ適用され、上に一覧表示されたすべてのアカウントには適用されません。別のアカウントの有料サービスを確認するには、そのアカウントを開いて専用のページを使用してください。",
         "aggregate_accounts_other": "アカウント {{count}} 件",
         "aggregate_keys_other": "キー {{count}} 個",
         "aggregate_healthy_other": "正常 {{count}} 件",
@@ -4725,7 +4726,8 @@
         "add_accounts_registering": "登録中…",
         "add_accounts_error": "それらのプロファイルを登録できませんでした。何も追加されていません。もう一度お試しください。",
         "search_placeholder": "アカウントを検索",
-        "search_none": "「{{query}}」に一致するアカウントはありません。"
+        "search_none": "「{{query}}」に一致するアカウントはありません。",
+        "paid_services_title": "有料サービス"
       }
     }
   },
@@ -5064,7 +5066,7 @@
         "kirocrew_registry": "{{productName}} レジストリ"
       },
       "trustAppModal": {
-        "title": "{{app}} に独自のコードの実行を許可しますか？",
+        "title": "「{{app}}」に独自のコードの実行を許可しますか？",
         "scope": "これは {{app}} にのみ適用されます。その他のサードパーティーアプリはブロックされたままです。",
         "on_cancel": "キャンセルしても何も変わりません：{{app}} はインストールされたままオフの状態で、後からオンにできます。",
         "intro": "{{app}} を信頼すると、{{productName}} は以下のすべてを許可します。",
@@ -5171,7 +5173,10 @@
       "save": "保存",
       "set_a_goal": "目標を設定",
       "start_loop": "ループ開始",
-      "stop_loop": "ループ停止"
+      "stop_loop": "ループ停止",
+      "watches_next": "次回",
+      "watches_note": "実際のシグナルがあったときだけエージェントを起こします。管理は「スケジュール」ページから。",
+      "watches_title": "トークンを消費しない監視"
     },
     "bottomTerminalPanel": {
       "terminal_is_in_its_own_window": "ターミナルは別ウィンドウで開いています",
@@ -5288,7 +5293,13 @@
       "used": "使用済み",
       "voice_input": "音声入力",
       "finishing": "処理中…",
-      "keep_holding_to_record": "押したままで録音"
+      "keep_holding_to_record": "押したままで録音",
+      "plan_limit": "プラン上限",
+      "limit_type": "上限の種類",
+      "resets": "リセット",
+      "rate_limit_allowed": "正常",
+      "rate_limit_warning": "上限に近い",
+      "rate_limit_rejected": "制限中"
     },
     "chatPane": {
       "agent_list": "エージェントリスト",
@@ -5351,7 +5362,6 @@
         },
         "pagesProvider": {
           "developer": "デベロッパー",
-          "explore": "探索",
           "hooks": "フック",
           "kirocrew_agents": "{{productName}} エージェント",
           "logs": "ログ",
@@ -5602,6 +5612,8 @@
       "removals_other": "{{count}} 件の削除",
       "show": "表示",
       "show_less": "表示を減らす",
+      "switch_to_split_view": "分割ビューに切り替え",
+      "switch_to_unified_view": "統一ビューに切り替え",
       "this_document_is_tracked_as_a_session_artifact_n": "このドキュメントはセッションアーティファクトとして追跡されており、ソースファイルの変更ではありません",
       "toggle_diff": "{{path}} の差分を表示または非表示にする"
     },
@@ -5876,6 +5888,42 @@
       "prev": "← 前へ",
       "s_elapsed": "秒経過"
     },
+    "kasLogin": {
+      "aside_body": "CLI のインストールもターミナルも不要で、ここからそのまま Kiro にサインインできます。あとは Kiro Crew にお任せください。",
+      "aside_footnote": "サインイン情報はこのマシンにのみ保存され、Kiro Crew のサーバーには送信されません。",
+      "aside_headline": "サインインして始める",
+      "browser_note": "どのオプションも Kiro サインインを開始し、次の手順へ案内します。",
+      "check_again": "もう一度確認",
+      "continue_with_github": "GitHub で続行",
+      "continue_with_google": "Google で続行",
+      "copied": "コピーしました",
+      "copy_link": "リンクをコピー",
+      "could_not_start_sign_in": "サインインを開始できませんでした。接続を確認して、もう一度お試しください。",
+      "device_aside_body": "Kiro Crew は別のコンピューターで動作しているため、ブラウザーのウィンドウを開けません。下のリンクを任意のデバイス（スマートフォンでも可）で開き、コードを入力してください。",
+      "device_aside_footnote": "コードの有効期限は 5 分です。",
+      "device_aside_headline": "ブラウザーで承認",
+      "enter_the_code_in_your_browser": "スマートフォンか別のコンピューターでサインインを完了",
+      "enter_this_code": "このコードを入力",
+      "get_started": "はじめる",
+      "open_this_link": "このリンクをスマートフォンか別のブラウザーで開く",
+      "provider_builder_id": "AWS Builder ID",
+      "provider_company_sso": "会社の SSO",
+      "provider_github": "GitHub",
+      "provider_google": "Google",
+      "remote_host": "追加の手順",
+      "click_to_copy": "クリックしてコピー",
+      "code_valid_note": "コードは 5 分間有効",
+      "use_different_sign_in": "別の方法でサインイン",
+      "sign_in_failed": "サインインに失敗しました",
+      "sign_in_failed_body": "承認を待つ間に問題が発生しました",
+      "sign_in_status_unavailable": "サインイン状態を確認できませんでした",
+      "sign_in_to_kiro": "Kiro にサインイン",
+      "signing_in_with": "{{provider}} でサインイン中",
+      "start_over": "最初からやり直す",
+      "the_code_expired": "コードの有効期限が切れました",
+      "the_code_expired_body": "このサインインコードは無効になりました",
+      "waiting_for_you_to_approve": "承認をお待ちしています…"
+    },
     "kiroPrerequisiteGate": {
       "agent_specs_missing": "エージェント仕様が見つかりません",
       "agent_specs_rejected": "エージェント仕様が拒否されました",
@@ -5952,18 +6000,7 @@
       "try_again": "もう一度試してください",
       "waiting": "待機中",
       "we_could_not_check_kiro_cli": "Kiro CLI を確認できませんでした。",
-      "your_crew_is_almost_ready": "クルーの準備がほぼ完了しました。",
-      "copied": "コピーしました",
-      "copy_command": "コマンドをコピー",
-      "how_to_fix": "解決方法",
-      "if_this_keeps_happening": "問題が続く場合",
-      "linux_sandbox_guide": "Linux サンドボックスガイド",
-      "remedy_apparmor_service_install": "Kiro Crew をサービスとしてインストールしてください。ユーザー名前空間の権限のみを許可する狭い範囲の AppArmor プロファイル (kirocrew-userns) も Kiro Crew サービスに限定して書き込まれます。マシン上の他の部分の制限が緩められることはありません。",
-      "remedy_max_user_namespaces": "ユーザー名前空間の作成がユーザーごとの上限に達しました。通常これは、要塞化されたホストで user.max_user_namespaces が 0 になっていることを意味します。値を引き上げ、再起動後も維持されるよう /etc/sysctl.d/ に保存してください。",
-      "remedy_no_user_ns": "このカーネルはユーザー名前空間のサポート (CONFIG_USER_NS) なしでビルドされているため、変更できる設定はありません。別のカーネルを使うことが唯一の解決策です。",
-      "remedy_userns_denied": "カーネルがユーザー名前空間の作成を拒否しました。Debian 系のホストではこのレガシー設定を確認し、再起動後も維持されるよう /etc/sysctl.d/ に値を保存してください。コンテナ内の場合は通常、コンテナ自身の seccomp フィルターが unshare を拒否しているため、ホストの設定ではなく コンテナの実行フラグで解決します。",
-      "run_kirocrew_doctor_on_the_gateway_host_for_a_ful": "どのサンドボックスの手順が失敗したかを含む完全な前提条件レポートを得るには、これをゲートウェイホストで実行してください。",
-      "this_host_allows_user_namespaces_but_the_kernel_d": "このホストはユーザー名前空間を許可していますが、カーネルがマウント名前空間を拒否しました。これは Ubuntu 23.10 以降の特徴で、ユーザー名前空間を作成したプロセスを制限付きの AppArmor プロファイルに移動させます。Kiro Crew は認証情報を露出させるよりも、隔離されていない状態で エージェントを実行することを拒否するため、プロファイルが設定されるまでブロックされたままになります。"
+      "your_crew_is_almost_ready": "クルーの準備がほぼ完了しました。"
     },
     "linkPreview": {
       "copied": "コピー済み",
@@ -6784,30 +6821,15 @@
       "triggers": "トリガー",
       "what_this_skill_does_and_when_the_agent_should_u": "このスキルが何をするか、およびエージェントがいつそれを使用すべきかの説明"
     },
-    "projectSkillsTrust": {
-      "body": "${{skill}} はこのプロジェクト自身の .kiro/skills フォルダーにあります。",
-      "confirm": "このフォルダーを信頼",
-      "consequence": "このフォルダーを信頼すると、その中のスキルファイルがこのチャットのコンテキストに読み込まれ、エージェントにコマンドの実行を指示できるようになります。信頼していいのは、心当たりのあるプロジェクトだけです。",
-      "decline": "今はしない",
-      "decline_consequence": "拒否した場合、何も読み込まれず、メッセージは入力したままになります。",
-      "grant_failed": "このフォルダーの信頼を記録できませんでした。",
-      "title": "このプロジェクトのスキルを信頼しますか？",
-      "withdraw_hint": "これは後でスキル設定ページから取り消せます。",
-      "working": "信頼中…"
-    },
-    "projectSkillsTrustList": {
-      "folder_missing": "このフォルダーはもう存在しません。",
-      "hint": "これらのプロジェクトフォルダーは、独自のスキルをチャットに読み込めます。フォルダーの信頼を取り消すと、そのスキルは読み込まれなくなります。",
-      "revoke": "取り消す",
-      "revoke_failed": "このフォルダーの信頼を取り消せませんでした。",
-      "revoking": "取り消し中…",
-      "title": "信頼済みのプロジェクトフォルダー"
-    },
     "skillPickerMenu": {
       "loading_skills": "スキルを読み込み中…",
       "no_matching_skills": "一致するスキルがありません",
       "no_matching_skills_ctrl_enter_sends": "一致するスキルがありません — Ctrl+Enter でメッセージを送信します",
       "no_matching_skills_enter_sends": "一致するスキルがありません — Enter でメッセージを送信します",
+      "no_skills_mapped_to_agent": "{{agent}} にマッピングされたスキルはありません",
+      "no_skills_mapped_to_agent_ctrl_enter_sends": "{{agent}} にマッピングされたスキルはありません — Ctrl+Enter でメッセージを送信します",
+      "no_skills_mapped_to_agent_enter_sends": "{{agent}} にマッピングされたスキルはありません — Enter でメッセージを送信します",
+      "scoped_to_agent": "エージェント {{agent}} に限定",
       "trust_needed_badge": "信頼が必要",
       "trust_needed_hint": "このプロジェクトのスキルです。選択すると内容を確認してフォルダーを信頼できます。"
     },
@@ -6840,6 +6862,7 @@
       "desc_todos": "タスクリストを表示または管理する",
       "desc_tools": "利用可能なツールを表示する",
       "desc_usage": "課金と使用情報を表示する",
+      "desc_workflow": "保存済みワークフローを名前で一覧表示または実行する",
       "no_matching_commands_ctrl_enter_sends": "一致するコマンドがありません — Ctrl+Enter でメッセージを送信します",
       "no_matching_commands_enter_sends": "一致するコマンドがありません — Enter でメッセージを送信します"
     },
@@ -7027,13 +7050,6 @@
       "restart_update": "更新をインストールしてアプリを再起動",
       "restarting": "再起動中…",
       "update_ready": "更新準備完了"
-    },
-    "updatePill": {
-      "downloading": "ダウンロード中…",
-      "downloading_percent": "ダウンロード中 {{percent}}%",
-      "open_update_settings": "アップデート設定を開く",
-      "update_available": "アップデートあり",
-      "update_ready": "アップデート準備完了"
     },
     "voiceDictationPanel": {
       "esc_to_cancel_click_mic_to_finish": "Escキーでキャンセル、マイクをクリックして終了",
@@ -7310,6 +7326,32 @@
       "confirm_button": "確認して有効化",
       "withdraw": "確認を取り消す"
     },
+    "projectSkillsTrust": {
+      "body": "${{skill}} はこのプロジェクト自身の .kiro/skills フォルダーにあります。",
+      "confirm": "このフォルダーを信頼",
+      "consequence": "このフォルダーを信頼すると、その中のスキルファイルがこのチャットのコンテキストに読み込まれ、エージェントにコマンドの実行を指示できるようになります。信頼していいのは、心当たりのあるプロジェクトだけです。",
+      "decline": "今はしない",
+      "decline_consequence": "拒否した場合、何も読み込まれず、メッセージは入力したままになります。",
+      "grant_failed": "このフォルダーの信頼を記録できませんでした。",
+      "title": "このプロジェクトのスキルを信頼しますか？",
+      "withdraw_hint": "これは後でスキル設定ページから取り消せます。",
+      "working": "信頼中…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "このフォルダーはもう存在しません。",
+      "hint": "これらのプロジェクトフォルダーは、独自のスキルをチャットに読み込めます。フォルダーの信頼を取り消すと、そのスキルは読み込まれなくなります。",
+      "revoke": "取り消す",
+      "revoke_failed": "このフォルダーの信頼を取り消せませんでした。",
+      "revoking": "取り消し中…",
+      "title": "信頼済みのプロジェクトフォルダー"
+    },
+    "updatePill": {
+      "downloading": "ダウンロード中…",
+      "downloading_percent": "ダウンロード中 {{percent}}%",
+      "open_update_settings": "アップデート設定を開く",
+      "update_available": "アップデートあり",
+      "update_ready": "アップデート準備完了"
+    },
     "confirmDialog": {
       "cancel": "キャンセル"
     },
@@ -7527,14 +7569,16 @@
   "nav": {
     "agent_capabilities": "エージェント機能",
     "artifacts": "アーティファクト",
-    "explore": "探索",
+    "discover": "発見",
     "knowledge": "ナレッジ",
+    "library": "ライブラリ",
     "notifications": "通知",
     "schedule": "スケジュール",
     "sessions": "セッション",
     "settings": "設定",
     "task_runner": "Task Runner",
-    "webhooks": "Webhooks"
+    "webhooks": "Webhooks",
+    "crew_members": "クルーメンバー"
   },
   "pages": {
     "agentsPage": {
@@ -7745,11 +7789,10 @@
     },
     "appsPage": {
       "action_failed": "{{name}} の{{action}}に失敗しました",
-      "add_an_app_source_gear_icon_above_or_install_fro": "アプリソースを追加（上の歯車アイコン）またはローカルパスからインストールします。",
+      "add_an_app_source_gear_icon_above_or_install_fro": "アプリソースを追加（右上の「ソース」）するか、ローカルパスからインストールしてください。",
       "agent_other": "{{count}} エージェント",
       "all_apps": "すべてのアプリ",
       "app_other": "{{count}} アプリ",
-      "apps": "アプリ",
       "available": "利用可能",
       "built_in_kirocrew": "ビルトイン · kirocrew",
       "cancel": "キャンセル",
@@ -7757,16 +7800,14 @@
       "confirm_uninstall": "アンインストールを確認",
       "cron_job_other": "{{count}} cron ジョブ",
       "dependencies": "依存関係：",
-      "discover": "発見",
-      "discover_install_and_manage_agentic_apps": "エージェンティックアプリの発見、インストール、管理",
       "dismiss_message": "メッセージを非表示",
       "failed_to_enable": "{{name}} の有効化に失敗しました",
       "failed_to_load_apps": "アプリの読み込みに失敗",
       "failed_to_load_registry": "レジストリの読み込みに失敗",
       "failed_to_uninstall": "{{name}} のアンインストールに失敗しました",
       "failed_to_update": "更新に失敗しました：{{names}}",
-      "find_apps_in_the_discover_tab_or_install_from_a": "[Discover] タブでアプリを見つけるか、上のソース歯車からローカルパスを使ってインストールしてください。",
-      "hidden_you_can_re_enable_it_from_the_discover_ta": "無効化しました。[Discover] タブから再度有効化できます。",
+      "find_apps_in_the_discover_tab_or_install_from_a": "アプリは「見つける」ページで探すか、そのページの「ソース」からローカルパスでインストールできます。",
+      "hidden_you_can_re_enable_it_from_the_discover_ta": "無効にしました。「見つける」ページから再有効化できます。",
       "keep_app_data": "アプリデータを保持",
       "keep_dependency": "依存関係 {{name}} を保持",
       "keep_this_dependency": "この依存関係を保持",
@@ -7775,6 +7816,7 @@
       "kirocrew_registry": "{{productName}} レジストリ",
       "library": "ライブラリ",
       "loading_apps": "アプリを読み込み中…",
+      "manage_your_installed_apps": "インストール済みアプリを管理",
       "name": "名前",
       "no_apps_available": "利用可能なアプリがありません",
       "no_apps_installed_yet": "まだアプリがインストールされていません",
@@ -7799,9 +7841,11 @@
       "uninstall_removes_metadata_secret_and_source": "アプリからインストール — {{productName}} メタデータ、アプリシークレット、ダウンロードされたソースコードが削除されます。",
       "update_all": "すべて更新",
       "update_other": "{{count}} 更新",
+      "updates_hint_link": "更新を表示",
+      "updates_hint_other": "{{count}} 件の更新があります",
       "updating_progress": "更新中 {{done}}/{{total}}…",
       "v": "v",
-      "installed_app_find_in_library_and_enable": "{{name}} をインストールしました。下でオンにして有効化してください。",
+      "installed_app_find_in_library_and_enable": "{{name}} をインストールしました。ライブラリで有効にしてください。",
       "synced_from_its_source_directory": "{{name}} をソースディレクトリから同期しました。",
       "updated_app_other": "{{count}} アプリを更新しました。",
       "updated_from_the_registry": "{{name}} をレジストリから更新しました。"
@@ -8188,6 +8232,8 @@
     },
     "capabilitiesPage": {
       "agent_capabilities": "エージェント機能",
+      "workflows_label": "ワークフロー",
+      "workflows_description": "再利用可能なエージェントワークフローを作成、編集、実行します",
       "connections_description": "公式サービスを接続してカスタム MCP サーバーを管理",
       "connections_label": "接続",
       "crews_description": "チャットするエージェント、それぞれが独自のワークスペースを備えている",
@@ -8385,7 +8431,8 @@
       "collapsibleToolGroup": {
         "approval_needed": "承認が必要です",
         "approvals_pending": "承認待ち",
-        "batch_preview_note": "保留中の {{count}} 件のうち最新のもの。すべてまとめて処理されます。",
+        "batch_preview_all": "保留中の {{count}} 件のコールを以下ですべて確認してください。すべてまとめて処理されます。",
+        "batch_preview_none": "このコールのプレビューはありません。",
         "approve": "承認",
         "approve_all": "すべて承認 ({{count}})",
         "approved": "承認済み",
@@ -8709,8 +8756,14 @@
         "could_not_load_run_snapshot": "実行スナップショットを読み込めませんでした:"
       },
       "workflowRunCard": {
+        "cancel": "キャンセル",
         "open_in_the_workflows_panel": "ワークフローパネルで開く",
-        "open_workflows_panel": "· ワークフローパネルを開く"
+        "open_workflows_panel": "· ワークフローパネルを開く",
+        "save_help": "この完了した実行のワークフローをそのままグローバルライブラリに保存します。",
+        "save_title": "このワークフローを保存",
+        "save_workflow": "ワークフローを保存",
+        "saved_as": "{{command}} として保存済み",
+        "source_unavailable": "完了したワークフローのソースを読み込めませんでした。"
       },
       "workflowSidebarRow": {
         "could_not_load_snapshot": "スナップショットを読み込めませんでした:",
@@ -9053,6 +9106,14 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "新しい順",
       "sort_oldest": "古い順",
+      "stale_collapse_caption": "次の期間より長く操作がない場合",
+      "stale_collapse_ctx_in_name": "{{name}}フォルダー",
+      "stale_collapse_menu": "休眠中のセッションを折りたたむ",
+      "stale_collapse_off": "オフ",
+      "stale_collapse_paused": "一時停止中",
+      "stale_collapse_paused_hint": "検索・フィルター中、または「新しい順」以外の並び替え中は一時停止します。",
+      "stale_collapse_row": "休眠中のセッション",
+      "stale_collapse_row_ungrouped": "フォルダー外",
       "started_in_channel": "この会話は {{channel}} で始まりました。",
       "started_in_direct_message": "この会話はダイレクトメッセージで始まりました。",
       "stop_filtering_by_tag": "{{name}} でのフィルターを解除",
@@ -9400,8 +9461,8 @@
       "worktrees_count": "ワークツリー（{{count}}）",
       "worktrees_created_under_a_previous_repository_na": "以前のリポジトリ名の下で作成されたワークツリー。デフォルトでは非表示。マージ済み削除の対象です。",
       "cancel_staged_cutover": "準備済みの切り替えをキャンセル",
-      "keeps_name_the_live_target_and_discards_the_stag": "{{name}} がライブ対象のままとなり、{{staged}} への準備済みの切り替えは破棄されます。何も再起動されません — ゲートウェイは現在のコードで動作し続けます。",
-      "keeps_this_checkout_the_live_target_and_discards": "このチェックアウトがライブ対象のままとなり、{{staged}} への準備済みの切り替えは破棄されます（何も再起動されません）",
+      "keeps_name_the_live_target_and_discards_the_stag": "「{{name}}」 がライブ対象のままとなり、「{{staged}}」 への準備済みの切り替えは破棄されます。何も再起動されません — ゲートウェイは現在のコードで動作し続けます。",
+      "keeps_this_checkout_the_live_target_and_discards": "このチェックアウトがライブ対象のままとなり、「{{staged}}」 への準備済みの切り替えは破棄されます（何も再起動されません）",
       "cancel_staged_cutover_2": "準備済みの切り替えをキャンセルしますか？",
       "keep_cutover": "切り替えを維持",
       "cutover_staged_run_cmd_to_finish_or_cancel": "切り替え準備完了：ゲートウェイの次回起動時にこのワークツリーがライブになります。完了するには `{{cmd}}` を実行するか、この行のメニュー → 準備済みの切り替えをキャンセル で取り消せます。それまでゲートウェイは以前のチェックアウトで動作し続けます。",
@@ -9410,15 +9471,35 @@
       "no_checkout_found_action": "下記の環境変数を設定するか、設定を永続化するには {{productName}} データディレクトリ（既定では ~/.kiro/crew）の config.json に dev_fleet.repo_path を追加し、ゲートウェイを再起動してください。"
     },
     "developer": {
+      "agentBackendTab": {
+        "agent_backend": "エージェントバックエンド",
+        "claude_code": "Claude Code",
+        "could_not_load_the_agent_backend": "エージェントバックエンドを読み込めませんでした。",
+        "could_not_save_the_agent_backend": "エージェントバックエンドを保存できませんでした。",
+        "default_all_features_supported": "デフォルト。すべての機能に対応しています。",
+        "experimental": "実験的",
+        "kas_kiro_agent": "KAS (kiro-agent)",
+        "kiro_cli": "Kiro CLI",
+        "loading_configuration": "設定を読み込んでいます…",
+        "new_sessions_use_this_agent_a_session_that_is_al": "新しいセッションはこのエージェントを使用します。すでに開いているセッションは開始時のエージェントを維持し、ここで切り替えてもセッション中に変わることはありません。",
+        "not_enabled_in_this_build": "このビルドでは有効になっていません",
+        "retry": "再試行"
+      },
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "受信 Webhook のトークン、登録済みコンテキスト、実行履歴。API は動作しますが、ページは未完成です。",
         "open_webhooks": "Webhooks を開く",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "acp_backends": "ACP アダプター",
+        "experimental_acp_backends_claude_code": "Kiro CLI の代わりとなる Claude Code。実験的 — 安全上の拒否は機能しますが、エンドツーエンドのセッションはまだ検証されていません。"
       }
     },
     "developerPage": {
       "developer": "デベロッパー",
       "tabs": {
+        "agentBackend": {
+          "description": "新しいセッションが起動するエージェント — Kiro CLI、Claude Code、KAS",
+          "label": "エージェントバックエンド"
+        },
         "archive": {
           "description": "ローテーション/圧縮済みセッション履歴（7 日間保持）",
           "label": "アーカイブ"
@@ -9456,6 +9537,19 @@
           "label": "テレメトリー"
         }
       }
+    },
+    "discoverPage": {
+      "subtitle": "エージェンティックアプリの閲覧とインストール",
+      "tab_featured": "注目",
+      "tab_updates": "更新",
+      "title": "発見",
+      "updates_badge_label_other": "{{count}} 件の更新があります",
+      "updates_empty": "すべて最新です。",
+      "updates_empty_back_to_featured": "おすすめアプリを見る",
+      "version_diff": "v{{from}} → v{{to}}",
+      "updating": "更新中…",
+      "updates_check_failed": "更新を確認できませんでした。",
+      "updates_retry": "再試行"
     },
     "embedSettingsPage": {
       "back": "戻る",
@@ -10024,6 +10118,31 @@
       "unread": "未読"
     },
     "overview": {
+      "workflowLibrary": {
+        "adapted_from": "派生元",
+        "create_draft": "下書きを作成",
+        "create_title": "再利用可能なワークフローを作成",
+        "description": "保存済みワークフローは Kiro Crew 全体で共有され、対応するすべてのエージェントハーネスで動作します。新しい下書きは、元を変更せずに一致するワークフローを適応できます。",
+        "empty": "保存済みワークフローが見つかりません。",
+        "intent": "このワークフローで何を行いますか？",
+        "loading": "ワークフローを読み込み中…",
+        "name": "名前",
+        "new_workflow": "新しいワークフロー",
+        "request_failed": "ワークフローのリクエストに失敗しました",
+        "revision": "リビジョン {{revision}}",
+        "run": "ワークフローを実行",
+        "run_input": "入力（ctx.args.input として利用可能）",
+        "save_revision": "新しいリビジョンを保存",
+        "save_to_library": "ライブラリに保存",
+        "search": "ワークフローを検索…",
+        "select_or_create": "保存済みワークフローを選択するか、新規作成してください。",
+        "slug": "スラッシュコマンド名",
+        "source": "ワークフローソース",
+        "started": "{{runId}} を開始しました",
+        "title": "ワークフローライブラリ",
+        "updated": "更新日時: {{date}}",
+        "workflow_description": "説明"
+      },
       "agentCfgTab": {
         "after_saving_use": "保存後、使用",
         "agent_config_file": "エージェント設定 ({{file}})",
@@ -10213,7 +10332,14 @@
         "probe_failing": "連続失敗",
         "probe_failing_help": "{{failures}} 回連続でプローブに失敗しました。サーバーはマウントされたままで、これは状態の表示であり変更ではありません。",
         "reset_failures": "カウントをリセット",
-        "reset_failures_help": "このサーバーの連続失敗回数をクリアします。"
+        "reset_failures_help": "このサーバーの連続失敗回数をクリアします。",
+        "sign_in": "サインイン",
+        "sign_in_authorize": "{{name}} を承認",
+        "sign_in_mint_failed": "サインインを開始できませんでした。もう一度お試しください。",
+        "sign_in_preparing": "サインインを準備しています…",
+        "sign_in_retry": "もう一度試す",
+        "sign_in_row_updates_after_probe": "上部の「Probe MCP servers」を使ってこの行を更新してください。",
+        "sign_in_timeout": "サインインが時間内に承認リンクを生成しませんでした。もう一度お試しください。"
       },
       "memoryGraphTab": {
         "all_count": "すべて（{{count}}）",
@@ -10553,6 +10679,43 @@
         "vector_memory": "ベクトルメモリ",
         "vector_memory_is_initializing_the_embedding_mode": "ベクトルメモリが初期化中です。埋め込みモデル（約610MB）はバックグラウンドで自動的にダウンロードされ、レガシーメモリは自動的に移行します — 操作は不要です。",
         "verifying_model_integrity": "モデルの整合性を確認中…"
+      },
+      "acpBackend": {
+        "title": "ACP アダプター",
+        "experimental": "実験的",
+        "all_features_supported": "デフォルト。すべての機能がサポートされています。",
+        "features_differ": "{{total}} 個中 {{count}} 個の機能は動作が異なるか、利用不可、または未検証です。",
+        "show_what_changes": "変更点を表示",
+        "applies_to_new_sessions": "今後開始するセッションに適用されます。開いているセッションは開始時のアダプターを維持します。",
+        "not_enabled_in_this_build": "このビルドでは有効化されていません: {{backends}}。実験的な ACP アダプターのドキュメントを参照してください。",
+        "level_supported": "サポート済み",
+        "level_degraded": "動作が異なる",
+        "level_unavailable": "利用不可",
+        "cap_session_sharing": "共有サブエージェントランタイム",
+        "cap_reasoning_effort": "推論の深さ",
+        "cap_mcp_tool_search": "MCP ツール検索",
+        "cap_agent_profiles": "エージェントプロファイル",
+        "cap_slash_commands": "スラッシュコマンド",
+        "cap_turn_usage": "ターンごとの使用量",
+        "cap_billing": "コストと制限",
+        "cap_native_resume": "セッションの再開",
+        "cap_registry_model_ids": "Kiro モデルカタログを使用",
+        "cap_mid_turn_steer": "ターン中の軌道修正",
+        "confirm_title": "{{backend}} に切り替えますか？",
+        "confirm_body": "このアダプターは実験的です。{{total}} 個中 {{count}} 個の Kiro Crew 機能は動作が異なるか、利用不可、または未検証です。",
+        "confirm_model_reset": "モデルの選択はリセットされます — 各ハーネスには独自のモデル一覧があります。開いているチャットも対象です。",
+        "confirm_open_sessions": "開いているセッションは影響を受けず、現在のアダプターを維持します。",
+        "cancel": "キャンセル",
+        "confirm_switch": "アダプターを切り替える",
+        "confirm_prerequisites": "最初にゲートウェイホストで次のコマンドを順番に実行してください。",
+        "not_installed": "アダプター未インストール",
+        "level_unverified": "未検証",
+        "load_failed": "ACP アダプターを読み込めませんでした。もう一度お試しください。",
+        "routing_routed": "ツール呼び出しは {{productName}} のセキュリティゲートに到達します",
+        "routing_indeterminate": "ツール呼び出しのルーティングは未検証です — 新しいセッションはツール呼び出しを拒否します",
+        "routing_bypassed": "ツール呼び出しは {{productName}} のセキュリティゲートを迂回します — 新しいセッションはツール呼び出しを拒否します",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "ゲートなしのツールが許可されています。拒否コマンド規則、機密パスのブロック、ガバナンス上限は、このバックエンドの自己承認呼び出しでは参照されません。"
       }
     },
     "overviewPage": {
@@ -10897,11 +11060,8 @@
       "owning_session": "所有セッション"
     },
     "servicesTab": {
-      "channels": "チャネル",
-      "connect_error": "接続エラー",
       "connected": "接続済み",
       "cpu": "CPU %",
-      "discord": "Discord",
       "embeddings": "エンベディング",
       "gateway_process": "ゲートウェイプロセス",
       "governance": "ガバナンス",
@@ -10909,7 +11069,6 @@
       "governance_tip_degraded": "ガバナンスチェックがフェイルクローズで失敗したか、整合性の不一致が検出されたか、受け入れポリシーを検証できませんでした（未設定または読み取り不可）。SEL 監査ログを確認してください。",
       "governance_tip_disabled": "強制適用する受け入れポリシーは設定されていません（許可が既定）。プラグインは明示的に禁止されていない限り受け入れられます。",
       "governance_tip_unknown": "ガバナンスステータスはこのセッションではまだ決定されていません。",
-      "imessage": "iMessage",
       "mcp_process_breakdown": "{{total}}（サンドボックス {{sandbox}} · {{providerLabel}} {{provider}} · MCP {{mcp}}）",
       "mcp_process_breakdown_unique": "一意 {{total}}（サンドボックス {{sandbox}} · {{providerLabel}} {{provider}} · MCP {{mcp}}）",
       "mcp_processes": "MCP プロセス",
@@ -10926,16 +11085,22 @@
       "status_disabled": "無効",
       "status_unknown": "不明",
       "stopped": "停止",
-      "teams": "Microsoft Teams",
-      "telegram": "Telegram",
       "threads": "スレッド",
       "uptime": "稼働時間",
+      "working_directory": "作業ディレクトリ",
+      "channels": "チャネル",
+      "connect_error": "接続エラー",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
       "webex": "Webex",
       "wecom": "WeCom",
       "weixin": "WeChat",
       "whatsapp": "WhatsApp",
       "feishu": "Feishu",
-      "working_directory": "作業ディレクトリ"
+      "acp_backend": "ACP アダプター",
+      "acp_backend_experimental": "{{label}}（実験的）"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "ファジィフィルタ（部分文字列マッチ）",
@@ -10945,6 +11110,25 @@
       "select_an_archive_to_view_its_contents": "アーカイブを選択してその内容を表示",
       "truncated_showing_first_200kb": "… 切り詰め（最初の 200KB を表示）…",
       "no_archives_with_compaction_hint": "アーカイブはありません。セッションファイルがローテーション（>2MB）またはコンパクト化されるときに作成されます。自動コンパクションは <settingRef/> で制御されます。"
+    },
+    "sessionBreakdown": {
+      "header_meta": "サブエージェント {{subs}} 件 · 実行中 {{running}} 件",
+      "legend_history": "履歴",
+      "legend_lessons": "学習",
+      "legend_memory": "メモリ",
+      "legend_skill": "スキル",
+      "legend_skillidx": "スキル索引",
+      "legend_sys": "エージェント",
+      "node_caption": "{{model}} · {{turns}} ターン · 自身のウィンドウ",
+      "occupancy": "ウィンドウの {{pct}}%",
+      "stalled": "停滞",
+      "status_done": "完了",
+      "status_error": "終了",
+      "status_running": "実行中",
+      "title": "セッション内訳",
+      "tool_count": "ツール {{count}} 件",
+      "unknown_agent": "サブエージェント",
+      "unknown_model": "不明"
     },
     "sessionStorage": {
       "age_option_other": "{{days}} 日以上前 — {{count}} セッション · {{size}}",
@@ -11174,7 +11358,16 @@
         "you_are_on_the_latest_version": "最新版を使用しています。",
         "you_re_on_the_latest_version": "最新版を使用しています。",
         "checks_for_updates_with_timing": "{{name}} は自動的にアップデートを確認します。{{timing}} 今すぐ確認することもできます。",
-        "last_checked_ago_next_check_in": "最終確認 {{ago}}、次回の自動確認 {{next}}。"
+        "last_checked_ago_next_check_in": "最終確認 {{ago}}、次回の自動確認 {{next}}。",
+        "in_app_update_intro": "新しいバージョンは現在のバージョンの隣にインストールされ、アトミックに切り替わります。適用にはゲートウェイホストで承認コマンドを1つ実行するだけです。",
+        "or_update_manually": "またはインストーラーを手動で再実行",
+        "armed_run_on_host": "ゲートウェイホストでこのコマンドを実行すると、承認して適用できます。",
+        "armed_expires_in": "承認ウィンドウは {{time}} 後に閉じます",
+        "armed_waiting_note": "承認待ち — 承認されるとここに進行状況が表示され、ゲートウェイは自動的に再起動します。",
+        "applying_update": "更新を適用しています…",
+        "applying_restart_note": "新しいバージョンの準備ができるとゲートウェイは自動的に再起動し、このページも自動的に再接続します。",
+        "approval_window_expired": "承認されないまま承認ウィンドウの期限が切れました。準備ができたら再度更新を開始してください。",
+        "try_again": "再試行"
       },
       "botChannelPanel": {
         "allowed_user_ids": "許可されたユーザー ID",
@@ -11209,7 +11402,11 @@
         "file_sessions_in_folder_desc": "新しい{{channel}}のセッションを未整理のままにせず、サイドバーのフォルダーに入れます。",
         "session_folder_name": "フォルダー名",
         "session_folder_name_desc": "この設定を保存したときに、まだ存在しなければ作成されます。",
-        "shared_channels": "共有チャネル"
+        "shared_channels": "共有チャネル",
+        "sdk_missing": "{{channel}} SDK をインストール",
+        "sdk_missing_body": "{{channel}} チャンネルには {{package}} パッケージが必要ですが、既定ではインストールされません。下のコマンドをターミナルで実行して追加してください。",
+        "sdk_restart_after_install": "その後ゲートウェイを再起動して {{channel}} チャンネルを開始してください。",
+        "sdk_install_unsupported": "このゲートウェイの Python は追加パッケージをインストールできないため、ここでは {{package}} を追加できません。pip でインストールできる Python 環境からゲートウェイを実行してください。"
       },
       "browserPanel": {
         "use_builtin_label": "内蔵ブラウザーを使用する",
@@ -12909,6 +13106,28 @@
     "worldsPopout": {
       "hide_controls": "コントロールを隠す",
       "show_controls": "コントロールを表示"
+    },
+    "membersPage": {
+      "agent_template": "エージェントテンプレート",
+      "configuration": "設定",
+      "details": "詳細",
+      "edit_in_crew_manager": "クルー管理ページで編集",
+      "empty_roster": "クルーメンバーはまだいません。クルー管理ページで作成するとここに表示されます。",
+      "inherited": "継承",
+      "member_count_other": "{{count}} 名のメンバー",
+      "memory_shared_note": "メンバーは現在同じメモリを共有しています。あるメンバーに伝えた内容は全員が知ることになります。",
+      "memory_store": "メモリストア",
+      "model": "モデル",
+      "opening_thread": "会話を開いています…",
+      "pick_a_member": "メンバーを選んで会話を開きます。",
+      "pinned_to": "{{name}} に固定",
+      "roster_load_failed": "メンバー一覧を読み込めませんでした。",
+      "slug_collision": "このメンバーは {{name}} と識別子が重複しており、スレッドは後者に属しています。別々のスレッドにするには、どちらかのクルー名を変更してください。",
+      "status_idle": "待機中",
+      "status_working": "作業中",
+      "thread_open_failed": "このメンバーの会話を開けませんでした。",
+      "title": "クルーメンバー",
+      "workspace": "ワークスペース"
     }
   },
   "privacyDisclosure": {

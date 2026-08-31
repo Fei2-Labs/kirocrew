@@ -898,7 +898,8 @@ async def test_sync_script_emits_step_markers():
     with patch.object(mod, "_git", new_callable=AsyncMock, return_value="main"), \
          patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
-         patch("kiro_crew.apps.builtins.dev_fleet.server.sandboxed_spawn_argv",
+         patch("kiro_crew.apps.builtins.dev_fleet.server.sandboxed_spawn_argv_off_loop",
+               new_callable=AsyncMock,
                side_effect=lambda cmd, mode, env=None: (cmd, env or {}, None)), \
          patch.object(mod, "_start_run", new_callable=AsyncMock, return_value="run-123") as mock_start:
         async with mod._SYNC_LOCK:
@@ -960,7 +961,8 @@ async def _run_sync(mod, locked):
          patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
          patch.object(mod.dep_sync, "locked_console_scripts", return_value=locked), \
-         patch("kiro_crew.apps.builtins.dev_fleet.server.sandboxed_spawn_argv",
+         patch("kiro_crew.apps.builtins.dev_fleet.server.sandboxed_spawn_argv_off_loop",
+               new_callable=AsyncMock,
                side_effect=lambda cmd, mode, env=None: (cmd, env or {}, None)), \
          patch.object(mod, "_start_run", new_callable=AsyncMock, return_value="run-123") as mock_start:
         async with mod._SYNC_LOCK:
@@ -2085,11 +2087,11 @@ async def test_run_cmd_pins_git_protocols(monkeypatch):
 
     captured = {}
 
-    def fake_sandbox(cmd, mode, *, env=None, **kw):
+    async def fake_sandbox(cmd, mode, *, env=None, **kw):
         captured["env"] = env
         raise RuntimeError("stop here")  # short-circuit before spawning
 
-    monkeypatch.setattr(mod, "sandboxed_spawn_argv", fake_sandbox)
+    monkeypatch.setattr(mod, "sandboxed_spawn_argv_off_loop", fake_sandbox)
     rc, _, err = await mod._run_cmd(["git", "-C", "/x", "fetch"])
     assert rc == -1 and "sandbox unavailable" in err
     _assert_git_neutralizers(captured["env"])
@@ -2133,10 +2135,10 @@ async def test_run_cmd_cancel_with_reaped_child_propagates_cancellation(monkeypa
     async def fake_spawn(*args, **kwargs):
         return FakeProc()
 
-    monkeypatch.setattr(
-        mod, "sandboxed_spawn_argv",
-        lambda cmd, mode, *, env=None, **kw: (cmd, env, None),
-    )
+    async def fake_sandboxed_spawn(cmd, mode, *, env=None, **kw):
+        return (cmd, env, None)
+
+    monkeypatch.setattr(mod, "sandboxed_spawn_argv_off_loop", fake_sandboxed_spawn)
     monkeypatch.setattr(mod, "create_subprocess_limited", fake_spawn)
     monkeypatch.setattr(mod, "_kill_tree", AsyncMock())
     # The shared reap helper also signals the tree; intercept it so the fake
@@ -2232,7 +2234,7 @@ async def test_sync_fetch_standard_merge_strict(monkeypatch):
 
     captured: list[tuple[list, str]] = []
 
-    def fake_sandbox(argv, mode, *, env=None, **kw):
+    async def fake_sandbox(argv, mode, *, env=None, **kw):
         captured.append((list(argv), mode))
         return list(argv), dict(env or {}), None
 
@@ -2241,7 +2243,7 @@ async def test_sync_fetch_standard_merge_strict(monkeypatch):
          patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
          patch.object(mod, "_build_env", return_value={}), \
-         patch.object(mod, "sandboxed_spawn_argv", fake_sandbox), \
+         patch.object(mod, "sandboxed_spawn_argv_off_loop", fake_sandbox), \
          patch.object(mod, "_start_run", new_callable=AsyncMock,
                       return_value="rid-sync-test"):
         mod._SYNC_RID = None
@@ -5291,7 +5293,7 @@ async def _sync_step_argvs(monkeypatch) -> list:
     """Run _sync with every spawn stubbed; return each step's argv, in order."""
     captured: list = []
 
-    def fake_sandbox(argv, mode, *, env=None, **kw):
+    async def fake_sandbox(argv, mode, *, env=None, **kw):
         captured.append(list(argv))
         return list(argv), dict(env or {}), None
 
@@ -5299,7 +5301,7 @@ async def _sync_step_argvs(monkeypatch) -> list:
                       return_value=mod.BASE_BRANCH), \
          patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
-         patch.object(mod, "sandboxed_spawn_argv", fake_sandbox), \
+         patch.object(mod, "sandboxed_spawn_argv_off_loop", fake_sandbox), \
          patch.object(mod, "_start_run", new_callable=AsyncMock,
                       return_value="rid-steps"):
         mod._SYNC_RID = None
@@ -5382,7 +5384,7 @@ async def test_sync_build_steps_never_see_credential_helpers(monkeypatch):
     monkeypatch.setattr(mod, "_GIT_TRUSTED_HELPERS", helpers)
     captured: list[tuple[list, dict]] = []
 
-    def fake_sandbox(argv, mode, *, env=None, **kw):
+    async def fake_sandbox(argv, mode, *, env=None, **kw):
         captured.append((list(argv), dict(env or {})))
         return list(argv), dict(env or {}), None
 
@@ -5390,7 +5392,7 @@ async def test_sync_build_steps_never_see_credential_helpers(monkeypatch):
                       return_value=mod.BASE_BRANCH), \
          patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
-         patch.object(mod, "sandboxed_spawn_argv", fake_sandbox), \
+         patch.object(mod, "sandboxed_spawn_argv_off_loop", fake_sandbox), \
          patch.object(mod, "_start_run", new_callable=AsyncMock,
                       return_value="rid-cred-test"):
         mod._SYNC_RID = None
@@ -5485,12 +5487,12 @@ async def test_run_cmd_pins_trusted_path(monkeypatch):
     """_run_cmd rewrites bare names to trusted absolute paths and pins PATH."""
     captured: dict = {}
 
-    def fake_sandbox(argv, mode, *, env=None, **kw):
+    async def fake_sandbox(argv, mode, *, env=None, **kw):
         captured["argv"] = list(argv)
         captured["env"] = dict(env or {})
         return ["/bin/false"], dict(env or {}), None
 
-    monkeypatch.setattr(mod, "sandboxed_spawn_argv", fake_sandbox)
+    monkeypatch.setattr(mod, "sandboxed_spawn_argv_off_loop", fake_sandbox)
     mod._TRUSTED_BIN_CACHE.clear()
     await mod._run_cmd(["git", "--version"], timeout=5)
     assert captured["argv"][0].startswith(("/usr/", "/bin"))
@@ -5814,11 +5816,11 @@ async def test_sync_pip_uses_target_repo_venv(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "_trusted_bin", lambda n: f"/usr/bin/{n}")
     captured: dict = {}
 
-    def fake_sandboxed(argv, mode, env=None):
+    async def fake_sandboxed(argv, mode, env=None):
         captured.setdefault("argvs", []).append(list(argv))
         return list(argv), dict(env or {}), None
 
-    monkeypatch.setattr(mod, "sandboxed_spawn_argv", fake_sandboxed)
+    monkeypatch.setattr(mod, "sandboxed_spawn_argv_off_loop", fake_sandboxed)
 
     async def fake_run_cmd(cmd, **kw):
         return 0, "main", ""
@@ -7518,11 +7520,11 @@ async def test_sync_builds_and_stages_under_one_lock_holder(monkeypatch, tmp_pat
     monkeypatch.setattr(mod, "_trusted_bin", lambda n: f"/usr/bin/{n}")
     argvs: list[list[str]] = []
 
-    def fake_sandboxed(argv, mode, env=None):
+    async def fake_sandboxed(argv, mode, env=None):
         argvs.append(list(argv))
         return list(argv), dict(env or {}), None
 
-    monkeypatch.setattr(mod, "sandboxed_spawn_argv", fake_sandboxed)
+    monkeypatch.setattr(mod, "sandboxed_spawn_argv_off_loop", fake_sandboxed)
 
     async def fake_run_cmd(cmd, **kw):
         return 0, "main", ""

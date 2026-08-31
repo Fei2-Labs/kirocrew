@@ -146,8 +146,19 @@ function markerFor(container: HTMLElement, title: string): HTMLElement | null {
   return metaLineFor(container, title).querySelector('[data-testid="session-effective-agent"]')
 }
 
-beforeEach(() => localStorage.clear())
-afterEach(() => vi.clearAllMocks())
+beforeEach(() => {
+  localStorage.clear()
+  // Freeze "now" just after LAST_TS: the sidebar's dormant-session grouping
+  // collapses rows older than DEFAULT_STALE_COLLAPSE_MS (2 days) into a
+  // hidden "Dormant sessions" expander, and this suite's fixed LAST_TS would
+  // otherwise drift into that window as real wall-clock time passes.
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date(LAST_TS))
+})
+afterEach(() => {
+  vi.useRealTimers()
+  vi.clearAllMocks()
+})
 
 describe('chat sidebar — effective-agent marker', () => {
   it('names the agent that actually answers when it differs', () => {

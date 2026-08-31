@@ -67,7 +67,7 @@ class TestRunAws:
                 return "out", "err"
 
         monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
 
         assert aws.run_aws(["sts", "get-caller-identity"]) == (0, "out", "err")
 
@@ -77,7 +77,7 @@ class TestRunAws:
         def raise_fnf(*a, **k):
             raise FileNotFoundError("aws not found")
 
-        monkeypatch.setattr(aws.subprocess, "Popen", raise_fnf)
+        monkeypatch.setattr(aws, "popen_limited", raise_fnf)
         rc, out, err = aws.run_aws(["sts", "get-caller-identity"])
         assert rc == 127
         assert "aws CLI not found" in err
@@ -95,6 +95,10 @@ class TestRunAws:
         assert aws.env_credentials_hint() == ""
 
     def test_keyboard_interrupt_terminates_child(self, monkeypatch):
+        # Exercise the child-cleanup branch independently of the agent-session
+        # chokepoint, which is injected into this test runner's environment.
+        monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
+
         class FakeProc:
             terminated = False
             killed = False
@@ -116,7 +120,7 @@ class TestRunAws:
 
         proc = FakeProc()
         monkeypatch.setattr(aws, "wrap_argv", lambda argv, mode: (argv, ""))
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: proc)
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: proc)
 
         with pytest.raises(KeyboardInterrupt):
             aws.run_aws(["cloudformation", "deploy"])
@@ -220,7 +224,7 @@ class TestChokepointHumanActionGuard:
             def communicate(self, timeout):
                 return "out", ""
 
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
         for readonly in (
             ["sts", "get-caller-identity"],
             ["ec2", "describe-instances"],
@@ -275,7 +279,7 @@ class TestChokepointHumanActionGuard:
             def communicate(self, timeout):
                 return "", ""
 
-        monkeypatch.setattr(aws.subprocess, "Popen", lambda *a, **k: FakeProc())
+        monkeypatch.setattr(aws, "popen_limited", lambda *a, **k: FakeProc())
         # A human terminal (no session key) can run a mutation.
         rc, _o, _e = aws.run_aws(["cloudformation", "delete-stack", "--stack-name", "x"])
         assert rc == 0

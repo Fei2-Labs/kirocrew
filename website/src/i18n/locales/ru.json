@@ -34,8 +34,6 @@
     "dismiss": "Скрыть",
     "dsk": "DSK",
     "expand_sidebar": "Развернуть боковую панель",
-    "explore": "Обзор",
-    "explore_apps": "Обзор приложений",
     "gateway_connected": "Шлюз подключён",
     "gateway_offline": "Шлюз офлайн",
     "gateway_offline_reconnecting": "Шлюз офлайн — переподключение",
@@ -45,7 +43,6 @@
     "iam_identity_center": "IAM Identity Center",
     "installing_packages": "Установка пакетов",
     "k_search_for_anything": "⌘K — Поиск по всему…",
-    "kiro_credit_usage_api_key": "Расход кредитов Kiro — недоступен при аутентификации по API-ключу",
     "kiro_credit_usage_checking": "Расход кредитов Kiro — проверка…",
     "kiro_credit_usage_checking_2": "Расход кредитов Kiro — проверка",
     "kiro_credit_usage_unavailable": "Расход кредитов Kiro — недоступен",
@@ -121,7 +118,10 @@
     "open_command_bar": "Открыть Command Bar",
     "focus_mode": "Режим фокусировки",
     "focus_mode_title": "Режим фокусировки · Alt+Shift+M",
-    "focus_mode_title_mac": "Режим фокусировки · ⌥⇧M"
+    "focus_mode_title_mac": "Режим фокусировки · ⌥⇧M",
+    "kiro_credit_usage_api_key": "Расход кредитов Kiro — недоступен при аутентификации по API-ключу",
+    "active_harness": "Окружение агента: {{label}}",
+    "harness_new_sessions": "Новые сеансы"
   },
   "appSdk": {
     "chatEmbed": {
@@ -457,6 +457,10 @@
         "header_resolved": "РЕШЕНО"
       },
       "global": {
+        "unattributed_label": "СОБЫТИЯ БЕЗ РЕПОЗИТОРИЯ",
+        "unattributed_note": "Записаны до того, как события стали указывать свой репозиторий, поэтому их нельзя отнести ни к одному.",
+        "repos_label": "РЕПОЗИТОРИИ",
+        "repos_note": "Эта панель объединяет их и пока не может показать их по отдельности.",
         "tab_pipeline": "Конвейер",
         "tab_lanes": "Дорожки элементов",
         "tablist_label": "Представления конвейера авторазбора",
@@ -1784,8 +1788,10 @@
       },
       "components": {
         "agentSessionButton": {
+          "already_finished_its_session_was_closed": "Уже завершено — расшифровка в «Прежних сессиях».",
           "couldn_t_start": "не удалось запустить",
-          "resume": "Продолжить"
+          "resume": "Продолжить",
+          "start_over": "Начать заново"
         },
         "aiSummaryCard": {
           "ai_summary": "ИИ-сводка",
@@ -4730,7 +4736,6 @@
         "workflows": "Рабочие процессы"
       },
       "workflowsRuns": {
-        "background_runs": "Фоновые запуски",
         "budget": "бюджет",
         "cancel": "Отменить",
         "cancelling": "Отмена...",
@@ -4801,8 +4806,6 @@
       },
       "console": {
         "crumb_accounts": "Аккаунты",
-        "connected": "Подключено",
-        "not_connected": "Не подключено",
         "copy": "Копировать",
         "copied": "Скопировано",
         "close": "Закрыть",
@@ -4814,17 +4817,25 @@
         "download_failed": "Не удалось начать загрузку. Ничего не было отправлено. Попробуйте снова.",
         "delete_confirm_action": "Удалить файл",
         "delete_confirm": "Удалить «{{name}}»? Файл будет убран из диска.",
+        "col_name": "Название",
+        "col_kind": "Тип",
+        "col_size": "Размер",
+        "col_modified": "Изменено",
+        "col_actions": "Действия",
+        "kind_folder": "Папка",
+        "folder_new": "Новая папка",
+        "folder_name": "Название папки",
+        "folder_delete_confirm": "Удалить «{{name}}» и всё её содержимое?",
+        "folder_delete_action": "Удалить папку",
+        "folder_delete_failed": "Не удалось удалить папку.",
+        "folder_create_failed": "Не удалось создать папку.",
+        "folder_bad_name": "В этом имени папки есть символы, которые S3 не принимает. Буквы, цифры, пробелы и . _ - ( ) + @ = безопасны.",
+        "folder_deleted": "Удалено объектов: {{objects}}.",
         "cancel": "Отмена",
         "load_more": "Показать ещё",
-        "connects_later": "Подключится позже",
         "stat_this_month": "За этот месяц",
-        "more_actions": "Другие действия",
         "storage_consent_needed": "Облачное хранилище для этого аккаунта ещё не подтверждено. Подтвердите его ниже и обновите страницу.",
-        "stat_stored": "Хранится",
         "stat_stored_value": "{{size}} · {{objects}} объектов",
-        "stat_sites": "Сайты",
-        "stat_tasks": "Задачи",
-        "guard_line": "Защита включена — всё, что создаёт новые расходы, сначала спросит вас · каждое изменение фиксируется.",
         "costs_as_of": "Кэшированные данные по состоянию на {{date}}.",
         "costs_consent_missing": "Включите отчёт о расходах ниже, чтобы увидеть траты этого аккаунта.",
         "costs_unavailable": "Сейчас не удалось получить данные о счёте.",
@@ -4854,12 +4865,12 @@
         "kind_webapp": "Веб-приложение",
         "kind_image": "Изображение",
         "drive_title": "Диск",
-        "drive_root": "Диск",
         "drive_upload": "Загрузить",
         "drive_uploading": "Загрузка…",
         "drive_bad_name": "В имени файла есть символы, которые диск не может сохранить. Переименуйте файл и попробуйте снова.",
         "drive_empty": "Эта папка пуста.",
         "section_drive": "Диск",
+        "section_files": "Файлы",
         "section_library": "Библиотека",
         "section_backup": "Резервная копия",
         "share_title": "Поделиться этим файлом",
@@ -4895,30 +4906,23 @@
         "access_expires_in": "истекает {{when}}",
         "access_forget": "Убрать из списка",
         "access_footer": "Удаление ссылки из списка не отзывает её — общая ссылка работает до истечения срока.",
-        "ghost_tasks": "Задачи",
-        "ghost_sites": "Сайты",
-        "general": "Общее",
-        "name": "Имя",
-        "account_id": "ID аккаунта",
-        "region": "Регион",
-        "connection": "Соединение",
-        "keys": "Ключи",
         "keys_count_one": "{{count}} ключ",
         "keys_count_few": "{{count}} ключа",
         "keys_count_many": "{{count}} ключей",
         "keys_count_other": "{{count}} ключей",
         "connections": "Соединения",
-        "copy_id": "Скопировать ID аккаунта",
         "key_healthy": "Исправен",
         "key_failed": "Сбой",
+        "parent_folders": "Родительские папки",
         "connection_connected": "Подключено",
         "connection_degraded": "Ухудшено",
         "connection_unknown": "Неизвестно",
-        "parent_folders": "Родительские папки"
+        "copy_id": "Скопировать ID аккаунта",
+        "folder_actions": "Действия с папкой",
+        "file_actions": "Действия с файлом"
       },
       "page": {
         "title": "AWS Control",
-        "subtitle": "Каждый аккаунт AWS, который может использовать Kiro Crew, и работает ли ещё каждое подключение.",
         "refresh": "Обновить",
         "health_ok": "Исправно",
         "health_degraded": "Требует внимания",
@@ -4944,9 +4948,6 @@
         "retry": "Повторить",
         "disabled_title": "AWS Control отключён",
         "disabled_body": "Включите приложение в App Store, чтобы увидеть свои аккаунты.",
-        "paid_services_title": "Платные сервисы",
-        "paid_services_intro": "Эти сервисы могут списывать средства с вашего аккаунта, поэтому каждый из них запрашивает подтверждение перед первым платным вызовом.",
-        "paid_services_scope": "Каждая карточка ниже относится только к тому одному подключению, которое на ней указано, а не ко всем аккаунтам из списка выше. Чтобы проверить платные услуги для другого аккаунта, откройте его и используйте его собственную страницу.",
         "aggregate_accounts_one": "{{count}} аккаунт",
         "aggregate_accounts_other": "{{count}} аккаунтов",
         "aggregate_keys_one": "{{count}} ключ",
@@ -4977,7 +4978,8 @@
         "keys_summary_few": "{{count}} ключа",
         "keys_summary_many": "{{count}} ключей",
         "add_accounts_count_few": "{{count}} из {{max}} зарегистрировано",
-        "add_accounts_count_many": "{{count}} из {{max}} зарегистрировано"
+        "add_accounts_count_many": "{{count}} из {{max}} зарегистрировано",
+        "paid_services_title": "Платные сервисы"
       }
     }
   },
@@ -5351,7 +5353,7 @@
         "kirocrew_registry": "Реестр {{productName}}"
       },
       "trustAppModal": {
-        "title": "Доверить {{app}} запуск своего кода?",
+        "title": "Доверить «{{app}}» запуск своего кода?",
         "scope": "Это касается только {{app}}. Все остальные сторонние приложения остаются заблокированными.",
         "on_cancel": "Отмена ничего не меняет: {{app}} останется установленным, но выключенным, и ты сможешь включить его позже.",
         "intro": "Если ты доверишь {{app}}, {{productName}} разрешит ему всё перечисленное ниже.",
@@ -5450,7 +5452,10 @@
       "save": "Сохранить",
       "set_a_goal": "Задать цель",
       "start_loop": "Запустить цикл",
-      "stop_loop": "Остановить цикл"
+      "stop_loop": "Остановить цикл",
+      "watches_next": "далее",
+      "watches_note": "Будят агента только при реальном сигнале. Управление на странице «Расписание».",
+      "watches_title": "Наблюдатели без расхода токенов"
     },
     "bottomTerminalPanel": {
       "close_terminal": "Закрыть терминал",
@@ -5567,7 +5572,13 @@
       "used": "Использовано",
       "voice_input": "Голосовой ввод",
       "finishing": "Завершение…",
-      "keep_holding_to_record": "Удерживайте, чтобы записать"
+      "keep_holding_to_record": "Удерживайте, чтобы записать",
+      "plan_limit": "Лимит плана",
+      "limit_type": "Тип лимита",
+      "resets": "Сброс",
+      "rate_limit_allowed": "Норма",
+      "rate_limit_warning": "Близко к лимиту",
+      "rate_limit_rejected": "Ограничено"
     },
     "chatPane": {
       "agent_list": "Список агентов",
@@ -5630,7 +5641,6 @@
         },
         "pagesProvider": {
           "developer": "Разработчик",
-          "explore": "Обзор",
           "hooks": "Хуки",
           "kirocrew_agents": "Агенты {{productName}}",
           "logs": "Логи",
@@ -5899,6 +5909,8 @@
       "removals_other": "{{count}} удаления",
       "show": "Показать",
       "show_less": "Показать меньше",
+      "switch_to_split_view": "Переключить на разделённый вид",
+      "switch_to_unified_view": "Переключить на объединённый вид",
       "this_document_is_tracked_as_a_session_artifact_n": "Этот документ отслеживается как артефакт сессии, а не как изменение исходного файла",
       "toggle_diff": "Показать или скрыть diff для {{path}}"
     },
@@ -6181,6 +6193,42 @@
       "no_execution_history_yet": "История запусков пока пуста",
       "prev": "← Назад",
       "s_elapsed": "с прошло"
+    },
+    "kasLogin": {
+      "aside_body": "Войди в Kiro прямо здесь: не нужно ни устанавливать CLI, ни открывать терминал. Остальное сделает Kiro Crew.",
+      "aside_footnote": "Твой вход остаётся на этой машине — на серверы Kiro Crew ничего не отправляется.",
+      "aside_headline": "Войди, чтобы начать",
+      "browser_note": "Каждый вариант запускает вход в Kiro и ведёт тебя к следующему шагу.",
+      "check_again": "Проверить снова",
+      "continue_with_github": "Продолжить с GitHub",
+      "continue_with_google": "Продолжить с Google",
+      "copied": "Скопировано",
+      "copy_link": "Скопировать ссылку",
+      "could_not_start_sign_in": "Не удалось начать вход. Проверь соединение и попробуй ещё раз.",
+      "device_aside_body": "Kiro Crew работает на другом компьютере, поэтому не может открыть окно браузера для тебя. Открой ссылку ниже на любом устройстве — подойдёт и телефон — и введи код.",
+      "device_aside_footnote": "Код действителен 5 минут.",
+      "device_aside_headline": "Подтверди в браузере",
+      "enter_the_code_in_your_browser": "Заверши вход на телефоне или другом компьютере",
+      "enter_this_code": "Введи этот код",
+      "get_started": "Начало работы",
+      "open_this_link": "Открой эту ссылку на телефоне или в другом браузере",
+      "provider_builder_id": "AWS Builder ID",
+      "provider_company_sso": "Корпоративный SSO",
+      "provider_github": "GitHub",
+      "provider_google": "Google",
+      "remote_host": "Дополнительный шаг",
+      "click_to_copy": "Нажми, чтобы скопировать",
+      "code_valid_note": "Код действителен 5 минут",
+      "use_different_sign_in": "Использовать другой способ входа",
+      "sign_in_failed": "Не удалось войти",
+      "sign_in_failed_body": "Во время ожидания подтверждения что-то пошло не так",
+      "sign_in_status_unavailable": "Не удалось проверить состояние входа",
+      "sign_in_to_kiro": "Вход в Kiro",
+      "signing_in_with": "Вход через {{provider}}",
+      "start_over": "Начать заново",
+      "the_code_expired": "Срок действия кода истёк",
+      "the_code_expired_body": "Этот код входа больше не действует",
+      "waiting_for_you_to_approve": "Ждём твоего подтверждения…"
     },
     "kiroPrerequisiteGate": {
       "agent_specs_missing": "Спецификации агента отсутствуют",
@@ -7100,30 +7148,15 @@
       "triggers": "Триггеры",
       "what_this_skill_does_and_when_the_agent_should_u": "Что делает этот навык и когда агент должен его использовать"
     },
-    "projectSkillsTrust": {
-      "body": "${{skill}} взят из собственной папки .kiro/skills этого проекта.",
-      "confirm": "Доверять этой папке",
-      "consequence": "Если доверять этой папке, её файлы навыков попадут в контекст этого чата, где смогут указывать агенту выполнять команды. Доверяй только проекту, который узнаёшь.",
-      "decline": "Не сейчас",
-      "decline_consequence": "Если откажешься, ничего не загрузится, а твоё сообщение останется таким, каким ты его набрал.",
-      "grant_failed": "Не удалось сохранить доверие для этой папки.",
-      "title": "Доверять навыкам этого проекта?",
-      "withdraw_hint": "Отозвать это можно позже на странице настроек «Навыки».",
-      "working": "Установка доверия…"
-    },
-    "projectSkillsTrustList": {
-      "folder_missing": "Эта папка больше не существует.",
-      "hint": "Эти папки проектов могут загружать свои скиллы в чат. Отзови папку, чтобы её скиллы больше не загружались.",
-      "revoke": "Отозвать",
-      "revoke_failed": "Не удалось отозвать доверие для этой папки.",
-      "revoking": "Отзываем…",
-      "title": "Доверенные папки проектов"
-    },
     "skillPickerMenu": {
       "loading_skills": "Загрузка навыков…",
       "no_matching_skills": "Нет подходящих навыков",
       "no_matching_skills_ctrl_enter_sends": "Нет подходящих навыков — Ctrl+Enter отправит сообщение",
       "no_matching_skills_enter_sends": "Нет подходящих навыков — Enter отправит сообщение",
+      "no_skills_mapped_to_agent": "Нет навыков, сопоставленных с {{agent}}",
+      "no_skills_mapped_to_agent_ctrl_enter_sends": "Нет навыков, сопоставленных с {{agent}} — Ctrl+Enter отправит сообщение",
+      "no_skills_mapped_to_agent_enter_sends": "Нет навыков, сопоставленных с {{agent}} — Enter отправит сообщение",
+      "scoped_to_agent": "Ограничено агентом {{agent}}",
       "trust_needed_badge": "Нужно доверие",
       "trust_needed_hint": "Из этого проекта. Выбери его, чтобы просмотреть и доверять папке."
     },
@@ -7156,6 +7189,7 @@
       "desc_todos": "Показать список задач или управлять им",
       "desc_tools": "Показать доступные инструменты",
       "desc_usage": "Показать сведения о биллинге и расходе",
+      "desc_workflow": "Показать или запустить сохранённый процесс по имени",
       "no_matching_commands_ctrl_enter_sends": "Нет подходящих команд — Ctrl+Enter отправит сообщение",
       "no_matching_commands_enter_sends": "Нет подходящих команд — Enter отправит сообщение"
     },
@@ -7342,13 +7376,6 @@
       "later": "Позже",
       "restart_update": "Установить обновление и перезапустить приложение",
       "restarting": "Перезапуск...",
-      "update_ready": "Обновление готово"
-    },
-    "updatePill": {
-      "downloading": "Загрузка…",
-      "downloading_percent": "Загрузка {{percent}}%",
-      "open_update_settings": "Открыть настройки обновления",
-      "update_available": "Доступно обновление",
       "update_ready": "Обновление готово"
     },
     "voiceDictationPanel": {
@@ -7629,6 +7656,32 @@
       "confirm_button": "Подтвердить и включить",
       "withdraw": "Отозвать подтверждение"
     },
+    "projectSkillsTrust": {
+      "body": "${{skill}} взят из собственной папки .kiro/skills этого проекта.",
+      "confirm": "Доверять этой папке",
+      "consequence": "Если доверять этой папке, её файлы навыков попадут в контекст этого чата, где смогут указывать агенту выполнять команды. Доверяй только проекту, который узнаёшь.",
+      "decline": "Не сейчас",
+      "decline_consequence": "Если откажешься, ничего не загрузится, а твоё сообщение останется таким, каким ты его набрал.",
+      "grant_failed": "Не удалось сохранить доверие для этой папки.",
+      "title": "Доверять навыкам этого проекта?",
+      "withdraw_hint": "Отозвать это можно позже на странице настроек «Навыки».",
+      "working": "Установка доверия…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "Эта папка больше не существует.",
+      "hint": "Эти папки проектов могут загружать свои скиллы в чат. Отзови папку, чтобы её скиллы больше не загружались.",
+      "revoke": "Отозвать",
+      "revoke_failed": "Не удалось отозвать доверие для этой папки.",
+      "revoking": "Отзываем…",
+      "title": "Доверенные папки проектов"
+    },
+    "updatePill": {
+      "downloading": "Загрузка…",
+      "downloading_percent": "Загрузка {{percent}}%",
+      "open_update_settings": "Открыть настройки обновления",
+      "update_available": "Доступно обновление",
+      "update_ready": "Обновление готово"
+    },
     "confirmDialog": {
       "cancel": "Отмена"
     },
@@ -7849,14 +7902,16 @@
   "nav": {
     "agent_capabilities": "Возможности агента",
     "artifacts": "Артефакты",
-    "explore": "Обзор",
+    "discover": "Обзор",
     "knowledge": "Знания",
+    "library": "Библиотека",
     "notifications": "Уведомления",
     "schedule": "Расписание",
     "sessions": "Сессии",
     "settings": "Настройки",
     "task_runner": "Task Runner",
-    "webhooks": "Вебхуки"
+    "webhooks": "Вебхуки",
+    "crew_members": "Участники команды"
   },
   "pages": {
     "agentsPage": {
@@ -8073,7 +8128,7 @@
     },
     "appsPage": {
       "action_failed": "Не удалось {{action}} {{name}}",
-      "add_an_app_source_gear_icon_above_or_install_fro": "Добавьте источник приложений (значок шестерёнки выше) или установите из локального пути.",
+      "add_an_app_source_gear_icon_above_or_install_fro": "Добавьте источник приложений («Источники», справа вверху) или установите из локального пути.",
       "agent_few": "{{count}} агента",
       "agent_many": "{{count}} агентов",
       "agent_one": "{{count}} агент",
@@ -8083,7 +8138,6 @@
       "app_many": "{{count}} приложений",
       "app_one": "{{count}} приложение",
       "app_other": "{{count}} приложения",
-      "apps": "Приложения",
       "available": "доступно",
       "built_in_kirocrew": "Встроенное · kirocrew",
       "cancel": "Отмена",
@@ -8094,16 +8148,14 @@
       "cron_job_one": "{{count}} задание cron",
       "cron_job_other": "{{count}} задания cron",
       "dependencies": "Зависимости:",
-      "discover": "Обзор",
-      "discover_install_and_manage_agentic_apps": "Находите и устанавливайте агентные приложения и управляйте ими",
       "dismiss_message": "Скрыть сообщение",
       "failed_to_enable": "Не удалось включить {{name}}",
       "failed_to_load_apps": "Не удалось загрузить приложения",
       "failed_to_load_registry": "Не удалось загрузить реестр",
       "failed_to_uninstall": "Не удалось удалить {{name}}",
       "failed_to_update": "Не удалось обновить: {{names}}",
-      "find_apps_in_the_discover_tab_or_install_from_a": "Ищи приложения на вкладке «Обзор» или установи из локального пути через шестерёнку источников выше.",
-      "hidden_you_can_re_enable_it_from_the_discover_ta": "Отключено. Снова включить можно на вкладке «Обзор».",
+      "find_apps_in_the_discover_tab_or_install_from_a": "Ищите приложения на странице «Обзор» или установите из локального пути через «Источники» на той странице.",
+      "hidden_you_can_re_enable_it_from_the_discover_ta": "Отключено. Вы можете снова включить его на странице «Обзор».",
       "keep_app_data": "Сохранить данные приложения",
       "keep_dependency": "Сохранить зависимость {{name}}",
       "keep_this_dependency": "Сохранить эту зависимость",
@@ -8112,6 +8164,7 @@
       "kirocrew_registry": "Реестр {{productName}}",
       "library": "Библиотека",
       "loading_apps": "Загрузка приложений…",
+      "manage_your_installed_apps": "Управляйте установленными приложениями",
       "name": "Название",
       "no_apps_available": "Нет доступных приложений",
       "no_apps_installed_yet": "Приложения ещё не установлены",
@@ -8146,9 +8199,14 @@
       "updated_app_many": "Обновлено {{count}} приложений.",
       "updated_app_one": "Обновлено {{count}} приложение.",
       "updated_app_other": "Обновлено {{count}} приложения.",
+      "updates_hint_link": "Посмотреть обновления",
+      "updates_hint_few": "Доступно {{count}} обновления",
+      "updates_hint_many": "Доступно {{count}} обновлений",
+      "updates_hint_one": "Доступно {{count}} обновление",
+      "updates_hint_other": "Доступно {{count}} обновления",
       "updating_progress": "Обновление {{done}}/{{total}}...",
       "v": "v",
-      "installed_app_find_in_library_and_enable": "{{name}} установлено. Включите его ниже, чтобы активировать.",
+      "installed_app_find_in_library_and_enable": "{{name}} установлено. Включите его в Библиотеке.",
       "synced_from_its_source_directory": "{{name}} синхронизировано из исходного каталога.",
       "updated_from_the_registry": "{{name}} обновлено из реестра."
     },
@@ -8546,6 +8604,8 @@
     },
     "capabilitiesPage": {
       "agent_capabilities": "Возможности агента",
+      "workflows_label": "Рабочие процессы",
+      "workflows_description": "Создавайте, изменяйте и запускайте повторно используемые процессы агентов",
       "connections_description": "Подключайте официальные сервисы и управляйте пользовательскими MCP-серверами",
       "connections_label": "Подключения",
       "crews_description": "Агенты, с которыми вы общаетесь, у каждого своё рабочее пространство",
@@ -8755,7 +8815,8 @@
       "collapsibleToolGroup": {
         "approval_needed": "Требуется подтверждение",
         "approvals_pending": "ожидают подтверждения",
-        "batch_preview_note": "Последний из {{count}} ожидающих вызовов; все будут обработаны вместе.",
+        "batch_preview_all": "Просмотрите ниже все {{count}} ожидающих вызовов — все будут обработаны вместе.",
+        "batch_preview_none": "Предпросмотр для этого вызова недоступен.",
         "approve": "Разрешить",
         "approve_all": "Разрешить все ({{count}})",
         "approved": "Разрешено",
@@ -9106,8 +9167,14 @@
         "could_not_load_run_snapshot": "Не удалось загрузить снимок запуска:"
       },
       "workflowRunCard": {
+        "cancel": "Отмена",
         "open_in_the_workflows_panel": "Открыть на панели «Рабочие процессы»",
-        "open_workflows_panel": "· Открыть панель «Рабочие процессы»"
+        "open_workflows_panel": "· Открыть панель «Рабочие процессы»",
+        "save_help": "Сохраните точный рабочий процесс из этого завершённого запуска в глобальной библиотеке.",
+        "save_title": "Сохранить этот рабочий процесс",
+        "save_workflow": "Сохранить рабочий процесс",
+        "saved_as": "Сохранено как {{command}}",
+        "source_unavailable": "Не удалось загрузить исходный код завершённого рабочего процесса."
       },
       "workflowSidebarRow": {
         "could_not_load_snapshot": "Не удалось загрузить снимок:",
@@ -9482,6 +9549,14 @@
       "sort_newest": "Сначала новые",
       "sort_oldest": "Сначала старые",
       "source_links_expand_failed": "Не удалось загрузить остальное. Нажмите, чтобы повторить.",
+      "stale_collapse_caption": "Без активности дольше",
+      "stale_collapse_ctx_in_name": "папка {{name}}",
+      "stale_collapse_menu": "Сворачивать спящие сессии",
+      "stale_collapse_off": "Выкл.",
+      "stale_collapse_paused": "Приостановлено",
+      "stale_collapse_paused_hint": "Приостановлено, пока список в поиске, отфильтрован или отсортирован не по новизне.",
+      "stale_collapse_row": "Спящие сессии",
+      "stale_collapse_row_ungrouped": "вне папок",
       "started_in_channel": "Этот диалог начался в {{channel}}.",
       "started_in_direct_message": "Этот диалог начался в личном сообщении.",
       "stop_filtering_by_tag": "Не фильтровать по тегу {{name}}",
@@ -9839,8 +9914,8 @@
       "worktrees_count": "Worktree ({{count}})",
       "worktrees_created_under_a_previous_repository_na": "Worktree, созданные под предыдущим именем репозитория. По умолчанию скрыты; по-прежнему учитываются кнопкой «Очистить объединённые».",
       "cancel_staged_cutover": "Отменить подготовленное переключение",
-      "keeps_name_the_live_target_and_discards_the_stag": "{{name}} остаётся активной целью, а подготовленное переключение на {{staged}} отменяется. Ничего не перезапускается — шлюз продолжает выполнять текущий код.",
-      "keeps_this_checkout_the_live_target_and_discards": "Этот чекаут остаётся активной целью, а подготовленное переключение на {{staged}} отменяется (ничего не перезапускается)",
+      "keeps_name_the_live_target_and_discards_the_stag": "«{{name}}» остаётся активной целью, а подготовленное переключение на «{{staged}}» отменяется. Ничего не перезапускается — шлюз продолжает выполнять текущий код.",
+      "keeps_this_checkout_the_live_target_and_discards": "Этот чекаут остаётся активной целью, а подготовленное переключение на «{{staged}}» отменяется (ничего не перезапускается)",
       "cancel_staged_cutover_2": "Отменить подготовленное переключение?",
       "keep_cutover": "Оставить переключение",
       "cutover_staged_run_cmd_to_finish_or_cancel": "Переключение подготовлено: это рабочее дерево станет активным при следующем запуске шлюза. Выполните `{{cmd}}`, чтобы завершить его, или используйте меню этой строки → Отменить подготовленное переключение, чтобы отказаться. До этого шлюз продолжает работать на прежнем чекауте.",
@@ -9849,15 +9924,35 @@
       "no_checkout_found_action": "Задайте переменную окружения ниже или добавьте dev_fleet.repo_path в config.json в каталоге данных {{productName}} (по умолчанию ~/.kiro/crew), чтобы сохранить настройку, затем перезапустите шлюз."
     },
     "developer": {
+      "agentBackendTab": {
+        "agent_backend": "Бэкенд агента",
+        "claude_code": "Claude Code",
+        "could_not_load_the_agent_backend": "Не удалось загрузить бэкенд агента.",
+        "could_not_save_the_agent_backend": "Не удалось сохранить бэкенд агента.",
+        "default_all_features_supported": "По умолчанию. Все функции поддерживаются.",
+        "experimental": "Экспериментальный",
+        "kas_kiro_agent": "KAS (kiro-agent)",
+        "kiro_cli": "Kiro CLI",
+        "loading_configuration": "Загрузка конфигурации…",
+        "new_sessions_use_this_agent_a_session_that_is_al": "Новые сессии используют этого агента. Уже открытая сессия сохраняет того, с которым была начата, — переключение здесь не меняет её посреди сессии.",
+        "not_enabled_in_this_build": "Не включено в этой сборке",
+        "retry": "Повторить"
+      },
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "Токены входящих вебхуков, зарегистрированные контексты и история запусков. API работает, но страница не доделана.",
         "open_webhooks": "Открыть вебхуки",
-        "webhooks": "Вебхуки"
+        "webhooks": "Вебхуки",
+        "acp_backends": "Адаптеры ACP",
+        "experimental_acp_backends_claude_code": "Claude Code как альтернатива Kiro CLI. Экспериментальная функция — защитные отказы работают; сквозные сеансы пока не проверены."
       }
     },
     "developerPage": {
       "developer": "Разработчик",
       "tabs": {
+        "agentBackend": {
+          "description": "Какого агента запускают новые сессии — Kiro CLI, Claude Code или KAS",
+          "label": "Бэкенд агента"
+        },
         "archive": {
           "description": "Ротированная и сжатая история сессий (хранение 7 дней)",
           "label": "Архив"
@@ -9895,6 +9990,22 @@
           "label": "Телеметрия"
         }
       }
+    },
+    "discoverPage": {
+      "subtitle": "Просматривайте и устанавливайте агентные приложения",
+      "tab_featured": "Рекомендуемое",
+      "tab_updates": "Обновления",
+      "title": "Обзор",
+      "updates_badge_label_few": "Доступно {{count}} обновления",
+      "updates_badge_label_many": "Доступно {{count}} обновлений",
+      "updates_badge_label_one": "Доступно {{count}} обновление",
+      "updates_badge_label_other": "Доступно {{count}} обновления",
+      "updates_empty": "Всё обновлено.",
+      "updates_empty_back_to_featured": "Смотреть рекомендуемые приложения",
+      "version_diff": "v{{from}} → v{{to}}",
+      "updating": "Обновление…",
+      "updates_check_failed": "Не удалось проверить обновления.",
+      "updates_retry": "Повторить"
     },
     "embedSettingsPage": {
       "back": "Назад",
@@ -10475,6 +10586,31 @@
       "unread": "Непрочитанные"
     },
     "overview": {
+      "workflowLibrary": {
+        "adapted_from": "Адаптировано из",
+        "create_draft": "Создать черновик",
+        "create_title": "Создать повторно используемый процесс",
+        "description": "Сохранённые процессы доступны глобально в Kiro Crew и работают со всеми поддерживаемыми агентскими средами. Новый черновик может адаптировать подходящий процесс, не изменяя его.",
+        "empty": "Сохранённые процессы не найдены.",
+        "intent": "Что должен делать этот процесс?",
+        "loading": "Загрузка процессов…",
+        "name": "Имя",
+        "new_workflow": "Новый процесс",
+        "request_failed": "Не удалось выполнить запрос процесса",
+        "revision": "Редакция {{revision}}",
+        "run": "Запустить процесс",
+        "run_input": "Ввод (доступен как ctx.args.input)",
+        "save_revision": "Сохранить новую редакцию",
+        "save_to_library": "Сохранить в библиотеку",
+        "search": "Поиск процессов…",
+        "select_or_create": "Выберите сохранённый процесс или создайте новый.",
+        "slug": "Имя slash-команды",
+        "source": "Исходный код процесса",
+        "started": "Запущен {{runId}}",
+        "title": "Библиотека процессов",
+        "updated": "Обновлено: {{date}}",
+        "workflow_description": "Описание"
+      },
       "agentCfgTab": {
         "after_saving_use": "После сохранения нажмите",
         "agent_config_file": "Конфигурация агента ({{file}})",
@@ -10670,7 +10806,14 @@
         "probe_failing": "Постоянные сбои",
         "probe_failing_help": "{{failures}} последовательных неудачных проверок. Сервер по-прежнему подключён; это показание состояния, а не изменение.",
         "reset_failures": "Сбросить счётчик",
-        "reset_failures_help": "Сбрасывает счётчик последовательных сбоев этого сервера."
+        "reset_failures_help": "Сбрасывает счётчик последовательных сбоев этого сервера.",
+        "sign_in": "Войти",
+        "sign_in_authorize": "Авторизовать {{name}}",
+        "sign_in_mint_failed": "Не удалось начать вход. Попробуйте ещё раз.",
+        "sign_in_preparing": "Подготовка входа…",
+        "sign_in_retry": "Попробовать ещё раз",
+        "sign_in_row_updates_after_probe": "Нажмите «Probe MCP servers» выше, чтобы обновить эту строку.",
+        "sign_in_timeout": "Вход не выдал ссылку на подтверждение вовремя. Попробуйте ещё раз."
       },
       "memoryGraphTab": {
         "all_count": "Все ({{count}})",
@@ -11016,6 +11159,43 @@
         "vector_memory": "Векторная память",
         "vector_memory_is_initializing_the_embedding_mode": "Векторная память инициализируется. Модель эмбеддингов (~610MB) скачивается автоматически в фоне, а старая память переносится сама — действий не требуется.",
         "verifying_model_integrity": "Проверка целостности модели..."
+      },
+      "acpBackend": {
+        "title": "Адаптер ACP",
+        "experimental": "Экспериментальный",
+        "all_features_supported": "По умолчанию. Все функции поддерживаются.",
+        "features_differ": "{{count}} из {{total}} функций работают иначе, недоступны или не проверены.",
+        "show_what_changes": "Показать, что изменится",
+        "applies_to_new_sessions": "Применяется к сеансам, запущенным с этого момента. Открытые сеансы сохраняют исходный адаптер.",
+        "not_enabled_in_this_build": "Не включено в этой сборке: {{backends}}. См. документацию по экспериментальным адаптерам ACP.",
+        "level_supported": "Поддерживается",
+        "level_degraded": "Работает иначе",
+        "level_unavailable": "Недоступно",
+        "cap_session_sharing": "Общая среда выполнения субагентов",
+        "cap_reasoning_effort": "Глубина рассуждений",
+        "cap_mcp_tool_search": "Поиск инструментов MCP",
+        "cap_agent_profiles": "Профили агентов",
+        "cap_slash_commands": "Слэш-команды",
+        "cap_turn_usage": "Использование за ход",
+        "cap_billing": "Стоимость и лимиты",
+        "cap_native_resume": "Возобновление сеанса",
+        "cap_registry_model_ids": "Использует каталог моделей Kiro",
+        "cap_mid_turn_steer": "Корректировка в течение хода",
+        "confirm_title": "Переключиться на {{backend}}?",
+        "confirm_body": "Этот адаптер экспериментальный. {{count}} из {{total}} функций Kiro Crew работают иначе, недоступны или не проверены.",
+        "confirm_model_reset": "Выбор моделей будет сброшен — у каждого рабочего окружения свой список моделей. Это относится и к открытым чатам.",
+        "confirm_open_sessions": "Открытые сеансы не затрагиваются и сохраняют текущий адаптер.",
+        "cancel": "Отмена",
+        "confirm_switch": "Переключить адаптер",
+        "confirm_prerequisites": "Сначала выполните это на хосте шлюза, в указанном порядке.",
+        "not_installed": "Адаптер не установлен",
+        "level_unverified": "Не проверено",
+        "load_failed": "Не удалось загрузить адаптеры ACP. Повторите попытку.",
+        "routing_routed": "Вызовы инструментов достигают шлюза безопасности {{productName}}",
+        "routing_indeterminate": "Маршрутизация вызовов инструментов не проверена — новые сеансы будут отклонять вызовы инструментов",
+        "routing_bypassed": "Вызовы инструментов обошли бы шлюз безопасности {{productName}} — новые сеансы будут отклонять вызовы инструментов",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "Неконтролируемые инструменты разрешены. Правила запрещённых команд, блокировка чувствительных путей и потолок управления не применяются к самостоятельно одобренным вызовам этого бэкенда."
       }
     },
     "overviewPage": {
@@ -11375,11 +11555,8 @@
       "owning_session": "Сессия-владелец"
     },
     "servicesTab": {
-      "channels": "Каналы",
-      "connect_error": "Ошибка подключения",
       "connected": "Подключено",
       "cpu": "CPU %",
-      "discord": "Discord",
       "embeddings": "Embeddings",
       "gateway_process": "Процесс шлюза",
       "governance": "Управление политиками",
@@ -11387,7 +11564,6 @@
       "governance_tip_degraded": "Проверка управления политиками завершилась отказом, обнаружено несовпадение целостности либо политика допуска не проверена (отсутствует или не читается). Изучи журнал аудита SEL.",
       "governance_tip_disabled": "Принудительная политика допуска не настроена (разрешающий режим по умолчанию). Плагины допускаются, если не запрещены явно.",
       "governance_tip_unknown": "Статус управления политиками в этой сессии пока не определён.",
-      "imessage": "iMessage",
       "mcp_process_breakdown": "{{total}} ({{sandbox}} в песочнице · {{provider}} {{providerLabel}} · {{mcp}} mcp)",
       "mcp_process_breakdown_unique": "Уникальных: {{total}} ({{sandbox}} в песочнице · {{provider}} {{providerLabel}} · {{mcp}} mcp)",
       "mcp_processes": "Процессы MCP",
@@ -11404,16 +11580,22 @@
       "status_disabled": "Отключено",
       "status_unknown": "Неизвестно",
       "stopped": "Остановлено",
-      "teams": "Microsoft Teams",
-      "telegram": "Telegram",
       "threads": "Потоки",
       "uptime": "Время работы",
+      "working_directory": "Рабочий каталог",
+      "channels": "Каналы",
+      "connect_error": "Ошибка подключения",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
       "webex": "Webex",
       "wecom": "WeCom",
       "weixin": "WeChat",
       "whatsapp": "WhatsApp",
       "feishu": "Feishu",
-      "working_directory": "Рабочий каталог"
+      "acp_backend": "Адаптер ACP",
+      "acp_backend_experimental": "{{label}} (экспериментальный)"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "Нечёткий фильтр (поиск подстроки)",
@@ -11423,6 +11605,25 @@
       "select_an_archive_to_view_its_contents": "Выберите архив, чтобы посмотреть его содержимое.",
       "truncated_showing_first_200kb": "... обрезано (показаны первые 200KB) ...",
       "no_archives_with_compaction_hint": "Архивов нет. Архивы создаются при ротации файлов сессий (>2MB) или их сжатии. Автоматическое сжатие управляется через <settingRef/>."
+    },
+    "sessionBreakdown": {
+      "header_meta": "{{subs}} субагентов · {{running}} активно",
+      "legend_history": "история",
+      "legend_lessons": "уроки",
+      "legend_memory": "память",
+      "legend_skill": "навык",
+      "legend_skillidx": "индекс навыков",
+      "legend_sys": "агент",
+      "node_caption": "{{model}} · {{turns}} ходов · собственное окно",
+      "occupancy": "{{pct}} % окна",
+      "stalled": "застрял",
+      "status_done": "готово",
+      "status_error": "завершено",
+      "status_running": "активно",
+      "title": "Разбор сессии",
+      "tool_count": "{{count}} инструментов",
+      "unknown_agent": "субагент",
+      "unknown_model": "неизвестно"
     },
     "sessionMemoryCard": {},
     "sessionStorage": {
@@ -11665,7 +11866,16 @@
         "you_are_on_the_latest_version": "У вас установлена последняя версия.",
         "you_re_on_the_latest_version": "У вас установлена последняя версия.",
         "checks_for_updates_with_timing": "{{name}} автоматически проверяет обновления. {{timing}} Вы также можете проверить сейчас.",
-        "last_checked_ago_next_check_in": "Последняя проверка {{ago}}, следующая автоматическая проверка {{next}}."
+        "last_checked_ago_next_check_in": "Последняя проверка {{ago}}, следующая автоматическая проверка {{next}}.",
+        "in_app_update_intro": "Новая версия устанавливается рядом с текущей и переключается атомарно. Для применения достаточно одной команды подтверждения на хосте шлюза.",
+        "or_update_manually": "Или заново запустите установщик вручную",
+        "armed_run_on_host": "Чтобы подтвердить и применить, выполните эту команду на хосте шлюза.",
+        "armed_expires_in": "Окно подтверждения закроется через {{time}}",
+        "armed_waiting_note": "Ожидание подтверждения — после него здесь появится прогресс, и шлюз перезапустится сам.",
+        "applying_update": "Применение обновления…",
+        "applying_restart_note": "Когда новая версия готова, шлюз перезапускается сам; эта страница переподключится автоматически.",
+        "approval_window_expired": "Окно подтверждения истекло без подтверждения. Запустите обновление снова, когда будете готовы.",
+        "try_again": "Повторить"
       },
       "botChannelPanel": {
         "allowed_user_ids": "Разрешённые ID пользователей",
@@ -11700,7 +11910,11 @@
         "file_sessions_in_folder_desc": "Новые сессии из {{channel}} попадают в папку на боковой панели, а не остаются без папки.",
         "session_folder_name": "Название папки",
         "session_folder_name_desc": "Создаётся при сохранении этих настроек, если её ещё нет.",
-        "shared_channels": "Общие каналы"
+        "shared_channels": "Общие каналы",
+        "sdk_missing": "Установить SDK для {{channel}}",
+        "sdk_missing_body": "Каналу {{channel}} требуется пакет {{package}}, который не устанавливается по умолчанию. Выполните команду ниже в терминале, чтобы добавить его.",
+        "sdk_restart_after_install": "Затем перезапустите шлюз, чтобы запустить канал {{channel}}.",
+        "sdk_install_unsupported": "Python этого шлюза не может устанавливать дополнительные пакеты, поэтому {{package}} здесь не добавить. Запустите шлюз из окружения Python, в котором pip может выполнить установку."
       },
       "browserPanel": {
         "use_builtin_label": "Использовать встроенный браузер",
@@ -13427,6 +13641,31 @@
     "worldsPopout": {
       "hide_controls": "Скрыть управление",
       "show_controls": "Показать управление"
+    },
+    "membersPage": {
+      "agent_template": "Шаблон агента",
+      "configuration": "Конфигурация",
+      "details": "Подробности",
+      "edit_in_crew_manager": "Изменить в менеджере команд",
+      "empty_roster": "Участников пока нет. Создайте команду в менеджере команд, и она появится здесь.",
+      "inherited": "Наследуется",
+      "member_count_few": "{{count}} участника",
+      "member_count_many": "{{count}} участников",
+      "member_count_one": "{{count}} участник",
+      "member_count_other": "{{count}} участника",
+      "memory_shared_note": "Сейчас у участников общая память: то, что вы скажете одному, известно всем.",
+      "memory_store": "Хранилище памяти",
+      "model": "Модель",
+      "opening_thread": "Открываем переписку…",
+      "pick_a_member": "Выберите участника, чтобы открыть переписку.",
+      "pinned_to": "Закреплено за {{name}}",
+      "roster_load_failed": "Не удалось загрузить список участников.",
+      "slug_collision": "Идентификатор этого участника совпадает с {{name}}, за которым уже закреплена переписка. Переименуйте одну из команд, чтобы у каждой была своя переписка.",
+      "status_idle": "Свободен",
+      "status_working": "Работает",
+      "thread_open_failed": "Не удалось открыть переписку этого участника.",
+      "title": "Участники команды",
+      "workspace": "Рабочее пространство"
     }
   },
   "privacyDisclosure": {

@@ -1067,7 +1067,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       {/* Sits next to Logs on purpose: both answer "what actually happened
           in THIS session" — Logs for the tool calls, this for the context
           that was injected around them. */}
-      {effectiveTab === 'context' && <ContextBreakdownTab slot={slot} />}
+      {effectiveTab === 'context' && <ContextBreakdownTab slot={slot} subagents={subagents} />}
 
       {/* Session summary — the goal-level view of this session, so returning to
           it does not mean re-reading the transcript. */}

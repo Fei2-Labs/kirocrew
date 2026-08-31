@@ -23,6 +23,7 @@ from kiro_crew.dashboard.token_auth import (
     app_token_path_allowed,
     bind_token_ip,
     check_token_ip,
+    claims_an_app_unverified,
     generate_token,
     is_consumed,
     mark_consumed,
@@ -398,6 +399,147 @@ async def test_cookie_not_reset_when_present() -> None:
     assert resp.status == 200
     # Cookie should NOT be re-set on cookie-based auth
     assert "mc_token_5476" not in resp.cookies
+
+
+# -- Stale ?token= must not veto a valid session cookie (query→cookie fallback) --
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_falls_back_to_valid_cookie() -> None:
+    """Re-opening a bookmarked link replays a long-expired ``?token=`` alongside
+    the still-valid session cookie that link was exchanged for. The dead query
+    token must be ignored, not act as a one-vote veto over the live cookie."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser", ttl_seconds=300)
+    cookie = generate_token("staleuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(query={"token": stale}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+    # Fallback lands on the COOKIE path: no token→session exchange, no re-set.
+    assert "mc_token_5476" not in resp.cookies
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_without_cookie_still_denied() -> None:
+    """The fallback adds no capability: a dead query token alone stays denied
+    (the SPA-shell carve-out aside — this data path is not a shell request)."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser2", ttl_seconds=300)
+    req = _make_request(path="/api/status", query={"token": stale})
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_with_expired_cookie_denied() -> None:
+    """When BOTH credentials are dead, the query token's failure reason stands
+    (the credential the caller actually presented) and the request is denied."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser3", ttl_seconds=300)
+        dead_cookie = generate_token("staleuser3", ttl_seconds=300)
+    req = _make_request(
+        path="/api/status", query={"token": stale}, cookies={"mc_token_5476": dead_cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_valid_query_token_still_wins_over_cookie() -> None:
+    """The fallback fires only on an INVALID query token. A valid one keeps
+    today's precedence — including its token→session exchange (fresh cookie)."""
+    mw = token_auth_middleware()
+    fresh = generate_token("precedence", ttl_seconds=300)
+    cookie = generate_token("someoneelse", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    req = _make_request(query={"token": fresh}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+    assert resp.cookies.get("mc_token_5476") is not None
+
+
+@pytest.mark.asyncio
+async def test_internal_path_expired_query_token_falls_back_to_cookie() -> None:
+    """The internal-path helper (_extract_and_validate_token) applies the same
+    rule: a stale ``?token=`` on a polled internal path must not 401 a request
+    whose session cookie is still valid."""
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("intuser", ttl_seconds=300)
+    cookie = generate_token("intuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    mw = token_auth_middleware(internal_paths=frozenset({"/api/spawn"}), internal_secret="s")
+    req = _make_request(
+        path="/api/spawn", query={"token": stale}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_expired_app_token_does_not_fall_back_to_user_cookie() -> None:
+    """An expired APP token must NOT adopt the dashboard user's cookie.
+
+    An installed app's UI is served from this same origin, so the browser sends
+    the user's session cookie alongside the app's own ``?token=``. If the
+    fallback fired here, ``app_name`` would come back empty, the app-scope gate
+    would become a no-op, and an app whose token merely expired would silently
+    gain the user's full API reach. It must stay denied so the app re-exchanges
+    its secret instead.
+    """
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale_app = generate_token("appsub", ttl_seconds=300, app="someapp")
+    cookie = generate_token("realuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(
+        path="/api/status", query={"token": stale_app}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_internal_path_expired_app_token_does_not_fall_back_to_cookie() -> None:
+    """The internal-path helper applies the same app-token exception."""
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale_app = generate_token("appsub2", ttl_seconds=300, app="someapp")
+    cookie = generate_token("realuser2", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    mw = token_auth_middleware(internal_paths=frozenset({"/api/spawn"}), internal_secret="s")
+    req = _make_request(
+        path="/api/spawn", query={"token": stale_app}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+def test_claims_an_app_unverified_only_ever_refuses() -> None:
+    """The unverified reader answers True only for a payload that names an app.
+
+    Garbage and app-less payloads answer False, so the claim can never widen the
+    fallback — it can only withhold it.
+    """
+    assert claims_an_app_unverified(generate_token("u", ttl_seconds=60, app="a")) is True
+    assert claims_an_app_unverified(generate_token("u", ttl_seconds=60)) is False
+    assert claims_an_app_unverified("not-a-token") is False
+    assert claims_an_app_unverified("") is False
 
 
 # -- Cookie keyed by browser-facing (Host) port for tunneled multi-instance --
@@ -1103,7 +1245,7 @@ def test_signing_secret_persisted_across_loads(tmp_path, monkeypatch) -> None:
     assert key_file.exists()
     assert len(s1) >= 32
     # Owner-only permissions. POSIX enforces this via chmod 0o600; Windows applies
-    # an owner DACL (icacls) that does not surface in st_mode (files report
+    # an owner DACL that does not surface in st_mode (files report
     # 0o666), so the POSIX-bit assertion is only meaningful off Windows (the
     # Windows DACL path is covered by test_platform_compat::TestRestrictToOwner).
     if os.name != "nt":
@@ -1166,7 +1308,7 @@ def test_signing_secret_concurrent_first_init_converges(tmp_path, monkeypatch) -
     assert all(r == on_disk for r in results), "concurrent inits diverged from the on-disk key"
     assert len(set(results)) == 1, "more than one distinct signing key was issued"
     # Winner's create still locked the file down to owner-only. POSIX enforces
-    # this via chmod 0o600; Windows applies an owner-only DACL (icacls) that does
+    # this via chmod 0o600; Windows applies an owner-only DACL that does
     # NOT surface in st_mode (files report 0o666), so the POSIX-bit assertion is
     # only meaningful off Windows — the Windows DACL path has direct coverage in
     # test_platform_compat::TestRestrictToOwner.
@@ -2082,7 +2224,7 @@ def test_revoked_store_locks_the_file_down_to_its_owner(tmp_path, monkeypatch) -
     locked: list[tuple[str, int]] = []
     real_restrict = platform_compat.restrict_to_owner
 
-    def _spy(path) -> None:
+    def _spy(path, **_kw) -> None:
         # Record the size at lockdown time: the nonce list must not be sitting
         # in the file yet (see the ordering assertion below).
         locked.append((str(path), os.path.getsize(str(path))))
@@ -2101,9 +2243,9 @@ def test_revoked_store_locks_the_file_down_to_its_owner(tmp_path, monkeypatch) -
     )
     locked_path, size_at_lockdown = locked[0]
     assert size_at_lockdown == 0, (
-        "the denylist was written before the lockdown applied; on Windows "
-        "restrict_to_owner shells out to icacls, so the nonces would sit under "
-        "the parent-inherited DACL for the length of that call"
+        "the denylist was written before the lockdown applied; on Windows the "
+        "lockdown replaces the DACL rather than setting it at create time, so "
+        "the nonces would sit under the parent-inherited DACL until it landed"
     )
     assert locked_path.startswith(
         str(state_path)
@@ -2702,8 +2844,8 @@ def test_warm_auth_singletons_primes_both_off_loop(monkeypatch) -> None:
     the middleware serves requests.
 
     Both lazily do blocking file I/O on first use (read/create
-    token_signing.key + read the nonce denylist; on Windows an icacls
-    subprocess to lock the DACL). They are NO LONGER warmed synchronously in
+    token_signing.key + read the nonce denylist; on Windows also the owner-only
+    DACL). They are NO LONGER warmed synchronously in
     the token_auth_middleware() factory, because that factory runs on the loop
     via the async start_dashboard()/start_api_server(). The async startup paths
     await this helper instead, so the first auth op hits warm singletons with

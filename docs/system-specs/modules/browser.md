@@ -149,6 +149,46 @@ system prompt states only the loop and the ref rule. The verbs:
 
 Sessions are selected with `-s=<name>` on any command.
 
+### Generated session reachability
+
+Each agent process receives a generated `PLAYWRIGHT_CLI_SESSION`
+(`kc-<random>`). For generated sessions only, `PWTEST_SOCKETS_DIR` and
+`PWTEST_DAEMON_SESSION_DIR` point at separate short namespaces under
+`<data-home>/pw/<8hex>/s` and `/d`. A `playwright-cli list` in one agent
+therefore cannot enumerate peer chat families. Operator-configured PWTEST roots
+are treated as base directories and receive the same generated-session
+namespace. Relative configured roots are rejected because the gateway and agent
+working directories can differ. Operator-provided non-`kc-` session names
+preserve their complete existing Playwright environment and are not redirected.
+
+Keeping both locations outside scratch means a daemon remains reachable after
+its agent process or scratch directory is gone. Operator cleanup supplies the
+generated session's `/s` and `/d` paths with the corresponding PWTEST variables
+and then uses the ordinary `playwright-cli -s=<name> close` protocol. Kiro Crew
+does not execute the CLI, connect to the socket, or
+signal a process automatically: proving cross-process ownership and complete
+agent-tree quiescence is not possible from agent-writable filesystem state on
+all supported platforms. Crash orphan reclamation therefore remains open under
+#5986; this change removes the permanent-unreachability root cause and enables
+operator-controlled cleanup without adding unattended close authority.
+
+The generated socket root is rejected when its worst-case AF_UNIX path exceeds
+the upstream 103-byte budget. Before either variable is injected, the installed
+`@playwright/cli` package resolved from the active launcher is checked through
+the same package anchor as browser revision detection (a stale standalone
+fallback is never accepted), and its serving `playwright-core` sources must
+contain both hooks on their execution paths (`process.env.PWTEST_SOCKETS_DIR ||`
+and `process.env.PWTEST_DAEMON_SESSION_DIR`). A future upstream
+rename/removal therefore logs a warning and fails back instead of silently
+returning sockets to scratch. The source verdict is cached by path, mtime, and
+size so an upgrade invalidates it.
+
+Kiro-Crew-owned lifecycle directories are created
+owner-only and then restricted with the fail-loud platform helper before their
+environment variables are exported. A crash can leave a small per-session
+registry/socket namespace behind; safe connect-test-then-prune remains part of
+#5986 rather than adding unattended deletion authority in this partial fix.
+
 ### Auth
 
 Two paths, chosen by whose browser holds the session.

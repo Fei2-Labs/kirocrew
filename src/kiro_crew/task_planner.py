@@ -276,14 +276,14 @@ async def decompose(
     )
     # Route onto the run's shared AcpRuntime (one process per run), keyed by the
     # run's task_id. get_or_create would cold-start a dedicated process instead.
-    parent_key = (
-        f"{SESSION_PREFIX}:{task_id}:runtime" if task_id else f"{SESSION_PREFIX}:runtime"
-    )
+    parent_key = f"{SESSION_PREFIX}:{task_id}:runtime" if task_id else f"{SESSION_PREFIX}:runtime"
     try:
         client, is_new, _resumed = await sessions.open_task_session(
             parent_key, session_key, agent=agent or None, cwd=work_dir or None
         )
         if ctx:
+            from kiro_crew.providers.acp import provider_label
+
             # Off-loop: build_message embeds the episodic query (blocking urllib).
             full_prompt, _ = await run_in_embed_pool(
                 ctx.build_message,
@@ -292,6 +292,7 @@ async def decompose(
                 session_key,
                 agent=agent or None,
                 project=work_dir or None,
+                provider_type=provider_label(client),
             )
         else:
             full_prompt = prompt
@@ -315,6 +316,9 @@ async def decompose(
                         raw_params=event.raw_tool_params,
                         command=event.shell_command,
                         is_shell=event.is_shell,
+                        mcp_server_name=event.mcp_server_name,
+                        mcp_tool_name=event.tool_name,
+                        mcp_identity_ambiguous=event.mcp_identity_ambiguous,
                     )
                     if hook_result.action == TOOL_DENY:
                         await client.reject_tool(event.request_id)
@@ -471,9 +475,19 @@ def update_plan_tasks(run: Project, tasks: list[dict]) -> Project:
 
 # ── YAML Workflow Decomposition ──
 
-_YAML_ALLOWED_AGENT_KEYS = frozenset({
-    "agent", "timeout", "depends_on", "description", "prompt", "shell",
-})
+_YAML_ALLOWED_AGENT_KEYS = frozenset(
+    {
+        "agent",
+        "timeout",
+        "depends_on",
+        "description",
+        "prompt",
+        "shell",
+        "requires_approval",
+        "force_approval",
+    }
+)
+_YAML_APPROVAL_KEYS = ("requires_approval", "force_approval")
 
 
 def _check_acyclic(tasks: list[Task]) -> None:
@@ -544,6 +558,12 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
         bad_keys = set(spec.keys()) - _YAML_ALLOWED_AGENT_KEYS
         if bad_keys:
             raise ValueError(f"Agent '{name}' has unknown keys: {bad_keys}")
+        for string_key in ("description", "prompt", "shell", "agent", "timeout"):
+            if string_key in spec and not isinstance(spec[string_key], str):
+                raise ValueError(f"Agent '{name}' {string_key} must be a string")
+        for approval_key in _YAML_APPROVAL_KEYS:
+            if approval_key in spec and not isinstance(spec[approval_key], bool):
+                raise ValueError(f"Agent '{name}' {approval_key} must be a boolean")
 
         deps = spec.get("depends_on", [])
         if deps is None:
@@ -553,7 +573,9 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
         dep_indices = []
         for d in deps:
             if not isinstance(d, str):
-                raise ValueError(f"Agent '{name}' depends_on entries must be strings, got {type(d).__name__}: {d!r}")
+                raise ValueError(
+                    f"Agent '{name}' depends_on entries must be strings, got {type(d).__name__}: {d!r}"
+                )
             if d not in name_to_idx:
                 raise ValueError(f"Agent '{name}' depends on unknown agent '{d}'")
             dep_indices.append(name_to_idx[d])
@@ -564,12 +586,16 @@ def decompose_yaml(yaml_content: str) -> list[Task]:
             f"Timeout: {spec.get('timeout', '45m')}\n\n{prompt}"
         ).strip()
 
-        tasks.append(Task(
-            index=i,
-            title=spec.get("description", name.replace("-", " ").title()),
-            description=description,
-            depends_on=dep_indices,
-        ))
+        tasks.append(
+            Task(
+                index=i,
+                title=spec.get("description", name.replace("-", " ").title()),
+                description=description,
+                depends_on=dep_indices,
+                requires_approval=spec.get("requires_approval", False),
+                force_approval=spec.get("force_approval", False),
+            )
+        )
 
     _check_acyclic(tasks)
     return normalize_cross_group_deps(tasks)
@@ -604,8 +630,8 @@ def plan_to_yaml(tasks: list[Task]) -> str:
     Inverse of :func:`decompose_yaml` — the emitted YAML re-imports through
     ``decompose_yaml`` to the same task graph (titles + dependency structure).
     ``depends_on`` is emitted as agent-name references (not indices) so the DAG
-    survives re-import's renumbering. ``requires_approval`` has no YAML
-    representation (not an allowed agent key) and is intentionally dropped.
+    survives re-import's renumbering. Approval gates round-trip so saving a
+    reusable plan never weakens it.
     """
     if not tasks:
         raise ValueError("no tasks to export")
@@ -618,7 +644,9 @@ def plan_to_yaml(tasks: list[Task]) -> str:
 
     ordered = sorted(tasks, key=lambda t: t.index)
     used: set[str] = set()
-    idx_to_name: dict[int, str] = {t.index: _slugify_agent_name(t.title, t.index, used) for t in ordered}
+    idx_to_name: dict[int, str] = {
+        t.index: _slugify_agent_name(t.title, t.index, used) for t in ordered
+    }
 
     agents: dict[str, Any] = {}
     for t in ordered:
@@ -638,6 +666,10 @@ def plan_to_yaml(tasks: list[Task]) -> str:
         deps = [idx_to_name[d] for d in t.depends_on if d in idx_to_name]
         if deps:
             spec["depends_on"] = deps
+        if t.requires_approval:
+            spec["requires_approval"] = True
+        if t.force_approval:
+            spec["force_approval"] = True
         agents[idx_to_name[t.index]] = spec
 
     return _yaml.safe_dump(

@@ -14,7 +14,13 @@
  *   needs-setup   — first run: no credentials, so the guide card is the content
  *   missing-extra — credentialed but `lark-oapi` is not installed. This is the
  *                   failure a user cannot diagnose from a bare "not connected",
- *                   so the badge reason names the install command instead.
+ *                   so the panel shows the install command for THIS gateway's
+ *                   interpreter — installing into a different environment is the
+ *                   actual failure mode, and a bare `pip` cannot say which.
+ *   sdk-unsupported — same missing SDK, but in an environment where no pip
+ *                   install can work (bundled desktop app, no pip, PEP 668).
+ *                   A command there would be discarded on the next app update,
+ *                   so the card must withhold it and say so.
  *   connected     — running, with both allow-lists populated
  *   group-empty   — group chats ON with an empty chat_id list. Both fail closed,
  *                   so that combination serves NO group; the warning is the
@@ -68,6 +74,12 @@ const BASE_CONFIG = {
   allowed_group_ids: [],
   soft_threshold_pct: 80,
   session_folder: '',
+  // The optional [feishu] extra is present in every shot except the two that are
+  // ABOUT it missing: a stub that omitted these would render the install card on
+  // every scenario and photograph a state no configured user is in.
+  sdk_installed: true,
+  sdk_install_supported: true,
+  sdk_install_command: '',
 }
 
 /** Credentialed + enabled, which is what every non-first-run shot starts from. */
@@ -92,9 +104,25 @@ const SCENARIOS = [
     config: {
       ...CREDENTIALED,
       connect_error: 'lark-oapi is not installed — run: pip install "kirocrew[feishu]"',
+      sdk_installed: false,
+      sdk_install_supported: true,
+      sdk_install_command: "/opt/kirocrew/.venv/bin/python -m pip install 'kirocrew[feishu]'",
     },
-    // The reason belongs to the header, so it is in the first shot.
-    expectText: /lark-oapi is not installed/,
+    // Assert the COMMAND, not the badge reason: the badge cannot report this
+    // state before a restart (maybe_start_feishu returns early when the channel
+    // is disabled, ahead of the ImportError branch that writes the reason), so
+    // the card is the surface under test.
+    expectText: /-m pip install 'kirocrew\[feishu\]'/,
+  },
+  {
+    name: 'sdk-unsupported',
+    config: {
+      ...CREDENTIALED,
+      sdk_installed: false,
+      sdk_install_supported: false,
+      sdk_install_command: '',
+    },
+    expectText: /cannot install extra packages/,
   },
   {
     name: 'connected',

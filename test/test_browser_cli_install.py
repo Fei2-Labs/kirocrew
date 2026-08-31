@@ -723,8 +723,11 @@ class TestFailureDetailIsRedactedAtTheSource:
         step = mod._step("npm-install-global", ["npm", "install"], 1.0)
 
         # Extract the actual secret value (the part after = or between : and @)
-        # and confirm it does not survive.
-        assert "[REDACTED]" in step["stderr"]
+        # and confirm it does not survive. The inline-credential URL shape is
+        # now caught by the SHARED pass (whose marker is "[REDACTED:
+        # credential]") before the npm-specific patterns run, so accept either
+        # redaction marker -- what matters is that the secret is gone.
+        assert "[REDACTED" in step["stderr"]
         # None of the raw secret portions should appear.
         for fragment in (
             "npm_abc123secretXYZ",
@@ -1365,3 +1368,52 @@ class TestManifestResolution:
         monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", "/nonexistent-prefix")
         assert mod._browsers_manifest_path() is None
         assert _REAL_REQUIRED_REVISIONS() is None
+
+
+def _lifecycle_contract_tree(tmp_path: Path) -> tuple[Path, Path]:
+    package = tmp_path / "node_modules" / "@playwright" / "cli"
+    core = package / "node_modules" / "playwright-core"
+    (core / "lib" / "tools" / "cli-client").mkdir(parents=True)
+    (core / "browsers.json").write_text('{"browsers": []}', encoding="utf-8")
+    registry = core / "lib" / "tools" / "cli-client" / "registry.js"
+    bundle = core / "lib" / "coreBundle.js"
+    return package, registry, bundle
+
+
+def test_lifecycle_env_contract_is_confirmed_from_serving_cli_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, registry, bundle = _lifecycle_contract_tree(tmp_path)
+    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
+    bundle.write_text("process.env.PWTEST_SOCKETS_DIR || os.tmpdir()", encoding="utf-8")
+    monkeypatch.setattr(mod, "_cli_package_dirs", lambda: [package])
+    mod._source_contains.cache_clear()
+
+    assert mod.cli_lifecycle_env_supported() is True
+
+
+def test_lifecycle_env_contract_fails_when_upstream_hook_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, registry, bundle = _lifecycle_contract_tree(tmp_path)
+    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
+    bundle.write_text("// lifecycle socket override removed upstream", encoding="utf-8")
+    monkeypatch.setattr(mod, "_cli_package_dirs", lambda: [package])
+    mod._source_contains.cache_clear()
+
+    assert mod.cli_lifecycle_env_supported() is False
+
+
+def test_lifecycle_contract_never_falls_through_to_stale_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    active, active_registry, active_bundle = _lifecycle_contract_tree(tmp_path / "active")
+    stale, stale_registry, stale_bundle = _lifecycle_contract_tree(tmp_path / "stale")
+    active_registry.write_text("// hook removed", encoding="utf-8")
+    active_bundle.write_text("// hook removed", encoding="utf-8")
+    stale_registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
+    stale_bundle.write_text("process.env.PWTEST_SOCKETS_DIR || os.tmpdir()", encoding="utf-8")
+    monkeypatch.setattr(mod, "_cli_package_dirs", lambda: [active, stale])
+    mod._source_contains.cache_clear()
+
+    assert mod.cli_lifecycle_env_supported() is False

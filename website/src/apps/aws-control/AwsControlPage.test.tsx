@@ -121,22 +121,19 @@ describe('AwsControlPage', () => {
     )
   })
 
-  it('shows a single quiet aggregate line, never fake zeros', async () => {
+  it('carries accounts and a search, and no aggregate counts line', async () => {
+    // The counts line summarised the list printed directly beneath it, so it
+    // said nothing the rows did not. The search box stays: it is the only reason
+    // this page needs chrome at all once the list is long.
     vi.mocked(awsControlApi.accounts).mockResolvedValue(accountsPayload())
     renderWithProviders(<AwsControlPage />)
 
-    // The line exists during loading as a nbsp placeholder, so wait for the
-    // loaded rows first, then read the populated aggregate line.
     await screen.findAllByTestId('account-id')
-    const line = screen.getByTestId('aggregate-line')
-    // "2 accounts · 2 keys · 1 healthy" — counts we actually have, joined by · .
-    expect(line).toHaveTextContent(i18nT('apps.awsControl.page.aggregate_accounts', { count: 2 }))
-    expect(line).toHaveTextContent(i18nT('apps.awsControl.page.aggregate_keys', { count: 2 }))
-    expect(line).toHaveTextContent(i18nT('apps.awsControl.page.aggregate_healthy', { count: 1 }))
-    // The old 4-card stat strip (and its em-dash "Stored"/"This month" fakes) is gone.
+    expect(screen.queryByTestId('aggregate-line')).toBeNull()
+    // The older 4-card stat strip stayed gone too.
     expect(screen.queryByTestId('totals-strip')).toBeNull()
-    // No stored/cost figure is invented as a zero on this surface.
-    expect(line.textContent).not.toMatch(/\$?0(\s|$|GB)/)
+    expect(screen.getByTestId('accounts-search')).toBeTruthy()
+    expect(screen.getByTestId('accounts-list')).toBeTruthy()
   })
 
   it('rows carry no Reconnect action — they only navigate', async () => {
@@ -210,58 +207,33 @@ describe('AwsControlPage', () => {
     expect(screen.queryByTestId('account-card')).toBeNull()
   })
 
-  it('mounts both paid-service consent gates (s3 and ce)', async () => {
-    vi.mocked(awsControlApi.accounts).mockResolvedValue(accountsPayload())
-    renderWithProviders(<AwsControlPage />)
-
-    // The gates read their status through the mocked client — one call per service.
-    await waitFor(() => {
-      expect(api.awsConsent).toHaveBeenCalledWith('s3')
-      expect(api.awsConsent).toHaveBeenCalledWith('ce')
-    })
-    expect(screen.getByTestId('paid-services')).toBeTruthy()
-  })
-
-  it('states each paid-service card is scoped to its named connection, not the whole page', async () => {
-    // Defect 2: AwsConsentGate resolves ONE (default) connection internally, so
-    // on a multi-account page the cards silently concern a single account. The
-    // scope sentence is what stops the operator reading a one-account
-    // confirmation as covering every account in the header.
+  it('keeps the paid-service gates page-wide, without the paragraphs', async () => {
+    // Page-wide is the scope a confirmation actually has: the endpoint takes a
+    // service and derives the connection itself. This is also the ONLY surface
+    // that can show them - the settings cards mount polly and transcribe, never
+    // s3 or ce - so a granted confirmation would otherwise have nowhere to be
+    // seen or withdrawn. What went away is the three paragraphs above the cards.
     vi.mocked(awsControlApi.accounts).mockResolvedValue(accountsPayload())
     renderWithProviders(<AwsControlPage />)
 
     const section = await screen.findByTestId('paid-services')
-    expect(within(section).getByTestId('paid-services-scope')).toHaveTextContent(
-      i18nT('apps.awsControl.page.paid_services_scope'),
-    )
+    await waitFor(() => {
+      expect(api.awsConsent).toHaveBeenCalledWith('s3')
+      expect(api.awsConsent).toHaveBeenCalledWith('ce')
+    })
+    expect(within(section).queryByTestId('paid-services-scope')).toBeNull()
   })
 
-  it('keeps the paid-services section visible in the normal (unfiltered) state', async () => {
-    // The guard must only hide the section on a no-match search — a plain loaded
-    // page with no query still shows it.
+  it('drops the list, and says so, when a search filters every account out', async () => {
     vi.mocked(awsControlApi.accounts).mockResolvedValue(accountsPayload())
     renderWithProviders(<AwsControlPage />)
 
     await screen.findByTestId('accounts-list')
-    expect(screen.getByTestId('paid-services')).toBeTruthy()
-  })
-
-  it('hides the paid-services section when a search filters every account out', async () => {
-    // Defect 1: after a search matches nothing the page already shows
-    // "No accounts match X"; rendering the two consent cards next to it reads as
-    // if they survived the filter. The section must disappear with the list.
-    vi.mocked(awsControlApi.accounts).mockResolvedValue(accountsPayload())
-    renderWithProviders(<AwsControlPage />)
-
-    await screen.findByTestId('accounts-list')
-    expect(screen.getByTestId('paid-services')).toBeTruthy()
 
     fireEvent.change(screen.getByTestId('accounts-search'), { target: { value: 'no-such-account' } })
 
-    // The no-match line is shown, the list is gone, and so is the paid section.
     expect(screen.getByTestId('accounts-search-empty')).toBeTruthy()
     expect(screen.queryByTestId('accounts-list')).toBeNull()
-    expect(screen.queryByTestId('paid-services')).toBeNull()
   })
 
   it('renders the standard disabled-app state on a 403 app_disabled', async () => {

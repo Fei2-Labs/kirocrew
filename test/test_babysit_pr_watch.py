@@ -959,3 +959,60 @@ def test_the_horizon_is_not_a_cron_parameter(monkeypatch, module):
     # A horizon wide enough to include that comment, if the key were honoured.
     with pytest.raises(Skip):
         _tick(module, _msg(wake_on_green=False, comment_horizon_secs=99999999))
+
+
+# ── the footer belongs to the wake, not to each observation ───────────────
+
+
+def test_the_note_and_tail_live_on_the_wake_not_on_every_brief(monkeypatch, module):
+    """A brief describes ONE observation; the note and the standing instructions
+    describe the delivery.
+
+    Keeping them in the brief is what made a well-coalesced wake expensive: the
+    kernel joins N briefs into one body, so both paragraphs were paid N times and
+    the waste grew with every signal folded in. On a measured six-observation
+    wake that was 56% of the delivered bytes.
+    """
+    probe = module.PrWatchProbe()
+    probe.identity(_Ctx(_msg(note="watching for the rebase")))
+
+    brief = probe._brief("abc123456789", "new failing check(s)", "detail line")
+    assert "new failing check(s)" in brief
+    assert "detail line" in brief
+    # Neither paragraph may ride along on a per-observation brief.
+    assert "watching for the rebase" not in brief
+    assert module._WAKE_TAIL not in brief
+
+    suffix = probe.wake_suffix()
+    assert "Context: watching for the rebase" in suffix
+    assert module._WAKE_TAIL in suffix
+
+
+def test_a_watch_with_no_note_still_carries_the_tail(monkeypatch, module):
+    """The note is optional, the standing instructions are not -- an empty note
+    must not leave the wake without them, nor emit a bare `Context:` line."""
+    probe = module.PrWatchProbe()
+    probe.identity(_Ctx(_msg()))
+    suffix = probe.wake_suffix()
+    assert suffix == module._WAKE_TAIL
+    assert "Context:" not in suffix
+
+
+def test_a_coalesced_probe_wake_pays_for_the_tail_once(monkeypatch, module):
+    """End to end through the real kernel: two reds on one head arrive as one
+    wake carrying both check names and exactly one copy of the footer."""
+    _wire(
+        monkeypatch,
+        module,
+        _payload([_check("A", "FAILURE"), _check("B", "FAILURE")]),
+    )
+    message = _msg(coalesce_secs=0.01, note="two reds")
+    with pytest.raises(Skip):
+        _tick(module, message)
+    time.sleep(0.05)
+    with pytest.raises(Report) as caught:
+        _tick(module, message)
+    body = str(caught.value)
+    assert "A" in body and "B" in body
+    assert body.count(module._WAKE_TAIL) == 1
+    assert body.count("Context: two reds") == 1

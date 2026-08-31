@@ -33,10 +33,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
+from kiro_crew import name_grant
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
+    STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TOOL_STALL,
 )
@@ -2288,6 +2290,59 @@ class TestRunChatRecoveryLadders:
         assert slot._queue == []
 
     @pytest.mark.asyncio
+    async def test_compaction_failure_neither_retries_nor_claims_a_lost_link(self, tmp_path):
+        """A compaction-failed turn is terminal: the reason is in the "error:"
+        family, so without its own branch it lands in pipe-death recovery — a
+        re-queue plus a "Connection lost" card, both false. Compaction retry
+        policy is not this layer's to invent (issue #3583)."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                LLMEvent(
+                    kind="compaction_status",
+                    text="failed",
+                    title="context window exceeded",
+                ),
+                _complete(STOP_REASON_COMPACTION_FAILED),
+            ],
+        )
+
+        await _drive(state, slot)
+
+        errors = _errors(slot)
+        assert not any("Connection lost" in err for err in errors), errors
+        assert not any("Session stuck" in err for err in errors), errors
+        assert slot._acp_pipe_death_retries == 0
+        assert slot._queue == []
+        # The failure is still explained — by the compaction notice the status
+        # path appended, which is the only message this turn needs.
+        assert any(
+            "Compaction failed" in m.get("content", "")
+            and "context window exceeded" in m.get("content", "")
+            for m in slot.messages
+        ), slot.messages
+
+    @pytest.mark.asyncio
+    async def test_compaction_failure_resets_the_abandoned_backend_session(self, tmp_path):
+        """The completion is synthetic — the client stopped reading; the
+        backend never sent end_turn — so without a reset the runtime still
+        counts the turn as in progress and the NEXT prompt collides with
+        "prompt already in progress". The finally must reset (tear down +
+        session/load resume) WITHOUT re-queuing anything."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        state.sessions.reset = AsyncMock()
+        _set_stream(client, [_complete(STOP_REASON_COMPACTION_FAILED)])
+
+        await _drive(state, slot)
+
+        state.sessions.reset.assert_awaited_once()
+        assert slot._queue == []
+        assert slot._acp_pipe_death_retries == 0
+
+    @pytest.mark.asyncio
     async def test_tool_stall_recovery_names_the_stalled_tool(self, tmp_path):
         state, client = _runner_state(tmp_path)
         slot = _slot()
@@ -2401,6 +2456,87 @@ class TestRunChatAutoApproveRungs:
             chat_runner, "_name_grant_refusal_off_loop", new=AsyncMock(return_value=None)
         ):
             yield
+
+    @pytest.mark.asyncio
+    async def test_a_non_shell_approval_mints_no_shell_witness(self, tmp_path):
+        """GPT 5.6 round-22: a non-shell approval must not pin a shell program.
+
+        `extract_bash_command` reads a `command` key out of ANY structured input,
+        so a non-shell MCP call carrying `{"command": "gh ..."}` would otherwise
+        record a durable identity for `gh` from an approval that was never about
+        running `gh`.
+        """
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        _set_stream(
+            client,
+            [
+                _permission(
+                    title="Looking up the record",
+                    tool_input='{"command": "gh repo view"}',
+                    tool_kind="other",
+                    is_shell=False,
+                    tool_name="read_record",
+                    mcp_server_name="records:primary",
+                ),
+                _complete(),
+            ],
+        )
+
+        def _allow_once_when_registered():
+            future = slot._approval_futures.get("req-cov-1")
+            if future is not None and not future.done():
+                future.set_result("approved")
+
+        state.push_slots_update.side_effect = _allow_once_when_registered
+        with patch.object(chat_runner, "pin_human_approval") as pin:
+            await _drive(state, slot)
+
+        # The branch really was reached -- otherwise the assertion below would
+        # pass for the wrong reason, which is exactly how a guard like this gets
+        # a test that cannot fail.
+        client.approve_tool.assert_awaited_once_with("req-cov-1")
+        pin.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_declined_name_grant_is_audited(self, tmp_path):
+        """GPT 5.6 round-19: declining a grant is a security decision, so it is logged.
+
+        Without this the audit trail shows a command arriving at the interactive
+        card and never says a name grant was withheld, or why.
+        """
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(
+            client,
+            [_permission(title="Running: ls -la", tool_input='{"command": "ls -la"}'), _complete()],
+        )
+        refusal = name_grant.Refusal(name_grant.SHADOWED, "ls resolves to /writable/ls")
+        slot._empty_response_retries = 2
+        with (
+            patch.object(chat_runner, "sel") as mock_sel,
+            patch.object(
+                chat_runner, "_name_grant_refusal_off_loop", new=AsyncMock(return_value=refusal)
+            ),
+            patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0),
+        ):
+            audit = MagicMock()
+            mock_sel.return_value = audit
+            await chat_runner._run_chat(state, slot, "hello")
+        await _settle(slot)
+
+        declined = [
+            c.kwargs
+            for c in audit.log_tool_invocation.call_args_list
+            if c.kwargs.get("outcome") == "auto_approve_declined"
+        ]
+        assert declined, audit.log_tool_invocation.call_args_list
+        assert declined[0]["metadata"]["code"] == name_grant.SHADOWED
+        assert declined[0]["metadata"]["tier"] == "trust_reads"
+        # The CODE, never the detail: the detail names resolved paths, and an
+        # audit sink is exactly where that becomes a disclosure.
+        assert "/writable/ls" not in json.dumps(declined[0], default=str)
 
     @pytest.mark.asyncio
     async def test_non_shell_trust_matches_cached_server_tool_identity(self, tmp_path):

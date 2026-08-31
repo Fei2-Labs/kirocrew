@@ -1355,25 +1355,13 @@ class TestProcessStartTime:
         monkeypatch.setattr(pc, "Path", _FakeStatPath)
         assert pc.process_start_time(4242) is None
 
-    def test_the_bsd_leg_resolves_ps_through_trusted_system_bin(self, monkeypatch):
-        """A PATH-resolved `ps` would let a planted binary forge process identity.
-
-        The value gates a kill, so its source binary must come from the pinned
-        lookup rather than whatever `PATH` leads with.
-        """
+    def test_the_macos_leg_uses_the_full_libproc_start_identity(self, monkeypatch):
+        """macOS keeps libproc's seconds and microseconds as one opaque token."""
         monkeypatch.setattr(pc.sys, "platform", "darwin")
         monkeypatch.setattr(pc, "IS_WINDOWS", False)
-        monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: "/usr/bin/ps")
-        seen: list[list[str]] = []
+        monkeypatch.setattr(pc, "get_process_start_id", lambda pid: f"1704067200:{pid}")
 
-        def _check_output(argv, **_k):
-            seen.append(list(argv))
-            return b" Mon Jan  1 00:00:00 2024\n"
-
-        monkeypatch.setattr(pc.subprocess, "check_output", _check_output)
-
-        assert pc.process_start_time(4242) == "Mon Jan  1 00:00:00 2024"
-        assert seen and seen[0][0] == "/usr/bin/ps", "ps was not the pinned binary"
+        assert pc.process_start_time(4242) == "1704067200:4242"
 
     def test_an_absent_ps_fails_safe(self, monkeypatch):
         monkeypatch.setattr(pc.sys, "platform", "darwin")
@@ -2024,161 +2012,147 @@ class TestTaskkillErrorMapping:
 
 
 class TestRestrictToOwnerArgvOnLinux:
-    """Regression guard for the Windows icacls DACL argv fix.
+    """Regression guard for the Windows owner-only DACL, exercised on Linux.
 
-    Runs on the Linux CI fleet by monkeypatching IS_WINDOWS + subprocess.run —
-    the argv construction is platform-independent code, and without this the
-    security-critical `icacls /inheritance:r /grant:r "*S-1-3-4:F" /grant:r
-    "*<user-sid>:F"` string is only exercised on the author's manual Windows
-    E2E (skipif-Windows tests don't run on AL2). A regression that mangles
-    the flags or the S-1-3-4 SID silently reopens the parent-inherited-DACL
-    gap.
+    Runs on the Linux CI fleet by monkeypatching IS_WINDOWS + the DACL writer --
+    the decision of WHICH principals to grant, and whether the grants are
+    inheritable, is platform-independent code, and without this it is only
+    exercised on the author's manual Windows E2E (skipif-Windows tests don't run
+    on AL2). A regression that drops the S-1-3-4 grant or the invoking-user grant
+    silently reopens the parent-inherited-DACL gap.
+
+    The observable used to be the ``icacls`` argv. The lockdown now goes through
+    ``windows_acl.apply_owner_only`` in-process, so the observable is that call's
+    arguments instead -- the same seam, one layer down, and still the only thing
+    visible off Windows (NTFS reports 0o666 for any file regardless of its DACL,
+    so no mode assertion can substitute).
     """
 
-    def test_icacls_argv_includes_owner_and_user_grants(self, tmp_path, monkeypatch):
+    @staticmethod
+    def _capture(monkeypatch, sid="S-1-5-21-1-2-3-1000"):
+        """Force the Windows branch and record the DACL write instead of doing it."""
         monkeypatch.setattr(pc, "IS_POSIX", False)
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        # Reset the success-only SID memo so the monkeypatched stub wins
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
-        captured: dict = {}
+        # Reset the SID memo so the monkeypatched stub wins. The lockdown reads
+        # current_user_sid, which is token-only and cannot spawn.
+        monkeypatch.setattr(pc, "_TOKEN_SID_CACHE", [])
+        monkeypatch.setattr(pc, "current_user_sid", lambda: sid)
+        calls: list[dict] = []
 
-        def fake_run(argv, **_kw):
-            captured["argv"] = list(argv)
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        def fake_apply(path, *, inherit, sids, **_kw):
+            calls.append({"path": os.fspath(path), "inherit": inherit, "sids": tuple(sids)})
 
-        monkeypatch.setattr(pc.subprocess, "run", fake_run)
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", fake_apply)
+        return calls
+
+    def test_dacl_grants_owner_rights_and_the_invoking_user(self, tmp_path, monkeypatch):
+        calls = self._capture(monkeypatch)
         f = tmp_path / "secret.key"
         f.write_bytes(b"s" * 32)
         pc.restrict_to_owner(f)
-        argv = captured["argv"]
-        # icacls + path + /inheritance:r + Owner Rights grant + user-SID grant.
-        assert argv[0].endswith("icacls") or "icacls" in argv[0]
-        assert os.fspath(f) in argv
-        assert "/inheritance:r" in argv
-        # Grants come in (flag, "SID:F") pairs — assert both are present.
-        grants = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "/grant:r"]
-        assert "*S-1-3-4:F" in grants, grants
-        assert "*S-1-5-21-1-2-3-1000:F" in grants, grants
+        assert len(calls) == 1, calls
+        assert calls[0]["path"] == os.fspath(f)
+        # Bare SIDs: the `*` prefix is icacls argv syntax and the API rejects it.
+        assert calls[0]["sids"] == ("S-1-3-4", "S-1-5-21-1-2-3-1000"), calls[0]
+        assert not any(s.startswith("*") for s in calls[0]["sids"]), calls[0]
 
-    def test_icacls_nonzero_rc_raises_oserror_on_linux_shim_path(self, tmp_path, monkeypatch):
-        # With a resolvable SID, an icacls non-zero rc still raises OSError so
-        # the caller's warn-and-continue handler fires. Complements the
+    def test_write_failure_raises_oserror(self, tmp_path, monkeypatch):
+        # With a resolvable SID, a failure to apply the DACL still raises OSError
+        # so the caller's warn-and-continue handler fires. Complements the
         # None-SID early-raise test below.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-9-9-9-9")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"denied"),
-        )
+        self._capture(monkeypatch, sid="S-1-5-21-9-9-9-9")
+
+        def boom(path, *, inherit, sids, **_kw):
+            raise pc.windows_acl.AclWriteFailed("SetNamedSecurityInfoW failed (error 5)")
+
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", boom)
+        f = tmp_path / "secret.key"
+        f.write_bytes(b"s" * 32)
+        with pytest.raises(OSError):
+            pc.restrict_to_owner(f)
+
+    def test_unreadable_platform_api_raises_oserror(self, tmp_path, monkeypatch):
+        # AclUnavailable (the descriptor API could not be loaded at all) must
+        # reach the caller as OSError too, not escape as a bare RuntimeError that
+        # no caller's handler catches.
+        self._capture(monkeypatch, sid="S-1-5-21-9-9-9-9")
+
+        def boom(path, *, inherit, sids, **_kw):
+            raise pc.windows_acl.AclUnavailable("cannot load the Windows security API")
+
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", boom)
         f = tmp_path / "secret.key"
         f.write_bytes(b"s" * 32)
         with pytest.raises(OSError):
             pc.restrict_to_owner(f)
 
     def test_none_sid_raises_before_icacls_to_avoid_lockout(self, tmp_path, monkeypatch):
-        # When _current_user_sid() returns None (whoami absent / fails /
-        # unparseable), restrict_to_owner MUST refuse to apply a lockdown —
+        # When current_user_sid() returns None (the process token read is
+        # unavailable), restrict_to_owner MUST refuse to apply a lockdown —
         # granting only S-1-3-4 (Owner Rights) with inheritance stripped
         # locks non-owner users out of their own file (elevated first-run,
         # backup restore, SYSTEM-context service scenarios). Fail-loud with
-        # OSError BEFORE invoking icacls; the caller's warn handler fires
+        # OSError BEFORE touching the DACL; the caller's warn handler fires
         # and the pre-existing DACL is preserved unchanged.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: None)
-        called = []
-
-        def fake_run(argv, **_kw):
-            called.append(list(argv))
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-        monkeypatch.setattr(pc.subprocess, "run", fake_run)
+        calls = self._capture(monkeypatch, sid=None)
         f = tmp_path / "secret.key"
         f.write_bytes(b"s" * 32)
         with pytest.raises(OSError) as ei:
             pc.restrict_to_owner(f)
-        assert "current user SID" in str(ei.value) or "whoami" in str(ei.value)
-        # icacls must NOT have been spawned — the whole point is to avoid
+        assert "current user SID" in str(ei.value)
+        # The DACL must NOT have been touched — the whole point is to avoid
         # applying a half-configured lockdown.
-        assert called == [], f"icacls should not run when SID is unknown: {called}"
+        assert calls == [], f"no DACL write may happen when the SID is unknown: {calls}"
 
     def test_directory_grants_are_inheritable(self, tmp_path, monkeypatch):
         # The bug this pins: make_owner_only_dir used to delegate to the
-        # FILE-shaped restrict_to_owner, whose grants carry no (OI)(CI). Those
+        # FILE-shaped restrict_to_owner, whose grants are not inheritable. Those
         # ACEs apply to the directory alone, so a file created inside an
         # "owner-only" directory got no explicit ACE and fell back to the
-        # creating token's default DACL. No mode assertion can catch this —
-        # NTFS reports 0o666 for any file regardless of its DACL — so the
-        # argv IS the observable, exactly as the file-shape test above.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
-        captured: dict = {}
-
-        def fake_run(argv, **_kw):
-            captured["argv"] = list(argv)
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-        monkeypatch.setattr(pc.subprocess, "run", fake_run)
+        # creating token's default DACL.
+        calls = self._capture(monkeypatch)
         d = tmp_path / "secrets-dir"
         d.mkdir()
         pc.restrict_dir_to_owner(d)
-        argv = captured["argv"]
-        assert os.fspath(d) in argv
-        assert "/inheritance:r" in argv
-        grants = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "/grant:r"]
+        assert len(calls) == 1, calls
+        assert calls[0]["path"] == os.fspath(d)
         # Both grants must propagate to children, or the directory guarantee
         # covers nothing created inside it.
-        assert "*S-1-3-4:(OI)(CI)F" in grants, grants
-        assert "*S-1-5-21-1-2-3-1000:(OI)(CI)F" in grants, grants
+        assert calls[0]["inherit"] is True, calls[0]
+        assert calls[0]["sids"] == ("S-1-3-4", "S-1-5-21-1-2-3-1000"), calls[0]
 
     def test_file_grants_stay_non_inheritable(self, tmp_path, monkeypatch):
-        # The other half of the split, asserted negatively: (OI)(CI) is
-        # meaningless on a file, so restrict_to_owner must NOT acquire it when
-        # the directory shape does. Without this, "just add (OI)(CI) to
-        # restrict_to_owner" reads as a passing simplification.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
-        captured: dict = {}
-
-        def fake_run(argv, **_kw):
-            captured["argv"] = list(argv)
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-        monkeypatch.setattr(pc.subprocess, "run", fake_run)
+        # The other half of the split, asserted negatively: inheritance flags are
+        # meaningless on a file, so restrict_to_owner must NOT acquire them when
+        # the directory shape does. Without this, "just make both inheritable"
+        # reads as a passing simplification.
+        calls = self._capture(monkeypatch)
         f = tmp_path / "secret.key"
         f.write_bytes(b"s" * 32)
         pc.restrict_to_owner(f)
-        grants = [
-            captured["argv"][i + 1] for i, a in enumerate(captured["argv"][:-1]) if a == "/grant:r"
-        ]
-        assert grants, captured["argv"]
-        for g in grants:
-            assert "(OI)" not in g and "(CI)" not in g, g
+        assert len(calls) == 1, calls
+        assert calls[0]["inherit"] is False, calls[0]
+
+    def test_owner_rights_is_not_granted_twice(self, tmp_path, monkeypatch):
+        # Degenerate case: when the invoking user's SID IS Owner Rights, the two
+        # grants collapse to one rather than producing a duplicate ACE.
+        calls = self._capture(monkeypatch, sid="S-1-3-4")
+        f = tmp_path / "secret.key"
+        f.write_bytes(b"s" * 32)
+        pc.restrict_to_owner(f)
+        assert calls[0]["sids"] == ("S-1-3-4",), calls[0]
 
     def test_file_helper_warns_when_handed_a_directory(self, tmp_path, monkeypatch, caplog):
-        # The misuse guard. The argv tests cannot see this from the call site, so
-        # a directory reaching the file-shaped helper has to be caught here --
-        # it tightens the directory but leaves files created inside on the
+        # The misuse guard. The DACL-argument tests cannot see this from the call
+        # site, so a directory reaching the file-shaped helper has to be caught
+        # here -- it tightens the directory but leaves files created inside on the
         # creating token's default DACL. Warn, not raise: the ACE still applies
         # to the named object, so the lockdown is partial rather than absent.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-        )
+        #
+        # _capture stubs the DACL writer: this test is about the warning, and the
+        # real writer refuses off Windows (_load raises AclUnavailable), which
+        # would fail this on the POSIX CI runners while passing on Windows.
+        self._capture(monkeypatch)
         d = tmp_path / "a-directory"
         d.mkdir()
         with caplog.at_level(logging.WARNING, logger=pc.logger.name):
@@ -2190,15 +2164,7 @@ class TestRestrictToOwnerArgvOnLinux:
     def test_file_helper_stays_quiet_for_a_file(self, tmp_path, monkeypatch, caplog):
         # The guard must not fire on the helper's actual purpose, or every
         # secret-file lockdown would emit a spurious warning.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        monkeypatch.setattr(pc, "_current_user_sid", lambda: "*S-1-5-21-1-2-3-1000")
-        monkeypatch.setattr(
-            pc.subprocess,
-            "run",
-            lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-        )
+        self._capture(monkeypatch)
         f = tmp_path / "secret.key"
         f.write_bytes(b"s" * 32)
         with caplog.at_level(logging.WARNING, logger=pc.logger.name):
@@ -2214,35 +2180,6 @@ class TestRestrictToOwnerArgvOnLinux:
         monkeypatch.setattr(pc.os, "chmod", lambda p, m: modes.append(m))
         pc.restrict_dir_to_owner(tmp_path)
         assert modes == [0o700], modes
-
-    def test_sid_failure_is_not_cached_success_is(self, monkeypatch):
-        # A transient whoami failure (timeout under AV scan, non-zero rc) must
-        # NOT be memoized: with lru_cache the first failure poisoned every
-        # later restrict_to_owner for the process lifetime. The success-only
-        # memo retries after a failure and caches only a resolved SID.
-        monkeypatch.setattr(pc, "IS_POSIX", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "_USER_SID_CACHE", [])
-        # Force the whoami fallback, which is what this test covers. On a real
-        # Windows host the non-spawn primary (the process token) succeeds, so
-        # without this the flaky_run below is never reached and the first
-        # assertion sees a genuine SID instead of the simulated failure.
-        monkeypatch.setattr(pc, "_process_token_sid", lambda: None)
-        attempts = []
-
-        def flaky_run(argv, **_kw):
-            attempts.append(argv)
-            if len(attempts) == 1:
-                return types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
-            return types.SimpleNamespace(
-                returncode=0, stdout=b'"ANT\\user","S-1-5-21-1-2-3-500"', stderr=b""
-            )
-
-        monkeypatch.setattr(pc.subprocess, "run", flaky_run)
-        assert pc._current_user_sid() is None  # first call fails...
-        assert pc._current_user_sid() == "*S-1-5-21-1-2-3-500"  # ...retry succeeds
-        assert pc._current_user_sid() == "*S-1-5-21-1-2-3-500"  # ...and is cached
-        assert len(attempts) == 2, "success must be memoized (no third spawn)"
 
 
 class TestChmodShimsApply:
@@ -2413,8 +2350,10 @@ class TestRestrictToOwner:
             pc.restrict_to_owner(f)
 
     def test_applies_owner_only_dacl_on_windows(self, tmp_path):
-        # Windows path: shell out to icacls, then re-read the DACL via icacls to
-        # confirm the owner-only shape end-to-end. Windows is the ONLY platform
+        # Windows path: apply the DACL in-process, then re-read it via icacls to
+        # confirm the owner-only shape end-to-end. Reading through the external
+        # tool is deliberate here -- it is an independent check, not the same
+        # ctypes code that wrote the descriptor. Windows is the ONLY platform
         # that can execute this branch, so the node id must never be added to
         # windows-expected-failures.txt: listed there alongside this self-skip it
         # would run on no platform at all, and the DACL would be the one control
@@ -2430,26 +2369,22 @@ class TestRestrictToOwner:
         ).decode("utf-8", "replace")
         assert _owner_only_dacl_violations(out) == [], out
 
-    def test_propagates_oserror_on_windows_when_icacls_missing(self, tmp_path, monkeypatch):
-        # The fail-loud contract on Windows: icacls returning nonzero or
-        # failing to launch MUST raise OSError so the caller's warn-and-continue
-        # handler fires (dead-code otherwise, per review-bot). Simulate by pointing
-        # the resolver at a nonexistent binary; the SubprocessError branch of
-        # subprocess.run is what raises FileNotFoundError -> OSError below.
+    def test_propagates_oserror_on_windows_when_the_dacl_write_fails(self, tmp_path, monkeypatch):
+        # The fail-loud contract on Windows: a DACL that cannot be applied MUST
+        # raise OSError so the caller's warn-and-continue handler fires
+        # (dead-code otherwise, per review-bot). Simulate at the writer seam --
+        # there is no longer a subprocess to make un-launchable, and the failure
+        # this models (SetNamedSecurityInfoW returning ERROR_ACCESS_DENIED on a
+        # file whose owner we cannot change) is not reproducible on demand.
         if not pc.IS_WINDOWS:
-            pytest.skip("Windows icacls branch")
+            pytest.skip("Windows DACL branch")
         f = tmp_path / "secret.key"
         f.write_bytes(b"s" * 32)
 
-        real_run = subprocess.run
+        def boom(path, *, inherit, sids, **_kw):
+            raise pc.windows_acl.AclWriteFailed("SetNamedSecurityInfoW failed (error 5)")
 
-        def failing_run(argv, **kwargs):
-            if argv and "icacls" in str(argv[0]).lower():
-                raise FileNotFoundError(2, "icacls.exe not found")
-            return real_run(argv, **kwargs)
-
-        monkeypatch.setattr(pc.subprocess, "run", failing_run)
-        monkeypatch.setattr(pc.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(pc.windows_acl, "apply_owner_only", boom)
         with pytest.raises(OSError):
             pc.restrict_to_owner(f)
 
@@ -3245,8 +3180,8 @@ class TestMakeOwnerOnlyDir:
         calls: list[str] = []
         wrong: list[str] = []
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p: calls.append(str(p)))
-        monkeypatch.setattr(pc, "restrict_to_owner", lambda p: wrong.append(str(p)))
+        monkeypatch.setattr(pc, "restrict_dir_to_owner", lambda p, **_kw: calls.append(str(p)))
+        monkeypatch.setattr(pc, "restrict_to_owner", lambda p, **_kw: wrong.append(str(p)))
         target = tmp_path / "win"
         pc.make_owner_only_dir(target)
         assert target.is_dir()
@@ -3267,7 +3202,7 @@ class TestMakeOwnerOnlyDir:
         monkeypatch.setattr(
             pc,
             "restrict_dir_to_owner",
-            lambda p: (_ for _ in ()).throw(OSError("nope")),
+            lambda p, **_kw: (_ for _ in ()).throw(OSError("nope")),
         )
         target = tmp_path / "partial"
         pc.make_owner_only_dir(target)
@@ -3279,10 +3214,10 @@ class TestCurrentUserSidNeverSpawns:
     admission check, the client-side server check, and the pipe DACL builder --
     which runs once per pipe instance and so sits on the accept path.
 
-    It used to delegate to ``_current_user_sid``, whose fallback is a ``whoami``
-    subprocess with a 5 s timeout. A token-lookup failure therefore stalled
-    accepts for seconds at a time, repeatedly. ``restrict_to_owner`` keeps that
-    fallback because it always runs through ``asyncio.to_thread``.
+    It used to delegate to a helper whose fallback was a ``whoami`` subprocess
+    with a 5 s timeout, so a token-lookup failure stalled accepts for seconds at
+    a time, repeatedly. That helper is gone: the owner-only lockdown was its last
+    caller and now reads the token directly too, so no path here can spawn.
     """
 
     @staticmethod

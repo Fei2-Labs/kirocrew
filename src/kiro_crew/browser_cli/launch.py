@@ -54,7 +54,9 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
+from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.browser_cli.install import cli_lifecycle_env_supported
 from kiro_crew.config.paths import config_dir
 
 logger = logging.getLogger(__name__)
@@ -71,11 +73,120 @@ LAUNCH_ENGINE = "chromium"
 #: addresses. Its name is fixed by the CLI, not by us.
 SESSION_ENV = "PLAYWRIGHT_CLI_SESSION"
 
+#: The variable playwright-core reads before ``os.tmpdir()`` when choosing the
+#: daemon control-socket root. Its name is upstream's test-prefixed public seam,
+#: but it is the only supported way to keep the socket reachable after an
+#: agent's per-process scratch directory is reclaimed.
+SOCKETS_ENV = "PWTEST_SOCKETS_DIR"
+
+#: The registry root holding ``<workspace-hash>/<session>.session`` metadata.
+#: Fixed beside the socket root so controlled teardown can locate the socket
+#: without executing the user-writable playwright-cli wrapper.
+DAEMON_DIR_ENV = "PWTEST_DAEMON_SESSION_DIR"
+
+#: Short common root; each generated session gets its own `/<8hex>/s` and
+#: `/<8hex>/d` subtree so `playwright-cli list` cannot enumerate peer chats.
+_LIFECYCLE_DIR = "pw"
+_UNIX_SOCKET_PATH_MAX_BYTES = 103
+
 #: Marks a generated name as Kiro Crew's in ``playwright-cli list``, so an
 #: operator can tell an agent's browser from one they opened themselves.
 _SESSION_PREFIX = "kc-"
 
 _CONFIG_FILE = "playwright-cli-config.json"
+
+
+def _session_leaf(session_name: str) -> str:
+    """Filesystem leaf for one generated ``kc-<8hex>`` session."""
+    if not session_name.startswith(_SESSION_PREFIX):
+        return ""
+    leaf = session_name.removeprefix(_SESSION_PREFIX)
+    return leaf if len(leaf) == 8 and all(c in "0123456789abcdef" for c in leaf) else ""
+
+
+def socket_dir(session_name: str, base: Path | None = None) -> Path:
+    """Stable, per-session daemon-socket root outside agent scratch."""
+    root = base if base is not None else config_dir() / _LIFECYCLE_DIR
+    return root / _session_leaf(session_name) / "s"
+
+
+def daemon_dir(session_name: str, base: Path | None = None) -> Path:
+    """Stable, per-session Playwright registry root outside agent scratch."""
+    root = base if base is not None else config_dir() / _LIFECYCLE_DIR
+    return root / _session_leaf(session_name) / "d"
+
+
+def browser_socket_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Environment additions keeping daemon sockets reachable and discoverable.
+
+    ``playwright-cli`` launches its daemon after Kiro Crew has pointed
+    ``TMPDIR`` at a per-process scratch directory. Without ``SOCKETS_ENV`` the
+    socket disappears when that scratch is reclaimed. ``DAEMON_DIR_ENV`` fixes
+    the corresponding session registry location, letting Kiro Crew find and
+    validate the exact generated session file at controlled teardown without
+    executing the user-writable CLI wrapper.
+
+    This helper is called only when Kiro Crew generated ``SESSION_ENV``.
+    Existing location variables are treated as operator-selected BASE roots,
+    then namespaced by the generated session; non-generated operator sessions
+    never call this helper. Both final directories are owner-restricted. If
+    validation or preparation fails, no partial additions are returned and the
+    current TMPDIR/default-registry behavior remains. This helper performs
+    filesystem I/O and event-loop callers MUST offload it.
+    """
+    session_name = env.get(SESSION_ENV, "").strip()
+    if not _session_leaf(session_name):
+        return {}
+    if not cli_lifecycle_env_supported():
+        logger.warning(
+            "installed playwright-cli does not expose the stable daemon "
+            "socket/session hooks; leaving its lifecycle environment unchanged"
+        )
+        return {}
+    configured_sockets = env.get(SOCKETS_ENV, "").strip()
+    configured_daemons = env.get(DAEMON_DIR_ENV, "").strip()
+    if (
+        configured_sockets
+        and not Path(configured_sockets).is_absolute()
+        or configured_daemons
+        and not Path(configured_daemons).is_absolute()
+    ):
+        logger.warning("Playwright lifecycle root overrides must be absolute paths")
+        return {}
+    sockets_path = socket_dir(
+        session_name, Path(configured_sockets) if configured_sockets else None
+    )
+    daemons_path = daemon_dir(
+        session_name, Path(configured_daemons) if configured_daemons else None
+    )
+    additions: dict[str, str] = {}
+    # Upstream builds `<root>/cli/<16-char-workspace>-<11-char-session>.sock`.
+    # Check the complete shortest non-trimmed form; if even that cannot fit,
+    # makeSocketPath raises and browsing fails before cleanup can help.
+    worst_case = sockets_path / "cli" / "0000000000000000-kc-00000000.sock"
+    if (
+        not platform_compat.IS_WINDOWS
+        and len(os.fsencode(str(worst_case))) > _UNIX_SOCKET_PATH_MAX_BYTES
+    ):
+        logger.warning(
+            "Playwright socket directory is too long for AF_UNIX (%d bytes): %s",
+            len(os.fsencode(str(worst_case))),
+            sockets_path,
+        )
+        return {}
+    for key, path in ((SOCKETS_ENV, sockets_path), (DAEMON_DIR_ENV, daemons_path)):
+        try:
+            platform_compat.make_owner_only_dir(path)
+            platform_compat.restrict_dir_to_owner(path)
+        except OSError:
+            logger.warning(
+                "could not prepare Playwright lifecycle directory at %s; "
+                "browser daemon cleanup may be unavailable",
+                path,
+            )
+            return {}
+        additions[key] = str(path)
+    return additions
 
 
 def launch_config_path() -> Path:

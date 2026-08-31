@@ -69,6 +69,41 @@ export type McpShareReason = {
   detail: string
 }
 
+export interface WorkflowLineage {
+  workflow_id: string
+  revision: number
+}
+
+export interface WorkflowDefinitionRevision {
+  revision: number
+  source: string
+  created_at: string
+}
+
+export interface WorkflowDefinition {
+  schema_version: number
+  id: string
+  slug: string
+  name: string
+  description: string
+  created_at: string
+  updated_at: string
+  revision: number
+  format: 'python' | 'task-plan'
+  source: string
+  content_hash: string
+  derived_from: WorkflowLineage | null
+  revisions: WorkflowDefinitionRevision[]
+}
+
+export interface WorkflowDefinitionWrite {
+  source: string
+  format?: 'python' | 'task-plan'
+  name?: string
+  description?: string
+  slug?: string
+  derived_from?: WorkflowLineage | null
+}
 /** The gateway's advisory reading of whether a server's backend can be shared.
  *
  *  `strength` is the evidence tier, weakest first: `unknown`, `no_objection`,
@@ -485,6 +520,16 @@ export interface FeishuConfigData {
   soft_threshold_pct: number
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
+  /**
+   * Whether lark-oapi (the optional [feishu] extra) is importable by the gateway
+   * process. False means the channel is skipped at boot however complete the
+   * rest of this config is.
+   */
+  sdk_installed?: boolean
+  /** False where a pip install cannot work: bundled app, no pip, PEP 668. */
+  sdk_install_supported?: boolean
+  /** Install command naming the gateway's OWN interpreter; "" when not useful. */
+  sdk_install_command?: string
 }
 
 /** Writable Feishu config fields sent to PUT /api/feishu/config. */
@@ -1699,6 +1744,39 @@ export interface KiroCreditUsage {
   startUrl?: string
 }
 
+export interface KasLoginStatus {
+  authenticated: boolean
+  /** Provider of the active sign-in (e.g. 'google', 'github', 'builder_id'), null when signed out. */
+  provider: string | null
+  /** Human-readable account identity (email / profile ARN), null when signed out. */
+  identity: string | null
+  /**
+   * How a sign-in can return to this gateway. 'loopback' means the browser and
+   * the gateway share a machine, so the OAuth callback lands directly on a
+   * local port; 'device' means the gateway is remote and the user instead
+   * approves a short code in their own browser (no callback required).
+   */
+  transport: 'loopback' | 'device'
+}
+
+export interface KasLoginDeviceSession {
+  /** Handle for polling this sign-in attempt. */
+  login_id: string
+  /** The short code the user types into the verification page. */
+  user_code: string
+  /** The page (opened on ANY device) where the code is entered. */
+  verification_uri_complete: string
+  /** ISO-8601 UTC instant the code stops working. */
+  expires_at: string
+}
+
+export interface KasLoginPollResult {
+  status: 'pending' | 'authorized' | 'expired' | 'error'
+  /** Machine-readable failure code — error responses carry one too. */
+  code?: string
+  error?: string
+}
+
 export interface AgentImportCategory {
   id: string
   label: string
@@ -1870,6 +1948,27 @@ export type ProjectGitFile = {
   repoRoot?: string
 }
 
+/** One row of GET /api/members — a global crew as a Crew Members roster entry.
+ *  Crew-record fields (kiro_agent, workspace, memory_store, model, …) are
+ *  spread verbatim from the backend dataclass; only the fields the page reads
+ *  are typed here, and extras pass through untyped by design so a new backend
+ *  field is not a frontend break. */
+export interface MemberRosterRow {
+  /** Crew name — the display identity and the agent the DM thread pins to. */
+  name: string
+  /** Stable path-safe slug deriving the member dir and the slot key. */
+  slug: string
+  /** The pinned DM thread's slot key ('' until first open / unbound). */
+  slot_key: string
+  /** O(1) liveness: the bound slot is mid-turn right now. */
+  running: boolean
+  kiro_agent?: string
+  workspace?: string
+  memory_store?: string
+  model?: string
+  [extra: string]: unknown
+}
+
 export const api = {
   status: () => fetch('/api/status').then(j),
   tunnelStatus: () => fetch('/api/tunnel/status').then(j) as Promise<TunnelStatus>,
@@ -1955,6 +2054,17 @@ export const api = {
   // cross-site triggerable and would leave no audit record.
   repairKiroPrerequisiteSpecs: () =>
     post('/api/kiro-prerequisite/repair-specs').then(j) as Promise<KiroPrerequisiteStatus>,
+  // KAS-mode in-product sign-in (no kiro-cli, no terminal). Status is a cheap
+  // read; every step that changes sign-in state is a POST for the same
+  // CSRF/audit reasons as the spec repair above. Error responses carry a
+  // machine-readable `code` field alongside the human message.
+  kasLoginStatus: () => get('/api/kas-login').then(j) as Promise<KasLoginStatus>,
+  kasLoginBeginDevice: (provider: string) =>
+    post('/api/kas-login/device', { provider }).then(j) as Promise<KasLoginDeviceSession>,
+  kasLoginPoll: (login_id: string) =>
+    post('/api/kas-login/poll', { login_id }).then(j) as Promise<KasLoginPollResult>,
+  kasLoginLogout: (identity: string) =>
+    post('/api/kas-login/logout', { identity }).then(j) as Promise<KasLoginStatus>,
   onboardingImportScan: () =>
     get('/api/onboarding/import/scan').then(j) as Promise<AgentImportScanResponse>,
   onboardingImportApply: (body: AgentImportApplyRequest) =>
@@ -2187,14 +2297,30 @@ export const api = {
     fetch('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)).then(j),
   syncKirocrewAgents: () => post('/api/agents/sync', {}).then(j),
   createKirocrewAgent: (body: object) => post('/api/agents', body).then(j),
+  // Crew Members page — roster of GLOBAL crews with DM-thread binding and the
+  // cheap live-status fields the backend can answer without IO (richer live
+  // detail rides the already-subscribed WS `slots` frames).
+  members: () => fetch('/api/members').then(j) as Promise<{ members: MemberRosterRow[] }>,
+  // Idempotent get-or-create of a member's pinned DM thread. Member slots are
+  // born ONLY through this route (the generic slot-create endpoint refuses
+  // mode="member"), so this is also the only place a member slot key comes from.
+  memberThread: (slug: string) =>
+    post('/api/members/' + encodeURIComponent(slug) + '/thread').then(j) as Promise<{ slot_key: string; slug: string; member: string }>,
   updateKirocrewAgent: (name: string, body: object) =>
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
     del('/api/agents/' + encodeURIComponent(name)).then(j),
-  models: () => fetch('/api/models').then(j),
+  models: (opts?: { slot?: string }) =>
+    fetch('/api/models' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
+  // `probe=1` walks each adapter's resolution ladder. Default is off; the
+  // preview-gated Settings selector and Services label opt into the same probed
+  // query so they can share one cache and stay synchronized.
+  acpBackends: ({ probe }: { probe?: boolean } = {}) =>
+    fetch('/api/acp-backends' + (probe ? '?probe=1' : '')).then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
-  slashCommands: () => fetch('/api/slash-commands').then(j),
+  slashCommands: (opts?: { slot?: string }) =>
+    fetch('/api/slash-commands' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
   chatSlotAgent: (slot: string, agent: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j) as Promise<{ ok?: boolean; agent?: string; workspace?: string }>,
   chatSlotModel: (slot: string, model: string) =>
@@ -2328,7 +2454,11 @@ export const api = {
   // every slot shares", so workspace skills leak between chats on different
   // projects and vanish entirely when two chats disagree (#2457, #3551).
   // agent, when given, scopes the listing to that agent's own skill:// mapping;
-  // an agent with no explicit mapping keeps the unfiltered listing.
+  // an agent with no explicit mapping keeps the unfiltered listing. When the
+  // mapping IS applied the server answers with the envelope
+  // {skills, agent_scoped: true, agent} instead of the bare array, so the
+  // picker can cue the scope (and tell "nothing mapped" from "nothing exists").
+  // Consume through lib/skillsPayload.ts unwrapSkills() rather than assuming an array.
   skills: (sessionKey?: string, agent?: string) =>
     get('/api/skills' + (agent ? '?agent=' + encodeURIComponent(agent) : ''),
         sessionKey).then(j),
@@ -2777,6 +2907,32 @@ export const api = {
    */
   workflowRuns: () =>
     get('/api/workflows/runs').then(j) as Promise<{ runs?: WorkflowRunSummary[] }>,
+  workflowDefinitions: (search = '') =>
+    get('/api/workflows/definitions' + (search ? `?q=${encodeURIComponent(search)}` : '')).then(j) as Promise<{ definitions: WorkflowDefinition[] }>,
+  authorWorkflow: (intent: string) =>
+    post('/api/workflows/author', { intent }).then(j) as Promise<{
+      ok: boolean
+      source: string
+      meta?: { name?: string; description?: string }
+      derived_from?: WorkflowLineage | null
+      errors?: string[]
+    }>,
+  saveWorkflowDefinition: (body: WorkflowDefinitionWrite) =>
+    post('/api/workflows/definitions', body).then(j) as Promise<{ ok: boolean; definition: WorkflowDefinition }>,
+  promoteWorkflowRun: (
+    runId: string,
+    body: Omit<WorkflowDefinitionWrite, 'source' | 'derived_from'>,
+  ) =>
+    post(`/api/workflows/runs/${encodeURIComponent(runId)}/promote`, body).then(j) as Promise<{
+      ok: boolean
+      definition: WorkflowDefinition
+    }>,
+  updateWorkflowDefinition: (
+    workflowRef: string,
+    body: Omit<WorkflowDefinitionWrite, 'derived_from'> & { expected_revision: number },
+  ) => patch(`/api/workflows/definitions/${encodeURIComponent(workflowRef)}`, body).then(j) as Promise<{ ok: boolean; definition: WorkflowDefinition }>,
+  runWorkflowDefinition: (workflowRef: string, input: string, args: Record<string, unknown> = {}) =>
+    post(`/api/workflows/definitions/${encodeURIComponent(workflowRef)}/run`, { input, args }).then(j) as Promise<{ run_id: string; workflow_id: string; revision: number; slug: string }>,
   refineTaskInput: (input: string) => post('/api/taskrunner/refine', { input }).then(j),
   refineStatus: () => fetch('/api/taskrunner/refine').then(j),
   refineCancel: () => post('/api/taskrunner/refine/cancel').then(j),
@@ -2831,6 +2987,10 @@ export const api = {
    * the expected path rather than an error.
    */
   restartGateway: () => post('/api/restart').then(j),
+  // In-app wheel update step-up: arming records the request and returns the
+  // host command to run; the approval nonce never reaches this client.
+  armUpdate: () => post('/api/update/arm').then(j) as Promise<{ ok?: boolean; armed?: boolean; request_id?: string; version?: string; expires_in?: number; approve_command?: string; error?: string; code?: string }>,
+  armStatus: () => fetch('/api/update/arm').then(j) as Promise<{ armed: boolean; request_id?: string; version?: string; expires_in?: number; approve_command?: string }>,
   cancelUpdate: () => post('/api/update/cancel').then(j),
   simulateUpdate: (opts?: { delay?: number; fail_at?: string }) => post('/api/update/simulate', opts || {}).then(j),
   pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,

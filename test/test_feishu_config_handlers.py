@@ -688,3 +688,82 @@ def test_id_shape_validator() -> None:
     assert not _is_valid_feishu_id("", "ou_")
     assert not _is_valid_feishu_id("ou_ab-cd", "ou_")
     assert not _is_valid_feishu_id("ou_" + "a" * 200, "ou_")
+
+
+# ── Missing-SDK install advice (GET) ──
+# lark-oapi ships as the optional [feishu] extra, so a fully credentialed channel
+# still cannot start without it. The badge cannot report that in the case that
+# matters: maybe_start_feishu returns at its first line when the channel is
+# disabled, and the ImportError branch that records the missing SDK sits AFTER
+# that return -- so a user who has not yet flipped the enable toggle gets no hint
+# at all, and one who has must restart the gateway first. These cover the config
+# endpoint answering it directly instead.
+
+
+def _get_config(monkeypatch, *, connected: bool = False) -> dict:
+    """Run the Feishu config GET and return its JSON body."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    class _State:
+        feishu_connected = connected
+        feishu_connect_error = ""
+
+    req = make_mocked_request("GET", "/api/feishu/config")
+    req.app["state"] = _State()
+    resp = asyncio.run(mod.api_feishu_config_get(req))
+    return json.loads(resp.body.decode())
+
+
+def test_get_reports_the_sdk_as_present_when_importable(monkeypatch) -> None:
+    """An importable SDK needs no advice, so the command is empty."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    monkeypatch.setattr(mod.importlib.util, "find_spec", lambda name: object())
+    body = _get_config(monkeypatch)
+    assert body["sdk_installed"] is True
+    assert body["sdk_install_command"] == ""
+
+
+def test_get_names_this_interpreter_when_the_sdk_is_missing(monkeypatch) -> None:
+    """The command must name the gateway's OWN python, not a bare ``pip``.
+
+    Installing into a different environment is the actual failure mode: the
+    gateway keeps skipping the channel and nothing says the install landed
+    elsewhere.
+    """
+    import sys
+
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    monkeypatch.setattr(mod.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(mod, "_pip_install_channel_available", lambda: True)
+    body = _get_config(monkeypatch)
+    assert body["sdk_installed"] is False
+    assert body["sdk_install_supported"] is True
+    assert sys.executable in body["sdk_install_command"]
+    assert "kirocrew[feishu]" in body["sdk_install_command"]
+    assert "-m pip install" in body["sdk_install_command"]
+
+
+def test_get_withholds_a_command_that_cannot_work(monkeypatch) -> None:
+    """No install channel -> no command.
+
+    On the bundled desktop interpreter a pip install writes into the code-signed
+    bundle and is discarded on the next app update, so naming the command there
+    is wrong advice rather than merely unhelpful.
+    """
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    monkeypatch.setattr(mod.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr(mod, "_pip_install_channel_available", lambda: False)
+    body = _get_config(monkeypatch)
+    assert body["sdk_installed"] is False
+    assert body["sdk_install_supported"] is False
+    assert body["sdk_install_command"] == ""
+
+
+def test_sdk_probe_reports_nothing_missing_for_a_channel_without_an_extra() -> None:
+    """A channel with no optional extra renders no card: nothing can be missing."""
+    from kiro_crew.dashboard.handlers.messaging import _channel_sdk_status
+
+    assert _channel_sdk_status("wecom") == (True, False, "")

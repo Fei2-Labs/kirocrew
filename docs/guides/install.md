@@ -673,11 +673,15 @@ kirocrew service install
 
 Where, and only where, this mechanism is the one in play, the installer also
 writes `/etc/apparmor.d/kirocrew-userns` and loads it. The profile grants
-exactly one permission (`userns`) and is applied by systemd to the kirocrew
-service only, via `AppArmorProfile=-kirocrew-userns` in the unit. It is a
-**named** profile with no attachment path, so it cannot apply to any other
-process, and it is the same approach stock Ubuntu already uses for `chrome` and
-`brave`.
+exactly one permission (`userns`) and is **attached** to the resolved kirocrew
+launcher script (the same absolute path `service install` uses as `ExecStart`,
+typically something like `~/.kiro/crew-venv/bin/kirocrew`) — the same approach
+stock Ubuntu already uses for `chrome` and `brave`. An earlier version of this
+profile was named-but-unattached and applied purely via `AppArmorProfile=` in
+the unit; that shipped first (#1210) but was found not to actually confine the
+gateway's sandbox probe (#3463) — the directive labels only the unit's own
+top-level process, and the probe runs in a child reached through a fork the
+directive's labelling never reaches. The directive is no longer used.
 
 This uses the sudo prompt `service install` already needs for the unit file, so
 it costs no additional privilege, and it **cannot fail your install**: if the
@@ -692,12 +696,16 @@ rule needs 4.x or newer). So on Debian, Arch, RHEL and Amazon Linux nothing
 changes.
 
 **Running the gateway outside systemd** (for example `kirocrew gateway` in a
-terminal) does not pick up the profile, because systemd is what applies it —
-and there is no unprivileged way to enter it yourself. `aa_change_onexec()` into
-a named profile is not permitted for an ordinary unconfined user, and `aa-exec`
-does **not** fail when it cannot transition: it execs the command unconfined, so
-`aa-exec -p kirocrew-userns -- kirocrew gateway` appears to work and changes
-nothing. Run the gateway as the service instead.
+terminal) is covered *only when the launch goes through the attached launcher
+path*: the kernel applies a path-attached profile at every `execve()` of that
+exact file, unit or no unit, so once `service install` has attached the profile,
+a foreground `kirocrew gateway` typed at a shell that resolves to the same
+launcher script runs confined too. A launch that does **not** go through that
+path — `python -m kiro_crew`, a different venv's entry point, a re-created venv
+the profile has not been re-pointed at — stays unconfined, and `kirocrew doctor`
+reports the attachment as stale in the re-created-venv case. Prefer running the
+gateway as the service: it pins `ExecStart` to the attached path and restarts on
+boot.
 
 ### The AppImage (desktop app) needs its own profile
 

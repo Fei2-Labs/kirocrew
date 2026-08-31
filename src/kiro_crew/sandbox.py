@@ -53,6 +53,7 @@ except ImportError:  # non-POSIX (Windows)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from concurrent.futures import ThreadPoolExecutor
     from typing import Any, NoReturn
 
 logger = logging.getLogger(__name__)
@@ -1706,12 +1707,48 @@ def main():
         # available — better to function (with the original regression risk)
         # than to refuse to start.
 
-        # Pre-read files that must survive dir hiding
+        # Pre-read files that must survive dir hiding.
+        #
+        # An expose source that cannot be READ degrades to "not exposed" with a
+        # stderr warning, the same way the Step 7 hardlink scan degrades open.
+        # This read runs during sandbox SETUP, so letting the OSError propagate
+        # aborts the child before the command runs at all -- and selective
+        # exposure is an OPTIMIZATION (keep ~/.aws/config reachable so
+        # credential_process still resolves inside an otherwise-hidden ~/.aws),
+        # never a security control. Failing the whole spawn because an optional
+        # convenience is unreadable trades a working sandbox for no sandbox.
+        #
+        # `isfile` already covers ABSENT; this covers UNREADABLE, and the two
+        # are not the same test: `stat` can succeed on a path whose `open` is
+        # then denied. Seen in the wild as a filesystem restriction inherited
+        # from the parent process, denying read on a 0600 file the child's own
+        # uid owned -- so DAC bits and uid both looked correct while every
+        # cc-mode spawn on that host died here.
+        #
+        # Catching the error is the only guard that HOLDS. Do not "tighten" this
+        # into a pre-flight `os.access(src_path, os.R_OK)`: measured on the
+        # affected host, `os.stat()` succeeded and `os.access()` reported BOTH
+        # X_OK and R_OK as True while the operation was denied anyway. The
+        # weaker check looks equivalent from the source alone and would
+        # silently restore the abort.
+        #
+        # The warning is not optional. Skipping silently would leave the child
+        # with no ~/.aws/config and no explanation, turning a loud setup failure
+        # into a later auth failure that points nowhere near this line.
         expose_data = {{}}
         for src_path, filename in EXPOSE_FILES:
             if os.path.isfile(src_path):
-                with open(src_path, "rb") as fh:
-                    expose_data[src_path] = fh.read()
+                try:
+                    with open(src_path, "rb") as fh:
+                        expose_data[src_path] = fh.read()
+                except OSError as exc:
+                    print(
+                        "sandbox: WARNING — cannot read %s (%s); it will be "
+                        "ABSENT inside the sandbox. Anything depending on it "
+                        "(e.g. credential_process in ~/.aws/config) will fail."
+                        % (src_path, exc),
+                        file=sys.stderr,
+                    )
 
         # Bind-mount empty dirs over credential paths (per-dir tmpdir to
         # prevent content leaking across mounts via shared backing dir).
@@ -1752,8 +1789,38 @@ def main():
         if HIDE_SSH and os.path.isdir(SSH_DIR):
             kh_data = b""
             if os.path.isfile(SSH_KNOWN_HOSTS):
-                with open(SSH_KNOWN_HOSTS, "rb") as fh:
-                    kh_data = fh.read()
+                # Host trust data FAILS CLOSED. This is deliberately NOT the
+                # degrade-open treatment the EXPOSE_FILES pre-read above gets,
+                # and the two sites are NOT symmetric:
+                #
+                #   - an unreadable ~/.aws/config costs REACHABILITY, so
+                #     skipping it trades a convenience for a working sandbox;
+                #   - an unreadable known_hosts costs VERIFICATION. The launcher
+                #     puts StrictHostKeyChecking=accept-new into
+                #     GIT_SSH_COMMAND, gated ONLY on that variable being unset
+                #     -- never on whether this read succeeded. So continuing
+                #     with an empty kh_data points UserKnownHostsFile at an
+                #     absent file while auto-accept is still on: every host then
+                #     reads as NEW and an interceptor's key is accepted. With
+                #     known_hosts present, accept-new REFUSES a CHANGED key.
+                #
+                # A degrade here would therefore convert "refuse a changed key"
+                # into "accept anything". Aborting is the safe direction: no
+                # sandbox at all beats one that has quietly stopped verifying
+                # hosts. Report first so the abort is diagnosable, then re-raise
+                # and let it kill setup.
+                try:
+                    with open(SSH_KNOWN_HOSTS, "rb") as fh:
+                        kh_data = fh.read()
+                except OSError as exc:
+                    print(
+                        "sandbox: FATAL — cannot read %s (%s). Refusing to "
+                        "continue: proceeding without it would leave host-key "
+                        "verification accepting any new key."
+                        % (SSH_KNOWN_HOSTS, exc),
+                        file=sys.stderr,
+                    )
+                    raise
             # Cross-fs source for the same kernel-race reason as SENSITIVE_DIRS
             # (line 371) and SENSITIVE_FILES (line 389).
             ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src).encode()
@@ -4171,6 +4238,85 @@ async def sandboxed_spawn_argv_off_loop(
                 os.unlink(cleanup)
             except OSError:
                 pass
+        raise
+
+
+async def shielded_prepare_off_loop(
+    prepare: Callable[[], tuple[list[str], dict[str, str], str | None]],
+    *,
+    executor: ThreadPoolExecutor | None = None,
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Run a spawn-preparation callable off the loop, shielded from cancellation.
+
+    ``prepare`` must follow the :func:`sandboxed_spawn_argv` contract: it returns
+    ``(wrapped_argv, scrubbed_env, cleanup_path_or_None)`` where the third element
+    is a temp launcher/profile the CALLER must unlink after the child exits.
+
+    Every async caller reaches the sync chokepoint through a worker hop.
+    Cancelling that hop abandons the returned tuple while the worker still
+    materializes the launcher/profile, leaking the temp file forever.  Shielding
+    the hop keeps the worker's result recoverable: on cancellation we wait for
+    the thread to settle, unlink the launcher it created, and re-raise.
+
+    A REPEAT cancellation landing on a bare recovery ``await`` is a
+    ``BaseException`` that would abandon the recovery before the unlink runs,
+    leaking the materialized launcher (#5841).  The settle-then-unlink therefore
+    runs as its own task, shielded from cancellations aimed at this caller; each
+    absorbed repeat is ``uncancel()``-ed so an enclosing ``asyncio.timeout``
+    still reports ``TimeoutError``, and the ORIGINAL cancellation is re-raised
+    once the launcher is gone.
+
+    ``executor`` keeps pool choice with the CALLER, because which pool absorbs a
+    wedged preparation is per-site policy, not a shield concern: the chokepoint
+    can cold-probe the sandbox backend with a synchronous subprocess, and
+    :mod:`kiro_crew.executors` partitions blocking work into named pools so such
+    a probe cannot occupy the workers another subsystem (the orphan-reaping
+    sweep) needs. Defaulting it to ``None`` — the loop's default pool, via
+    ``asyncio.to_thread`` — would silently collapse that partition for callers
+    that had chosen a pool, so every site that had one passes it explicitly.
+    """
+
+    Prepared = tuple[list[str], dict[str, str], str | None]
+    task: asyncio.Future[Prepared]
+    if executor is None:
+        task = asyncio.ensure_future(asyncio.to_thread(prepare))
+    else:
+        task = asyncio.get_running_loop().run_in_executor(executor, prepare)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+
+        async def _settle_then_unlink() -> None:
+            cleanup: str | None = None
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                _, _, cleanup = await task
+            if not cleanup:
+                return
+            target = cleanup
+
+            def _unlink() -> None:
+                with contextlib.suppress(OSError):
+                    os.unlink(target)
+
+            if executor is None:
+                await asyncio.to_thread(_unlink)
+            else:
+                await asyncio.get_running_loop().run_in_executor(executor, _unlink)
+
+        current = asyncio.current_task()
+        recovery = asyncio.create_task(_settle_then_unlink())
+        while not recovery.done():
+            try:
+                await asyncio.shield(recovery)
+            except asyncio.CancelledError:
+                uncancel = getattr(current, "uncancel", None)  # 3.11+
+                if uncancel is not None:
+                    uncancel()
+            except Exception:
+                logger.warning(
+                    "sandbox launcher cleanup failed after cancellation",
+                    exc_info=True,
+                )
         raise
 
 

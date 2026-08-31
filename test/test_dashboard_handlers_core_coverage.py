@@ -34,6 +34,7 @@ from kiro_crew.config.loader import (
     SUBAGENT_MAX_TURNS_CEILING,
     config_path,
 )
+from kiro_crew.dashboard.handlers import _shared as shared_mod
 from kiro_crew.dashboard.handlers import core as core_mod
 from kiro_crew.sel import SelVerification as _SelVerification
 
@@ -438,21 +439,21 @@ class TestPipInstallChannel:
     @pytest.fixture(autouse=True)
     def _not_bundled(self, monkeypatch):
         """Pin the desktop-bundle probe; the bundled case has its own test."""
-        monkeypatch.setattr(core_mod.platform_compat, "is_bundled_interpreter", lambda: False)
+        monkeypatch.setattr(shared_mod.platform_compat, "is_bundled_interpreter", lambda: False)
 
     def test_bundled_desktop_interpreter_has_no_channel(self, monkeypatch) -> None:
         """A pip install into the desktop app's code-signed bundle breaks
         launches/updates and is discarded on every app update — the command
         must not be offered there even though pip itself may exist."""
-        monkeypatch.setattr(core_mod.platform_compat, "is_bundled_interpreter", lambda: True)
+        monkeypatch.setattr(shared_mod.platform_compat, "is_bundled_interpreter", lambda: True)
         assert core_mod._pip_install_channel_available() is False
 
     def test_pipless_interpreter_has_no_channel(self, monkeypatch) -> None:
         """uv tool installs and some pipx layouts ship no `pip` module, so
         `<python> -m pip` fails immediately — the command must not be shown."""
-        real = core_mod.importlib.util.find_spec
+        real = shared_mod.importlib.util.find_spec
         monkeypatch.setattr(
-            core_mod.importlib.util,
+            shared_mod.importlib.util,
             "find_spec",
             lambda name, *a: None if name == "pip" else real(name, *a),
         )
@@ -461,9 +462,9 @@ class TestPipInstallChannel:
     def test_externally_managed_python_has_no_channel(self, monkeypatch, tmp_path) -> None:
         """PEP 668: pip refuses installs into an externally-managed
         interpreter (distro/brew pythons) — but only outside a venv."""
-        monkeypatch.setattr(core_mod.sys, "prefix", core_mod.sys.base_prefix)
+        monkeypatch.setattr(shared_mod.sys, "prefix", shared_mod.sys.base_prefix)
         (tmp_path / "EXTERNALLY-MANAGED").write_text("", encoding="utf-8")
-        monkeypatch.setattr(core_mod.sysconfig, "get_path", lambda name: str(tmp_path))
+        monkeypatch.setattr(shared_mod.sysconfig, "get_path", lambda name: str(tmp_path))
         assert core_mod._pip_install_channel_available() is False
 
     def test_venv_on_managed_base_has_a_channel(self, monkeypatch, tmp_path) -> None:
@@ -471,16 +472,18 @@ class TestPipInstallChannel:
         resolves to the BASE interpreter's directory where distro pythons put
         the marker — the recommended install layout (venv on a Debian/brew
         python) must not be misread as unsupported."""
-        monkeypatch.setattr(core_mod.sys, "prefix", str(tmp_path / "venv"))
-        monkeypatch.setattr(core_mod.sys, "base_prefix", str(tmp_path / "base"))
+        monkeypatch.setattr(shared_mod.sys, "prefix", str(tmp_path / "venv"))
+        monkeypatch.setattr(shared_mod.sys, "base_prefix", str(tmp_path / "base"))
         (tmp_path / "EXTERNALLY-MANAGED").write_text("", encoding="utf-8")
-        monkeypatch.setattr(core_mod.sysconfig, "get_path", lambda name: str(tmp_path))
+        monkeypatch.setattr(shared_mod.sysconfig, "get_path", lambda name: str(tmp_path))
+        monkeypatch.setattr(shared_mod.importlib.util, "find_spec", lambda name: object())
         assert core_mod._pip_install_channel_available() is True
 
     def test_ordinary_venv_has_a_channel(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(core_mod.sys, "prefix", core_mod.sys.base_prefix)
-        monkeypatch.setattr(core_mod.sysconfig, "get_path", lambda name: str(tmp_path))
-        assert core_mod._pip_install_channel_available() is True
+        monkeypatch.setattr(shared_mod.sys, "prefix", shared_mod.sys.base_prefix)
+        monkeypatch.setattr(shared_mod.sysconfig, "get_path", lambda name: str(tmp_path))
+        has_pip = shared_mod.importlib.util.find_spec("pip") is not None
+        assert core_mod._pip_install_channel_available() is has_pip
 
 
 class TestAl2023Detection:
@@ -614,9 +617,12 @@ class TestFindSuitablePython:
         monkeypatch.setenv("PYTHONPATH", str(decoy))
         reject = self._capture(monkeypatch)
 
-        # sys.executable (this test venv) has pip and is not free-threaded:
-        # the decoy must not flip its verdict to "unusable".
-        assert reject(sys.executable) is False
+        # The isolated probe must return the same answer regardless of the
+        # caller's PYTHONPATH; this venv may or may not include pip.
+        monkeypatch.delenv("PYTHONPATH")
+        baseline = reject(sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        assert reject(sys.executable) is baseline
 
     def test_a_decoy_pip_package_neither_executes_nor_forges_the_verdict(
         self, monkeypatch, tmp_path
@@ -641,7 +647,10 @@ class TestFindSuitablePython:
         monkeypatch.setenv("PYTHONPATH", str(decoy))
         reject = self._capture(monkeypatch)
 
-        assert reject(sys.executable) is False
+        monkeypatch.delenv("PYTHONPATH")
+        baseline = reject(sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(decoy))
+        assert reject(sys.executable) is baseline
         assert not canary.exists(), "decoy pip must never be imported or executed"
 
 
@@ -764,9 +773,12 @@ class TestSttConfigEndpoint:
         assert body["available"] is False
         assert body["prereqs"] == []
         assert body["install_step"] in ("idle", "done", "error")
-        # This test venv has a working pip channel, so the unsupported flag
-        # must be False regardless of installed extras.
-        assert body["transcribe_unsupported"] is False
+        # The flag reflects the actual two-part install contract, including
+        # whether this test environment has a usable pip channel.
+        expected_unsupported = not core_mod._voice_extra_importable() and not (
+            core_mod._pip_install_channel_available()
+        )
+        assert body["transcribe_unsupported"] is expected_unsupported
         # Cause discriminator for the unsupported notice: the desktop bundle
         # needs different guidance than a pip-less/PEP 668 interpreter. A test
         # venv is never the bundled app.

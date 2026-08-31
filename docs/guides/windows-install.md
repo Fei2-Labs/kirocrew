@@ -303,8 +303,13 @@ signing key, refresh-token state, per-app secrets, snapshot tarballs, and the
 cron internal-secret temp file — are locked down to the current user via an
 owner-only NTFS DACL (inheritance stripped, `S-1-3-4:F` = Owner Rights full
 control). This is applied through `platform_compat.restrict_to_owner`, which
-routes to `os.chmod(..., 0o600)` on POSIX and `icacls /inheritance:r /grant:r
-"*S-1-3-4:F"` on Windows. Failure is fail-loud (raises `OSError`) so the
+routes to `os.chmod(..., 0o600)` on POSIX and, on Windows, builds the descriptor
+in-process through `advapi32` (`SetNamedSecurityInfoW` with
+`PROTECTED_DACL_SECURITY_INFORMATION`, the equivalent of
+`icacls /inheritance:r /grant:r "*S-1-3-4:F"`). It is a direct API call rather
+than a subprocess -- measured 0.24 ms against 313 ms for the equivalent `icacls`
+invocation -- so it is safe to call on the gateway's event loop. Failure is
+fail-loud (raises `OSError`) so the
 security-warning handlers in each caller fire — a naive `if IS_POSIX: os.chmod`
 guard would silently no-op on Windows, leaving secrets group/world-readable
 under NTFS.
@@ -523,6 +528,13 @@ fires on a guess. The cost is one enumeration per candidate instead of the singl
 shared `/proc` scan the POSIX sweep does per tick; `_build_child_map` therefore
 deliberately has no Windows branch. macOS still has no ctypes-only per-pid RSS
 path and keeps returning 0.
+
+The tracked-session orphan reaper uses the same creation-time principle. A
+query-only process handle supplies the Windows creation FILETIME stored beside
+the PID at spawn; the reaper compares it again immediately before `taskkill /T`.
+That permits cleanup of operator-installed registry adapters hosted by generic
+images such as `node.exe` without treating the image name or registry package
+text as authority to kill an unrelated process.
 
 ## Directory links on Windows
 

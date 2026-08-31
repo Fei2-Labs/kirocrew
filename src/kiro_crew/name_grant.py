@@ -455,7 +455,7 @@ def _program_names_line(command: str) -> list[str] | None:
         # follows unchecked, so the line is refused.
         if "=" in token:
             head = token.split("=", 1)[0]
-            if head in _EXEC_ENV_VARS or not _ASSIGN_NAME_RE.fullmatch(head):
+            if _decides_execution(head) or not _ASSIGN_NAME_RE.fullmatch(head):
                 return None
             continue
         names.append(token)
@@ -572,12 +572,35 @@ _DISPATCHERS = frozenset(
 _ENV_PRELOAD_VARS = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
 
 
+#: An EXPORTED SHELL FUNCTION, which shadows a program name directly rather than
+#: via a file bash is told to source. Bash exports `head() { payload; }` as an
+#: environment entry and re-imports it in the child, so `bash -c 'head file'`
+#: runs the function while this check resolves the name to `/usr/bin/head` and
+#: calls it a trusted system program -- the same unsoundness as
+#: :data:`_ENV_PRELOAD_VARS`, needing no writable file at all.
+#:
+#: The key is matched on its `BASH_FUNC_` PREFIX alone, deliberately: the suffix
+#: has been spelled `()` and `%%` by different bash versions, and pinning a
+#: spelling would hand the bypass back on any build that picks another one.
+#:
+#: The value form is matched too, for the pre-2014 spelling where the key is the
+#: bare function name and only the `() {` value marks it. Supported bash no
+#: longer imports that, so this is belt-and-braces rather than the live vector.
+_BASH_FUNC_KEY_PREFIX = "BASH_FUNC_"
+_BASH_FUNC_VALUE_PREFIX = "() {"
+
+
 def _inherited_preload() -> str | None:
     """The inherited variable that makes a name-based grant unsound, if any."""
 
     for var in _ENV_PRELOAD_VARS:
         if os.environ.get(var):
             return var
+    for key, value in os.environ.items():
+        if key.startswith(_BASH_FUNC_KEY_PREFIX) or value.startswith(_BASH_FUNC_VALUE_PREFIX):
+            # The FAMILY, not the key: the key embeds an attacker-chosen function
+            # name and this string reaches a log sink and the dashboard card.
+            return f"{_BASH_FUNC_KEY_PREFIX}*"
     return None
 
 
@@ -628,8 +651,62 @@ _EXEC_ENV_VARS = frozenset(
         "ENV",
         "SHELL",
         "IFS",
+        # A TOOL that runs a helper command named by its environment. The base
+        # program is genuinely the trusted system one, so resolving its name
+        # answers nothing about what executes: `GIT_SSH_COMMAND=/writable/evil
+        # git fetch ssh://x` vouches for `/usr/bin/git` and runs the planted
+        # file. Same shape as `LD_PRELOAD`, reached through a tool's own config.
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        # An INTERPRETER told to load extra code before the script it was given.
+        # `PYTHONPATH=/writable python3 x` with a planted `sitecustomize.py`, or
+        # `NODE_OPTIONS=--require=/writable/evil node x`, both run attacker code
+        # inside a program this check called trusted.
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONHOME",
+        "PERL5OPT",
+        "PERL5LIB",
+        "PERLLIB",
+        "RUBYOPT",
+        "RUBYLIB",
+        "GEM_PATH",
+        "GEM_HOME",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "CLASSPATH",
     }
 )
+
+#: Assignment-name FAMILIES that decide what code runs. Named as families rather
+#: than as more exact spellings because this is the shape that kept recurring:
+#: every round found one more interpreter or tool with its own way of being told
+#: to load code, and an exact list can only ever be as complete as the last
+#: person to think about it. A loader prefix (``LD_*``, ``DYLD_*``) and the
+#: option/search-path suffixes cover the families themselves.
+#:
+#: Over-refusing is the safe direction and its cost is bounded: an assignment
+#: like ``PYTHONUNBUFFERED=1`` or ``MY_CONFIG_PATH=/x`` costs ONE approval
+#: prompt, because a refusal here never blocks and never rewrites the command.
+_EXEC_ENV_PREFIXES = ("LD_", "DYLD_")
+_EXEC_ENV_SUFFIXES = ("_OPTIONS", "OPT", "PATH", "LIB", "_PRELOAD")
+
+
+def _decides_execution(head: str) -> bool:
+    """Whether assigning *head* decides WHAT runs, not merely a program's inputs."""
+
+    return (
+        head in _EXEC_ENV_VARS
+        or head.startswith(_EXEC_ENV_PREFIXES)
+        or head.endswith(_EXEC_ENV_SUFFIXES)
+    )
+
 
 #: Returned by :func:`_shebang_interpreter` for an ``env`` shebang carrying more
 #: than one bare name. A sentinel rather than ``None`` or a guess: ``None`` means
@@ -665,7 +742,7 @@ def _shebang_interpreter(real: str) -> str | None:
     try:
         with open(real, "rb") as handle:
             first = handle.readline(256)
-    except OSError:
+    except (OSError, ValueError):
         return None
     if not first.startswith(b"#!"):
         return None
@@ -677,6 +754,19 @@ def _shebang_interpreter(real: str) -> str | None:
         return None
     interpreter = tokens[0]
     if os.path.basename(interpreter) in ("env", "env.exe"):
+        # The `env` BINARY is what the kernel runs, so it decides what executes
+        # no matter which name follows it. Reading the name and forgetting the
+        # path would validate `node` while `#!~/.local/bin/env node` runs a
+        # planted `env` -- and because a pin binds the SCRIPT's bytes, the script
+        # keeps matching while the file behind its shebang is swapped. So the
+        # path is held to the same standard as any other program: it must BE the
+        # system `env`, not merely be spelled like it.
+        try:
+            real_env = os.path.realpath(interpreter)
+        except (OSError, ValueError):
+            return _COMPLEX_ENV_SHEBANG
+        if not _is_trusted_system_file(os.path.basename(interpreter), real_env):
+            return _COMPLEX_ENV_SHEBANG
         # ONLY the bare `#!/usr/bin/env NAME` form is read. `env`'s options take
         # operands (`-u VAR`, `-S 'cmd args'`, `--chdir=DIR`), so picking the
         # first non-flag token mistakes `VAR` for the interpreter -- which is
@@ -714,7 +804,7 @@ def _is_regular_file(real: str) -> bool:
 
     try:
         return stat.S_ISREG(os.stat(real).st_mode)
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -750,7 +840,7 @@ def _content_digest(real: str, size: int) -> str | None:
                     break
                 digest.update(chunk)
         return digest.hexdigest()
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
@@ -766,7 +856,7 @@ def _identity(real: str) -> tuple | None:
 
     try:
         st = os.stat(real)
-    except OSError:
+    except (OSError, ValueError):
         return None
     digest = _content_digest(real, st.st_size)
     if digest is None:
@@ -902,7 +992,7 @@ def _program_refusal(
             )
         try:
             real = os.path.realpath(name)
-        except OSError:
+        except (OSError, ValueError):
             return Refusal(UNINSPECTABLE, f"{name} could not be resolved")
         roots = _agent_writable_roots()
         if is_project_local(name) or _within(name, roots) or _within(real, roots):
@@ -911,6 +1001,9 @@ def _program_refusal(
             # Spelling the system program's own path out is still the system
             # program; it needs no witness.
             return _interpreter_refusal(name, real, witness, depth)
+        dispatched = _dispatcher_target_refusal(name, real, as_interpreter)
+        if dispatched is not None:
+            return dispatched
         pinned = _pin_refusal(name, name, real, witness)
         if pinned is not None:
             return pinned
@@ -945,7 +1038,7 @@ def _program_refusal(
         )
     try:
         real = os.path.realpath(found)
-    except OSError:
+    except (OSError, ValueError):
         return Refusal(UNINSPECTABLE, f"{name} could not be resolved")
     # `is_project_local` reads the location the name was FOUND in, never the
     # symlink target: a real system install can legitimately resolve THROUGH a
@@ -967,10 +1060,42 @@ def _program_refusal(
         # no witness is needed -- this is what keeps coreutils and the read-only
         # allowlist working with no approval history at all.
         return _interpreter_refusal(name, real, witness, depth)
+    dispatched = _dispatcher_target_refusal(name, real, as_interpreter)
+    if dispatched is not None:
+        return dispatched
     pinned = _pin_refusal(name, found, real, witness)
     if pinned is not None:
         return pinned
     return _interpreter_refusal(name, real, witness, depth)
+
+
+def _dispatcher_target_refusal(name: str, real: str, as_interpreter: bool) -> Refusal | None:
+    """Refuse a name whose RESOLVED file is a dispatcher, however it is spelled.
+
+    The check above this one reads the name as WRITTEN, so it catches `env foo`
+    and misses an alias for it: an agent plants `runner -> /usr/bin/env`, a human
+    approves `runner` once and pins it, and every later `runner <payload>` is
+    auto-approved while `env` runs the payload. The dispatcher rule is about the
+    FILE's behaviour, so it has to be asked of the file.
+
+    Deliberately reached only AFTER the trusted-system branch. On a BusyBox
+    install every coreutils name resolves to `/bin/busybox`, which is a
+    dispatcher by basename; those names are already recognised as the system
+    program they are, so asking this question later leaves them alone and still
+    catches a planted alias, which is never a trusted system file.
+    """
+
+    if as_interpreter:
+        # A shebang's interpreter runs the pinned script, not a program named in
+        # a command line, which is the distinction the caller already draws.
+        return None
+    if os.path.basename(real) not in _DISPATCHERS:
+        return None
+    return Refusal(
+        DISPATCHER,
+        f"{name} resolves to a program that runs whatever its arguments name, "
+        "which this check cannot identify from the command line",
+    )
 
 
 def _interpreter_refusal(name: str, real: str, witness: bool, depth: int) -> Refusal | None:
@@ -1007,7 +1132,7 @@ def _is_trusted_system_file(name: str, real: str) -> bool:
         return False
     try:
         return os.path.normcase(os.path.realpath(system)) == os.path.normcase(real)
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 

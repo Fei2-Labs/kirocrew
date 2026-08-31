@@ -692,14 +692,82 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     # that expires on a clock the operator did not ask for, which presents as a
     # phone that randomly signs itself out. The fallback is not unbounded
     # either — a boot-bound session still ends at the next restart.
+    # Read INDEPENDENTLY, each with its own conservative default, rather than as
+    # one all-or-nothing block. Coupling them means a config object missing any
+    # ONE attribute discards the other two — so adding this shape would silently
+    # take the existing opt-out away from anyone whose config predates it, which
+    # is the opposite of "an unreadable override falls back to the default".
+    # Per-field is the faithful version of that rule.
+    _until_restart = True
+    _persist = False
+    _identity_trusted = False
     try:
         _cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        _until_restart = bool(_cfg.dashboard.qr_session_until_restart)
     except Exception:
         logger.debug("tailnet mobile: config unreadable for session shape", exc_info=True)
-        _until_restart = True
+    else:
+        _dash = getattr(_cfg, "dashboard", None)
+        _until_restart = bool(getattr(_dash, "qr_session_until_restart", True))
+        _persist = bool(getattr(_dash, "qr_session_persist_across_restart", False))
+        _ts = getattr(_dash, "tailscale", None)
+        _identity_trusted = bool(
+            getattr(_ts, "trust_identity", False) and getattr(_ts, "allowed_logins", None)
+        )
 
-    if _until_restart:
+    # THIRD shape - ``persistent``: the refresh chain with NO boot claim, so one
+    # scan survives a gateway restart and is bounded only by the chain's own
+    # 30-day lifetime. Opt-in, because the boot bound it removes is a hard revoke
+    # needing no recorded state, and that default was chosen deliberately.
+    #
+    # GATED on daemon-verified tailnet identity, and the gate is what makes this
+    # offerable at all rather than merely convenient. Behind ``tailscale serve``
+    # every request reaches the gateway from 127.0.0.1 (#1762), so with identity
+    # trust off the pin is ``ip:127.0.0.1`` for every tailnet client and the
+    # cookie is a bearer credential any of them could replay. A session that ends
+    # at the next restart bounds that exposure; one that outlives the process does
+    # not. With ``trust_identity`` plus an allowlist the session pins to a
+    # verified peer instead, and the exposure is bounded by identity rather than
+    # by uptime.
+    #
+    # Both refusals are LOUD. Turning the flag on and silently getting a
+    # boot-bound session is the "checked but never ran, reported as a clean
+    # result" defect: the operator would believe the phone survives restarts and
+    # find out only by being signed out.
+    if _persist and not _until_restart:
+        logger.warning(
+            "dashboard.qr_session_persist_across_restart is on but "
+            "qr_session_until_restart is off, so the timed shape is in force and "
+            "there is no refresh chain to carry across a restart. The phone "
+            "session stays bounded by its TTL; turn qr_session_until_restart on "
+            "to use the persistent shape."
+        )
+        _persist = False
+    if _persist and not _identity_trusted:
+        logger.warning(
+            "dashboard.qr_session_persist_across_restart is on but tailnet "
+            "identity trust is not configured, so the phone session stays bound "
+            "to this gateway process. Behind `tailscale serve` every request "
+            "arrives from 127.0.0.1, so without dashboard.tailscale.trust_identity "
+            "plus a non-empty allowed_logins the session cannot be pinned to a "
+            "verified peer and must not outlive the process."
+        )
+        _persist = False
+
+    if _persist:
+        # No ``boot``, so the chain rather than the process bounds this session,
+        # and no ``no_refresh``, so the chain exists at all. ``require_peer`` is
+        # what keeps that honest: this session's whole security argument is that
+        # it is pinned to a daemon-verified tailnet identity, so the chain must
+        # refuse to rotate whenever that identity cannot be established.
+        #
+        # An address pin is NOT an alternative here, and that is the whole reason
+        # this claim exists rather than reusing the boot-bound rotation path.
+        # Behind ``tailscale serve`` every request reaches the gateway from
+        # 127.0.0.1, so ``ip:127.0.0.1`` is satisfied by every peer on the
+        # tailnet - it would read as a pin in the audit trail while excluding
+        # nobody. Refusing the rotation is the only bound that actually holds.
+        shape: dict[str, str] = {"require_peer": "1"}
+    elif _until_restart:
         shape = {"boot": current_boot_id()}
     else:
         shape = {"no_refresh": "1"}
@@ -742,6 +810,14 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     # minted credential ``no_refresh`` regardless of the configured shape, so
     # the phone session never grows a refresh chain its authorizing session did
     # not have.
+    #
+    # This caps the PERSISTENT shape too, and that is correct rather than a gap:
+    # a credential must not outlive the session that authorized it, so an owner
+    # who is themselves signed in on a boot-bound session hands the phone a
+    # boot-bound session as well, whatever the config says. Reaching the
+    # persistent shape therefore also requires the authorizing session to be
+    # unbounded - which the desktop local-bootstrap mint is, since
+    # ``/api/token/local`` carries neither ``boot`` nor ``no_refresh``.
     claims = {**shape, **carried}
     token = generate_token(owner_id or "local-app", ttl_seconds=ttl, extra=claims)
     url = f"https://{host}/?token={token}"

@@ -24,7 +24,6 @@
     "hide_full_changelog": "▾ Hide Full Changelog",
     "i_d_like_to_request_a_feature": "I’d like to request a feature!",
     "iam_identity_center": "IAM Identity Center",
-    "kiro_credit_usage_api_key": "Kiro credit usage — not available with API key authentication",
     "kiro_credit_usage_unavailable": "Kiro credit usage — unavailable",
     "memory_unavailable": "Memory: unavailable",
     "metrics_are_stale_latest_fetch_failed": "Metrics are stale, latest fetch failed",
@@ -65,7 +64,10 @@
     "open_command_bar": "Open Command Bar",
     "focus_mode": "Focus mode",
     "focus_mode_title": "Focus mode · Alt+Shift+M",
-    "focus_mode_title_mac": "Focus mode · ⌥⇧M"
+    "focus_mode_title_mac": "Focus mode · ⌥⇧M",
+    "kiro_credit_usage_api_key": "Kiro credit usage — not available with API key authentication",
+    "active_harness": "New sessions use {{label}}. Open chats keep the harness they started with.",
+    "harness_new_sessions": "New sessions"
   },
   "appSdk": {
     "chatEmbed": {
@@ -307,7 +309,9 @@
       },
       "components": {
         "agentSessionButton": {
-          "resume": "Resume"
+          "already_finished_its_session_was_closed": "Already finished — transcript under Older Sessions.",
+          "resume": "Resume",
+          "start_over": "Start over"
         },
         "aiSummaryCard": {
           "outdated": "outdated",
@@ -1279,11 +1283,6 @@
     "appHost": {
       "not_installed": "\"{{name}}\" is not installed"
     },
-    "approvalCard": {
-      "approval_no_longer_pending": "This approval has expired or was already decided — the agent is no longer waiting on it.",
-      "decision_failed": "This decision may not have been recorded — the request failed.",
-      "decision_not_recorded_error": "This decision wasn't recorded: {{error}}"
-    },
     "approvalModePicker": {
       "approval_mode_aria": "Approval mode: {{mode}}",
       "normal_label": "Normal",
@@ -1335,7 +1334,7 @@
         "research_writing": "Research & Writing"
       },
       "trustAppModal": {
-        "title": "Trust {{app}} to run its own code?",
+        "title": "Trust “{{app}}” to run its own code?",
         "scope": "This applies to {{app}} only. Every other third-party app stays blocked.",
         "on_cancel": "Cancel changes nothing: {{app}} stays installed but switched off, and you can turn it on later.",
         "intro": "If you trust {{app}}, {{productName}} will allow it to do all of the following.",
@@ -1385,13 +1384,6 @@
       "terminal": "Terminal"
     },
     "chatInput": {
-      "send_a_message_or_tap_the_mic_for_voice": "Send a message, or tap the mic for voice",
-      "release_to_transcribe": "Release to transcribe",
-      "hold_to_talk": "Hold to talk",
-      "release_to_cancel": "Release to cancel",
-      "slide_up_to_cancel": "Slide up to cancel",
-      "switch_to_keyboard": "Switch to keyboard",
-      "switch_to_voice": "Switch to voice",
       "drop_to_attach": "Drop to attach",
       "agent": "Agent: {{name}}",
       "approve_sub_agent": "Approve sub-agent: {{name}}",
@@ -1432,8 +1424,21 @@
       "queue": "Queue",
       "queue_run_after_the_current_work_finishes_desc": "Run after the current work finishes",
       "steer_act_on_this_right_away_desc": "Act on this right away",
+      "send_a_message_or_tap_the_mic_for_voice": "Send a message, or tap the mic for voice",
+      "release_to_transcribe": "Release to transcribe",
+      "hold_to_talk": "Hold to talk",
+      "release_to_cancel": "Release to cancel",
+      "slide_up_to_cancel": "Slide up to cancel",
+      "switch_to_keyboard": "Switch to keyboard",
+      "switch_to_voice": "Switch to voice",
       "finishing": "Finishing…",
-      "keep_holding_to_record": "Keep holding to record"
+      "keep_holding_to_record": "Keep holding to record",
+      "plan_limit": "Plan limit",
+      "limit_type": "Limit type",
+      "resets": "Resets",
+      "rate_limit_allowed": "OK",
+      "rate_limit_warning": "Near limit",
+      "rate_limit_rejected": "Rate limited"
     },
     "chatPane": {
       "earlier_messages_load_failed": "Couldn't load earlier messages. Scroll to the top of the session to try again.",
@@ -1488,7 +1493,6 @@
         },
         "pagesProvider": {
           "developer": "Developer",
-          "explore": "Explore",
           "hooks": "Hooks",
           "kirocrew_agents": "{{productName}} Agents",
           "logs": "Logs",
@@ -1756,6 +1760,42 @@
     },
     "jobLogsView": {
       "failed_to_load_history": "Failed to load history"
+    },
+    "kasLogin": {
+      "aside_body": "Sign in to Kiro right here — no CLI to install, no terminal to open. Kiro Crew handles the rest.",
+      "aside_footnote": "Your sign-in stays on this machine — nothing is sent to Kiro Crew's servers.",
+      "aside_headline": "Sign in to start",
+      "browser_note": "Each option starts Kiro sign-in and walks you through the next step.",
+      "check_again": "Check again",
+      "continue_with_github": "Continue with GitHub",
+      "continue_with_google": "Continue with Google",
+      "copied": "Copied",
+      "copy_link": "Copy link",
+      "could_not_start_sign_in": "Could not start the sign-in. Check your connection and try again.",
+      "device_aside_body": "Kiro Crew is running on a different computer, so it can't open a browser window for you. Open the link below on any device — your phone works — and enter the code.",
+      "device_aside_footnote": "The code is valid for 5 minutes.",
+      "device_aside_headline": "Approve in your browser",
+      "enter_the_code_in_your_browser": "Finish signing in on your phone or another computer",
+      "enter_this_code": "Enter this code",
+      "get_started": "Get started",
+      "open_this_link": "Open this link on your phone or another browser",
+      "provider_builder_id": "AWS Builder ID",
+      "provider_company_sso": "Company SSO",
+      "provider_github": "GitHub",
+      "provider_google": "Google",
+      "remote_host": "Extra step",
+      "click_to_copy": "Click to copy",
+      "code_valid_note": "Code valid for 5 minutes",
+      "use_different_sign_in": "Use a different sign-in",
+      "sign_in_failed": "Sign-in failed",
+      "sign_in_failed_body": "Something went wrong while waiting for approval",
+      "sign_in_status_unavailable": "We could not check sign-in status",
+      "sign_in_to_kiro": "Sign in to Kiro",
+      "signing_in_with": "Signing in with {{provider}}",
+      "start_over": "Start over",
+      "the_code_expired": "The code expired",
+      "the_code_expired_body": "That sign-in code is no longer valid",
+      "waiting_for_you_to_approve": "Waiting for you to approve…"
     },
     "kiroPrerequisiteGate": {
       "agent_specs_missing": "Agent specs missing",
@@ -2116,7 +2156,11 @@
     },
     "skillPickerMenu": {
       "no_matching_skills_ctrl_enter_sends": "No matching skills — Ctrl+Enter sends the message",
-      "no_matching_skills_enter_sends": "No matching skills — Enter sends the message"
+      "no_matching_skills_enter_sends": "No matching skills — Enter sends the message",
+      "no_skills_mapped_to_agent": "No skills mapped to {{agent}}",
+      "no_skills_mapped_to_agent_ctrl_enter_sends": "No skills mapped to {{agent}} — Ctrl+Enter sends the message",
+      "no_skills_mapped_to_agent_enter_sends": "No skills mapped to {{agent}} — Enter sends the message",
+      "scoped_to_agent": "Scoped to agent {{agent}}"
     },
     "snipOverlay": {
       "could_not_capture_the_selected_region_please_try": "Could not capture the selected region. Please try again."
@@ -2351,6 +2395,7 @@
       "desc_todos": "Show or manage the task list",
       "desc_tools": "Show available tools",
       "desc_usage": "Show billing and usage information",
+      "desc_workflow": "List or run a saved workflow by name",
       "no_matching_commands_ctrl_enter_sends": "No matching commands — Ctrl+Enter sends the message",
       "no_matching_commands_enter_sends": "No matching commands — Enter sends the message"
     },
@@ -2439,6 +2484,11 @@
       "unsaved_changes": "Unsaved changes",
       "webhook_unbound_short": "No tokens bound",
       "wire_what_it_works_with": "What it works with"
+    },
+    "approvalCard": {
+      "approval_no_longer_pending": "This approval has expired or was already decided — the agent is no longer waiting on it.",
+      "decision_failed": "This decision may not have been recorded — the request failed.",
+      "decision_not_recorded_error": "This decision wasn't recorded: {{error}}"
     },
     "confirmDialog": {
       "cancel": "Cancel"
@@ -2591,14 +2641,16 @@
   "nav": {
     "agent_capabilities": "Agent Capabilities",
     "artifacts": "Artifacts",
-    "explore": "Explore",
+    "discover": "Discover",
     "knowledge": "Knowledge",
+    "library": "Library",
     "notifications": "Notifications",
     "schedule": "Schedule",
     "sessions": "Sessions",
     "settings": "Settings",
     "task_runner": "Task Runner",
-    "webhooks": "Webhooks"
+    "webhooks": "Webhooks",
+    "crew_members": "Crew Members"
   },
   "pages": {
     "agentsPage": {
@@ -2648,17 +2700,17 @@
       "action_failed": "Failed to {{action}} {{name}}",
       "all_apps": "All apps",
       "built_in_kirocrew": "Built-in · kirocrew",
-      "discover": "Discover",
       "failed_to_enable": "Failed to enable {{name}}",
       "failed_to_load_apps": "Failed to load apps",
       "failed_to_load_registry": "Failed to load registry",
       "failed_to_uninstall": "Failed to uninstall {{name}}",
       "failed_to_update": "Failed to update: {{names}}",
-      "find_apps_in_the_discover_tab_or_install_from_a": "Find apps in the Discover tab, or install from a local path via the sources gear above.",
-      "hidden_you_can_re_enable_it_from_the_discover_ta": "Disabled. You can re-enable it from the Discover tab.",
+      "find_apps_in_the_discover_tab_or_install_from_a": "Find apps on the Discover page, or install from a local path via Sources there.",
+      "hidden_you_can_re_enable_it_from_the_discover_ta": "Disabled. You can re-enable it from the Discover page.",
       "keep_dependency": "Keep dependency {{name}}",
       "kirocrew_registry": "{{productName}} registry",
       "library": "Library",
+      "manage_your_installed_apps": "Manage your installed apps",
       "no_apps_installed_yet": "No apps installed yet",
       "removing": "Removing…",
       "search_library": "Search library",
@@ -2671,6 +2723,9 @@
       "uninstall_removes_metadata_secret_and_source": "Installed from Apps — {{productName}} metadata, the app secret, and the downloaded source code will be removed.",
       "updated_app_one": "Updated {{count}} app.",
       "updated_app_other": "Updated {{count}} apps.",
+      "updates_hint_link": "View updates",
+      "updates_hint_one": "{{count}} update available",
+      "updates_hint_other": "{{count}} updates available",
       "updating_progress": "Updating {{done}}/{{total}}…"
     },
     "artifactDeployPage": {
@@ -2829,7 +2884,9 @@
       "hooks_label": "Hooks",
       "hooks_description": "Shell commands that run automatically on agent events like prompts, tool calls, and session start/stop",
       "prompts_label": "Prompts",
-      "prompts_description": "Reusable prompt templates from {{registry}}"
+      "prompts_description": "Reusable prompt templates from {{registry}}",
+      "workflows_label": "Workflows",
+      "workflows_description": "Create, edit, and run reusable agent workflows"
     },
     "channelPage": {
       "agent_joining_one": "{{count}} agent joining",
@@ -2856,6 +2913,14 @@
       "state_working": "working"
     },
     "chat": {
+      "workflowRunCard": {
+        "cancel": "Cancel",
+        "save_help": "Keep the exact workflow from this completed run in your global library.",
+        "save_title": "Save this workflow",
+        "save_workflow": "Save workflow",
+        "saved_as": "Saved as {{command}}",
+        "source_unavailable": "The completed workflow source could not be loaded."
+      },
       "activityViewer": {
         "approval_needed": "Approval Needed",
         "artifact_save_permanently": "Save permanently",
@@ -3451,15 +3516,15 @@
       "cannot_resolve_worktree_path_for_name": "Cannot resolve worktree path for {{name}}",
       "commits_behind_main_2_one": "{{count}} commit behind main",
       "commits_behind_main_2_other": "{{count}} commits behind main",
-      "make_name_live": "Make \"{{name}}\" live?",
+      "make_name_live": "Make “{{name}}” live?",
       "pod_up_name": "Pod up: {{name}}",
       "provision_failed": "Provision failed",
       "provision_failed_exit_code": "Provision failed (exit {{code}})",
       "provision_failed_status": "Provision failed ({{status}})",
       "pull_build_failed_exit_code_detail": "Pull+Build failed (exit {{code}}): {{detail}}",
-      "rebase_name": "Rebase \"{{name}}\"?",
+      "rebase_name": "Rebase “{{name}}”?",
       "rebased_head": "Rebased (HEAD {{head}})",
-      "remove_name": "Remove \"{{name}}\"?",
+      "remove_name": "Remove “{{name}}”?",
       "removed_name": "Removed {{name}}",
       "restarted_name": "Restarted {{name}}",
       "starting_pod_for_name_can_take_1_min": "Starting pod for {{name}}… (can take ~1 min)",
@@ -3472,8 +3537,8 @@
       "cutover_staged_run_the_restart_command_to_finish": "Cutover staged: this worktree becomes live when the gateway next starts. Run `{{cmd}}` to finish it — the gateway is still running the previous checkout until then.",
       "stages_the_code_behind_the_live_dashboard_manual": "Stages this worktree as the live target (same port, same data). Dev Fleet cannot restart this gateway, so the swap takes effect when you run `{{cmd}}` yourself — this page will NOT reconnect on its own. Refused unless the worktree is provisioned and built.",
       "cancel_staged_cutover": "Cancel staged cutover",
-      "keeps_name_the_live_target_and_discards_the_stag": "Keeps {{name}} as the live target and discards the staged switch to {{staged}}. Nothing restarts — the gateway keeps running the code it is running now.",
-      "keeps_this_checkout_the_live_target_and_discards": "Keeps this checkout the live target and discards the staged switch to {{staged}} (nothing restarts)",
+      "keeps_name_the_live_target_and_discards_the_stag": "Keeps “{{name}}” as the live target and discards the staged switch to “{{staged}}”. Nothing restarts — the gateway keeps running the code it is running now.",
+      "keeps_this_checkout_the_live_target_and_discards": "Keeps this checkout the live target and discards the staged switch to “{{staged}}” (nothing restarts)",
       "cancel_staged_cutover_2": "Cancel staged cutover?",
       "keep_cutover": "Keep cutover",
       "cutover_staged_run_cmd_to_finish_or_cancel": "Cutover staged: this worktree becomes live when the gateway next starts. Run `{{cmd}}` to finish it, or use this row’s menu → Cancel staged cutover to back out. The gateway is still running the previous checkout until then.",
@@ -3484,8 +3549,17 @@
       "no_checkout_found_env_example": "KIROCREW_DEVFLEET_REPO=/path/to/your/checkout",
       "no_checkout_found_action": "Set the environment variable below, or add dev_fleet.repo_path to config.json in your {{productName}} data directory (~/.kiro/crew by default) to make it stick, then restart the gateway."
     },
+    "developer": {
+      "featurePreviewsTab": {
+        "experimental_acp_backends_claude_code": "Claude Code as an alternative to Kiro CLI. Experimental — safety refusals work; end-to-end sessions are not yet verified."
+      }
+    },
     "developerPage": {
       "tabs": {
+        "agentBackend": {
+          "description": "Which agent new sessions start — Kiro CLI, Claude Code, or KAS",
+          "label": "Agent Backend"
+        },
         "archive": {
           "description": "Rotated/compacted session history (7-day retention)",
           "label": "Archive"
@@ -3523,6 +3597,20 @@
           "label": "Telemetry"
         }
       }
+    },
+    "discoverPage": {
+      "subtitle": "Browse and install agentic apps",
+      "tab_featured": "Featured",
+      "tab_updates": "Updates",
+      "title": "Discover",
+      "updates_badge_label_one": "{{count}} update available",
+      "updates_badge_label_other": "{{count}} updates available",
+      "updates_empty": "Everything is up to date.",
+      "updates_empty_back_to_featured": "Browse Featured apps",
+      "version_diff": "v{{from}} → v{{to}}",
+      "updating": "Updating…",
+      "updates_check_failed": "Couldn't check for updates.",
+      "updates_retry": "Retry"
     },
     "hooksPage": {
       "click_again_to_confirm": "Click again to confirm",
@@ -3798,6 +3886,31 @@
       "click_a_notification_to_view_details_jump_to_the": "Click a notification to view details. Jump to the source chat or job from the detail panel."
     },
     "overview": {
+      "workflowLibrary": {
+        "adapted_from": "Adapted from",
+        "create_draft": "Create draft",
+        "create_title": "Create a reusable workflow",
+        "description": "Saved workflows are global to Kiro Crew and work with every supported agent harness. New drafts can adapt matching saved workflows without changing them.",
+        "empty": "No saved workflows found.",
+        "intent": "What should this workflow do?",
+        "loading": "Loading workflows…",
+        "name": "Name",
+        "new_workflow": "New workflow",
+        "request_failed": "Workflow request failed",
+        "revision": "Revision {{revision}}",
+        "run": "Run workflow",
+        "run_input": "Input (available as ctx.args.input)",
+        "save_revision": "Save new revision",
+        "save_to_library": "Save to library",
+        "search": "Search workflows…",
+        "select_or_create": "Select a saved workflow or create a new one.",
+        "slug": "Slash-command name",
+        "source": "Workflow source",
+        "started": "Started {{runId}}",
+        "title": "Workflow library",
+        "updated": "Updated {{date}}",
+        "workflow_description": "Description"
+      },
       "agentCfgTab": {
         "agent_config_file": "Agent Config ({{file}})",
         "agent_config_tip": "The {{process}} agent definition — prompt, tools, MCP servers, model settings. This is the execution layer config, separate from {{productName}}'s operational bindings.",
@@ -3840,6 +3953,13 @@
         "servers_scope_tip": "MCP servers across Kiro Crew and your interactive {{provider}}/Kiro globals. The Kiro Crew badge shows if it'll load in Kiro Crew sessions; the Globals badge shows if it's shared to your interactive Kiro global. Click to toggle, then Apply.",
         "sign_in_required": "Sign-in required",
         "sign_in_required_help": "This server uses OAuth and nobody has signed in yet. <chatLink>Go to chat</chatLink>, start a new session, and send any message — you'll be asked to approve the sign-in in chat. Then probe to refresh this list.",
+        "sign_in": "Sign in",
+        "sign_in_retry": "Try again",
+        "sign_in_preparing": "Preparing sign-in…",
+        "sign_in_authorize": "Authorize {{name}}",
+        "sign_in_mint_failed": "Could not start the sign-in. Try again.",
+        "sign_in_timeout": "The sign-in did not produce an approval link in time. Try again.",
+        "sign_in_row_updates_after_probe": "Use Probe MCP servers above to refresh this row.",
         "oauth_not_a_static_token": "This server signs in with OAuth, so a static Authorization header cannot satisfy it. Remove and re-add this server without the header, enable it, then start a new chat session to sign in.",
         "sign_in_required_next": "Once you have approved it, use the Probe MCP servers button above this table; this row will then read Signed in.",
         "signed_in": "Signed in",
@@ -3991,6 +4111,17 @@
         "structured_semantic_key_value_episodic_conversat": "Structured semantic (key-value) + episodic (conversation fragments) memory with vector search. Embeddings are always-on — the model downloads automatically in the background.",
         "unknown_error": "Unknown error",
         "verifying_model_integrity": "Verifying model integrity…"
+      },
+      "acpBackend": {
+        "routing_routed": "Tool calls reach {{productName}}'s security gate",
+        "routing_indeterminate": "Tool-call routing is not verified — new sessions will refuse tool calls",
+        "routing_bypassed": "Tool calls would bypass {{productName}}'s security gate — new sessions will refuse tool calls",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "Ungated tools are allowed. Denied-command rules, sensitive-path blocking, and the governance ceiling are not consulted for this backend's self-approved calls.",
+        "applies_to_new_sessions": "New chats use this harness. A chat that is already open keeps the one it started with — switching here does not change it mid-session.",
+        "confirm_open_sessions": "This does not switch the harness mid-session. Open chats keep the one they started with until you start a new chat.",
+        "confirm_model_reset": "Model selections will be reset — each harness has its own model list. This includes open chats.",
+        "load_failed": "Could not load ACP adapters. Try again."
       }
     },
     "overviewPage": {
@@ -4097,7 +4228,7 @@
       "delete_2": "Delete {{n}}",
       "delete_failed": "Delete failed",
       "delete_job": "Delete job",
-      "delete_named_job": "Delete \"{{name}}\"?",
+      "delete_named_job": "Delete “{{name}}”?",
       "deleting": "Deleting…",
       "deleting_2": "Deleting...",
       "disable_strict_schedule_allow_jitter": "Disable strict schedule (allow jitter)",
@@ -4150,19 +4281,6 @@
       "script_source_download": "Download script",
       "script_source_failed": "Could not load the script source.",
       "script_source_truncated": "Truncated — the script is larger than the preview limit."
-    },
-    "servicesTab": {
-      "channels": "Channels",
-      "connect_error": "Connection error",
-      "discord": "Discord",
-      "imessage": "iMessage",
-      "teams": "Microsoft Teams",
-      "telegram": "Telegram",
-      "webex": "Webex",
-      "wecom": "WeCom",
-      "weixin": "WeChat",
-      "whatsapp": "WhatsApp",
-      "feishu": "Feishu"
     },
     "sessionArchive": {
       "no_matches_for_query": "No matches for \"{{query}}\".",
@@ -4253,7 +4371,16 @@
         "restart_after_installer_note": "Already ran it? Restart to load the new version — active sessions briefly disconnect.",
         "restart_confirm": "Click again to restart",
         "restart_row_note": "Restart the gateway process without updating. Active sessions briefly disconnect.",
-        "update_error_stage_invalidated": "This update was withdrawn or superseded. Check for updates to get the latest version."
+        "update_error_stage_invalidated": "This update was withdrawn or superseded. Check for updates to get the latest version.",
+        "in_app_update_intro": "The new version installs beside the current one and switches over atomically. Applying takes one approval command on the gateway host.",
+        "or_update_manually": "Or re-run the installer manually",
+        "armed_run_on_host": "Approve and apply by running this command on the gateway host.",
+        "armed_expires_in": "Approval window closes in {{time}}",
+        "armed_waiting_note": "Waiting for approval — once approved, progress appears here and the gateway restarts itself.",
+        "applying_update": "Applying the update…",
+        "applying_restart_note": "The gateway restarts itself when the new version is ready; this page reconnects automatically.",
+        "approval_window_expired": "The approval window expired without an approval. Arm the update again when ready.",
+        "try_again": "Try again"
       },
       "computerUsePanel": {
         "computer_use_lets_the_agent_read_any_app_window": "Computer use lets the agent read any app window and send clicks and keystrokes into it. Most clicks are delivered straight to the app and leave your pointer alone, but the agent can ask to move the real pointer when a target needs it. Password fields are never read; nothing else limits which apps it may drive.",
@@ -4317,7 +4444,11 @@
         "start_the_channel_at_gateway_startup": "Start the {{channel}} channel at gateway startup (requires a bot token).",
         "verified_with_channel_and_saved": "Verified with {{channel}} and saved. Restart the gateway to connect.",
         "where_to_find_the_bot_token": "Where to find the bot token",
-        "where_to_find_the_credential": "Where to find the {{label}}"
+        "where_to_find_the_credential": "Where to find the {{label}}",
+        "sdk_missing": "Install the {{channel}} SDK",
+        "sdk_missing_body": "The {{channel}} channel needs the {{package}} package, which is not installed by default. Run the command below in a terminal to add it.",
+        "sdk_restart_after_install": "Then restart the gateway to start the {{channel}} channel.",
+        "sdk_install_unsupported": "This gateway's Python cannot install extra packages, so {{package}} cannot be added here. Run the gateway from a Python environment where pip can install it."
       },
       "channelsPanel": {
         "checking": "Checking…",
@@ -5011,6 +5142,19 @@
     "worldsPopout": {
       "hide_controls": "Hide controls",
       "show_controls": "Show controls"
+    },
+    "servicesTab": {
+      "channels": "Channels",
+      "connect_error": "Connection error",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
+      "webex": "Webex",
+      "wecom": "WeCom",
+      "weixin": "WeChat",
+      "whatsapp": "WhatsApp",
+      "feishu": "Feishu"
     }
   },
   "privacyDisclosure": {

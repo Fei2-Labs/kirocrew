@@ -864,6 +864,9 @@ class TestSandboxCleanupPathIsDropped:
         sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
         proc = AsyncMock()
         proc.stdout.readline = AsyncMock(side_effect=[b'{"type": "ready"}\n', b""])
+        proc.stdin = Mock()
+        proc.stdin.is_closing.return_value = False
+        proc.stdin.drain = AsyncMock()
         proc.kill = Mock()
         proc.returncode = None
         session = apple_speech.StreamingSession()
@@ -887,6 +890,9 @@ class TestSandboxCleanupPathIsDropped:
         sandbox_patch, created = _cleanup_file_sandbox(tmp_path)
         proc = AsyncMock()
         proc.stdout.readline = AsyncMock(side_effect=[b'{"type": "ready"}\n', b""])
+        proc.stdin = Mock()
+        proc.stdin.is_closing.return_value = False
+        proc.stdin.drain = AsyncMock()
         proc.kill = Mock()
         proc.returncode = None
         session = apple_speech.StreamingSession()

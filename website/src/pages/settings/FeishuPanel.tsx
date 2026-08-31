@@ -85,6 +85,10 @@ function feishuSpec(): BotChannelSpec {
       new: '/new',
     }),
     emptyAllowlistHint: i18nT('pages.settings.feishuPanel.empty_allowlist_hint'),
+    // lark-oapi ships as the optional [feishu] extra, so a fully credentialed
+    // channel still cannot start without it; the panel surfaces the install
+    // command for THIS gateway's interpreter when it is missing.
+    sdkExtra: { packageLabel: 'lark-oapi' },
     getConfig: api.getFeishuConfig,
     saveConfig: api.saveFeishuConfig,
     // The badge tracks the receiver thread, which a rejected app ends within
