@@ -3859,9 +3859,10 @@ class TestAcpRuntimeLoadSession:
         two files, and this bug was exactly one of them silently sending [].
         Enumerate every function that issues session/new or session/load and
         assert each one consults the pooled-stub resolution (either
-        pooled_session_servers directly or the _pooled_mcp_servers hook), so a
-        fourth builder — or a regression in an existing one — fails here
-        instead of shipping another silent un-pooling path."""
+        pooled_session_servers directly, the _pooled_mcp_servers hook, or the
+        _session_mcp_servers merger that wraps both), so a fourth builder — or
+        a regression in an existing one — fails here instead of shipping
+        another silent un-pooling path."""
         import ast
         import inspect
 
@@ -3870,6 +3871,11 @@ class TestAcpRuntimeLoadSession:
 
         _SEND_FUNCS = {"_send_request", "_send_and_await"}
         _SESSION_METHODS = {"METHOD_SESSION_NEW", "METHOD_SESSION_LOAD"}
+        _POOLED_HOOKS = {
+            "pooled_session_servers",
+            "_pooled_mcp_servers",
+            "_session_mcp_servers",  # wraps _pooled_mcp_servers + spec entries
+        }
 
         def _builders(module) -> dict[str, str]:
             src = inspect.getsource(module)
@@ -3899,7 +3905,7 @@ class TestAcpRuntimeLoadSession:
             "_initialize_session",
         } <= builders.keys(), f"expected builders missing from scan: {sorted(builders)}"
         for name, body in builders.items():
-            assert "pooled_session_servers" in body or "_pooled_mcp_servers" in body, (
+            assert any(hook in body for hook in _POOLED_HOOKS), (
                 f"{name} issues session/new or session/load but never consults "
                 "the pooled broker stubs — it would un-pool its sessions (#3528)"
             )

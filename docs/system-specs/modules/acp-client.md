@@ -186,6 +186,26 @@ flag passed to `kiro-cli acp` at spawn time drives all configuration:
     to their canonical stdio command (overriding any stale `url`) and always
     injected even when the registry is missing. Read per spawn so MCP
     installs/toggles apply on the next session without a gateway restart.
+  - **opencode-acp** (and any other non-kiro external backend): like
+    claude-agent-acp, reads NO KiroCrew config itself, so `session/new` and
+    `session/load` must carry the resolved agent spec's MCP servers in
+    `mcpServers`. `_external_session_mcp_servers()` →
+    `mcp_gateway.session_servers.agent_session_servers(agent)` reads
+    `~/.kiro/agents/<agent>.json` (via `agent.agent_spec_path`), fails soft on
+    missing/malformed files (returns `[]`, never raises), skips `disabled`
+    entries, and shapes each enabled server to the ACP array form (stdio →
+    `{name,command,args,env:[{name,value}]}` via the shared `_acp_server_entry`;
+    `type:"http"` → `{name,type:"http",url,headers:[]}`). This is how
+    `kirocrew-computer` — which is session-bound and therefore DISQUALIFIED
+    from pooling (`mcp_gateway/shareability.py`) — reaches an OpenCode session:
+    it rides along as a plain spec entry, never through the pool.
+    `_session_mcp_servers()` merges the three sources — claude-specific entries
+    (empty for non-claude backends), the agent-spec entries, and the pooled
+    broker stubs — with **pooled stubs winning on name collision** (matching
+    kiro-cli's injection-outranks-spec precedence, so a pooled server is not
+    double-launched). kiro-cli itself is excluded (`_is_kiro` short-circuits to
+    `[]`) because it loads servers via `--agent`; injecting the spec there
+    would launch every server twice.
 - **Tools/allowedTools/toolsSettings**: Applied by kiro-cli via `set_mode`.
 - **Prompt/resources/hooks**: Applied by kiro-cli via `set_mode`.
 - **deniedCommands**: Enforced by KiroCrew's `_enforce_denied_commands()` on
@@ -229,11 +249,13 @@ attempts `session/load` instead of `session/new`:
 
 1. Check `agentCapabilities.loadSession` from `initialize` response
 2. Verify `~/.kiro/sessions/cli/{sid}.json` exists on disk
-3. Send `session/load` with `sessionId`, `cwd`, `mcpServers` (the pooled
-   broker stubs, re-declared so the resumed session keeps talking to the
-   shared gateway — `session/load` re-initializes the session's MCP servers,
-   so an empty list would un-pool the session; `[]` only when the gateway is
-   disabled), and `_meta: {"_kiro.dev/session_file": "<path>"}` (required —
+3. Send `session/load` with `sessionId`, `cwd`, `mcpServers` (the merged
+   server set from `_session_mcp_servers()` — pooled broker stubs re-declared
+   so the resumed session keeps talking to the shared gateway, plus the
+   agent-spec entries for external backends that don't read the spec
+   themselves; `session/load` re-initializes the session's MCP servers, so an
+   empty list would un-pool the session; `[]` only when the gateway is
+   disabled AND the backend is kiro-cli), and `_meta: {"_kiro.dev/session_file": "<path>"}` (required —
    without it kiro-cli silently ignores the request). `AcpRuntime.load_session`
    builds the same params for the multiplexed runtime.
 4. On success (response contains `modes`): set `_session_id`, `_resumed = True`
