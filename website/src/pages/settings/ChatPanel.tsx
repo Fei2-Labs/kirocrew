@@ -4,7 +4,7 @@ import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, Settings
 import { loadChatConfig, saveChatConfig, type ChatConfig, type ContentWidth, type DashboardConfig, type SendMode } from '../chat/ChatSettings'
 import { api } from '../../api/client'
 import { useAvailableModels } from '../../hooks/useAvailableModels'
-import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
+import { EFFORT_LEVELS, effortLabel, showEffortControl } from '../../lib/effort'
 import { isMac } from '../../utils/platform'
 import { capRoleOther, clampRoleOther } from '../../lib/userProfile'
 import { ROLE_SLUGS, TECH_SLUGS } from '../../lib/profileOptions'
@@ -63,8 +63,8 @@ const SOFT_STOP_DEFAULT = 10.0
 type CompletionKeepMode = 'head' | 'tail' | 'both'
 const COMPLETION_KEEP_OPTIONS: CompletionKeepMode[] = ['head', 'tail', 'both']
 
-type VerbosityLevel = 'default' | 'concise' | 'ultra'
-const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra']
+type VerbosityLevel = 'default' | 'concise' | 'ultra' | 'answer_only'
+const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra', 'answer_only']
 
 /**
  * Narrow a persisted `dashboard.verbosity` to a level this Select can render.
@@ -153,8 +153,8 @@ export function ChatPanel() {
     session?: { autocompact_pct?: number }
     session_summary?: { enabled?: boolean }
     agent?: {
-      model?: string
       acp_backend?: string
+      model?: string
       role_models?: { background?: string; subagent?: string }
       role_efforts?: { background?: string; subagent?: string }
       reasoning_effort?: string
@@ -300,8 +300,14 @@ export function ChatPanel() {
   // ── Default model + default reasoning effort ──
   // These are the DEFAULTS for new sessions. A session's own model/effort
   // picker still overrides them per-slot; nothing here touches live sessions.
-  // Same query key as every other model picker so the list is fetched once.
-  const availableModels = useAvailableModels()
+  // Scoped to the configured harness so a backend save does not keep showing
+  // the previous catalog while the first refetch is in flight.
+  const configBackend = mcCfg?.agent?.acp_backend ?? ''
+  const availableModels = useAvailableModels({ backend: configBackend })
+  const { data: advertisedEffort } = useQuery({
+    queryKey: ['effort-levels', 'config'],
+    queryFn: () => api.effortLevels(),
+  })
   // '' in config means "unset" and resolves the same way 'auto' does, so both
   // render as the 'auto' option rather than as a missing selection.
   const defaultModel = mcCfg?.agent?.model || 'auto'
@@ -321,7 +327,7 @@ export function ChatPanel() {
   // Effort is only meaningful on reasoning-capable models. Rather than hide the
   // row (which would make the setting look absent), keep it visible and
   // disabled with an explanatory hint.
-  const effortSupported = modelSupportsEffort(defaultModel)
+  const effortSupported = showEffortControl(advertisedEffort, defaultModel, configBackend)
   const defaultEffortMut = useMutation({
     mutationFn: (v: string) => api.patchConfig('agent.reasoning_effort', v),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
@@ -388,8 +394,16 @@ export function ChatPanel() {
   // rather than folded into this copy fix.
   const backgroundEffort = mcCfg?.agent?.role_efforts?.background ?? ''
   const subagentEffort = mcCfg?.agent?.role_efforts?.subagent ?? ''
-  const bgEffortSupported = modelSupportsEffort(backgroundModel !== 'auto' ? backgroundModel : defaultModel)
-  const subEffortSupported = modelSupportsEffort(subagentModel !== 'auto' ? subagentModel : defaultModel)
+  const bgEffortSupported = showEffortControl(
+    advertisedEffort,
+    backgroundModel !== 'auto' ? backgroundModel : defaultModel,
+    configBackend,
+  )
+  const subEffortSupported = showEffortControl(
+    advertisedEffort,
+    subagentModel !== 'auto' ? subagentModel : defaultModel,
+    configBackend,
+  )
   const effortLabels = EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.settings.chatPanel.model_default') : effortLabel(l)))
   const backgroundEffortMut = useMutation({
     mutationFn: (v: string) => api.patchConfig('agent.role_efforts.background', v),
@@ -642,7 +656,7 @@ export function ChatPanel() {
           <SettingsSelect label={i18nT('pages.settings.chatPanel.widget_density')} description={i18nT('pages.settings.chatPanel.how_aggressively_the_agent_uses_inline_widgets_f')} value={dashCfg.widget_density ?? 'more'} options={['more', 'less']} optionLabels={[i18nT('pages.settings.chatPanel.more_encourage_widgets'), i18nT('pages.settings.chatPanel.less_only_when_needed')]} onChange={v => setDash({ widget_density: v as 'more' | 'less' })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.mcp_apps_in_side_panel')} description={i18nT('pages.settings.chatPanel.render_interactive_mcp_apps_in_the_right_side_pa')} checked={dashCfg.mcp_app_panel} onChange={v => setDash({ mcp_app_panel: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.auto_open_git_panel')} description={i18nT('pages.settings.chatPanel.expand_the_side_panel_to_the_git_tab_each_time_yo')} checked={dashCfg.auto_open_git_panel} onChange={v => setDash({ auto_open_git_panel: v })} disabled={dashDisabled} />
-          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} description={i18nT('pages.settings.chatPanel.how_terse_the_agent_s_prose_is_ultra_concise_cap')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.ultra_concise_3_sentences')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
+          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} description={i18nT('pages.settings.chatPanel.how_terse_the_agent_s_prose_is_ultra_concise_cap')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.ultra_concise_3_sentences'), i18nT('pages.settings.chatPanel.answer_only_details_on_request')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_context_percentage')} description={i18nT('pages.settings.chatPanel.display_usage_percentage_next_to_the_context_pro')} checked={chatCfg.showContextPct} onChange={v => setChat('showContextPct', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_token_usage')} description={i18nT('pages.settings.chatPanel.display_used_and_total_tokens_next_to_the_contex')} checked={chatCfg.showContextTokens} onChange={v => setChat('showContextTokens', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.feature_tips')} description={tipsConfigOff ? i18nT('pages.settings.chatPanel.disabled_by_instance_config_tips_enabled_false') : i18nT('pages.settings.chatPanel.show_occasional_feature_discovery_tips_above_the')} checked={!!tipsQ.data && tipsQ.data.enabled_config && !tipsQ.data.opted_out} onChange={v => tipsMut.mutate(v)} disabled={tipsConfigOff || tipsQ.isLoading || tipsQ.isError} />

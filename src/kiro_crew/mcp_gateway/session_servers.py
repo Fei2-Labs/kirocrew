@@ -76,19 +76,23 @@ def _acp_server_entry(
         # shadow the agent's working entry with a broken one. Skip instead,
         # leaving the spec's own server in place.
         return None
-    args = [a if isinstance(a, str) else json.dumps(a, sort_keys=True, default=str)
-            for a in (entry.get("args") or [])]
+    args = [
+        a if isinstance(a, str) else json.dumps(a, sort_keys=True, default=str)
+        for a in (entry.get("args") or [])
+    ]
     if channel_id and "--channel-id" not in args:
         args.extend(["--channel-id", channel_id])
     shaped: dict[str, Any] = {
         k: v for k, v in entry.items() if k not in _ACP_RESERVED and k != "command"
     }
-    shaped.update({
-        "name": name,
-        "command": command,
-        "args": args,
-        "env": _acp_env(entry.get("env")),
-    })
+    shaped.update(
+        {
+            "name": name,
+            "command": command,
+            "args": args,
+            "env": _acp_env(entry.get("env")),
+        }
+    )
     return shaped
 
 
@@ -141,7 +145,9 @@ def _load_overlay_for_agent(overlay_dir: Path, agent: str) -> dict[str, Any] | N
         logger.debug(
             "MCP-gateway: no overlay with name %r among %d filename-qualified "
             "candidate(s) in %s; session runs unpooled",
-            agent, len(candidates), overlay_dir,
+            agent,
+            len(candidates),
+            overlay_dir,
         )
     return None
 
@@ -191,6 +197,44 @@ def pooled_session_servers(
     return out
 
 
+def agent_session_servers(agent: str | None) -> list[dict[str, Any]]:
+    """Return enabled MCP entries from an agent spec in ACP array form.
+
+    External ACP backends do not load Kiro's agent file themselves. Keep this
+    reader fail-soft and use the same name resolver as the rest of the agent
+    configuration code so malformed or missing user files cannot block startup.
+    """
+    if not agent:
+        return []
+    try:
+        from kiro_crew.agent import agent_spec_path
+
+        path = agent_spec_path(agent)
+        if path is None:
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+        servers = data.get("mcpServers") if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError):
+        return []
+    if not isinstance(servers, dict):
+        return []
+    result: list[dict[str, Any]] = []
+    for name, entry in sorted(servers.items()):
+        if not isinstance(entry, dict) or entry.get("disabled") is True:
+            continue
+        if isinstance(entry.get("command"), str):
+            shaped = _acp_server_entry(str(name), entry)
+            if shaped is not None:
+                result.append(shaped)
+            continue
+        if entry.get("type") == "http" and isinstance(entry.get("url"), str):
+            headers = _acp_env(entry.get("headers"))
+            result.append(
+                {"name": str(name), "type": "http", "url": entry["url"], "headers": headers}
+            )
+    return result
+
+
 def injection_server_names(
     overlay_dir: str | Path | None,
     agent: str | None,
@@ -214,8 +258,8 @@ def injection_server_names(
     if not isinstance(servers, dict):
         return frozenset()
     return frozenset(
-        name for name, entry in servers.items()
-        if isinstance(entry, dict) and (
-            entry.get(_WRAPPER_MARKER) or entry.get(_WRAPPER_MARKER_LEGACY)
-        )
+        name
+        for name, entry in servers.items()
+        if isinstance(entry, dict)
+        and (entry.get(_WRAPPER_MARKER) or entry.get(_WRAPPER_MARKER_LEGACY))
     )

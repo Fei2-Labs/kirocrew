@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import AutoNudgePopover, { type AutoNudgeLoop } from '../components/AutoNudgePopover'
 import { __resetForTests, loadGoalDraft, saveGoalDraft } from '../utils/goalDrafts'
 import { DRAFT_SAVE_DEBOUNCE_MS } from '../utils/draftConstants'
@@ -7,14 +8,19 @@ import { DRAFT_SAVE_DEBOUNCE_MS } from '../utils/draftConstants'
 const SLOT = 'chat-1-100'
 
 function renderPopover(loop: AutoNudgeLoop | null) {
+  // A FRESH client per render: the popover reads the shared `cron-jobs` key, and
+  // a client reused across tests would serve one test's stubbed rows to the next.
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
   return render(
-    <AutoNudgePopover
-      slotKey={SLOT}
-      loop={loop}
-      open={true}
-      onOpenChange={() => {}}
-      onChange={() => {}}
-    />,
+    <QueryClientProvider client={qc}>
+      <AutoNudgePopover
+        slotKey={SLOT}
+        loop={loop}
+        open={true}
+        onOpenChange={() => {}}
+        onChange={() => {}}
+      />
+    </QueryClientProvider>,
   )
 }
 
@@ -27,7 +33,8 @@ describe('AutoNudgePopover goal persistence', () => {
   beforeEach(() => {
     localStorage.clear()
     __resetForTests()
-    // Popover only calls fetch on Save/Stop; stub so nothing escapes the test.
+    // The popover fetches on OPEN (reads /api/crons to list this slot's
+    // watches) and on Save/Stop. Stub so nothing escapes the test.
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({ loop: null }) })) as unknown as typeof fetch)
   })
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
@@ -169,7 +176,13 @@ describe('AutoNudgePopover number-field editing (idle / max cycles)', () => {
     // Click Start loop WITHOUT blurring the field first — save() must read the
     // raw string, not a stale committed number.
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: /Start loop/i })) })
-    const body = JSON.parse((fetch as unknown as { mock: { calls: any[][] } }).mock.calls[0][1].body)
+    // Select the call by URL, not by index: opening the popover also READS
+    // /api/crons to list this slot's watches, so the save POST is no longer
+    // call 0 and an index would pin an unrelated ordering.
+    const calls = (fetch as unknown as { mock: { calls: any[][] } }).mock.calls
+    const save = calls.find(c => String(c[0]).startsWith('/api/autonudge') && c[1]?.body)
+    expect(save, 'no /api/autonudge write was issued').toBeTruthy()
+    const body = JSON.parse(save![1].body)
     expect(body.idle_secs).toBe(45)
   })
 })
@@ -183,14 +196,16 @@ describe('AutoNudgePopover trigger chip — interrupted state', () => {
   afterEach(() => { vi.unstubAllGlobals() })
 
   const renderChip = (loop: AutoNudgeLoop | null, interrupted: boolean) => render(
-    <AutoNudgePopover
-      slotKey={SLOT}
-      loop={loop}
-      open={false}
-      onOpenChange={() => {}}
-      onChange={() => {}}
-      interrupted={interrupted}
-    />,
+    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}>
+      <AutoNudgePopover
+        slotKey={SLOT}
+        loop={loop}
+        open={false}
+        onOpenChange={() => {}}
+        onChange={() => {}}
+        interrupted={interrupted}
+      />
+    </QueryClientProvider>,
   )
 
   it('pulses while the loop is active and the session is healthy', () => {
@@ -215,5 +230,111 @@ describe('AutoNudgePopover trigger chip — interrupted state', () => {
     renderChip(null, true)
     const chip = screen.getByTitle('Set a goal')
     expect(chip.className).not.toContain('animate-pulse')
+  })
+})
+
+
+describe('AutoNudgePopover — zero-token watches armed on this slot', () => {
+  const cron = (over: Record<string, unknown> = {}) => ({
+    id: 'j1',
+    name: 'pr watch #6234',
+    schedule: 'every 60s',
+    next_run_ts: 1787816571,
+    session_key: `dashboard:${SLOT}`,
+    script: '~/.kiro/crew/crons/pr_watch.py:watch',
+    enabled: true,
+    ...over,
+  })
+
+  function stubCrons(rows: unknown[]) {
+    // `{ jobs: [...] }` is the endpoint's real envelope. An earlier version of
+    // these tests stubbed a bare array, which matched a wrong reader and hid a
+    // section that never rendered against the live gateway -- the fixture has to
+    // be the shape the server sends, or the test only proves the reader agrees
+    // with itself.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) =>
+        Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(String(url).startsWith('/api/crons') ? { jobs: rows } : { loop: null }),
+        }),
+      ) as unknown as typeof fetch,
+    )
+  }
+
+  beforeEach(() => { localStorage.clear(); __resetForTests() })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('lists a script cron this slot owns, so an armed watch is visible in chat', async () => {
+    // The reported gap: a watch is deliberately NOT an autonudge loop, so the
+    // popover showed "Set a goal" and nothing else while a watch was polling --
+    // the one surface a user opens to confirm something is running.
+    stubCrons([cron()])
+    await act(async () => { renderPopover(null) })
+    expect(await screen.findByText(/Zero-token watches/i)).toBeTruthy()
+    expect(screen.getByText('pr watch #6234')).toBeTruthy()
+  })
+
+  it('never lists a watch owned by a different slot', async () => {
+    // Ownership goes through the shared `runBelongsToSlot`, which normalizes the
+    // `dashboard:` namespace rather than demanding byte equality -- but the SLOT
+    // must still match, and that is the property worth pinning: another
+    // conversation's watch appearing here is worse than showing none.
+    stubCrons([cron({ session_key: 'dashboard:chat-9-999', name: 'someone elses watch' })])
+    await act(async () => { renderPopover(null) })
+    expect(screen.queryByText('someone elses watch')).toBeNull()
+    expect(screen.queryByText(/Zero-token watches/i)).toBeNull()
+  })
+
+  it('never lists a message-only cron under a zero-token heading', async () => {
+    // A cron with no script wakes the agent every fire. Listing it here would
+    // make the heading lie about what it costs.
+    stubCrons([cron({ script: '', name: 'daily reminder' })])
+    await act(async () => { renderPopover(null) })
+    expect(screen.queryByText('daily reminder')).toBeNull()
+    expect(screen.queryByText(/Zero-token watches/i)).toBeNull()
+  })
+
+  it('never lists a disabled watch as if it were armed', async () => {
+    stubCrons([cron({ enabled: false, name: 'paused watch' })])
+    await act(async () => { renderPopover(null) })
+    expect(screen.queryByText('paused watch')).toBeNull()
+  })
+
+  it('reads the jobs envelope the endpoint actually returns, not a bare array', async () => {
+    // The live endpoint answers `{ jobs: [...] }` (handlers/cron.py). Reading a
+    // bare array fails SILENTLY -- no error, the filter just never matches -- so
+    // this pins the envelope rather than trusting the reader. Found by a pod
+    // capture after the unit tests were green against the wrong fixture.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) =>
+        Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(String(url).startsWith('/api/crons') ? [cron()] : { loop: null }),
+        }),
+      ) as unknown as typeof fetch,
+    )
+    await act(async () => { renderPopover(null) })
+    // A bare array is NOT the contract, so nothing should be read out of it.
+    expect(screen.queryByText(/Zero-token watches/i)).toBeNull()
+  })
+
+  it('stays silent when the read fails rather than banner-ing over the goal form', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((url: string) =>
+        String(url).startsWith('/api/crons')
+          ? Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({}) })
+          : Promise.resolve({ ok: true, json: () => Promise.resolve({ loop: null }) }),
+      ) as unknown as typeof fetch,
+    )
+    await act(async () => { renderPopover(null) })
+    expect(screen.queryByText(/Zero-token watches/i)).toBeNull()
+    // The popover's actual job is still fully usable.
+    expect(screen.getByPlaceholderText(/Describe what you want the agent to accomplish/i)).toBeTruthy()
   })
 })

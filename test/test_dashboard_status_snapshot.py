@@ -173,8 +173,11 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "update_managed_by",
             "update_commits_ahead",
             "update_commits_behind",
+            "update_can_arm",
             "update_last_checked_at",
             "update_check_interval_secs",
+            "update_required",
+            "update_min_version",
         }
 
     def test_the_shared_reader_never_flattens_a_missing_verdict(self) -> None:

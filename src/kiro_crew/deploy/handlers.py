@@ -224,9 +224,11 @@ _LOCAL_DIR_SPEC = FieldSpec(name="local_dir", type=str, max_len=4096, pattern=_L
 # profile/region are LLM-influenceable (chat-native skill) and flow into subprocess
 # argv (--profile/--region) on every aws call, so they get schema validation too.
 # Both allow empty (clears profile / falls back to default region); the pattern is
-# only enforced on non-empty values by validate_field.
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-_PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
+# only enforced on non-empty values by validate_field. The profile charset
+# ('+' admitted for IAM Identity Center derived names, leading '-' excluded,
+# \Z anchor — #6055) is profiles.py's PROFILE_SPEC, aliased like REGION_SPEC
+# below rather than re-spelled here.
+_PROFILE_SPEC = profiles_mod.PROFILE_SPEC
 _REGION_SPEC = profiles_mod.REGION_SPEC
 
 # artifact_slug is LLM-influenceable (chat-native skill) and is used in a store

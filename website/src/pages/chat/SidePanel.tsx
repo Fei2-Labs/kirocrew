@@ -239,6 +239,13 @@ interface SidePanelProps {
   onFileSave: (filePath: string, content: string) => Promise<void>
   /** Close the whole panel (hides the side column). */
   onClose: () => void
+  /** Is the whole panel mounted-but-invisible? A live app or browser tab keeps
+   *  the subtree mounted through a close (its iframe / WebContentsView cannot
+   *  survive a remount), and the find pane hides it while owning the dock — so
+   *  "panel closed" is a visibility state, not an unmount. Tab bodies that bind
+   *  document-level keys need it: the SELECTED tab is still selected while the
+   *  panel is hidden, so tab selection alone does not mean the user can see it. */
+  panelHidden?: boolean
   /** Preview "focus" mode: when true the panel takes its maximum width (chat
    *  shrinks to its minimum), driven by the Web Preview tab's expand toggle. */
   expanded?: boolean
@@ -362,7 +369,7 @@ export default function SidePanel({
   tabsCtl, slot, onFileOpen, onArtifactOpen, onAddToContext,
   projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
   issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
-  onAddSourceToChat, onSubmitComments, onFileSave, onClose,
+  onAddSourceToChat, onSubmitComments, onFileSave, onClose, panelHidden,
   pins, pinsLoading, onJumpToPin, onUnpin,
   slotTitle, chatMode,
   expanded, fillWidth, canDockBottom = true,
@@ -690,7 +697,7 @@ export default function SidePanel({
                       <span className="shrink-0 opacity-80">{item.icon}</span>
                       <span className="text-[13px] font-medium">{i18nT(NEW_MENU_LABEL_KEY[item.kind])}</span>
                       {badge && (
-                        <span className="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-accent/12 text-accent font-medium shrink-0">{badge}</span>
+                        <span className="ml-auto text-[10px] px-2 py-0.5 rounded-full bg-accent-subtle text-accent font-medium shrink-0">{badge}</span>
                       )}
                     </div>
                     <div className="text-[11px] text-muted leading-snug">{i18nT(NEW_MENU_DESC_KEY[item.kind])}</div>
@@ -758,7 +765,11 @@ export default function SidePanel({
           return (
             <div key={t.id} className="absolute inset-0" style={{ display: isActive ? 'block' : 'none' }}>
               <TabBody
-                tab={t} active={isActive}
+                // Visible to the user means BOTH: this tab is the selected one
+                // AND the panel itself is on screen. A hidden panel still has a
+                // selected tab, so selection alone would let a closed panel's
+                // editor answer Escape and Cmd+S.
+                tab={t} active={isActive && !panelHidden}
                 slot={slot}
                 onClose={() => handleCloseTab(t.id)}
                 onContentChange={(c) => patchTab(t.id, { content: c })}
@@ -848,8 +859,11 @@ function McpAppTabBody({ tab, slot }: { tab: PanelTab; slot: string }) {
  * Rail visibility is a single app-wide preference; the rail only renders at
  * all when the chat has a project dir whose tree the backend serves.
  */
-function FileTabBody({ tab, projectDir, scrollMemoryKey, onContentChange, onDiskContent, onDiffModeChange, onFileSave, onFileOpen, onAddToContext, onClose, onSubmitComments, onRevealConsumed }: {
+function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange, onDiskContent, onDiffModeChange, onFileSave, onFileOpen, onAddToContext, onClose, onSubmitComments, onRevealConsumed }: {
   tab: PanelTab
+  /** Is this the visible tab? Background file tabs stay mounted, so the panel
+   *  needs this to keep its Cmd+F handler off a document the user cannot see. */
+  active: boolean
   projectDir?: string
   /** Cross-remount scroll identity (slot + tab id) — see `useScrollMemory`. */
   scrollMemoryKey?: string
@@ -866,7 +880,7 @@ function FileTabBody({ tab, projectDir, scrollMemoryKey, onContentChange, onDisk
   onSubmitComments?: (m: string) => void
   onRevealConsumed: () => void
 }) {
-  const [railOpen, setRailOpen] = usePersistedBool('mc-files-rail-open', true)
+  const [railOpen, setRailOpen] = usePersistedBool('mc-files-rail-open', false)
   const treeAvailable = useTreeAvailable(projectDir)
   const railUsable = treeAvailable && !!projectDir && !!onFileOpen
   // The rail re-targets this tab in place, so the panel's own dirty guard has to
@@ -876,6 +890,7 @@ function FileTabBody({ tab, projectDir, scrollMemoryKey, onContentChange, onDisk
     <MarkdownPanel
       ref={panelRef}
       embedded
+      active={active}
       filePath={tab.path || ''}
       content={tab.content || ''}
       scrollMemoryKey={scrollMemoryKey}
@@ -951,6 +966,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
     return (
       <FileTabBody
         tab={tab}
+        active={active}
         projectDir={projectDir}
         scrollMemoryKey={scrollMemoryKey}
         onContentChange={onContentChange}
@@ -969,8 +985,10 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
     return (
       <FolderPanel
         path={tab.path || ''}
+        projectDir={projectDir}
         onClose={onClose}
         onFileOpen={onFileOpen}
+        onAddToContext={onAddToContext}
         onPathChange={onPathChange}
       />
     )
@@ -979,6 +997,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
     return (
       <ArtifactPanel
         embedded
+        active={active}
         slug={tab.artifactSlug || ''}
         kind={tab.artifactKind || 'markdown'}
         content={tab.content || ''}

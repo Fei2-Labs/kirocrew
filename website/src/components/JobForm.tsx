@@ -281,7 +281,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgen
           <Input placeholder={i18nT('components.jobForm.message_task')} style={{ flex: 2 }} value={msg} onChange={e => setMsg(e.target.value)} />
           {locked
             ? <LockedAgentValue name={locked} />
-            : <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} />}
+            : <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} modal />}
           <SimpleSelect
             options={modelOptions.values}
             optionLabels={modelOptions.labels}
@@ -349,7 +349,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgen
             ? <LockedAgentValue name={locked} />
             : (<>
               <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_agent_handles_this_job_leave_default_for_t')}</span>
-              <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} />
+              <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} modal />
             </>)}
         </div>
         </>)}

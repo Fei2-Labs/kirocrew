@@ -16,6 +16,14 @@ interface CollapsibleToolGroupProps {
   children: ReactNode
   /** Permission message meta — used to extract command preview when approval pending. */
   permissionMeta?: Record<string, unknown>
+  /**
+   * Meta for EVERY pending permission in this group. When batching (>1 pending
+   * + a batch handler), the row previews all N commands one `<pre>` each so the
+   * human sees every call "Approve all N" will resolve — closing the
+   * approve-unseen gap where only `permissionMeta` (the newest) was shown. For
+   * a single pending approval this is unused; the row previews `permissionMeta`.
+   */
+  permissionMetas?: Record<string, unknown>[]
   /** Number of pending permission messages in this group (shown as indicator when > 1). */
   pendingPermCount?: number
   /** Callback for approve/reject (and trust, only when `canTrust`) — same as PermissionMessage.onApprove.
@@ -23,6 +31,18 @@ interface CollapsibleToolGroupProps {
    *  (rejection restores the buttons). No `void` arm, so a fire-and-forget
    *  handler — the shape behind #5524 — cannot compile here. */
   onApprove?: (decision: string) => Promise<unknown>
+  /**
+   * Batch resolver: apply one decision to EVERY unresolved permission in this
+   * group in a single click (Req 4.1-4.4). Wired only by hosts that can resolve
+   * each pending approval id (ChatEmbed, via ChatMessageList). Used in place of `onApprove` when
+   * `pendingPermCount > 1`; when there is a single pending approval the row
+   * keeps the id-scoped `onApprove` path unchanged. Like `onApprove`, MUST
+   * return the settle promise so `submitDecision`'s rollback restores the
+   * buttons if any resolve fails. Gate-denied (TOOL_DENY) calls never surface
+   * as pending permissions (backend gate; locked by the T5-guard test), so no
+   * client-side exclusion is needed here.
+   */
+  onApproveBatch?: (decision: string) => Promise<unknown>
   /**
    * Offer the standing-trust tier. FAIL-CLOSED: leave unset unless this mount's
    * `onApprove` routes to an endpoint that actually RECORDS standing trust
@@ -58,7 +78,7 @@ function extractPreview(meta?: Record<string, unknown>): string {
 }
 
 /** Collapsible row that wraps tool/thinking/permission messages — always collapsed unless autoExpand. */
-const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExpand, disclosureKey, hasPermission, isRunning, children, permissionMeta, pendingPermCount, onApprove, canTrust, onViewActivity, activityOpen }: CollapsibleToolGroupProps) {
+const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExpand, disclosureKey, hasPermission, isRunning, children, permissionMeta, permissionMetas, pendingPermCount, onApprove, onApproveBatch, canTrust, onViewActivity, activityOpen }: CollapsibleToolGroupProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, !!autoExpand)
   const userToggled = useRef(false)
@@ -97,13 +117,37 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
   const preview = needsAttention ? sanitizeLlmOutput(extractPreview(permissionMeta)) : ''
   const truncated = preview.length > 150 ? preview.slice(0, 150) + '…' : preview
 
+  // Per-call previews for batch mode: one row per pending call, so the row shows
+  // EVERY command "Approve all N" will resolve — in FULL, not truncated (a
+  // truncated preview could hide a destructive suffix on a command with a benign
+  // prefix at the human-vetting boundary). Each <pre> is height-bounded +
+  // scrollable (below), so the full text never breaks layout. A meta with no
+  // derivable command is NOT dropped — it renders a placeholder row (text: '')
+  // so the rendered row count always equals pendingPermCount; dropping it would
+  // let "Review all N" promise more rows than it shows and let a preview-less
+  // call be approved sight-unseen (the exact gap this fix closes).
+  const batchPreviews: string[] = needsAttention && permissionMetas && permissionMetas.length > 1
+    ? permissionMetas.map(m => sanitizeLlmOutput(extractPreview(m)))
+    : []
+  // The full list is rendered inside a bounded, scrollable container (below), so
+  // EVERY pending command stays reachable — no call is hidden from "Approve all
+  // N" — while the Approve/Reject row stays above the fold on a large fan-out.
+
   // Dispatch an approval decision, optimistically reflecting it locally and rolling
   // back on failure. Logs failures for diagnostics via the error console.
+  // When more than one approval is pending in this group AND the host supplied a
+  // batch resolver, one click applies the decision to every pending call (Req 4.1-4.4);
+  // otherwise the id-scoped single-approval path is used unchanged.
+  const isBatch = !!onApproveBatch && !!pendingPermCount && pendingPermCount > 1
   const submitDecision = (decision: string) => {
     setSubmitting(true)
     setLocalResolved(decision)
+    // Batch only approve/reject. 'trust' records a STANDING grant and is never
+    // batched: the trust tier is fail-closed (#5400/#5434) and must stay
+    // id-scoped to the single owned id, so it always routes through onApprove.
+    const batchThis = isBatch && decision !== 'trust'
     void Promise.resolve()
-      .then(() => onApprove?.(decision))
+      .then(() => (batchThis ? onApproveBatch!(decision) : onApprove?.(decision)))
       .catch((err) => {
         // Intentional error diagnostic: surfaces a failed approval round-trip.
         // eslint-disable-next-line no-console
@@ -143,16 +187,34 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
           gating this row on !expanded left the expanded pending group with no
           actionable buttons — a dead end exactly while the agent is parked
           waiting on the user (#5487). */}
-      {needsAttention && onApprove && truncated && (
+      {needsAttention && (onApprove || onApproveBatch) && (isBatch ? batchPreviews.length > 0 : !!truncated) && (
         <div className="mt-1 ml-4 pl-3 shadow-[inset_2px_0_0_0_theme(colors.amber.400)] forced-colors:border-l-2">
-          <pre className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 font-mono overflow-x-auto whitespace-pre-wrap break-all max-h-[4.5em] overflow-y-auto mb-2"><ToolInputText text={truncated} /></pre>
+          {isBatch ? (
+            <>
+              {/* Batch: preview EVERY pending call so "Approve all N" is not a
+                  blind approval — the human sees each command being resolved. */}
+              <div className="text-[12px] leading-5 text-muted mb-1">{i18nT('pages.chat.collapsibleToolGroup.batch_preview_all', { count: pendingPermCount })}</div>
+              {/* Every pending command renders; the container is height-bounded and
+                  scrolls, so nothing is hidden AND the buttons stay above the fold
+                  even on a large fan-out. */}
+              <div className="max-h-[15em] overflow-y-auto mb-2">
+                {batchPreviews.map((p, i) => (
+                  p
+                    ? <pre key={i} className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 font-mono overflow-x-auto whitespace-pre-wrap break-all max-h-[4.5em] overflow-y-auto mb-2 last:mb-0"><ToolInputText text={p} /></pre>
+                    : <div key={i} className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 italic text-muted mb-2 last:mb-0">{i18nT('pages.chat.collapsibleToolGroup.batch_preview_none')}</div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <pre className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 font-mono overflow-x-auto whitespace-pre-wrap break-all max-h-[4.5em] overflow-y-auto mb-2"><ToolInputText text={truncated} /></pre>
+          )}
         </div>
       )}
-      {needsAttention && onApprove && (
+      {needsAttention && (onApprove || onApproveBatch) && (
         <div className="mt-1 ml-4 pl-3 flex gap-2 flex-wrap">
-          <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('approved') }}><CheckCircle className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.approve')}</button>
-          {canTrust && <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('trust') }}><Handshake className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.trust')}</button>}
-          <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-danger hover:border-danger transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('rejected') }}><Ban className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.reject')}</button>
+          <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('approved') }}><CheckCircle className="lucide-inline" /> {isBatch ? i18nT('pages.chat.collapsibleToolGroup.approve_all', { count: pendingPermCount }) : i18nT('pages.chat.collapsibleToolGroup.approve')}</button>
+          {canTrust && !isBatch && <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-text hover:border-border-strong hover:bg-bg-hover transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('trust') }}><Handshake className="lucide-inline" /> {i18nT('pages.chat.collapsibleToolGroup.trust')}</button>}
+          <button disabled={submitting} className="px-3 py-1 rounded-md border border-border bg-transparent text-muted text-[13px] leading-5 cursor-pointer font-body hover:text-danger hover:border-danger transition-all disabled:opacity-50 disabled:cursor-not-allowed" onClick={e => { e.stopPropagation(); submitDecision('rejected') }}><Ban className="lucide-inline" /> {isBatch ? i18nT('pages.chat.collapsibleToolGroup.reject_all', { count: pendingPermCount }) : i18nT('pages.chat.collapsibleToolGroup.reject')}</button>
         </div>
       )}
 

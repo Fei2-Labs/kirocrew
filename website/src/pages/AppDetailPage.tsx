@@ -50,6 +50,7 @@ type AppInfo = {
   heroImageDetail?: string
   heroImageDetailDark?: string
   repo?: string
+  trustRepository?: string
   branch?: string
   // Installed state
   installed: boolean
@@ -344,6 +345,7 @@ export default function AppDetailPage() {
             // trust-consent prompt and the details list, and widening those to a
             // fallback identifier is a separate decision from resolving art.
             repo: registryEntry?.repo || '',
+            trustRepository: installed.trustRepository,
             installed: true,
             installedVersion: installed.version,
             enabled: installed.enabled,
@@ -539,7 +541,12 @@ export default function AppDetailPage() {
     if (!app) return
     if (await runInstall() !== 'trust-required') return
     trust.open(
-      { name: app.name, displayName: app.displayName, repo: app.repo, origin: app.origin },
+      {
+        name: app.name,
+        displayName: app.displayName,
+        trustRepository: app.trustRepository,
+        origin: app.origin,
+      },
       async () => {
         // ANY unsuccessful retry must REJECT, not resolve. `useTrustGate` rolls the
         // fresh grant back on rejection (and only then), so resolving here on an
@@ -591,7 +598,12 @@ export default function AppDetailPage() {
       // let the modal grant it inline instead of sending the user to a blanket
       // switch. Every OTHER failure still renders its own prose.
       if (action === 'enable' && isTrustDeniedError(e)) {
-        trust.open({ name: app.name, displayName: app.displayName, repo: app.repo, origin: app.origin })
+        trust.open({
+          name: app.name,
+          displayName: app.displayName,
+          trustRepository: app.trustRepository,
+          origin: app.origin,
+        })
       } else {
         setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to', { action }))
       }

@@ -370,10 +370,19 @@ Model: `Qwen/Qwen3-Embedding-0.6B` Q8_0 GGUF (610MB). Apache-2.0 licensed. Serve
 
 `kirocrew memory {list,search,show,stats,audit,export,migrate,import}` — manage memory from the command line:
 - `show [preferences|projects|history]` — read the markdown layer through `MemoryStore` (all three targets when none given); `--format md|json` (json entries carry `path`, `updated_at` mtime in UTC ISO-8601, `content`), `--since YYYY-MM-DD` filters history days. Missing/empty files print as empty rather than erroring
+- `search <query>` — searches BOTH memories and labels each section: the vector store's episodic recall, then keyword hits from the markdown layer's FTS5 index (`MemoryStore.search`, over `preferences.md` / `projects.md` / every `history/*.md`). `--layer vector|history|all` (default `all`); `--layer vector` reproduces the previous vector-only output exactly, and `--layer history` skips constructing the vector store entirely, the same way `show` does. The two indexes answer different questions — "where did I write this word" versus "what does this mean like" — so they are reported separately rather than merged into one ranking
 - `export` — vector-store collections; `--include-markdown` opts in a `markdown` collection (`preferences`/`projects` entries + per-day `history` list from `MemoryStore.markdown_snapshot()`) without changing the default payload shape
 - `migrate` — one-time markdown → structured migration (preferences.md → semantic, history/*.md → episodic)
 - `import <file>` — restore from JSON export with full validation
 - `kirocrew security audit` also scans vector memory for injection patterns
+
+### Keyword search over the markdown layer
+
+**Query escaping.** The query is treated as literal words, not FTS5 expression syntax. Tokens are quoted by `fts5_quote_tokens` in `_sqlite_compat.py`, the single escaping dialect shared with knowledge retrieval. Unquoted, `-` and `.` and a bare `AND` are FTS5 operators, so `PROJ-123` or `hooks.py` raises inside the driver and `MemoryStore.search`'s `except` turns it into `[]`, a silent "never written" for the likeliest queries. The join differs by surface on purpose: memory ANDs every token (a hand-typed query is deliberate), knowledge drops stopwords and ORs (natural-language recall).
+
+**Empty index is not absence.** `MemoryStore.index_row_count()` returns the FTS row count, or `None` when the index cannot be read, so a caller can separate three states that `search` collapses into one empty list: unreadable, empty, genuinely no match. An unbuilt or unreadable index is reported as such rather than as "no match".
+
+**No agent-facing tool.** The index is reachable from the CLI only. An MCP tool that reads memory on demand would have to enforce the temporary-session read boundary itself, and that boundary is not readable from an out-of-process stdio server: `memory_mode` lives on the dashboard's `SessionSlot`, while Slack and Telegram carry it in `privacy_mode.is_temporary`, and a temporary Slack thread writes no transcript metadata at all. Exposing the index to agents needs a governance capability scope, the way `learn_add` gates durable writes through `capabilities.memory_writes`, and that is left to separate work.
 
 ### Migration (`migrate_from_markdown`)
 
@@ -397,6 +406,13 @@ The backend `POST /api/memory/migrate` endpoint and the `kirocrew memory migrate
 ### Cross-Platform
 
 macOS (Apple Silicon and Intel), Linux (x86_64, arm64/Graviton), and Windows supported. All paths use `pathlib.Path`. GGUF model downloaded over sha256-pinned HTTPS from the Kiro Crew CDN. No runtime install step — native llama.cpp libraries are vendored per platform in `_vendor/llama_cpp_libs/` and selected via `LLAMA_CPP_LIB_PATH` (the old Docker fallback is gone).
+
+Before the vendored runtime becomes usable, `embeddings._load_llama_class()`
+reconfigures llama-cpp-python's import-time stdout/stderr null streams to UTF-8
+with backslash replacement. The upstream suppressor temporarily installs those
+streams process-wide while the GGUF loads on `kc-embed-load`; keeping the same
+handles preserves its native fd suppression while preventing unrelated Unicode
+gateway output from failing under a locale encoding such as Windows cp1252.
 
 | Platform | Vendored libs | GPU | Notes |
 |----------|--------------|-----|-------|
@@ -1212,7 +1228,7 @@ and exfiltration URLs; clean assets are copied byte-for-byte, including leading
 and trailing whitespace. No per-asset preview truncation is used for either the
 security decision or the copied content.
 
-**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep.
+**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
 **LLM tool mechanisms:**
 - MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
@@ -1421,6 +1437,20 @@ a hook is therefore **not portable across platforms**:
 
 Both platforms receive the same `KIROCREW_HOOK_EVENT` / `KIROCREW_HOOK_CONTEXT`
 env vars and the same hook-event JSON on stdin.
+
+**A hook subprocess inherits only an allowlisted slice of the gateway
+environment, not the whole of `os.environ`.** The gateway process holds
+credentials (provider API keys, tokens) in its environment; copying that wholesale
+into every hook command would hand an untrusted shell line those secrets. The
+allowlist (`_HOOK_BASE_ENV_KEYS` in `hooks.py`) preserves only what a hook
+legitimately needs — `PATH`/`PATHEXT`/`COMSPEC`/`SYSTEMROOT`, the home/profile and
+`KIROCREW_HOME` data-home vars, temp-dir and locale vars, and TLS-trust
+(`SSL_CERT_*`, `NO_PROXY`) — plus the two `KIROCREW_HOOK_*` metadata vars set last.
+`HTTP(S)_PROXY` is deliberately dropped (it commonly embeds userinfo credentials).
+The consequence for operators: a hook that relied on an ambient var outside that
+set (e.g. `VIRTUAL_ENV`, `PYTHONPATH`, `JAVA_HOME`, `AWS_PROFILE`, nvm/pyenv vars)
+runs fine in a terminal but fails once fired as a hook; the fix is to add that key
+to `_HOOK_BASE_ENV_KEYS` by name — the allowlist is fail-closed by design.
 
 **Windows spawns through `asyncio.create_subprocess_shell`, not an argv.** cmd.exe
 must receive the operator's command line verbatim: an argv spawn of

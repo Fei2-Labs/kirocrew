@@ -21,6 +21,7 @@ from chat_test_helpers import (
     _make_folder_app,
     _make_ready_kiro_prerequisite,
     _make_state,
+    stub_acp_identity,
 )
 
 from kiro_crew.acp.types import TurnUsage
@@ -62,6 +63,24 @@ def test_tool_call_ws_payload_preserves_shell_capability_signal():
 
 
 class TestChatSlot:
+    @pytest.mark.asyncio
+    async def test_turn_generation_survives_task_clear(self):
+        slot = _ChatSlot("s1")
+        assert slot._turn_generation == 0
+
+        first = asyncio.create_task(asyncio.sleep(0))
+        slot.task = first
+        assert slot._turn_generation == 1
+        await first
+
+        slot.task = None
+        assert slot._turn_generation == 1
+
+        second = asyncio.create_task(asyncio.sleep(0))
+        slot.task = second
+        assert slot._turn_generation == 2
+        await second
+
     def test_append_and_drain(self):
         slot = _ChatSlot("s1")
         slot.append("user", "hello", "msg")
@@ -102,6 +121,69 @@ class TestChatSlot:
             slot.append("user", f"msg {i}")
         assert slot.messages[0]["content"] == "msg 50"
         assert slot.messages[-1]["content"] == f"msg {count - 1}"
+
+    def test_trim_advances_the_durable_counter_by_durable_rows_only(self):
+        """Transient rows folded into the frozen prefix advance ONLY the all-rows counter.
+
+        ``_disk_older_count`` credits every persisted trimmed row (its contract
+        with the save model), while ``_disk_older_durable_count`` counts only
+        the rows a durable read returns — the base absolute message positions
+        are built over. Counting them together is the cursor-skew defect.
+
+        Mutation guards: advancing the durable counter by ``persisted_trim``
+        re-introduces the skew; counting the slice AFTER the ``del`` counts the
+        wrong (surviving) rows — the leading transient rows here make both
+        mutants visibly wrong.
+        """
+        slot = _ChatSlot("s1")
+        # The five oldest window rows: 2 transient, 3 durable.
+        slot.append("permission", "approve?", "")
+        slot.append("queued", "queued prompt", "")
+        for i in range(3):
+            slot.append("user", f"old {i}")
+        for i in range(_MAX_SLOT_MESSAGES - 5):
+            slot.append("user", f"fill {i}")
+        # Pretend the whole window was flushed, as a 5s save would have.
+        slot._disk_window_len = len(slot.messages)
+        assert slot._disk_older_count == 0
+        assert slot._disk_older_durable_count == 0
+
+        # Cross the cap by 5: the trimmed slice is exactly the 5 rows above.
+        for i in range(5):
+            slot.append("user", f"new {i}")
+
+        assert slot._disk_older_count == 5, "all persisted trimmed rows are credited"
+        assert (
+            slot._disk_older_durable_count == 3
+        ), "only the durable trimmed rows advance the durable counter"
+
+    def test_trim_counts_evicted_durable_rows_even_when_unpersisted(self):
+        """Durable rows lost to the unpersisted overflow still advance the durable counter.
+
+        ``_disk_older_count`` excludes the overflow (its save contract: it
+        claims on-disk lines, and these rows never reached disk). The durable
+        counter is a POSITION base with no disk contract: if evicted durable
+        rows were uncounted, every later absolute position would shift down and
+        a poller's ``since`` guard would pass while rows were silently skipped
+        — the silent failure the deleted blanket refusal used to make loud.
+        Counting them makes such a cursor refuse loudly (``since < base``).
+
+        Mutation guard: restricting the durable count to the persisted slice
+        (``messages[:persisted_trim]``) yields 2 here instead of 5.
+        """
+        slot = _ChatSlot("s1")
+        for i in range(_MAX_SLOT_MESSAGES):
+            slot.append("user", f"old {i}")
+        # Only the first 2 window rows ever reached disk.
+        slot._disk_window_len = 2
+
+        for i in range(5):
+            slot.append("user", f"new {i}")
+
+        assert slot._disk_older_count == 2, "the disk counter keeps its persisted-only contract"
+        assert (
+            slot._disk_older_durable_count == 5
+        ), "every evicted durable row advances the position base"
 
     def test_to_dict(self):
         slot = _ChatSlot("s1", title="Test Chat", mode="orchestrator")
@@ -668,6 +750,22 @@ class TestBroadcastCompactionResultBackoff:
         assert "x in a row" in msg
         assert "too large to" in msg or "unknown error" in msg
 
+    def test_enriched_title_replaces_unknown_error(self, tmp_path, monkeypatch):
+        """The notice reads the event title. kiro-cli sends no summary on
+        failure, so the ACP layer now carries the notification's own reason
+        there (issue #3583) — the row must name it instead of collapsing to
+        "unknown error"."""
+        from kiro_crew.dashboard.chat_utils import _broadcast_compaction_result
+
+        state, slot = self._make_slot_and_state(tmp_path, monkeypatch)
+
+        msg = _broadcast_compaction_result(
+            state, slot, self._failed_event("context window exceeded")
+        )
+        assert msg is not None
+        assert "context window exceeded" in msg
+        assert "unknown error" not in msg
+
     def test_success_resets_streak_and_cooldown(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.chat_utils import (
             _COMPACTION_NOTICE_SHOW_FIRST_N,
@@ -731,7 +829,8 @@ class TestApiChatDrainOnDisconnect:
         state = _make_state(tmp_path)
         slot = state.get_or_create_slot("s1")
 
-        async def fake_run_chat(st, sl, msg):
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            assert _directive_user_origin is True
             sl.append("chunk", "partial answer", "chunk")
             await asyncio.sleep(60)
 
@@ -770,7 +869,8 @@ class TestApiChatMemoryModeForwarding:
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
 
-        async def fake_run_chat(st, sl, msg):
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            assert _directive_user_origin is True
             sl.append("chunk", "ack", "chunk")
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
@@ -798,7 +898,8 @@ class TestApiChatMemoryModeForwarding:
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
 
-        async def fake_run_chat(st, sl, msg):
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            assert _directive_user_origin is True
             sl.append("chunk", "ack", "chunk")
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
@@ -822,7 +923,8 @@ class TestApiChatMemoryModeForwarding:
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
 
-        async def fake_run_chat(st, sl, msg):
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            assert _directive_user_origin is True
             sl.append("chunk", "ack", "chunk")
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
@@ -894,7 +996,8 @@ class TestApiChatModeForwarding:
     """
 
     async def _post_chat(self, state, body):
-        async def fake_run_chat(st, sl, msg):
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            assert _directive_user_origin is True
             sl.append("chunk", "ack", "chunk")
 
         with pytest.MonkeyPatch.context() as mp:
@@ -1006,7 +1109,8 @@ class TestApiChatNoBrowseMarker:
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
 
-        async def fake_run_chat(st, sl, msg):
+        async def fake_run_chat(st, sl, msg, *, _directive_user_origin):
+            assert _directive_user_origin is True
             sl.append("chunk", "ack", "chunk")
 
         monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", fake_run_chat)
@@ -2618,6 +2722,19 @@ class TestSlotLifecycle:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
         slot._approval_futures["test"] = fut
+        slot.messages.append(
+            {
+                "role": "permission",
+                "content": "Running: ls",
+                "cls": json.dumps(
+                    {
+                        "request_id": "test",
+                        "full_command": "ls",
+                        "trust_grantable": "1",
+                    }
+                ),
+            }
+        )
 
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots/s1/approve", json={"action": "trust"})
@@ -5417,14 +5534,15 @@ class TestTokenPersistenceBackfill:
         slot = state.get_or_create_slot("s1")
         slot.model = ""  # CC has not yet emitted init when _run_chat begins
 
-        # This simulates a claude_code session, so the backfill must run under
-        # provider=claude_code for canonicalize_for_provider to map 'opus' ->
-        # 'opus-4.8-1m'. The default test config is provider=acp, under which the
-        # backfill (correctly) leaves a kiro/acp model unchanged — so force a CC
-        # config here. _run_chat reads only cfg.agent.provider (+ dashboard.
-        # merge_queued_messages) on this path, so a MagicMock cfg suffices.
+        # This simulates a Claude ACP adapter session, so the backfill must use
+        # the live provider identity for canonicalize_for_provider to map
+        # 'opus' -> 'opus-4.8-1m'. A MagicMock config suffices for the few
+        # settings this path reads.
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
         _cc_cfg = MagicMock()
-        _cc_cfg.agent.provider = "claude_code"
+        _cc_cfg.agent.provider = "acp"
+        _cc_cfg.agent.acp_backend = ACP_BACKEND_CLAUDE
         _cc_cfg.dashboard.merge_queued_messages = False
         monkeypatch.setattr("kiro_crew.dashboard.chat_runner.KiroCrewConfig.load", lambda: _cc_cfg)
 
@@ -5432,7 +5550,10 @@ class TestTokenPersistenceBackfill:
         # branch (chat_runner.py:471-476) finds nothing and leaves slot.model
         # blank. Then mutate inner._model mid-stream — just before yielding
         # EVENT_COMPLETE — so only the late backfill branch can populate it.
-        client = AsyncMock()
+        from kiro_crew.providers.acp import AcpProvider
+
+        client = AsyncMock(spec=AcpProvider)
+        client.backend = ACP_BACKEND_CLAUDE
         client.context_usage_pct = MagicMock(return_value=10.0)
         inner = MagicMock()
         inner._model = ""  # empty at session-create time
@@ -8183,6 +8304,19 @@ class TestApproveYoloPropagation:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
         slot._approval_futures["test"] = fut
+        slot.messages.append(
+            {
+                "role": "permission",
+                "content": "Running: ls",
+                "cls": json.dumps(
+                    {
+                        "request_id": "test",
+                        "full_command": "ls",
+                        "trust_grantable": "1",
+                    }
+                ),
+            }
+        )
 
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots/s1/approve", json={"action": "trust"})
@@ -8431,6 +8565,33 @@ class TestPlanAction:
             )
             assert resp.status == 200
         assert slot._auto_run is False
+
+    @pytest.mark.asyncio
+    async def test_busy_go_queues_with_stamp_and_human_provenance(self, tmp_path, monkeypatch):
+        """A Go clicked on a BUSY slot queues, and the entry carries both the
+        admission-time containment stamp and authenticated-human provenance —
+        without the flag, a human linking their own session before the drain
+        would silently destroy the approval they already gave (the same
+        request-identity split as api_chat and the manual continue)."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard import session_control as sc
+
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("plan-busy", mode="orchestrator")
+        task = MagicMock()
+        task.done.return_value = False
+        slot.task = task  # running -> the Go must queue, not start a stage loop
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/plan-busy/plan-action",
+                json={"action": "go"},
+            )
+            assert resp.status == 200
+            assert (await resp.json()).get("queued") is True
+        entry = slot._queue[0]
+        assert entry["content"] == "Go"
+        assert entry.get("_directive_user_origin") is True  # no app identity on the request
+        assert sc.QUEUED_CONTAINMENT_META_KEY in entry.get("meta", {})
 
 
 class TestPlanValidationStuck:
@@ -10604,6 +10765,141 @@ class TestFolderCRUD:
             assert resp.status == 200
             data = await resp.json()
             assert data["project_dir"] == os.path.realpath(str(proj))
+
+    @pytest.mark.asyncio
+    async def test_slot_create_inherits_nearest_folder_project(self, tmp_path, monkeypatch):
+        """The server owns folder inheritance when the client cache omits project."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        root_project = tmp_path / "root-project"
+        parent_project = tmp_path / "parent-project"
+        root_project.mkdir()
+        parent_project.mkdir()
+        state._folders = [
+            {
+                "id": "root",
+                "name": "Root",
+                "order": 0,
+                "parent_id": "",
+                "project_dir": str(root_project),
+            },
+            {
+                "id": "parent",
+                "name": "Parent",
+                "order": 1,
+                "parent_id": "root",
+                "project_dir": str(parent_project),
+            },
+            {
+                "id": "child",
+                "name": "Child",
+                "order": 2,
+                "parent_id": "parent",
+                "project_dir": "",
+            },
+        ]
+        mock_cfg = MagicMock()
+        mock_cfg.dashboard.default_project = ""
+        # A bare MagicMock leaks into the slot: the handler stamps
+        # cfg.default_agent (a truthy MagicMock) as the slot's agent when the
+        # request names none, and the coalesced slots broadcast then dies in
+        # json.dumps ("Object of type MagicMock is not JSON serializable"),
+        # 500ing the create. Pin it to a string like the sibling cfg mocks.
+        mock_cfg.default_agent = ""
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", lambda: mock_cfg
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.default_project_dir",
+            lambda _workspace: str(root_project),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.schedule_eager_spawn",
+            lambda *_args, **_kwargs: None,
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "folder-project", "folder_id": "child"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["folder_id"] == "child"
+        assert data["project"] == os.path.realpath(str(parent_project))
+        assert state._slots["folder-project"].project == data["project"]
+
+    @pytest.mark.asyncio
+    async def test_slot_create_rejects_invalid_inherited_project(self, tmp_path, monkeypatch):
+        """A stale folder path fails before a partially configured slot is created."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state._folders = [
+            {
+                "id": "folder",
+                "name": "Folder",
+                "order": 0,
+                "parent_id": "",
+                "project_dir": str(tmp_path / "missing"),
+            }
+        ]
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "invalid-folder-project", "folder_id": "folder"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["code"] == "folder_project_invalid"
+        assert state._slots == {}
+
+    @pytest.mark.asyncio
+    async def test_slot_create_does_not_rescope_existing_named_slot(self, tmp_path, monkeypatch):
+        """Folder inheritance initializes new slots; explicit project changes stay explicit."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        old_project = tmp_path / "old-project"
+        folder_project = tmp_path / "folder-project"
+        old_project.mkdir()
+        folder_project.mkdir()
+        slot = state.get_or_create_slot("existing")
+        slot.project = str(old_project)
+        slot.append("user", "existing conversation")
+        slot.drain()
+        state._folders = [
+            {
+                "id": "folder",
+                "name": "Folder",
+                "order": 0,
+                "parent_id": "",
+                "project_dir": str(folder_project),
+            }
+        ]
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.schedule_eager_spawn",
+            lambda *_args, **_kwargs: None,
+        )
+
+        async with TestClient(TestServer(_make_app_with_agent_routes(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "existing", "folder_id": "folder"},
+            )
+
+        assert resp.status == 200
+        assert slot.project == str(old_project)
+
+    def test_resolve_folder_project_dir_terminates_on_cycle(self):
+        from kiro_crew.dashboard.chat_folders import _resolve_folder_project_dir
+
+        folders = [
+            {"id": "a", "parent_id": "b", "project_dir": ""},
+            {"id": "b", "parent_id": "a", "project_dir": ""},
+        ]
+        assert _resolve_folder_project_dir(folders, "a") == ("", None)
 
     @pytest.mark.asyncio
     async def test_update_folder_empty_name_rejected(self, tmp_path, monkeypatch):
@@ -13346,6 +13642,115 @@ class TestStopHistoryBanner:
 # ── Tests: AcpProcessDied handler in _run_chat ──
 
 
+class TestStopDuringSessionPrep:
+    """A Stop pressed while the turn is still being prepared must not open it.
+
+    During ``get_or_create``'s cold start the session is not registered yet,
+    so ``SessionManager.stop_turn`` answers ``"idle"`` and the stop resolves
+    without cancelling anything. The dispatch gate in ``_run_chat`` is what
+    honors that stop: it compares ``slot._stop_generation`` against the
+    turn-entry snapshot and refuses to open the turn (#5464 — [Stopped] card
+    shown while the response streams to completion).
+    """
+
+    def _make_state_and_slot(self, tmp_path):
+        from kiro_crew.dashboard.chat_runner import _run_chat
+
+        state = _make_state(tmp_path)
+        state.sessions.release = MagicMock()
+        state.sessions.reset = AsyncMock()
+        state.sessions.set_approval_policy = MagicMock()
+        state.sessions.check_context_usage = MagicMock()
+        state.sessions.get_slack_link = MagicMock(return_value=(None, None))
+        state.broadcast_ws = MagicMock()
+        state.push_slots_update = MagicMock()
+        state.is_yolo_active = MagicMock(return_value=False)
+        state._background_tasks = set()
+
+        slot = state.get_or_create_slot("stop-prep-slot")
+        slot.append("user", "hello", "msg msg-u")
+        return state, slot, _run_chat
+
+    def _make_client(self, stream_calls):
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        client = MagicMock()
+        client.shutdown = AsyncMock()
+
+        async def _stream(msg):
+            stream_calls.append(msg)
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="full response")
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
+
+        client.stream = _stream
+        client.stream_command = _stream
+        return client
+
+    @pytest.mark.asyncio
+    async def test_stop_during_get_or_create_aborts_dispatch(self, tmp_path: Path) -> None:
+        """Stop lands mid-cold-start → the turn never opens, nothing streams.
+
+        The stop is simulated exactly as the /stop handler leaves it for this
+        race: ``_stop_state`` flips idle → soft_pending (bumping
+        ``_stop_generation``) and, because ``stop_turn`` found no session and
+        answered "idle", snaps straight back to idle. A point-in-time state
+        check at dispatch sees nothing — only the generation delta survives.
+        """
+        state, slot, _run_chat = self._make_state_and_slot(tmp_path)
+        stream_calls: list[str] = []
+        client = self._make_client(stream_calls)
+
+        async def _slow_create(*args, **kwargs):
+            # Stop pressed while the session is still being created.
+            slot._stop_state = "soft_pending"
+            slot._stop_state = "idle"
+            return client, True, False
+
+        state.sessions.get_or_create = AsyncMock(side_effect=_slow_create)
+
+        await _run_chat(state, slot, "hello")
+
+        assert stream_calls == [], (
+            "the turn was dispatched despite a Stop during session prep — "
+            "the full response would stream behind a [Stopped] card (#5464)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_stop_dispatches_normally(self, tmp_path: Path) -> None:
+        """Control: without a Stop, the same setup opens the turn exactly once."""
+        state, slot, _run_chat = self._make_state_and_slot(tmp_path)
+        stream_calls: list[str] = []
+        client = self._make_client(stream_calls)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        await _run_chat(state, slot, "hello")
+
+        assert len(stream_calls) == 1, "the dispatch gate must not fire without a Stop"
+
+    @pytest.mark.asyncio
+    async def test_stop_of_a_previous_turn_does_not_abort_the_next(self, tmp_path: Path) -> None:
+        """A stop generation inherited from an EARLIER turn must not trip the gate.
+
+        The gate compares against the snapshot taken at THIS turn's entry, so a
+        slot whose previous turn was stopped (generation already > 0) still
+        dispatches its next turn normally.
+        """
+        state, slot, _run_chat = self._make_state_and_slot(tmp_path)
+        # A previous turn was stopped and resolved before this turn began.
+        slot._stop_state = "soft_pending"
+        slot._stop_state = "idle"
+
+        stream_calls: list[str] = []
+        client = self._make_client(stream_calls)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+
+        await _run_chat(state, slot, "hello")
+
+        assert (
+            len(stream_calls) == 1
+        ), "a stale stop generation from a previous turn aborted a fresh turn"
+
+
 class TestAcpProcessDiedRecovery:
     """Verify _run_chat handles AcpProcessDied with retry logic, redaction, and session reset."""
 
@@ -13481,6 +13886,9 @@ class TestAcpProcessDiedRecovery:
                 # A continuation, not the user's request: the turn had emitted, so
                 # this text is the runner's and must not mirror as user speech.
                 "payload": RecoveryPayload.CONTINUATION,
+                # Admission stamp (#5911): recovery requeues record the containment
+                # that held at requeue so the drain can re-validate the retry.
+                "meta": slot._queue[0]["meta"],
             }
         ]
 
@@ -13528,6 +13936,9 @@ class TestAcpProcessDiedRecovery:
                 # A continuation, not the user's request: the turn had emitted, so
                 # this text is the runner's and must not mirror as user speech.
                 "payload": RecoveryPayload.CONTINUATION,
+                # Admission stamp (#5911): recovery requeues record the containment
+                # that held at requeue so the drain can re-validate the retry.
+                "meta": slot._queue[0]["meta"],
             }
         ]
         # The status card and the queued marker describe the same event to two
@@ -13571,6 +13982,9 @@ class TestAcpProcessDiedRecovery:
                 "content": _CONN_RECOVER_MSG,
                 "kind": SYNTHETIC_RECOVERY_KIND,
                 "payload": RecoveryPayload.CONTINUATION,
+                # Admission stamp (#5911): recovery requeues record the containment
+                # that held at requeue so the drain can re-validate the retry.
+                "meta": slot._queue[0]["meta"],
             }
         ]
 
@@ -13722,6 +14136,97 @@ class TestAcpProcessDiedRecovery:
         assert (0, "test message") in calls
 
     @pytest.mark.asyncio
+    async def test_retry_requeues_with_consumption_callback(self, tmp_path: Path) -> None:
+        """A pre-consumption pipe-death retry keeps its producer callback."""
+        from unittest.mock import Mock
+        from unittest.mock import patch as _patch
+
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        self._make_stream_raise(client, AcpProcessDied("pipe broken"))
+        on_consumed = Mock()
+        on_irreversibly_consumed = Mock()
+        callbacks = []
+        orig = _ChatSlot.queue_insert
+
+        def spy(self_slot, *args, **kwargs):
+            callbacks.append(
+                (
+                    kwargs.get("on_consumed"),
+                    kwargs.get("on_irreversibly_consumed"),
+                )
+            )
+            return orig(self_slot, *args, **kwargs)
+
+        with (
+            _patch.object(_ChatSlot, "queue_insert", spy),
+            _patch(
+                "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
+                new=AsyncMock(return_value=False),
+            ),
+            _patch("kiro_crew.dashboard.chat_runner._finish_queue_cycle"),
+        ):
+            await _run_chat(
+                state,
+                slot,
+                "test message",
+                _on_consumed=on_consumed,
+                _on_irreversibly_consumed=on_irreversibly_consumed,
+            )
+
+        assert callbacks[0] == (on_consumed, on_irreversibly_consumed)
+
+    @pytest.mark.parametrize("event_type", ["text", "tool"])
+    @pytest.mark.asyncio
+    async def test_output_reports_irreversible_consumption_before_turn_end(
+        self, tmp_path: Path, event_type: str
+    ) -> None:
+        """First token or tool closes durable replay windows immediately."""
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
+        from kiro_crew.providers.base import (
+            EVENT_COMPLETE,
+            EVENT_TEXT_CHUNK,
+            EVENT_TOOL_CALL,
+            LLMEvent,
+        )
+
+        state, slot, client, _run_chat = self._make_state_and_slot(tmp_path)
+        irreversible_reported = asyncio.Event()
+        allow_turn_finish = asyncio.Event()
+
+        async def _stream(_message):
+            if event_type == "text":
+                yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="started")
+            else:
+                yield LLMEvent(kind=EVENT_TOOL_CALL, title="read_file", tool_kind="read")
+            await allow_turn_finish.wait()
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
+
+        client.stream = _stream
+        client.stream_command = _stream
+        turn = asyncio.create_task(
+            _run_chat(
+                state,
+                slot,
+                "test message",
+                _on_irreversibly_consumed=irreversible_reported.set,
+            )
+        )
+
+        report = asyncio.create_task(irreversible_reported.wait())
+        done, _pending = await asyncio.wait(
+            (turn, report),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert report in done, turn.exception()
+        assert not turn.done()
+
+        allow_turn_finish.set()
+        await turn
+
+    @pytest.mark.asyncio
     async def test_acperror_process_exited_uses_pipe_death_counter(self, tmp_path: Path) -> None:
         """Option Y: AcpError 'process exited' increments the pipe-death counter, not busy."""
         from kiro_crew.acp.client import AcpError
@@ -13828,10 +14333,11 @@ class TestEmptyResponseRetry:
 
     def _make_empty_stream(self, mock_client):
         """Stream that completes immediately with no text."""
+        from kiro_crew.acp.types import STOP_REASON_END_TURN
         from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
 
         async def _stream(msg):
-            yield LLMEvent(kind=EVENT_COMPLETE)
+            yield LLMEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
 
         mock_client.stream = _stream
         mock_client.stream_command = _stream
@@ -13845,10 +14351,15 @@ class TestEmptyResponseRetry:
         # Spy on queue_insert to verify the message is ACTUALLY re-queued (the
         # behavior the test name promises) — not merely that the counter ticked.
         calls = []
+        callbacks = []
+        directive_origins = []
+        on_consumed = MagicMock()
         orig = _ChatSlot.queue_insert
 
         def spy(self_slot, *a, **kw):
             calls.append(a)
+            callbacks.append(kw.get("on_consumed"))
+            directive_origins.append(kw.get("directive_user_origin"))
             return orig(self_slot, *a, **kw)
 
         with (
@@ -13866,7 +14377,13 @@ class TestEmptyResponseRetry:
             # launching a second turn. Patching the queue-drain boundary avoids
             # globally replacing asyncio.create_task, which can otherwise let
             # unrelated lifecycle tasks race the assertions under xdist load.
-            await _run_chat(state, slot, "test message")
+            await _run_chat(
+                state,
+                slot,
+                "test message",
+                _directive_user_origin=True,
+                _on_consumed=on_consumed,
+            )
             background_tasks = list(state._background_tasks)
             for _bg_task in background_tasks:
                 _bg_task.cancel()
@@ -13876,6 +14393,9 @@ class TestEmptyResponseRetry:
         assert slot._empty_response_retries == 1
         # The message must be re-queued at the front of the queue.
         assert (0, "test message") in calls
+        assert callbacks[0] is on_consumed
+        assert directive_origins == [True]
+        assert [args.args for args in on_consumed.call_args_list] == [(True,), (False,)]
         # No notice card shown on first attempt — the empty is silently re-queued
         notice_msgs = [m for m in slot.messages if m.get("role") == "notice"]
         assert not any("returned nothing this turn" in m.get("content", "") for m in notice_msgs)
@@ -15894,6 +16414,28 @@ class TestBulkModelSwitch:
         state.push_slots_update.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_codex_composite_switch_persists_effort_for_cold_start(
+        self, tmp_path, monkeypatch
+    ):
+        cfg = MagicMock()
+        cfg.agent.provider = "acp"
+        cfg.agent.acp_backend = "codex"
+        monkeypatch.setattr("kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load", lambda: cfg)
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        slot = state.get_or_create_slot("a", model="gpt-5.2[low]")
+        slot.reasoning_effort = "low"
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/model", json={"model": "gpt-5.2[high]"})
+
+        assert resp.status == 200
+        assert slot.model == "gpt-5.2[high]"
+        assert slot.reasoning_effort == "high"
+        state.sessions.reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_skips_running_slot_by_default(self, tmp_path):
         state = _make_state(tmp_path)
         state.sessions.reset = AsyncMock()
@@ -16188,22 +16730,37 @@ class TestSlotModelLiveSwitch:
     def _provider(
         *,
         claude: bool = False,
+        codex: bool = False,
         active_turn: bool = False,
         models=("auto",),
         supports_effort: bool = False,
         change_effort: bool = True,
     ):
-        """A live AcpProvider double. ``spec=`` keeps isinstance() working."""
+        """A live AcpProvider double. ``spec=`` keeps isinstance() working.
+
+        The identity is stubbed as a whole SET from one backend id: an unstubbed
+        ``spec=`` property answers a truthy Mock, so setting only the claude flag
+        would leave this double claiming every other harness identity too, and
+        dispatch keyed on any of them would take the wrong branch.
+        """
+        from kiro_crew.acp.types import (
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_CODEX,
+            ACP_BACKEND_KIRO,
+        )
         from kiro_crew.providers.acp import AcpProvider
 
         provider = MagicMock(spec=AcpProvider)
-        provider.is_claude_backend = claude
+        backend = ACP_BACKEND_CODEX if codex else ACP_BACKEND_CLAUDE if claude else ACP_BACKEND_KIRO
+        stub_acp_identity(provider, backend)
+        provider.backend = backend
         provider.has_active_turn.return_value = active_turn
         provider.available_models.return_value = [{"modelId": m} for m in models]
         provider.supports_effort.return_value = supports_effort
         provider.change_effort = AsyncMock(return_value=change_effort)
         provider.clear_effort = AsyncMock(return_value=False)
         provider.client = MagicMock()
+        provider.client.backend = backend
         provider.client.set_model = AsyncMock()
         return provider
 
@@ -16408,6 +16965,26 @@ class TestSlotModelLiveSwitch:
 
         assert resp.status == 200
         provider.change_effort.assert_awaited_once_with("high")
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_codex_composite_pick_applies_and_persists_its_effort(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        provider = self._provider(codex=True, supports_effort=True)
+        state.sessions.get_provider = MagicMock(return_value=provider)
+        slot = state.get_or_create_slot("a", model="gpt-5.2[low]")
+        slot.reasoning_effort = "low"
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/a/model", json={"model": "gpt-5.2[xhigh]"})
+
+        assert resp.status == 200
+        provider.client.set_model.assert_awaited_once_with("gpt-5.2")
+        provider.change_effort.assert_awaited_once_with("xhigh")
+        assert slot.model == "gpt-5.2[xhigh]"
+        assert slot.reasoning_effort == "xhigh"
         state.sessions.reset.assert_not_awaited()
 
     @pytest.mark.asyncio

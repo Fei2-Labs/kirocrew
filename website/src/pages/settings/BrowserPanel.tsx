@@ -437,7 +437,7 @@ export function BrowserPanel() {
                   {installCommand && (
                     <div className="text-muted text-left max-w-[340px] mt-1">
                       {i18nT('pages.settings.browserPanel.node_no_admin')}
-                      <pre className="mt-1.5 mb-1 whitespace-pre-wrap break-all text-[12px] bg-surface-2 rounded px-2 py-1.5">
+                      <pre className="mt-1.5 mb-1 whitespace-pre-wrap break-all text-[12px] bg-bg-elevated rounded px-2 py-1.5">
                         <code>{installCommand}</code>
                       </pre>
                       {/*

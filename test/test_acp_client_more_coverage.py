@@ -587,6 +587,20 @@ class TestModelAndConfigGuards:
         assert client.acp_config_options == []
 
 
+# ── session/new MCP-server injection for backends without a kiro-config reader ──
+#
+# The mechanism this class exercised (arbitrary mcpServers entries read
+# verbatim from the agent's on-disk spec file) was replaced by PR #6307's
+# spec_servers.py: Crew's OWN managed servers (kirocrew-core/cron/computer),
+# gated by a ROUTED verdict from acp.tool_gate, never arbitrary spec-file
+# content. That mechanism's coverage now lives in test_acp_spec_mcp_delivery.py
+# (managed-server shaping), test_acp_spec_mcp_tools.py, and test_acp_runtime.py
+# (session/new + session/load builder consultation, KAS parity, the
+# pooled-stub-outranks-managed-entry guard). This class is superseded, not
+# merely stale — its assertions describe a spec-reading path that no longer
+# exists in kiro_crew.acp.client.
+
+
 # ── stderr drain ──
 
 
@@ -1291,9 +1305,9 @@ class TestPermissionEvent:
         event = client._build_permission_event(msg)
 
         assert event.kind == EVENT_PERMISSION_REQUEST
-        assert event.options == [{"id": "allow_once", "label": ""}]
+        assert event.options == [{"id": "allow_once", "label": "", "kind": "allow_once"}]
         # Legacy id with no usable kind still resolves the allow ids.
-        assert client._permission_options["req-1"]["once"] == "allow_once"
+        assert client._permission_options["req-1"]["allow_once"] == "allow_once"
         # is_shell is deny-by-default: the payload's own kind is untrusted.
         assert event.is_shell is False
 
@@ -1317,7 +1331,7 @@ class TestPermissionEvent:
 
         assert event.tool_input == '{"path": "/etc/hosts"}'
         assert event.raw_tool_params == {"path": "/etc/hosts"}
-        assert client._permission_options["req-2"] == {"reject": "reject"}
+        assert client._permission_options["req-2"] == {"reject_once": "reject"}
 
     def test_debug_logging_redacts_the_payload(self, tmp_path, caplog):
         client = _client(tmp_path)

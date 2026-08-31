@@ -33,6 +33,8 @@ export type RegistryApp = {
   heroImageDetailDark?: string
   license?: string
   repo?: string
+  /** Server-resolved clone target shown and echoed by the trust consent flow. */
+  trustRepository?: string
   branch?: string
   featured?: boolean | number
   _registry?: string
@@ -77,6 +79,8 @@ export type InstalledApp = {
    * install, and on records written before provenance was captured.
    */
   sourceUrl?: string
+  /** Server-normalized source URL used as the trust-consent scope. */
+  trustRepository?: string
   resources?: string  // "gateway" | "app"
   lifecycle?: string  // "gateway" | "app" | "locked"
   migratedTo?: string

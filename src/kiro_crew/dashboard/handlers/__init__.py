@@ -132,6 +132,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     _write_file_restricted,
     api_browse_dirs,
     api_browse_files,
+    api_channel_upload_file,
     api_dashboard_config,
     api_file_diff,
     api_file_download,
@@ -201,6 +202,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_measure_start,
     api_mcp_probe,
     api_mcp_probe_cached,
+    api_mcp_quarantine_clear,
     api_mcp_remove,
     api_mcp_resolve_refresh,
     api_mcp_server_detail,
@@ -212,6 +214,12 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
 )
 from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
     api_mcp_apps_call,
+)
+
+# ── Crew Members (handlers/members.py) ──
+from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
+    api_member_thread,
+    api_members,
 )
 from kiro_crew.dashboard.handlers.memory import (  # noqa: E402, F401
     _get_vector_store,
@@ -259,6 +267,8 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_delete_message,
     api_discord_config_get,
     api_discord_config_save,
+    api_feishu_config_get,
+    api_feishu_config_save,
     api_imessage_config_get,
     api_imessage_config_save,
     api_notification_ack,
@@ -471,6 +481,9 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     api_releases,
     api_stream,
     api_update_apply,
+    api_update_approve,
+    api_update_arm,
+    api_update_arm_status,
     api_update_auto,
     api_update_cancel,
     api_update_channel,

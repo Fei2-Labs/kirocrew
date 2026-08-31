@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
 from kiro_crew.executors import maintenance_executor
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
+from kiro_crew.trust_patterns import ENV_ASSIGNMENT_RE
 from kiro_crew.vector_memory_constants import _contains_injection
 
 # NB: kiro_crew.vector_memory is imported lazily inside scan_memory() rather than
@@ -241,7 +242,8 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
             # sink prefix is what makes this safe -- it is precisely what a regex
             # literal (``re.search(...)``), a commit message and prose lack, so
             # they stay allowed while ``os.system(\"... token\")`` does not.
-            "|" "(?:os\\.system|os\\.popen|os\\.exec\\w*|(?:asyncio\\.)?create_subprocess_\\w*"
+            "|"
+            "(?:os\\.system|os\\.popen|os\\.exec\\w*|(?:asyncio\\.)?create_subprocess_\\w*"
             "|(?:\\w+\\.)?(?:run|call|check_call|check_output|popen|Popen|getoutput|getstatusoutput)"
             "|commands\\.getoutput|popen\\d?|system|shell_exec|passthru|proc_open"
             "|child_process\\.exec\\w*|exec\\w*sync|spawn\\w*"
@@ -2094,8 +2096,9 @@ def is_safe_user_regex(pattern: str) -> bool:
     reject/skip a pattern that fails this check so a catastrophic user regex can
     never freeze the synchronous PreToolUse gate.
 
-    The known-safe linearized aws flag run is stripped before the structural
-    check so the (harmless) built-in construct is never misflagged.
+    The known-safe aws flag runs are stripped before the structural check only
+    when the complete pattern is a built-in.  A user pattern wrapping the same
+    fragment receives no exemption.
 
     A pattern with a TOP-LEVEL alternation (``a|b``) is also rejected: it cannot
     be split on ``.*`` for the linear full-length fragment matcher, so it would
@@ -2109,7 +2112,11 @@ def is_safe_user_regex(pattern: str) -> bool:
         re.compile(pattern)
     except re.error:
         return False
-    scrubbed = pattern.replace(_DANGEROUS_AWS_FLAG_RUN, "").replace(_LINEARIZED_AWS_FLAG_RUN, "")
+    scrubbed = pattern
+    if pattern in BUILTIN_DENY_PATTERNS:
+        scrubbed = pattern.replace(_DANGEROUS_AWS_FLAG_RUN, "").replace(
+            _LINEARIZED_AWS_FLAG_RUN, ""
+        )
     if _redos_prone(scrubbed):
         return False
     return not _has_top_level_alternation(scrubbed)
@@ -2469,6 +2476,8 @@ _ONE_CHAR_CLASS_RE = re.compile(r"\[(\w)\]")
 def _debracket(text: str) -> str:
     """Collapse one-character bracket classes (``[k]irocrew`` -> ``kirocrew``)."""
     return _ONE_CHAR_CLASS_RE.sub(r"\1", text)
+
+
 # The product name as a WHOLE program name (bare or the tail of a path), which is
 # what distinguishes ``bin/kirocrew token`` from ``cd kirocrew-wt-x``.
 
@@ -2834,17 +2843,47 @@ _ENV_SPLIT_PROGRAMS = frozenset({"env"})
 # unrecognised program is "this could execute the name".
 _DATA_CONSUMER_PROGRAMS = frozenset(
     {
-        "echo", "printf", "print", "cat", "tac", "tee", "head", "tail", "less", "more",
-        "grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "cut", "tr", "sort",
-        "uniq", "wc", "nl", "fold", "column", "comm", "diff", "strings", "jq", "yq",
-        "base64", "md5sum", "sha256sum", "xxd", "od",
+        "echo",
+        "printf",
+        "print",
+        "cat",
+        "tac",
+        "tee",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "ag",
+        "ack",
+        "sed",
+        "awk",
+        "cut",
+        "tr",
+        "sort",
+        "uniq",
+        "wc",
+        "nl",
+        "fold",
+        "column",
+        "comm",
+        "diff",
+        "strings",
+        "jq",
+        "yq",
+        "base64",
+        "md5sum",
+        "sha256sum",
+        "xxd",
+        "od",
     }
 )
 # Control operators that end one command and begin another.  Used to find the
 # program in a run that ``shlex`` handed over as a single word.
 _CONTROL_OPERATOR_RE = re.compile(r"[;&|\n]+")
-# ``VAR=value`` prefixes a command rather than being the command.
-_ENV_ASSIGN_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*=")
 # An EMPTY substitution expands to nothing, so ``p$()kill`` runs ``pkill`` -- the
 # same glue-evasion as the empty-quote form (``ca""t`` -> ``cat``) that
 # ``normalize_shell_command`` already undoes, but spelled with a substitution and
@@ -2964,9 +3003,7 @@ def _resolve_function_aliases(tokens: "list[str]") -> "list[str]":
 # ``${VAR:0}`` / ``${VAR^^}`` / ``${VAR/x/y}`` and friends TRANSFORM a variable's own
 # value.  The ``:-``/``:+``/``:=``/``:?`` default forms are deliberately NOT matched here --
 # those carry a literal of their own and are handled by ``_resolve_param_defaults``.
-_PARAM_TRANSFORM_RE = re.compile(
-    r"\$\{([A-Za-z_]\w*)(?::(?![-+=?])[^}]*|[#%^,/@][^}]*)\}"
-)
+_PARAM_TRANSFORM_RE = re.compile(r"\$\{([A-Za-z_]\w*)(?::(?![-+=?])[^}]*|[#%^,/@][^}]*)\}")
 
 
 # ``${!VAR}`` expands to the value of the variable NAMED by ``VAR`` -- one more hop
@@ -3059,9 +3096,7 @@ def _resolve_local_assignments(tokens: "list[str]") -> "list[str]":
             # matters where it is used as a program or verb, and a wrong guess there is a
             # refusal, not a bypass.  The ``:-``/``:+``/``:=``/``:?`` DEFAULT forms are
             # excluded: they carry their own literal and are resolved separately.
-            token = _PARAM_TRANSFORM_RE.sub(
-                lambda m: values.get(m.group(1), m.group(0)), token
-            )
+            token = _PARAM_TRANSFORM_RE.sub(lambda m: values.get(m.group(1), m.group(0)), token)
             token = _INDIRECT_VAR_USE_RE.sub(
                 lambda m: values.get(values.get(m.group(1), ""), m.group(0)), token
             )
@@ -3142,12 +3177,12 @@ def _pipes_into_evaluator(tokens: "list[str]") -> bool:
 
 # Constructs by which a text-processing tool RUNS a command rather than printing it:
 # ``awk``'s ``system()`` and pipe-to-command, and GNU ``sed``'s ``e`` flag.
-_SCRIPT_EXECUTES_RE = re.compile(
-    r"system\s*\(|\|\s*[\"']|\|&|print\s*\||\bclose\s*\(|/e\b|\be\s*$"
-)
+_SCRIPT_EXECUTES_RE = re.compile(r"system\s*\(|\|\s*[\"']|\|&|print\s*\||\bclose\s*\(|/e\b|\be\s*$")
 
 
-def _data_consumer_exempt(index: int, token: str, programs: "list[str]", tokens: "list[str]") -> bool:
+def _data_consumer_exempt(
+    index: int, token: str, programs: "list[str]", tokens: "list[str]"
+) -> bool:
     """True if *token* is an ARGUMENT of a command that treats arguments as data.
 
     ``echo <name> <verb>`` prints two words -- a mention, not an invocation.
@@ -3172,8 +3207,10 @@ def _data_consumer_exempt(index: int, token: str, programs: "list[str]", tokens:
         return False
     # ``$(printf <name>) <verb>`` puts the consumer INSIDE a substitution that occupies
     # program position, so its OUTPUT is what runs -- the words are not inert data.
-    if tokens and tokens[0].lstrip("\"'").startswith("$(") or (
-        tokens and tokens[0].lstrip("\"'").startswith("`")
+    if (
+        tokens
+        and tokens[0].lstrip("\"'").startswith("$(")
+        or (tokens and tokens[0].lstrip("\"'").startswith("`"))
     ):
         return False
     # A "data consumer" that can EXECUTE is not one for this command.  ``awk`` has
@@ -3199,7 +3236,7 @@ def _argv_programs(tokens: "list[str]") -> "list[str]":
     current = ""
     expect_program = True
     for token in tokens:
-        if expect_program and token and not _ENV_ASSIGN_RE.match(token):
+        if expect_program and token and not ENV_ASSIGNMENT_RE.match(token):
             current = _program_basename(token)
             expect_program = False
         programs.append(current)
@@ -4937,6 +4974,22 @@ _CREW_SECRET_LEAVES: list[str] = [
     # HMAC-gated ``PUT /api/settings``; the app's own backend opens the file
     # directly rather than through this gate, so it keeps working.
     "workspace/md-notebook/settings.json",
+    # The AWS Control builtin's app data directory. ``backup.json`` in here holds
+    # ``nightly``, the bit that AUTHORIZES the app's startup loop to upload the
+    # gateway's memory and workspace to S3 unattended, so a prompt-injected agent
+    # that could write it would schedule an owner-billed export the owner never
+    # asked for -- routing around the owner-only HTTP surface that is supposed to
+    # be the only way to turn it on. Exactly the ``autoSync`` escalation above,
+    # one app over.
+    #
+    # Classified as the whole DIRECTORY, not that one file, for the reason the
+    # ``whatsapp`` entry above is: an atomic write goes through a temporary in the
+    # same directory and is then renamed, so fencing only the final name leaves a
+    # writable path to the same bytes. Its siblings (the cost cache, the library
+    # ledger) have no legitimate file-tool reader either -- the app's own backend
+    # opens every one of them directly rather than through this gate, so the app
+    # keeps working and future state files are covered without a new entry.
+    "apps/aws-control/data",
     "browser-cookies.txt",
     "playwright-storage-state.json",
     # Per-session work ledgers (session_ledger.py). Not credentials, but each
@@ -4965,6 +5018,14 @@ _CREW_SECRET_LEAVES: list[str] = [
     # dir is gated (like ``profiles``/``run``) so future trust-root material is
     # covered without a new entry. sel.py opens the key directly, not through
     # this gate.
+    #
+    # Spec Builder's decision record (``trust/spec-builder-decisions.json``) relies
+    # on that whole-directory gating. The app refuses a second answer for a decision
+    # it has recorded, so an agent able to write the file could erase an entry to
+    # make a settled decision answerable again, or forge one to lock a decision the
+    # user never answered. Gating the leaf alone was not enough: its parent under
+    # ``workspace/`` was itself replaceable with one ``ln -s``, and the app opens the
+    # path directly (as keystone writers must), so it would have followed the link.
     "trust",
     "security_events.jsonl",
     # Rotated SEL segments. sel.py closes the live log at a size cap and renames
@@ -5000,6 +5061,13 @@ _CREW_SECRET_LEAVES: list[str] = [
     # treatment ``webhooks`` and ``profiles`` already get.
     "crons.json",
     "cron-history",
+    # Saved workflow definitions are executable capabilities whose presence is
+    # authorized only by an explicit dashboard action. Same-UID owner-only file
+    # modes do not stop an agent file tool from planting or rewriting a valid
+    # definition, so fence the whole directory, including atomic-write temp
+    # files. The dashboard and workflow service open it directly and remain able
+    # to create, list, update, and execute definitions.
+    "workflow_library",
     # The operator's OAuth consent-endpoint extension
     # ({additional_authorization_endpoints: [{host, path}]}). Each entry widens
     # the banner-only OAuth entropy carve-out (_OAUTH_AUTHORIZATION_ENDPOINTS),
@@ -5021,6 +5089,21 @@ _CREW_SECRET_LEAVES: list[str] = [
     # gateway's own startup reader opens it directly rather than through this
     # gate, so both keep working.
     "live_target.json",
+    # Holds `backup/redaction.json`, the switch that decides whether a bundle
+    # leaving this machine is redacted first. An agent that could write it would
+    # turn redaction off and every later upload would carry the operator's
+    # secrets verbatim; an agent that could read it learns whether the memory
+    # store is currently being scrubbed. Flipping it is the attack and reading it
+    # is reconnaissance, so this needs read AND write protection, not just write.
+    #
+    # The DIRECTORY is classified, not just the leaf inside it. Naming only the
+    # leaf leaves the container writable, and a writable container is the same
+    # hole one level up: replace `backup/` with a symlink and the protected leaf
+    # now resolves somewhere unprotected, where the switch can be rewritten at
+    # will. Restore's rollback copies live at `pre-restore-<ts>/`, not here, so
+    # nothing legitimate is shut out, and the product's own reader opens the file
+    # directly rather than through this gate.
+    "backup",
     # The computer-use primary enable ({enabled, allowed_apps, extra_denied_apps}).
     # Same class of control as ``denied_commands.json`` directly above, and here
     # for the same reason: flipping ``enabled`` grants full desktop observation
@@ -5167,15 +5250,58 @@ _CREW_SECRET_LEAVES: list[str] = [
     # delivery, or alter its own execution/lease state. Protect the whole
     # directory so every SQLite sidecar inherits the same read/write floor.
     "run-coordinator",
+    # Legacy process-tracking files lived at the data-home root, where an agent
+    # could forge a PID plus a real process-start token and turn the orphan
+    # reaper into kill authority over another same-user process. Current
+    # tracking lives inside the protected run/ directory above; keep the old
+    # leaves sealed too so a downgrade or stale binary cannot recreate the
+    # writable authority surface.
+    "kiro_pids.txt",
+    "kiro_pids.lock",
+    "kiro_session_pids.txt",
+    "kiro_session_pids.lock",
     # Encrypted secret vault directory — denylists the entire subdirectory so
     # the key file, ciphertext store, lock, and atomic-write temp files are all
     # unreadable to the agent through any Kiro Crew-mediated channel (PR 1 of
     # #2351). The verb-independent sensitive-path backstop covers a scripted
     # ``python -c "open('~/.kiro/crew/.vault/...')"`` too.
     ".vault",
+    # KAS-mode auth token store. In the KAS-embedded runtime Kiro Crew performs the
+    # Kiro OIDC lifecycle itself (there is no kiro-cli), and persists the resulting
+    # access/refresh tokens as ``0600`` files under this dir. They are live bearer
+    # credentials for the model service, so — like every other credential store —
+    # they sit behind the shared read+write floor: an auto-approved or sandboxed
+    # agent must not be able to read the token back or overwrite it. The auth
+    # module's own store opens these paths directly rather than through this gate,
+    # so login/refresh keep working. Fence the whole ``kas`` dir (not just
+    # ``kas/auth``): fencing only the leaf would let the agent rename ``kas`` and
+    # then read the relocated token store from outside the fence.
+    "kas",
 ]
 _SENSITIVE_HOME_DIRS += [
     f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in _CREW_SECRET_LEAVES
+]
+
+# ── ACP backend credential stores ──
+# An experimental ACP backend authenticates with its own vendor CLI, which
+# persists a live OAuth token under the user's home. The agent must not be able
+# to read the credential that authorises its own backend.
+#
+# Each entry names the FILE, not the directory: the vendor roots also hold
+# settings and config files, and an operator diagnosing a tool-gate routing
+# verdict has to be able to read them — the refusal message tells them to.
+#
+# Listed literally rather than imported from ``acp.backends``. That import is a
+# CYCLE: security sits below the acp package, so importing it here runs
+# acp/__init__ -> acp.client -> acp._dispatch, which imports back into this
+# half-initialised module and raises. A defensive try/except around it is worse
+# than useless — it swallows the failure and silently protects nothing.
+# ``test_acp_backend_credentials_are_protected`` asserts every registered
+# backend's ``credential_leaves`` appears below, so adding a backend without its
+# credential path fails a test instead of shipping an unprotected token.
+_SENSITIVE_HOME_DIRS += [
+    ".claude/.credentials.json",
+    ".codex/auth.json",
 ]
 
 # ── Write-protected paths (block modification, allow reads) ──
@@ -5222,7 +5348,12 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
     # directly and does NOT route through this gate, so its own write still works.
     # Paired with the same leaf in _WRITE_PROTECTED_BASH_LEAVES — protected on one
     # path only is not protected.
-    for leaf in ("config.json", "config.local.json", "playwright-cli-config.json")
+    for leaf in (
+        "acp-registry.json",
+        "config.json",
+        "config.local.json",
+        "playwright-cli-config.json",
+    )
 ] + [
     # Ops Mission Control's on-call schedule. WRITE-protected, not read+write
     # sensitive: it holds no secret and every teammate's instance must READ it to
@@ -5395,6 +5526,11 @@ _WRITE_PROTECTED_HOME_PATHS += [_KIRO_AGENTS_DIR]
 # unaffected. Reads stay allowed on the tool path for the same reason as the two entries
 # above: the record holds no secret.
 _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
+    # Executable adapter metadata: the selected package, argv, and admitted env
+    # are consumed by the next ACP session spawn. Kiro Crew refreshes this cache
+    # directly; agent file/shell tools may read it but cannot persist a launch
+    # substitution through it.
+    "acp-registry.json",
     "apps/ops-mission-control/data/rotation.yaml",
     "apps/ops-mission-control/data/incidents/index.json",
     "connections-tool-aliases.json",
@@ -5670,9 +5806,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # canonical-no-op chains (``\.\``, ``\X\..\``): they are equivalent to a
     # plain separator, so ``%APPDATA%\.\kiro-cli\data.sqlite3`` and
     # ``...\AppData\Roaming\..\Roaming\kiro-cli\...`` still name the store.
-    win_sensitive_path = (
-        rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern})(?:{win_sep}|\s|$|['\"])"
-    )
+    win_sensitive_path = rf"{win_home_alts}{win_gsep}(?:{win_dirs_pattern})(?:{win_sep}|\s|$|['\"])"
     # ``%APPDATA%`` already points INTO ``AppData\Roaming``, so a spelling like
     # ``%APPDATA%\kiro-cli\data.sqlite3`` names a fenced store WITHOUT the
     # ``AppData\Roaming`` text the branch above anchors on. Map the variable
@@ -5918,18 +6052,28 @@ def _candidate_forms(path_str: str, base_dir: str | None = None) -> set[str]:
 
 def _home_dir_targets_uncached(
     home_dirs: list[str],
-    roots: tuple[str, str | None, str | None] | None = None,
+    roots: (
+        tuple[
+            str,
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+        ]
+        | None
+    ) = None,
 ) -> set[str]:
     """Anchor the ``$HOME``-relative *home_dirs* entries into absolute, casefolded
     on-disk targets.
 
-    *roots* optionally supplies the ``(home, crew_home, kiro_home)`` anchors
-    already resolved by the caller. The TTL cache in :func:`_home_dir_targets` MUST pass
-    it: resolving the roots here as well would read the filesystem a second
-    time, and a root symlink repointed between the two reads would file this
-    set under a key naming the OTHER root — caching one root's targets against
-    another root's key, which fails OPEN. ``None`` (direct callers and tests)
-    resolves them here as before.
+    *roots* optionally supplies the ``(home, crew_home, kiro_home, codex_home,
+    claude_config_dir, claude_home)`` anchors already resolved by the caller.
+    The TTL cache in :func:`_home_dir_targets` MUST pass it: resolving the roots
+    here as well would read the filesystem a second time, and a root symlink
+    repointed between the two reads would file this set under a key naming the
+    OTHER root — caching one root's targets against another root's key, which
+    fails OPEN. ``None`` (direct callers and tests) resolves them here as before.
 
     Anchors against BOTH the logical home and its realpath.  On macOS the
     per-user temp/home prefix can itself be reached via OS symlinks (``/var`` →
@@ -5946,9 +6090,23 @@ def _home_dir_targets_uncached(
     this is a no-op there.
     """
     if roots is not None:
-        home, crew_home, kiro_home_override = roots
+        (
+            home,
+            crew_home,
+            kiro_home_override,
+            codex_home_override,
+            claude_config_dir_override,
+            claude_home_override,
+        ) = roots
     else:
-        home, crew_home, kiro_home_override = _resolved_root_key()
+        (
+            home,
+            crew_home,
+            kiro_home_override,
+            codex_home_override,
+            claude_config_dir_override,
+            claude_home_override,
+        ) = _resolved_root_key()
 
     def _anchor(root: str, d: str) -> str:
         return os.path.join(root, *d.split("/")).casefold()
@@ -6004,6 +6162,30 @@ def _home_dir_targets_uncached(
             sensitive_targets.add(os.path.realpath(agents_full).casefold())
         except (OSError, ValueError):
             pass
+    # codex-acp follows CODEX_HOME for its OAuth token. The literal list entry
+    # keeps the documented ~/.codex default covered and pinned against the
+    # backend registry; this additional anchor covers the operator override.
+    # config.toml deliberately remains readable for routing diagnosis.
+    if codex_home_override and ".codex/auth.json" in home_dirs:
+        auth_full = os.path.join(codex_home_override, "auth.json")
+        sensitive_targets.add(auth_full.casefold())
+        try:
+            sensitive_targets.add(os.path.realpath(auth_full).casefold())
+        except (OSError, ValueError):
+            pass
+    # Claude Code supports both roots for its vendor-owned OAuth token. Keep
+    # the default ~/.claude leaf and each explicit override covered; settings
+    # files beside the token deliberately remain readable for routing diagnosis.
+    if ".claude/.credentials.json" in home_dirs:
+        for claude_root in (claude_config_dir_override, claude_home_override):
+            if not claude_root:
+                continue
+            credentials_full = os.path.join(claude_root, ".credentials.json")
+            sensitive_targets.add(credentials_full.casefold())
+            try:
+                sensitive_targets.add(os.path.realpath(credentials_full).casefold())
+            except (OSError, ValueError):
+                pass
     return sensitive_targets
 
 
@@ -6052,19 +6234,23 @@ _HOME_TARGETS_TTL_SECS = 0.1
 _home_targets_cache: dict[tuple[object, ...], tuple[float, set[str]]] = {}
 
 
-def _resolved_root_key() -> tuple[str, str | None, str | None]:
-    """Return the (home, crew_home, kiro_home) roots the target set is anchored on.
+def _resolved_root_key() -> tuple[
+    str,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+]:
+    """Return the roots the sensitive target set is anchored on.
 
     Mirrors how :func:`_home_dir_targets_uncached` derives its anchors, so the
     cache key changes exactly when the anchors would. Falls back to the
     unresolved form on OSError/ValueError the same way the builder does.
 
-    ``kiro_home`` is the resolved ``KIRO_HOME`` override (kiro-cli's own home
-    override, honoured by ``kiro_agents_dir()``), or ``None`` when unset — it
-    re-anchors the ``~/.kiro/agents`` write-protection, so a changed ``KIRO_HOME``
-    must invalidate the cache. No validity check here (an unsafe value falls back
-    to ``~/.kiro`` in ``kiro_home()``, already covered by the default form); it is
-    resolved only so a symlinked override keys and anchors identically.
+    The optional values are resolved vendor/data roots. Each is part of the key
+    because changing it re-anchors protected paths; a symlinked override must key
+    and anchor identically so the cache cannot serve targets for another root.
     """
     try:
         home = str(Path.home().resolve())
@@ -6086,7 +6272,27 @@ def _resolved_root_key() -> tuple[str, str | None, str | None]:
             kiro = os.path.abspath(os.path.expanduser(kiro_env))
     else:
         kiro = None
-    return home, crew, kiro
+    codex_env = os.environ.get("CODEX_HOME", "").strip()
+    if codex_env:
+        try:
+            codex: str | None = str(Path(codex_env).expanduser().resolve())
+        except (OSError, ValueError):
+            codex = os.path.abspath(os.path.expanduser(codex_env))
+    else:
+        codex = None
+
+    def _resolved_env_root(name: str) -> str | None:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return None
+        try:
+            return str(Path(raw).expanduser().resolve())
+        except (OSError, ValueError):
+            return os.path.abspath(os.path.expanduser(raw))
+
+    claude_config_dir = _resolved_env_root("CLAUDE_CONFIG_DIR")
+    claude_home = _resolved_env_root("CLAUDE_HOME")
+    return home, crew, kiro, codex, claude_config_dir, claude_home
 
 
 def _home_dir_targets(home_dirs: list[str]) -> set[str]:
@@ -6289,6 +6495,136 @@ _EXTRACT_INTO_TRUST_ROOT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The destination half above is deliberately left as the DEFAULT verdict, and
+# this carve-out is the only thing that overrides it.  That direction is the
+# whole design: ``-d`` is also ``ls``'s "show the directory entry itself, not its
+# contents", so the flag-only rule refused a read-only listing of the crew home
+# (issue #6021) while the same read spelled ``-l``, ``-lt``, a grep or a Python
+# ``open`` stayed allowed -- the flag character was never the boundary.
+#
+# Two earlier attempts tried to name the WRITERS instead (an archive-program
+# word, then that word in "command position").  Both were rejected because the
+# set of programs that write through ``-c``/``-C``/``-d``/``-D`` is open-ended,
+# so every program not enumerated became a silent permit against the old rule:
+# ``patch -d``, ``git -C ... apply`` and ``make -C`` were re-admitted into the
+# governance trust root, and a quote-split ``t""ar`` defeated the word match.
+# Enumerating writers fails OPEN, which is the wrong direction for this gate.
+#
+# So the exoneration is an allow-list of READ-ONLY listers instead, and it is
+# narrow by construction: a command qualifies only if it has no shell
+# composition at all AND its program is one of these.  Anything else -- an
+# unknown program, a pipeline, a quoted subshell, a redirection -- keeps the
+# destination-half verdict byte-for-byte, so a shape nobody anticipated
+# over-blocks rather than opening the trust root.
+#
+# Every entry here must be a program that cannot WRITE to the directory it is
+# given.  Do not add a program because it "usually" reads: ``find -delete`` and
+# ``install -d`` are why this is a hand-audited list and not a heuristic.
+_TRUST_ROOT_READ_LISTERS: frozenset[str] = frozenset(
+    {
+        "ls",  # -d: the directory entry itself, the reported false positive
+        "stat",
+        "du",
+        "readlink",
+        "basename",
+        "dirname",
+        "wc",
+    }
+)
+# ``file`` is deliberately ABSENT.  It looks like a pure reader but it is not:
+# ``file -C`` compiles a magic database, and ``file -C <crewhome> -m
+# <crewhome>/evil.magic`` writes ``evil.magic.mgc`` INTO the trust root while the
+# destination half matches on the ``-C`` argument.  That is a real write this
+# carve-out would have exonerated.  Every candidate for this set has to be
+# checked for a compile/output mode, not just for its usual reading role.
+
+# The exonerated shape is validated POSITIVELY: every character of the command
+# must come from a set that carries no meaning to any shell.  This replaced a
+# deny-list of metacharacters (``| & ; newline CR backtick < > ( )`` and
+# ``$(``), which lost four rounds in a row -- each review found one more spelling
+# the screen did not enumerate (a quoted program, an ``&`` inside a quoted
+# filename, a bare CR, then a PowerShell parenthesised group that RUNS in
+# argument position with no ``$`` sigil).  Enumerating what is dangerous cannot
+# terminate against an untrusted string and an unknown target shell; enumerating
+# what is INERT does, because a character absent from this set is refused whether
+# or not anyone has thought of a way to abuse it.
+#
+# So the set is deliberately tiny: letters, digits, and the punctuation a path or
+# a flag actually needs.  Everything else is out, including quotes, ``$``,
+# backslash, glob characters and every bracket -- a bare read listing needs none
+# of them.
+#
+# ``$HOME`` is the ONE exception, stripped before the check, because the
+# destination half of this rule enumerates that spelling itself
+# (``_EXTRACT_INTO_TRUST_ROOT_RE`` matches ``$HOME`` alongside ``~``), so
+# refusing it here would leave half of #6021 unfixed.  It is matched only when
+# followed by ``/``, whitespace or end of string, so ``$HOMEX``, ``${HOME}`` and
+# ``$(...)`` all keep their ``$`` and are refused.
+#
+# The residual cost is over-blocking a read whose PATH contains an excluded
+# character -- ``ls -d ~/.kiro/crew/foo(1)``, or a quoted path with a space.
+# Those keep the destination-half refusal exactly as they did at base: an
+# unfixed false positive of the #6021 family, not a new one. Fixing them would
+# mean telling a literal parenthesis from a grouping one inside an untrusted
+# string, which is the inference this rule has stopped making.
+# Named distinctly on purpose: this module already binds ``_HOME_VAR_RE`` further
+# down for the normalizer, with different semantics (it also accepts
+# ``${HOME}``, case-insensitively).  Reusing that name here silently redefined
+# it -- harmless only by accident of definition order -- so this rule carries its
+# own anchored spelling and cannot be moved out from under by an edit to the
+# other one.
+_TRUST_ROOT_HOME_VAR_RE = re.compile(r"\$HOME(?=[/\s]|\Z)")
+_SHELL_INERT_COMMAND_RE = re.compile(r"\A[A-Za-z0-9_@%+=:,./~^ \t-]+\Z")
+
+
+def _is_bare_trust_root_read(command: str) -> bool:
+    """True for a single simple command whose program only READS its argument.
+
+    Fails closed on anything it does not recognise, because the caller treats a
+    False here as "keep the destination-half refusal".
+    """
+    # Positive validation first: if the command carries a character that could
+    # mean anything to a shell, nothing below is trustworthy.
+    if not _SHELL_INERT_COMMAND_RE.match(_TRUST_ROOT_HOME_VAR_RE.sub("", command)):
+        return False
+    # Past that gate the string provably holds no quote, backslash or
+    # metacharacter, so a plain whitespace split IS the tokenisation -- there is
+    # no shlex-versus-shell disagreement left to exploit.
+    tokens = command.split()
+    if not tokens:
+        return False
+    program = tokens[0]
+    # A PATHNAME is never classified, because a basename says nothing about what
+    # the binary is: ``/tmp/ls`` and ``./ls`` end in ``ls`` and can write the
+    # trust root, so accepting them for the convenience of ``/bin/ls`` would
+    # exonerate an attacker-placed executable.  Only a bare command word counts;
+    # a path falls through to the destination-half refusal, which over-blocks a
+    # legitimate ``/bin/ls`` and is the direction this gate must fail in.
+    # A backslash cannot survive the charset above, so only ``/`` needs testing.
+    if "/" in program:
+        return False
+    # A bare word still resolves through PATH at execution time, so this
+    # carve-out cannot pin WHICH binary runs -- no string matcher can.  That is
+    # not a boundary this rule ever held: a planted shim named ``ls`` in an
+    # agent-writable PATH entry executes through every spelling this matcher
+    # never sees (``ls``, ``ls -l <crewhome>``), so refusing exactly the
+    # ``-d <crewhome>`` form defends nothing against it.  PATH integrity is the
+    # write-path policy's boundary, not this matcher's.
+    return program.lower() in _TRUST_ROOT_READ_LISTERS
+
+
+def _extracts_into_trust_root(command: str) -> bool:
+    """True when a command writes INTO the crew data home via a dest flag.
+
+    The destination match (:data:`_EXTRACT_INTO_TRUST_ROOT_RE`) is the verdict;
+    :func:`_is_bare_trust_root_read` is the single narrow exoneration for the
+    read-only listing that flag spelling made indistinguishable from a write.
+    """
+    if not _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
+        return False
+    return not _is_bare_trust_root_read(command)
+
+
 # ── Symlink-staging to a sensitive target via RELATIVE traversal ──
 # The home-anchored ~/$HOME/absolute forms of ``ln -sf ~/.aws/credentials link``
 # are already caught by _build_sensitive_regex (the sensitive path appears as an
@@ -6305,8 +6641,7 @@ _SENSITIVE_SEGMENT_ALT = "|".join(re.escape(d) for d in _SENSITIVE_HOME_DIRS)
 # the traversal matcher below alongside the POSIX one. Forward-slash-only
 # entries still match (the class includes ``/``), so this strictly widens.
 _SENSITIVE_SEGMENT_ALT_ANYSEP = "|".join(
-    r"[\\/]".join(re.escape(part) for part in d.split("/"))
-    for d in _SENSITIVE_HOME_DIRS
+    r"[\\/]".join(re.escape(part) for part in d.split("/")) for d in _SENSITIVE_HOME_DIRS
 )
 _RELATIVE_SENSITIVE_RE = re.compile(
     rf"(?:^|[\s'\"=:,;])(?:\.\.?[\\/])+(?:{_SENSITIVE_SEGMENT_ALT_ANYSEP})(?:[\\/]|\s|$|['\"])",
@@ -6401,7 +6736,7 @@ def is_sensitive_bash_command(command: str) -> str | None:
     # ── Pass 1: regex fast-path ──
     if _get_sensitive_re().search(command):
         return "Blocked: command accesses sensitive credential path"
-    if _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
+    if _extracts_into_trust_root(command):
         return "Blocked: command extracts into the governance trust-root directory"
     # Block ANY command referencing a sensitive path via relative traversal,
     # regardless of verb.  The home-anchored/absolute forms are already caught
@@ -6453,8 +6788,7 @@ _SHELL_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)$", re.DOTALL
 # saw it and the path resolved clean. The body admits one level of nesting so
 # `${V:-${W}}` resolves on the outer name rather than the inner one.
 _SHELL_VAR_REF_RE = re.compile(
-    r"\$\{[!#]?([A-Za-z_][A-Za-z0-9_]*)(?:[^{}]|\$\{[^{}]*\})*\}"
-    r"|\$([A-Za-z_][A-Za-z0-9_]*)"
+    r"\$\{[!#]?([A-Za-z_][A-Za-z0-9_]*)(?:[^{}]|\$\{[^{}]*\})*\}" r"|\$([A-Za-z_][A-Za-z0-9_]*)"
 )
 
 #: Shell keywords whose whole job is to assign. The name they set persists just as
@@ -6949,9 +7283,7 @@ def _expansion_readings(token: str, assignments: dict[str, str]) -> list[str]:
 _BRACE_OPERATOR_RE = re.compile(r"^(?::[-+=?]|##?|%%?|\^\^?|,,?|[-+=?]|/)")
 #: ``${NAME<operator><operand>}``, with the tail captured so the operand can be
 #: read out of it. One level of nesting, matching `_SHELL_VAR_REF_RE`.
-_BRACE_WITH_OPERAND_RE = re.compile(
-    r"\$\{[!#]?[A-Za-z_][A-Za-z0-9_]*((?:[^{}]|\$\{[^{}]*\})+)\}"
-)
+_BRACE_WITH_OPERAND_RE = re.compile(r"\$\{[!#]?[A-Za-z_][A-Za-z0-9_]*((?:[^{}]|\$\{[^{}]*\})+)\}")
 
 
 def _brace_operand_reading(token: str) -> str | None:
@@ -7025,8 +7357,7 @@ _GENERAL_PURPOSE_PARENT_DIRS: frozenset[str] = frozenset(
 #: Single-segment entries are excluded on purpose: their parent is the home
 #: directory, and treating ``~`` as holding a secret would taint ``cd ~``.
 _SENSITIVE_LEAF_PARENT_DIRS: list[str] = sorted(
-    {d.rsplit("/", 1)[0] for d in _SENSITIVE_HOME_DIRS if "/" in d}
-    - _GENERAL_PURPOSE_PARENT_DIRS
+    {d.rsplit("/", 1)[0] for d in _SENSITIVE_HOME_DIRS if "/" in d} - _GENERAL_PURPOSE_PARENT_DIRS
 )
 
 
@@ -7169,6 +7500,27 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
     Returns denial reason string, or None if clean.
     """
     assignments: dict[str, str] = {}
+    # These roots move sensitive leaves away from $HOME. The segment walk must
+    # resolve an inherited root in a `cd` target so a later bare filename is
+    # checked against the same effective location as the direct-path gate.
+    (
+        _home,
+        crew_home,
+        kiro_home_override,
+        codex_home_override,
+        claude_config_dir_override,
+        claude_home_override,
+    ) = _resolved_root_key()
+    if crew_home:
+        assignments["KIROCREW_HOME"] = crew_home
+    if kiro_home_override:
+        assignments["KIRO_HOME"] = kiro_home_override
+    if codex_home_override:
+        assignments["CODEX_HOME"] = codex_home_override
+    if claude_config_dir_override:
+        assignments["CLAUDE_CONFIG_DIR"] = claude_config_dir_override
+    if claude_home_override:
+        assignments["CLAUDE_HOME"] = claude_home_override
     # A LIST, not one value. A `cd` target carrying a parameter expansion has more
     # than one possible value and only bash knows which (see
     # `_expansion_readings`), so every reading becomes a candidate base and a
@@ -7512,9 +7864,7 @@ def _check_sensitive_via_normalizer(command: str) -> str | None:
     return _check_sensitive_cd_taint(command)
 
 
-def _remember_bases(
-    seen: list[str], bases: list[str], sensitivity: dict[str, bool]
-) -> None:
+def _remember_bases(seen: list[str], bases: list[str], sensitivity: dict[str, bool]) -> None:
     """Add *bases* to the never-pruned *seen* list, keeping order and uniqueness.
 
     Bounded so a long chain of `cd`s cannot grow it without limit; the cap is far
@@ -7776,10 +8126,7 @@ def _shape_path_token(word: str) -> _PathShape:
     text = text.replace("\\", "/")
     if text.startswith("/"):
         absolute = True
-    raw = [
-        _strip_windows_component_padding(segment)
-        for segment in text.split("/")
-    ]
+    raw = [_strip_windows_component_padding(segment) for segment in text.split("/")]
     raw = [segment for segment in raw if segment not in ("", ".")]
     home_anchored = False
     if raw and _HOME_SEGMENT_RE.match(raw[0]):
@@ -8053,11 +8400,11 @@ def _check_sensitive_cd_taint(command: str) -> str | None:
                 # A cd target containing a command substitution with separators may
                 # assemble a sensitive path piecemeal that static analysis cannot
                 # reconstruct.  Fail closed: taint the command.
-                if ("$(" in target or "`" in target):
+                if "$(" in target or "`" in target:
                     inner = (
-                        target[target.index("$(") + 2:]
+                        target[target.index("$(") + 2 :]
                         if "$(" in target
-                        else target[target.index("`") + 1:]
+                        else target[target.index("`") + 1 :]
                     )
                     if any(sep in inner for sep in (";", "&&", "||", "\n")):
                         tainted_by = target
@@ -8082,9 +8429,7 @@ def _check_sensitive_cd_taint(command: str) -> str | None:
                 if target != expanded:
                     unexpanded = _rewrite_windows_home_anchor(target)
                     probe_orig = (
-                        os.path.expanduser(unexpanded)
-                        if unexpanded.startswith("~")
-                        else unexpanded
+                        os.path.expanduser(unexpanded) if unexpanded.startswith("~") else unexpanded
                     )
                     if (
                         is_sensitive_path(probe_orig)
@@ -8149,7 +8494,7 @@ def _check_sensitive_cd_taint(command: str) -> str | None:
             if taint_idx >= 0:
                 break
         if taint_idx >= 0:
-            for seg in aware_segments[taint_idx + 1:]:
+            for seg in aware_segments[taint_idx + 1 :]:
                 seg = seg.strip()
                 if not seg:
                     continue
@@ -8370,9 +8715,7 @@ def _valid_oauth_extension_path(path: str) -> bool:
 # a gateway restart, while repeated checks against an unchanged file cost one
 # ``stat`` instead of a read+parse+validate pass. (path, None) memoizes the
 # absent-file case; any stat/read error bypasses the memo and fails soft.
-_OAUTH_EXTENSION_MEMO: dict[
-    tuple[str, tuple[int, int] | None], frozenset[tuple[str, str]]
-] = {}
+_OAUTH_EXTENSION_MEMO: dict[tuple[str, tuple[int, int] | None], frozenset[tuple[str, str]]] = {}
 
 
 def _load_operator_oauth_endpoints() -> frozenset[tuple[str, str]]:
@@ -8407,9 +8750,7 @@ def _load_operator_oauth_endpoints() -> frozenset[tuple[str, str]]:
             return frozenset()
         raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        logger.debug(
-            "oauth_endpoints.json unreadable; ignoring extension file", exc_info=True
-        )
+        logger.debug("oauth_endpoints.json unreadable; ignoring extension file", exc_info=True)
         return frozenset()
 
     approved = _validate_operator_oauth_entries(raw)
@@ -8858,9 +9199,9 @@ def _exfil_url_warning(
         if next_payload == decoded_payload:
             break
         decoded_payload = next_payload
-        if _HARD_CREDENTIAL_RE.search(
+        if _HARD_CREDENTIAL_RE.search(decoded_payload) or _contains_fixed_credential(
             decoded_payload
-        ) or _contains_fixed_credential(decoded_payload):
+        ):
             return f"Suspicious URL with encoded credential in path/query: {domain}"
 
     # Fail closed when the budget above ran out with layers still to go. A
@@ -9088,13 +9429,23 @@ _CREDENTIAL_PATTERNS = re.compile(
     r"|pypi-[A-Za-z0-9_-]{16,}"  # PyPI API token
     r"|do[opr]_v1_[A-Za-z0-9]{40,}"  # DigitalOcean PAT/OAuth/refresh
     r"|GOCSPX-[A-Za-z0-9_-]{20,}"  # Google OAuth client secret
-    # DB connection URIs with embedded credentials — redact the
-    # ``scheme://user:pass@`` prefix (the password lives here).
-    r"|(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis(?:s)?|amqp(?:s)?)"
+    # Connection/fetch URIs with embedded credentials — redact the
+    # ``scheme://user:pass@`` prefix (the password lives here). http(s)/ftp(s)
+    # are included because URL userinfo is a credential wherever it appears
+    # (e.g. a token-bearing artifact CDN base quoted by an update-failure
+    # message); the user:pass@ shape cannot false-positive on a bare URL — a
+    # port (``:8080``) is never followed by ``@`` within the authority.
+    r"|(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis(?:s)?|amqp(?:s)?"
+    r"|https?|ftps?)"
     # User portion is `*` (not `+`): empty-user connection strings (e.g. MongoDB
     # Atlas IAM `mongodb+srv://:secret@…`) still redact the password (ported
     # from the upstream project).
-    r"://[^\s:/@]*:[^\s/@]+@"
+    # Password segment allows ``@`` (``[^\s/]`` not ``[^\s/@]``): an unencoded
+    # ``@`` inside a password is common, and stopping the match at the FIRST
+    # ``@`` would redact only the head and leak the rest (``…ss@host``) to
+    # logs. ``/`` still bounds the authority, so greedy ``+`` consumes through
+    # the FINAL ``@`` — the real userinfo/host separator — and never past it.
+    r"://[^\s:/@]*:[^\s/]+@"
     # ── JWT / JWE / OAuth Bearer tokens ──
     # `eyJ` is the base64url encoding of every JWT header's `{"` prefix; a signed
     # JWT (JWS) is three `.`-separated base64url segments (header.payload.sig), an
@@ -9510,10 +9861,7 @@ _PKCE_S256_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 
 def _text_contains_bare_secret(text: str) -> bool:
     """Return True when *text* contains an isolated bare AWS-secret run."""
-    return any(
-        _contains_bare_secret(match.group())
-        for match in _BARE_SECRET_RUN_RE.finditer(text)
-    )
+    return any(_contains_bare_secret(match.group()) for match in _BARE_SECRET_RUN_RE.finditer(text))
 
 
 def _oauth_credential_scan_target(
@@ -9603,9 +9951,7 @@ def oauth_url_contains_credential(url: str) -> bool:
         approved_endpoint=approved_endpoint,
     )
     for candidate in (scan_target, unquote(scan_target)):
-        if _contains_fixed_credential(candidate) or _text_contains_bare_secret(
-            candidate
-        ):
+        if _contains_fixed_credential(candidate) or _text_contains_bare_secret(candidate):
             return True
 
     # Provider consent URLs need neither path params nor fragments. Keep these

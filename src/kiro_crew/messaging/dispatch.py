@@ -31,6 +31,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.messaging.driver import DirectiveConsumer, TurnDriver
@@ -289,6 +290,9 @@ def build_tool_gate(ctx_builder: Any, *, session_key: str, agent: str) -> Callab
             raw_params=getattr(event, "raw_tool_params", None),
             command=getattr(event, "shell_command", None),
             is_shell=bool(getattr(event, "is_shell", False)),
+            mcp_server_name=getattr(event, "mcp_server_name", "") or "",
+            mcp_tool_name=getattr(event, "tool_name", "") or "",
+            mcp_identity_ambiguous=bool(getattr(event, "mcp_identity_ambiguous", False)),
         )
         if result.action == TOOL_DENY:
             return "deny"
@@ -604,6 +608,8 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # Publish this turn's session identity so managed MCP tools resolve
         # X-Session-Key; one shared writer lives in messaging.identity.
         await publish_turn_identity(sessions, session_key)
+        from kiro_crew.providers.acp import provider_label
+
         # Off-loop: build_message embeds the episodic query (blocking urllib).
         full_message, _ = await run_in_embed_pool(
             ctx_builder.build_message,
@@ -615,6 +621,7 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             resumed=resumed,
             minimal_context=turn.minimal_context,
             runtime_source=turn.channel_type,
+            provider_type=provider_label(provider),
         )
 
         driver = TurnDriver(
@@ -629,6 +636,28 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             directive_consumer=turn.directive_consumer,
         )
         accumulated = await driver.run(full_message)
+
+        # Defensive lookup, like every other attribute read on this seam: the
+        # driver is resolved through the module attribute, so a caller (or a
+        # test) may supply a stand-in that predates this field. A missing
+        # reason means "no synthetic completion", never an AttributeError
+        # thrown at a real inbound message after the turn already ran.
+        if getattr(driver, "last_stop_reason", "") == STOP_REASON_COMPACTION_FAILED:
+            # Synthetic completion: the backend abandoned the turn after a
+            # failed auto-compaction and never sent end_turn, so it still
+            # counts the prompt as in progress. Reset (mirrors the dashboard
+            # runner's needs_session_reset) or this channel's NEXT message
+            # collides with "prompt already in progress". No re-queue: the
+            # compaction notice already reached the user via the renderer.
+            try:
+                await sessions.reset(session_key)
+            except Exception:
+                logger.warning(
+                    "%s: session reset after compaction failure failed session=%s",
+                    turn.channel_type,
+                    session_key,
+                    exc_info=True,
+                )
 
         # ── Post-turn bookkeeping. Each step is guarded independently so a
         # failure here cannot fall through to the except and re-record a turn

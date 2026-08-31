@@ -119,6 +119,20 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
     useCases: ['apps.autoTriagePipeline.manifest.use_case_1'],
     configuration: ['apps.autoTriagePipeline.manifest.configuration_1'],
   },
+  'aws-control': {
+    displayName: 'apps.awsControl.manifest.display_name',
+    description: 'apps.awsControl.manifest.description',
+    pageLabel: 'apps.awsControl.manifest.page_label',
+    highlights: [
+      'apps.awsControl.manifest.highlight_1',
+      'apps.awsControl.manifest.highlight_2',
+      'apps.awsControl.manifest.highlight_3',
+      'apps.awsControl.manifest.highlight_4',
+      'apps.awsControl.manifest.highlight_5',
+    ],
+    useCases: ['apps.awsControl.manifest.use_case_1'],
+    configuration: ['apps.awsControl.manifest.configuration_1'],
+  },
   'channels': {
     displayName: 'apps.channels.manifest.display_name',
     description: 'apps.channels.manifest.description',
@@ -398,32 +412,27 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
  * inherited `Object.prototype` member and hand a function to i18next. Same guard as
  * `categoryLabel()`; `effort.ts` documents the incident that made it a rule.
  *
- * `_registry` is rejected BEFORE the id is even looked up, for the reason `isVerified()`
- * in `./types.ts` spells out: an id alone is not provenance. An external registry can
- * publish an index entry named `projects`, and without this guard the store would dress
- * that third-party row in the FIRST-PARTY app's localised name, description and feature
- * bullets — trusted copy next to an Install button that runs setup code with gateway
- * privileges. `_registry` is attached server-side by `_load_external_registries` and
- * cannot be forged by index content, whereas `origin` is copied verbatim from that
- * content, so testing `origin === 'builtin'` here would be self-certifying. Genuine
- * built-ins are merged client-side from the installed-apps list and never carry
- * `_registry`, so they still resolve.
+ * Both provenance checks are required before the id is looked up. `_registry` rejects
+ * an external store row even when install-state enrichment lends it `origin: builtin`;
+ * `origin` rejects an installed third-party record, whose detail payload carries no
+ * `_registry`. An id alone is never provenance: otherwise an app named `projects`
+ * inherits trusted first-party copy next to controls that run its setup code.
  */
-function keysFor(app: { name?: string, _registry?: string }): ManifestKeys | undefined {
-  if (!app.name || app._registry) return undefined
+function keysFor(app: { name?: string, _registry?: string, origin?: string }): ManifestKeys | undefined {
+  if (!app.name || app._registry || app.origin !== 'builtin') return undefined
   return Object.prototype.hasOwnProperty.call(APP_MANIFEST_KEY, app.name)
     ? APP_MANIFEST_KEY[app.name]
     : undefined
 }
 
 /** Localised app name, falling back to the manifest's own value then its id. */
-export function appDisplayName(app: { name?: string; displayName?: string; _registry?: string }): string {
+export function appDisplayName(app: { name?: string; displayName?: string; _registry?: string; origin?: string }): string {
   const k = keysFor(app)
   return k ? i18nT(k.displayName) : (app.displayName || app.name || '')
 }
 
 /** Localised one-paragraph app description. */
-export function appDescription(app: { name?: string; description?: string; _registry?: string }): string {
+export function appDescription(app: { name?: string; description?: string; _registry?: string; origin?: string }): string {
   const k = keysFor(app)
   return k ? i18nT(k.description) : (app.description || '')
 }
@@ -435,8 +444,8 @@ export function appDescription(app: { name?: string; description?: string; _regi
  * than off the app record, and `App.tsx` resolves `page.label || displayName || name`.
  * Only installed apps contribute nav pages, so there is no `_registry` to weigh here.
  */
-export function appPageLabel(name: string | undefined, label?: string, displayName?: string): string {
-  const k = keysFor({ name })
+export function appPageLabel(name: string | undefined, label?: string, displayName?: string, origin?: string): string {
+  const k = keysFor({ name, origin })
   // An overlay-only builtin declares no page-label key; fall through to the caller's
   // own strings exactly as a third-party app does.
   return k?.pageLabel ? i18nT(k.pageLabel) : (label || displayName || name || '')
@@ -452,15 +461,21 @@ export function appPageLabel(name: string | undefined, label?: string, displayNa
  * Losing a bullet is a worse failure than showing it in the wrong language, and
  * `check-app-manifest-sync.mjs` fails the build for the same mismatch anyway.
  */
-export function appHighlights(app: { name?: string; highlights?: string[]; _registry?: string }): string[] {
+export function appHighlights(app: { name?: string; highlights?: string[]; _registry?: string; origin?: string }): string[] {
   const manifest = app.highlights || []
   const k = keysFor(app)
   if (!k || k.highlights.length !== manifest.length) return manifest
   return k.highlights.map(key => i18nT(key))
 }
 
-/** Localised, operator-oriented situations where the app is a good fit. */
-export function appUseCases(app: { name?: string; useCases?: unknown; _registry?: string }): string[] {
+/**
+ * Localised, operator-oriented situations where the app is a good fit.
+ *
+ * Installed third-party records do not carry `_registry`, so guidance has an
+ * additional fail-closed provenance check. Without it, an installed app that
+ * reuses a built-in id inherits first-party setup copy from the locale catalog.
+ */
+export function appUseCases(app: { name?: string; useCases?: unknown; _registry?: string; origin?: string }): string[] {
   const manifest = Array.isArray(app.useCases)
     && app.useCases.every((item): item is string => typeof item === 'string')
     ? app.useCases
@@ -471,7 +486,7 @@ export function appUseCases(app: { name?: string; useCases?: unknown; _registry?
 }
 
 /** Localised, concise setup/configuration instructions for an app. */
-export function appConfiguration(app: { name?: string; configuration?: unknown; _registry?: string }): string[] {
+export function appConfiguration(app: { name?: string; configuration?: unknown; _registry?: string; origin?: string }): string[] {
   const manifest = Array.isArray(app.configuration)
     && app.configuration.every((item): item is string => typeof item === 'string')
     ? app.configuration

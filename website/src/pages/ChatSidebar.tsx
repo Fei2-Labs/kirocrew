@@ -16,16 +16,17 @@ import { useConnected } from '../hooks/useConnected'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent } from '../components/ui/dropdown-menu'
 import { ContextMenu, ContextMenuTrigger, ContextMenuContent } from '../components/ui/context-menu'
 import { offlineProps } from '../utils/offline'
-import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, clearSlotReveal } from '../store/chatSlice'
+import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, clearSlotReveal, selectSidebarSubagentCounts, selectSidebarApprovalCounts } from '../store/chatSlice'
 import { sseSlotTitle, setSidebarOrder } from '../store/dashboardSlice'
-import { useDigitModifierHeld, jumpLabelFor } from '../hooks/useKeyboardShortcuts'
+import { useDigitModifierHeld, jumpLabelFor, IS_MAC } from '../hooks/useKeyboardShortcuts'
 import { api, SEARCH_MIN_CHARS } from '../api/client'
 import { computeReorderedFolders } from '../utils/reorderFolders'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { computeActiveSubtree, folderIsHidden, folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
 import { boardCollapseKey, boardColumnFromDroppableId, loadBoardFolderCollapse, persistBoardOverride, persistClearFolderOverrides, clearFolderOverrides } from '../utils/boardFolderCollapse'
-import { slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
+import { isChatPageSurface, slotChannelLabel, slotChannelNamespace } from '../utils/channelOrigin'
+import ErrorNotice from '../components/ErrorNotice'
 import { toolStatusLabel } from '../utils/toolStatusLabel'
 import { sessionRefBlockReason, type SessionRefBlockReason } from '../utils/sessionRefs'
 import { SearchInput, Input, Btn, IconButton, IconButtonGroup, Badge } from '../components/ui'
@@ -54,11 +55,11 @@ import SessionMoveUndoBar, { MOVE_UNDO_MS, type MovedSession } from '../componen
 import SessionActionsMenu from '../components/SessionActionsMenu'
 import { ChannelBrandIcon, hasChannelBrandIcon } from '../components/ChannelBrandIcon'
 import TagManagerList from '../components/TagManagerList'
-import { DndDraggable, DndDroppable } from '../components/dnd'
+import { DndDraggable, DndDroppable, pointerWithinDeepest, closestEdge } from '../components/dnd'
 import { collectFolderSubtreeIds } from '../utils/folderTree'
 import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { sanitizeLlmOutput } from '../utils/sanitize'
-import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SubagentActivity, SessionLink } from '../types'
+import type { ChatFolder, ChatTag, TagColumn, TagColumnMode, SessionLink } from '../types'
 import { SESSION_LANES, inferLane } from './chat/sessionLane'
 import { decideUnreadDrain } from './unreadDrain'
 import {
@@ -75,7 +76,9 @@ import {
 import { loadChatConfig, saveChatConfig } from './chat/ChatSettings'
 import { focusSiblingSessionRow, SESSION_ROW_SELECTOR } from './chat/sessionRowNav'
 import { focusComposer } from './chat/composerFocus'
-import { compareBySort, comparePinnedThenSort, fmtRelativeTime, slotActivityTs } from './chat/sessionOrder'
+import { compareBySort, comparePinnedThenSort, fmtRelativeTime, lastActivityEpoch, slotActivityTs } from './chat/sessionOrder'
+import { DEFAULT_STALE_COLLAPSE_MS, STALE_COLLAPSE_PRESETS_MS, STALE_COLLAPSE_TICK_MS, splitStaleSlots } from './staleCollapse'
+import type { StaleSplit } from './staleCollapse'
 import type { SortKey } from './chat/sessionOrder'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
@@ -159,8 +162,8 @@ function slotStatusText(detail: { kind?: string; text?: string; toolName?: strin
  * want different collision behavior:
  *  - Dragging a folder: restrict collisions to folder sortable containers so
  *    verticalListSortingStrategy animates cleanly and `over.id` is a folder id.
- *  - Dragging a session: prefer the innermost droppable under the pointer
- *    (folder/root drop target), falling back to closestCenter.
+ *  - Dragging a session: prefer the innermost (DOM-deepest) droppable under
+ *    the pointer (folder/root drop target), falling back to closest-edge.
  */
 // Exported for a call-site unit test (ChatSidebar.folderNestBandCallSite.test.tsx):
 // asserts the collision uses the MEASURED header height, not
@@ -175,11 +178,22 @@ export const sidebarCollision: CollisionDetection = (args) => {
       // Target the innermost folder-drop zone under the pointer (or the root
       // lane to move to top level), excluding the dragged folder's own
       // subtree so it can never be dropped into itself or a descendant.
+      // Innermost = leaf-first by DOM containment: the root lane is every
+      // folder's ancestor with a viewport-sized box, so pointerWithin's
+      // box-size ranking would resolve a pointer on a tall expanded folder to
+      // the LANE and silently un-nest the dragged subfolder instead of
+      // re-parenting it.
       const dropContainers = args.droppableContainers.filter(c => {
         const d = c.data?.current as { type?: string; folderId?: string | null } | undefined
         return d?.type === 'folder-drop' && !(d.folderId && subtree.has(d.folderId))
       })
-      return pointerWithin({ ...args, droppableContainers: dropContainers })
+      const within = pointerWithinDeepest({ ...args, droppableContainers: dropContainers })
+      // A pointer drag outside every drop zone deliberately has NO target
+      // (releasing there keeps the current parent). A drag WITHOUT pointer
+      // coordinates (keyboard / synthetic activation) has no such "outside",
+      // so it degrades to closestCenter rather than resolving to nothing.
+      if (within.length || args.pointerCoordinates) return within
+      return closestCenter({ ...args, droppableContainers: dropContainers })
     }
     // Root folder drag: two gestures share the drag, disambiguated by where
     // the pointer sits on the target — the "thirds" pattern from VS Code /
@@ -232,23 +246,49 @@ export const sidebarCollision: CollisionDetection = (args) => {
     )
     return closestCenter({ ...args, droppableContainers: folderContainers })
   }
-  const within = pointerWithin(args)
-  if (within.length) return within
-  // Session drag that is inside no droppable: fall back to the nearest one, but
-  // NEVER to the chat-pane zone. That zone is a pane-sized rect living outside
-  // the sidebar, so by center-distance it would routinely beat the folder row
-  // the user was actually aiming at and steal near-miss drops. A pointer
-  // genuinely inside it still wins above, via `within`.
-  const fallback = args.droppableContainers.filter(
+  // Session drag. Containment first, leaf-first by DOM containment: the root
+  // lane is the folders' ancestor but its border box is only viewport-sized
+  // while an expanded folder block overflows it, so pointerWithin's box-size
+  // ranking would resolve a pointer on a tall folder's own rows to the LANE —
+  // no highlight on the folder, and the drop unfiles the session.
+  //
+  // Sidebar targets are consulted BEFORE the portaled chat-pane zone: the
+  // pane's rect can geometrically overlap the sidebar in overlay layouts, and
+  // with no DOM relation between the two trees containment cannot arbitrate —
+  // a pointer inside any sidebar droppable belongs to the sidebar, and the
+  // pane wins only when nothing in the sidebar contains the pointer.
+  const sidebarContainers = args.droppableContainers.filter(
     c => (c.data?.current as { type?: string } | undefined)?.type !== CHAT_PANE_DROP_TYPE
   )
-  return closestCenter({ ...args, droppableContainers: fallback })
+  const within = pointerWithinDeepest({ ...args, droppableContainers: sidebarContainers })
+  if (within.length) return within
+  const paneWithin = pointerWithinDeepest(args)
+  if (paneWithin.length) return paneWithin
+  // No pointer coordinates (keyboard / synthetic) and no sidebar droppable at
+  // all: the pane is the only conceivable target, so degrade to closestCenter
+  // over everything rather than resolving to nothing. Pointer drags never take
+  // this path — the pane must not win by mere proximity.
+  if (!args.pointerCoordinates && sidebarContainers.length === 0) return closestCenter(args)
+  // Session drag that is inside no droppable: fall back to the nearest one, but
+  // NEVER to the chat-pane zone. That zone is a pane-sized rect living outside
+  // the sidebar, so by proximity it would routinely beat the folder row the
+  // user was actually aiming at and steal near-miss drops. Nearness is
+  // measured to the rect's EDGE (closestEdge), not its center: a pointer a
+  // fraction of a px outside a tall expanded folder is half that folder's
+  // height from its center, so closestCenter would hand the drop to a small
+  // sibling instead.
+  return closestEdge({ ...args, droppableContainers: sidebarContainers })
 }
 
 /** Droppable `type` for the chat-pane target that stages a session reference in
  *  the composer. Lives outside the sidebar's DOM (portaled into ChatPage's pane)
  *  but inside its DndContext, so React context reaches it while `useDroppable`
  *  measures its real on-screen rect. */
+// Load-bearing invariant: the pane's portal host is never a DOM ancestor of
+// the sidebar lane — that is what keeps containment re-ranking from ever
+// arbitrating between the two trees (they always land in the "unrelated"
+// group). Re-pointing chatDropTarget at a wrapper shared with the sidebar
+// would break it.
 const CHAT_PANE_DROP_TYPE = 'chat-pane-ref'
 
 /**
@@ -523,7 +563,17 @@ interface Slot {
   interrupted?: boolean
   mode?: string
   agent?: string
+  // The agent that will actually answer, when it is NOT `agent`. The backend
+  // stores `agent` verbatim — it is the user's intent, and rewriting it on disk
+  // was destructive — and reports the divergence here instead. "" / absent means
+  // NOTHING TO REPORT, which covers both "the request is honored" and "resolution
+  // is not settled yet" (a cold snapshot during boot). So it must be read as a
+  // positive claim only: a falsy value never means "mismatch".
+  effective_agent?: string
   model?: string  // '' / absent = provider-default ("auto")
+  // Live ACP harness this slot is driving ('' = kiro). Distinct from the
+  // Settings default. The bulk model switcher scopes GET /api/models to it.
+  acp_backend?: string
   // Message count from the slot payload. Already carried by every ChatSlot
   // (redux seeds it in addSlotOptimistic and SessionGridView renders it); it was
   // simply never declared on this local view of the type.
@@ -926,6 +976,26 @@ function readStoredRecentWindow(): number {
  *  array of folder ids under this key. */
 const HIDDEN_FOLDERS_LS_KEY = 'mc-flat-hidden-folders'
 
+// Stale-session collapse threshold (ms), persisted. 0 = off. Presets live in
+// the filter menu's display section; the pure split math lives in
+// ./staleCollapse so it can be unit-tested without a render.
+const STALE_COLLAPSE_LS_KEY = 'mc-session-stale-collapse-ms'
+
+/** Read the persisted stale-collapse threshold (ms). A stored "0" means the
+ *  user turned the feature off and must survive reloads, so only a missing or
+ *  invalid value falls back to the default. Runs in a useState initializer, so
+ *  a throwing localStorage must not crash the component. */
+function readStoredStaleCollapse(): number {
+  try {
+    const raw = localStorage.getItem(STALE_COLLAPSE_LS_KEY)
+    if (raw === null) return DEFAULT_STALE_COLLAPSE_MS
+    const saved = Number(raw)
+    return Number.isFinite(saved) && saved >= 0 ? saved : DEFAULT_STALE_COLLAPSE_MS
+  } catch {
+    return DEFAULT_STALE_COLLAPSE_MS
+  }
+}
+
 /** Whether the filter menu's Folders section is rolled up to its heading. */
 const FOLDERS_SHELVED_LS_KEY = 'mc-filter-folders-shelved'
 
@@ -1190,6 +1260,20 @@ interface ChatSidebarProps {
    *  When provided, this fires AFTER the switchSlot dispatch so consumers
    *  can react to user-driven selection (e.g. to navigate the URL). */
   onSelectSlot?: (key: string) => void
+  /** Open a session as a TAB on the host surface instead of switching to it,
+   *  bound to middle-click, modifier-click and the row menu's "Open in a session
+   *  tab".
+   *
+   *  `background` follows the pointer/menu split every browser and editor uses:
+   *  a middle-click or modifier-click QUEUES the session without moving the user
+   *  (that is what makes triaging three rows in a row useful), while the menu
+   *  item is a deliberate "take me there" and opens in the foreground.
+   *
+   *  Omitted on surfaces with no tab strip (the embed sessions list, a popped-out
+   *  window), and an omitted callback leaves the gestures unbound rather than
+   *  falling back to a plain switch — a middle-click that quietly navigated
+   *  would be indistinguishable from a misfire. */
+  onOpenSlotInNewTab?: (key: string, opts?: { background?: boolean }) => void
   /** Reveal a session's pull request / issue in the side panel instead of
    *  leaving for the provider's website.
    *
@@ -1321,7 +1405,7 @@ interface FilterDimension {
 
 function ChatSidebar({
   slots, activeSlot, unreadSlots, history, historyHasMore,
-  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSource, collapsible,
+  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSlotInNewTab, onOpenSource, collapsible,
   chatDropTarget, onDropSessionRef,
 }: ChatSidebarProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
@@ -1341,6 +1425,16 @@ function ChatSidebar({
   const [seedError, setSeedError] = useState('')
   const [slotFilter, setSlotFilter] = useState('')
   const [historyFilter, setHistoryFilter] = useState('')
+  // A resumed history row whose surface ChatPage cannot display (e.g. a
+  // dashboard session) used to succeed on the wire and then silently bounce
+  // the user back to whatever slot was already open, indistinguishable from a
+  // dead click (#3624). Set right after such a resume resolves; cleared on
+  // dismiss or the next resume attempt.
+  const [unresumableNotice, setUnresumableNotice] = useState<string | null>(null)
+  // Monotonic guard for the resume promise chain below: rapid successive row
+  // clicks each start a resume, and an EARLIER one resolving after a LATER one
+  // must not show (or clear) feedback for a row the user has moved past.
+  const resumeSeqRef = useRef(0)
   // Digest of session keys + titles (NOT status), fed to both searches as their
   // revalidate signal. Sorted+joined so reordering `slots` alone cannot refetch.
   const slotTitleDigest = useMemo(
@@ -1582,75 +1676,12 @@ function ChatSidebar({
   const uiLang = useLanguage().resolved
   // Presence in this map means "this session is in an active goal loop".
   const goalLoops = useAppSelector(s => s.chat.goalLoops)
-  // Live subagent activity per slot, for the sidebar row's "N agents running"
-  // subtitle. Mirrors SubagentProgressBar's source of truth: chatSlice.subagents
-  // for the store's active slot, slotActivity[slot].subagents for background
-  // slots (both populated by the globally-subscribed subagent_spawn/tool/done WS
-  // events). We deliberately do NOT use dashboardSlice.subagentRunning — that
-  // count is only broadcast on the subagent_status "done" event
-  // (gateway._broadcast_subagent_status), never on spawn, so it under-reports
-  // while agents are still running.
-  const storeActiveSlot = useAppSelector(s => s.chat.activeSlot)
-  const activeSlotSubagents = useAppSelector(s => s.chat.subagents)
-  const slotActivity = useAppSelector(s => s.chat.slotActivity)
-  // Queued-but-not-started agents have no entry in the per-slot subagents map,
-  // so a slot whose whole wave is still behind the concurrency cap counted 0
-  // and showed no subtitle at all — the window in which a user is most likely
-  // to wonder whether their spawn did anything. Fold the queue depth in.
+  // NOT dashboardSlice.subagentRunning — that only broadcasts on "done", not spawn.
+  const subagentCounts = useAppSelector(selectSidebarSubagentCounts, shallowEqual)
+  // Spawn approvals (pending + approval_id) — surfaced here since background chats have no inline prompt.
+  const subagentApprovalCounts = useAppSelector(selectSidebarApprovalCounts, shallowEqual)
+  // Queued agents (behind concurrency cap) — ensures subtitle shows even when no agents started yet.
   const subagentQueued = useAppSelector(s => s.chat.subagentQueued)
-  const subagentCounts = useMemo(() => {
-    const countActive = (m?: Record<string, SubagentActivity>) => {
-      if (!m) return 0
-      let n = 0
-      for (const a of Object.values(m)) {
-        if (a.status === 'running' || a.status === 'tool' || a.status === 'pending') n++
-      }
-      return n
-    }
-    const counts: Record<string, number> = {}
-    if (storeActiveSlot) { const n = countActive(activeSlotSubagents); if (n > 0) counts[storeActiveSlot] = n }
-    for (const [slot, act] of Object.entries(slotActivity ?? {})) {
-      // Load-bearing: on switchSlot the active slot's subagents map is aliased
-      // into BOTH state.subagents and slotActivity[active].subagents (same
-      // object reference), so skipping the active slot here is what prevents
-      // double-counting it. Do not drop this guard.
-      if (slot === storeActiveSlot) continue
-      const n = countActive(act.subagents)
-      if (n > 0) counts[slot] = n
-    }
-    for (const [slot, q] of Object.entries(subagentQueued ?? {})) {
-      if (q > 0) counts[slot] = (counts[slot] || 0) + q
-    }
-    return counts
-  }, [storeActiveSlot, activeSlotSubagents, slotActivity, subagentQueued])
-  // Sub-agents blocked on a SPAWN approval, per slot. Mirrors
-  // selectSlotPendingSpawnApprovals (status 'pending' + an approval_id), but
-  // across every slot rather than the viewed one: a spawn approval raised by a
-  // background chat has no inline prompt and no notification, so without this
-  // the sidebar was the only place it could have surfaced and it showed
-  // "N agents running" instead — an owed decision rendered as work in
-  // progress. Counted separately from `subagentCounts` so the running subtitle
-  // can subtract them (an agent waiting on approval is not running).
-  const subagentApprovalCounts = useMemo(() => {
-    const countPending = (m?: Record<string, SubagentActivity>) => {
-      if (!m) return 0
-      let n = 0
-      for (const a of Object.values(m)) {
-        if (a.status === 'pending' && a.approval_id) n++
-      }
-      return n
-    }
-    const counts: Record<string, number> = {}
-    if (storeActiveSlot) { const n = countPending(activeSlotSubagents); if (n > 0) counts[storeActiveSlot] = n }
-    for (const [slot, act] of Object.entries(slotActivity ?? {})) {
-      // Same aliasing guard as countActive above: the active slot's map is the
-      // same object in both places, so skipping it here avoids double-counting.
-      if (slot === storeActiveSlot) continue
-      const n = countPending(act.subagents)
-      if (n > 0) counts[slot] = n
-    }
-    return counts
-  }, [storeActiveSlot, activeSlotSubagents, slotActivity])
   // Live dynamic-workflow runs per slot, for the sidebar row's "workflow
   // running" subtitle. Mirrors WorkflowProgressBar's source of truth:
   // chatSlice.workflowRuns (populated by the globally-subscribed
@@ -1877,7 +1908,18 @@ function ChatSidebar({
   const [bulkModel, setBulkModel] = useState('')        // pending pick ('auto' = provider default)
   const [bulkSkipRunning, setBulkSkipRunning] = useState(true)
   const [bulkModelError, setBulkModelError] = useState('')
-  const bulkModelOptions = useAvailableModels({ enabled: bulkModelOpen })
+  // Scope to the live session's harness, same as ChatPage: a config-only list
+  // flashes Auto on an adapter chat whose advertised set does not include it.
+  const harnessBackend = useAppSelector((s) => s.dashboard.status?.harness?.backend ?? '')
+  const liveBackend = useMemo(() => {
+    const live = slots.find((s) => s.key === activeSlot)
+    return live?.acp_backend ?? harnessBackend
+  }, [slots, activeSlot, harnessBackend])
+  const bulkModelOptions = useAvailableModels({
+    enabled: bulkModelOpen,
+    slot: activeSlot || undefined,
+    backend: liveBackend,
+  })
   const bulkRunningCount = useMemo(() => slots.filter(s => s.running).length, [slots])
   // Count only slots that would actually change: model differs from the target
   // (the backend leaves already-on-target slots as `unchanged`), minus running
@@ -1922,6 +1964,118 @@ function ChatSidebar({
 
   // Pinned: derived from server-persisted slot.pinned
   const pinned = useMemo(() => new Set(slots.filter(s => s.pinned).map(s => s.key)), [slots])
+
+  // ── Stale-session collapse ─────────────────────────────────────────────────
+  // Sessions idle past the threshold collapse behind a per-container
+  // "Dormant sessions (N)" expander row, independently at every tree level (each
+  // folder body + the ungrouped root). Pinned, focused, running and
+  // needs-input sessions are exempt: collapsing de-noises settled work, it is
+  // never a place where live or deliberately-kept rows can disappear.
+  const [staleCollapseMs, setStaleCollapseMsState] = useState(readStoredStaleCollapse)
+  const setStaleCollapseMs = useCallback((ms: number) => {
+    setStaleCollapseMsState(ms)
+    safeSetItem(STALE_COLLAPSE_LS_KEY, String(ms))
+    // Off also stops the heartbeat (the map's only GC), so drop the move
+    // exemptions now rather than letting them accumulate unpruned. Read-time
+    // expiry keeps them harmless meanwhile; this is hygiene, not correctness.
+    if (ms <= 0) setStaleRecentlyMoved(prev => (prev.size ? new Map() : prev))
+  }, [])
+  // Manually-expanded containers ('root' or a folder id). Deliberately NOT
+  // persisted: expanding is a "let me peek" gesture, and the collapse is the
+  // steady state the user chose via the threshold — a reload restores it.
+  const [staleExpanded, setStaleExpanded] = useState<Set<string>>(new Set())
+  // Rows the user just MOVED between containers, keyed to WHEN they moved.
+  // Exempt from collapsing so a drag or menu move never lands its row behind
+  // a closed expander (which reads as data loss). Timestamped so the
+  // heartbeat prunes only entries a full interval old — a bare clear could
+  // strip a move made milliseconds before the tick fired.
+  const [staleRecentlyMoved, setStaleRecentlyMoved] = useState<ReadonlyMap<string, number>>(new Map())
+  // Slow heartbeat so rows age INTO the collapsed set while the tab stays
+  // open. Staleness moves on a scale of days, so ten minutes is plenty.
+  const [, setStaleCollapseTick] = useState(0)
+  useEffect(() => {
+    if (staleCollapseMs <= 0) return
+    const id = setInterval(() => {
+      setStaleCollapseTick(t => t + 1)
+      setStaleRecentlyMoved(prev => {
+        if (prev.size === 0) return prev
+        const cutoff = Date.now() - STALE_COLLAPSE_TICK_MS
+        const kept = new Map([...prev].filter(([, at]) => at > cutoff))
+        return kept.size === prev.size ? prev : kept
+      })
+    }, STALE_COLLAPSE_TICK_MS)
+    return () => clearInterval(id)
+  }, [staleCollapseMs])
+  // Exempt everything live or owed to the user: pinned, focused, running
+  // (incl. workflows/goal loops), live or queued subagents, an approval gate,
+  // an unanswered question, unread output — and a row the user JUST moved,
+  // which must stay visible at its destination whatever its age. The collapse
+  // de-noises settled work; a row that needs the user is not settled.
+  const isStaleExempt = (s: Slot): boolean =>
+    pinned.has(s.key) || s.key === activeSlot || runningSet.has(s.key)
+    || (subagentCounts[s.key] ?? 0) > 0 || !!s.pending_approval
+    || !!s.needs_input || unreadSet.has(s.key)
+    // Read-time expiry: an entry only counts while younger than one heartbeat
+    // interval, so correctness never depends on the prune timer having fired
+    // (the timer is gated on the feature being on; the writer is not).
+    || (staleRecentlyMoved.get(s.key) ?? 0) > Date.now() - STALE_COLLAPSE_TICK_MS
+  const splitStale = (list: Slot[]): StaleSplit<Slot> => {
+    // Inert while the list is narrowed: a search or status chip must reach
+    // every match (the same invariant that sends the folder filter inert
+    // while searching), so the collapse may never become a fourth hiding
+    // dimension on top of an active one. Also inert under non-date sorts —
+    // only newest-first ordering makes the stale set a truthful contiguous
+    // tail, so an expander under name/created sort would hide rows from the
+    // middle of the visible ordering.
+    const active = !listNarrowed && sortKey === 'date-desc'
+    return splitStaleSlots(
+      list,
+      active ? staleCollapseMs : 0,
+      Date.now(),
+      s => lastActivityEpoch(s) * 1000,
+      isStaleExempt,
+    )
+  }
+  const renderStaleSection = (containerId: string, staleSlots: Slot[], depth: number, containerName?: string): React.ReactNode => {
+    if (staleSlots.length === 0) return null
+    const open = staleExpanded.has(containerId)
+    const regionId = `stale-rows-${containerId}`
+    const lblId = `stale-lbl-${containerId}`
+    const countId = `stale-count-${containerId}`
+    const ctxId = `stale-ctx-${containerId}`
+    return (
+      <Fragment key={`stale-${containerId}`}>
+        {/* aria-labelledby composes the visible label + count badge + a
+            visually-hidden container name, so AT announces "Dormant sessions
+            3 <folder>" — an aria-label would drop the count (it overrides
+            button contents) and re-pluralizing it per locale is exactly the
+            concatenation trap the i18n rules ban. */}
+        <button type="button"
+          aria-expanded={open}
+          aria-controls={regionId}
+          aria-labelledby={`${lblId} ${countId} ${ctxId}`}
+          data-testid={`stale-expander-${containerId}`}
+          onClick={() => setStaleExpanded(prev => {
+            const next = new Set(prev)
+            if (next.has(containerId)) next.delete(containerId); else next.add(containerId)
+            return next
+          })}
+          className="w-full flex items-center gap-1.5 px-3 py-0.5 rounded-md text-[11px] leading-4 text-muted hover:text-accent hover:bg-bg-hover transition-all bg-transparent border-none cursor-pointer text-left">
+          <DisclosureChevron open={open} size={11} />
+          <span id={lblId}>{i18nT('pages.chatSidebar.stale_collapse_row')}</span>
+          <span id={countId} className="px-1 rounded-full bg-bg-hover text-[10px] tabular-nums">{staleSlots.length}</span>
+          <span id={ctxId} className="sr-only">{containerName
+            ? i18nT('pages.chatSidebar.stale_collapse_ctx_in_name', { name: containerName })
+            : i18nT('pages.chatSidebar.stale_collapse_row_ungrouped')}</span>
+        </button>
+        {/* The controlled region always exists so aria-controls never dangles
+            in the collapsed state; only the rows are conditionally mounted. */}
+        <div id={regionId} hidden={!open}>{open && staleSlots.map(s => renderSessionRow(s, depth, false))}</div>
+      </Fragment>
+    )
+  }
+  // ── end stale-session collapse ─────────────────────────────────────────────
+
   // Ranks up to the configured count of sessions by settled recency for the sidebar tint —
   // see ../utils/recencyTint. Count = server-side dashboard.recent_tint_count (shared
   // kirocrewConfig query); recomputes when the slots or the configured count change.
@@ -2026,8 +2180,13 @@ function ChatSidebar({
     }
   }, [])
 
-  // Folders via React Query
-  const { data: folders = [] } = useQuery<ChatFolder[]>({ queryKey: ['chat-folders'], queryFn: () => api.chatFolders() })
+  // Folders via React Query. `isSuccess` gates the stale-collapse move
+  // watcher below: before folder data has actually ARRIVED `folders` is the
+  // [] default, so every filed slot would read as "just moved" the moment
+  // real data lands — hydration is not user movement. isSuccess (not
+  // isFetched, which is also true after a FAILED first fetch) stays false
+  // through an error window until the websocket seed or a retry backfills.
+  const { data: folders = [], isSuccess: foldersLoaded } = useQuery<ChatFolder[]>({ queryKey: ['chat-folders'], queryFn: () => api.chatFolders() })
 
   // Tags via React Query (dynamic vocabulary, defaults seeded server-side)
   const { data: tags = [] } = useQuery<ChatTag[]>({ queryKey: ['chat-tags'], queryFn: () => api.chatTags() })
@@ -2290,6 +2449,36 @@ function ChatSidebar({
     return m
   }, [slots, folders])
 
+  // Watch for sessions changing container and exempt them from the stale
+  // collapse until they age out (see the timestamped prune on the heartbeat).
+  // Derived from the store rather than wrapped around a move call site, so
+  // EVERY path that moves a session — drag, the row menu, the chat-header
+  // menu, and the move-undo bar — gets the exemption, including moves
+  // initiated outside this component. Gated on `foldersLoaded`: until folder
+  // data has arrived every filed slot maps to undefined, and treating that
+  // hydration as movement would exempt the whole tree on a cold load.
+  const prevSlotFoldersRef = useRef<Map<string, string | undefined> | null>(null)
+  useEffect(() => {
+    if (!foldersLoaded) return
+    const prev = prevSlotFoldersRef.current
+    const next = new Map<string, string | undefined>()
+    for (const s of slots) next.set(s.key, slotFolders[s.key])
+    prevSlotFoldersRef.current = next
+    if (!prev) return
+    const moved: string[] = []
+    for (const [key, fid] of next) {
+      if (prev.has(key) && prev.get(key) !== fid) moved.push(key)
+    }
+    if (moved.length) {
+      const now = Date.now()
+      setStaleRecentlyMoved(prevMap => {
+        const merged = new Map(prevMap)
+        for (const key of moved) merged.set(key, now)
+        return merged
+      })
+    }
+  }, [slots, slotFolders, foldersLoaded])
+
   // Folder IDs that hold at least one ACTIVE slot, directly or via any
   // descendant folder. Computed from all `slots` (not filteredSlots) so a
   // search/filter never spuriously hides a folder that still holds work.
@@ -2477,6 +2666,47 @@ function ChatSidebar({
   // silently miss one (a missed dimension used to strand the folder lane's
   // folders as empty "New chat in <name>" shells).
   const listNarrowed = filterDimensions.some(d => d.narrows !== null && d.narrows())
+
+  // Bridge a clearing narrow for the stale collapse: while narrowed the
+  // collapse is inert, so a 10-day-old search match renders as an ordinary
+  // row. Clearing the search must not swallow the row the user was just
+  // reading behind an expander they have never seen — so when the narrow
+  // ends, pre-expand every container whose narrowed-visible rows would now
+  // collapse. Captured in an EFFECT (committed renders only — a ref written
+  // during render could hold a speculative list an abandoned render never
+  // showed), consumed on the committed narrowed→clear transition. Effect
+  // order matters and matches declaration order: the capture effect sees
+  // `listNarrowed === false` on the clearing commit and leaves the ref for
+  // the consumer below. Pre-expanding a container the narrow never scrolled
+  // into view is accepted: an expanded section inside a collapsed folder is
+  // invisible, and over-expansion never hides anything.
+  const staleNarrowBridgeRef = useRef<Slot[] | null>(null)
+  useEffect(() => {
+    if (listNarrowed) staleNarrowBridgeRef.current = filteredSlots
+  }, [listNarrowed, filteredSlots])
+  useEffect(() => {
+    if (listNarrowed) return
+    const shown = staleNarrowBridgeRef.current
+    // Consumed (and discarded) on the clearing transition even when the
+    // bridge cannot act — under a non-date sort or with the feature off the
+    // collapse is inert anyway, and holding the capture for a LATER sort
+    // switch would mean expanding containers from an arbitrarily old list.
+    staleNarrowBridgeRef.current = null
+    if (!shown?.length || staleCollapseMs <= 0 || sortKey !== 'date-desc') return
+    const { stale } = splitStaleSlots(
+      shown, staleCollapseMs, Date.now(),
+      s => lastActivityEpoch(s) * 1000, isStaleExempt,
+    )
+    if (!stale.length) return
+    setStaleExpanded(prev => {
+      const next = new Set(prev)
+      for (const s of stale) next.add(slotFolders[s.key] || 'root')
+      return next
+    })
+    // isStaleExempt/slotFolders are render-fresh closures; keying the effect on
+    // them would re-fire it every render. The transition is what matters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listNarrowed])
 
   /** Every filter that can hide a reveal target, derived from
    *  `filterDimensions`: the reveal effect iterates this list instead of
@@ -3099,6 +3329,9 @@ function ChatSidebar({
       if (a.nested) {
         // Nested subfolder drag = re-parent: into the folder-drop target, or
         // to the top level when dropped on the root lane (folderId null).
+        // moveFolderTo itself no-ops on the folder's current parent, so a
+        // drop resolving to it (easy to hit now that a tall parent's whole
+        // block is a reachable target) costs no write.
         if (o?.type === 'folder-drop') moveFolderTo(active.id as string, o.folderId ?? null)
         return
       }
@@ -3113,7 +3346,7 @@ function ChatSidebar({
       return
     }
     if (a?.type === 'session' && a.key) {
-      // Drop targets, innermost-first via pointerWithin:
+      // Drop targets, innermost-first via pointerWithinDeepest:
       //  chat-pane-ref → stage a LINK to this session in the open chat's composer
       //  folder-drop  → assign to that folder (folderId may be null for root lane)
       //  folder       → sortable folder container (whole block) → assign to its id
@@ -3457,6 +3690,20 @@ function ChatSidebar({
     // Board columns keep the separate native-HTML5 drag (their own scope).
     const dndRow = scope === 'list' || scope === 'flat'
     const agentName = s.agent || defaultAgent || ''
+    // A DIVERGENCE, not a status: the row is advertising `agentName` while a
+    // different agent answers the session — usually an app agent that was
+    // removed, or one whose registration has not landed yet. Shown because the
+    // stored binding is deliberately left verbatim, so without this the sidebar
+    // names an agent that is not running, and the user only finds out turns
+    // later when none of its tools are there.
+    //
+    // Empty is the common case and means "nothing to report", so the marker is
+    // gated on a non-empty value that actually differs from what is displayed —
+    // never on inequality alone, which would fire during the boot window on a
+    // healthy install. The `?? ''` is load-bearing: rows arrive from persisted
+    // and optimistically-added state that predates this field.
+    const effectiveAgent = s.effective_agent ?? ''
+    const agentDiverged = effectiveAgent !== '' && effectiveAgent !== agentName
     const agentMeta = installedAgents.find(a => a.name === agentName)
     const isPackageAgent = agentMeta?.source === 'package'
     const isBuiltin = agentMeta?.source === 'builtin'
@@ -3725,6 +3972,7 @@ function ChatSidebar({
       slotKey: s.key,
       mode,
       onRename: () => { const sl = slots.find(x => x.key === s.key); suppressMenuRestoreRef.current = true; setRenamingSlot(s.key); setRenameScope(scope); setRenameValue(sl?.title && sl.title !== sl.key ? sl.title : '') },
+      onOpenInNewTab: onOpenSlotInNewTab ? () => onOpenSlotInNewTab(s.key) : undefined,
     }
     return (
       <motion.div key={s.key} layout="position" layoutId={`slot-${layoutScope}-${s.key}`}
@@ -3788,6 +4036,23 @@ function ChatSidebar({
             onSelectSlot?.(s.key)
           }}
           onDragStart={!dndRow ? (e => { e.dataTransfer.setData('text/plain', s.key); e.dataTransfer.effectAllowed = 'move' }) : undefined}
+          // Chrome and Edge on Windows enter autoscroll on middle-button
+          // MOUSEDOWN, before `auxclick` fires — so cancelling it in the
+          // auxclick handler alone opens the tab AND leaves the pointer in
+          // autoscroll mode on a scrollable sidebar. This is the only place that
+          // can stop it. Middle button only: the primary button's mousedown
+          // belongs to dnd-kit's drag listeners, spread above.
+          onMouseDownCapture={onOpenSlotInNewTab ? (e => { if (e.button === 1) e.preventDefault() }) : undefined}
+          // Middle-click opens the session as a tab in the BACKGROUND, the way
+          // every browser and editor treats it — a user triaging by
+          // middle-clicking three rows means "queue these up", and yanking them
+          // to each one in turn defeats the gesture. Bound separately from
+          // onClick because a middle press produces no click event.
+          onAuxClick={onOpenSlotInNewTab ? (e => {
+            if (e.button !== 1 || !connected) return
+            e.preventDefault()
+            onOpenSlotInNewTab(s.key, { background: true })
+          }) : undefined}
           onClick={e => {
             if ((e.target as HTMLElement).closest?.('[data-fork]')) { sessionActions.duplicate(s.key); return }
             if ((e.target as HTMLElement).closest?.('[data-close]')) { sessionActions.close(s.key); return }
@@ -3803,6 +4068,15 @@ function ChatSidebar({
             // /forking still works — those are local ops (or short-circuit) that
             // don't depend on gateway state.
             if (!connected) return
+            // Modifier-click = open as a background tab, matching the
+            // editor/browser convention. The platform split is deliberate:
+            // Ctrl+click IS a right-click on macOS, so honouring it there would
+            // fire this and the context menu from one gesture.
+            if (onOpenSlotInNewTab && (IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey) && !e.shiftKey && !e.altKey) {
+              e.preventDefault()
+              onOpenSlotInNewTab(s.key, { background: true })
+              return
+            }
             dispatch(switchSlot(s.key))
             onSelectSlot?.(s.key)
           }}>
@@ -3846,8 +4120,43 @@ function ChatSidebar({
           <div className="flex-1 min-w-0 overflow-hidden">
             <div className={`session-agent-label ${ROW_META_CLS} font-semibold truncate flex items-center gap-1 ${agentColor}`}>
               <AnimatePresence mode="wait">
-                <motion.span key={agentName || 'empty'} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }} className={`truncate shrink-0 ${resolvedSlotTags.length > 0 ? 'max-w-[50%]' : ''}`}>{agentName || '\u00A0'}</motion.span>
+                <motion.span key={agentName || 'empty'} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: 0.15 }} className={`truncate shrink-0 ${resolvedSlotTags.length > 0 || agentDiverged ? 'max-w-[50%]' : ''}`}>{agentName || '\u00A0'}</motion.span>
               </AnimatePresence>
+              {agentDiverged && (
+                // Plain secondary TEXT, deliberately not a badge, a colour or an
+                // icon. It is informational — the session works, it is simply
+                // answered by someone else — so it must not read as an error, and
+                // it must not be the row's loudest element.
+                //
+                // Accessibility follows from being real text: it is in the
+                // accessible name of the meta line, read in document order by a
+                // screen reader, and legible with colour vision ignored (it
+                // inherits the line's muted tone rather than encoding meaning in
+                // a hue). Nothing here is hover-only — the `title` merely repeats
+                // the visible string so a truncated row can still be read in
+                // full, which is why it is not the only carrier of the meaning.
+                //
+                // `font-normal` because the line is `font-semibold` for the agent
+                // name; `shrink-0` because only the tag group owns the truncate
+                // budget on this flex row.
+                <span
+                  data-testid="session-effective-agent"
+                  // Shrinkable and ellipsizing, NOT `shrink-0`. The trailing meta
+                  // group is `ml-auto … shrink-0` (see :4013 below), so an
+                  // unbounded marker here squeezes the timestamp and channel
+                  // glyphs off a minimum-width sidebar. This is the row's least
+                  // important fact, so it is the one that yields: `min-w-0` lets
+                  // flexbox shrink it, `max-w-[45%]` stops it from claiming the
+                  // line before shrinking starts, and `truncate` ellipsizes what
+                  // is left — the same shape as the tag group below, and the
+                  // reason the `title` is worth keeping.
+                  className="min-w-0 max-w-[45%] truncate font-normal text-muted"
+                  title={i18nT('pages.chatSidebar.answered_by', { agent: effectiveAgent })}
+                >
+                  <span aria-hidden>{'\u00A0·\u00A0'}</span>
+                  {i18nT('pages.chatSidebar.answered_by', { agent: effectiveAgent })}
+                </span>
+              )}
               {resolvedSlotTags.length > 0 && (
                 // Every tag, each as `· <name>` tinted with the tag's own colour
                 // and NO border — plain text sitting as context beside the agent
@@ -4253,7 +4562,7 @@ function ChatSidebar({
           onClick={() => toggleReveal(containerKey)}
           aria-expanded={open}
           title={open ? i18nT('pages.chatSidebar.collapse_hidden_folders') : i18nT('pages.chatSidebar.show_hidden_folder', { count: n })}
-          className="w-full flex items-center gap-1.5 py-1 pr-2 text-left text-[11px] text-muted hover:text-fg hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
+          className="w-full flex items-center gap-1.5 py-1 pr-2 text-left text-[11px] text-muted hover:text-text hover:bg-accent-subtle rounded-md cursor-pointer bg-transparent border-none transition-colors"
           style={{ paddingLeft: `${8 + depth * 12}px` }}
         >
           <DisclosureChevron open={open} size={11} />
@@ -4306,12 +4615,15 @@ function ChatSidebar({
     // new-subfolder input, so it reads as part of the folder list.
     const hiddenHere = hiddenByContainer.get(folder.id)
     if (hiddenHere?.length) childNodes.push(renderHiddenReveal(folder.id, hiddenHere, depth + 1))
-    childSlots.forEach((s, i) => {
+    const { fresh: freshChildSlots, stale: staleChildSlots } = splitStale(childSlots)
+    freshChildSlots.forEach((s, i) => {
       const isActive = activeSlot === s.key
-      const nextIsActive = i < childSlots.length - 1 && activeSlot === childSlots[i + 1].key
-      const showDivider = i < childSlots.length - 1 && !isActive && !nextIsActive
+      const nextIsActive = i < freshChildSlots.length - 1 && activeSlot === freshChildSlots[i + 1].key
+      const showDivider = i < freshChildSlots.length - 1 && !isActive && !nextIsActive
       childNodes.push(renderSessionRow(s, depth + 1, showDivider))
     })
+    const staleSection = renderStaleSection(folder.id, staleChildSlots, depth + 1, folder.name)
+    if (staleSection) childNodes.push(staleSection)
     // Hide folders with no matching children while the list is narrowed
     if (listNarrowed && childNodes.length === 0) return []
     // Wrap children in a bordered container so the folder's extent is visually
@@ -4869,6 +5181,57 @@ function ChatSidebar({
                     {sortKey === o.value && <Check size={14} className="text-accent shrink-0" />}
                   </DropdownMenuItem>
                 ))}
+                <DropdownMenuSeparator />
+                {/* Stale-session collapse threshold. Lives beside Sort rather than
+                    in Settings: it shapes how this list reads, exactly like the
+                    sort order, and the Recent filter's window picker set the
+                    precedent for a duration control in this menu. Hidden in the
+                    flat lane and on the board — those views render rows through
+                    paths the collapse does not touch, and a control that
+                    displays an active setting while doing nothing is a lie. */}
+                {!flatLaneActive && !boardLaneActive && (() => {
+                  // The trigger must not advertise "· 2d" while the collapse
+                  // is inert (narrowed list / non-date sort): a control that
+                  // displays an active setting while doing nothing is a lie.
+                  const stalePaused = staleCollapseMs > 0 && (listNarrowed || sortKey !== 'date-desc')
+                  return (
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger data-testid="stale-collapse-menu"
+                    title={stalePaused ? i18nT('pages.chatSidebar.stale_collapse_paused_hint') : undefined}>
+                    <Clock size={14} className="text-muted shrink-0" />
+                    <span className="flex-1 truncate">
+                      {i18nT('pages.chatSidebar.stale_collapse_menu')}
+                      <span className="text-muted"> · {staleCollapseMs > 0
+                        ? (stalePaused
+                          ? i18nT('pages.chatSidebar.stale_collapse_paused')
+                          : formatRecentWindow(staleCollapseMs))
+                        : i18nT('pages.chatSidebar.stale_collapse_off')}</span>
+                    </span>
+                    <ChevronRight size={13} className="text-muted shrink-0" />
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent className="min-w-[150px] max-w-[240px]">
+                    {/* Caption saying what the durations mean, mirroring the
+                        Recent submenu's "Within" caption above its presets. */}
+                    <div className="px-2 pt-1 pb-1 text-[11px] text-muted">{i18nT('pages.chatSidebar.stale_collapse_caption')}</div>
+                    {/* While paused the WHY must be readable without hover —
+                        the trigger's title tooltip is invisible to keyboard
+                        and touch users, so the hint renders here too. */}
+                    {stalePaused && (
+                      <div className="px-2 pb-1.5 text-[11px] text-muted italic">{i18nT('pages.chatSidebar.stale_collapse_paused_hint')}</div>
+                    )}
+                    {STALE_COLLAPSE_PRESETS_MS.map(ms => (
+                      <DropdownMenuItem
+                        key={ms}
+                        onSelect={() => setStaleCollapseMs(ms)}
+                      >
+                        <span className="flex-1">{ms > 0 ? formatRecentWindow(ms) : i18nT('pages.chatSidebar.stale_collapse_off')}</span>
+                        {staleCollapseMs === ms && <Check size={14} className="text-accent shrink-0" />}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+                  )
+                })()}
                 {/* Tags. Placed above Folders and NOT gated on the lane: tags are
                     a property of the session, so they mean the same thing in the
                     flat list, the folder tree and the board — and the board is
@@ -5078,7 +5441,7 @@ function ChatSidebar({
           // there is nothing for a drop inside the lane to land on. (Order is
           // the reason: a flat lane spans every folder, so a manual position
           // would have no place to be stored.) `sidebarCollision` also keeps the
-          // pane out of its closestCenter fallback, so a release inside the
+          // pane out of its closest-edge fallback, so a release inside the
           // sidebar resolves to no target rather than snapping to the pane.
           <DndContext sensors={dndSensors} collisionDetection={sidebarCollision}
             measuring={dndMeasuring}
@@ -5185,12 +5548,20 @@ function ChatSidebar({
                              *  below, always reachable even when the root lane has
                              *  no empty space. */}
                             {draggingNestedFolder && <RootDropHint />}
-                            {ungroupedSlots.map((s, i) => {
-                              const nextIsActive = i < ungroupedSlots.length - 1 && activeSlot === ungroupedSlots[i + 1].key
-                              const isActive = activeSlot === s.key
-                              const showDivider = i < ungroupedSlots.length - 1 && !isActive && !nextIsActive
-                              return renderSessionRow(s, 0, showDivider)
-                            })}
+                            {(() => {
+                              const { fresh: freshRoot, stale: staleRoot } = splitStale(ungroupedSlots)
+                              return (
+                                <>
+                                  {freshRoot.map((s, i) => {
+                                    const nextIsActive = i < freshRoot.length - 1 && activeSlot === freshRoot[i + 1].key
+                                    const isActive = activeSlot === s.key
+                                    const showDivider = i < freshRoot.length - 1 && !isActive && !nextIsActive
+                                    return renderSessionRow(s, 0, showDivider)
+                                  })}
+                                  {renderStaleSection('root', staleRoot, 0)}
+                                </>
+                              )
+                            })()}
                             {ungroupedSlots.length === 0 && draggingFolderedSession && <RootDropHint />}
                           </div>
                         )}
@@ -5548,6 +5919,14 @@ function ChatSidebar({
                   <button type="button" className="absolute right-2 top-1/2 -translate-y-1/2 text-muted hover:text-text cursor-pointer bg-transparent border-none p-0 leading-none transition-colors" onClick={() => setHistoryFilter('')} aria-label={i18nT('pages.chatSidebar.clear_search')}><X size={13} /></button>
                 )}
               </div>
+              {unresumableNotice && (
+                <ErrorNotice
+                  message={unresumableNotice}
+                  onDismiss={() => setUnresumableNotice(null)}
+                  variant="block"
+                  className="mt-1.5"
+                />
+              )}
             </div>
             {/* scroll-shadow already fades the top/bottom edge as its
              *  scrollability cue, so the bar itself is redundant here. */}
@@ -5629,8 +6008,34 @@ function ChatSidebar({
                   const remoteInstanceId = (s as { instance_id?: string }).instance_id
                   const remoteInstanceName = (s as { instance_name?: string }).instance_name
                   const activateRow = () => {
+                    // A remote row never resumes here, so it can never produce the
+                    // unresumable notice below — the pane switch IS its outcome.
                     if (remoteInstanceId) { selectInstance(remoteInstanceId); return }
+                    // Resume, then check whether the resolved surface is one ChatPage
+                    // can actually show. The request itself succeeds either way
+                    // (`ok`), so `ok` alone cannot tell a genuinely usable resume
+                    // apart from one that will bounce right back (#3624).
+                    setUnresumableNotice(null)
+                    const seq = ++resumeSeqRef.current
                     dispatch(resumeFromHistory({ key: s.key, title: s.title || s.key }))
+                      .unwrap()
+                      .then(result => {
+                        // Latest-click-wins: an earlier resume resolving late must
+                        // not narrate a row the user has already moved past.
+                        if (seq !== resumeSeqRef.current) return
+                        if (result.ok && !isChatPageSurface(result.surface)) {
+                          // Name the surface from the WIRE answer the check itself
+                          // used. The key-prefix heuristic stays only as the
+                          // localized label for the known dashboard case and as a
+                          // last-resort fallback -- interpolating it for arbitrary
+                          // surfaces mislabels them (e.g. "a Session session").
+                          const noticeSurface = isDashboard ? surfaceLabel : (result.surface || surfaceLabel)
+                          setUnresumableNotice(
+                            i18nT('pages.chatSidebar.this_session_cannot_be_opened_from_the_chat_side', { title: s.title || s.key, surface: noticeSurface }),
+                          )
+                        }
+                      })
+                      .catch(() => { /* resumeFromHistory itself never rejects on an API-level failure; a genuine rejection has nothing more useful to add here. */ })
                   }
                   return (
                     <div className={`group relative flex items-start gap-2.5 pr-4 py-2 rounded-md text-sm transition-all select-none ${!connected ? 'text-muted opacity-50 cursor-not-allowed' : 'text-muted hover:text-text hover:bg-bg-hover cursor-pointer'}`} style={{ paddingLeft: '10px' }} title={s.title || s.key} {...offlineProps(connected, 'resume sessions')} role="button" tabIndex={0} aria-disabled={!connected} onKeyDown={e => {
@@ -5666,7 +6071,7 @@ function ChatSidebar({
                       <div className="flex-1 min-w-0 overflow-hidden">
                         <div className={`session-agent-label text-[11px] font-semibold truncate leading-tight flex items-center gap-1 ${agentColor}`}>
                           <span className="truncate">{agentName || '\u00A0'}</span>
-                          {remoteInstanceName && <span className="shrink-0 text-[10px] px-1 rounded bg-bg-muted text-muted border border-border" title={remoteInstanceName}>{remoteInstanceName}</span>}
+                          {remoteInstanceName && <span className="shrink-0 text-[10px] px-1 rounded bg-bg-elevated text-muted border border-border" title={remoteInstanceName}>{remoteInstanceName}</span>}
                           {s.clean_mode
                             ? <span className="text-accent" title={i18nT('pages.chatSidebar.clean_agent_only_no_kirocrew_context_or_mcp')}><Droplet size={10} /></span>
                             : <>

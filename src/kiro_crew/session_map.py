@@ -8,6 +8,7 @@ generic ChannelLink mirror map) for bidirectional sync.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import functools
 import json
 import logging
@@ -652,6 +653,38 @@ class SessionMap:
             self._restore_dirty()
             raise
 
+    async def aclose(self) -> None:
+        """Retire deferred flush tasks and durably land every owed snapshot.
+
+        Cancelling and awaiting the registered task handles both ends of the
+        debounce lifecycle: a task cancelled before its first step leaves the
+        dirty mark untouched, while a task cancelled after claiming a snapshot
+        restores that mark in ``_flush_async``. ``aflush`` then queues a newer
+        snapshot behind any worker-thread write that cancellation could not
+        stop. Repeat if a mutation registered a replacement task while the
+        durability write was in flight, and return only with no task retained.
+        """
+        while True:
+            with _MAP_LOCK:
+                task = self._flush_task
+            if task is not None:
+                task.cancel()
+                try:
+                    await asyncio.gather(task, return_exceptions=True)
+                finally:
+                    # A coroutine cancelled before its first step cannot run
+                    # _restore_dirty(), so retire its registration here. The
+                    # identity guard preserves a replacement scheduled by a
+                    # concurrent mutation.
+                    with _MAP_LOCK:
+                        if self._flush_task is task:
+                            self._flush_task = None
+
+            await self.aflush()
+            with _MAP_LOCK:
+                if self._flush_task is None:
+                    return
+
     @_guarded
     def _write(self) -> None:
         payload, seq = self._serialize()
@@ -927,6 +960,29 @@ class SessionMap:
         if not entry:
             return ""
         return entry.get("provider", "")
+
+    def provider_label_for(self, key: str) -> str:
+        """Return the backend identity bound to *key*, or ``""`` if unbound.
+
+        A bare ``SessionMap`` has no live provider (that lives on
+        ``SessionManager``), so this always falls back to the persisted entry.
+        Legacy entries omit their provider field, so an existing entry
+        normalizes to the default label instead of looking like a brand-new
+        slot.
+        """
+        if not self.has_hint(key):
+            return ""
+        return self.get_provider(key) or PROVIDER_LABEL_DEFAULT
+
+    def set_active_dashboard_slots(self, slot_keys: builtins.set[str]) -> None:
+        """No-op on a bare ``SessionMap``.
+
+        Idle-session reaping keyed off active dashboard slots is a
+        ``SessionManager`` concern; a raw ``SessionMap`` (used directly by
+        Slack-only call sites with no live sessions to expire) has nothing to
+        track here.
+        """
+        return
 
     @_guarded
     def clear_sid(self, key: str) -> bool:

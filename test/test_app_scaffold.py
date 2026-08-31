@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from conftest import make_dir_link, requires_symlinks
+from kiro_crew import platform_compat
 from kiro_crew.apps.manifest import AppManifest
 from kiro_crew.apps.scaffold import (
     _placeholder_icon_png,
@@ -197,6 +198,77 @@ class TestWriteContainment:
             assert manifest.read_text(encoding="utf-8") == original
         assert squatter.is_dir(), "the refused run replaced the occupied site"
 
+    @pytest.mark.parametrize("relpath", _SCAFFOLD_FILES)
+    def test_a_read_only_file_site_is_refused(self, tmp_path, relpath):
+        """A read-only existing file passes the type check (it is not a
+        directory) but its own write_text would raise PermissionError -- not a
+        ValueError -- after app.json was already overwritten. The up-front pass
+        must refuse it while the app is still exactly as it was found."""
+        out = tmp_path / "out"
+        app_dir = out / "victim"
+        squatter = app_dir.joinpath(*relpath)
+        squatter.parent.mkdir(parents=True, exist_ok=True)
+        squatter.write_text("locked", encoding="utf-8")
+        squatter.chmod(0o444)
+
+        # app.json is itself a site here, so only seed a separate manifest when
+        # the read-only squatter is not standing on app.json.
+        manifest = app_dir / "app.json"
+        original = '{"name": "victim", "version": "9.9.9"}\n'
+        seeded = squatter != manifest
+        if seeded:
+            manifest.write_text(original, encoding="utf-8")
+
+        try:
+            with pytest.raises(ValueError, match="not writable"):
+                _scaffold_all(out, "victim")
+
+            if seeded:
+                assert manifest.read_text(encoding="utf-8") == original, (
+                    "the refused run overwrote the existing manifest"
+                )
+            assert squatter.read_text(encoding="utf-8") == "locked", (
+                "the refused run overwrote the read-only site"
+            )
+        finally:
+            squatter.chmod(0o644)
+
+    @pytest.mark.skipif(
+        platform_compat.IS_WINDOWS,
+        reason="chmod(0o555) on a directory does not remove write access on Windows; the read-only-ancestor refusal is POSIX-observable only",
+    )
+    def test_a_read_only_parent_of_an_absent_site_is_refused(self, tmp_path):
+        """A read-only existing directory with the file site still ABSENT slips
+        past the file-writability check (there is no file to test yet), then the
+        eventual write_bytes/mkdir into that directory raises PermissionError --
+        not a ValueError -- after app.json was already overwritten. GPT's case:
+        a read-only `assets/` and no `icon.png`. The up-front pass must prove the
+        nearest existing ancestor of every site is writable and refuse first."""
+        out = tmp_path / "out"
+        app_dir = out / "victim"
+        # Read-only assets/ directory, icon.png absent -- the write site is the
+        # icon, whose nearest existing ancestor is the unwritable assets dir.
+        assets = app_dir / "assets"
+        assets.mkdir(parents=True, exist_ok=True)
+
+        manifest = app_dir / "app.json"
+        original = '{"name": "victim", "version": "9.9.9"}\n'
+        manifest.write_text(original, encoding="utf-8")
+
+        assets.chmod(0o555)
+        try:
+            with pytest.raises(ValueError, match="not writable"):
+                _scaffold_all(out, "victim")
+
+            assert manifest.read_text(encoding="utf-8") == original, (
+                "the refused run overwrote the existing manifest"
+            )
+            assert list(assets.iterdir()) == [], (
+                "the refused run wrote into the read-only directory"
+            )
+        finally:
+            assets.chmod(0o755)
+
     def test_a_refusal_leaves_an_existing_apps_manifest_untouched(self, tmp_path):
         """Re-running `app init` over an existing app must not cost it app.json.
 
@@ -221,6 +293,114 @@ class TestWriteContainment:
 
         assert (app_dir / "app.json").read_text(encoding="utf-8") == original, (
             "the refused run overwrote the existing manifest"
+        )
+
+    def test_a_runtime_write_failure_leaves_an_existing_manifest_intact(
+        self, tmp_path, monkeypatch
+    ):
+        """The up-front pass proves every path is writable, but it cannot prove
+        the write itself will not fail at runtime -- a full disk, an exhausted
+        inode table, EIO. app.json is written LAST so that such a failure aborts
+        before the destructive overwrite, leaving the existing manifest intact.
+
+        Simulated by making the icon write (an early, pre-manifest site) raise
+        ENOSPC the way a full disk would; the pre-seeded app.json must survive.
+        """
+        import errno
+
+        out = tmp_path / "out"
+        app_dir = out / "victim"
+        app_dir.mkdir(parents=True)
+        original = '{"name": "victim", "version": "9.9.9"}\n'
+        (app_dir / "app.json").write_text(original, encoding="utf-8")
+
+        def _boom():
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        # The icon body is produced right before it is written, early in the
+        # write sequence and well before app.json. Failing here stands in for any
+        # runtime write failure past what validation can foresee.
+        monkeypatch.setattr(
+            "kiro_crew.apps.scaffold._placeholder_icon_png", _boom
+        )
+
+        with pytest.raises(OSError):
+            _scaffold_all(out, "victim")
+
+        assert (app_dir / "app.json").read_text(encoding="utf-8") == original, (
+            "a runtime write failure overwrote the existing manifest -- app.json "
+            "must be written last so the destructive write never precedes a "
+            "failure"
+        )
+
+    def test_a_failed_icon_write_leaves_no_partial_placeholder(
+        self, tmp_path, monkeypatch
+    ):
+        """The icon is written only when absent, so a truncated icon.png left by
+        a write that failed partway would be mistaken for the developer's own
+        artwork on every later run and never repaired -- a manifest pointing at a
+        corrupt PNG. The write goes through atomic_write (temp file + rename,
+        temp cleaned up on failure), so a failure leaves NO icon.png rather than
+        a half-written one. Simulated by making atomic_write raise ENOSPC the way
+        a full disk would mid-write; no icon.png must remain.
+        """
+        import errno
+
+        out = tmp_path / "out"
+
+        def _boom(*args, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr("kiro_crew.apps.scaffold.atomic_write", _boom)
+
+        with pytest.raises(OSError):
+            _scaffold_all(out, "myapp")
+
+        icon = out / "myapp" / "assets" / "icon.png"
+        assert not icon.exists(), (
+            "a failed icon write left a partial icon.png behind; the only-when-"
+            "absent guard would treat it as real artwork and never repair it"
+        )
+
+    def test_a_failed_final_manifest_write_leaves_the_old_manifest_intact(
+        self, tmp_path, monkeypatch
+    ):
+        """app.json is written last AND atomically. Last so an earlier failure
+        never reaches it; atomically because the write itself is destructive --
+        write_text would truncate the existing app.json in place, so a full disk
+        DURING the final write would corrupt the very manifest the ordering
+        protects. atomic_write renames a complete temp into place, so app.json is
+        always either the old manifest or the new one, never a truncated hybrid.
+
+        Simulated by failing atomic_write only for app.json (the way a disk that
+        fills exactly at the final write would); the pre-seeded manifest must be
+        byte-for-byte intact.
+        """
+        import errno
+
+        import kiro_crew.apps.scaffold as scaffold_mod
+
+        out = tmp_path / "out"
+        app_dir = out / "victim"
+        app_dir.mkdir(parents=True)
+        original = '{"name": "victim", "version": "9.9.9"}\n'
+        (app_dir / "app.json").write_text(original, encoding="utf-8")
+
+        real = scaffold_mod.atomic_write
+
+        def _fail_only_manifest(path, content, *args, **kwargs):
+            if Path(path).name == "app.json":
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return real(path, content, *args, **kwargs)
+
+        monkeypatch.setattr(scaffold_mod, "atomic_write", _fail_only_manifest)
+
+        with pytest.raises(OSError):
+            _scaffold_all(out, "victim")
+
+        assert (app_dir / "app.json").read_text(encoding="utf-8") == original, (
+            "a disk-full during the final manifest write truncated the existing "
+            "app.json; the write must be atomic so the old manifest survives"
         )
 
     def test_app_dir_symlink_escaping_output_dir_is_refused(self, tmp_path):
