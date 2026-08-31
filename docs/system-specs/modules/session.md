@@ -7,8 +7,11 @@ its own kiro-cli session with idle expiry, context compaction, circuit
 breaker, per-session semaphore, and persistent background session.
 
 Chat sessions are served from the warm pool when eligible (default pool
-agent, default cwd, no resume mapping); otherwise they cold-start on first
-message via `get_or_create()`.
+agent, default cwd, no resume mapping, no foreign `acp_backend` override);
+otherwise they cold-start on first message via `get_or_create()`.
+`live_harness(key)` returns the live session's backend and advertised model
+ids so a dedicated subagent child can pin that harness instead of the
+factory snapshot.
 
 ## Background Session
 
@@ -114,6 +117,30 @@ send time.
   pending synthesis, and the tag is merge-breaking so a nudge is never folded
   into a `[N queued messages merged]` user turn. At `_prompt_depth > 0` the ladder is disabled entirely (terminal
   notice on the first empty) to prevent nested-turn re-queue loops.
+- **Leaked tool-call notice** (dashboard chat runner, depth-0 turns only,
+  issue #6112): a turn that ends normally with an invoke block emitted as
+  TEXT and zero tool calls executed — the model wrote its invocation into the
+  prose channel instead of dispatching it (observed with deferred MCP tools
+  whose schema is not yet bound, and with large nested arguments) — surfaces
+  a visible notice card and is marked un-landed (no success recording, no
+  budget reset, no consolidation), so an unattended monitor/autonudge cycle
+  that leaked never lands silently. Detection is machine-shaped
+  (`chat_utils.has_leaked_tool_call`): an unquoted invoke open tag plus a
+  parameter or close tag, with fenced code blocks and inline code spans
+  stripped first so a pasted transcript or explained example never matches;
+  the gate (`should_notice_leaked_tool_call`) is claimed ahead of the
+  promise-only guard and excludes stage-execution turns (the orchestrator's
+  stage loop reads the turn result for stage accounting). Deliberately **notice-only** — no continuation is
+  queued, because an injected "re-issue that call" would carry runtime
+  authority into sessions where the call auto-approves (slot trust, global
+  yolo, or a static agent tool allowlist, the last invisible at the runner
+  layer, so no fail-closed downgrade condition exists) and the leaked block
+  may be untrusted external content the model merely reproduced. A loop loses
+  one cycle, visibly, and retries on its own schedule. Scope limit: the
+  notice/un-landing applies only to ZERO-tool-call turns — a mixed turn that
+  executed tools and then leaked its final dispatch as text lands normally
+  (un-landing a turn whose earlier calls had real side effects would
+  misdescribe it) and is logged at WARNING as a diagnostic instead.
 - **Context compaction**: at ≥ configured threshold (`session.autocompact_pct`, default 70%, valid 5–90), compacts **in place** on both
   backends: kiro-cli via a `/compact` **prompt** (`session/prompt` +
   `_kiro.dev/compaction/status` watch — never the string form of
@@ -155,6 +182,20 @@ send time.
   memory, leaving the new ACP process with zero history.
 - **Per-session semaphore**: serializes concurrent messages on the same
   thread key. `get_or_create()` acquires; caller must `release()` when done.
+- **Backend-aware cold-start models**: the effective backend includes a live
+  per-call `acp_backend` override. Within the configured backend, every
+  namespace honors an explicit caller model, then a per-crew pin; registry-model
+  backends may continue through the bound Kiro agent and global tiers, while
+  adapter-owned namespaces skip Kiro agent definitions and use their concrete
+  adapter-global default. When a live-parent override differs from the current
+  configured backend, every current-config model tier is withheld and the child
+  inherits the live parent's backend default unless its advertised-model filter
+  retained an explicit caller or role pin.
+- **New-session config refresh**: changing `agent.acp_backend`, `agent.model`, or
+  `agent.reasoning_effort` rebuilds the provider factory and drains the warm
+  pool, because those values are captured when the factory is built. Existing
+  sessions keep their current adapter and defaults; the next session uses the
+  new configuration without a gateway restart.
 - **Post-semaphore revalidation** (`_reacquire_and_validate`): the per-session
   semaphore may be held for a full turn, so it is ALWAYS acquired with the
   global `self._lock` RELEASED (pinning the lock across that wait would freeze
@@ -257,7 +298,8 @@ send time.
 | Method | Purpose |
 |--------|---------|
 | `start_pool(blocking=True)` | Pre-spawn warm + background sessions. `blocking=False` for non-blocking mode. |
-| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False)` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. |
+| `live_harness(key)` | Returns `(backend, advertised_ids)` for a live session. `None` backend means there is no parent; `""` is kiro-cli and must be pinned, not treated as absence. Dedicated children use this instead of the factory snapshot. |
+| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False)` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). A `reasoning_effort_override` also skips the warm pool (`bypass_effort`): a pre-warmed provider was built without the override and post-claim fixups never touch effort, so the override must reach a fresh provider-factory call to be delivered — which also keeps the factory's effort gate the single authority reporting a dropped level. A per-call `acp_backend` that differs from `SessionManager.acp_backend` skips it as `bypass_backend`. Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and disqualifiers are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. |
 | `check_context_usage(key, provider)` | Returns %. Triggers compaction at configured threshold (default 70%), warns one `CONTEXT_WARN_MARGIN_PCT` below it. |
 | `compact_if_needed(key)` | Awaitable twin of the `check_context_usage` trigger for callers that must not start their next turn while a compaction is pending (the task runner's between-steps check, #4686). Same gates in the same order — both entry points consume the shared `_compaction_gate_decision` ladder, the single owner of the gate order (its docstring documents each rung) — then AWAITS `_compact_session`. Returns the outcome: `"absent"`, `"reset"` (the settled verdict on the prior attempt was ineffective-and-still-critical and the promoted escalation reset the session here, awaited), `"cc_managed"` (checked before the threshold, mirroring `check_context_usage`), `"below_threshold"`, `"unconfirmed"`, `"in_progress"`, `"cooldown"`, `"ok"`, `"busy"`, `"recycled"`, `"failed"`. A `"busy"` decline means a turn holds the semaphore — the caller leaves the session alone and retries later, never falls back to a direct `provider.compact()`. |
 | `record_success(key)` / `record_failure(key)` | Circuit breaker tracking. |
@@ -307,11 +349,15 @@ kiro-cli conversation history when a session is recycled.
 
 **Only long-lived conversational sessions are mapped.** Stateless sessions
 (cron, subagent, taskrunner, channel, secretary, side, heartbeat/background,
-`wf-pool:` warm workflow-pool workers) are excluded via `_STATELESS_PREFIXES`.
-The `wf-pool:` prefix keeps per-run pooled workers (workflows/agent_pool.py)
-from persisting a session_map entry or resuming a prior transcript — their
-hard-reset fallback must hand the next task a clean session, never a
-`session/load` replay of the previous task's conversation. The `side:` prefix is included so
+`wf-author:` workflow authoring, and `wf-pool:` warm workflow-pool workers) are
+excluded via `_STATELESS_PREFIXES`. A `wf-author:` session is also explicitly
+destroyed after each authoring attempt, which shuts down its provider, removes its
+registry entry, and deletes any stale map entry; stateless classification prevents
+resume lookup or persistence during acquisition. The `wf-pool:` prefix keeps
+per-run pooled workers (workflows/agent_pool.py) from persisting a session_map entry
+or resuming a prior transcript — their hard-reset fallback must hand the next task
+a clean session, never a `session/load` replay of the previous task's conversation.
+The `side:` prefix is included so
 `/side` conversations never resume across KiroCrew restarts — each cold-start
 triggers `is_first_turn=True` in `build_side_message` which re-seeds the
 parent snapshot + accumulated side history.
@@ -473,10 +519,12 @@ in a worker thread — the loop never pays the file write inline, and `_data`
 never crosses the thread boundary. Coalescing never drops a trailing mutation
 (the task loops until it observes a clean map), and a per-snapshot ticket keeps
 a slow in-flight write from landing an older map over a newer forced one.
-`SessionMap.flush()` (sync contexts) and `SessionMap.aflush()` (awaited, for
-loop-side shutdown paths — `SessionManager.close_all()` uses it) are the
-deterministic durability points; off the loop (CLI, tests, worker threads)
-every mutation still writes inline. Losing a pending
+`SessionMap.flush()` (sync contexts) and `SessionMap.aflush()` (awaited) are the
+deterministic durability points. `SessionMap.aclose()` is the shutdown boundary
+used by `SessionManager.close_all()`: it cancels and awaits the registered
+debounce task, preserves an unstarted or claimed-but-unwritten snapshot, lands
+it through `aflush()`, and returns only after the task registration is retired.
+Off the loop (CLI, tests, worker threads) every mutation still writes inline. Losing a pending
 flush on a crash leaves a well-formed older map, never a truncated file.
 
 **Auto-prune:** `SessionMap.get()` auto-removes entries whose `.json` file
@@ -571,7 +619,11 @@ when that exists, so a thread active across the migration keeps one log file.
 opens a DM thread, links the session, and posts the last 5 messages as context.
 
 **Dashboard state:** `ChatSlot.summary()` includes `slack_linked: bool` so
-the frontend can show a link indicator.
+the frontend can show a link indicator. `_ChatSlot.task` publishes ownership through a
+property that increments `_turn_generation` for every new non-null task. The counter is
+process-local and monotonic for the slot lifetime; unlike `task`, normal turn teardown
+does not clear it, so code spanning an await can detect a turn that started and finished
+inside that interval.
 
 **Slash commands** (`slack/events.py`):
 - `/kirocrew sessions` — lists active sessions with Slack link status
@@ -911,7 +963,7 @@ Security properties (enforced in `session_directive.decode` plus the applier):
 - **Native sub-agent calls refused**: they surface as flat events in the parent loop but have no independently bindable slot, so the applier declines them.
 - **SEL audit on every application**: `apply_session_directive` emits a tool-invocation event tagged `source="mcp-directive"` with outcome `success` / `denied` (e.g. a `set_project` sensitive-path block) / `error`, since the effect now runs in the consumer rather than in the tool body or an HTTP endpoint.
 
-The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions").
+The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions"). `set_project` additionally requires structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing. Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
 
 Gateway-off (the default topology this targets), the model's tool result is the tool's OWN returned line delivered over kiro-cli's MCP pipe; the applier's confirmation string and SEL audit are recorded on KiroCrew's own surfaces (transcript / WS / hooks) and do NOT rewrite the model's tool result. Each tool therefore phrases its own message as a *request* that the consumer applies (and may refuse — no interactive session, invalid/sensitive path, capped/paused loop) rather than asserting the effect already landed.
 
@@ -934,7 +986,7 @@ sequenceDiagram
 
 ### Orphan Sweep Active Set
 
-The periodic sweep of `kiro_session_pids.txt` (which kills tracked kiro-cli
+The periodic sweep of `<data-home>/run/kiro_session_pids.txt` (which kills tracked kiro-cli
 PIDs no longer in `self._sessions`) builds its active set as the union of
 `_collect_active_pids(self._sessions)` + `_pool_pids()` + `_in_flight_pids()`
 + `_companion_runtime_pids()`, re-checked against the same union in phase 2
@@ -944,11 +996,34 @@ subagents) and `self._bg_runtime` (the multiplexed `_bg` runtime), each guarded
 on `is_alive()` — only alive runtimes are shielded, so dead ones are still
 reaped.
 
+Each current `run/kiro_session_pids.txt` entry also records the child's OS
+process-start identity. The startup and periodic sweeps compare that token
+before signalling and carry it through the periodic two-phase active-set check,
+then pass it to `platform_compat.kill_process_tree_pinned` for the final kill.
+On Windows that helper holds the verified process handle across `taskkill`, so
+the PID cannot be recycled between the last comparison and the signal. A
+matching token authorizes
+the isolated process-tree cleanup without consulting adapter argv or registry
+metadata; a mismatch is a recycled PID and is pruned without signalling, while
+an unreadable token is retained for a later retry. Legacy tokenless entries use
+only the fixed, code-owned managed-agent marker catalog.
+Records split into at most three fields, so a legacy/textual token containing
+colons is preserved intact. On macOS the token comes from libproc's microsecond
+start identity rather than `ps lstart`'s one-second rendering; two processes
+created within the same second therefore cannot compare equal after PID reuse.
+Other platforms continue through `platform_compat.process_start_time`, including
+the Windows creation-time identity held by the pinned kill helper.
+
 **Failure it fixes**: since the `AcpRuntime` unify, *every* runtime records its
-PID in `kiro_session_pids.txt` at spawn. These two runtime kinds live outside
+PID in `run/kiro_session_pids.txt` at spawn. These two runtime kinds live outside
 `self._sessions`, so before this union the sweep saw their live PIDs as
 untracked orphans and SIGKILLed them mid-chat (surfacing as
 `process exited (rc=-9)`).
+
+Both PID authority files (`kiro_pids.txt` and `kiro_session_pids.txt`) and their
+locks live under the sensitive `run/` trust root. Legacy data-home-root copies
+are neither migrated nor read and remain on the sensitive-path deny list; an
+agent-writable legacy entry therefore cannot become process-kill authority.
 
 ### Cross-platform process management (platform_compat)
 
@@ -958,8 +1033,12 @@ Windows as well as macOS/Linux. The critical correctness reason is that
 **`os.kill(pid, 0)` is NOT a liveness probe on Windows — it terminates the process** —
 so every liveness check uses `platform_compat.pid_exists(pid)` (or the tri-state
 `pid_liveness`) instead, kills use `kill_pid` / `kill_process_tree`, the PID-reuse
-guard reads the parent via `get_ppid`, the managed-agent check uses
-`process_matches(pid, ("kiro-cli","claude"))`, and the PID-file locks use
+guard reads creation time via `process_start_time` and the parent via `get_ppid`,
+the managed-agent check uses
+`process_matches` for distinctive backend command-line markers and
+`process_image_name` for short bare adapter executables (an exact basename
+check; names such as `"pi"` and `"codex"` are never substring kill gates), and
+the PID-file locks use
 `platform_compat.file_lock` / `acquire_lock` / `try_acquire_lock` (POSIX `flock`
 vs Windows `msvcrt`). On POSIX the behavior is unchanged.
 
@@ -1006,11 +1085,14 @@ see [security](security.md) § Conditional Python-interpreter env strip.
 | TaskRunner acceptance | `taskrunner:{task_id}:acceptance` | Seconds | Own kiro-cli |
 | Warm spare | _(in pool queue)_ | Until assigned | Pre-started kiro-cli |
 
-**Cold-start semaphore**: `_start_sem = Semaphore(2)` limits concurrent
-`provider.start()` calls to 2 for memory safety. This
-prevents resource exhaustion when multiple sessions cold-start simultaneously,
-while still allowing 3 parallel subagents to all run concurrently once started
-(they queue briefly during cold-start).
+**Cold-start admission**: `SessionManager._start_sem` bounds provider starts local
+to one manager. The narrower common runtime chokepoint adds a gateway-wide
+`AcpRuntime.spawn()` coordinator capped at 2 concurrent spawn + `initialize`
+handshakes, matching worker-pool `max_starting=min(workers, 2)`. Authoring,
+interactive, background, shared-runtime, and unpooled callers therefore share the
+same expensive-start bound even when they bypass this manager or a worker pool.
+Queued cancellation returns the permit, and runtime startup retains its existing
+subprocess cleanup on cancellation or failure.
 
 **Parallel step throttling**: TaskRunner limits concurrent step sessions
 to `max_parallel_steps` (default 2) via `asyncio.Semaphore`. Cold starts

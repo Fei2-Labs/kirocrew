@@ -37,6 +37,24 @@ def _structured_monitor(**changes: object) -> MonitorState:
     return MonitorState(**values)
 
 
+_FROZEN_NOW = 1_000_000.0
+
+
+def _freeze_clock(monkeypatch) -> None:
+    """Pin ``autonudge``'s clock so a deadline-anchored first delay is exact.
+
+    ``add()`` anchors ``next_due_ts = now + idle_secs``, then AWAITS an fsync of
+    the state file before ``_arm_from_deadline`` re-reads ``time.time()`` to
+    derive ``remaining``. Unfrozen, the first delay comes out short by however
+    long that write took (2.4s on a loaded Windows shard), so any tolerance on it
+    is really asserting that the runner never stalls between two statements.
+    Frozen, ``remaining`` is exactly ``idle_secs``, so every assertion below can
+    be exact -- a tolerance there would only hide a regression that reintroduces
+    the wall-clock dependency.
+    """
+    monkeypatch.setattr(_an.time, "time", lambda: _FROZEN_NOW)
+
+
 @pytest.mark.asyncio
 async def test_add_and_fire_on_idle(svc, monkeypatch):
     """Arming a timer and letting it elapse triggers the fire callback."""
@@ -641,6 +659,7 @@ async def test_skip_when_delivery_returns_false(svc, monkeypatch):
         return None
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    _freeze_clock(monkeypatch)
 
     fired: list[NudgeLoop] = []
 
@@ -668,7 +687,7 @@ async def test_skip_when_delivery_returns_false(svc, monkeypatch):
     assert not svc._timers[loop.id].done()
     # First sleep used the (deadline-anchored) full idle; the re-arm used the
     # shorter backoff.
-    assert sleep_calls[0] == pytest.approx(60, abs=1)
+    assert sleep_calls[0] == 60
     assert _an._REARM_BACKOFF_SECS in sleep_calls
     svc._cancel_timer(loop.id)  # cleanup
 
@@ -737,13 +756,7 @@ async def test_rearm_backoff_escalates_on_consecutive_failures(svc, monkeypatch)
         await real_sleep(0)
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
-    # Freeze the clock for the arm. add() anchors next_due_ts = now + idle_secs,
-    # then AWAITS an fsync of the state file before _arm_from_deadline re-reads
-    # time.time() to derive `remaining`. Unfrozen, the first delay is short by
-    # however long that write took (1.8s on a loaded shard), so the assertion
-    # below was really asserting that the runner never stalls between two
-    # statements. Frozen, `remaining` is exactly idle_secs.
-    monkeypatch.setattr(_an.time, "time", lambda: 1_000_000.0)
+    _freeze_clock(monkeypatch)
 
     async def on_fire_skip(loop):
         return False
@@ -763,9 +776,6 @@ async def test_rearm_backoff_escalates_on_consecutive_failures(svc, monkeypatch)
             break
         task = nxt
     # First sleep = (deadline-anchored) full idle; then exponential backoff per failure.
-    # Exact, not approx: the frozen clock makes the first delay deterministic,
-    # so a tolerance here would only hide a regression that reintroduces the
-    # wall-clock dependency.
     assert sleep_calls == [10000, 15, 30, 60, 120]
     assert svc._loops[loop.id].active is True
     assert svc._rearm_fail_count[loop.id] == 4
@@ -831,6 +841,7 @@ async def test_failure_streak_resets_on_delivery(svc, monkeypatch):
         return None
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    _freeze_clock(monkeypatch)
 
     results = [False, False, True]  # third fire delivers
     idx = {"i": 0}
@@ -855,7 +866,7 @@ async def test_failure_streak_resets_on_delivery(svc, monkeypatch):
         task = nxt
     # 2 skips escalated (15, 30), then delivery bumped cycle_count and the
     # delivered happy-path does not re-arm, so the chain stops at 3 sleeps.
-    assert sleep_calls == [pytest.approx(10000, abs=1), 15, 30]
+    assert sleep_calls == [10000, 15, 30]
     assert svc._loops[loop.id].cycle_count == 1
     assert loop.id not in svc._rearm_fail_count  # streak cleared on delivery
 
@@ -876,6 +887,7 @@ async def test_fire_removed_loop_does_not_rearm_orphan(svc, monkeypatch):
         return None
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    _freeze_clock(monkeypatch)
 
     removed = _asyncio.Event()
 
@@ -898,7 +910,7 @@ async def test_fire_removed_loop_does_not_rearm_orphan(svc, monkeypatch):
     assert loop.id not in svc._timers
     assert loop.id not in svc._rearm_fail_count
     # Only the initial idle sleep ran; no backoff re-arm fired.
-    assert sleep_calls == [pytest.approx(60, abs=1)]
+    assert sleep_calls == [60]
 
 
 @pytest.mark.asyncio
@@ -1056,6 +1068,7 @@ async def test_unrouted_channel_namespace_degrades_instead_of_raising(svc, monke
         return None
 
     monkeypatch.setattr(_an.asyncio, "sleep", _sleep)
+    _freeze_clock(monkeypatch)
 
     removed = _asyncio.Event()
 
@@ -1079,7 +1092,7 @@ async def test_unrouted_channel_namespace_degrades_instead_of_raising(svc, monke
     assert loop.id not in svc._timers
     assert loop.id not in svc._rearm_fail_count
     # Only the initial idle sleep ran — no backoff re-arm was scheduled.
-    assert sleep_calls == [pytest.approx(60, abs=1)]
+    assert sleep_calls == [60]
     svc.stop()
 
 

@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from aiohttp import web
 
+from kiro_crew.acp.types import ACP_BACKEND_KIRO
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+from kiro_crew.messaging.link import ChannelLink
 
 #: Draining is a LOOP because a drained task may register another -- not because any
 #: current one does (``chat_slack`` has a single ``create_task``, and the backfill
@@ -18,6 +22,46 @@ from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 #: forever fails the test instead of hanging until the 120s pytest timeout, whose
 #: report names the timeout and not the task.
 _DRAIN_ROUNDS = 20
+
+
+def acp_identity_flags(backend: str = ACP_BACKEND_KIRO) -> dict[str, bool]:
+    """Every ``AcpProvider.is_*`` flag that follows from a backend id, for *backend*.
+
+    ``MagicMock(spec=AcpProvider)`` answers an unstubbed property with a truthy
+    Mock, so a double that stubs only the flags a test happens to care about
+    silently claims every OTHER harness identity at once. That is not a
+    hypothetical: dispatch keyed on ``is_spec_adapter`` took the adapter arm for
+    doubles meant to be kiro-cli, and the tests failed on the *result* of the
+    translation rather than on the wrong branch being taken.
+
+    Computed by running the real property getters against a stand-in exposing
+    nothing but ``_client.backend``, and DISCOVERED from the class rather than
+    listed here — an identity property added later is stubbed for free, in
+    agreement with production by construction. Membership-based flags
+    (``ACP_BACKENDS_*``) come along because they read the same attribute.
+    """
+    from kiro_crew.providers.acp import AcpProvider
+
+    class _BackendOnly:
+        def __init__(self, value: str) -> None:
+            self._client = SimpleNamespace(backend=value)
+
+    stub = _BackendOnly(backend)
+    flags: dict[str, bool] = {}
+    for name, attr in vars(AcpProvider).items():
+        if not isinstance(attr, property) or not name.startswith("is_"):
+            continue
+        getter = attr.fget
+        if getter is None or "self._client.backend" not in inspect.getsource(getter):
+            continue
+        flags[name] = bool(getter(stub))
+    return flags
+
+
+def stub_acp_identity(provider, backend: str = ACP_BACKEND_KIRO) -> None:
+    """Apply :func:`acp_identity_flags` to an ``AcpProvider`` double in place."""
+    for name, value in acp_identity_flags(backend).items():
+        setattr(provider, name, value)
 
 
 def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
@@ -130,12 +174,16 @@ def _make_state(tmp_path, **kwargs):
     # and a bare MagicMock is unconditionally truthy, so every session reads as
     # mirrored to a channel. A guard that refuses mirrored sessions then refuses
     # ALL of them, which looks like a broken guard rather than a missing double.
-    # Parity with SessionStore: absent -> None.
-    _mirror_links: dict[str, tuple[str, str]] = {}
+    # Parity with SessionStore: absent -> None, present -> ChannelLink (the
+    # drain's mirror-retarget comparison reads the link's identity fields, so a
+    # bare tuple would make every mirror identical).
+    _mirror_links: dict[str, ChannelLink] = {}
 
     def _set_mirror_link(key, channel_id, thread_ts):
         if channel_id or thread_ts:
-            _mirror_links[key] = (channel_id, thread_ts)
+            _mirror_links[key] = ChannelLink(
+                channel_type="slack", channel_id=channel_id, thread_id=thread_ts
+            )
         else:
             _mirror_links.pop(key, None)
 

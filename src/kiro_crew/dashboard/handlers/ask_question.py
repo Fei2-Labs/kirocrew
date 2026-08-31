@@ -25,10 +25,7 @@ import uuid
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
-from kiro_crew.dashboard.handlers.source_providers import (
-    is_owner_dashboard_request,
-    stale_owner_session_response,
-)
+from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.sel import sel
 from kiro_crew.validation import (
@@ -90,7 +87,11 @@ def _deny_app_token(request: web.Request, operation: str) -> web.Response | None
     except Exception:
         logger.warning("SEL audit failed for app-token denial", exc_info=True)
     return web.json_response(
-        {"error": "app token not permitted for this endpoint"}, status=403
+        {
+            "error": "app token not permitted for this endpoint",
+            "code": "app_token_forbidden",
+        },
+        status=403,
     )
 
 
@@ -111,8 +112,15 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
     is configured. That matches the identity the ``ask_question`` MCP tool
     itself carries, since its token is minted as ``owner_id or "local-app"``.
     """
+    from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+
     if is_owner_dashboard_request(request):
         return None
+    # Domain-specific audit kept here rather than delegated to
+    # ``require_owner_dashboard_request``: this record carries the endpoint as
+    # ``resources`` plus an ``error`` reason, which the shared helper's generic
+    # ``non_owner_block`` record does not. Only the denial TAIL (stale-session
+    # relabel + 403) is shared -- see ``_owner_denial_response``.
     try:
         sel().log_api_access(
             caller=str(request.get("user") or "anonymous"),
@@ -126,10 +134,7 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
         logger.warning("SEL audit failed for non-owner denial", exc_info=True)
     # Deny decision made above; only the response label changes for a signed
     # pre-owner bootstrap subject (see stale_owner_session_response).
-    stale = stale_owner_session_response(request)
-    if stale is not None:
-        return stale
-    return web.json_response({"error": "forbidden"}, status=403)
+    return _owner_denial_response(request, "forbidden", "owner_only")
 
 
 async def api_ask_question(request: web.Request) -> web.Response:
@@ -150,34 +155,49 @@ async def api_ask_question(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400
+        )
     if not isinstance(body, dict):
         # Valid JSON is not necessarily an object: `[]`, `null` and bare scalars
         # all parse, then blow up on `.get()` as a 500 instead of a 400.
-        return web.json_response({"error": "body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
+        )
 
     session_key = str(body.get("session_key") or "")
     if not session_key:
-        return web.json_response({"error": "session_key is required"}, status=400)
+        return web.json_response(
+            {"error": "session_key is required", "code": "missing_session_key"},
+            status=400,
+        )
     slot_key = _slot_key_from_session(session_key)
     # Refuse to address a slot that does not exist: otherwise the caller blocks
     # for the full window on a card no client will ever render. An empty slot key
     # is the same dead end — the conversation has no open tab to render into.
     if not slot_key or slot_key not in state._slots:
         return web.json_response(
-            {"error": f"unknown slot for {session_key!r} — no dashboard session to ask"},
+            {
+                "error": f"unknown slot for {session_key!r} — no dashboard session to ask",
+                "code": "slot_not_found",
+            },
             status=404,
         )
 
     try:
         questions = validate_ask_user_question(body)
     except ValidationError as exc:
-        return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(
+            {"error": str(exc), "code": "invalid_questions"}, status=400
+        )
 
     try:
         timeout_secs = int(body.get("timeout_secs") or state._QUESTION_TIMEOUT_DEFAULT)
     except (TypeError, ValueError):
-        return web.json_response({"error": "timeout_secs must be an integer"}, status=400)
+        return web.json_response(
+            {"error": "timeout_secs must be an integer", "code": "invalid_field_type"},
+            status=400,
+        )
 
     ask_id = uuid.uuid4().hex
     try:
@@ -202,7 +222,9 @@ async def api_ask_question(request: web.Request) -> web.Response:
         # Raised when redaction collapses two questions into the same key, which
         # is only detectable after the redaction pass — so it surfaces here as a
         # 400 rather than from validate_ask_user_question.
-        return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(
+            {"error": str(exc), "code": "duplicate_question_key"}, status=400
+        )
     if answers is None:
         return web.json_response({"status": "timeout", "ask_id": ask_id})
     return web.json_response({"status": "answered", "ask_id": ask_id, "answers": answers})
@@ -343,9 +365,13 @@ async def api_ask_question_answer(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400
+        )
     if not isinstance(body, dict):
-        return web.json_response({"error": "body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
+        )
 
     if body.get("dismissed"):
         answers: dict[str, str] | None = None
@@ -353,11 +379,16 @@ async def api_ask_question_answer(request: web.Request) -> web.Response:
         raw = body.get("answers")
         if not isinstance(raw, dict) or not raw:
             return web.json_response(
-                {"error": "answers must be a non-empty object"}, status=400
+                {"error": "answers must be a non-empty object", "code": "invalid_answers"},
+                status=400,
             )
         if len(raw) > _ASK_MAX_QUESTIONS:
             return web.json_response(
-                {"error": f"at most {_ASK_MAX_QUESTIONS} answers"}, status=400
+                {
+                    "error": f"at most {_ASK_MAX_QUESTIONS} answers",
+                    "code": "too_many_answers",
+                },
+                status=400,
             )
         # Keys and values are echoed back to the agent as tool output, so they
         # are coerced to str (a nested object cannot smuggle structure into the
@@ -372,7 +403,10 @@ async def api_ask_question_answer(request: web.Request) -> web.Response:
         for k, v in answers.items():
             if len(k) > _ASK_MAX_QUESTION_LEN:
                 return web.json_response(
-                    {"error": f"question key exceeds {_ASK_MAX_QUESTION_LEN} characters"},
+                    {
+                        "error": f"question key exceeds {_ASK_MAX_QUESTION_LEN} characters",
+                        "code": "question_key_too_long",
+                    },
                     status=400,
                 )
             if len(v) > _ASK_MAX_ANSWER_LEN:
@@ -381,14 +415,18 @@ async def api_ask_question_answer(request: web.Request) -> web.Response:
                         "error": (
                             f"answer exceeds {_ASK_MAX_ANSWER_LEN} characters "
                             "— shorten it and submit again"
-                        )
+                        ),
+                        "code": "answer_too_long",
                     },
                     status=400,
                 )
 
     if not state.resolve_question(ask_id, answers):
         return web.json_response(
-            {"error": "no pending question with that id (already answered or expired)"},
+            {
+                "error": "no pending question with that id (already answered or expired)",
+                "code": "question_not_found",
+            },
             status=404,
         )
     return web.json_response({"ok": True})

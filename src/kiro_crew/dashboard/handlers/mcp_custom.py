@@ -388,8 +388,8 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
             if not enable:
                 entry["disabled"] = True
             entries[name] = entry
-        # The secure store write DACLs its temp file via icacls on Windows —
-        # a blocking subprocess that must not run on the event loop.
+        # The secure store write applies an owner-only DACL to its temp file on
+        # Windows — blocking filesystem work kept off the event loop.
         await _mcp._offload_config_write(_mcp._atomic_write, _mcp._kirocrew_mcp_json(), data)
 
     await _rebuild_agent_config()

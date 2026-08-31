@@ -73,9 +73,15 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
     data: dict = {
         "id": a.id,
         "slot": subagent_event_slot(a.parent_session_key),
+        # The sub-agent's OWN session key (where it writes its ctx_blocks /
+        # token rows), so a client can fetch this node's own context-trace and
+        # render its window composition. Mirrors the run key derived in
+        # SubagentManager._run: `conversation_key or subagent:<id>`.
+        "child_session": getattr(a, "conversation_key", "") or f"subagent:{a.id}",
         "task": _r(a.task),
         "agent": _r(a.agent),
         "model": a.resolved_model,
+        "requested_model": _r(a.requested_model),
         "streaming": _r(a.streaming_text),
         "last_tool": _r(a.last_tool),
         "tool_count": a.tool_count,
@@ -484,13 +490,15 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     # gateway upgrade) and the liveness signal. That only holds
                     # while the payload stays counts-and-environment: the
                     # checkout's branch and commit say what the operator is
-                    # working ON, which is not an app's business and has no
-                    # consumer outside the owner surfaces. Strip them here
+                    # working ON, and the harness block says which agent
+                    # binary they chose to run — host configuration, not an
+                    # app's business, with no consumer outside the owner
+                    # surfaces. Strip them here
                     # rather than moving the whole frame behind a declaration,
                     # which would silently cut every existing app off from the
                     # version signal. ``/api/status`` and the SSE stream run on
                     # dashboard-user tokens and keep the full snapshot.
-                    for _owner_only in ("branch", "commit"):
+                    for _owner_only in ("branch", "commit", "harness"):
                         data.pop(_owner_only, None)
                     # Tier 0 admits every app unconditionally, but the decision
                     # is still a grant per ``AUTOSDE.yaml`` -- this frame is
@@ -718,6 +726,8 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                             "data": {
                                                 "id": a.id,
                                                 "slot": slot,
+                                                "child_session": getattr(a, "conversation_key", "")
+                                                or f"subagent:{a.id}",
                                                 "elapsed": a.elapsed,
                                                 "error": _r(a.error) if a.error else None,
                                                 "stopped": a.user_stopped,
@@ -725,6 +735,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                                 "task": _r(a.task),
                                                 "agent": _r(a.agent),
                                                 "model": a.resolved_model,
+                                                "requested_model": _r(a.requested_model),
                                             },
                                         }
                                     )

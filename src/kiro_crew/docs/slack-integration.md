@@ -180,8 +180,9 @@ your own workspace.
 
 ## Settings API (dashboard)
 
-The Slack channel view at `/settings?tab=channels&channel=slack` (legacy
-`?tab=slack` links redirect there) is backed by three dashboard-only
+The Slack channel view at `/settings/channels/slack` (legacy
+`?tab=slack` / `?tab=channels&channel=slack` links redirect there) is backed
+by three dashboard-only
 endpoints (registered behind token auth, never on the API-only server):
 
 - `GET /api/slack/config` — masked token previews (`xoxb-••••wxyz`), presence

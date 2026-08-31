@@ -57,7 +57,7 @@ from kiro_crew.config.loader import (
     read_local_secret,
     update_config_locked,
 )
-from kiro_crew.cron import CronSchedule, CronService, format_schedule
+from kiro_crew.cron import CronSchedule, CronService, CronStoreUnreadable, format_schedule
 from kiro_crew.cron_trigger import trigger_cron_job
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.origin import parse_dashboard_url
@@ -70,6 +70,11 @@ from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.memory import MemoryStore
 from kiro_crew.port_resolution import resolve_client_port_ex
+from kiro_crew.secrets.migrate import (
+    MigrationConflictError,
+    format_report,
+    migrate_env_secrets,
+)
 from kiro_crew.security import (
     BUILTIN_DENIED_RULES,
     BUILTIN_DENY_PATTERNS,
@@ -603,9 +608,15 @@ def _run_app_mcp_server(app_name: str) -> None:
     module_name = f"kiro_crew.apps.builtins.{app_name.replace('-', '_')}.mcp_server"
     try:
         mod = importlib.import_module(module_name)
-    except ImportError as exc:
-        print(f"App {app_name!r} has no MCP server ({module_name}): {exc}", file=sys.stderr)
-        sys.exit(1)
+    except ModuleNotFoundError as exc:
+        # Only the TARGET module (or one of its parent packages) missing means
+        # "this app has no MCP server". A missing dependency imported INSIDE
+        # mcp_server.py — or any other ImportError — is a real defect and must
+        # keep its traceback rather than exit with a misleading diagnosis.
+        if exc.name and (exc.name == module_name or module_name.startswith(exc.name + ".")):
+            print(f"App {app_name!r} has no MCP server ({module_name}): {exc}", file=sys.stderr)
+            sys.exit(1)
+        raise
     runner = getattr(mod, "run_mcp_server", None)
     if runner is None:
         print(f"{module_name} defines no run_mcp_server()", file=sys.stderr)
@@ -875,6 +886,27 @@ def _agent_reset_model(args: argparse.Namespace) -> None:
 
 
 def _cron(args: argparse.Namespace) -> None:
+    """Dispatch cron subcommands, translating a refused write into an error.
+
+    ``CronService._save`` raises ``CronStoreUnreadable`` rather than silently
+    skipping the write when the last load failed, so every mutating verb here can
+    fail that way. Untranslated it reached the user as a stack trace, which names
+    the raise site but not the one action that fixes it. The exception's own
+    message carries that remediation, so it is surfaced verbatim.
+
+    One wrapper rather than a handler per verb: `add`, `update`, `remove`,
+    `pause`, `resume` and `adopt` all persist through the same ``_save``, so
+    catching at the dispatch boundary covers them without eight duplicated
+    blocks, and any verb added later is covered by construction.
+    """
+    try:
+        _cron_dispatch(args)
+    except CronStoreUnreadable as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _cron_dispatch(args: argparse.Namespace) -> None:
     """Dispatch cron subcommands: list, add, remove, pause, resume."""
 
     svc = CronService(base_dir=config_dir())
@@ -1106,24 +1138,7 @@ def _cron(args: argparse.Namespace) -> None:
             print(f"Job not found: {args.job_id}")
 
     elif action == "remove":
-        removed = svc.remove_job(args.job_id)
-        # SEL audit: single delete records the affected job and outcome, same
-        # shape as cron.add/cron.update above. Exception-contained: the first
-        # sel() of a process constructs the log and can raise, and the job is
-        # already removed — a completed delete must not exit as a crash
-        # because the audit trail is unavailable.
-        try:
-            sel().log_api_access(
-                caller="cli",
-                operation="cron.remove",
-                outcome="allowed" if removed else "not_found",
-                source="cli",
-                resources=(
-                    f"job_id={args.job_id}" if removed else f"job_id={args.job_id} reason=not_found"
-                ),
-            )
-        except Exception as e:
-            print(f"Warning: audit log write failed: {e}", file=sys.stderr)
+        removed = svc.remove_job(args.job_id, actor="cli", source="cli")
         if removed:
             print(f"Removed job: {args.job_id}")
         else:
@@ -1874,6 +1889,39 @@ def _markdown_memory_store() -> MemoryStore:
     return MemoryStore()
 
 
+def _memory_search_history(args: argparse.Namespace) -> None:
+    """Print FTS5 hits from the markdown memory layer.
+
+    Reads the same index the heartbeat and gateway keep current, so this needs
+    no embedder and no vector store — it answers "where did I write this word"
+    against preferences, projects and the dated daily-history files.
+
+    Resolves the store through ``_markdown_memory_store`` for the reason spelled
+    out there: the reader must anchor exactly where the gateway's consolidator
+    writes, or a config that remaps the default workspace searches a tree
+    nothing writes to.
+    """
+    store = _markdown_memory_store()
+    results = store.search(args.query, limit=10)
+    if not results:
+        # An empty index is not the same statement as an absent word, so the two
+        # are reported differently.
+        if not store.index_row_count():
+            print("Memory history index is empty or unavailable; nothing was searched.")
+        else:
+            print("No memory-history matches.")
+        return
+    print("  Daily history / preferences / projects:")
+    for r in results:
+        # Strip terminal control sequences for the same reason the semantic
+        # listing does: memory holds whatever the user pasted into a session.
+        path = _TERMINAL_CTRL_RE.sub("", str(r.get("path", "?")))
+        snippet = _TERMINAL_CTRL_RE.sub("", str(r.get("snippet", ""))).strip()
+        print(f"    {path}")
+        if snippet:
+            print(f"        {snippet}")
+
+
 def _memory_show(args: argparse.Namespace) -> None:
     """Read-only view of the markdown memory layer (preferences/projects/history).
 
@@ -1921,6 +1969,11 @@ def _memory_cmd(args: argparse.Namespace) -> None:
     if action == "show":
         _memory_show(args)
         return
+    # "search --layer history" reads only the markdown FTS index, so don't open
+    # (or create) the vector store for it — same reason as "show" above.
+    if action == "search" and getattr(args, "layer", "all") == "history":
+        _memory_search_history(args)
+        return
     cfg = KiroCrewConfig.load()
     store = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim)
     store.init()
@@ -1946,19 +1999,31 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                 )
 
         elif action == "search":
-            results = store.search_episodic(query_text=args.query, limit=10)
-            if not results:
-                print("No episodic memories found.")
-                return
-            for r in results:
-                tags = (
-                    json.loads(r.get("tags", "[]"))
-                    if isinstance(r.get("tags"), str)
-                    else r.get("tags", [])
-                )
-                print(f"  [{r.get('importance', 0):.1f}] {r['text'][:120]}")
-                if tags:
-                    print(f"        tags: {', '.join(tags)}")
+            layer = getattr(args, "layer", "all")
+            if layer in ("vector", "all"):
+                results = store.search_episodic(query_text=args.query, limit=10)
+                if not results:
+                    print("No episodic memories found.")
+                    # Under "all" the markdown layer is still to come: an empty
+                    # vector result is not an empty answer.
+                    if layer == "vector":
+                        return
+                elif layer == "all":
+                    # Both sections are printed, so both are named. Unlabelled,
+                    # the first block of hits reads as the whole answer. Held
+                    # back under "vector", whose output shape is a promise.
+                    print("  Episodic recall:")
+                for r in results:
+                    tags = (
+                        json.loads(r.get("tags", "[]"))
+                        if isinstance(r.get("tags"), str)
+                        else r.get("tags", [])
+                    )
+                    print(f"  [{r.get('importance', 0):.1f}] {r['text'][:120]}")
+                    if tags:
+                        print(f"        tags: {', '.join(tags)}")
+            if layer == "all":
+                _memory_search_history(args)
 
         elif action == "stats":
             stats = store.memory_stats()
@@ -2649,3 +2714,42 @@ def _telemetry(args: argparse.Namespace) -> None:
     else:
         print("✅ Anonymous usage beacon DISABLED. Nothing will be sent.")
         print(f"   You can also delete {beacon.INSTALL_ID_FILE} from the data home.")
+
+
+def _handle_secrets(args: argparse.Namespace) -> None:
+    """Dispatch secrets subcommands. Currently only ``import`` (migration)."""
+
+    action = getattr(args, "secrets_action", None)
+
+    if action == "import":
+        # Import ONLY from the fixed data-home .env — never an arbitrary path.
+        # A caller-supplied file would let a sandbox-off agent import attacker
+        # Jira values into the vault and have the vault-first consumer trust
+        # them, so there is deliberately no --file option.
+        # A concurrent .env change or an undecryptable pre-existing vault entry
+        # aborts the migration with MigrationConflictError. That is an expected
+        # operational condition (retry after the concurrent write settles, or
+        # repair the vault entry), so surface it as a clean CLI error with a
+        # nonzero exit — never an uncaught traceback.
+        try:
+            report = migrate_env_secrets(dry_run=not args.apply)
+        except MigrationConflictError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except (OSError, ValueError) as exc:
+            # A truncated/corrupt `secrets.enc` makes the vault's `list_names()`
+            # (or a decrypt) raise `ValueError`/`OSError` rather than
+            # `MigrationConflictError`. Surface it as the same concise CLI error
+            # with a nonzero exit instead of an uncaught traceback — the store is
+            # unreadable, which the operator must repair before importing.
+            print(
+                f"error: could not read the secrets vault "
+                f"({exc.__class__.__name__}: {exc}); repair or remove the vault "
+                f"store, then re-run `kirocrew secrets import --apply`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(format_report(report))
+    else:
+        print("Usage: kirocrew secrets import [--apply]", file=sys.stderr)
+        sys.exit(1)

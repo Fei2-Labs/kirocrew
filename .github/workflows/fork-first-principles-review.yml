@@ -67,7 +67,7 @@ jobs:
       # MUST be first: block egress except the endpoints the reviewer needs, so
       # an injection-driven exfil attempt fails at the network layer.
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
         with:
           egress-policy: block
           disable-telemetry: true
@@ -186,6 +186,12 @@ jobs:
       # pull request (two PRs may share a commit), and completing that one would
       # publish a verdict computed from a different diff. The sweep matches on
       # this id, so it can only ever finish a run this pull request created.
+      #
+      # `details_url` carries this run's URL: a workflow_run-triggered run is
+      # keyed to the DEFAULT branch context, so this stamp is the only link
+      # from the PR head back to the lane run — the human-override handler
+      # reads it to re-run the lane, and a human clicking the check lands on
+      # the run logs instead of a bare check-run page.
       - name: Open check-run (in progress)
         id: check
         env:
@@ -198,6 +204,7 @@ jobs:
           id="$(gh api --method POST "repos/$REPO/check-runs" \
             -f name="First Principles Review" -f head_sha="$HEAD" -f status="in_progress" \
             -f external_id="first-principles-pr-$PR" \
+            -f details_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" \
             --jq '.id')"
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
@@ -363,7 +370,7 @@ jobs:
         if: >-
           steps.scope.outputs.surface == 'true'
           && steps.contract.outputs.available == 'true'
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1
+        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           # Inference via Amazon Bedrock (region from the AWS creds step above).
           # Model id form (bare, regional `us.` inference profile) is
@@ -380,6 +387,12 @@ jobs:
           # Read/Grep/Glob.
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # workflow_run runs as the fork contributor, who lacks repo write;
+          # claude-code-action >=1.0.194 rejects that actor before the model
+          # call unless allow-listed here. Read-only lane (Read,Grep,Glob);
+          # setting this input auto-enables subprocess secret-scrub +
+          # bubblewrap isolation. See issue #6116.
+          allowed_non_write_users: "*"
           claude_args: |
             --model us.anthropic.claude-fable-5
             --fallback-model us.anthropic.claude-opus-4-8
@@ -654,9 +667,19 @@ jobs:
           if [ -n "${CHECK_ID:-}" ]; then
             complete "$CHECK_ID" "$conclusion" "$title" || true
           elif [ -n "${HEAD:-}" ]; then
+            # external_id makes this fallback check-run discoverable by the
+            # override handler's fork rerun lookup, same as the opening POST.
+            # PR can be empty in exactly this branch (HEAD has a workflow_run
+            # fallback, PR does not), and a malformed "first-principles-pr-" id would
+            # match nothing -- stamp it only when the PR is known.
+            ext_args=()
+            if [ -n "${PR:-}" ]; then
+              ext_args=(-f external_id="first-principles-pr-$PR")
+            fi
             gh api --method POST "repos/$REPO/check-runs" \
               -f name="First Principles Review" -f head_sha="$HEAD" \
-              -f status="completed" -f conclusion="neutral" \
+              -f status="completed" -f conclusion="neutral" "${ext_args[@]}" \
+              -f details_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" \
               -f "output[title]=First Principles Review — could not run (advisory)" \
               -f "output[summary]=The fork first-principles review job failed before producing a verdict; re-run it. Advisory — does not block merge." >/dev/null || true
           fi
@@ -666,6 +689,10 @@ jobs:
           # on this head can belong to another PR that shares the commit, and
           # completing that one would publish a verdict computed from a different
           # diff -- the wedge is closed without ever touching a sibling's review.
+          # Completed with THIS run's computed verdict, not a hardcoded neutral:
+          # a genuine BLOCK whose own PATCH lost both attempts must not be
+          # swept into a verdict pr-readiness no longer gates on. With no
+          # verdict, $conclusion is already neutral/"review incomplete".
           if [ -n "${HEAD:-}" ] && [ -n "${PR:-}" ]; then
             enc="$(jq -rn '"First Principles Review" | @uri')"
             stranded="$(gh api --method GET \
@@ -676,6 +703,6 @@ jobs:
                     | .id" 2>/dev/null || true)"
             for id in $stranded; do
               echo "completing stranded check-run $id for $HEAD (PR #$PR)"
-              complete "$id" "neutral" "review incomplete (advisory)" || true
+              complete "$id" "$conclusion" "$title" || true
             done
           fi

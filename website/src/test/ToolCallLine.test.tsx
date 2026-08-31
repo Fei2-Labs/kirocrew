@@ -66,6 +66,39 @@ describe('ToolCallLine simplifiedToolNames', () => {
     renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
     expect(screen.getByText('Running: echo hello')).toBeTruthy()
   })
+
+  it('substitutes a derived summary for a flood-length purpose-less shell label', () => {
+    // No purpose + simplified ON: pickToolLabel falls back to the raw command,
+    // and a multi-line heredoc label is substituted with a command digest. The
+    // collapsed row's CSS truncate bounds VISIBILITY; this bounds MEANING.
+    localStorage.setItem(LS_KEY, JSON.stringify({ simplifiedToolNames: true }))
+    const heredoc = "cat > /tmp/desc.md <<'EOF'\n### Notes\nbody line one\nbody line two\nEOF"
+    const msg = toolMsg({ content: `🔧 Running: ${heredoc}`, meta: { tool_call_id: 'tc_3' } })
+    const store = createTestStore({
+      chat: {
+        messages: [msg],
+        toolLog: [{ type: 'tool', text: heredoc, tool_call_id: 'tc_3', output: 'ok', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    expect(screen.getByText('Running: cat → /tmp/desc.md')).toBeTruthy()
+    expect(screen.queryByText(/body line two/)).toBeNull()
+  })
+
+  it('leaves a short raw shell label untouched in simplified mode', () => {
+    localStorage.setItem(LS_KEY, JSON.stringify({ simplifiedToolNames: true }))
+    const msg = toolMsg({ content: '🔧 Running: git status', meta: { tool_call_id: 'tc_5' } })
+    const store = createTestStore({
+      chat: {
+        messages: [msg],
+        toolLog: [{ type: 'tool', text: 'git status', tool_call_id: 'tc_5', output: 'clean', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    expect(screen.getByText('Running: git status')).toBeTruthy()
+  })
 })
 
 describe('ToolCallLine inline expansion', () => {

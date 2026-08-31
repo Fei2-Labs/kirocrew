@@ -506,7 +506,7 @@ class TestRunHelper:
         proc.communicate = mock.AsyncMock(return_value=(b"out", b"err"))
         proc.returncode = 0
         with mock.patch.object(
-            latex, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
+            latex, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
         ) as wrap, mock.patch(
             "asyncio.create_subprocess_exec", mock.AsyncMock(return_value=proc)
         ):
@@ -531,7 +531,7 @@ class TestRunHelper:
         proc.communicate = mock.AsyncMock(return_value=(b"", b""))
         proc.returncode = 0
         with mock.patch.object(
-            latex, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
+            latex, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
         ) as wrap, mock.patch(
             "asyncio.create_subprocess_exec", mock.AsyncMock(return_value=proc)
         ):
@@ -562,7 +562,7 @@ class TestRunHelper:
         proc.communicate = mock.AsyncMock(return_value=(b"", b""))
         proc.returncode = 0
         with mock.patch.object(
-            latex, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
+            latex, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
         ) as wrap, mock.patch(
             "asyncio.create_subprocess_exec", mock.AsyncMock(return_value=proc)
         ):
@@ -601,7 +601,7 @@ class TestRunHelper:
         proc.returncode = 0
         spawn = mock.AsyncMock(return_value=proc)
         with mock.patch.object(
-            latex, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
+            latex, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
         ), mock.patch.object(latex, "create_subprocess_limited", spawn):
             await latex._run(
                 ["pdflatex"], cwd=project, env={}, timeout=5, operation="compile"
@@ -616,7 +616,7 @@ class TestRunHelper:
         proc.returncode = None
         proc.pid = 4321
         with mock.patch.object(
-            latex, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
+            latex, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
         ), mock.patch(
             "asyncio.create_subprocess_exec", mock.AsyncMock(return_value=proc)
         ), mock.patch.object(
@@ -637,7 +637,7 @@ class TestRunHelper:
         proc.communicate = mock.AsyncMock(return_value=(b"", b""))
         proc.returncode = 0
         with mock.patch.object(
-            latex, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, str(cleanup))
+            latex, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, str(cleanup))
         ), mock.patch("asyncio.create_subprocess_exec", mock.AsyncMock(return_value=proc)):
             await latex._run(["pdflatex"], cwd=project, env={}, timeout=5, operation="compile")
         assert not cleanup.exists()
@@ -1259,7 +1259,7 @@ class TestSandboxRefusalIsReportedNotSwallowed:
         )
         with mock.patch.object(
             latex, "find_compiler", mock.AsyncMock(return_value="/usr/bin/pdflatex")
-        ), mock.patch.object(latex, "sandboxed_spawn_argv", side_effect=boom):
+        ), mock.patch.object(latex, "sandboxed_spawn_argv_off_loop", side_effect=boom):
             result = await latex.compile_project(project, "main.tex")
         assert result.ok is False
         # Carried in its OWN field, so the route layer can answer with a distinct
@@ -1279,7 +1279,7 @@ class TestSandboxRefusalIsReportedNotSwallowed:
         )
         with mock.patch.object(
             latex, "find_compiler", mock.AsyncMock(return_value="/usr/bin/pdflatex")
-        ), mock.patch.object(latex, "sandboxed_spawn_argv", wrap):
+        ), mock.patch.object(latex, "sandboxed_spawn_argv_off_loop", wrap):
             result = await latex.compile_project(project, "main.tex")
         assert result.ok is False
         assert wrap.call_count == 1

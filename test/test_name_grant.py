@@ -114,6 +114,44 @@ class TestProgramNames:
         assert name_grant.program_names(f"{assignment} head file") is None
 
     @pytest.mark.parametrize(
+        "command",
+        [
+            # A TOOL pointed at a helper command by its environment.
+            "GIT_SSH_COMMAND=/writable/evil git fetch ssh://x",
+            "GIT_EXTERNAL_DIFF=/writable/evil git diff",
+            # An INTERPRETER told to load extra code first.
+            "PYTHONPATH=/writable python3 x",
+            "NODE_OPTIONS=--require=/writable/evil node x",
+            "PERL5OPT=-Mevil perl x",
+            "RUBYOPT=-revil ruby x",
+            "JAVA_TOOL_OPTIONS=-javaagent:/writable/e.jar java X",
+            # The FAMILIES, not just the spellings above: a name this list never
+            # enumerates is still refused when it is shaped like one of them.
+            "SOMETOOL_OPTIONS=--load=/writable/evil head file",
+            "WHATEVERLIB=/writable head file",
+            "LD_SOMETHING_NEW=/writable head file",
+        ],
+    )
+    def test_code_injecting_assignment_refuses(self, command):
+        # Opus 4.8 round-18. The base program really is the trusted system one,
+        # so resolving its name answers nothing: `GIT_SSH_COMMAND=/writable/evil
+        # git fetch` vouched for `/usr/bin/git` and ran the planted file. Same
+        # shape as `LD_PRELOAD`, arriving through a tool's or interpreter's own
+        # configuration. Matched as FAMILIES because each round found one more
+        # interpreter with its own spelling, so an exact list is only ever as
+        # complete as the last person to think about it.
+        assert name_grant.program_names(command) is None
+
+    @pytest.mark.parametrize(
+        "command",
+        ["FOO=bar head x", "A=1 B=2 head x", "MY_TOKEN=abc head x"],
+    )
+    def test_an_ordinary_assignment_is_still_skipped(self, command):
+        # The other side of the rule: an assignment that changes a program's
+        # INPUTS is not a statement about what runs, so it must not cost a prompt.
+        assert name_grant.program_names(command) == ["head"]
+
+    @pytest.mark.parametrize(
         "token",
         ["PATH+=:.", "PATH+=:/writable", "A[0]=x", "=bare"],
     )
@@ -362,6 +400,72 @@ class TestPathFormPrograms:
             name_grant, "_agent_writable_roots", lambda: (os.path.normcase(str(checkout)),)
         )
         assert name_grant.name_grant_refusal(f"{planted} --help") is not None
+
+    def test_a_nul_bearing_path_refuses_instead_of_raising(
+        self, world
+    ):  # GPT 5.6 round-18. A NUL byte makes the filesystem calls raise
+        # ValueError, NOT OSError -- `shlex` hands the token through intact, so
+        # an OSError-only guard let it escape and abort the whole chat turn with
+        # an error card in place of the approval. This module's contract is that
+        # it RETURNS a refusal and never raises at its callers, so every
+        # inspection site fails closed on both.
+        refusal = name_grant.name_grant_refusal("/tmp/a\x00b --version")
+        assert refusal is not None
+        assert refusal.code == name_grant.UNINSPECTABLE
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "head /tmp/a\x00b",  # a NUL in an OPERAND, not the program
+            "/tmp/a\x00b",  # the program alone, no arguments
+            "head file; /tmp/a\x00b",  # a second command position
+        ],
+    )
+    def test_a_nul_byte_never_raises_from_any_position(self, world, command):
+        # The contract is total: whatever a caller passes, this returns a verdict.
+        system_dir, _ = world
+        _program(system_dir, "head")
+        name_grant.name_grant_refusal(command)
+        name_grant.program_names(command)
+
+    def test_an_alias_for_a_dispatcher_is_refused(self, world, monkeypatch):
+        # GPT 5.6 round-19. The dispatcher rule read the name as WRITTEN, so an
+        # ALIAS for one slipped past it: plant `runner -> env`, have a human
+        # approve `runner` once (which pins it), and every later
+        # `runner <payload>` auto-approves while `env` runs the payload. The rule
+        # is about the FILE's behaviour, so it is now asked of the resolved file.
+        system_dir, user_dir = world
+        env = _program(system_dir, "env")
+        alias = user_dir / "runner"
+        alias.symlink_to(env)
+        # Pin it the way a human approval would, so the pin cannot be what
+        # refuses this -- the dispatcher rule has to be what does.
+        name_grant.pin_human_approval("runner --version")
+        refusal = name_grant.name_grant_refusal("runner /writable/payload")
+        assert refusal is not None
+        assert refusal.code == name_grant.DISPATCHER
+
+    def test_an_absolute_alias_for_a_dispatcher_is_refused(self, world):
+        # The same bypass spelled as a path rather than found on the search path.
+        system_dir, user_dir = world
+        env = _program(system_dir, "env")
+        alias = user_dir / "runner2"
+        alias.symlink_to(env)
+        name_grant.pin_human_approval(f"{alias} --version")
+        refusal = name_grant.name_grant_refusal(f"{alias} /writable/payload")
+        assert refusal is not None
+        assert refusal.code == name_grant.DISPATCHER
+
+    def test_a_system_program_resolving_to_a_dispatcher_is_still_honoured(self, world):
+        # The BusyBox shape, and the reason the new question is asked AFTER the
+        # trusted-system branch: there every coreutils name resolves to
+        # `/bin/busybox`, a dispatcher by basename. Those names ARE the system
+        # program they claim to be, so they must not start costing a prompt.
+        system_dir, _ = world
+        busybox = _program(system_dir, "busybox")
+        head = system_dir / "head"
+        head.symlink_to(busybox)
+        assert name_grant.name_grant_refusal("head file") is None
 
 
 class TestUnenumerableConstructs:
@@ -821,6 +925,41 @@ class TestDispatchers:
         assert refusal is not None
         assert refusal.code == name_grant.AMBIGUOUS_ENV
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "BASH_FUNC_head%%",  # bash >= 4.3, the live spelling
+            "BASH_FUNC_head()",  # the interim post-Shellshock spelling
+            "BASH_FUNC_anything%%",  # a function that shadows nothing in THIS command
+        ],
+    )
+    def test_an_exported_shell_function_refuses(self, world, key, monkeypatch):
+        # GPT 5.6 round-17. An exported function shadows the name with no writable
+        # file anywhere: bash re-imports `BASH_FUNC_head%%` in the child, so
+        # `head file` runs the payload while the name still resolves to
+        # /usr/bin/head. Matched on the `BASH_FUNC_` PREFIX so a build that spells
+        # the suffix differently cannot hand the bypass back -- which is why the
+        # third case, naming a function this command never mentions, refuses too.
+        system_dir, _ = world
+        _program(system_dir, "head")
+        assert name_grant.name_grant_refusal("head file") is None
+        monkeypatch.setenv(key, "() { payload; }")
+        refusal = name_grant.name_grant_refusal("head file")
+        assert refusal is not None
+        assert refusal.code == name_grant.AMBIGUOUS_ENV
+
+    def test_a_legacy_bare_name_function_export_refuses(self, world, monkeypatch):
+        # The pre-2014 spelling: the key is the bare function name and only the
+        # `() {` value marks it as a function. Supported bash no longer imports
+        # this, so it is belt-and-braces -- but the value form costs one check.
+        system_dir, _ = world
+        _program(system_dir, "head")
+        assert name_grant.name_grant_refusal("head file") is None
+        monkeypatch.setenv("head", "() { payload; }")
+        refusal = name_grant.name_grant_refusal("head file")
+        assert refusal is not None
+        assert refusal.code == name_grant.AMBIGUOUS_ENV
+
     @pytest.mark.parametrize("builtin", ["compgen", "pushd", "popd", "bind", "caller", "disown"])
     def test_an_unenumerated_builtin_is_refused_by_default(self, world, builtin):
         # THE POINT OF THE INVERSION, and the reason this class is closed rather
@@ -860,7 +999,13 @@ class TestInterpreterChain:
         # actually runs is replaced underneath it.
         system_dir, user_dir = world
         script = user_dir / "tool"
-        script.write_text("#!/usr/bin/env node\n")
+        # The env path must be the fixture's OWN system env, not a literal
+        # `/usr/bin/env`: the shebang's env binary is now held to the same
+        # standard as any program (round 21), and a host path would make this
+        # test depend on the runner's filesystem, which the fixture exists to
+        # avoid.
+        system_env = _program(system_dir, "env")
+        script.write_text(f"#!{system_env} node\n")
         script.chmod(0o700)
         _program(user_dir, "node")
         name_grant.pin_human_approval("tool run")
@@ -877,7 +1022,8 @@ class TestInterpreterChain:
         _program(system_dir, "python3")
         _program(user_dir, "python3")  # shim shadowing the system interpreter
         script = user_dir / "tool"
-        script.write_text("#!/usr/bin/env python3\n")
+        system_env = _program(system_dir, "env")
+        script.write_text(f"#!{system_env} python3\n")
         script.chmod(0o700)
         name_grant.pin_human_approval("tool run")
         refusal = name_grant.name_grant_refusal("tool run")
@@ -890,10 +1036,11 @@ class TestInterpreterChain:
         # file while vouching for the command. Only the bare one-name form is read.
         system_dir, user_dir = world
         _program(user_dir, "node")
+        system_env = _program(system_dir, "env")
         for line in (
-            "#!/usr/bin/env -S -u UNUSED node",
-            "#!/usr/bin/env -i node",
-            "#!/usr/bin/env FOO=bar node",
+            f"#!{system_env} -S -u UNUSED node",
+            f"#!{system_env} -i node",
+            f"#!{system_env} FOO=bar node",
         ):
             script = user_dir / "tool"
             script.write_text(f"{line}\n")
@@ -902,6 +1049,36 @@ class TestInterpreterChain:
             refusal = name_grant.name_grant_refusal("tool run")
             assert refusal is not None, line
             assert refusal.code == name_grant.UNENUMERABLE, line
+
+    def test_a_shebang_env_that_is_not_the_system_env_is_refused(self, world):
+        # GPT 5.6 round-21. `env` was matched by BASENAME, so the path was read
+        # for the name after it and then forgotten -- `#!<planted>/env node`
+        # validated `node` while the planted `env` is what the kernel actually
+        # runs. A pin binds the SCRIPT's bytes, so the script keeps matching
+        # while the file behind its shebang is swapped underneath it. The env
+        # binary now has to BE the system one, not merely be spelled like it.
+        system_dir, user_dir = world
+        _program(system_dir, "node")
+        planted_env = _program(user_dir, "env")
+        script = user_dir / "tool"
+        script.write_text(f"#!{planted_env} node\n")
+        script.chmod(0o700)
+        name_grant.pin_human_approval("tool run")
+        refusal = name_grant.name_grant_refusal("tool run")
+        assert refusal is not None
+        assert refusal.code == name_grant.UNENUMERABLE
+
+    def test_the_system_env_shebang_is_still_honoured(self, world):
+        # The other side: tightening the env path must not refuse the ordinary
+        # `#!<system>/env node` form, which is what real scripts carry.
+        system_dir, user_dir = world
+        _program(system_dir, "node")
+        system_env = _program(system_dir, "env")
+        script = user_dir / "tool"
+        script.write_text(f"#!{system_env} node\n")
+        script.chmod(0o700)
+        name_grant.pin_human_approval("tool run")
+        assert name_grant.name_grant_refusal("tool run") is None
 
     def test_shell_shebang_is_not_treated_as_a_dispatcher(self, world):
         # The distinction the `as_interpreter` step exists for: `sh -c '...'` on a

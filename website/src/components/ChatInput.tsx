@@ -15,7 +15,7 @@ import { useSlotId } from '../providers/SlotContext'
 import { useToolPillVisible } from '../store/toolPillRegistry'
 import { ToolDetails } from '../pages/chat/ToolDetails'
 import { api, ApiError } from '../api/client'
-import { safeSetItem } from '../utils/safeStorage'
+import { safeSetItem, safeGetItem } from '../utils/safeStorage'
 import { offlineProps } from '../utils/offline'
 import { shallowEqual } from 'react-redux'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -27,6 +27,7 @@ import TrustDropdown from './TrustDropdown'
 import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
 import { Btn } from './ui'
 import { useTouchPushToTalk } from '../hooks/useTouchPushToTalk'
 import { consumeComposerRelease } from '../pages/chat/composerFocus'
@@ -59,7 +60,16 @@ import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 // Upload picker accept hints. Client-side ONLY (UX) — the server validates type
 // (magic bytes), size, and runs malware scanning per input-validation guidance.
 const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/svg+xml'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',.txt,.md,.json,.har,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+// Video containers the server accepts (see `_ALLOWED_VIDEO_EXT`). MIME form, not
+// extensions, because this string is also what the MOBILE photo picker filters
+// the library by: iOS shows videos only when a video/* type is listed, so an
+// extension-only hint is what made a phone able to attach photos and nothing else.
+// One MIME per accepted extension — `video/x-m4v` is NOT covered by `video/mp4`
+// in a picker's filter, so omitting it hides a file the server would accept.
+// test_accept_list_covers_every_accepted_extension pins this set against the
+// server's, from the Python side, since a vitest cannot read the Python constant.
+const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
+const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.md,.json,.har,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 // Extension per image MIME type, mirroring IMAGE_ACCEPT. Used to synthesize a
 // filename for clipboard-pasted images (see nameClipboardImage).
@@ -99,7 +109,7 @@ function nameClipboardImage(f: File, batchIndex: number): File {
   return new File([f], `pasted-image-${stamp}${suffix}.${ext}`, { type: f.type, lastModified: f.lastModified })
 }
 
-import ApprovalModePicker from './ApprovalModePicker'
+import ApprovalModePicker, { APPROVAL_MODE_ADJUSTED_LS_KEY } from './ApprovalModePicker'
 // Effort vocabulary lives in lib/effort.ts (mirrors backend effort.py).
 // Re-exported here for back-compat with existing `from './ChatInput'` imports.
 export {
@@ -120,9 +130,10 @@ import { skillsCacheStaleTime } from '../lib/skillsCache'
 import ProjectSkillsTrustDialog from './ProjectSkillsTrustDialog'
 import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composerTokens'
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
+import { useMeasuredHeight } from '../hooks/useMeasuredHeight'
 
 import { i18nT } from '../i18n/t'
-import { fmtDateFields, fmtPercent } from '../i18n/format'
+import { fmtDateFields, fmtPercent, fmtRelative } from '../i18n/format'
 import { Badge } from './ui'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
@@ -147,14 +158,6 @@ const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
 const INPUT_DRAG_MIN_H = 93
-const FILE_PREVIEW_H = 81 // h-16 (64px) + py-2 (16px) + border-t (1px)
-/** Same strip once any staged image carries a resize pill: the pill sits in flow
- *  under its thumbnail, so the tallest chip grows by gap-0.5 (2px) + the pill's
- *  own 18px. Keep in sync with ResizeBadge and FilePreviewStrip. */
-const FILE_PREVIEW_H_RESIZED = 101
-/** Height of the staged-session-reference strip: one chip row (py-1 + 12px text
- *  ≈ 26px) + py-2 (16px) + border-t (1px). Keep in sync with SessionRefStrip. */
-const SESSION_REF_STRIP_H = 43
 const INPUT_DRAG_MAX_RATIO = 0.5
 const INPUT_HEIGHT_LS_KEY = 'mc-input-height'
 /**
@@ -224,8 +227,26 @@ export function oneShotResolution(decision: string): { wire: 'approve' | 'reject
  *  `_BACKGROUND_APPROVAL_SOURCES` minus `autonudge`, which does run in-session. */
 export const UNATTENDED_APPROVAL_SOURCES = new Set(['cron', 'heartbeat', 'taskrunner'])
 
+/** B2 nudge: after this many manual one-shot approvals in one slot while the
+ *  mode is still `normal`, offer the approval-mode picker once. Three is the
+ *  point where repeated prompting reads as friction rather than safety. */
+const APPROVAL_NUDGE_THRESHOLD = 3
+
 // Pending-approval selection is slot-aware — see selectSlotPendingApproval
 // in chatSlice: each grid pane's approval bar reflects ITS slot.
+
+/** Plan rate-limit statuses, ordered by whether the account can still send a
+ *  turn, with the label key and readout colour each one renders as. The backend
+ *  parser drops a status it does not recognise (`_dispatch.parse_rate_limit`),
+ *  so an unknown spelling arrives here as an absent status rather than falling
+ *  through to the wrong severity. `allowed` gets no colour: it is the normal
+ *  state, and tinting it would spend the popover's one accent on "nothing to
+ *  see". */
+const RATE_LIMIT_STATUS_VIEW: Record<string, { key: string; color?: string }> = {
+  allowed: { key: 'components.chatInput.rate_limit_allowed' },
+  allowed_warning: { key: 'components.chatInput.rate_limit_warning', color: 'var(--warn)' },
+  rejected: { key: 'components.chatInput.rate_limit_rejected', color: 'var(--danger)' },
+}
 
 /** Usable viewport height. Native window zoom already reports zoomed CSS
  *  pixels through innerHeight, so no compensation var is needed. */
@@ -254,12 +275,24 @@ function stripTrailingBlankLines(s: string): string {
 /** Auto-size textarea to fit content (only when not manually sized).
  *  Sets overflow:hidden during measurement so the parent flex container
  *  never sees the collapsed (height:0) intermediate state — prevents the
- *  Virtuoso message list above from reflowing and causing visible vibration. */
+ *  Virtuoso message list above from reflowing and causing visible vibration.
+ *
+ *  `parked` is a hard precondition, not an optimisation. Voice hold mode and the
+ *  dictation panel both keep the textarea mounted inside an `sr-only` box (value,
+ *  caret and IME state have to survive the swap), and `sr-only` is a 1px clip — a
+ *  textarea one pixel wide reports a `scrollHeight` of the better part of a
+ *  viewport, which this function would then clamp to `cap` and WRITE BACK as an
+ *  inline height. That height outlives the parking (nothing re-measures until
+ *  `value` changes again), so a single voice round-trip left the composer stuck
+ *  at the 140px ceiling with an empty box, on a surface whose only way to shrink
+ *  it — the drag handle's double-click — does not exist under a finger. */
 function applyHeight(
   el: HTMLTextAreaElement,
   manualHeight: number | null,
   prefillHint?: boolean,
+  parked?: boolean,
 ) {
+  if (parked) return // clipped out of layout — there is nothing valid to measure
   if (manualHeight !== null) return // manual height — wrapper controls size
   const cap = prefillHint ? INPUT_PREFILL_MAX_H : INPUT_DEFAULT_MAX_H
   const prev = el.style.height
@@ -423,6 +456,12 @@ interface ChatInputProps {
   contextPct?: number
   contextUsedTokens?: number
   contextWindowTokens?: number
+  /** Plan rate-limit reading for the harness behind this slot, when it reports
+   *  one. Rendered as an extra section of the context popover rather than its own
+   *  control: it answers the same "can I keep going" question as the context
+   *  ring, on the same refresh, and most harnesses report nothing so a dedicated
+   *  pill would be empty space for them. */
+  rateLimit?: { status?: string; limit_type?: string; utilization?: number; resets_at?: number }
   showContextPct?: boolean
   /** Show used/window token counts in the inline context readout. */
   showContextTokens?: boolean
@@ -481,14 +520,20 @@ interface ChatInputProps {
   followUpOptions?: string[]
   /** Options the user has picked (visual highlight in FollowUpBar) */
   followUpPicked?: Set<string>
-  /** Select a follow-up option — handler toggles text in input (see ChatPage wiring) */
-  onFollowUpSelect?: (option: string, event: React.MouseEvent) => void
+  /** Select a follow-up option — handler toggles text in input (see ChatPage wiring).
+   *  Third arg is `followUpSourceKey` as it was when the chip was CLICKED (the
+   *  chip debounces, and the row can advance inside that window); `undefined`
+   *  when no `followUpSourceKey` is supplied. */
+  onFollowUpSelect?: (option: string, event: React.MouseEvent, sourceKeyAtClick?: string | null) => void
   /** Double-click a follow-up option — send with option text directly (bypasses setInput race) */
   onFollowUpSend?: (text?: string) => void
   /** Quick Send enabled — clicking sends immediately */
   quickSend?: boolean
   /** Layout mode for the follow-up bar: 'multiline' (default) or 'scroll' (original single-line). */
   followUpLayout?: 'multiline' | 'scroll'
+  /** Identity of the transcript row the follow-up options were derived from.
+   *  Forwarded to FollowUpBar so a chip click carries the row it acted on. */
+  followUpSourceKey?: string | null
   /** Collapsed paste blocks backing `⌜🗒 Pasted …⌟` tokens in `value`. */
   pasteBlocks?: PasteBlock[]
   /** Replace the current list of paste blocks (add/remove). */
@@ -592,7 +637,7 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
  *  effect on every render (a fresh [] literal changes deps each time). */
 const NO_DIRS: string[] = []
 
-function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemoveDir }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void }) {
+function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemoveDir, rootRef }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void; rootRef?: (node: HTMLDivElement | null) => void }) {
   const [attachScroller, edges, remeasure] = useScrollEdges<HTMLDivElement>()
   // Chips are added and removed while the strip stays mounted (a paste, a
   // remove), and the scroller keeps its own box through those changes, so the
@@ -606,10 +651,8 @@ function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemo
     // The wrapper exists for the edge cues: absolutely-positioned children of
     // the scroller itself would travel with the scrolled content, so the fades
     // anchor to a non-scrolling parent, same shape as the sibling strips.
-    <div className="relative">
-      {/* NOTE: rendered height must match FILE_PREVIEW_H / FILE_PREVIEW_H_RESIZED,
-          update them together.
-          items-start, not items-end: a chip carrying a resize pill is taller than a
+    <div className="relative" ref={rootRef}>
+      {/* items-start, not items-end: a chip carrying a resize pill is taller than a
           plain one, and bottom-alignment would spend that difference staggering the
           THUMBNAILS (the thing being compared) instead of letting the pills hang. */}
       <div ref={attachScroller} data-testid="preview-strip" className="flex gap-2 px-4 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-start" data-image-scope="">
@@ -777,6 +820,7 @@ function ChatInput({
   contextPct,
   contextUsedTokens,
   contextWindowTokens,
+  rateLimit,
   showContextPct,
   showContextTokens,
   isRunning = false,
@@ -810,6 +854,7 @@ function ChatInput({
   onFollowUpSend,
   quickSend,
   followUpLayout,
+  followUpSourceKey,
   pasteBlocks = [],
   onPasteBlocksChange,
   knowledgeChip,
@@ -831,6 +876,33 @@ function ChatInput({
   const pendingApproval = slotApprovalChrome ? pendingApprovalRaw : null
   const hasApproval = !!pendingApproval
   const [approvalSubmitting, setApprovalSubmitting] = useState(false)
+  // A2: bumping this opens the footer ApprovalModePicker with a spotlight
+  // ring, so the approval bar's hint lands the user on the real control.
+  const [approvalPickerSignal, setApprovalPickerSignal] = useState(0)
+  // A1: the hint retires once the user has ever adjusted the mode themselves.
+  // Read per approval arrival (cheap), not once per mount, so adjusting the
+  // mode hides the hint on the very next approval without a reload.
+  const approvalModeAdjusted = !!pendingApproval && !!safeGetItem(APPROVAL_MODE_ADJUSTED_LS_KEY)
+  // B2: per-slot manual one-shot approval tally for this dashboard session.
+  // In-memory by design — "3 approvals in one sitting" is the annoyance
+  // signal; persisting it would fire the nudge on stale history.
+  const approvalCountsRef = useRef<Record<string, number>>({})
+  const [approvalNudgeSlot, setApprovalNudgeSlot] = useState<string | null>(null)
+  const approvalNudgeActive = !!approvalNudgeSlot && approvalNudgeSlot === slotId
+  // Permanent dismissal (buttons / menu open): the callout has delivered its
+  // lesson, so the A1 hint retires with it — otherwise a "Got it" user keeps
+  // seeing "Tired of confirming every step?" on every later approval.
+  const dismissApprovalNudge = useCallback(() => {
+    setApprovalNudgeSlot(null)
+    // One flag carries both retirements: the adjusted/discovery flag already
+    // suppresses the hint AND gates the nudge, so a separate dismissed flag
+    // would only ever be written alongside it — dead state.
+    safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, '1')
+  }, [])
+  // Session-scoped hide (Escape): a reflexive Escape aimed at the composer
+  // must not spend the one-time callout unseen; it may re-fire on a later
+  // approval in this sitting.
+  const hideApprovalNudge = useCallback(() => setApprovalNudgeSlot(null), [])
   // Non-null while the last approval decision failed. Rendered as a one-line
   // strip under the composer; auto-clears so it cannot become permanent chrome.
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null)
@@ -842,8 +914,12 @@ function ChatInput({
   const approvalIsReadOnly = !!(approvalMeta?.is_read_only)
   const approvalFullCommand = (approvalMeta?.full_command as string) || ''
   const approvalBaseCommand = (approvalMeta?.base_command as string) || ''
-  const approvalToolTitle = (approvalMeta?.tool_title as string) || ''
-  const approvalIsShell = approvalToolTitle.startsWith('Running: ')
+  const approvalIsShell = approvalMeta?.is_shell === '1'
+  // Command-scoped trust is offered only when the gateway proved a canonical,
+  // unredacted scope.  The title/input preview are presentation data and must
+  // never be promoted into grant authority by a frontend fallback.
+  const approvalTrustCommandGrantable = approvalMeta?.trust_command_grantable === '1'
+  const approvalTrustBaseGrantable = approvalMeta?.trust_base_grantable === '1'
   /** Sources that run with no human attached to THIS conversation. Session
    *  trust means "auto-approve tools for this chat session", which is
    *  incoherent for an unattended job: the job is not this session, so the
@@ -929,6 +1005,21 @@ function ChatInput({
     const finish = (granted: string = decision) => {
       dispatch(resolveByApprovalId({ id: approvalId, decision: granted }))
       setApprovalSubmitting(false)
+      // B2: tally manual one-shot approvals per slot. Only 'approved' counts —
+      // a trust grant already reduces future prompts, and a rejection is not
+      // approval fatigue. Fires once per dashboard install (localStorage
+      // guard) and only while the slot still asks about everything (normal).
+      if (decision === 'approved' && activeSlot && !approvalIsUnattended) {
+        const n = (approvalCountsRef.current[activeSlot] || 0) + 1
+        approvalCountsRef.current[activeSlot] = n
+        if (
+          n >= APPROVAL_NUDGE_THRESHOLD &&
+          approvalMode === 'normal' &&
+          !safeGetItem(APPROVAL_MODE_ADJUSTED_LS_KEY)
+        ) {
+          setApprovalNudgeSlot(activeSlot)
+        }
+      }
     }
     const fail = (err: unknown) => {
       setApprovalSubmitting(false)
@@ -972,7 +1063,7 @@ function ChatInput({
       const { wire, granted } = oneShotResolution(decision)
       api.resolveApproval(approvalId, wire).then(() => finish(granted)).catch(fail)
     }
-  }, [approvalId, activeSlot, approvalIsUnattended, approvalSource, dispatch])
+  }, [approvalId, activeSlot, approvalIsUnattended, approvalSource, approvalMode, dispatch])
 
   // Pending sub-agent SPAWN approvals for this slot (blocked on user approval).
   // Surfaced as a top-level banner with inline Approve/Reject so the user can
@@ -1304,8 +1395,8 @@ function ChatInput({
   // `$` trigger renders the picker instantly (the fetch is the only latency).
   // prefetchQuery is a no-op if the cache is already fresh (staleTime), so it's
   // cheap to call on every focus. The key and the session key must match
-  // SkillPickerMenu's exactly, or the prefetch warms a different entry and the
-  // menu still pays the fetch on open.
+  // SkillPickerMenu's exactly — including the trailing agent segment — or the
+  // prefetch warms a different entry and the menu still pays the fetch on open.
   const queryClient = useQueryClient()
   const skillSlotKey = slotId ? `dashboard:${slotId}` : undefined
   const skillSlotKeyRef = useRef(skillSlotKey)
@@ -1314,11 +1405,11 @@ function ChatInput({
   skillProjectRef.current = project
   const prefetchSkills = useCallback(() => {
     queryClient.prefetchQuery({
-      queryKey: ['skills', skillSlotKey ?? null, project ?? null],
-      queryFn: () => api.skills(skillSlotKey),
+      queryKey: ['skills', skillSlotKey ?? null, project ?? null, agentName ?? null],
+      queryFn: () => api.skills(skillSlotKey, agentName),
       staleTime: skillsCacheStaleTime(project),
     })
-  }, [queryClient, skillSlotKey, project])
+  }, [queryClient, skillSlotKey, project, agentName])
   // Shared caret-relative token insertion for the @/$ pickers: replace the
   // sigil-token ending at the caret with `token`, commit, and restore the caret
   // just after it. One copy keeps the two onSelect handlers duplication-free.
@@ -1329,11 +1420,33 @@ function ChatInput({
     requestAnimationFrame(() => { const e2 = inputRef.current; if (e2) { e2.focus(); e2.setSelectionRange(next.caret, next.caret) } })
   }, [value, onChange])
   const chatMessages = useAppSelector(s => s.chat.messages)
-  const [manualHeight, setManualHeight] = useState<number | null>(() => {
+  /** The persisted drag-to-resize preference. Read `manualHeight` below instead —
+   *  this is the raw stored value and is not what the composer renders at. */
+  const [manualHeightPref, setManualHeight] = useState<number | null>(() => {
     const saved = localStorage.getItem(INPUT_HEIGHT_LS_KEY)
     const n = saved ? parseInt(saved, 10) : NaN
     return !isNaN(n) && n >= INPUT_MIN_H ? n : null
   })
+  /**
+   * Drag-to-resize is pointer-only, so on a touch device the composer always
+   * auto-sizes and the persisted preference is ignored outright.
+   *
+   * Nobody drags a phone's message box, and the affordance is not merely unused
+   * there — it is a trap. The handle is a 6px strip with `touch-action:none` and a
+   * zero-px drag threshold sitting directly above the input, so a thumb that lands
+   * short pins the height on the spot; and the only way back out is a
+   * double-click, which no finger can produce. One stray tap and the box was that
+   * size for good, across reloads.
+   *
+   * Derived rather than baked into the state's seed so a pointer-class change
+   * mid-session (a tablet gaining a trackpad) is honoured in both directions:
+   * the preference is never destroyed, only disregarded while there is no pointer
+   * to have set it. Every consumer below — the wrapper's height, the textarea's
+   * `flex-1`, the manual-resize floor, `applyHeight`'s bail — reads this and so
+   * follows automatically.
+   */
+  const isTouch = useIsTouchDevice()
+  const manualHeight = isTouch ? null : manualHeightPref
 
   // Drag-to-resize refs — resize wrapper div via direct DOM writes, commit on mouseup.
   // Resizing the wrapper (not the textarea) avoids layout thrashing: the textarea
@@ -1342,6 +1455,11 @@ function ChatInput({
   const dragging = useRef(false)
   const dragStartY = useRef(0)
   const dragStartH = useRef(0)
+  /** Mirrors `textareaParked` (defined with the voice-mode derivations, far below)
+   *  for the handlers declared above it. Assigned during render, like the other
+   *  prop/state mirrors in this file, so it is already current by the time any
+   *  effect or event handler reads it. */
+  const parkedRef = useRef(false)
 
   // Prompt history navigation: -1 = draft (not in history), else index into sentMessages.
   // Refs keep the handler stable across re-renders while preserving state between keystrokes.
@@ -1528,20 +1646,11 @@ function ChatInput({
     }
   }, [manualHeight, pendingFiles.length, pendingSessions.length])
 
-  // Auto-resize textarea to fit content
-  useEffect(() => {
-    if (inputRef.current && !dragging.current) applyHeight(inputRef.current, manualHeight, prefillHint)
-  }, [value, prefillHint, manualHeight])
-
-  // Keep the paste-highlight mirror's scroll aligned with the textarea after
-  // value/height changes (applyHeight mutates scrollTop programmatically, which
-  // doesn't fire the textarea's onScroll). rAF lets layout settle first.
-  useEffect(() => {
-    const id = requestAnimationFrame(() => {
-      if (mirrorRef.current && inputRef.current) mirrorRef.current.scrollTop = inputRef.current.scrollTop
-    })
-    return () => cancelAnimationFrame(id)
-  }, [value, prefillHint, manualHeight])
+  // The two effects that MEASURE the textarea (auto-size, and the paste-mirror
+  // scroll sync that reads the scrollTop auto-size just wrote) are declared much
+  // further down, immediately below `textareaParked` — they must not run while the
+  // textarea is clipped out of layout, and a dep can only name a variable already
+  // in scope. Do not move them back up here.
 
   // Reset manual height when input is cleared (new message sent)
   const prevValueRef = useRef(value)
@@ -1643,7 +1752,7 @@ function ChatInput({
   }, [value, autoFocusKey])
 
   const handleInput = useCallback((e: React.FormEvent<HTMLTextAreaElement>) => {
-    if (!dragging.current) applyHeight(e.target as HTMLTextAreaElement, manualHeight, prefillHint)
+    if (!dragging.current) applyHeight(e.target as HTMLTextAreaElement, manualHeight, prefillHint, parkedRef.current)
   }, [manualHeight, prefillHint])
 
   const setTextUndoable = useCallback((text: string) => {
@@ -2333,14 +2442,9 @@ function ChatInput({
     e.target.value = '' // reset so same file can be re-selected
   }, [onUploadFiles])
 
-  // The preview strip renders for folder references too, so height
-  // compensation must key off both staged families — otherwise a dirs-only
-  // strip appears with no wrapper expansion and eats into the textarea.
-  const hasFiles = pendingFiles.length > 0 || pendingDirs.length > 0
-  // A resize pill makes the strip taller, so the compensation has to know about
-  // it — otherwise the extra row eats into the textarea.
-  const hasResizedFile = pendingFiles.some(p => IMG_EXT.test(p) && !!resizedInfo?.[p])
   const hasSessionRefs = pendingSessions.length > 0
+  const [fileStripRef, fileStripH] = useMeasuredHeight<HTMLDivElement>()
+  const [sessionStripRef, sessionStripH] = useMeasuredHeight<HTMLDivElement>()
   /** True when the composer holds something a send would carry.
    *
    *  Hoisted because the hold-to-talk gate has to agree with the send button, and
@@ -2381,14 +2485,8 @@ function ChatInput({
    * cannot do. Suspending hands the textarea back for exactly as long as there is
    * something in it, then returns the hold bar without the user re-choosing it.
    *
-   * `voiceRecording` OVERRIDES the draft check, and that clause is load-bearing
-   * rather than defensive. Under streaming STT the transcript does not wait for
-   * the release — `onPartial` writes each hypothesis into the composer WHILE the
-   * finger is still down. Suspending on that draft would unmount the hold target
-   * mid-gesture, and unmounting it takes the pointer listeners with it: the
-   * release and the slide-up would both land on nothing while capture kept
-   * running, stranding an open microphone under a button that no longer exists.
-   * A draft may only reclaim the textarea once no capture is in flight.
+   * When a capture the touch gesture OWNS is in flight, the draft check is
+   * overridden — the mechanics and the reason live with `voiceHoldMode` below.
    */
   /** "Is capture in flight at all" — see the `voiceCaptureActive` prop doc. Falls
    *  back to the gated flag so the prop stays optional for other callers. */
@@ -2398,7 +2496,7 @@ function ChatInput({
   const transcribeInFlight = voiceTranscribeActive ?? voiceTranscribing
   /** State, not a ref: the hold target mounts only once hold mode is on, and the
    *  gesture hook can only bind its listeners when that arrival is observable.
-   *  Declared above the hook call because the hook binds to this element. */
+   *  Declared above `touchPtt` because the hook binds to it. */
   const [holdTarget, setHoldTarget] = useState<HTMLButtonElement | null>(null)
   const touchVoice = useMemo(
     () => ({
@@ -2409,24 +2507,46 @@ function ChatInput({
     }),
     [captureInFlight, onVoiceStart, onVoiceStop, onVoiceCancel],
   )
+  /*
+   * `disabled` deliberately omits `!voiceHoldMode`, and that omission is what
+   * lets `voiceHoldMode` read the hook's ownership below without a cycle. The
+   * term is implied rather than lost: the hook binds only to `holdTarget`, the
+   * only writer of `holdTarget` is the hold bar's ref, and the bar renders under
+   * `voiceHoldMode &&` — so outside hold mode the hook has no element, no
+   * listeners, and nothing left to disable. Leaving hold mode unmounts the bar,
+   * which clears the target and runs the hook's own abandon path.
+   */
   const touchPtt = useTouchPushToTalk(touchVoice, {
     target: holdTarget,
     disabled: disabled || transcribeInFlight || optimizing,
   })
   /*
-   * A draft suspends hold mode, EXCEPT while the gesture's own capture is still
-   * running — otherwise a transcript landing in the composer would unmount the
-   * bar from under the finger that is still holding it.
+   * A draft suspends hold mode, EXCEPT while the touch gesture's own capture is
+   * still running — otherwise a transcript landing in the composer would unmount
+   * the bar from under the finger that is still holding it.
    *
-   * `touchPtt.owns` is the direct ownership signal from the hook: it is true
-   * when the touch gesture started this capture, and false otherwise. This
-   * replaces the earlier proxy (`holdTarget !== null`, meaning "the bar is
-   * mounted") which could not distinguish a keyboard-started capture on a device
-   * with both inputs from one the touch gesture owns. The hook already cannot be
-   * live outside hold mode — it binds to `holdTarget`, which only renders under
-   * `voiceHoldMode &&` — so the redundant `!voiceHoldMode` term that previously
-   * existed in its `disabled` prop is no longer needed and the declaration cycle
-   * that required it is broken.
+   * `touchPtt.owns` is what distinguishes the gesture's capture from any other,
+   * and it has to be asked: `captureInFlight` alone also matches capture opened
+   * elsewhere — the mic-as-record-button, or the keyboard push-to-talk binding
+   * on a coarse-pointer device that also has a hardware keyboard. The previous
+   * proxy, `holdTarget !== null`, could not tell those apart either: the bar is
+   * mounted for EVERY capture that happens while hold mode is on, so a keyboard
+   * dictation whose streaming partial landed in the composer kept hold mode
+   * alive and rendered a disabled `settling` bar beside a disabled mode switch —
+   * two dead touch controls describing a capture neither of them owned (#5753).
+   * Ownership comes from the hook's own state machine instead, recorded at the
+   * pointerdown that opens capture and relinquished when the gesture resolves.
+   *
+   * Relinquished AT THE RELEASE, deliberately: a draft the gesture itself
+   * streamed in drops hold mode the moment the finger lifts, and the mic — a
+   * record toggle again once hold mode drops — is the live stop control for
+   * whatever drain remains. The old proxy instead held the surface as a
+   * disabled `settling` bar until capture fully ended: a window where nothing
+   * on screen was pressable. (What is VISIBLE through that drain depends on the
+   * dictation panel: its own gate reads `voiceRecording`, so when enabled — the
+   * default — it stays up and the textarea returns when capture ends; the
+   * panel's `gestureDriven` carries the settling term for the same window, see
+   * the render site.)
    */
   const voiceHoldMode = voiceModeAvailable && voiceModePref
     && (!composerHasDraft || (captureInFlight && touchPtt.owns))
@@ -2461,6 +2581,34 @@ function ChatInput({
    * pointer events, so the gesture cannot start from a bar that is switched off.
    */
   const voiceSettling = voiceHoldMode && touchPtt.bar === 'settling'
+  /**
+   * The textarea is PARKED: still mounted, but clipped out of layout by the
+   * `sr-only` box the hold bar and the dictation panel both put it in.
+   *
+   * Anything that measures the textarea has to ask this first — see `applyHeight`
+   * for what a 1px-wide measurement did to the composer's height. It also has to
+   * be a dep of those effects, so the height is recomputed on the way BACK: the
+   * value that was streamed in while parked is exactly the value whose height was
+   * never measurable.
+   */
+  const textareaParked = !!showDictation || voiceHoldMode
+  parkedRef.current = textareaParked
+
+  // Auto-resize textarea to fit content. Moved down here from the other composer
+  // effects so it can name `textareaParked` — see the note at that site.
+  useEffect(() => {
+    if (inputRef.current && !dragging.current) applyHeight(inputRef.current, manualHeight, prefillHint, textareaParked)
+  }, [value, prefillHint, manualHeight, textareaParked])
+
+  // Keep the paste-highlight mirror's scroll aligned with the textarea after
+  // value/height changes (applyHeight mutates scrollTop programmatically, which
+  // doesn't fire the textarea's onScroll). rAF lets layout settle first.
+  useEffect(() => {
+    const id = requestAnimationFrame(() => {
+      if (mirrorRef.current && inputRef.current) mirrorRef.current.scrollTop = inputRef.current.scrollTop
+    })
+    return () => cancelAnimationFrame(id)
+  }, [value, prefillHint, manualHeight, textareaParked])
   const toggleVoiceMode = useCallback(() => {
     setVoiceModePref(prev => {
       const next = !prev
@@ -2542,13 +2690,31 @@ function ChatInput({
   const voiceModePlaceholder = voiceModeAvailable && !voiceHoldMode && !composerHasDraft && !placeholder
     ? i18nT('components.chatInput.send_a_message_or_tap_the_mic_for_voice')
     : ''
-  /** Combined height of every strip currently stacked above the textarea. The
+  /** Combined height of every strip currently stacked above the textarea,
+   *  MEASURED rather than predicted from the strips' Tailwind classes. The
    *  manual-resize floor and the transient height adjustment below both work off
    *  this total, so adding a strip can never leave one of them counting only
-   *  attachments. */
-  const stripH = (hasFiles ? (hasResizedFile ? FILE_PREVIEW_H_RESIZED : FILE_PREVIEW_H) : 0)
-    + (hasSessionRefs ? SESSION_REF_STRIP_H : 0)
-  const prevStripH = useRef(stripH)
+   *  attachments.
+   *
+   *  Each strip reports 0 while unmounted, so the sum needs no per-strip
+   *  booleans: an absent strip reserves nothing by construction. That also
+   *  retires the `hasResizedFile` special case — a chip carrying a resize pill
+   *  is simply taller when measured, instead of needing a second predicted
+   *  height, which is how the third constant came to exist in the first place.
+   */
+  const stripH = fileStripH + sessionStripH
+  /** Whether `stripH` describes what is actually on screen right now.
+   *
+   *  A measured height arrives one commit AFTER the strip mounts: the ref
+   *  callback cannot read a box that has not been laid out yet. Without this
+   *  gate the settling 0 -> 81 reads as "a strip appeared" and the transient
+   *  adjustment below inflates a persisted manual height by the strip's height
+   *  on every mount that already had something staged. Waiting for a mounted
+   *  strip to report a non-zero box makes the first value a BASELINE rather
+   *  than a change. */
+  const stripsMounted = pendingFiles.length > 0 || pendingDirs.length > 0 || hasSessionRefs
+  const stripHSettled = stripsMounted ? stripH > 0 : stripH === 0
+  const prevStripH = useRef<number | null>(null)
   const dragMinH = INPUT_DRAG_MIN_H + stripH
   const dragMinHRef = useRef(dragMinH)
   dragMinHRef.current = dragMinH
@@ -2557,11 +2723,14 @@ function ChatInput({
   // rather than a per-strip boolean keeps the arithmetic correct when both
   // strips change in the same commit (e.g. send clears files and refs at once).
   useLayoutEffect(() => {
+    if (!stripHSettled) return
     const prev = prevStripH.current
     prevStripH.current = stripH
-    if (prev === stripH) return
+    // `null` is the first settled reading: there is no previous state to have
+    // moved from, so it establishes the baseline instead of adjusting.
+    if (prev === null || prev === stripH) return
     setManualHeight(h => h !== null ? Math.max(INPUT_DRAG_MIN_H, h + (stripH - prev)) : h)
-  }, [stripH])
+  }, [stripH, stripHSettled])
 
   return (
     // 'input-area' is a stable theming hook — see website/docs/theming-contract.md
@@ -2573,7 +2742,7 @@ function ChatInput({
 
       {/* Ghost follow-up bubbles floating above input */}
       {!showGhost && followUpOptions && followUpOptions.length > 0 && onFollowUpSelect && (
-          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} />
+          <FollowUpBar options={followUpOptions} picked={followUpPicked ?? new Set()} onSelect={onFollowUpSelect} onSend={sendFollowUp} quickSend={quickSend} layout={followUpLayout} sourceKey={followUpSourceKey} />
       )}
 
       {/* Tip / folder-suggestion band — LAST above the composer so it always
@@ -2583,13 +2752,19 @@ function ChatInput({
           push it away from the box. */}
       {aboveComposer}
 
-      {/* Drag handle — always visible, sits above approval bar or input */}
+      {/* Drag handle — sits above approval bar or input, on pointer devices only */}
       {/* Pointer-drag resize handle for the message input (double-click resets).
           Resize is a pure visual enhancement — the textarea already auto-sizes to
           its content and there is no per-pixel keyboard resize gesture — so the
-          handle is aria-hidden and carries no interactive semantics. */}
-      {!showGhost && <div
+          handle is aria-hidden and carries no interactive semantics.
+
+          Absent under a finger, and its absence is the feature: the reset is a
+          double-click, so on touch the gesture could only ever pin the height, never
+          undo it. See `manualHeight` for why the persisted value is disregarded
+          there too. */}
+      {!showGhost && !isTouch && <div
         aria-hidden="true"
+        data-testid="composer-resize-handle"
         className="flex items-center justify-center h-[6px] cursor-row-resize group/drag"
         style={{ touchAction: 'none' }}
         {...inputResize}
@@ -2772,11 +2947,12 @@ function ChatInput({
                   <div className="flex gap-1.5 flex-wrap items-center">
                       <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('approved')}><CheckCircle size={12} className="shrink-0" />{i18nT('components.chatInput.allow_once')}</button>
                       {approvalIsReadOnly && approvalCanTrust && <button disabled={approvalSubmitting} className={approvalBtnClass} onClick={() => handleApprovalAction('trust_reads')}><BookOpen size={12} className="shrink-0" />{i18nT('components.chatInput.trust_reads')}</button>}
-                      {approvalCanTrust && (
+                      {approvalCanTrust && approvalTrustCommandGrantable && (
                         <TrustDropdown
-                            fullCommand={approvalFullCommand || approvalLabelRaw}
-                            baseCommand={approvalBaseCommand || approvalLabelRaw.split(/\s+/)[0] || ''}
-                            isShell={approvalIsShell}
+                            fullCommand={approvalFullCommand}
+                            baseCommand={approvalBaseCommand}
+                            isShell={approvalIsShell && approvalTrustBaseGrantable}
+                            hasCommand={approvalTrustCommandGrantable}
                             disabled={approvalSubmitting}
                             className={approvalBtnClass}
                             onAction={(action, pattern) => { handleApprovalAction(action, pattern) }}
@@ -2785,6 +2961,31 @@ function ChatInput({
                       <button disabled={approvalSubmitting} className={`${approvalBtnClass} hover:!text-danger hover:!bg-[color-mix(in_srgb,var(--danger)_10%,transparent)]`} onClick={() => handleApprovalAction('rejected')}><Ban size={12} className="shrink-0" />{i18nT('components.chatInput.reject')}</button>
                   </div>
               </div>
+              {/* A1 discoverability hint: points at the footer mode picker so a
+                  new user learns approval prompting is adjustable. Withheld for
+                  unattended sources (the mode picker governs THIS slot, not the
+                  job that raised the card), in the ghost state (the collapsed
+                  composer unmounts the picker, so the link would have nothing
+                  to open), while the B2 nudge is up (two pointers at one
+                  control), and retired forever once the user has found the
+                  picker — via this link or by adjusting the mode. */}
+              {!showGhost && !approvalIsUnattended && !approvalModeAdjusted && !approvalNudgeActive && approvalMode && (
+                <div className="flex items-center gap-1.5 flex-wrap px-3.5 pb-2 -mt-1 text-[12px] text-muted select-none">
+                  <span>{i18nT('components.chatInput.approval_hint_question')}</span>
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-0.5 p-0 bg-transparent border-none text-accent text-[12px] cursor-pointer hover:underline"
+                    onClick={() => {
+                      // Discovery achieved: the picker is about to open under a
+                      // spotlight, so the hint has done its job for good.
+                      safeSetItem(APPROVAL_MODE_ADJUSTED_LS_KEY, '1')
+                      setApprovalPickerSignal(n => n + 1)
+                    }}
+                  >
+                    {i18nT('components.chatInput.approval_hint_adjust')}
+                  </button>
+                </div>
+              )}
             </div>
           </motion.div>
         )}
@@ -2808,7 +3009,7 @@ function ChatInput({
 
       <input id={fileInputId} ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="sr-only" onChange={handleFileInputChange} />
 
-      {typedCommandMenus && <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />}
+      {typedCommandMenus && <SlashCommandMenu input={value} slotId={slotId} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />}
 
       {onFileSelect && (
         <FilePickerMenu
@@ -2837,6 +3038,7 @@ function ChatInput({
         sendOnEnter={sendOnEnter}
         slotKey={skillSlotKey}
         project={project}
+        agent={agentName}
         onSelect={({ leaf }) => {
           // Token left literal — backend appends the skill body; the user still
           // sees their $token marker. Caret-relative replace via shared helper.
@@ -2922,8 +3124,8 @@ function ChatInput({
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
-        <SessionRefStrip refs={pendingSessions} onRemove={onRemoveSessionRef} />
-        <FilePreviewStrip files={pendingFiles} dirs={pendingDirs} resizedInfo={resizedInfo} onRemove={onRemoveFile} onRemoveDir={onRemoveDir} />
+        <SessionRefStrip refs={pendingSessions} onRemove={onRemoveSessionRef} rootRef={sessionStripRef} />
+        <FilePreviewStrip files={pendingFiles} dirs={pendingDirs} resizedInfo={resizedInfo} onRemove={onRemoveFile} onRemoveDir={onRemoveDir} rootRef={fileStripRef} />
 
         {/* Cancel cue for the hold gesture. Rendered above the dictation panel so
             the drop zone is genuinely UP from the thumb, and only while a press is
@@ -2948,7 +3150,15 @@ function ChatInput({
 
 
         {showDictation ? (
-          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} gestureDriven={voiceHoldMode} />
+          /* `gestureDriven` carries the settling term because ownership ends at
+             the release while this panel outlives it: `showDictation` is gated
+             on `voiceRecording`, which stays true through the streaming drain.
+             `bar === 'settling'` can only name the gesture's OWN drain (the
+             hook records `draining` solely on its own commit path), so the
+             keyboard hint stays suppressed for exactly the drain the finger
+             just committed — and stays SHOWN for a keyboard-binding capture,
+             where Esc/Enter genuinely work. */
+          <VoiceDictationPanel sampleRef={showDictation} value={value} partial={voicePartial} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} streaming={voiceStreaming} gestureDriven={voiceHoldMode || touchPtt.bar === 'settling'} />
         ) : (
           <VoiceStatusBar recording={voiceRecording} level={voiceLevel} deviceLabel={voiceDeviceLabel} deviceId={voiceDeviceId} error={voiceError} onDismissError={onClearVoiceError} onSelectDevice={onSelectVoiceDevice || noopSelectDevice} deviceSwitchIsLive={voiceDeviceSwitchIsLive} />
         )}
@@ -3170,7 +3380,7 @@ function ChatInput({
                 />
               )}
               {!isMobile && approvalMode && (
-                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} />
+                <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
               )}
               </div>
               {/* Edge cues, same treatment as the sibling strips that already
@@ -3191,7 +3401,7 @@ function ChatInput({
               )}
             </div>
             {isMobile && approvalMode && (
-              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact />
+              <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} compact openSignal={approvalPickerSignal} nudge={approvalNudgeActive} onNudgeDismiss={dismissApprovalNudge} onNudgeHide={hideApprovalNudge} />
             )}
           </div>
           <div className="flex items-center gap-1 shrink-0">
@@ -3494,6 +3704,50 @@ function ChatInput({
                             <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.remaining')}</span><span className="text-text">{approx ? '~' : ''}{fmtTokens(remaining)}</span></div>
                             <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.total')}</span><span className="text-text">{fmtTokens(win)}</span></div>
                           </div>
+                          {/* Plan quota, when the harness behind this slot reports one.
+                              Every field is independently optional: the adapter sends
+                              whichever ones its plan has, so each row is guarded
+                              rather than the section assuming a full block. */}
+                          {rateLimit && (() => {
+                            const statusView = rateLimit.status ? RATE_LIMIT_STATUS_VIEW[rateLimit.status] : undefined
+                            const util = typeof rateLimit.utilization === 'number' && rateLimit.utilization >= 0
+                              ? Math.min(rateLimit.utilization, 100)
+                              : undefined
+                            // A block carrying nothing this popover can render renders
+                            // nothing — a lone "Plan limit" heading over an empty row
+                            // reads as a broken readout rather than as no quota.
+                            if (!statusView && util == null && !rateLimit.resets_at && !rateLimit.limit_type) return null
+                            return (
+                              <div className="mt-2 pt-2 border-t border-border flex flex-col gap-1 text-[11px] font-mono">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-muted">{i18nT('components.chatInput.plan_limit')}</span>
+                                  {statusView
+                                    ? <span className="font-semibold truncate max-w-[110px]" style={statusView.color ? { color: statusView.color } : undefined} title={i18nT(statusView.key)}>{i18nT(statusView.key)}</span>
+                                    : util != null && <span className="text-text">{fmtPercent(util / 100)}</span>}
+                                </div>
+                                {/* The percentage moves up into the header row when there
+                                    is no status to head the section, so it is never shown
+                                    twice. */}
+                                {statusView && util != null && (
+                                  <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.used')}</span><span className="text-text">{fmtPercent(util / 100)}</span></div>
+                                )}
+                                {!!rateLimit.resets_at && (
+                                  /* Unix SECONDS from the backend; toDate's own
+                                     seconds-vs-ms disambiguation covers that, so no
+                                     conversion here would be a second guess at the
+                                     same question. */
+                                  <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.resets')}</span><span className="text-text">{fmtRelative(rateLimit.resets_at)}</span></div>
+                                )}
+                                {/* The limit type is the plan's own identifier, rendered
+                                    verbatim for the same reason the model id below is:
+                                    translating it would break the match against what the
+                                    provider's docs and billing page call it. */}
+                                {!!rateLimit.limit_type && (
+                                  <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.limit_type')}</span><span className="text-text truncate max-w-[110px]" title={rateLimit.limit_type}>{rateLimit.limit_type}</span></div>
+                                )}
+                              </div>
+                            )
+                          })()}
                           {modelName && (
                             <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
                               <span className="text-muted">{i18nT('components.chatInput.model')}</span><span className="text-text truncate max-w-[120px]" title={modelName}>{modelName}</span>

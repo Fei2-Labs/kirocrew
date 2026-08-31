@@ -27,6 +27,13 @@ installed by the caller should just forward into ``stop_event.set()``.
 
 from __future__ import annotations
 
+# System-trust injection is process-local and must run before imports below can
+# create or cache an SSLContext. Environment-only CA settings are inherited
+# from GatewayManager, but Security.framework-backed contexts are not.
+from kiro_crew._ssl_compat import _ensure_ssl_certs
+
+_ensure_ssl_certs()
+
 import argparse
 import asyncio
 import contextlib
@@ -398,6 +405,11 @@ async def run_gatewayd(
         except asyncio.CancelledError:
             # Normal on shutdown — propagate for the gather() below.
             raise
+        except ConnectionError:
+            # Abrupt peer disconnect (ECONNRESET / EPIPE from a hard-killed
+            # client) is routine — the clean-EOF sibling is already handled
+            # inside _handle_connection — so don't log it as a crash.
+            logger.debug("client disconnected abruptly", exc_info=True)
         except Exception:
             logger.exception("connection handler crashed")
         finally:
@@ -1287,6 +1299,46 @@ def _declared_env_to_forward(pool_key: PoolKey) -> dict[str, str]:
     return _declared_non_secret_env(pool_key)
 
 
+#: The canonical target-env prefix. ``MC_MCP_TARGET_`` is the legacy spelling
+#: :func:`env_target_resolver` still accepts, so both normalize to this stem set.
+_TARGET_ENV_PREFIXES = ("KIROCREW_MCP_TARGET_", "MC_MCP_TARGET_")
+
+
+def resolvable_target_stems(env: Optional[dict[str, str]] = None) -> list[str]:
+    """The set of target-env STEMS this daemon can resolve, sorted.
+
+    A stem is the env key with its prefix and any ``__<command_args_hash>``
+    suffix removed -- e.g. both ``KIROCREW_MCP_TARGET_KIROCREW_CORE`` and
+    ``KIROCREW_MCP_TARGET_KIROCREW_CORE__61774e20...`` yield ``KIROCREW_CORE``.
+
+    Reported on the ``pong`` reply so an adopting :class:`GatewayManager` can
+    tell whether an incumbent daemon's env still covers the servers the current
+    config wants stubbed. This is the ONLY way to see that: the daemon's target
+    map is baked into its process env at spawn (``manager._spawn_once``) and a
+    frozen :class:`GatewaySpec` is never re-applied to an adopted survivor, so a
+    daemon that predates a ``stub_servers`` change serves a stale map forever.
+
+    Deliberately reports STEMS rather than server names. Recovering a name would
+    mean undoing ``upper().replace("-", "_")``, which is lossy -- ``my-server``
+    and ``my_server`` normalize identically (the rewriter warns about exactly
+    that collision). Both sides comparing stems needs no such guess.
+    """
+    source = os.environ if env is None else env
+    stems: set[str] = set()
+    for key in source:
+        for prefix in _TARGET_ENV_PREFIXES:
+            if not key.startswith(prefix):
+                continue
+            stem = key[len(prefix) :]
+            # Strip the args-disambiguated suffix so a hashed-only entry still
+            # reports the server it serves.
+            stem = stem.split("__", 1)[0]
+            if stem:
+                stems.add(stem)
+            break
+    return sorted(stems)
+
+
 def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dict[str, str], str]]:
     """Look up ``KIROCREW_MCP_TARGET_<SERVER>`` in the process env and return the
     spawn tuple, or ``None`` if no mapping is set.
@@ -2117,7 +2169,10 @@ async def _handle_connection(
     # uses this to confirm the daemon is serving before returning from
     # ``start()``.
     if register.get("type") == "ping":
-        await _write_json_line(writer, {"type": "pong"})
+        # ``targets`` lets the pinger detect a STALE incumbent before adopting
+        # it. Absent on a pre-#6xxx daemon, which the adoption gate treats as
+        # unverifiable rather than assuming coverage.
+        await _write_json_line(writer, {"type": "pong", "targets": resolvable_target_stems()})
         return
 
     # Metrics short-circuit: return a point-in-time pool snapshot (backends,
@@ -2212,10 +2267,50 @@ async def _handle_connection(
     # the safe default in both directions: an overlay written before the flag
     # existed never silently starts sharing, and a malformed frame cannot widen
     # a connection's blast radius beyond itself.
-    exclusive_stub_uuid = "" if register.get("poolable") is True else stub_uuid
+    poolable_requested = register.get("poolable") is True
+    exclusive_stub_uuid = "" if poolable_requested else stub_uuid
+
+    # Retreat: a server OBSERVED behaving per-client while shared is not pooled
+    # again, whatever the overlay still says. This is the consuming half of the
+    # hazard ledger. Without it, recording a hazard changed a label on the MCP
+    # page and nothing else, so "share by default, retreat when observed" had no
+    # retreat -- the ledger's own evidence never reached a routing decision.
+    #
+    # The identity-checked read is the right one precisely BECAUSE this acts on
+    # the verdict: it answers for the program this launch actually runs, so an
+    # upgrade or a config edit re-earns pooling instead of leaving the server
+    # stranded on evidence about the build it replaced.
+    #
+    # Per-connection and per-key, so nothing global is switched off: every other
+    # server keeps pooling, and this one still gets a working PRIVATE backend --
+    # the same topology it would have with no gateway at all. The cost of a
+    # wrong retreat is therefore lost process reuse, never a broken server.
+    if poolable_requested:
+        observed = hazards.observed_codes(
+            pool_key.server_name,
+            hazards.launch_identity(
+                pool_key.command_args_hash,
+                pool_key.effective_env_hash,
+                pool_key.binary_version,
+            ),
+        )
+        if observed:
+            exclusive_stub_uuid = stub_uuid
+            logger.warning(
+                "hazard retreat: serving %r a private backend because %s was "
+                "observed while it was shared",
+                pool_key.server_name,
+                ", ".join(observed),
+            )
 
     def _release_reservation() -> None:
         """Release the hand-out reservation this connection actually took.
+
+        Keyed on the OUTCOME, because that is what decides which acquire path
+        ran: ``pool.get_or_create`` reserves, ``pool.acquire_exclusive`` does
+        not. A hazard-retreated connection therefore reserved nothing even
+        though it asked to pool, so releasing on the REQUEST would decrement a
+        digest this connection never reserved.
 
         A private backend takes none: it never enters the shared index, so no
         sweeper can reclaim it between hand-out and attach. Releasing one anyway
@@ -2223,9 +2318,10 @@ async def _handle_connection(
         ``poolable`` is not a PoolKey dimension, so a pooled connection with an
         identical PoolKey shares the digest. That pairing is reachable whenever
         the allowlist changes under a daemon that outlives the gateway: the old
-        overlay's stub still registers poolable while the new one does not. The
-        stray decrement would drop the pooled connection's eviction protection
-        before its stub attaches.
+        overlay's stub still registers poolable while the new one does not, and
+        now also whenever a retreat lands beside a concurrent pooled connection
+        on the same key. The stray decrement would drop the pooled connection's
+        eviction protection before its stub attaches.
         """
         if not exclusive_stub_uuid:
             pool.unreserve(pool_key)
@@ -2526,12 +2622,43 @@ async def _handle_connection(
                         # + create_task overhead so the metric stays true to name.
                         _acquire_ms = (time.monotonic() - _acquire_t0) * 1000.0
                     except _TargetUnknown as exc:
-                        _audit_pool_rejected(
+                        # An unknown target here means THIS DAEMON'S env has no
+                        # mapping -- which, at the pre-flight, can only be map
+                        # drift: a stub exists at all only because the rewriter
+                        # wrapped that server, and the stub is holding the real
+                        # ``--target-command`` on its own argv. A genuinely
+                        # unrunnable target fails later, as BackendUnavailable.
+                        # So this is fallback-ELIGIBLE: no real MCP frame has
+                        # been forwarded yet, so the stub can exec the target
+                        # directly and lose nothing but pooling.
+                        #
+                        # Loud, and named: the pre-fix behaviour was a bare
+                        # ``rejected`` with no ``fallback`` key, which the stub
+                        # reads as terminal (stub.py) -- it died in 0.2s having
+                        # logged only to a stderr nobody captures, so a whole
+                        # server's tools vanished from the session with no
+                        # attributable record anywhere. See
+                        # docs/architecture/design-notes/mcp-stub-decoupling.md.
+                        logger.warning(
+                            "ensure_backend: no target mapping for %s -- this "
+                            "daemon's target env predates the current "
+                            "stub_servers set (target map is baked at spawn and "
+                            "an adopted daemon never re-applies it). Replying "
+                            "fallback-eligible so the stub degrades to a "
+                            "per-session exec; pooling and the strict session "
+                            "key are LOST for this connection. Daemon stems: %s",
+                            pool_key.human_readable(),
+                            ",".join(resolvable_target_stems()) or "(none)",
+                        )
+                        _audit_pool_fallback(
                             caller.session_key if caller else "",
                             pool_key.human_readable(),
                             str(exc),
                         )
-                        await _write_json_line(writer, {"type": "rejected", "reason": str(exc)})
+                        await _write_json_line(
+                            writer,
+                            {"type": "rejected", "reason": str(exc), "fallback": True},
+                        )
                         return
                     except (BackendUnavailable, PoolAtCapacity) as exc:
                         logger.info(
@@ -2628,6 +2755,20 @@ async def _handle_connection(
                     # create_task overhead.
                     _lazy_elapsed_ms = (time.monotonic() - _lazy_t0) * 1000.0
                 except _TargetUnknown as exc:
+                    # Same drift as the pre-flight site, but NOT fallback-tagged:
+                    # only a pre-ensure_backend stub reaches this path and it has
+                    # already forwarded a real MCP frame, so an exec fallback
+                    # would lose that frame. Terminal is correct here -- what was
+                    # missing is saying so anywhere durable.
+                    logger.warning(
+                        "lazy-spawn: no target mapping for %s -- this daemon's "
+                        "target env predates the current stub_servers set. "
+                        "Terminal (a real frame was already forwarded, so an "
+                        "exec fallback would drop it): this server's tools will "
+                        "be ABSENT for the session. Daemon stems: %s",
+                        pool_key.human_readable(),
+                        ",".join(resolvable_target_stems()) or "(none)",
+                    )
                     _audit_pool_rejected(
                         caller.session_key if caller else "",
                         pool_key.human_readable(),
@@ -3000,14 +3141,43 @@ async def _respawn_backend_for_stub(
         )
         return None
 
+    # A respawn must honour the ledger too, or the retreat has a hole exactly
+    # where it matters most. The recycle that follows an unroutable server
+    # request comes straight back here, so re-pooling would hand the SAME stubs
+    # a shared backend for the server just observed misbehaving -- and no new
+    # register happens to re-decide it, so the retreat would not take effect
+    # until those sessions reconnected.
+    #
+    # ONE local drives both the acquire below and the release in the ``finally``,
+    # because those two must agree: only ``pool.get_or_create`` reserves, so a
+    # release keyed on a different predicate than the acquire would decrement a
+    # digest this respawn never reserved and drop a concurrent pooled
+    # connection's eviction protection.
+    respawn_exclusive_uuid = stub_uuid if old_backend.exclusive_token else ""
+    if not respawn_exclusive_uuid and hazards.observed_codes(
+        pool_key.server_name,
+        hazards.launch_identity(
+            pool_key.command_args_hash,
+            pool_key.effective_env_hash,
+            pool_key.binary_version,
+        ),
+    ):
+        respawn_exclusive_uuid = stub_uuid
+        logger.warning(
+            "hazard retreat on respawn: %r comes back private because a "
+            "hazard is on record for this launch",
+            pool_key.server_name,
+        )
+
     try:
         new_backend, _ = await _acquire_backend(
             pool,
             pool_key,
             resolver,
             # A respawn must not silently promote a private backend into the
-            # shared bucket: the replacement inherits the original binding.
-            exclusive_stub_uuid=stub_uuid if old_backend.exclusive_token else "",
+            # shared bucket: the replacement inherits the original binding,
+            # unless the ledger has since argued against sharing it at all.
+            exclusive_stub_uuid=respawn_exclusive_uuid,
         )
     except (_TargetUnknown, BackendUnavailable, PoolAtCapacity, OSError) as exc:
         logger.info(
@@ -3085,8 +3255,11 @@ async def _respawn_backend_for_stub(
     finally:
         # A private backend never took a reservation, and releasing one would
         # decrement a POOLED connection sharing this digest (see
-        # ``_release_reservation`` in the connection handler).
-        if not old_backend.exclusive_token:
+        # ``_release_reservation`` in the connection handler). Read the SAME
+        # local the acquire used, not ``old_backend.exclusive_token``: a hazard
+        # retreat above can make this respawn private while the old backend was
+        # pooled, and the two must not disagree.
+        if not respawn_exclusive_uuid:
             pool.unreserve(pool_key)
     new_writer_task = asyncio.create_task(
         _drain_inbox_to_stub(new_inbox, writer, stub_uuid),

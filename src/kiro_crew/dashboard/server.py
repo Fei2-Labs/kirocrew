@@ -119,6 +119,7 @@ from kiro_crew.dashboard.origin import (
     check_host,
     check_origin,
     dashboard_socket_path,
+    frame_ancestors_value,
     resolve_dashboard_host,
     should_canonicalize_host,
 )
@@ -358,6 +359,14 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # ``local_only=False`` deployment reclassifies strict paths as mixed.
         "/api/computer-use/frame",
         "/api/session-keepalive",
+        # In-app update approval (RFC OQ7 step-up). STRICT: its only legitimate
+        # caller is `kirocrew update approve` on the gateway host presenting the
+        # trust/-fenced nonce plus X-Local-Secret; no browser ever posts to it —
+        # the SPA can only ARM. Keeping it off the cookie fall-through means a
+        # dashboard bearer cannot even reach the handler whose refusal is the
+        # boundary, and the handler re-asserts host-locality itself because a
+        # local_only=False deployment reclassifies strict paths as mixed.
+        "/api/update/approve",
         "/api/session-tool-policy",
         # NOTE: "/api/hooks/agent" is deliberately NOT here. It is an inbound
         # webhook for EXTERNAL callers (CI runners, review bots) that hold no
@@ -372,6 +381,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/outbox/notify",
         "/api/notifications/agent",  # MCP-only (send_notification tool); no browser caller
         "/api/slack/upload-file",
+        "/api/channel/upload-file",
         "/api/slack/pins",
         "/api/slack/reactions",
         "/api/slack-profile",  # MCP-only (slack_profile tool); no browser caller
@@ -418,7 +428,7 @@ async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
 
     * OFF THE LOOP — ``log_api_access`` only enqueues, but the first ``sel()``
       of a process CONSTRUCTS the log: trust-dir creation, key validation, and
-      on Windows an ``icacls`` subprocess to lock the key file's DACL. A fresh
+      on Windows the owner-only DACL on the key file. A fresh
       dashboard whose first state-changing request is cross-origin would run
       that synchronously on the event loop and stall every other request.
     * BEST-EFFORT — a trust root too short to sign the chain makes construction
@@ -751,6 +761,56 @@ _INSTANCES_FRAME_SRC_EXTRA = " http://*.localhost:*"
 # artifacts. Grant same-origin only; cross-origin remains denied.
 _PERMISSIONS_POLICY = "clipboard-write=(self), clipboard-read=(self)"
 
+# /vendor/* is fetched by sandboxed widget/artifact iframes, which are
+# null-origin (srcdoc/blob) documents and therefore NON-secure contexts. On the
+# default deployment the gateway is plain http on loopback — a "more-private
+# address space" under Chrome's Private Network Access policy — which blocks
+# the iframe's <script src> for the Tailwind runtime unless the load goes
+# through CORS with server approval: the tag carries
+# crossorigin="anonymous" (widgetSrcdoc.ts) and this response carries
+# Access-Control-Allow-Origin. Verified against real Chromium: with the
+# header the runtime loads; without it the load hard-fails (crossorigin
+# makes the header MANDATORY, not additive), the runtime never arrives,
+# Tailwind-classed widgets render unstyled, and the widget loading overlay
+# sits on its hang backstop (blank box), see issue #6181. `*` leaks nothing:
+# /vendor/ holds only public, non-secret static JS (already auth-exempt via
+# token_auth._BYPASS_PREFIXES) and the response carries no credentials or
+# user data.
+_VENDOR_PATH_PREFIX = "/vendor/"
+_VENDOR_CORS_HEADER_VALUE = "*"
+_PNA_REQUEST_HEADER = "Access-Control-Request-Private-Network"
+_PNA_RESPONSE_HEADER = "Access-Control-Allow-Private-Network"
+# Two hours — Chrome caps preflight cache entries at 7200s, so a larger value
+# documents a guarantee the browser does not honour. The vendor files are
+# stable, unversioned assets; caching the approval avoids a preflight per
+# widget for the cap's duration.
+_VENDOR_PREFLIGHT_MAX_AGE_SECS = 7200
+
+
+async def _vendor_preflight_handler(request: web.Request) -> web.Response:
+    """Answer the CORS / Private Network Access preflight for ``/vendor/*``.
+
+    Forward-compat: current Chromium blocks the insecure-initiator load at
+    the CORS layer WITHOUT sending a PNA preflight (verified empirically —
+    the GET-with-Access-Control-Allow-Origin path above is the live fix).
+    Chrome's PNA rollout answers a private-network subresource fetch with a
+    preflight OPTIONS carrying ``Access-Control-Request-Private-Network:
+    true``; ``add_static`` registers GET/HEAD only, so if/when that ships
+    for this initiator class the preflight would 405 and the runtime load
+    would fail closed again. The PNA grant header is echoed only when the
+    request actually asks for it, per the PNA spec's request/response
+    pairing.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": _VENDOR_CORS_HEADER_VALUE,
+        "Access-Control-Allow-Methods": "GET, HEAD",
+        "Access-Control-Max-Age": str(_VENDOR_PREFLIGHT_MAX_AGE_SECS),
+    }
+    if request.headers.get(_PNA_REQUEST_HEADER, "").lower() == "true":
+        headers[_PNA_RESPONSE_HEADER] = "true"
+    return web.Response(status=204, headers=headers)
+
+
 # Content-hashed build output (Vite emits ``/assets/<name>-<hash>.<ext>``;
 # the URL changes whenever the content changes) is safe to cache forever.
 # Everything else — index.html, the SPA shell, /api — keeps the no-store
@@ -821,7 +881,16 @@ def _extra_frame_ancestors(
         if 1 <= _p <= 65535:
             port = _p
     if port is None:
-        token = request.query.get("token") or ""
+        # Prefer the credential token_auth actually VALIDATED (it publishes it
+        # as request["auth_token"]): its extraction can adopt the session cookie
+        # over an invalid query token, so a fixed query-then-cookie re-derivation
+        # could read an unverified value. Fall back to that order only when no
+        # credential was published (e.g. a surface that never reached the
+        # middleware's authenticated paths).
+        published = request.get("auth_token", "")
+        token = published if isinstance(published, str) else ""
+        if not token:
+            token = request.query.get("token") or ""
         if not token:
             port_fallback = app.get("port", _DEFAULT_PORT) if app is not None else _DEFAULT_PORT
             cookie_port = _cookie_port_from_host(request, port_fallback)
@@ -829,10 +898,13 @@ def _extra_frame_ancestors(
         port = token_embed_parent_port(token)
     if port is None:
         return []
-    return [
-        f"http://{host}:{port}"
-        for host in ("127.0.0.1", "localhost", "[::1]", "kirocrew.localhost")
-    ]
+    # A CSP host-source admits only letters, digits and hyphens in the host, so a
+    # bracketed IPv6 literal cannot be expressed: `http://[::1]:<port>` is refused by
+    # the browser ("the directive 'frame-ancestors' does not support the source
+    # expression") and dropped, so it never granted anything — it only logged a
+    # warning on every framed response. There is no valid spelling to substitute,
+    # so an IPv6-loopback parent cannot be authorized at all.
+    return [f"http://{host}:{port}" for host in ("127.0.0.1", "localhost", "kirocrew.localhost")]
 
 
 def _apply_security_headers(
@@ -894,7 +966,11 @@ def _apply_security_headers(
     # instance dashboard across loopback ports, while any local page without a
     # validly-signed token stays blocked (clickjacking).
     extra_ancestors = _extra_frame_ancestors(request, app)
-    frame_ancestors = " ".join(["'self'", *extra_ancestors])
+    # Same builder the sandboxed-document responses use. Hand-joining here instead
+    # would leave the shell as the one ancestor source nothing validates, which is
+    # exactly how an inexpressible entry (a bracketed IPv6 literal) reached a
+    # header before and made engines drop the whole directive.
+    frame_ancestors = frame_ancestors_value(extra_ancestors)
     resp.headers.setdefault(
         "Content-Security-Policy",
         _BASE_CSP.format(
@@ -904,6 +980,11 @@ def _apply_security_headers(
         ),
     )
     resp.headers.setdefault("Permissions-Policy", _PERMISSIONS_POLICY)
+    # CORS approval for the vendored runtime files fetched by null-origin
+    # sandboxed iframes; pairs with the /vendor OPTIONS preflight handler.
+    # See _VENDOR_PATH_PREFIX for the full Private-Network-Access rationale.
+    if path.startswith(_VENDOR_PATH_PREFIX):
+        resp.headers.setdefault("Access-Control-Allow-Origin", _VENDOR_CORS_HEADER_VALUE)
     # Defense-in-depth browser headers (CWE-1021/693/200/319). All via setdefault
     # so a handler can override. The clickjacking control is CSP ``frame-ancestors``
     # above. X-Frame-Options is origin-exact (SAMEORIGIN) and cannot express the
@@ -1037,6 +1118,12 @@ def _register_dist_static_routes(app: web.Application, dist_dir: Path) -> None:
             show_index=False,
             append_version=False,  # stable URLs, no cache-busting
         )
+        # PNA/CORS preflight, forward-compat: add_static registers GET/HEAD
+        # only, so a private-network preflight OPTIONS would 405 and fail the
+        # widget iframe's runtime load closed if Chrome starts sending one for
+        # this initiator class (today it blocks at the CORS layer without a
+        # preflight — see _vendor_preflight_handler).
+        app.router.add_route("OPTIONS", "/vendor/{tail:.*}", _vendor_preflight_handler)
     # App Store brand assets — builtin app icons + hero images live at
     # dist/app-assets/ and are referenced by absolute url('/app-assets/...')
     # from each builtin's app.json (iconUrl / heroImage / heroImageDark).
@@ -1269,10 +1356,16 @@ def _register_mcp_routes(app: web.Application) -> None:
     # Dynamic Workflows (M6) — author, run, monitor, cancel, rerun
     from kiro_crew.dashboard.handlers.workflows import (
         api_workflow_author,
+        api_workflow_definition_get,
+        api_workflow_definition_run,
+        api_workflow_definition_update,
+        api_workflow_definitions,
+        api_workflow_definitions_create,
         api_workflow_run,
         api_workflow_run_cancel,
         api_workflow_run_get,
         api_workflow_run_intent,
+        api_workflow_run_promote,
         api_workflow_run_rerun,
         api_workflow_runs,
     )
@@ -1280,8 +1373,18 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/workflows/author", api_workflow_author)
     app.router.add_post("/api/workflows/run", api_workflow_run)
     app.router.add_post("/api/workflows/run_intent", api_workflow_run_intent)
+    app.router.add_get("/api/workflows/definitions", api_workflow_definitions)
+    app.router.add_post("/api/workflows/definitions", api_workflow_definitions_create)
+    app.router.add_post(
+        "/api/workflows/definitions/{workflow_ref}/run", api_workflow_definition_run
+    )
+    app.router.add_get("/api/workflows/definitions/{workflow_ref}", api_workflow_definition_get)
+    app.router.add_patch(
+        "/api/workflows/definitions/{workflow_ref}", api_workflow_definition_update
+    )
     app.router.add_get("/api/workflows/runs", api_workflow_runs)
     app.router.add_get("/api/workflows/runs/{run_id}", api_workflow_run_get)
+    app.router.add_post("/api/workflows/runs/{run_id}/promote", api_workflow_run_promote)
     app.router.add_post("/api/workflows/runs/{run_id}/cancel", api_workflow_run_cancel)
     app.router.add_post("/api/workflows/runs/{run_id}/rerun", api_workflow_run_rerun)
 
@@ -1686,7 +1789,7 @@ def _write_secret_file(secret_path: Path, secret: str) -> None:
             # OSError, which would defeat the cleanup-and-reraise below — a
             # pre-existing file with loose perms would stay loose and the caller
             # never learns. On POSIX this applies chmod 0o600 by path;
-            # on Windows an owner-only DACL via icacls (fchmod doesn't exist on
+            # on Windows an owner-only DACL (fchmod doesn't exist on
             # Windows, where a raw fchmod would be a silent no-op).
             platform_compat.restrict_to_owner(secret_path)
             with os.fdopen(fd, "w") as f:
@@ -2347,7 +2450,7 @@ def _arm_prevent_sleep_poll(state: DashboardState, port: int) -> None:
 # the notification can offer the opt-out at the exact moment the user is being
 # asked to review yet another candidate. Same highlight=key:<configKey> format
 # the frontend's <SettingRef> builds, consumed by useSettingHighlight.
-_SKILL_APPROVAL_SETTING_URL = "/settings?tab=skills&highlight=key:skills.approval_required"
+_SKILL_APPROVAL_SETTING_URL = "/settings/skills?highlight=key:skills.approval_required"
 
 
 def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[str, str]]]:
@@ -2417,6 +2520,12 @@ def _pending_skill_notification(info: dict) -> tuple[str, str, str, list[dict[st
         },
     ]
     return title, body, review_url, actions
+
+
+def _tailnet_origin_enabled() -> bool:
+    """Read the live recovery opt-in; callers offload this blocking config read."""
+
+    return bool(KiroCrewConfig.load().dashboard.tailscale.enabled)
 
 
 async def start_dashboard(
@@ -2698,6 +2807,9 @@ async def start_dashboard(
             nudge_authorizer=_wf_nudge_authorizer,
             timeout_secs=_wf_timeout_secs,
         )
+        if state.task_runner is not None:
+            state.workflow_service.attach_task_runner(state.task_runner)
+            state.task_runner.attach_workflow_service(state.workflow_service)
         logger.info(
             "WorkflowService ready (dynamic workflows, max parallel agents=%s, run ceiling=%ss)",
             _wf_concurrency,
@@ -2728,7 +2840,12 @@ async def start_dashboard(
 
     app = web.Application(
         client_max_size=60 * 1024 * 1024
-    )  # 60 MB: covers 50 MB upload + multipart overhead
+    )  # 60 MB: covers a 50 MB BUFFERED upload + multipart overhead. NOT a
+    # ceiling on every upload: aiohttp enforces this in Request.read()/.post(),
+    # not on the streaming multipart() reader, so the video path in
+    # handlers/files.py streams past it under its own _MAX_VIDEO_UPLOAD_BYTES
+    # (pinned by test_streaming_bypasses_the_app_client_max_size). Reading this
+    # number as a global request cap is the false invariant to avoid.
     app["state"] = state
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
@@ -2772,8 +2889,12 @@ async def start_dashboard(
     await asyncio.to_thread(state.load_cron_folders)
     # Off-loop: a large chat_pins.json must not block the event loop at startup.
     await asyncio.to_thread(state.load_chat_pins)
-    state.load_tags()
+    # Off-loop: load_tags runs a synchronous save_tags() during load (status
+    # back-fill / seed) which fsyncs on the event loop; a large tags.json —
+    # including preserved-but-malformed rows (#5792) — must not stall startup.
+    await asyncio.to_thread(state.load_tags)
     app["port"] = port
+    app["dashboard_url"] = dashboard_url
 
     # Route pull-request status deltas to owner websockets. Extracted so the
     # register + shutdown-cleanup contract is unit-testable without booting the
@@ -3091,14 +3212,9 @@ async def start_dashboard(
             "tailnet access enabled: trusting origin https://%s (bind and auth unchanged)",
             _tailnet_host,
         )
-    # Stashed on the app, not left a local, because GET /api/tailnet/status must
-    # report the value the running origin set was actually built from rather than
-    # re-probe the daemon (see handlers/tailnet.py). ``tailnet_resolved_at`` is
-    # stamped unconditionally — it timestamps the resolution ATTEMPT, so an
-    # "unresolved" card can say when we last looked; ``0`` means the derivation
-    # never ran (feature off, or pinned). Both start-up paths set both keys: only
-    # one of them serves this route today, but an earlier round of this feature
-    # already shipped a bug from touching one startup site and not the other.
+    # Keep the initial snapshot on both startup surfaces for compatibility.
+    # Runtime-aware handlers read the mutable state installed below, which can
+    # acquire one validated origin after a Tailscale/Gateway boot race.
     app["tailnet_host"] = _tailnet_host
     app["tailnet_resolved_at"] = int(time.time()) if _tailnet_host else 0
     # The governance-filtered identity-trust value the middleware was built
@@ -3149,7 +3265,7 @@ async def start_dashboard(
 
     # Warm the auth singletons (signing secret + revoked-nonce store) off the
     # event loop BEFORE building the middleware chain, so no blocking key-file
-    # I/O (or Windows icacls subprocess) lands on the loop on the first auth op.
+    # I/O lands on the loop on the first auth op.
     await warm_auth_singletons()
 
     # Explicit middleware ordering — self-documenting and immune to future insertions
@@ -3196,6 +3312,17 @@ async def start_dashboard(
             )
             raise RuntimeError("dashboard_url requires token auth middleware")
 
+    # Register only after the final allowed-origin set is selected.  The startup
+    # hook schedules a sleeping background task and returns immediately, so this
+    # cannot extend listener startup; cleanup owns cancellation before aiohttp
+    # freezes the signal lists in runner.setup().
+    tailnet.install_tailnet_origin_recovery(
+        app,
+        enabled=_ts_cfg.enabled,
+        initial_host=_tailnet_host,
+        load_enabled=_tailnet_origin_enabled,
+    )
+
     # ── Loop stall watchdog shutdown ─────────────────────────────────────────
     # Register the cleanup hook HERE, before ``runner.setup()`` freezes the
     # app's signal lists (appending after setup raises "Cannot modify frozen
@@ -3219,6 +3346,16 @@ async def start_dashboard(
         await app_["kiro_prerequisite_service"].close()
 
     app.on_cleanup.append(_kiro_prerequisite_shutdown)
+
+    async def _kas_login_shutdown(app_: web.Application) -> None:
+        # Releases the service's aiohttp session IF a KAS request created it. It is
+        # lazily built on first use (never at boot), so an app that never served a
+        # KAS request has nothing to close.
+        service = app_.get("kas_login_service")
+        if service is not None:
+            await service.close()
+
+    app.on_cleanup.append(_kas_login_shutdown)
 
     # ── Instances (multi-instance management) ────────────────────────────────
     # Register the opt-in instances startup/cleanup hooks HERE, before
@@ -3250,8 +3387,8 @@ async def start_dashboard(
     _unix_socket_holder["path"] = await _start_unix_site(runner, port)
 
     # Port bind succeeded — now safe to write the secret file. Offloaded:
-    # _write_secret_file does blocking fs I/O (os.open/os.close and, on Windows,
-    # an icacls subprocess via restrict_to_owner), so it must not run on the
+    # _write_secret_file does blocking fs I/O (os.open/os.close, plus the
+    # owner-only lockdown on Windows), so it must not run on the
     # event loop (no-blocking-call-on-event-loop). The port is passed so the
     # credential is published per listener, not only into the shared file every
     # gateway in this data home writes (see _write_instance_credentials).
@@ -3722,7 +3859,12 @@ async def start_api_server(
 
     app = web.Application(
         client_max_size=60 * 1024 * 1024
-    )  # 60 MB: covers 50 MB upload + multipart overhead
+    )  # 60 MB: covers a 50 MB BUFFERED upload + multipart overhead. NOT a
+    # ceiling on every upload: aiohttp enforces this in Request.read()/.post(),
+    # not on the streaming multipart() reader, so the video path in
+    # handlers/files.py streams past it under its own _MAX_VIDEO_UPLOAD_BYTES
+    # (pinned by test_streaming_bypasses_the_app_client_max_size). Reading this
+    # number as a global request cap is the false invariant to avoid.
     app["state"] = state
     # Bind the serving loop once, here: this runs ON that loop, so every
     # surface that later hands work in from a foreign thread -- slots
@@ -3756,7 +3898,10 @@ async def start_api_server(
     await asyncio.to_thread(state.load_cron_folders)
     # Off-loop: a large chat_pins.json must not block the event loop at startup.
     await asyncio.to_thread(state.load_chat_pins)
-    state.load_tags()
+    # Off-loop: load_tags runs a synchronous save_tags() during load (status
+    # back-fill / seed) which fsyncs on the event loop; a large tags.json —
+    # including preserved-but-malformed rows (#5792) — must not stall startup.
+    await asyncio.to_thread(state.load_tags)
     app["port"] = port
 
     _precompute_telemetry(state)
@@ -3790,6 +3935,14 @@ async def start_api_server(
     # re-bind a rotated access token to the same verified peer identity).
     app["tailnet_trust"] = _tailnet_trust
     app["local_only"] = local_only
+    # Parity with the full dashboard: headless gateways have the same live
+    # Origin/Host boundary and must recover the same boot race without restart.
+    tailnet.install_tailnet_origin_recovery(
+        app,
+        enabled=_ts_cfg.enabled,
+        initial_host=_tailnet_host,
+        load_enabled=_tailnet_origin_enabled,
+    )
 
     # Per-session internal secret for machine-to-machine (mcp-core, cron) auth.
     # Deferred file write (and parent mkdir) until after the port binds (mirrors
@@ -3887,6 +4040,16 @@ async def start_api_server(
 
     app.on_cleanup.append(_kiro_prerequisite_shutdown)
 
+    async def _kas_login_shutdown(app_: web.Application) -> None:
+        # Releases the service's aiohttp session IF a KAS request created it. It is
+        # lazily built on first use (never at boot), so an app that never served a
+        # KAS request has nothing to close.
+        service = app_.get("kas_login_service")
+        if service is not None:
+            await service.close()
+
+    app.on_cleanup.append(_kas_login_shutdown)
+
     # Prevent-sleep shutdown hook — registered before runner.setup freezes the
     # signal lists; the poll itself is armed after the port binds (below). This
     # is what makes headless --slack-only keep the host awake during a long
@@ -3921,7 +4084,7 @@ async def start_api_server(
     # Port bind succeeded — now safe to persist the secret file (parity with
     # start_dashboard: write deferred so a failed bind can't poison it).
     # Offloaded: _write_secret_file does blocking fs I/O (os.open/os.close and,
-    # on Windows, an icacls subprocess via restrict_to_owner), so it must not run
+    # on Windows, the owner-only DACL), so it must not run
     # on the event loop (no-blocking-call-on-event-loop). Same per-listener
     # publication as start_dashboard: both surfaces must pair the credential
     # with the port or a client cannot tell which generation it reached.

@@ -53,6 +53,7 @@ except ImportError:  # non-POSIX (Windows)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
+    from concurrent.futures import ThreadPoolExecutor
     from typing import Any, NoReturn
 
 logger = logging.getLogger(__name__)
@@ -1580,6 +1581,36 @@ if _libc.prctl:
     _libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
     _libc.prctl.restype = ctypes.c_int
 
+def _mount_or_die(source, target, flags, what):
+    """``mount(2)`` or refuse to exec, naming *what* and the errno.
+
+    Every mount in this launcher IS a security control -- each one hides a
+    credential path, or (for ``/``) pins mount propagation so the hiding
+    cannot escape. Discarding the return value makes those controls fail
+    OPEN: the path stays visible and the agent runs anyway, believing it is
+    hidden. Nothing downstream notices -- there is no post-mount emptiness
+    check, the launcher has no logger, and the pre-exec hardlink scan only
+    fires when a credential happens to carry an extra link.
+
+    So these refuse, matching what the rest of this launcher already does
+    when a control cannot be established: both ``unshare`` calls, the
+    seccomp-BPF install, and the hardlink scan all ``sys.exit``. The
+    degrade-open decisions nearby are deliberately narrower -- the tmpfs
+    source-dir fallback and the hardlink scan's budget ceiling -- and
+    neither concerns the hiding itself.
+
+    ``sandbox_level`` is the explicit opt-out for a host that cannot mount;
+    a silent unhidden credential is not.
+    """
+    if _libc.mount(source, target, None, flags, None) != 0:
+        _err = ctypes.get_errno()
+        sys.exit(
+            "sandbox: BLOCKED -- %s failed: errno %d (%s). The sandbox could not "
+            "establish this control, so the agent would run with the path "
+            "visible. Lower sandbox_level to run without it deliberately."
+            % (what, _err, os.strerror(_err))
+        )
+
 REAL_UID = {uid}
 REAL_GID = {gid}
 SENSITIVE_DIRS = {dirs_json}
@@ -1645,7 +1676,8 @@ def main():
             sys.exit(f"sandbox: unshare(NEWNS) failed: errno {{ctypes.get_errno()}}")
 
         # Private mount propagation
-        _libc.mount(None, b"/", None, _MS_REC | _MS_PRIVATE, None)
+        _mount_or_die(None, b"/", _MS_REC | _MS_PRIVATE,
+                      "making mount propagation private on /")
 
         # Pick a tmpfs-backed source dir for bind-mount empty files/dirs. Same-fs
         # binds (e.g. /tmp on ext4 over ~/.kiro/crew/.env on ext4) can corrupt the
@@ -1675,12 +1707,48 @@ def main():
         # available — better to function (with the original regression risk)
         # than to refuse to start.
 
-        # Pre-read files that must survive dir hiding
+        # Pre-read files that must survive dir hiding.
+        #
+        # An expose source that cannot be READ degrades to "not exposed" with a
+        # stderr warning, the same way the Step 7 hardlink scan degrades open.
+        # This read runs during sandbox SETUP, so letting the OSError propagate
+        # aborts the child before the command runs at all -- and selective
+        # exposure is an OPTIMIZATION (keep ~/.aws/config reachable so
+        # credential_process still resolves inside an otherwise-hidden ~/.aws),
+        # never a security control. Failing the whole spawn because an optional
+        # convenience is unreadable trades a working sandbox for no sandbox.
+        #
+        # `isfile` already covers ABSENT; this covers UNREADABLE, and the two
+        # are not the same test: `stat` can succeed on a path whose `open` is
+        # then denied. Seen in the wild as a filesystem restriction inherited
+        # from the parent process, denying read on a 0600 file the child's own
+        # uid owned -- so DAC bits and uid both looked correct while every
+        # cc-mode spawn on that host died here.
+        #
+        # Catching the error is the only guard that HOLDS. Do not "tighten" this
+        # into a pre-flight `os.access(src_path, os.R_OK)`: measured on the
+        # affected host, `os.stat()` succeeded and `os.access()` reported BOTH
+        # X_OK and R_OK as True while the operation was denied anyway. The
+        # weaker check looks equivalent from the source alone and would
+        # silently restore the abort.
+        #
+        # The warning is not optional. Skipping silently would leave the child
+        # with no ~/.aws/config and no explanation, turning a loud setup failure
+        # into a later auth failure that points nowhere near this line.
         expose_data = {{}}
         for src_path, filename in EXPOSE_FILES:
             if os.path.isfile(src_path):
-                with open(src_path, "rb") as fh:
-                    expose_data[src_path] = fh.read()
+                try:
+                    with open(src_path, "rb") as fh:
+                        expose_data[src_path] = fh.read()
+                except OSError as exc:
+                    print(
+                        "sandbox: WARNING — cannot read %s (%s); it will be "
+                        "ABSENT inside the sandbox. Anything depending on it "
+                        "(e.g. credential_process in ~/.aws/config) will fail."
+                        % (src_path, exc),
+                        file=sys.stderr,
+                    )
 
         # Bind-mount empty dirs over credential paths (per-dir tmpdir to
         # prevent content leaking across mounts via shared backing dir).
@@ -1688,7 +1756,8 @@ def main():
             target = d.encode()
             if os.path.isdir(target):
                 per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src).encode()
-                _libc.mount(per_dir_empty, target, None, _MS_BIND, None)
+                _mount_or_die(per_dir_empty, target, _MS_BIND,
+                              "hiding credential directory %s" % d)
 
         # Restore selectively exposed files into the now-empty mounts
         for src_path, filename in EXPOSE_FILES:
@@ -1713,18 +1782,50 @@ def main():
             if os.path.isfile(target):
                 fd, empty_path = tempfile.mkstemp(dir=_tmpfs_src)
                 os.close(fd)
-                _libc.mount(empty_path.encode(), target, None, _MS_BIND, None)
+                _mount_or_die(empty_path.encode(), target, _MS_BIND,
+                              "hiding sensitive file %s" % f)
 
         # .ssh: hide keys but expose known_hosts content (strict only)
         if HIDE_SSH and os.path.isdir(SSH_DIR):
             kh_data = b""
             if os.path.isfile(SSH_KNOWN_HOSTS):
-                with open(SSH_KNOWN_HOSTS, "rb") as fh:
-                    kh_data = fh.read()
+                # Host trust data FAILS CLOSED. This is deliberately NOT the
+                # degrade-open treatment the EXPOSE_FILES pre-read above gets,
+                # and the two sites are NOT symmetric:
+                #
+                #   - an unreadable ~/.aws/config costs REACHABILITY, so
+                #     skipping it trades a convenience for a working sandbox;
+                #   - an unreadable known_hosts costs VERIFICATION. The launcher
+                #     puts StrictHostKeyChecking=accept-new into
+                #     GIT_SSH_COMMAND, gated ONLY on that variable being unset
+                #     -- never on whether this read succeeded. So continuing
+                #     with an empty kh_data points UserKnownHostsFile at an
+                #     absent file while auto-accept is still on: every host then
+                #     reads as NEW and an interceptor's key is accepted. With
+                #     known_hosts present, accept-new REFUSES a CHANGED key.
+                #
+                # A degrade here would therefore convert "refuse a changed key"
+                # into "accept anything". Aborting is the safe direction: no
+                # sandbox at all beats one that has quietly stopped verifying
+                # hosts. Report first so the abort is diagnosable, then re-raise
+                # and let it kill setup.
+                try:
+                    with open(SSH_KNOWN_HOSTS, "rb") as fh:
+                        kh_data = fh.read()
+                except OSError as exc:
+                    print(
+                        "sandbox: FATAL — cannot read %s (%s). Refusing to "
+                        "continue: proceeding without it would leave host-key "
+                        "verification accepting any new key."
+                        % (SSH_KNOWN_HOSTS, exc),
+                        file=sys.stderr,
+                    )
+                    raise
             # Cross-fs source for the same kernel-race reason as SENSITIVE_DIRS
             # (line 371) and SENSITIVE_FILES (line 389).
             ssh_tmp = tempfile.mkdtemp(dir=_tmpfs_src).encode()
-            _libc.mount(ssh_tmp, SSH_DIR.encode(), None, _MS_BIND, None)
+            _mount_or_die(ssh_tmp, SSH_DIR.encode(), _MS_BIND,
+                          "hiding ssh key directory %s" % SSH_DIR)
             if kh_data:
                 with open(os.path.join(SSH_DIR, "known_hosts"), "wb") as fh:
                     fh.write(kh_data)
@@ -2272,6 +2373,7 @@ def _delegate_to_kiro_internal_sandbox(
     part of kiro's own sandbox mechanism on this path, so bypassing it here
     would defeat the delegated layer.
     """
+
     global _kiro_delegation_warned
     try:
         # circular import (pre-emptive, layering): sandbox.py is a low-level
@@ -2285,7 +2387,7 @@ def _delegate_to_kiro_internal_sandbox(
             session_key="sandbox",
             agent="system",
             source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
+            tool_name=_command_log_label(argv),
             tool_kind="subprocess",
             outcome="delegated",
             resources=(
@@ -2963,6 +3065,37 @@ def _warn_no_isolation(mode: str) -> None:
     )
 
 
+def _command_log_label(argv: list[str]) -> str:
+    """Return a fixed, non-sensitive executable class for diagnostics.
+
+    ``wrap_argv`` is a generic boundary: later argv elements routinely contain
+    user-controlled paths, URLs, and occasionally transport capabilities. Static
+    analysis also correctly treats a list element as able to reach any other
+    element. Never send a value taken from that container to a log or SEL event,
+    even when the runtime expression selects ``argv[0]``. The fixed labels retain
+    enough operational signal without exposing executable paths or arguments.
+    """
+
+    if not argv:
+        return "unknown"
+    name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name == "git":
+        return "git"
+    if name in {"python", "python3", "pythonw", "pythonw3"}:
+        return "python"
+    if name in {"node", "npm", "npx"}:
+        return "node"
+    if name in {"kiro", "kiro-cli", "kirocrew"}:
+        return "kiro"
+    if name in {"bash", "sh", "zsh", "cmd", "powershell", "pwsh"}:
+        return "shell"
+    if name in {"env", "bwrap", "sandbox-exec", "systemd-run"}:
+        return "sandbox-helper"
+    return "other"
+
+
 def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
     """Emit a once-per-process SECURITY warning when mode='off' results in
     no OS-level isolation and no verified delegation.
@@ -2978,7 +3111,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             logger.info(
                 "agent.sandbox='off' with no active delegation; operator opted "
                 "in via sandbox_allow_no_isolation. Command: %s",
-                argv[0] if argv else "unknown",
+                _command_log_label(argv),
             )
         return
 
@@ -2997,7 +3130,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "security.py checks remain. Set agent.sandbox='auto' or enable "
             "kiro-cli's internal sandbox to restore OS-level confinement. "
             "Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     elif sys.platform.startswith("linux"):
         if "linux" in _warned_set:
@@ -3010,7 +3143,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "secrets are readable by it and only the bypassable app-level "
             "security.py checks remain. Set agent.sandbox='auto' to engage "
             "namespace isolation. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     elif sys.platform == "win32":
         if "win32" in _warned_set:
@@ -3020,7 +3153,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "SECURITY: agent.sandbox='off' on Windows — no OS-level sandbox "
             "backend exists on this platform. The agent subprocess runs with "
             "full filesystem access. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
     else:
         if "other" in _warned_set:
@@ -3030,7 +3163,7 @@ def _warn_mode_off_unconfined(argv: list[str], is_kiro_spawn: bool) -> None:
             "SECURITY: agent.sandbox='off' for a non-kiro-cli subprocess — "
             "running without OS-level confinement. Set agent.sandbox='auto' "
             "to engage seatbelt isolation. Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
         )
 
     _warn_mode_off_unconfined._warned_set = _warned_set  # type: ignore[attr-defined]
@@ -3054,7 +3187,7 @@ def _warn_first_party_unconfined_once(argv: list[str]) -> None:
         "Hostile-input spawn paths are unaffected: they keep failing closed "
         "and still require agent.sandbox_allow_unsandboxed_exec=true. "
         "Command: %s",
-        argv[0] if argv else "unknown",
+        _command_log_label(argv),
     )
 
 
@@ -3091,7 +3224,7 @@ def _first_party_no_backend_passthrough(
             session_key="sandbox",
             agent="system",
             source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
+            tool_name=_command_log_label(argv),
             tool_kind="subprocess",
             outcome="unconfined",
             resources="first-party fixed argv, no sandbox backend (issue #1563 carve-out)",
@@ -3102,7 +3235,7 @@ def _first_party_no_backend_passthrough(
             "unaudited: the argv is package-derived and denying the spawn "
             "would brick built-in tooling whenever SEL hiccups (matches the "
             "mode=off delegation posture). Command: %s",
-            argv[0] if argv else "unknown",
+            _command_log_label(argv),
             exc_info=True,
         )
     # Same env scrub as the seatbelt / delegation paths, via the trusted
@@ -3434,7 +3567,7 @@ def wrap_argv(
                     session_key="sandbox",
                     agent="system",
                     source="sandbox.wrap_argv",
-                    tool_name=argv[0] if argv else "unknown",
+                    tool_name=_command_log_label(argv),
                     tool_kind="subprocess",
                     outcome="delegated",
                     resources=(
@@ -3451,7 +3584,7 @@ def wrap_argv(
                 logger.warning(
                     "SECURITY: SEL audit failed for mode=off delegation; "
                     "proceeding with env scrub but no seatbelt. Command: %s",
-                    argv[0] if argv else "unknown",
+                    _command_log_label(argv),
                     exc_info=True,
                 )
             unset_args = _sandbox_env_unset_args("standard", strip_python_env)
@@ -3510,7 +3643,7 @@ def wrap_argv(
                 "Applying the stricter tier's env scrub to the passthrough.",
                 requested_level,
                 active_level,
-                argv[0] if argv else "unknown",
+                _command_log_label(argv),
             )
         # Emit an SEL audit event for this security-relevant passthrough so the
         # decision to spawn without a *fresh* wrap is tamper-evidently recorded,
@@ -3541,7 +3674,7 @@ def wrap_argv(
                 session_key="sandbox",
                 agent="system",
                 source="sandbox.wrap_argv",
-                tool_name=argv[0] if argv else "unknown",
+                tool_name=_command_log_label(argv),
                 tool_kind="subprocess",
                 outcome="allowed",
                 metadata={
@@ -3847,7 +3980,7 @@ def wrap_argv(
                     session_key="sandbox",
                     agent="system",
                     source="sandbox.wrap_argv",
-                    tool_name=argv[0] if argv else "unknown",
+                    tool_name=_command_log_label(argv),
                     tool_kind="subprocess",
                     outcome="denied",
                     error=(f"{sel_reason} (probe: {probe_reason})"),
@@ -4105,6 +4238,85 @@ async def sandboxed_spawn_argv_off_loop(
                 os.unlink(cleanup)
             except OSError:
                 pass
+        raise
+
+
+async def shielded_prepare_off_loop(
+    prepare: Callable[[], tuple[list[str], dict[str, str], str | None]],
+    *,
+    executor: ThreadPoolExecutor | None = None,
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Run a spawn-preparation callable off the loop, shielded from cancellation.
+
+    ``prepare`` must follow the :func:`sandboxed_spawn_argv` contract: it returns
+    ``(wrapped_argv, scrubbed_env, cleanup_path_or_None)`` where the third element
+    is a temp launcher/profile the CALLER must unlink after the child exits.
+
+    Every async caller reaches the sync chokepoint through a worker hop.
+    Cancelling that hop abandons the returned tuple while the worker still
+    materializes the launcher/profile, leaking the temp file forever.  Shielding
+    the hop keeps the worker's result recoverable: on cancellation we wait for
+    the thread to settle, unlink the launcher it created, and re-raise.
+
+    A REPEAT cancellation landing on a bare recovery ``await`` is a
+    ``BaseException`` that would abandon the recovery before the unlink runs,
+    leaking the materialized launcher (#5841).  The settle-then-unlink therefore
+    runs as its own task, shielded from cancellations aimed at this caller; each
+    absorbed repeat is ``uncancel()``-ed so an enclosing ``asyncio.timeout``
+    still reports ``TimeoutError``, and the ORIGINAL cancellation is re-raised
+    once the launcher is gone.
+
+    ``executor`` keeps pool choice with the CALLER, because which pool absorbs a
+    wedged preparation is per-site policy, not a shield concern: the chokepoint
+    can cold-probe the sandbox backend with a synchronous subprocess, and
+    :mod:`kiro_crew.executors` partitions blocking work into named pools so such
+    a probe cannot occupy the workers another subsystem (the orphan-reaping
+    sweep) needs. Defaulting it to ``None`` — the loop's default pool, via
+    ``asyncio.to_thread`` — would silently collapse that partition for callers
+    that had chosen a pool, so every site that had one passes it explicitly.
+    """
+
+    Prepared = tuple[list[str], dict[str, str], str | None]
+    task: asyncio.Future[Prepared]
+    if executor is None:
+        task = asyncio.ensure_future(asyncio.to_thread(prepare))
+    else:
+        task = asyncio.get_running_loop().run_in_executor(executor, prepare)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+
+        async def _settle_then_unlink() -> None:
+            cleanup: str | None = None
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                _, _, cleanup = await task
+            if not cleanup:
+                return
+            target = cleanup
+
+            def _unlink() -> None:
+                with contextlib.suppress(OSError):
+                    os.unlink(target)
+
+            if executor is None:
+                await asyncio.to_thread(_unlink)
+            else:
+                await asyncio.get_running_loop().run_in_executor(executor, _unlink)
+
+        current = asyncio.current_task()
+        recovery = asyncio.create_task(_settle_then_unlink())
+        while not recovery.done():
+            try:
+                await asyncio.shield(recovery)
+            except asyncio.CancelledError:
+                uncancel = getattr(current, "uncancel", None)  # 3.11+
+                if uncancel is not None:
+                    uncancel()
+            except Exception:
+                logger.warning(
+                    "sandbox launcher cleanup failed after cancellation",
+                    exc_info=True,
+                )
         raise
 
 

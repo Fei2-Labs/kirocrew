@@ -12,8 +12,8 @@
  *   node scripts/capture-app-store-gallery.mjs [outputRoot]
  */
 import { chromium } from 'playwright'
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { serveDist } from './lib/serve-dist.mjs'
@@ -21,8 +21,8 @@ import { json, logPageProblems, stubDashboardApi } from './lib/stub-dashboard-ap
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url))
 const BUILTINS = fileURLToPath(new URL('../../src/kiro_crew/apps/builtins/', import.meta.url))
-const OUTPUT_ROOT = process.argv[2]
-  || fileURLToPath(new URL('../public/app-assets/', import.meta.url))
+const OUTPUT_ROOT = resolve(process.argv[2]
+  || fileURLToPath(new URL('../public/app-assets/', import.meta.url)))
 const VIEWPORT = { width: 1280, height: 800 }
 
 // These are prior captures of the same real SPA in richer, deliberately seeded
@@ -33,6 +33,7 @@ const SEEDED_CAPTURES = {
   'auto-triage-pipeline': fileURLToPath(new URL('../../temp-screenshots/auto-triage-pipeline/app-01-populated.png', import.meta.url)),
   'command-bar': fileURLToPath(new URL('../../temp-screenshots/command-bar/2-command-bar-root.png', import.meta.url)),
   'crew-companion': fileURLToPath(new URL('../../temp-screenshots/crew-companion/dashboard-app-page.png', import.meta.url)),
+  mochi: fileURLToPath(new URL('../public/app-assets/mochi/shot-1-gallery.png', import.meta.url)),
 }
 
 const APPS = [
@@ -51,6 +52,7 @@ const APPS = [
   ['issue-radar', 'issue_radar', 'issue-radar', '/issue-radar'],
   ['md-notebook', 'md_notebook', 'md-notebook', '/md-notebook'],
   ['meetings', 'meetings', 'meetings', '/meetings'],
+  ['mochi', 'mochi', 'mochi', '/mochi', 'shot-1-gallery.png'],
   ['ops-mission-control', 'ops_mission_control', 'ops-mission-control', '/ops-mission-control'],
   ['papyrus', 'papyrus', 'papyrus', '/papyrus'],
   ['personal-shopper', 'personal_shopper', 'personal-shopper', '/personal-shopper'],
@@ -59,6 +61,15 @@ const APPS = [
   ['spec-builder', 'spec_builder', 'spec-builder', '/spec-builder'],
   ['workflows', 'workflows', 'workflows', '/workflows'],
 ]
+
+const configuredDirs = new Set(APPS.map(([, dir]) => dir))
+const discoveredDirs = readdirSync(BUILTINS, { withFileTypes: true })
+  .filter(entry => entry.isDirectory() && existsSync(join(BUILTINS, entry.name, 'app.json')))
+  .map(entry => entry.name)
+const unconfiguredDirs = discoveredDirs.filter(dir => !configuredDirs.has(dir))
+if (unconfiguredDirs.length > 0) {
+  throw new Error(`capture list is missing built-in manifests: ${unconfiguredDirs.join(', ')}`)
+}
 
 const manifests = new Map(APPS.map(([name, dir]) => {
   const manifest = JSON.parse(readFileSync(`${BUILTINS}${dir}/app.json`, 'utf8'))
@@ -184,13 +195,13 @@ async function main() {
   })
   logPageProblems(page)
 
-  for (const [name, , assetDir, route] of APPS) {
+  for (const [name, , assetDir, route, screenshotName = 'screenshot-main.png'] of APPS) {
     const outputDir = join(OUTPUT_ROOT, assetDir)
     mkdirSync(outputDir, { recursive: true })
-    const output = join(outputDir, 'screenshot-main.png')
+    const output = join(outputDir, screenshotName)
     const seeded = SEEDED_CAPTURES[name]
     if (seeded && existsSync(seeded)) {
-      copyFileSync(seeded, output)
+      if (seeded !== output) copyFileSync(seeded, output)
       console.log(`copied seeded real capture ${output.replace(`${ROOT}`, '')}`)
       continue
     }

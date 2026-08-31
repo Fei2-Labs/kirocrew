@@ -27,6 +27,9 @@ from kiro_crew.irq import (
     Probe,
     Severity,
     Tick,
+)
+from kiro_crew.irq import _dedupe_key as dedupe_key
+from kiro_crew.irq import (
     load_state,
     run,
     sanitize_label,
@@ -338,7 +341,9 @@ def test_window_state_survives_across_ticks():
     probe = ScriptedProbe([Tick(epoch="e1", observations=[_wake("red:a")], pending=3)])
     _verdict(probe, coalesce_secs=999)
     state = load_state(state_path("test-kind", "sub-1", "job-1"))
-    assert list(state["coalescing"]) == ["red:a"]
+    # Asserted through the kernel's own key helper rather than a literal: the
+    # test's subject is that the window PERSISTED, not how a key is spelled.
+    assert list(state["coalescing"]) == [dedupe_key(_wake("red:a"))]
     assert state["coalesce_started_at"] > 0
 
 
@@ -629,3 +634,369 @@ def test_sanitize_label_strips_control_and_markup():
     assert "\n" not in sanitize_label("bad\nname")
     assert sanitize_label(None) == ""
     assert len(sanitize_label("x" * 500)) == 120
+
+
+# ------------------------------------------------- epoch-independent keys
+#
+# Some signals a probe reports through the same tick are not properties of the
+# epoch. A comment on a pull request belongs to the conversation, not to the
+# commit under review, and does not stop having happened because the head moved.
+# These keys therefore survive the reset that wipes everything else.
+
+
+def _sticky(observation_key: str, brief: str = "brief") -> Observation:
+    return Observation(observation_key, Severity.WAKE, brief, epoch_scoped=False)
+
+
+def test_a_sticky_key_survives_an_epoch_change():
+    """The load-bearing invariant. Without it, one force-push replays every
+    epoch-independent signal the watch has ever reported."""
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[_sticky("comment:1")]),
+            Tick(epoch="e2", observations=[_sticky("comment:1")]),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=0), Report)
+    assert isinstance(_verdict(probe, coalesce_secs=0), Skip)
+
+
+def test_an_epoch_scoped_key_is_still_wiped_by_an_epoch_change():
+    """The carry-over filter must keep exactly one half. A filter that kept
+    everything would silently disable the epoch reset itself."""
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[_wake("red:a")]),
+            Tick(epoch="e2", observations=[_wake("red:a")]),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=0), Report)
+    assert isinstance(_verdict(probe, coalesce_secs=0), Report)
+
+
+def test_the_two_key_spaces_do_not_collide():
+    """Same probe key, different scoping: two independent signals, so the second
+    must not be suppressed by the first's dedupe entry."""
+    probe = ScriptedProbe([Tick(epoch="e1", observations=[_wake("dup"), _sticky("dup")])])
+    verdict = _verdict(probe, coalesce_secs=0)
+    assert isinstance(verdict, Report)
+    state = load_state(state_path("test-kind", "sub-1", "job-1"))
+    assert len(state["alerted"]) == 2
+
+
+def test_a_sticky_key_is_dropped_once_past_the_realert_window():
+    """Epoch-scoped keys are bounded by the reset that wipes them; sticky keys
+    have no such bound, so a long-lived watch would grow its state forever.
+    Dropping them past the re-alert window frees state without changing any
+    decision -- they no longer suppress anything at that age."""
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[_sticky("comment:1")]),
+            Tick(epoch="e1", observations=[]),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=0, realert_secs=0.01), Report)
+    time.sleep(0.05)
+    assert isinstance(_verdict(probe, coalesce_secs=0, realert_secs=0.01), Skip)
+    state = load_state(state_path("test-kind", "sub-1", "job-1"))
+    assert not [k for k in state.get("alerted", {}) if "comment:1" in k]
+
+
+def test_the_blind_marker_is_not_carried_across_an_epoch_change():
+    """It records that the probe could not observe AT ALL, which is a judgement
+    a fresh epoch deserves to make again rather than inherit."""
+
+    class FlakyProbe(Probe):
+        def __init__(self) -> None:
+            self.ticks = [
+                Tick(fetch_ok=False),
+                Tick(epoch="e2", observations=[]),
+            ]
+
+        def identity(self, ctx):
+            return ("test-kind", "sub-1")
+
+        def observe(self, ctx):
+            return self.ticks.pop(0)
+
+    probe = FlakyProbe()
+    _verdict(probe, coalesce_secs=0, max_consecutive_errors=1)
+    state = load_state(state_path("test-kind", "sub-1", "job-1"))
+    assert "blind" in state.get("alerted", {})
+    _verdict(probe, coalesce_secs=0, max_consecutive_errors=1)
+    state = load_state(state_path("test-kind", "sub-1", "job-1"))
+    assert "blind" not in state.get("alerted", {})
+
+
+def test_state_written_before_the_sentinels_existed_costs_no_extra_wake():
+    """An upgrade must not re-report anomalies the previous version already
+    delivered. A bare key is adopted as epoch scoped, which is what every
+    pre-sentinel key was."""
+    path = state_path("test-kind", "sub-1", "job-1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"epoch": "e1", "alerted": {"red:a": time.time()}}), encoding="utf-8"
+    )
+    probe = ScriptedProbe([Tick(epoch="e1", observations=[_wake("red:a")])])
+    assert isinstance(_verdict(probe, coalesce_secs=0), Skip)
+
+
+def test_an_open_sticky_wake_is_not_pruned_when_the_probe_stops_reporting_it():
+    """The prune assumes "no longer observed" means "cleared", which is true of a
+    check and false of a comment: a probe with a horizon stops reporting a signal
+    that is still just as true. Pruning on that destroys the wake instead of
+    delaying it -- reachable on shipped defaults, because a signal first seen
+    minutes before its horizon expires ages out mid-window."""
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[_sticky("comment:1")], pending=0),
+            # Aged past the probe's horizon: gone from the tick, still true.
+            Tick(epoch="e1", observations=[], pending=0),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    verdict = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(verdict, Report)
+    assert "brief" in str(verdict)
+
+
+def test_an_open_epoch_scoped_wake_is_still_pruned_when_it_clears():
+    """The other half of the same asymmetry: a check that reran green must not be
+    announced as failing, so the prune has to keep applying to epoch-scoped
+    entries. Exempting everything would reintroduce the self-contradicting wake.
+    """
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[_wake("red:a")], pending=0),
+            Tick(epoch="e1", observations=[], pending=0),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+
+
+def test_an_open_epoch_scoped_window_is_dropped_by_an_epoch_change():
+    """The complement: window entries describing checks on a commit that is no
+    longer under review must still be discarded, or a force-push would announce
+    the old head's reds against the new one."""
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[_wake("red:a")], pending=0),
+            Tick(epoch="e2", observations=[], pending=0),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+
+
+def test_a_fresh_epoch_anomaly_still_gets_a_full_settling_floor():
+    """The floor exists because a freshly pushed commit briefly shows an
+    almost-empty rollup, so `pending == 0` can be true while nothing has run.
+    Carrying the OLD window's start stamp onto the new epoch left that floor
+    already satisfied, so a `ready` observation on the new head fired at once and
+    announced all-checks-green before its checks existed. One stamp cannot serve
+    an entry that has waited and one that has not.
+    """
+    probe = ScriptedProbe(
+        [
+            # A comment lands while checks run, so the window opens and cannot
+            # converge (pending > 0).
+            Tick(epoch="e1", observations=[_sticky("comment:1")], pending=3),
+            # Force-push. The fresh head momentarily looks converged.
+            Tick(epoch="e2", observations=[_wake("ready")], pending=0),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()  # the OLD window is now older than the floor
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+
+
+def test_a_carried_sticky_entry_is_delayed_not_lost_by_the_restart():
+    """`alerted` stops a DELIVERED signal repeating; an open `coalescing` entry
+    holds one that has NOT been delivered. Dropping the window at the epoch reset
+    destroys that wake outright, because the probe may legitimately stop
+    reporting the observation (a comment aged past its horizon) so nothing puts
+    it back -- reachable on shipped defaults by observing a near-horizon comment
+    then pushing a fix.
+
+    Carrying the entry while RESTARTING the stamp is what makes that a delay
+    rather than a loss, and this pins the difference: the probe reports nothing
+    on either new-epoch tick, and the carried entry must still fire once its
+    fresh window closes."""
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[_sticky("comment:1")], pending=3),
+            Tick(epoch="e2", observations=[], pending=0),
+            Tick(epoch="e2", observations=[], pending=0),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    # First new-epoch tick: the carried entry is present but its window restarted.
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    verdict = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(verdict, Report)
+    assert "brief" in str(verdict)
+
+
+# ------------------------------------------------- per-wake footer, not per brief
+
+
+class FootedProbe(ScriptedProbe):
+    """A probe that supplies a per-wake footer, and can be made to raise in it."""
+
+    def __init__(self, ticks: list[Tick], suffix: object = "FOOTER", subject: str = "sub-1"):
+        super().__init__(ticks, subject=subject)
+        self._suffix = suffix
+
+    def wake_suffix(self):
+        if isinstance(self._suffix, Exception):
+            raise self._suffix
+        return self._suffix
+
+
+def test_the_wake_footer_is_emitted_once_not_once_per_observation():
+    """Standing instructions describe the WAKE, so N coalesced observations must
+    not pay N copies of them.
+
+    This is the regression that made coalescing cost what it saved: on a measured
+    six-observation wake the per-observation form was 56% of the delivered bytes,
+    and the ratio got WORSE as coalescing got better -- every extra signal folded
+    into one wake added another copy of the same paragraph.
+    """
+    ticks = [
+        Tick(epoch="e1", observations=[_wake("red:a", "first"), _wake("red:b", "second")]),
+        Tick(epoch="e1", observations=[_wake("red:a", "first"), _wake("red:b", "second")]),
+    ]
+    probe = FootedProbe(ticks)
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    verdict = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(verdict, Report)
+    body = str(verdict)
+    # Both signals survive...
+    assert "first" in body and "second" in body
+    # ...and the footer is paid once for the wake, not once per signal.
+    assert body.count("FOOTER") == 1
+
+
+def test_a_single_observation_wake_still_carries_the_footer():
+    """The footer moved from the brief to the kernel, so every delivery path has
+    to apply it -- an NMI fires one observation without ever passing through the
+    coalescing join, and would silently lose its instructions."""
+    probe = FootedProbe(
+        [Tick(epoch="e1", observations=[Observation("conflict", Severity.NMI, "dirty")])]
+    )
+    verdict = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(verdict, Report)
+    assert "dirty" in str(verdict)
+    assert str(verdict).count("FOOTER") == 1
+
+
+def test_a_footer_that_raises_costs_the_footer_not_the_tick():
+    """A missing footer is recoverable; a watch that raises every tick is
+    auto-paused, which loses the watch itself."""
+    probe = FootedProbe(
+        [Tick(epoch="e1", observations=[Observation("conflict", Severity.NMI, "dirty")])],
+        suffix=RuntimeError("probe is broken"),
+    )
+    verdict = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(verdict, Report)
+    assert "dirty" in str(verdict)
+    assert "probe is broken" not in str(verdict)
+
+
+# --------------------------------- pending gates checks, never the conversation
+
+
+def test_a_sticky_wake_fires_at_the_floor_while_checks_are_still_pending():
+    """``pending`` counts CHECKS. A comment is complete the moment it is posted,
+    so holding it until an unrelated check drains buys no observation and costs
+    up to the hard cap -- measured at the full 30 minutes on a real pull request
+    with 18 checks in flight."""
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[_sticky("comment:1")], pending=7),
+            Tick(epoch="e1", observations=[_sticky("comment:1")], pending=7),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Report)
+
+
+def test_the_sticky_half_fires_while_the_epoch_scoped_half_keeps_waiting():
+    """The two populations fire on their OWN readiness, and both halves of that
+    matter.
+
+    Firing the whole window when a sticky signal is ready would announce an
+    epoch-scoped `ready` while checks were still draining -- the
+    convergence-that-never-happened the floor exists to prevent. Holding the
+    sticky signal until the checks drain is the defect above. So the wake is
+    split, and the remainder keeps the ORIGINAL start stamp: it has been waiting
+    since then, and restarting its clock on every partial fire would let a
+    talkative pull request defer the check anomaly indefinitely.
+    """
+    conversation = _sticky("comment:1", "said")
+    checks = _wake("ready", "green")
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[conversation, checks], pending=4),
+            Tick(epoch="e1", observations=[conversation, checks], pending=4),
+            Tick(epoch="e1", observations=[checks], pending=0),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+
+    partial = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(partial, Report)
+    assert "said" in str(partial)
+    assert "green" not in str(partial), "a converged-looking check must not ride out early"
+
+    # No _settle() here on purpose: the carried entry kept its stamp, so the very
+    # next converged tick delivers it rather than serving a fresh floor.
+    rest = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(rest, Report)
+    assert "green" in str(rest)
+
+
+def test_a_partial_fire_defers_to_the_unwritable_state_fallback():
+    """Withholding the epoch-scoped half is a DELAY only while the window can be
+    remembered.
+
+    With an unwritable state directory the next tick reloads an empty window, so
+    the withheld half is LOST -- the exact hazard the persistence fallback exists
+    to close, reintroduced for the half the split holds back. So the partial fire
+    is gated on the write succeeding, and a failed write delivers EVERYTHING now.
+    """
+    conversation = _sticky("comment:1", "said")
+    checks = _wake("ready", "green")
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[conversation, checks], pending=4),
+            Tick(epoch="e1", observations=[conversation, checks], pending=4),
+        ]
+    )
+    import kiro_crew.irq as irq_mod
+
+    # First tick writes normally so the window exists and can age.
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+
+    original = irq_mod.save_state
+    try:
+        irq_mod.save_state = lambda *a, **k: False  # type: ignore[assignment]
+        verdict = _verdict(probe, coalesce_secs=_COALESCE)
+    finally:
+        irq_mod.save_state = original  # type: ignore[assignment]
+
+    assert isinstance(verdict, Report)
+    body = str(verdict)
+    assert "said" in body, "the sticky half must still be delivered"
+    assert "green" in body, "the withheld half must NOT be held back into a lost window"
+    assert "unwritable" in body, "the operator has to be told why repeats are coming"

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Trans } from 'react-i18next'
 import { RefreshCw, Scale, CheckCircle2, AlertCircle, Bug, GitBranch, GitCommitHorizontal, ExternalLink, ArrowUp, History, Package, X, Download, Copy } from 'lucide-react'
@@ -7,7 +7,8 @@ import { Progress } from '@/components/ui/progress'
 import { Card, CardTitle, Btn, Toggle } from '../../components/ui'
 import { SettingsToggle } from '../../components/settings'
 import { useBranding } from '../../hooks/useBranding'
-import { useAppSelector } from '../../store'
+import { useAppDispatch, useAppSelector } from '../../store'
+import { setUpdateProgress } from '../../store/dashboardSlice'
 import { codeBrowserBranchUrl, codeBrowserCommitUrl } from '../../lib/codeBrowser'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import SegmentedControl from '../../components/SegmentedControl'
@@ -232,7 +233,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
  * Rendered at two call sites with the same behaviour and different emphasis, so
  * the confirm step cannot drift between them.
  */
-function RestartGatewayButton({
+export function RestartGatewayButton({
   primary,
   pending,
   restarting,
@@ -276,6 +277,233 @@ function RestartGatewayButton({
           ? i18nT('pages.settings.aboutPanel.restart_confirm')
           : i18nT('pages.settings.aboutPanel.restart_gateway')}
     </Btn>
+  )
+}
+
+/** The in-app update flow for a managed-venv install (RFC OQ7 step-up).
+ *
+ * Arming records the request server-side and yields the ONE command that can
+ * approve it — run on the gateway host, where reading the nonce file proves
+ * an identity a dashboard session does not have. The nonce itself never
+ * reaches this client, so this panel can request an update but can never
+ * approve one.
+ *
+ * The phase machine is what keeps the post-approval story visible: a consumed
+ * request (the poll answering `armed: false`) is the APPROVAL landing, so the
+ * panel narrates `applying` from the shared update-progress push instead of
+ * silently reverting to the Update button; a `failed` push pins the failure
+ * with a retry. Expiry is decided only by the local countdown reaching zero,
+ * so a poll racing the consume can never misread an approval as an expiry.
+ */
+/**
+ * Decide what an ARMED panel's poll answer of `armed: false` means. The wire
+ * shape is ambiguous: a consumed request (approval landed) and a server-side
+ * TTL lapse both read `armed: false`. A throttled background tab misses its
+ * 1s countdown ticks, so the decremented counter alone would misread the
+ * tab's own expiry as an approval and show "applying" forever — the decision
+ * compares the absolute wall-clock deadline instead.
+ */
+export function resolveUnarmedPhase(deadlineMs: number, now: number): 'expired' | 'applying' {
+  return now >= deadlineMs ? 'expired' : 'applying'
+}
+
+function InAppUpdateFlow({ version, manualCommand }: {
+  version: string
+  manualCommand: string
+}) {
+  const [phase, setPhase] = useState<'idle' | 'armed' | 'applying' | 'failed' | 'expired'>('idle')
+  const [armed, setArmed] = useState<{
+    approveCommand: string
+    expiresIn: number
+    // Absolute wall-clock deadline. The decremented counter is display-only:
+    // a throttled background tab fires the 1s tick rarely, so the counter can
+    // sit far above zero long after the server TTL lapsed — every expiry
+    // DECISION compares against this deadline instead.
+    deadlineMs: number
+  } | null>(null)
+  // Mirror of `armed` for effects that must READ it without depending on it
+  // (see the poll-decision effect below).
+  const armedRef = useRef(armed)
+  useEffect(() => {
+    armedRef.current = armed
+  }, [armed])
+  const [cmdCopied, setCmdCopied] = useState(false)
+  const [armError, setArmError] = useState('')
+  // The gateway's apply narrates over the shared update-progress push; render
+  // it inline so the armed copy's "progress appears here" is literally true.
+  const progress = useAppSelector(st => st.dashboard.updateProgress)
+  const dispatch = useAppDispatch()
+  const arm = useMutation({
+    mutationFn: () => api.armUpdate(),
+    onSuccess: res => {
+      if (res.armed && res.approve_command) {
+        setArmError('')
+        // A fresh arm starts a fresh narrative: clear any progress left by a
+        // PRIOR attempt. Without this, a stale `failed` push instantly
+        // bounces the new armed panel back to the failure screen, making
+        // "Try again" a dead loop until some new push overwrites it.
+        dispatch(setUpdateProgress(null))
+        const expiresIn = res.expires_in ?? 600
+        setArmed({
+          approveCommand: res.approve_command,
+          expiresIn,
+          deadlineMs: Date.now() + expiresIn * 1000,
+        })
+        setPhase('armed')
+      } else {
+        setArmError(res.error || i18nT('pages.settings.aboutPanel.update_failed'))
+      }
+    },
+    onError: (e: unknown) => setArmError(e instanceof ApiError ? e.message : String(e)),
+  })
+  // Countdown + liveness poll while ARMED. The count is cosmetic (the server
+  // enforces the TTL); the poll is what notices the request being consumed —
+  // approval happens in a terminal this tab cannot see.
+  const isArmed = phase === 'armed'
+  useEffect(() => {
+    if (!isArmed) return
+    const tick = setInterval(() => {
+      setArmed(a => {
+        if (!a) return a
+        // Derive the remaining time from the absolute deadline so a
+        // throttled tab that missed ticks recovers the true remainder.
+        const left = Math.ceil((a.deadlineMs - Date.now()) / 1000)
+        if (left > 0) return { ...a, expiresIn: left }
+        setPhase('expired')
+        return a
+      })
+    }, 1000)
+    return () => clearInterval(tick)
+  }, [isArmed])
+  // Liveness poll through react-query, enabled only while armed: a consumed
+  // request (armed: false) is the approval landing. Errors are left to retry
+  // on the next interval — the local countdown keeps running regardless.
+  const armStatusQuery = useQuery({
+    queryKey: ['update-arm-status'],
+    queryFn: () => api.armStatus(),
+    enabled: isArmed,
+    refetchInterval: 5000,
+  })
+  const polled = armStatusQuery.data
+  useEffect(() => {
+    if (!isArmed || !polled) return
+    if (!polled.armed) {
+      // See resolveUnarmedPhase: consumed and expired are indistinguishable
+      // on the wire, so the absolute deadline decides. Read the armed state
+      // through a ref rather than an effect dependency -- an `armed`
+      // dependency plus the re-anchor branch below (which builds a fresh
+      // object every poll) would re-run this effect off its own write,
+      // looping the render.
+      const a = armedRef.current
+      setPhase(a ? resolveUnarmedPhase(a.deadlineMs, Date.now()) : 'applying')
+    } else if (typeof polled.expires_in === 'number') {
+      const expiresIn = polled.expires_in
+      // The server is authoritative for the TTL: re-anchor the deadline --
+      // but only when the remainder actually moved, so a same-second poll
+      // answer does not mint a fresh object and re-trigger consumers.
+      setArmed(a =>
+        a && a.expiresIn !== expiresIn
+          ? { ...a, expiresIn, deadlineMs: Date.now() + expiresIn * 1000 }
+          : a
+      )
+    }
+  }, [isArmed, polled])
+  // The apply's OUTCOME arrives on the progress push, not the poll.
+  const progressStep = progress?.step
+  useEffect(() => {
+    if (phase !== 'applying' && phase !== 'armed') return
+    if (progressStep === 'failed' || progressStep === 'error') setPhase('failed')
+  }, [progressStep, phase])
+  if (phase === 'applying') {
+    return (
+      <div className="flex flex-col gap-2" data-testid="in-app-update-applying">
+        <p className="text-[13px] text-text flex items-center gap-1.5">
+          <RefreshCw size={13} className="lucide-inline animate-spin text-accent" />
+          {i18nT('pages.settings.aboutPanel.applying_update')}
+        </p>
+        {progress?.detail && (
+          <p className="text-[12px] text-muted font-mono break-all" data-testid="apply-progress">
+            {progress.detail}
+          </p>
+        )}
+        <p className="text-[12px] text-muted">
+          {i18nT('pages.settings.aboutPanel.applying_restart_note')}
+        </p>
+      </div>
+    )
+  }
+  if (phase === 'failed') {
+    return (
+      <div className="flex flex-col gap-2" data-testid="in-app-update-failed">
+        <span className="text-[12px] text-danger flex items-start gap-1.5">
+          <AlertCircle size={13} className="lucide-inline shrink-0" />
+          {progress?.detail || i18nT('pages.settings.aboutPanel.update_failed')}
+        </span>
+        <div>
+          <Btn onClick={() => { setPhase('idle'); setArmed(null); setCmdCopied(false) }}>
+            {i18nT('pages.settings.aboutPanel.try_again')}
+          </Btn>
+        </div>
+      </div>
+    )
+  }
+  if (phase !== 'armed' || !armed) {
+    return (
+      <div className="flex flex-col gap-2" data-testid="in-app-update">
+        {phase === 'expired' && (
+          <p className="text-[12px] text-muted" data-testid="arm-expired-note">
+            {i18nT('pages.settings.aboutPanel.approval_window_expired')}
+          </p>
+        )}
+        <p className="text-[13px] text-muted">
+          {i18nT('pages.settings.aboutPanel.in_app_update_intro')}
+        </p>
+        <div>
+          <Btn primary onClick={() => arm.mutate()} disabled={arm.isPending}>
+            <ArrowUp size={13} className="lucide-inline" /> {version
+              ? i18nT('pages.settings.aboutPanel.update_to_version', { version })
+              : i18nT('pages.settings.aboutPanel.update_now')}
+          </Btn>
+        </div>
+        {armError && (
+          <span className="text-[12px] text-danger flex items-start gap-1.5" data-testid="arm-error">
+            <AlertCircle size={13} className="lucide-inline shrink-0" /> {armError}
+          </span>
+        )}
+        <details className="text-[12px] text-muted">
+          <summary className="cursor-pointer">{i18nT('pages.settings.aboutPanel.or_update_manually')}</summary>
+          <div className="mt-2 p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all">
+            {manualCommand}
+          </div>
+        </details>
+      </div>
+    )
+  }
+  return (
+    <div className="flex flex-col gap-2" data-testid="in-app-update-armed">
+      <p className="text-[13px] text-muted">
+        {i18nT('pages.settings.aboutPanel.armed_run_on_host')}
+      </p>
+      <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
+        data-testid="approve-command">
+        {armed.approveCommand}
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        <Btn onClick={async () => { await copyToClipboard(armed.approveCommand); setCmdCopied(true) }}>
+          <Copy size={13} className="lucide-inline" /> {cmdCopied
+            ? i18nT('pages.settings.aboutPanel.copied')
+            : i18nT('pages.settings.aboutPanel.copy_command')}
+        </Btn>
+        <span className="text-[12px] text-muted" data-testid="arm-countdown">
+          {i18nT('pages.settings.aboutPanel.armed_expires_in', {
+            time: `${Math.floor(armed.expiresIn / 60)}:${String(armed.expiresIn % 60).padStart(2, '0')}`,
+          })}
+        </span>
+      </div>
+      <p className="text-[12px] text-muted">
+        {i18nT('pages.settings.aboutPanel.armed_waiting_note')}
+      </p>
+    </div>
   )
 }
 
@@ -339,7 +567,7 @@ export function AboutPanel() {
   // as the install is DISPATCHED, and on macOS the platform installer then works
   // for several more seconds before the app quits. Keying `disabled` on
   // isPending alone lets the button re-arm during that window, so the user sees
-  // a clickable "Restart & Update" followed by an unexplained quit -- which reads
+  // a clickable install-and-restart action followed by an unexplained quit -- which reads
   // as a crash.
   const installDispatched = installMutation.isPending || installMutation.isSuccess
   // Channel switcher (stable ⇄ insider opt-in). Switching persists the
@@ -406,6 +634,13 @@ export function AboutPanel() {
   // owns them, so self-managed installer copy would instruct the user to run
   // the exact mechanism the policy excluded.
   const gwManagedByCommand = useAppSelector(s => s.dashboard.status?.update_managed_by) === 'command'
+  // In-app arm+approve applies only where the backend probed the managed-venv
+  // shape; managed_by alone also covers bare source installs whose arm would 409.
+  const gwCanArm = useAppSelector(s => s.dashboard.status?.update_can_arm) === true
+  // The background check's candidate version, so the Arm button can name its
+  // target before the user ever presses the manual Check button (gwTarget is
+  // only populated by an explicit check in this tab).
+  const gwStatusLatest = useAppSelector(s => s.dashboard.status?.update_latest_version) || ''
   const isPrerelease = info?.stampedChannel === undefined
     ? (!!info?.packaged && versionLooksPrerelease(info?.version))
       || (!isDesktop && !!gatewayChannel && gatewayChannel !== 'stable')
@@ -439,6 +674,7 @@ export function AboutPanel() {
   const showUpdateCard = !checking && (cardState === 'found' || cardState === 'available' || cardState === 'downloading' || cardState === 'downloaded' || cardFailed)
   const cardBusy = cardState === 'available' || cardState === 'downloading'
   const cardReady = cardState === 'downloaded'
+  const showsWindowsInstaller = updateState?.installHandoff === 'windows-installer'
   // Determinate only once a progress event has arrived; before that the label
   // stays indeterminate, since `percent` is optional in the emit.
   const cardPercent = cardState === 'downloading' && typeof updateState?.percent === 'number'
@@ -469,7 +705,7 @@ export function AboutPanel() {
             <Btn primary onClick={() => installMutation.mutate()} disabled={installDispatched}>
               <RefreshCw size={13} className={`lucide-inline ${installDispatched ? 'animate-spin' : ''}`} /> {installMutation.isSuccess
                 ? i18nT('pages.settings.aboutPanel.restarting')
-                : i18nT('pages.settings.aboutPanel.restart_update')}
+                : i18nT('pages.settings.aboutPanel.install_update_restart_app')}
             </Btn>
           ) : (
             <Btn primary onClick={() => downloadMutation.mutate()} disabled={cardBusy || downloadMutation.isPending}>
@@ -505,11 +741,12 @@ export function AboutPanel() {
       {cardReady && (
         <span className="text-[12px] text-muted">
           {/* Once dispatched, the gateway goes down ON PURPOSE and the dashboard
-              disconnects for the ~1-2 min Squirrel handoff. This line is the last
-              thing the card says, so it must explain the coming silence. */}
+              disconnects during the platform installer handoff. This line is the
+              last thing the card says, so it must explain what happens next. */}
           {installDispatched
             ? i18nT('pages.settings.aboutPanel.installing_quiet_note')
             : i18nT('pages.settings.aboutPanel.downloaded_and_verified_the_app_restarts_to_fini')}
+          {showsWindowsInstaller && ` ${i18nT('components.updateModal.windows_installer_handoff')}`}
         </span>
       )}
       {showManualFallback && (
@@ -1152,7 +1389,12 @@ export function AboutPanel() {
                   </p>
                 )}
                 {showManualUpdate ? (
-                  gwManagedByCommand ? (
+                  gwCanArm ? (
+                    <InAppUpdateFlow
+                      version={gwTarget || gwStatusLatest}
+                      manualCommand={effectiveCommand || ''}
+                    />
+                  ) : gwManagedByCommand ? (
                     // A policy-pinned command provider owns this update, and a
                     // check-only pin has no in-app apply. The installer copy
                     // below would tell the user to run the exact mechanism the
@@ -1357,7 +1599,7 @@ export function AboutPanel() {
             pages/settings/ReleasesPanel.tsx. */}
         <div className="mt-3 pt-3 border-t border-border">
           <Link
-            to="?tab=releases"
+            to="/settings/releases"
             className="text-[13px] text-accent hover:underline inline-flex items-center gap-1.5"
           >
             <History size={13} className="lucide-inline" aria-hidden="true" />

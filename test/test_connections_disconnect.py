@@ -15,6 +15,7 @@ import pathlib
 
 import pytest
 
+from kiro_crew import mcp_grant
 from kiro_crew.connections import mint
 
 _URL = "https://mcp.notion.com/mcp"
@@ -22,7 +23,7 @@ _URL = "https://mcp.notion.com/mcp"
 
 def _write_grant(directory: pathlib.Path, url: str = _URL) -> tuple[pathlib.Path, pathlib.Path]:
     """Lay down the paired artifacts kiro-cli writes for a granted provider."""
-    token, registration = mint.grant_artifact_paths(url, cache_dir=directory)
+    token, registration = mcp_grant.grant_artifact_paths(url, cache_dir=directory)
     token.write_text("{}", encoding="utf-8")
     registration.write_text("{}", encoding="utf-8")
     return token, registration
@@ -30,37 +31,37 @@ def _write_grant(directory: pathlib.Path, url: str = _URL) -> tuple[pathlib.Path
 
 def test_revoke_unlinks_both_paired_artifacts(tmp_path: pathlib.Path) -> None:
     token, registration = _write_grant(tmp_path)
-    assert mint.grant_present(_URL, cache_dir=tmp_path) is True
+    assert mcp_grant.grant_presence(_URL, cache_dir=tmp_path) is True
 
-    removed = mint.revoke_local_grant(_URL, cache_dir=tmp_path)
+    removed = mcp_grant.revoke_local_grant(_URL, cache_dir=tmp_path)
 
     assert sorted(removed) == ["registration", "token"]
     assert not token.exists()
     assert not registration.exists()
-    assert mint.grant_present(_URL, cache_dir=tmp_path) is False
+    assert mcp_grant.grant_presence(_URL, cache_dir=tmp_path) is False
 
 
 def test_revoke_is_idempotent_on_a_provider_with_no_grant(tmp_path: pathlib.Path) -> None:
-    assert mint.revoke_local_grant(_URL, cache_dir=tmp_path) == []
-    assert mint.surviving_grant_artifacts(_URL, cache_dir=tmp_path) == []
+    assert mcp_grant.revoke_local_grant(_URL, cache_dir=tmp_path) == []
+    assert mcp_grant.surviving_grant_artifacts(_URL, cache_dir=tmp_path) == []
 
 
 def test_revoke_leaves_the_aws_sso_single_file_form_alone(tmp_path: pathlib.Path) -> None:
     """The cache directory mixes in SSO's ``{sha256}.json``; it is not ours."""
     _write_grant(tmp_path)
-    sso = tmp_path / f"{mint.grant_key(_URL)}.json"
+    sso = tmp_path / f"{mcp_grant.grant_key(_URL)}.json"
     sso.write_text("{}", encoding="utf-8")
 
-    mint.revoke_local_grant(_URL, cache_dir=tmp_path)
+    mcp_grant.revoke_local_grant(_URL, cache_dir=tmp_path)
 
     assert sso.exists(), "revoke deleted an AWS SSO artifact it does not own"
 
 
 def test_surviving_names_the_artifact_left_behind(tmp_path: pathlib.Path) -> None:
-    token, _registration = mint.grant_artifact_paths(_URL, cache_dir=tmp_path)
+    token, _registration = mcp_grant.grant_artifact_paths(_URL, cache_dir=tmp_path)
     token.write_text("{}", encoding="utf-8")
 
-    assert mint.surviving_grant_artifacts(_URL, cache_dir=tmp_path) == ["token"]
+    assert mcp_grant.surviving_grant_artifacts(_URL, cache_dir=tmp_path) == ["token"]
 
 
 def test_a_half_removed_grant_is_reported_not_claimed_done(
@@ -82,10 +83,10 @@ def test_a_half_removed_grant_is_reported_not_claimed_done(
 
     monkeypatch.setattr(pathlib.Path, "unlink", refuse_registration)
 
-    removed = mint.revoke_local_grant(_URL, cache_dir=tmp_path)
+    removed = mcp_grant.revoke_local_grant(_URL, cache_dir=tmp_path)
 
     assert removed == ["token"], "only the token could be removed"
-    assert mint.surviving_grant_artifacts(_URL, cache_dir=tmp_path) == ["registration"]
+    assert mcp_grant.surviving_grant_artifacts(_URL, cache_dir=tmp_path) == ["registration"]
     assert registration.exists()
 
 
@@ -102,7 +103,7 @@ def test_revoke_never_opens_an_artifact(
     monkeypatch.setattr(pathlib.Path, "read_text", forbid_open)
     monkeypatch.setattr(pathlib.Path, "read_bytes", forbid_open)
 
-    assert sorted(mint.revoke_local_grant(_URL, cache_dir=tmp_path)) == [
+    assert sorted(mcp_grant.revoke_local_grant(_URL, cache_dir=tmp_path)) == [
         "registration",
         "token",
     ]
@@ -110,8 +111,8 @@ def test_revoke_never_opens_an_artifact(
 
 def test_labels_are_bound_to_the_right_files(tmp_path: pathlib.Path) -> None:
     """A reorder in ``grant_artifact_paths`` must not silently swap the labels."""
-    token, registration = mint.grant_artifact_paths(_URL, cache_dir=tmp_path)
-    labelled = dict(mint._labelled_grant_artifacts(_URL, cache_dir=tmp_path))
+    token, registration = mcp_grant.grant_artifact_paths(_URL, cache_dir=tmp_path)
+    labelled = dict(mcp_grant._labelled_grant_artifacts(_URL, cache_dir=tmp_path))
 
     assert labelled == {"token": token, "registration": registration}
     assert labelled["token"].name.endswith(".token.json")
@@ -131,6 +132,7 @@ import pytest_asyncio  # noqa: E402  (imported for its marker plugin)
 from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 
+from dashboard_owner_helpers import as_owner  # noqa: E402
 from kiro_crew import agent as agent_mod  # noqa: E402
 from kiro_crew import mcp_discovery  # noqa: E402
 from kiro_crew.connections import get_provider  # noqa: E402
@@ -186,8 +188,8 @@ def _wire(
         if audits is not None:
             audits.append(dict(kwargs))
 
-    monkeypatch.setattr(mint, "revoke_local_grant", _revoke)
-    monkeypatch.setattr(mint, "surviving_grant_artifacts", lambda _url: list(surviving))
+    monkeypatch.setattr(mcp_grant, "revoke_local_grant", _revoke)
+    monkeypatch.setattr(mcp_grant, "surviving_grant_artifacts", lambda _url: list(surviving))
 
     async def _no_mint(_slug: str, _token: object) -> bool:
         return False
@@ -211,6 +213,7 @@ def _wire(
 async def _client() -> TestClient:
     app = web.Application()
     app.router.add_post("/api/connections/disconnect", connections.api_connections_disconnect)
+    as_owner(app)
     client = TestClient(TestServer(app))
     await client.start_server()
     return client

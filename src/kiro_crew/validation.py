@@ -31,7 +31,7 @@ from typing import Any
 # no native library is loaded on any platform. Aliased so the schema block below
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
-from kiro_crew.constants import WINDOWS_DEVICE_STEMS
+from kiro_crew.constants import AWS_PROFILE_NAME_RE, WINDOWS_DEVICE_STEMS
 
 # Reasoning-effort vocabulary: ``effort.py`` is the single source of truth for
 # the valid levels; EFFORT_VALUES additionally admits ``""`` ("unset — defer to
@@ -1393,10 +1393,17 @@ WORKFLOW_RUN_SCHEMA = ToolSchema(
         # Either an authored Python script (source) or a NL intent to author one.
         FieldSpec("source", str, max_len=MAX_LONG_STRING),
         FieldSpec("intent", str, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("workflow", str, max_len=MAX_SHORT_STRING, pattern=_WF_RUN_ID_RE),
+        FieldSpec("input", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("name", str, max_len=MAX_SHORT_STRING),
         FieldSpec("args", dict),
         FieldSpec("budget_total", int, min_val=0, max_val=100_000_000),
     ],
+)
+
+WORKFLOW_LIBRARY_LIST_SCHEMA = ToolSchema(
+    tool_name="workflow_library_list",
+    fields=[FieldSpec("search", str, max_len=MAX_MEDIUM_STRING)],
 )
 
 WORKFLOW_RUN_ID_SCHEMA = ToolSchema(
@@ -1454,7 +1461,13 @@ def _validate_artifact_save(cleaned: dict) -> None:
 
 # Shared slug pattern (matches _ARTIFACT_SLUG_RE + deploy slug validation).
 _WM_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_WM_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# constants.AWS_PROFILE_NAME_RE — the single source of truth (#6063): '+'
+# admitted for IAM Identity Center derived profiles
+# ("<account>+<permission-set>", #6051); first char excludes '-' so a stored
+# profile is never option-shaped when it later reaches `--profile <value>`
+# argv. \Z is load-bearing here: this path matches the raw value WITHOUT a
+# strip, so the old $ anchor let a trailing-newline value through.
+_WM_PROFILE_RE = AWS_PROFILE_NAME_RE
 _WM_URL_RE = re.compile(r"^https?://.{1,2048}$")
 _WM_LIFECYCLE_STATUSES = {"draft", "deploying", "live", "error", "expired"}
 _WM_LIST_CAP = 50
@@ -2723,6 +2736,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "workflow_result": WORKFLOW_RUN_ID_SCHEMA,
     "workflow_cancel": WORKFLOW_RUN_ID_SCHEMA,
     "workflow_rerun_subtree": WORKFLOW_RERUN_SCHEMA,
+    "workflow_library_list": WORKFLOW_LIBRARY_LIST_SCHEMA,
     "deploy_artifact": DEPLOY_ARTIFACT_SCHEMA,
     "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
     "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,

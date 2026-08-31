@@ -21,7 +21,7 @@ import reducer, {
   warmSlotCache,
   sseSubagentPending,
   sseSubagentSpawn,
-  sseSubagentChunk,
+  sseSubagentBatchChunks,
   sseSubagentTool,
   sseSubagentDone,
   sseSubagentSnapshot,
@@ -1293,15 +1293,15 @@ describe('subagent reducers', () => {
     expect(state.subagents['a1']).toBeUndefined()
   })
 
-  it('sseSubagentChunk appends streaming text', () => {
+  it('sseSubagentBatchChunks appends streaming text', () => {
     let state = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 'task', agent: '' }))
-    state = reducer(state, sseSubagentChunk({ slot: 'slot-1', id: 'a1', text: 'hello ' }))
-    state = reducer(state, sseSubagentChunk({ slot: 'slot-1', id: 'a1', text: 'world' }))
+    state = reducer(state, sseSubagentBatchChunks({ chunks: [{ slot: 'slot-1', id: 'a1', text: 'hello ' }] }))
+    state = reducer(state, sseSubagentBatchChunks({ chunks: [{ slot: 'slot-1', id: 'a1', text: 'world' }] }))
     expect(state.subagents['a1'].streaming).toBe('hello world')
   })
 
-  it('sseSubagentChunk ignores unknown agent', () => {
-    const state = reducer(withSlot, sseSubagentChunk({ slot: 'slot-1', id: 'unknown', text: 'data' }))
+  it('sseSubagentBatchChunks ignores unknown agent', () => {
+    const state = reducer(withSlot, sseSubagentBatchChunks({ chunks: [{ slot: 'slot-1', id: 'unknown', text: 'data' }] }))
     expect(state.subagents['unknown']).toBeUndefined()
   })
 
@@ -1739,6 +1739,34 @@ describe('slotHistory — session navigation stack', () => {
     expect(state.slotHistory).toEqual(['A'])
   })
 
+  it('resumeFromHistory.fulfilled with a non-chat surface keeps the history row and the active slot (#3624)', () => {
+    // The wire resume succeeded, but ChatPage cannot display the surface.
+    // Consuming the row while the sidebar's notice says "can't be opened"
+    // reads as data loss, and switching activeSlot to an undisplayable slot
+    // is the silent bounce itself -- the reducer must not mutate at all.
+    const before = { ...initial, activeSlot: 'A', history: [{ key: 'dash-1', title: 'Ops', messages: 3 }], historyOffset: 1, slotHistory: ['Z'] }
+    const after = reducer(before, {
+      type: 'chat/resumeFromHistory/fulfilled',
+      meta: { arg: { key: 'dash-1', title: 'Ops' }, requestId: 'r1', requestStatus: 'fulfilled' as const },
+      payload: { ok: true, key: 'dash-1', surface: 'dashboard', messages: [], hasMore: false, total: 0 },
+    })
+    expect(after.history).toEqual(before.history)
+    expect(after.activeSlot).toBe('A')
+    expect(after.historyOffset).toBe(1)
+    expect(after.slotHistory).toEqual(['Z'])
+  })
+
+  it('resumeFromHistory.fulfilled with a chat-page surface still consumes the row and switches', () => {
+    let state = { ...initial, activeSlot: 'A', history: [{ key: 'H', title: 'old', messages: 1 }] }
+    state = reducer(state, {
+      type: 'chat/resumeFromHistory/fulfilled',
+      meta: { arg: { key: 'H', title: 'old' }, requestId: 'r1', requestStatus: 'fulfilled' as const },
+      payload: { ok: true, key: 'H', surface: 'orchestrator', messages: [], hasMore: false, total: 0 },
+    })
+    expect(state.history).toEqual([])
+    expect(state.activeSlot).toBe('H')
+  })
+
   it('resumeFromHistory.fulfilled pushes activeSlot onto history', () => {
     let state = { ...initial, activeSlot: 'A' }
     state = reducer(state, {
@@ -2060,6 +2088,40 @@ describe('sseContextUsage reducer', () => {
     const seeded = reducer(initial, sseContextUsage({ slot: 's1', pct: 10, used_tokens: 100000, window_tokens: 1000000 }))
     const state = reducer(seeded, sseContextUsage({ slot: 's1', pct: 12 }))
     expect(state.slotContextTokens['s1']).toEqual({ used: 100000, window: 1000000 })
+  })
+
+  it('stores the plan rate limit per slot', () => {
+    const state = reducer(initial, sseContextUsage({
+      slot: 's1', pct: 44, used_tokens: 88000, window_tokens: 200000,
+      rate_limit: { status: 'allowed_warning', limit_type: 'five_hour', utilization: 81 },
+    }))
+    expect(state.slotRateLimit['s1']).toEqual({ status: 'allowed_warning', limit_type: 'five_hour', utilization: 81 })
+    // Another slot's quota is its own account state, never inherited.
+    expect(state.slotRateLimit['s2']).toBeUndefined()
+  })
+
+  it('keeps the stored quota when a later frame omits it', () => {
+    // The adapter emits the block only when the state CHANGES, so most frames
+    // carry none. Treating that as "quota unknown" would blank the readout for
+    // the rest of the session — the OPPOSITE rule to the token counts above.
+    const seeded = reducer(initial, sseContextUsage({ slot: 's1', pct: 10, rate_limit: { status: 'rejected' } }))
+    const state = reducer(seeded, sseContextUsage({ slot: 's1', pct: 12 }))
+    expect(state.slotRateLimit['s1']).toEqual({ status: 'rejected' })
+  })
+
+  it('reset does NOT clear the quota', () => {
+    // Compaction and a model switch — what `reset` marks — change the
+    // transcript, not the account the quota belongs to.
+    const seeded = reducer(initial, sseContextUsage({ slot: 's1', pct: 90, rate_limit: { status: 'allowed_warning', utilization: 76 } }))
+    const state = reducer(seeded, sseContextUsage({ slot: 's1', pct: 0, reset: true }))
+    expect(state.slotContextTokens['s1']).toBeUndefined()
+    expect(state.slotRateLimit['s1']).toEqual({ status: 'allowed_warning', utilization: 76 })
+  })
+
+  it('replaces the stored quota when a change event arrives', () => {
+    const seeded = reducer(initial, sseContextUsage({ slot: 's1', pct: 10, rate_limit: { status: 'allowed_warning', utilization: 76 } }))
+    const state = reducer(seeded, sseContextUsage({ slot: 's1', pct: 11, rate_limit: { status: 'rejected' } }))
+    expect(state.slotRateLimit['s1']).toEqual({ status: 'rejected' })
   })
 })
 

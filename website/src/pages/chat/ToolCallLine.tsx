@@ -5,7 +5,7 @@ import { useAppSelector, useAppDispatch } from '../../store'
 import { clearFocusToolCallId, mcpAppKey } from '../../store/chatSlice'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../../i18n/LanguageProvider'
-import { pickToolLabel } from '../../utils/toolLabel'
+import { DERIVE_LABEL_THRESHOLD_CHARS, deriveShellSummary, pickToolLabel } from '../../utils/toolLabel'
 import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
@@ -62,6 +62,25 @@ const foldedDiffCards = new Set<string>()
 // costs one scrollTop write.
 const SLIDE_DURATION = 0.22
 const SLIDE_EASE = [0.4, 0, 0.2, 1] as const
+
+// ── Collapsed label clamp ──
+// A tool title is whatever the transport hands us, and for a shell call that is
+// the WHOLE command — an inline heredoc or a chained one-liner is routinely
+// several kB. Rendered with `break-words` that wrapped to forty-odd lines, so a
+// single folded tool row could be taller than the answer it belongs to, and the
+// reader had to scroll a wall of quoting to reach the next message.
+//
+// A collapsed row is a STATUS line, exactly like ThinkingBlock's folded
+// "Thought process": it says which tool is running and that it is running, and
+// nothing more. So the collapsed label is pinned to one line with an ellipsis
+// and the full text lives one click away in ToolDetails, which already renders
+// the verbatim input. Expanding restores wrapping — the user asked to see it.
+//
+// `truncate` (not `line-clamp-1`) because the label is a plain flex child:
+// line-clamp would force `display: -webkit-box` on it and drop the flex
+// alignment the icon's centering depends on.
+const LABEL_COLLAPSED_CLASS = 'truncate'
+const LABEL_EXPANDED_CLASS = 'break-words'
 
 /**
  * A tool row's secondary status line (shell elapsed time, `wait` countdown).
@@ -637,6 +656,27 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     const stripped = toolLabel.split(filePath).join('').replace(/\s+/g, ' ').trim()
     return stripped || toolLabel
   }, [showFileOpen, filePath, toolLabel])
+  // A purpose-less shell call's label is the raw command. The collapsed row's
+  // `truncate` (LABEL_COLLAPSED_CLASS) already bounds how much of it is
+  // visible, but a clipped wall of quoting says nothing — in simplified mode a
+  // flood-length shell label is substituted with a derived command digest
+  // (binaries + redirect target), so the visible line is meaningful. Short
+  // labels pass through untouched, and raw mode always shows the exact command.
+  const pillLabelText = useMemo(() => {
+    if (!simplified) return displayLabel
+    if (displayLabel.length <= DERIVE_LABEL_THRESHOLD_CHARS && !displayLabel.includes('\n')) {
+      return displayLabel
+    }
+    return deriveShellSummary(displayLabel, { bareCommand: isShell }) ?? displayLabel
+  }, [displayLabel, simplified, isShell])
+  // Hover reveals the verbatim command whenever the pill shows a substitute.
+  const pillLabelTitle = pillLabelText === displayLabel ? undefined : displayLabel
+  // Keep transcript-sized shell payloads out of accessibility announcements,
+  // matching the visible summary while ordinary rows retain their raw label.
+  const ariaToolLabel = isShell
+    && (label.length > DERIVE_LABEL_THRESHOLD_CHARS || label.includes('\n'))
+    ? pillLabelText
+    : label
   // Both running and pending-approval pills shimmer — the highlight color
   // tracks the status so pending shimmers warn-yellow (matching the approval
   // bar) and running shimmers accent.
@@ -661,6 +701,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // user's intent for after the approval resolves, but the rendered panel
   // ignores it while pending.
   const effectivelyExpanded = expanded || hasPendingPerm
+
+  // One line while folded, full wrap once opened. See LABEL_COLLAPSED_CLASS.
+  const labelWrapClass = effectivelyExpanded ? LABEL_EXPANDED_CLASS : LABEL_COLLAPSED_CLASS
 
   // Stable per-instance fallback id for framer-motion's `LayoutGroup`. When a
   // pre-persistence historical message has neither `effectiveId` nor
@@ -782,21 +825,23 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         ref={pillButtonRef}
         className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
         aria-expanded={effectivelyExpanded}
+        title={pillLabelTitle}
         aria-label={hasPendingPerm
-          ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label })
+          ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label: ariaToolLabel })
           : effectivelyExpanded
-            ? i18nT('pages.chat.toolCallLine.aria_hide_details', { label })
-            : i18nT('pages.chat.toolCallLine.aria_show_details', { label })}
+            ? i18nT('pages.chat.toolCallLine.aria_hide_details', { label: ariaToolLabel })
+            : i18nT('pages.chat.toolCallLine.aria_show_details', { label: ariaToolLabel })}
         onClick={onToggle}
       >
         {/* Deterministic vertical centering: the label spans pin leading-5
             (20px), so the 12px icon centers on the first line at exactly
             (20 − 12) / 2 = 4px. items-start keeps the icon on the first line
-            when the label wraps. */}
+            when the label wraps, which only an EXPANDED row now does. */}
         <Icon size={12} className={`shrink-0 ${iconClass}`} style={{ marginTop: '4px' }} />
         {isShimmering ? (
           <motion.span
-            className="break-words min-w-0 leading-5 bg-clip-text"
+            data-testid="tool-pill-label"
+            className={`${labelWrapClass} min-w-0 leading-5 bg-clip-text`}
             style={{
               backgroundImage: `linear-gradient(90deg, ${shimmerBase} 0%, ${shimmerBase} 40%, ${shimmerHighlight} 50%, ${shimmerBase} 60%, ${shimmerBase} 100%)`,
               backgroundSize: '300% 100%',
@@ -805,9 +850,9 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             }}
             animate={{ backgroundPosition: ['100% 0%', '-50% 0%'] }}
             transition={{ duration: 2.4, repeat: Infinity, ease: 'linear' }}
-          >{displayLabel}</motion.span>
+          >{pillLabelText}</motion.span>
         ) : (
-          <span className="break-words min-w-0 leading-5 text-muted hover:text-text transition-colors">{displayLabel}</span>
+          <span data-testid="tool-pill-label" className={`${labelWrapClass} min-w-0 leading-5 text-muted hover:text-text transition-colors`}>{pillLabelText}</span>
         )}
       </button>
 
@@ -939,7 +984,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             transition={{ duration: 0.35, ease: [0.4, 0.0, 0.2, 1] /* Material standard */ }}
             style={{ overflow: 'hidden' }}
           >
-            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
+            <ToolDetails purpose={purpose} pillLabel={displayLabel} toolName={label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
           </motion.div>
         )}
       </AnimatePresence>

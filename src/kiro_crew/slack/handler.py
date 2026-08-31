@@ -35,7 +35,11 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
-from kiro_crew.acp.types import STOP_REASON_CANCELLED, STOP_REASON_END_TURN
+from kiro_crew.acp.types import (
+    STOP_REASON_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
+    STOP_REASON_END_TURN,
+)
 from kiro_crew.agent_discovery import project_agent_files, project_agent_name
 from kiro_crew.config.loader import (
     ACTIVATION_REVIEW,
@@ -84,6 +88,7 @@ from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trust
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
 from kiro_crew.platform import current_context
+from kiro_crew.providers.acp import provider_label
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -156,6 +161,90 @@ _BANG_TO_SLASH: dict[str, str] = {
 # Approval modes (UX-level, not provider-specific)
 APPROVAL_AUTO = "auto"
 APPROVAL_INTERACTIVE = "interactive"
+
+#: Slack reaction when a mid-turn message is folded via ``_session/steer``.
+_STEER_ACK_REACTION = "speech_balloon"
+#: Slack reaction when a mid-turn message is queued as a follow-up turn.
+_FOLLOW_UP_ACK_REACTION = "hourglass_flowing_sand"
+
+
+def _busy_owner_key(sessions: SessionManager, session_key: str, thread_ts: str = "") -> str:
+    """The live session a Slack thread is driving (dashboard link or itself)."""
+    lookup = thread_ts or session_key
+    owner = sessions.get_session_for_thread(lookup)
+    if isinstance(owner, str) and owner:
+        return owner
+    return session_key
+
+
+def dequeue_busy_followup(
+    sessions: SessionManager, session_key: str, thread_ts: str = ""
+) -> tuple[str, str, dict] | None:
+    """Pop the next mid-turn follow-up, trying the linked owner first.
+
+    ``inject_busy_followup`` enqueues on the live owner (a dashboard slot when
+    the thread is linked). The events.py drain still holds the bare Slack
+    ``thread_ts``, so a bare-only dequeue would strand those messages.
+    """
+    owner = _busy_owner_key(sessions, session_key, thread_ts)
+    if owner != session_key:
+        item = sessions.dequeue(owner)
+        if item is not None:
+            return item
+    return sessions.dequeue(session_key)
+
+
+async def inject_busy_followup(
+    sessions: SessionManager,
+    session_key: str,
+    text: str,
+    msg_ts: str,
+    *,
+    slack: SlackClientOps | None = None,
+    channel: str = "",
+    thread_ts: str = "",
+    force_busy: bool = False,
+    enqueue_kwargs: dict | None = None,
+) -> str:
+    """Handle a Slack message that arrived while a turn is already in flight.
+
+    Returns ``"idle"`` when the session is not busy (caller continues into
+    ``get_or_create``). Otherwise steers immediately when the live provider
+    implements ``supports_steer`` (kiro + KAS), or enqueues a follow-up and
+    returns without waiting on the session semaphore — the Discord-shaped
+    path. Spec adapters stay out of ``ACP_BACKENDS_STEER``; this reads the
+    named capability rather than comparing backend ids (H5/H6).
+
+    ``force_busy`` covers the events.py startup race: a handler task exists
+    but has not acquired the semaphore yet.
+    """
+    owner = _busy_owner_key(sessions, session_key, thread_ts)
+    if not force_busy and sessions.is_busy(owner) is not True:
+        return "idle"
+    extra = dict(enqueue_kwargs or {})
+    # The steer transport carries text only. If this follow-up owns temporary
+    # attachment files, steering would acknowledge the message while dropping
+    # the files and abandoning their cleanup. Queue the whole item so the drain
+    # transfers both prompt content and cleanup ownership together.
+    has_attachments = bool(extra.get("image_temp_paths"))
+    provider = sessions.get_provider(owner)
+    if not has_attachments and provider is not None and provider.supports_steer:
+        if provider.has_active_turn() and await provider.steer(text) is True:
+            if slack is not None and channel and msg_ts:
+                try:
+                    await slack.add_reaction(channel, msg_ts, _STEER_ACK_REACTION)
+                except Exception:
+                    logger.debug("slack: steer ack reaction failed", exc_info=True)
+            return "steer"
+    queued = sessions.enqueue(owner, msg_ts, text, force=True, **extra)
+    if queued is not True:
+        return "idle"
+    if slack is not None and channel and msg_ts:
+        try:
+            await slack.add_reaction(channel, msg_ts, _FOLLOW_UP_ACK_REACTION)
+        except Exception:
+            logger.debug("slack: follow-up ack reaction failed", exc_info=True)
+    return "follow_up"
 
 
 def _should_auto_approve_spawn(context_builder, event_title: str) -> bool:
@@ -2241,9 +2330,7 @@ async def _handle_compact_command(
                 outcome = "completed"
             elif cr["type"] == "failed":
                 error = cr.get("summary", "")
-                result_text = (
-                    f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
-                )
+                result_text = f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
                 outcome = "failed"
             else:
                 result_text = "⚠️ Compaction timed out."
@@ -2528,12 +2615,29 @@ async def maybe_route_linked_thread(
     if not _linked_slot.running:
         from kiro_crew.dashboard.chat import _run_chat
 
-        _chat_task = asyncio.create_task(_run_chat(_dashboard_state, _linked_slot, text))  # type: ignore[arg-type]
+        _chat_task = asyncio.create_task(
+            _run_chat(
+                _dashboard_state,  # type: ignore[arg-type]
+                _linked_slot,
+                text,
+                _directive_user_origin=True,
+            )
+        )
         _linked_slot.task = _chat_task
         _dashboard_state._background_tasks.add(_chat_task)  # type: ignore[attr-defined]
         _chat_task.add_done_callback(_dashboard_state._background_tasks.discard)  # type: ignore[attr-defined]
     else:
-        _linked_slot.queue_append(text)
+        # circular import: session_control pulls in dashboard modules at module level.
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        # Stamp the admission-time containment (#5911). A linked slot records
+        # linked=True here, so its own channel's queued messages keep draining;
+        # only a constraint that appears AFTER this enqueue drops the entry.
+        _linked_slot.queue_append(
+            text,
+            meta=containment_meta(_dashboard_state, _linked_slot),  # type: ignore[arg-type]
+            directive_user_origin=True,
+        )
     _dashboard_state.push_slots_update()  # type: ignore[attr-defined]
     sel().log_tool_invocation(
         session_key=session_key,
@@ -3073,6 +3177,25 @@ async def handle_message(
         session_key = thread_owner_key
 
     client: LLMProvider | None = None
+    _mid_turn = await inject_busy_followup(
+        sessions,
+        session_key,
+        text,
+        msg_ts,
+        slack=slack,
+        channel=channel,
+        thread_ts=reply_ts,
+        enqueue_kwargs={
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "sender_id": user_id,
+            "team_id": team_id,
+            "agent_override": channel_agent,
+            "user_display_name": user_display_name,
+        },
+    )
+    if _mid_turn != "idle":
+        return
     try:
         task.start()
         # Re-resolve _agent against (possibly linked) session_key for the main
@@ -3231,6 +3354,7 @@ async def handle_message(
                 blocks_reads=_slack_blocks_reads,
                 model_window=_model_window,
                 runtime_source="slack",
+                provider_type=provider_label(client),
             )
         else:
             full_message = text
@@ -3451,6 +3575,9 @@ async def handle_message(
                         raw_params=event.raw_tool_params,
                         command=event.shell_command,
                         is_shell=event.is_shell,
+                        mcp_server_name=event.mcp_server_name,
+                        mcp_tool_name=event.tool_name,
+                        mcp_identity_ambiguous=event.mcp_identity_ambiguous,
                     )
                     if tool_result.action == TOOL_AUTO_APPROVE:
                         await client.approve_tool(event.request_id)
@@ -3594,6 +3721,9 @@ async def handle_message(
                     _stop_reason
                     and _stop_reason != STOP_REASON_END_TURN
                     and _stop_reason != STOP_REASON_CANCELLED
+                    # Expected terminal state after a failed auto-compaction;
+                    # handled below with a session reset, so not "unexpected".
+                    and _stop_reason != STOP_REASON_COMPACTION_FAILED
                 ):
                     logger.warning(
                         "Unexpected stop_reason %r for %s — treating as normal completion",
@@ -3613,8 +3743,26 @@ async def handle_message(
             # the payload shape and model reflection cannot drift across surfaces.
             record_interaction_event(client, session_key, "slack")
 
-        # Check context usage — fires background compaction at configured threshold, never blocks
-        sessions.check_context_usage(session_key, client)
+        if _stop_reason == STOP_REASON_COMPACTION_FAILED:
+            # The completion was synthetic — the backend abandoned the turn
+            # after a failed auto-compaction and never sent end_turn, so it
+            # still counts the prompt as in progress. Reset now (mirrors the
+            # dashboard runner's needs_session_reset) or the NEXT message
+            # collides with "prompt already in progress" and burns the busy
+            # recovery path. No re-queue: the compaction notice already told
+            # the user. The context-usage probe is skipped — compaction just
+            # failed and the session was torn down.
+            try:
+                await sessions.reset(session_key)
+            except Exception:
+                logger.debug(
+                    "Failed to reset session %s after compaction failure",
+                    session_key,
+                    exc_info=True,
+                )
+        else:
+            # Check context usage — fires background compaction at configured threshold, never blocks
+            sessions.check_context_usage(session_key, client)
 
     except AcpTimeoutError as e:
         _had_error = True

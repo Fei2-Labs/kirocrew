@@ -18,11 +18,14 @@ were added
 not been re-audited since 2026-08-03. The durable-run-coordinator row was added
 2026-08-22 and the orchestrator-chat-sessions row was re-audited at
 `c4f253891`; the `rfc-token-efficient-monitors` row was added 2026-08-22 and
-verified against `6d3e30bbbd`.
+verified against `6d3e30bbbd`. The `rfc-global-workflow-library` row was added
+2026-08-25 and audited against `749468d42`; its implementation exists only in
+the active detached worktree.
 
 | Document | Status | What is actually on main |
 |---|---|---|
-| [rfc-durable-run-coordinator.md](rfc-durable-run-coordinator.md) | `in-progress` | PRs 1–4 are implemented locally: typed coordinator records, extracted lifecycle boundaries, a contract-tested SQLite store, security floor, and accepted-run shadow writes exist. The manager and run folders remain authoritative; command authority is unimplemented |
+| [rfc-global-workflow-library.md](rfc-global-workflow-library.md) | `in-progress` | Nothing. The active detached worktree adds the global definition library, local adaptation and lineage, exact `/workflow <name>` invocation, MCP/HTTP contracts, and the Agent Capabilities management surface |
+| [rfc-durable-run-coordinator.md](rfc-durable-run-coordinator.md) | `in-progress` | PRs 1–4 are implemented locally: typed coordinator records, extracted lifecycle boundaries, a contract-tested SQLite store, security floor, and accepted-run shadow writes exist. `SubagentCommandAuthority` now admits keyed mutations (follow-up, steer, execution-heartbeat, waiting-execution rejection) ahead of the manager, so command authority is wired rather than unimplemented; the manager and run folders remain the authoritative store |
 | [rfc-issue-radar-crews.md](rfc-issue-radar-crews.md) | `draft` | Nothing. Design of record only; `crew_brief.md` and `crew_ledger_spec.md` sit beside the Issue Radar backend as companion specs, also unimplemented |
 | [rfc-orchestrator-chat-sessions.md](rfc-orchestrator-chat-sessions.md) | `partial` | Crew Mode shipped in [#1295](https://github.com/kirodotdev/KiroCrew/pull/1295) and has since received store and routing fixes. The implementation deliberately diverges from the RFC in at least three places: no snapshot-generation CAS, no `release` decision action, and immediate per-result delivery instead of burst coalescing |
 | [rfc-channel-plugin-architecture.md](rfc-channel-plugin-architecture.md) | `partial` | Shared turn pipeline shipped; **4 of 7** channels adopted. Registry/seam collapse, telegram+discord, Feishu unstarted. Its §9 address rule is separately half-shipped — audit this row alongside [rfc-session-address-model.md](rfc-session-address-model.md) |

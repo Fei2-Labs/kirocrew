@@ -48,6 +48,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, NamedTuple, Protocol
 
+from kiro_crew._ssl_compat import _ssl_context_has_ca_trust
 from kiro_crew.config.loader import config_path
 from kiro_crew.config.paths import config_dir
 from kiro_crew.metrics.provider import get_recorder
@@ -344,6 +345,25 @@ def _install_diskcache_stub() -> None:
     sys.modules["diskcache"] = stub
 
 
+def _harden_llama_null_streams() -> None:
+    """Make llama-cpp-python's process-global suppression streams Unicode-safe.
+
+    The vendored suppressor temporarily assigns its import-time ``os.devnull``
+    handles to ``sys.stdout`` and ``sys.stderr`` while a model loads. That load
+    runs on a background thread, so unrelated gateway output can reach those
+    handles. Reconfiguring the existing wrappers preserves the native ``dup2``
+    suppression while removing the host locale from that process-wide window.
+    """
+    llama_utils = sys.modules.get("llama_cpp._utils")
+    if llama_utils is None:
+        return
+    for name in ("outnull_file", "errnull_file"):
+        stream = getattr(llama_utils, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 @functools.lru_cache(maxsize=1)
 def _load_llama_class():
     """Import the vendored llama-cpp-python runtime. Returns the Llama class or None.
@@ -431,6 +451,7 @@ def _load_llama_class():
     try:
         from llama_cpp import Llama  # noqa: F811
 
+        _harden_llama_null_streams()
         return Llama
     except Exception:
         logger.warning("Vendored llama-cpp-python failed to import", exc_info=True)
@@ -1711,9 +1732,7 @@ def _make_ssl_context() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     try:
         ctx.load_default_certs()
-        # Verify the defaults work by checking the cert store has entries
-        stats = ctx.cert_store_stats()
-        if stats["x509_ca"] > 0:
+        if _ssl_context_has_ca_trust(ctx):
             return ctx
     except ssl.SSLError:
         pass

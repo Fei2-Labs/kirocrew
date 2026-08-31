@@ -87,6 +87,8 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
         "Security and privacy",
         (
+            ("secrets", "Migrate .env credentials into the encrypted secret vault"),
+            ("byok", "Manage bring-your-own-key provider API keys for BYOK backends"),
             ("security", "Security audit and deny list"),
             ("policy", "Inspect the governance security policy + profiles"),
             ("telemetry", "Inspect or disable anonymous usage telemetry"),

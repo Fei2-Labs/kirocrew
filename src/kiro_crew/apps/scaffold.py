@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import struct
 import zlib
 from pathlib import Path
+
+from kiro_crew.atomic_write import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -370,24 +373,38 @@ def _validate_write_sites(
     refused path into lost data. Deciding up front makes the run all-or-nothing:
     either nothing on disk is touched, or every path was already proven writable.
 
-    Two independent properties, and containment alone is not enough. A site can
-    resolve squarely inside the app directory and still be unwritable because it
-    is there as the WRONG KIND: `mkdir(exist_ok=True)` raises `FileExistsError`
-    when the path is a regular file (exist_ok only forgives an existing
-    DIRECTORY), and `write_text` raises `IsADirectoryError` against a directory.
-    Neither is a `ValueError`, so both escape the caller's error contract as a
-    raw traceback on top of the lost manifest.
+    A write site can fail before its first byte for reasons that fall in three
+    layers, and containment alone covers only the first:
 
-    So each site is checked for both:
+    * it escapes the app directory (`_resolve_for_write` -- refuses traversal,
+      escaping and in-root symlinks);
+    * it is present as the WRONG KIND: `mkdir(exist_ok=True)` raises
+      `FileExistsError` when the path is a regular file (exist_ok only forgives
+      an existing DIRECTORY), and `write_text` raises `IsADirectoryError`
+      against a directory;
+    * it is the right kind (or absent) but the filesystem will refuse the write
+      on PERMISSIONS: an existing read-only file fails its own `write_text` with
+      `PermissionError`, and an absent file or directory whose nearest existing
+      ancestor is read-only fails the `write_*`/`mkdir` that first touches that
+      ancestor (a read-only `assets/` with no `icon.png`, say).
 
-    * every site resolves to its own lexical path inside `app_dir`
-      (`_resolve_for_write` -- refuses traversal, escaping and in-root symlinks);
-    * a directory site is absent or already a directory, and a file site is not
-      an existing directory.
+    None of `FileExistsError`, `IsADirectoryError` or `PermissionError` is a
+    `ValueError`, so each would otherwise escape the caller's error contract as a
+    raw traceback -- and, being raised at the write site, on top of the already
+    overwritten manifest. So each site is checked for all three here:
 
-    `exists()`/`is_dir()` are unambiguous here precisely because containment ran
-    first: it refuses every symlink beneath the root, so there is no link left
-    for these to follow somewhere else.
+    * every site resolves to its own lexical path inside `app_dir`;
+    * a directory site is absent or already a directory, a file site is not an
+      existing directory;
+    * the write is permitted -- an existing file site is writable, and for every
+      site the nearest ANCESTOR that already exists on disk is writable, since
+      that ancestor is what the eventual `mkdir(parents=True)`/`write_*` first
+      creates into.
+
+    `exists()`/`is_dir()`/`os.access` are unambiguous here precisely because
+    containment ran first: it refuses every symlink beneath the root, so there
+    is no link left for these to follow somewhere else, and the nearest existing
+    ancestor of a contained path is itself contained.
 
     Not a substitute for the per-site `_resolve_for_write` calls, because
     validation and use are separate moments: a path swapped in between is still
@@ -397,6 +414,23 @@ def _validate_write_sites(
     dirs, files = _write_sites(
         include_backend=include_backend, include_ui=include_ui
     )
+
+    def _writable_ancestor(target: Path) -> None:
+        # The nearest already-existing ancestor is the directory the eventual
+        # mkdir(parents=True)/write first creates into; if it is read-only the
+        # write raises PermissionError after app.json is already gone. app_dir
+        # was just created (or pre-existed and was written into), so the walk
+        # always terminates at or above it, inside the contained tree.
+        ancestor = target.parent
+        while not ancestor.exists():
+            ancestor = ancestor.parent
+        if not os.access(ancestor, os.W_OK):
+            raise ValueError(
+                f"refusing to scaffold {app_dir}: {ancestor} is not writable, so "
+                "creating the scaffolded files under it would fail partway and "
+                "could lose an existing manifest. Fix its permissions and retry."
+            )
+
     for rel in dirs:
         target = _resolve_for_write(app_dir, *rel)
         if target.exists() and not target.is_dir():
@@ -405,6 +439,7 @@ def _validate_write_sites(
                 "directory, so it cannot hold the scaffolded files. Remove or "
                 "rename it and retry."
             )
+        _writable_ancestor(target)
     for rel in files:
         target = _resolve_for_write(app_dir, *rel)
         if target.is_dir():
@@ -413,6 +448,13 @@ def _validate_write_sites(
                 "directory, so it cannot be written as a file. Remove or rename "
                 "it and retry."
             )
+        if target.exists() and not os.access(target, os.W_OK):
+            raise ValueError(
+                f"refusing to scaffold {app_dir}: {Path(*rel)} exists and is not "
+                "writable, so overwriting it would fail partway and could lose an "
+                "existing manifest. Fix its permissions or remove it and retry."
+            )
+        _writable_ancestor(target)
 
 
 def scaffold_app(
@@ -444,9 +486,12 @@ def scaffold_app(
     _resolve_for_write(output_dir, name)
     app_dir.mkdir(parents=True, exist_ok=True)
 
-    # Every write path is decided here, while nothing has been written yet: the
-    # manifest below overwrites an existing app's app.json, so a refusal raised
-    # later would cost the developer that file.
+    # Every write path is decided here, while nothing has been written yet, so
+    # a refusal aborts before the first byte rather than partway through a run
+    # that has already overwritten an existing app's app.json. Ordering does
+    # the rest: app.json is written LAST (see below), so even a write that
+    # fails at runtime -- past what this pass can prove -- leaves the existing
+    # manifest intact.
     _validate_write_sites(
         app_dir, include_backend=include_backend, include_ui=include_ui
     )
@@ -482,9 +527,17 @@ def scaffold_app(
                 "message": f"Run periodic check for {display_name}",
             }
         ]
-    _resolve_for_write(app_dir, "app.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    # The manifest is BUILT here but WRITTEN last (see the end of this
+    # function). Overwriting app.json is the one destructive act in a
+    # scaffold of an existing app -- every other site is generated and
+    # re-running reproduces it, but a half-written run that has already
+    # replaced app.json has cost the developer the manifest it found. The
+    # up-front pass proves every path is writable BEFORE the first byte, but
+    # it cannot prove the write itself will not fail at runtime (a full disk,
+    # an exhausted inode table, EIO). Writing app.json only after every other
+    # site has been created makes the run all-or-nothing against those too:
+    # a runtime failure aborts before the manifest is touched, leaving the
+    # existing app exactly as it was found.
 
     # Store icon. Real bytes, not just the manifest key: an `iconPath` naming a
     # file that does not exist publishes worse than naming nothing, because the
@@ -509,7 +562,15 @@ def scaffold_app(
     _resolve_for_write(app_dir, "assets").mkdir(exist_ok=True)
     icon = _resolve_for_write(app_dir, "assets", "icon.png")
     if not icon.exists():
-        icon.write_bytes(_placeholder_icon_png())
+        # atomic_write, not write_bytes: a write that fails partway (a full
+        # disk, an exhausted inode table) must not leave a truncated icon.png
+        # behind, because the keep-the-artwork guard above would then treat
+        # that corrupt stub as the developer's icon on every later run and
+        # never repair it. atomic_write lands the bytes in a temp file and
+        # renames only once whole, cleaning the temp up on failure, so the
+        # icon is either the complete placeholder or absent -- never a
+        # half-written file a retry would mistake for real artwork.
+        atomic_write(icon, _placeholder_icon_png())
 
     # Agent
     _resolve_for_write(app_dir, "agents").mkdir(exist_ok=True)
@@ -564,6 +625,20 @@ def scaffold_app(
             name=name, display_name=display_name, description=description
         ),
         encoding="utf-8",
+    )
+
+    # Manifest written last, and atomically. Last, so the destructive
+    # overwrite happens only once every other write above has already
+    # succeeded (see the note at the build site) -- a runtime failure earlier
+    # aborts with the existing app.json still intact. Atomically, because the
+    # final write is itself destructive: write_text truncates the existing
+    # app.json in place, so a full disk DURING this write would corrupt the
+    # very manifest the ordering exists to protect. atomic_write lands the
+    # bytes in a temp file and renames only once whole, so app.json is always
+    # either the old manifest or the new one -- never a truncated hybrid.
+    atomic_write(
+        _resolve_for_write(app_dir, "app.json"),
+        json.dumps(manifest, indent=2) + "\n",
     )
 
     logger.info("Scaffolded app %s at %s", name, app_dir)

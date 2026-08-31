@@ -73,6 +73,7 @@ const COMMAND_DESC_KEY: Record<string, string> = {
   '/todos': 'components.slashCommandMenu.desc_todos',
   '/tools': 'components.slashCommandMenu.desc_tools',
   '/usage': 'components.slashCommandMenu.desc_usage',
+  '/workflow': 'components.slashCommandMenu.desc_workflow',
 }
 
 /**
@@ -103,13 +104,14 @@ function commandDescription(cmd: SlashCommand): string {
 const FALLBACK_COMMAND_NAMES = [
   '/agent', '/changelog', '/clear', '/code', '/compact', '/context',
   '/experiment', '/help', '/hooks', '/issue', '/kb', '/logdump',
-  '/mcp', '/model', '/prompts', '/side', '/todos', '/tools', '/usage',
+  '/mcp', '/model', '/prompts', '/side', '/todos', '/tools', '/usage', '/workflow',
 ] as const
 
 const FALLBACK_COMMANDS: SlashCommand[] = FALLBACK_COMMAND_NAMES.map(name => ({ name }))
 
 interface Props {
   input: string
+  slotId?: string | null
   anchorRef: React.RefObject<HTMLElement | null>
   onSelect: (command: string) => void
   onClose: () => void
@@ -141,10 +143,10 @@ const FRONTEND_COMMAND_NAMES = ['/kb', '/onboarding', '/plain'] as const
 
 const FRONTEND_COMMANDS: SlashCommand[] = FRONTEND_COMMAND_NAMES.map(name => ({ name }))
 
-export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter' }: Props) {
+export default function SlashCommandMenu({ input, slotId, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter' }: Props) {
   const { data: apiCommands = FALLBACK_COMMANDS, isFetching } = useQuery<SlashCommand[]>({
-    queryKey: ['slash-commands'],
-    queryFn: () => api.slashCommands(),
+    queryKey: ['slash-commands', slotId ?? ''],
+    queryFn: () => api.slashCommands(slotId ? { slot: slotId } : undefined),
     enabled: typeof api.slashCommands === 'function',
   })
   const commands = useMemo(() => {

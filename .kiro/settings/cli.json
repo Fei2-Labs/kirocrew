@@ -1,5 +1,27 @@
 {
   "toolSearch.enabled": true,
   "toolSearch.minPct": 5,
-  "toolSearch.minTokens": 50000
+  "toolSearch.minTokens": 50000,
+  "chat.modelDefaults": {
+    "claude-opus-4.6": {
+      "output_config": {
+        "effort": "medium"
+      }
+    },
+    "swedeapi/gpt-5.6-sol": {
+      "reasoning": {
+        "effort": "medium"
+      }
+    },
+    "swedeapi/claude-opus-5": {
+      "output_config": {
+        "effort": "medium"
+      }
+    },
+    "swedeapi/gpt-5.6-luna": {
+      "reasoning": {
+        "effort": "medium"
+      }
+    }
+  }
 }

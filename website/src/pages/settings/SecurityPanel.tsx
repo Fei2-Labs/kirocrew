@@ -10,6 +10,7 @@ import Modal from '../../components/Modal'
 import InfoTip from '../../components/InfoTip'
 import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
 import { PostureDisclosureRow, CODE_BASE as POSTURE_CODE_BASE } from './PostureDisclosure'
+import { MobileLoginCard } from './MobileLoginCard'
 
 import { i18nT } from '../../i18n/t'
 import { fmtDateFields, fmtList, fmtTime, fmtTimeNumeric, toDate, compareText } from '../../i18n/format'
@@ -1287,6 +1288,7 @@ function PostureSection() {
 
   return (
     <SettingsSection title={i18nT('pages.settings.securityPanel.live_security_posture')}>
+      <MobileLoginCard />
       {/* data-setting-label: deep-link anchor for the manual registry entry
         * (settingsManual.ts `security.live-security-posture`) — the section is
         * raw markup the extractor cannot see, so without this the highlight
@@ -1702,7 +1704,7 @@ function ThirdPartyAppsCard() {
   // newer dashboard talking to an older gateway (or any response shape that drops
   // a list) would otherwise reach `ta.ineffective.length` and throw — taking down
   // the WHOLE Security page, not just this card. The i18n render gate caught
-  // exactly that on /settings?tab=security.
+  // exactly that on /settings/security.
   const ta = useMemo(
     () =>
       taRaw
@@ -2104,7 +2106,10 @@ function fmtRailExpiry(expiry: Date, now: Date = new Date()): string {
     : fmtDateFields(expiry, { weekday: 'short', hour: 'numeric', minute: '2-digit' })
 }
 
-export function SecurityPanel() {
+/** Security tab. `basePath` opts the section sub-nav into path navigation
+ *  (`${basePath}/security/<section>`); omitted, the historical ?sub= /
+ *  ?section= query behavior is unchanged. Passed by the Settings host. */
+export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
   // Held HERE, not in the rules pane: picking another rail section unmounts that
   // pane, and a half-typed deny pattern living in its local state would be
   // silently discarded. The 137-row rule table still unmounts — only the draft
@@ -2205,6 +2210,7 @@ export function SecurityPanel() {
       listLabel={i18nT('pages.settings.securityPanel.security_sections')}
       backLabel={i18nT('settings.tabs.security.label')}
       banner={banner}
+      basePath={basePath}
     >
       {active => {
         const key = active as SecuritySectionKey | null

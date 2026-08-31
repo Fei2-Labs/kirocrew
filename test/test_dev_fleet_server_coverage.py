@@ -814,7 +814,7 @@ async def test_pod_provision_starts_run_and_records_it(monkeypatch):
     monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-0"})
     monkeypatch.setattr(mod, "_RUNS", {"run-0": {"status": "done"}})
     monkeypatch.setattr(
-        mod, "sandboxed_spawn_argv", lambda argv, tier, env=None: (list(argv), {}, None)
+        mod, "sandboxed_spawn_argv_off_loop", AsyncMock(return_value=(["/bin/true"], {}, None))
     )
     monkeypatch.setattr(mod, "_start_run", AsyncMock(return_value="run-9"))
 
