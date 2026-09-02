@@ -36,6 +36,7 @@ the spawn's resolver and have the probe actually see it.
 from __future__ import annotations
 
 __all__ = [
+    "backend_uses_registry_model_ids",
     "claude_adapter_cached_negative",
     "claude_adapter_install_command",
     "claude_components_resolve",
@@ -117,3 +118,26 @@ def claude_adapter_install_command() -> str:
     from kiro_crew.acp.client import CLAUDE_ACP_NPM_PKG
 
     return f"npm i -g {CLAUDE_ACP_NPM_PKG}"
+
+
+def backend_uses_registry_model_ids(backend: str) -> bool:
+    """Does ``backend`` accept model ids in Kiro Crew's own registry spelling?
+
+    ``CAP_REGISTRY_MODEL_IDS`` is fail-closed for every level below SUPPORTED, so
+    a backend whose support is degraded or merely unmeasured answers False and
+    the caller sends the served id through unmapped -- the safe direction, since
+    a wrong mapping is a wire rejection on the operator's first prompt.
+
+    An id with NO descriptor raises ``UnknownAcpBackend`` rather than answering
+    False, and the exception is propagated for the same reason the install
+    probes propagate theirs: "I have never heard of this backend" is a caller's
+    error to handle, and collapsing it into a legitimate False would silently
+    unmap every model for a typo'd ``agent.acp_backend``.
+
+    The capability KEY does not cross the boundary, only the answer. A caller
+    handed ``supports`` plus the key would be branching on the ACP layer's own
+    vocabulary through a boundary whose purpose is to end exactly that.
+    """
+    from kiro_crew.acp import backends
+
+    return backends.supports(backend, backends.CAP_REGISTRY_MODEL_IDS)

@@ -22,6 +22,15 @@ the diff PARSING — N private parsers meant the same added line could be judged
 differently by different gates, and a scope fix to one copy left the others
 wrong.
 
+A merge commit has TWO ancestries, and both answers have to account for that:
+content that already existed in either one was not written by the change in
+front of the gate. ``imported_parents`` / ``scope_bases`` name those ancestries,
+``added_lines`` drops any line whose text one of them already carried in that
+file, and a count-baseline gate reads ``scope_bases`` for the same correction on
+its per-file counts. Without it a fork
+sync reddens every gate for thousands of upstream-authored lines, and the only
+remedy left is the baseline raise each ratchet header forbids.
+
 ``changed_paths`` names each checkout shape it tries and reports the winner,
 because they fail in ways that look alike and an earlier version of the black
 gate silently fell back to whole-tree scope on CI. ``added_lines`` reads the diff
@@ -32,6 +41,7 @@ worse than no added-line set at all.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -132,7 +142,14 @@ def changed_paths() -> tuple[set[str] | None, str]:
     is_merge = code == 0 and len(out.split()) >= 3
     attempts: list[tuple[str, list[str]]] = []
     if is_merge and _first_parent_is_base():
-        attempts.append(("merge HEAD^1..HEAD", ["diff", "--name-only", "HEAD^1", "HEAD"]))
+        # No second endpoint, so the diff runs to the WORKING TREE. On CI's
+        # merge ref the tree is clean and this is identical to `HEAD^1 HEAD`;
+        # locally it is the difference between judging the commits and judging
+        # what the gate actually scans, and naming HEAD while scanning the tree
+        # puts a violation's line numbers and the added-line set in different
+        # files. Under-scoping is the direction that lets a local run pass what
+        # CI then fails, so the tree wins.
+        attempts.append(("merge HEAD^1..HEAD", ["diff", "--name-only", "HEAD^1"]))
         attempts.append(("merge parents", ["diff", "--name-only", "HEAD^1", "HEAD^2"]))
     for base in ("origin/main", "main"):
         attempts.append((f"{base}...HEAD", ["diff", "--name-only", f"{base}...HEAD"]))
@@ -143,22 +160,8 @@ def changed_paths() -> tuple[set[str] | None, str]:
     return None, "undeterminable (judging the whole tree)"
 
 
-def added_lines(scope_label: str) -> dict[str, set[int]] | None:
-    """Repo-relative path -> line numbers this change ADDED, or None.
-
-    Uses the diff endpoints named by ``changed_paths``' label, so the added set
-    and the changed-file set always describe the same diff. An unknown label (or
-    a failing git) degrades to None -- the added-line rule is then skipped
-    rather than guessed, and a caller's count rules still apply.
-    """
-    if scope_label == "merge HEAD^1..HEAD":
-        args = ["diff", "--unified=0", "HEAD^1", "HEAD"]
-    elif scope_label == "merge parents":
-        args = ["diff", "--unified=0", "HEAD^1", "HEAD^2"]
-    elif scope_label.endswith("...HEAD"):
-        args = ["diff", "--unified=0", scope_label]
-    else:
-        return None
+def _added_from_diff(args: list[str]) -> dict[str, set[int]] | None:
+    """Parse one whole-diff ``--unified=0`` invocation into added line numbers."""
     proc = subprocess.run(
         ["git", "--no-pager", *args],
         cwd=ROOT,
@@ -183,6 +186,300 @@ def added_lines(scope_label: str) -> dict[str, set[int]] | None:
                 count = int(match.group(2)) if match.group(2) is not None else 1
                 added.setdefault(current, set()).update(range(start, start + count))
     return added
+
+
+# The merge scope labels ``changed_paths`` can return, mapped to the commit at
+# the scope's TIP. Used for TOPOLOGY -- walking ancestries -- so it names a
+# commit even where the diff endpoint is the working tree.
+_MERGE_TIPS = {"merge HEAD^1..HEAD": "HEAD", "merge parents": "HEAD^2"}
+
+# The same labels mapped to where the tip's CONTENT is read from. None means the
+# working tree, which is what the first label's diff endpoint is: the added-line
+# numbers index the tree the gate scans, so their text must come from there too.
+_MERGE_CONTENT_TIPS: dict[str, str | None] = {
+    "merge HEAD^1..HEAD": None,
+    "merge parents": "HEAD^2",
+}
+
+
+def _rev(ref: str) -> str | None:
+    code, out = _git("rev-parse", "--verify", "--quiet", ref)
+    resolved = out.strip()
+    return resolved if code == 0 and resolved else None
+
+
+def _parents(commit: str) -> list[str]:
+    code, out = _git("rev-list", "--parents", "-n", "1", commit)
+    return out.split()[1:] if code == 0 else []
+
+
+def imported_parents(scope_label: str) -> list[str]:
+    """Histories a MERGE at the scope tip brought in, which this change did not write.
+
+    A merge commit has two ancestries, and a line that already existed in either
+    one was not introduced by the person who made the merge. Judging such a line
+    as added is not a stricter gate, it is a wrong answer: on a fork sync it
+    reddens thousands of lines whose author is upstream, with no fix available in
+    the merger's own diff, and the only way out is the baseline raise every
+    ratchet header forbids.
+
+    The parents split into two kinds, and telling them apart is the whole
+    problem, because ``changed_paths`` reaches the merge shape from two very
+    different checkouts:
+
+    * CI's ``pull_request`` merge ref: ``HEAD^1`` is the base and ``HEAD^2`` is
+      the PR head, which is THIS CHANGE. Treating it as pre-existing history
+      would accept every line the PR adds -- the gate deleted, not fixed.
+    * a real merge on the branch (``git merge upstream/main``): ``HEAD^1`` is the
+      work so far and ``HEAD^2`` is foreign history being imported.
+
+    Topology alone cannot tell them apart -- a PR branch and an upstream branch
+    both merely SHARE a fork point with the base, and once the base moves after
+    the branch point neither is reachable from it. So the synthetic ref is
+    recognised for what it is, by :func:`_tip_is_pr_merge_ref`, and its second
+    parent is taken as this change's own history: the walk descends THROUGH it,
+    which is what finds the fork-sync merge nested inside a PR and still names
+    the upstream ancestry that one imported. Every other non-first parent is
+    imported, unless the base already contains it (a ``git merge origin/main``
+    into the branch brought in nothing the base lacked).
+
+    An empty list for every non-merge scope, so nothing about a fast-forward
+    change's judgment moves.
+    """
+    tip_ref = _MERGE_TIPS.get(scope_label)
+    if tip_ref is None:
+        return []
+    base = _rev("HEAD^1")
+    tip = _rev(tip_ref)
+    if base is None or tip is None:
+        return []
+    synthetic = tip_ref == "HEAD" and _tip_is_pr_merge_ref()
+    own: set[str] = {base}
+    imported: list[str] = []
+    pending = [tip]
+    while pending:
+        commit: str | None = pending.pop()
+        while commit is not None and commit not in own:
+            own.add(commit)
+            parents = _parents(commit)
+            for parent in parents[1:]:
+                if commit == tip and synthetic:
+                    pending.append(parent)  # the PR itself, not imported history
+                elif _git("merge-base", "--is-ancestor", parent, base)[0] == 0:
+                    continue  # the base already contains it
+                elif parent not in imported:
+                    imported.append(parent)
+            # ``rev-list --parents`` already prints full hashes, so the chain
+            # walks on without another rev-parse round trip.
+            commit = parents[0] if parents else None
+    return imported
+
+
+def _tip_is_pr_merge_ref() -> bool:
+    """True when HEAD is GitHub's SYNTHETIC ``pull_request`` merge commit.
+
+    This has to be answered from outside git, because inside git it is not
+    answerable: the merge ref and a real ``git merge`` of a fork's upstream have
+    the same shape, the same parent order, and the same fork-point relationship
+    to the base. Getting it wrong in the merge-ref direction is the expensive
+    one -- the second parent there is the PR under review, and calling it
+    pre-existing history accepts every line the PR adds.
+
+    Two independent signals, either of which is enough, and both of which hold
+    on a real Actions run:
+
+    * ``GITHUB_BASE_REF`` is set only for a ``pull_request`` event, which is the
+      only event that produces a merge ref. It is the platform stating the shape
+      rather than a guess about it.
+    * the merge ref is checked out DETACHED, so no branch contains it. A real
+      merge is made on a branch, which is what puts it on one.
+
+    Answering True when unsure is the strict direction -- the change is then
+    judged against the first parent alone, exactly as before this correction --
+    so a git failure falls that way too.
+    """
+    if os.environ.get("GITHUB_BASE_REF"):
+        return True
+    # ``for-each-ref``, not ``branch --contains``: the latter prints a
+    # ``(HEAD detached from ...)`` pseudo-entry for exactly the checkout this
+    # question is about, which reads as "a branch contains it" and inverts the
+    # answer.
+    code, out = _git("for-each-ref", "--contains", "HEAD", "--format=%(refname)", "refs/heads")
+    return code != 0 or not out.strip()
+
+
+def scope_bases(scope_label: str) -> list[str]:
+    """Every commit whose content a MERGE-scoped change inherited rather than wrote.
+
+    The base plus :func:`imported_parents`. A count-baseline ratchet reads this
+    to answer "was this file's violation count already this high in something
+    that predates the merge?" -- the count half of the same correction
+    :func:`imported_parents` makes for added lines. Deliberately NOT the merge's
+    literal parent list: on CI's merge ref one of those parents is the PR head,
+    and taking its counts as a ceiling would accept any regression the PR
+    introduced.
+
+    Empty for a non-merge scope, where the baseline is the only ceiling.
+    """
+    if scope_label not in _MERGE_TIPS:
+        return []
+    base = _rev("HEAD^1")
+    return ([base] if base else []) + imported_parents(scope_label)
+
+
+def _batch_show(commit: str, paths: list[str]):
+    """Yield ``(path, contents)`` for each path that exists in ``commit``.
+
+    One ``git cat-file --batch`` process for the whole list. A per-path
+    ``git show`` is the obvious spelling and is unusable here: a fork sync's
+    merge touches thousands of files and the merge correction reads each of them
+    once per ancestry, so the process spawns -- not the reads -- become the whole
+    runtime.
+
+    A path absent from the commit is simply skipped; the caller's question is
+    "did this content already exist", and a file that did not exist held none.
+    """
+    if not paths:
+        return
+    request = "".join(f"{commit}:{path}\n" for path in paths).encode("utf-8", "surrogateescape")
+    proc = subprocess.run(
+        ["git", "cat-file", "--batch"],
+        cwd=ROOT,
+        input=request,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return
+    out = proc.stdout
+    offset = 0
+    for path in paths:
+        newline = out.find(b"\n", offset)
+        if newline < 0:
+            return
+        header = out[offset:newline].decode("utf-8", "replace").split()
+        offset = newline + 1
+        # ``<oid> <type> <size>`` for a hit; ``<name> missing`` (no trailing
+        # payload) for a path the commit does not carry.
+        if len(header) != 3 or not header[2].isdigit():
+            continue
+        size = int(header[2])
+        blob = out[offset : offset + size]
+        offset += size + 1  # the batch format ends each payload with a newline
+        yield path, blob.decode("utf-8", "replace")
+
+
+def _read_many(source: str | None, paths: list[str]):
+    """``(path, contents)`` for each readable path in ``source``, or the tree if None.
+
+    A missing path is skipped either way: the question these feed is "did this
+    content already exist here", and a file that is not there held none.
+    """
+    if source is not None:
+        yield from _batch_show(source, paths)
+        return
+    for path in paths:
+        try:
+            yield path, (ROOT / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+
+def file_at(commit: str, path: str) -> str | None:
+    """A path's contents in ``commit``, or None when it did not exist there.
+
+    ``errors="replace"`` for the reason it is used everywhere else here: a file
+    that is not valid UTF-8 must yield a scannable string rather than raise
+    inside ``subprocess``.
+    """
+    proc = subprocess.run(
+        ["git", "--no-pager", "show", f"{commit}:{path}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def added_lines(scope_label: str) -> dict[str, set[int]] | None:
+    """Repo-relative path -> line numbers this change ADDED, or None.
+
+    Uses the diff endpoints named by ``changed_paths``' label, so the added set
+    and the changed-file set always describe the same diff. An unknown label (or
+    a failing git) degrades to None -- the added-line rule is then skipped
+    rather than guessed, and a caller's count rules still apply.
+
+    On a merge scope the answer is narrowed by :func:`_narrow_to_unwritten`: a
+    line whose text a pre-existing ancestry already carried in the same file was
+    not written here. This is a narrowing, not an exemption -- a line no ancestry
+    carried, which is exactly what a conflict resolution writes, survives it and
+    is still reported.
+    """
+    if scope_label == "merge HEAD^1..HEAD":
+        # Base to WORKING TREE, matching changed_paths' endpoints for this label.
+        args = ["diff", "--unified=0", "HEAD^1"]
+    elif scope_label == "merge parents":
+        args = ["diff", "--unified=0", "HEAD^1", "HEAD^2"]
+    elif scope_label.endswith("...HEAD"):
+        args = ["diff", "--unified=0", scope_label]
+    else:
+        return None
+    added = _added_from_diff(args)
+    if added is None:
+        return None
+    if scope_label not in _MERGE_CONTENT_TIPS:
+        return added
+    return _narrow_to_unwritten(_MERGE_CONTENT_TIPS[scope_label], scope_bases(scope_label), added)
+
+
+def _narrow_to_unwritten(
+    tip: str | None,
+    bases: list[str],
+    added: dict[str, set[int]],
+) -> dict[str, set[int]]:
+    """Drop added lines whose text a pre-existing ancestry already had in that file.
+
+    Position is the wrong key for a merge. A two-parent diff reports a line as
+    added whenever it MOVED -- an import that upstream left untouched but shifted
+    by an insertion above it reads as brand new against the other parent, and on
+    a fork sync that is most of the diff. So the question asked here is about
+    content: does this exact line already exist somewhere in this file in an
+    ancestry that predates the merge?
+
+    Two consequences are deliberate:
+
+    * **Whole-file, not same-position**, precisely so a move is not a write.
+    * **An exactly duplicated line is treated as inherited.** Re-adding a line
+      the file already contains elsewhere is the one thing this cannot tell
+      apart from a move, and accepting it is the safe direction for a rule whose
+      alternative is thousands of false reds with no in-diff remedy. What it
+      still catches is the case the rule exists for: text no ancestry contained,
+      which is what a conflict resolution and a hand edit both produce.
+    """
+    if not bases or not added:
+        return added
+    paths = sorted(added)
+    # Only the added lines' own text is needed, so the tip's contents are reduced
+    # to that immediately -- holding thousands of full files would not fit.
+    tip_text: dict[str, dict[int, str]] = {}
+    for path, contents in _read_many(tip, paths):
+        lines = contents.splitlines()
+        tip_text[path] = {
+            number: lines[number - 1].strip() for number in added[path] if 1 <= number <= len(lines)
+        }
+    remaining = {path: set(numbers) for path, numbers in added.items()}
+    for base in bases:
+        for path, contents in _read_many(base, paths):
+            candidates = remaining.get(path)
+            if not candidates:
+                continue
+            inherited = {line.strip() for line in contents.splitlines()}
+            texts = tip_text.get(path, {})
+            remaining[path] = {
+                number for number in candidates if texts.get(number, "\0") not in inherited
+            }
+    return {path: numbers for path, numbers in remaining.items() if numbers}
 
 
 # ---------------------------------------------------------------------------

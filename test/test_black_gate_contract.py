@@ -123,8 +123,13 @@ def test_only_this_changes_files_can_be_its_offenders() -> None:
     ), "the gate has grown a private copy of the shared resolver again"
     scope_source = (ROOT / "scripts" / "ratchet_scope.py").read_text(encoding="utf-8")
     # Both diff shapes: local branch tip, and CI's merge commit whose parents are
-    # base and PR head.
-    assert '"HEAD^1", "HEAD"' in scope_source, "the merge-vs-first-parent diff is the exact one"
+    # base and PR head. The merge diff names only its BASE endpoint, so it runs to
+    # the working tree: the gates scan the tree, and a scope computed against HEAD
+    # instead would judge a file the run never read -- on CI's clean checkout the
+    # two are identical, and locally the tree is the one that matches the scan.
+    assert (
+        '"diff", "--name-only", "HEAD^1"]' in scope_source
+    ), "the merge diff no longer runs from the first parent to the working tree"
     assert '"HEAD^1", "HEAD^2"' in scope_source
     assert "{base}...HEAD" in scope_source
     # The merge diffs are only exact when HEAD^1 IS the base; a local

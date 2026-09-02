@@ -14,7 +14,15 @@ need opposite diffs:
 
 The resolver decides by asking git which parent the base branch can reach, so
 these tests build one synthetic repo per shape and pin the attempt LABEL chosen
-plus the returned path set. The three-dot fallback deliberately keeps diffing
+plus the returned path set.
+
+A merge also has TWO ancestries, and ``TestMergeInheritsTwoAncestries`` pins the
+correction for that: content a parent already carried was not written by the
+merge, so it is not judged as added. Those tests come in pairs on purpose,
+because the correction and the hole it must not become are one code path -- for
+every accepted-inheritance case there is a case that must still fail, including
+the one that matters most, GitHub's merge ref, whose second parent is the PR
+itself. The three-dot fallback deliberately keeps diffing
 from ``merge-base(base, HEAD)`` rather than the base tip: an unscoped gate has
 already been observed reporting files the base branch merged after the baseline
 was taken, and the CI-shape test locks that property by moving main after the
@@ -335,3 +343,150 @@ def test_env_base_gates_delegate_to_the_shared_plumbing() -> None:
         source = (ROOT / "scripts" / name).read_text(encoding="utf-8")
         assert "ratchet_scope.py" in source, f"{name} no longer uses the shared plumbing"
         assert r"\+(\d+)(?:,(\d+))?" not in source, f"{name} grew a private hunk parser back"
+
+
+class TestMergeInheritsTwoAncestries:
+    """A merge is judged against BOTH parents, and a truly-new line still fails.
+
+    The correction and the hole it must not become are the same code path, so
+    every test here comes in a pair: an inherited line is accepted, and a line
+    no ancestry carried, in the same file of the same merge, is still reported.
+    """
+
+    @staticmethod
+    def _import_merge(repo: Path) -> None:
+        """A fork-sync shape: a real merge on main, both sides having edited one file.
+
+        ``consumer.py`` starts with one line. ``main`` inserts a line ABOVE it,
+        which is what makes the untouched line MOVE, and the imported branch
+        adds a line of its own below.
+        """
+        (repo / "consumer.py").write_text("original = 1\n", encoding="utf-8")
+        _git(repo, "add", "consumer.py")
+        _git(repo, "commit", "-m", "seed the consumer")
+        _git(repo, "checkout", "-b", "imported")
+        (repo / "consumer.py").write_text("original = 1\nfrom_upstream = 2\n", encoding="utf-8")
+        _git(repo, "commit", "-am", "upstream adds a line")
+        _git(repo, "checkout", "main")
+        (repo / "consumer.py").write_text("inserted_above = 0\noriginal = 1\n", encoding="utf-8")
+        _git(repo, "commit", "-am", "the fork inserts above")
+        _git(repo, "merge", "--no-ff", "-m", "sync", "imported", "--no-edit")
+
+    def test_a_line_only_moved_by_the_merge_is_not_reported_as_added(self, repo: Path) -> None:
+        self._import_merge(repo)
+        # The union of both sides: every line came from one or the other, so
+        # nothing was written by the merge. git resolves this one itself, and
+        # the merge commit is left as HEAD -- committing past it would make HEAD
+        # an ordinary commit and change the scope shape under test.
+
+        _, label = scope.changed_paths()
+        assert label == "merge HEAD^1..HEAD"
+        assert scope.added_lines(label).get("consumer.py", set()) == set()
+
+    def test_a_line_no_ancestry_carried_is_still_reported(self, repo: Path) -> None:
+        self._import_merge(repo)
+        # Left UNCOMMITTED on purpose: the merge scope diffs to the working
+        # tree, so this is what a resolver's own edit looks like to the gate
+        # while they are still fixing it.
+        (repo / "consumer.py").write_text(
+            "inserted_above = 0\noriginal = 1\nfrom_upstream = 2\nwritten_by_hand = 3\n",
+            encoding="utf-8",
+        )
+
+        _, label = scope.changed_paths()
+        # Only the hand-written line: line 4. Accepting it too would make the
+        # merge case a blanket exemption, which is the failure this pairs with.
+        assert scope.added_lines(label).get("consumer.py") == {4}
+
+    def test_the_imported_ancestry_is_named_and_the_own_history_is_not(self, repo: Path) -> None:
+        self._import_merge(repo)
+        imported = _git(repo, "rev-parse", "HEAD^2")
+        base = _git(repo, "rev-parse", "HEAD^1")
+
+        _, label = scope.changed_paths()
+        parents = scope.imported_parents(label)
+
+        assert parents == [imported]
+        # The base is not "imported" -- it is where the change started. It is
+        # a ceiling for the count rule, hence its presence in scope_bases.
+        assert base not in parents
+        assert scope.scope_bases(label) == [base, imported]
+
+    def test_a_non_merge_scope_names_no_ancestry(self, repo: Path) -> None:
+        # The fast-forward shape every ordinary PR takes: nothing about its
+        # judgment may move, so both helpers must answer empty.
+        _set_origin_main(repo)
+        _git(repo, "checkout", "feature")
+
+        _, label = scope.changed_paths()
+
+        assert label == "origin/main...HEAD"
+        assert scope.imported_parents(label) == []
+        assert scope.scope_bases(label) == []
+
+    def test_a_non_merge_scope_still_reports_a_plain_added_line(self, repo: Path) -> None:
+        # The counterpart: the added-line answer for a non-merge scope is the
+        # raw diff, with no content narrowing applied to it at all.
+        _set_origin_main(repo)
+        _git(repo, "checkout", "feature")
+        (repo / "feature.py").write_text("feature.py\nnovel = 1\n", encoding="utf-8")
+        _git(repo, "commit", "-am", "add a line")
+
+        _, label = scope.changed_paths()
+
+        # feature.py is wholly new against merge-base(main, HEAD), so BOTH of
+        # its lines are added -- the raw diff answer, unnarrowed.
+        assert scope.added_lines(label).get("feature.py") == {1, 2}
+
+    def test_a_ci_merge_ref_does_not_treat_the_pr_head_as_pre_existing(self, repo: Path) -> None:
+        # The dangerous direction. On GitHub's pull_request merge ref the second
+        # parent is the PR itself, so taking both parents as pre-existing
+        # history would accept every line the PR adds -- the gate deleted. The
+        # PR head must NOT appear as an imported ancestry.
+        _set_origin_main(repo)
+        _git(repo, "checkout", "--detach", "main")
+        _git(repo, "merge", "--no-ff", "-m", "merge ref", "feature", "--no-edit")
+        pr_head = _git(repo, "rev-parse", "HEAD^2")
+
+        _, label = scope.changed_paths()
+
+        assert label == "merge HEAD^1..HEAD"
+        assert pr_head not in scope.imported_parents(label)
+        assert pr_head not in scope.scope_bases(label)
+        # And the PR's own file is still judged as added.
+        assert scope.added_lines(label).get("feature.py") == {1}
+
+    def test_a_merge_nested_inside_a_ci_merge_ref_is_still_imported(self, repo: Path) -> None:
+        # The shape a fork-sync PR actually presents to CI: the PR head is
+        # itself a merge that imported foreign history. The walk must descend
+        # THROUGH the PR head -- own history -- and still name the ancestry it
+        # brought in, or the gate charges the PR with every upstream line.
+        _git(repo, "checkout", "-b", "imported-upstream", "main")
+        _commit_file(repo, "upstream.py", "foreign history")
+        upstream = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "feature")
+        _git(repo, "merge", "--no-ff", "-m", "sync upstream", upstream, "--no-edit")
+        _git(repo, "checkout", "main")
+        _set_origin_main(repo)
+        _git(repo, "checkout", "--detach", "main")
+        _git(repo, "merge", "--no-ff", "-m", "merge ref", "feature", "--no-edit")
+
+        _, label = scope.changed_paths()
+
+        assert label == "merge HEAD^1..HEAD"
+        assert scope.imported_parents(label) == [upstream]
+
+    def test_the_pull_request_env_signal_alone_forces_the_strict_direction(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A real merge ON a branch, so the detachment signal says "not a merge
+        # ref" -- but GITHUB_BASE_REF is set, which only a pull_request event
+        # does. Either signal is enough, and the strict reading must win: the
+        # second parent is then the change, never pre-existing history.
+        monkeypatch.setenv("GITHUB_BASE_REF", "main")
+        self._import_merge(repo)
+
+        _, label = scope.changed_paths()
+
+        assert label == "merge HEAD^1..HEAD"
+        assert scope.imported_parents(label) == []

@@ -84,8 +84,7 @@ class AllocationDeps:
     unlink_session_queue: Callable[[Any], None]
     unlink_queued_temp_paths: Callable[[dict[str, Any]], None]
     session_model: Callable[[Any, str | None, bool], str | None]
-    supports_capability: Callable[[str, str], bool]
-    registry_model_ids_capability: str
+    uses_registry_model_ids: Callable[[str], bool]
     load_config: Callable[[], Any]
     resolve_crew_identity: Callable[[Any, str | None, str | None], str]
     load_watchdog_settings: Callable[[str], object]
@@ -1130,10 +1129,7 @@ class SessionAllocationService:
 
         # Model resolution reads agent JSON and therefore stays off the loop.
         if model is None and inherits_config_model:
-            registry_model_ids = self._deps.supports_capability(
-                effective_backend,
-                self._deps.registry_model_ids_capability,
-            )
+            registry_model_ids = self._deps.uses_registry_model_ids(effective_backend)
             model = await asyncio.get_running_loop().run_in_executor(
                 None,
                 self._deps.session_model,

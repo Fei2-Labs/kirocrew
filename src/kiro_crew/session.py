@@ -91,8 +91,6 @@ if TYPE_CHECKING:
     from kiro_crew.acp.runtime import AcpRuntime, AcpSessionHandle
 
 from kiro_crew import model_registry, platform_compat, shutdown_event
-from kiro_crew.acp.backends import CAP_REGISTRY_MODEL_IDS
-from kiro_crew.acp.backends import supports as _supports_backend
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -104,6 +102,7 @@ from kiro_crew.acp.types import (
 from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
+from kiro_crew.agent_sdk import backend_uses_registry_model_ids
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     CONTEXT_WARN_MARGIN_PCT,
@@ -1018,8 +1017,7 @@ class SessionManager:
                     cast(bool, registry_model_ids),
                 ),
             ),
-            supports_capability=lambda backend, capability: _supports_backend(backend, capability),
-            registry_model_ids_capability=CAP_REGISTRY_MODEL_IDS,
+            uses_registry_model_ids=backend_uses_registry_model_ids,
             load_config=lambda: KiroCrewConfig.load(),
             resolve_crew_identity=lambda cfg, agent, crew: _resolve_allocation_crew_identity(
                 cfg, agent, crew

@@ -81,6 +81,24 @@ touches, for the reason the sibling gates document: CI evaluates a merge ref, so
 an unscoped gate would redden a PR for files the base branch merged after the
 baseline was recorded, and a stale count caused by someone else's cleanup is
 their prune to record.
+
+## A merge commit inherits two ancestries
+
+`ratchet_scope` reports when the scope's tip is a merge, and every rule above is
+then measured against BOTH histories the merge joins, not just the first parent:
+
+* the added-line rule drops lines whose text a parent already carried in that
+  file (`ratchet_scope.added_lines`), so an import that merely MOVED is not a
+  write;
+* the count rule takes each parent's own edge count as a ceiling alongside the
+  baseline (`_inherited_ceilings`), so a file whose count was already that high
+  in a parent is not growth.
+
+Neither is a merge exemption, and the difference matters: a fork sync's conflict
+resolution writes lines that exist in NEITHER parent, and those still fail. What
+the correction removes is a verdict that was simply wrong -- thousands of
+upstream-authored lines charged to whoever ran `git merge`, with no fix inside
+their own diff, leaving the forbidden baseline raise as the only exit.
 """
 
 from __future__ import annotations
@@ -501,11 +519,47 @@ def _shrunken_baseline(baseline: dict[str, int], current: dict[str, int]) -> dic
     return survivors
 
 
+def _inherited_ceilings(
+    files: list[str],
+    bases: list[str],
+    read_at,
+) -> dict[str, int]:
+    """Path -> the highest edge count any pre-existing ancestry already had.
+
+    Only ever consulted for a MERGE scope, where `bases` is
+    `ratchet_scope.scope_bases()`: the base plus each imported ancestry. A merge
+    inherits two histories, so a file's count is growth only when it exceeds
+    what BOTH of them carried -- otherwise a fork sync is reported as having
+    added every ACP import upstream wrote, which is false, has no fix inside the
+    merger's diff, and leaves the forbidden baseline raise as the only exit.
+
+    A path missing from an ancestry contributes nothing, and one that does not
+    parse there contributes nothing either: an unreadable ancestor must not be
+    able to RAISE a ceiling, so it is treated as having had no edges rather than
+    guessed at.
+    """
+    ceilings: dict[str, int] = {}
+    for rel in files:
+        highest = 0
+        for base in bases:
+            source = read_at(base, rel)
+            if source is None:
+                continue
+            try:
+                highest = max(highest, len(_violations_in_source(rel, source)))
+            except SyntaxError:
+                continue
+        if highest:
+            ceilings[rel] = highest
+    return ceilings
+
+
 def _verdicts(
     violations: dict[str, dict[int, str]],
     baseline: dict[str, int],
     changed: set[str] | None,
     added: dict[str, set[int]] | None,
+    inherited: dict[str, int] | None = None,
 ) -> tuple[list[str], list[str], dict[str, list[int]], list[str]]:
     """Split the scan against the baseline into the four things worth printing.
 
@@ -514,13 +568,24 @@ def _verdicts(
     tripwire: an edge landing anywhere in the tree turns the next unrelated PR
     red, and the author has no fix available in their own diff. Whoever grew the
     file is the PR that gets the error, because the file is in THEIR scope.
+
+    `inherited` raises the CEILING for a merge scope only (see
+    `_inherited_ceilings`) and never lowers one, so the baseline stays the floor
+    of the ratchet everywhere else. `shrunk` deliberately ignores it: a count
+    that fell below the recorded number is progress to record whatever a parent
+    used to carry, and reading a parent's higher count there would demand a
+    prune that does not exist.
     """
     current = {rel: len(lines) for rel, lines in violations.items()}
     in_scope = (lambda rel: True) if changed is None else (lambda rel: rel in changed)
+    ceilings = dict(inherited or {})
 
-    new_offenders = sorted(rel for rel in current if rel not in baseline and in_scope(rel))
+    def ceiling(rel: str) -> int:
+        return max(baseline.get(rel, 0), ceilings.get(rel, 0))
+
+    new_offenders = sorted(rel for rel in current if ceiling(rel) == 0 and in_scope(rel))
     grown = sorted(
-        rel for rel in current if rel in baseline and current[rel] > baseline[rel] and in_scope(rel)
+        rel for rel in current if ceiling(rel) > 0 and current[rel] > ceiling(rel) and in_scope(rel)
     )
     shrunk = sorted(
         rel for rel in baseline if current.get(rel, 0) < baseline[rel] and in_scope(rel)
@@ -529,7 +594,7 @@ def _verdicts(
     added_line_offenders: dict[str, list[int]] = {}
     if added is not None:
         for rel, lines in violations.items():
-            if rel in new_offenders or rel in grown or rel not in baseline:
+            if rel in new_offenders or rel in grown or ceiling(rel) == 0:
                 continue
             touched = sorted(set(lines) & added.get(rel, set()))
             if touched:
@@ -595,9 +660,20 @@ def run_gate(baseline_path: Path, update: bool) -> int:
     print("" if changed is None else f" ({len(changed)} changed file(s))")
     added = scope.added_lines(scope_label) if changed is not None else None
 
+    # A merge inherits two ancestries. Both the added-line answer above and the
+    # per-file counts below have to be measured against every one of them, or the
+    # merge is charged with everything the imported history wrote.
+    bases = scope.scope_bases(scope_label)
+    if bases:
+        print(f"  inheriting counts from {len(bases)} pre-existing ancestr(y/ies): {bases}")
+    inherited = _inherited_ceilings(sorted(violations), bases, scope.file_at) if bases else None
+
     new_offenders, grown, added_line_offenders, shrunk = _verdicts(
-        violations, baseline, changed, added
+        violations, baseline, changed, added, inherited
     )
+    ceiling_of = {
+        rel: max(baseline.get(rel, 0), (inherited or {}).get(rel, 0)) for rel in violations
+    }
 
     for rel in new_offenders:
         print(
@@ -608,7 +684,7 @@ def run_gate(baseline_path: Path, update: bool) -> int:
             print(f"  {rel}:{line}")
     for rel in grown:
         print(
-            f"::error file={rel}::ACP-layer imports grew from {baseline[rel]} to "
+            f"::error file={rel}::ACP-layer imports grew from {ceiling_of[rel]} to "
             f"{current[rel]}. The baseline is shrink-only."
         )
         for line in violations[rel]:
@@ -744,6 +820,8 @@ def _self_test() -> int:
     if _is_exempt("src/kiro_crew/dashboard/chat_runner.py"):
         failures.append("a consumer tree is exempt")
 
+    failures.extend(_merge_scope_probes())
+
     for line in failures:
         print(f"::error::{line}")
     if failures:
@@ -751,9 +829,102 @@ def _self_test() -> int:
         return 1
     print(
         f"self-test passed: {len(flagged)} violation probe(s) flagged, "
-        f"{len(clean)} clean probe(s) ignored."
+        f"{len(clean)} clean probe(s) ignored, "
+        f"{_MERGE_PROBE_COUNT} merge-scope probe(s) upheld."
     )
     return 0
+
+
+# Paired probes in `_merge_scope_probes`: each accepted-inheritance case has a
+# still-fails counterpart, so the count is stated rather than derived from a
+# list a refactor could quietly shorten.
+_MERGE_PROBE_COUNT = 6
+
+
+def _merge_scope_probes() -> list[str]:
+    """Probe the two-parent verdicts: inherited is accepted, genuinely-new is not.
+
+    A merge is judged against BOTH of its ancestries, and the failure mode that
+    correction can introduce is worse than the one it fixes: a rule that treats
+    every merge as exempt turns the gate off for exactly the commit that imports
+    the most code. So each probe below is paired -- the inherited edge is
+    accepted, and the same scenario with an edge no ancestry carried still
+    fails.
+
+    Pure functions with a stubbed content reader, so no git repository is
+    involved and the probes cannot go quiet on a shallow checkout.
+    """
+    failures: list[str] = []
+    inherited_file = "src/kiro_crew/dashboard/inherited.py"
+    novel_file = "src/kiro_crew/dashboard/novel.py"
+    two_edges = "from kiro_crew.acp.types import AcpEvent\nimport kiro_crew.acp.client\n"
+    ancestries = {
+        # The fork parent carried both edges; the upstream parent carried none.
+        ("fork", inherited_file): two_edges,
+        ("upstream", inherited_file): "from kiro_crew.agent_sdk import probe_backend\n",
+    }
+    read_at = ancestries.get
+
+    ceilings = _inherited_ceilings(
+        [inherited_file, novel_file], ["fork", "upstream"], lambda c, r: read_at((c, r))
+    )
+    if ceilings.get(inherited_file) != 2:
+        failures.append(
+            "an ancestry's own edge count did not raise the ceiling "
+            f"(got {ceilings.get(inherited_file)!r}, want 2)"
+        )
+    if novel_file in ceilings:
+        failures.append("a file NO ancestry carried was given an inherited ceiling")
+
+    violations = {inherited_file: {1: "kiro_crew.acp", 2: "kiro_crew.acp"}}
+    changed = {inherited_file, novel_file}
+    # As `ratchet_scope.added_lines` hands it over for a merge: the lines an
+    # ancestry already carried are already narrowed out of the added set, so the
+    # only edges reaching here on an added line are ones nothing inherited.
+    added: dict[str, set[int]] = {}
+
+    # Inherited: an empty baseline plus the ancestry's ceiling accepts it.
+    new_offenders, grown, on_added, _ = _verdicts(violations, {}, changed, added, ceilings)
+    if new_offenders or grown or on_added:
+        failures.append(
+            "a merge was charged with edges an ancestry already had "
+            f"(new={new_offenders}, grown={grown}, added={sorted(on_added)})"
+        )
+
+    # The same input with NO inherited ceilings -- a non-merge scope -- must
+    # still fail, or the correction has silently disabled the ordinary rule.
+    new_offenders, _, _, _ = _verdicts(violations, {}, changed, {inherited_file: {1, 2}}, None)
+    if new_offenders != [inherited_file]:
+        failures.append(
+            "a non-merge scope stopped reporting a new offender " f"(got {new_offenders!r})"
+        )
+
+    # Genuinely new: an edge beyond every ancestry's count is still growth.
+    grew = {inherited_file: {1: "kiro_crew.acp", 2: "kiro_crew.acp", 3: "kiro_crew.acp"}}
+    _, grown, _, _ = _verdicts(grew, {}, changed, {inherited_file: {3}}, ceilings)
+    if grown != [inherited_file]:
+        failures.append(f"a merge-scoped count ABOVE every ancestry passed (grown={grown!r})")
+
+    # Genuinely new: a file no ancestry carried at all is a new offender even
+    # under a merge scope.
+    fresh = {novel_file: {1: "kiro_crew.acp"}}
+    new_offenders, _, _, _ = _verdicts(fresh, {}, changed, {novel_file: {1}}, ceilings)
+    if new_offenders != [novel_file]:
+        failures.append(
+            f"a merge scope exempted a file no ancestry carried (new={new_offenders!r})"
+        )
+
+    # Genuinely new: an edge on an added line inside an INHERITED file, with the
+    # count level, is the case the added-line rule exists for and a merge must
+    # not launder it.
+    _, _, on_added, _ = _verdicts(violations, {}, changed, {inherited_file: {2}}, ceilings)
+    if sorted(on_added) != [inherited_file]:
+        failures.append(
+            "a merge scope dropped the added-line rule for an inherited file "
+            f"(added={sorted(on_added)!r})"
+        )
+
+    return failures
 
 
 def main(argv: list[str] | None = None) -> int:

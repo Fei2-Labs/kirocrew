@@ -594,12 +594,9 @@ def _spawn_effective_model(
             override = _session_model(cfg, agent or None)
         registry_model_ids = True
         if acp_backend is not None:
-            from kiro_crew.acp import backends as acp_backends
+            from kiro_crew.agent_sdk import backend_uses_registry_model_ids
 
-            registry_model_ids = acp_backends.supports(
-                acp_backend,
-                acp_backends.CAP_REGISTRY_MODEL_IDS,
-            )
+            registry_model_ids = backend_uses_registry_model_ids(acp_backend)
         return (
             cfg.acp_effective_model(
                 agent or None,

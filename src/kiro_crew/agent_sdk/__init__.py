@@ -12,6 +12,11 @@ three-state verdict (``installed`` / ``missing`` / ``unknown``) that names the
 absent component and never reports a failed check as an absent install. Its
 contract lives above the boundary; every resolve it needs is the ACP driver's.
 
+Beside it sits :mod:`kiro_crew.agent_sdk.capabilities`, which answers the
+PRE-SESSION backend questions as named predicates -- what a consumer needs to
+know, never which backend it is talking to, and never the ACP layer's own
+capability keys.
+
 Layering::
 
     consumers        dashboard/  slack/  discord/  telegram/  messaging/
@@ -54,6 +59,7 @@ from kiro_crew.agent_sdk.backend_install import (
     probe_backend,
     probe_backends,
 )
+from kiro_crew.agent_sdk.capabilities import backend_uses_registry_model_ids
 
 __all__ = [
     "CACHE_TTL_SECONDS",
@@ -64,6 +70,7 @@ __all__ = [
     "MISSING",
     "UNKNOWN",
     "BackendInstallState",
+    "backend_uses_registry_model_ids",
     "clear_probe_cache",
     "probe_backend",
     "probe_backends",

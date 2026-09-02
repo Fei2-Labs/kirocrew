@@ -449,3 +449,59 @@ def test_every_verdict_is_scope_gated(gate):
     assert new_offenders == [rels["new"]]
     assert grown == [rels["grown"]]
     assert shrunk == [rels["shrunk"]]
+
+
+def test_an_inherited_ceiling_never_lowers_the_baseline(gate):
+    """A parent's count may only RAISE the ceiling, never relax the ratchet.
+
+    The merge correction hands `_verdicts` each ancestry's own edge count. If
+    that replaced the baseline instead of joining it, a file whose parents were
+    cleaner than the recorded number would silently acquire a stricter-looking
+    ceiling that is really a different one -- and, in the other direction, a
+    baselined file could be judged against a parent that never carried the file
+    at all.
+    """
+    rel = "src/kiro_crew/dashboard/inherited.py"
+    violations = {rel: {1: "kiro_crew.acp", 2: "kiro_crew.acp"}}
+
+    # Parents cleaner than the baseline: the baseline still governs, so a count
+    # at the recorded ceiling passes.
+    _, grown, _, _ = gate._verdicts(violations, {rel: 2}, {rel}, {}, {rel: 1})
+    assert grown == [], "a lower inherited count must not override the baseline"
+
+    # Parents dirtier than the baseline: the merge inherited that count, so it
+    # is not growth introduced here.
+    _, grown, _, _ = gate._verdicts(violations, {rel: 1}, {rel}, {}, {rel: 2})
+    assert grown == [], "a count an ancestry already had is not this merge's growth"
+
+    # Beyond both: still growth. This is what stops the correction becoming a
+    # blanket merge exemption.
+    beyond = {rel: {1: "kiro_crew.acp", 2: "kiro_crew.acp", 3: "kiro_crew.acp"}}
+    _, grown, _, _ = gate._verdicts(beyond, {rel: 1}, {rel}, {}, {rel: 2})
+    assert grown == [rel], "a count above every ancestry and the baseline must fail"
+
+
+def test_the_registry_model_id_question_is_asked_through_the_boundary():
+    """The one capability consumers ask pre-session comes from `agent_sdk`.
+
+    `session.py` and `subagent.py` both need to know whether a backend takes
+    registry-spelled model ids. Re-exporting `supports` plus the capability KEY
+    would pass the import gate while leaving the branch on ACP vocabulary in
+    application code, so the boundary exposes the QUESTION and the key stays
+    behind the driver.
+    """
+    import kiro_crew.agent_sdk as sdk
+    from kiro_crew.agent_sdk.drivers import acp as driver
+
+    assert "backend_uses_registry_model_ids" in sdk.__all__
+    assert "backend_uses_registry_model_ids" in driver.__all__
+    assert not hasattr(sdk, "CAP_REGISTRY_MODEL_IDS"), "the capability key must not cross"
+    assert not hasattr(sdk, "supports"), "the generic capability probe must not cross"
+
+
+def test_the_boundary_reexports_exactly_what_it_declares():
+    """`__all__` is the boundary's contract; a drifting one is a silent hole."""
+    import kiro_crew.agent_sdk as sdk
+
+    for name in sdk.__all__:
+        assert hasattr(sdk, name), f"{name} is declared but not importable"

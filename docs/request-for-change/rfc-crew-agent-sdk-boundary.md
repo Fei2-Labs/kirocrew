@@ -415,6 +415,14 @@ def spawnable_multiplexed_selections() -> frozenset[str]:
     """
 ```
 
+The same reasoning covers `backend_uses_registry_model_ids`, which shipped as
+`agent_sdk/capabilities.py` alongside the install probes: it decides how to
+resolve a model *before* a session exists, so no session value can answer it, and
+it is spelled as the QUESTION rather than as `supports` plus a re-exported
+`CAP_REGISTRY_MODEL_IDS`. Handing a consumer the capability key would satisfy the
+import gate while leaving the branch on the ACP layer's own vocabulary, which is
+the shape §5.2's third principle rejects.
+
 `multiplexes_sessions` stays on `SessionCapabilities` for the post-session
 question (the existing spelling, `providers/acp.py:466-476`, needs a started
 process, which is what makes it post-session). A registry function was chosen over
@@ -661,6 +669,21 @@ than a figure that rots.
 - Exit: `./scripts/docs-lint.sh` passes and the host-contract spec is reachable
   from `docs/system-specs/features/README.md`.
 - Blocked on: nothing.
+
+**A merge commit is judged against BOTH of its parents.** The gate's scope, like
+every sibling ratchet's, comes from `scripts/ratchet_scope.py`, and for a merge
+that resolver names each pre-existing ancestry (`imported_parents` /
+`scope_bases`). Added lines are narrowed to text no ancestry carried in that
+file, and each ancestry's own edge count joins the baseline as a ceiling. Without
+it a fork sync charges whoever ran `git merge` with every ACP import upstream
+wrote — a verdict with no fix inside their diff, whose only exit is the baseline
+raise this document and the baseline header both forbid. It is not a merge
+exemption: a conflict resolution writes lines that exist in NEITHER parent, and
+those still fail. The one shape that must not be corrected is GitHub's synthetic
+`pull_request` merge ref, whose second parent is the PR itself; it is recognised
+from `GITHUB_BASE_REF` and from being checked out detached, and the walk descends
+*through* it so a fork-sync merge nested inside a PR is still recognised as
+imported.
 
 ### PR 2 — the SDK owns the types
 
