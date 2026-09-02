@@ -670,15 +670,17 @@ than a figure that rots.
   from `docs/system-specs/features/README.md`.
 - Blocked on: nothing.
 
-**A merge commit is judged against BOTH of its parents.** The gate's scope, like
-every sibling ratchet's, comes from `scripts/ratchet_scope.py`, and for a merge
+**A change is judged against every ancestry its range imported.** The gate's
+scope, like every sibling ratchet's, comes from `scripts/ratchet_scope.py`, and
 that resolver names each pre-existing ancestry (`imported_parents` /
-`scope_bases`). Added lines are narrowed to text no ancestry carried in that
+`scope_bases`) by looking for merges anywhere between the base and the tip --
+not at the tip's own shape, which stops being a merge as soon as one ordinary
+commit lands on top of it. Added lines are narrowed to text no ancestry carried in that
 file, and each ancestry's own edge count joins the baseline as a ceiling. Without
 it a fork sync charges whoever ran `git merge` with every ACP import upstream
 wrote — a verdict with no fix inside their diff, whose only exit is the baseline
-raise this document and the baseline header both forbid. It is not a merge
-exemption: a conflict resolution writes lines that exist in NEITHER parent, and
+raise this document and the baseline header both forbid. It is not an
+exemption: a conflict resolution writes lines that exist in NO ancestry, and
 those still fail. The one shape that must not be corrected is GitHub's synthetic
 `pull_request` merge ref, whose second parent is the PR itself; it is recognised
 from `GITHUB_BASE_REF` and from being checked out detached, and the walk descends

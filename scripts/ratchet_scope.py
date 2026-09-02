@@ -152,7 +152,12 @@ def changed_paths() -> tuple[set[str] | None, str]:
         attempts.append(("merge HEAD^1..HEAD", ["diff", "--name-only", "HEAD^1"]))
         attempts.append(("merge parents", ["diff", "--name-only", "HEAD^1", "HEAD^2"]))
     for base in ("origin/main", "main"):
-        attempts.append((f"{base}...HEAD", ["diff", "--name-only", f"{base}...HEAD"]))
+        # `{base}...HEAD` is `merge-base(base, HEAD)..HEAD`, so the base is
+        # resolved explicitly and the diff left with ONE endpoint -- it then
+        # runs to the working tree, which is what every consuming gate scans.
+        # `resolve_base` also survives a shallow clone with no shared history,
+        # where the three-dot form simply fails.
+        attempts.append((f"{base}...HEAD", ["diff", "--name-only", resolve_base(base)]))
     for label, args in attempts:
         code, out = _git(*args)
         if code == 0:
@@ -188,18 +193,36 @@ def _added_from_diff(args: list[str]) -> dict[str, set[int]] | None:
     return added
 
 
-# The merge scope labels ``changed_paths`` can return, mapped to the commit at
-# the scope's TIP. Used for TOPOLOGY -- walking ancestries -- so it names a
-# commit even where the diff endpoint is the working tree.
-_MERGE_TIPS = {"merge HEAD^1..HEAD": "HEAD", "merge parents": "HEAD^2"}
+def _scope_endpoints(scope_label: str) -> tuple[str, str, str | None] | None:
+    """``(base commit, tip commit, where the tip's CONTENT is)`` for a scope label.
 
-# The same labels mapped to where the tip's CONTENT is read from. None means the
-# working tree, which is what the first label's diff endpoint is: the added-line
-# numbers index the tree the gate scans, so their text must come from there too.
-_MERGE_CONTENT_TIPS: dict[str, str | None] = {
-    "merge HEAD^1..HEAD": None,
-    "merge parents": "HEAD^2",
-}
+    One place decides what a label's two endpoints actually are, because three
+    separate answers depend on it and they must agree: the changed-file set, the
+    added-line set, and the ancestry walk. The third element is where the tip's
+    text is READ from -- ``None`` meaning the working tree, which is the tip of
+    every scope whose diff has no second endpoint. That matters because the gates
+    scan the working tree: a line number produced against HEAD and looked up in
+    the tree is a line number in the wrong file.
+
+    ``None`` for an undeterminable scope, where the caller judges the whole tree
+    and no correction applies.
+    """
+    if scope_label == "merge HEAD^1..HEAD":
+        # Both endpoints RESOLVED: the ancestry walk matches the tip against
+        # `rev-list` output, which prints full hashes, so a bare "HEAD" here
+        # matches nothing and silently reports that nothing was imported.
+        base, tip = _rev("HEAD^1"), _rev("HEAD")
+        return (base, tip, None) if base and tip else None
+    if scope_label == "merge parents":
+        # The one label whose tip is not HEAD, so the working tree is neither
+        # endpoint and the content comes from the commit.
+        base, tip = _rev("HEAD^1"), _rev("HEAD^2")
+        return (base, tip, tip) if base and tip else None
+    if scope_label.endswith("...HEAD"):
+        tip = _rev("HEAD")
+        base = _rev(resolve_base(scope_label[: -len("...HEAD")]))
+        return (base, tip, None) if base and tip else None
+    return None
 
 
 def _rev(ref: str) -> str | None:
@@ -208,13 +231,8 @@ def _rev(ref: str) -> str | None:
     return resolved if code == 0 and resolved else None
 
 
-def _parents(commit: str) -> list[str]:
-    code, out = _git("rev-list", "--parents", "-n", "1", commit)
-    return out.split()[1:] if code == 0 else []
-
-
 def imported_parents(scope_label: str) -> list[str]:
-    """Histories a MERGE at the scope tip brought in, which this change did not write.
+    """Ancestries the scope's RANGE imported, which this change did not write.
 
     A merge commit has two ancestries, and a line that already existed in either
     one was not introduced by the person who made the merge. Judging such a line
@@ -233,50 +251,87 @@ def imported_parents(scope_label: str) -> list[str]:
     * a real merge on the branch (``git merge upstream/main``): ``HEAD^1`` is the
       work so far and ``HEAD^2`` is foreign history being imported.
 
-    Topology alone cannot tell them apart -- a PR branch and an upstream branch
-    both merely SHARE a fork point with the base, and once the base moves after
-    the branch point neither is reachable from it. So the synthetic ref is
-    recognised for what it is, by :func:`_tip_is_pr_merge_ref`, and its second
-    parent is taken as this change's own history: the walk descends THROUGH it,
-    which is what finds the fork-sync merge nested inside a PR and still names
-    the upstream ancestry that one imported. Every other non-first parent is
-    imported, unless the base already contains it (a ``git merge origin/main``
-    into the branch brought in nothing the base lacked).
+    **The tip's own shape is irrelevant.** An earlier version of this keyed on
+    "HEAD is a merge", and that is a property of where the branch happens to
+    stand: one ordinary commit on top of a fork-sync merge makes HEAD
+    single-parent, the whole imported diff is attributed to the change again, and
+    the same false verdict returns by a different door. A fast-forwardable PR is
+    the same defect from the other side, because GitHub then hands CI a
+    non-merge tip. So the question is asked of the RANGE: any merge between the
+    base and the tip may have imported an ancestry, wherever it sits.
 
-    An empty list for every non-merge scope, so nothing about a fast-forward
-    change's judgment moves.
+    **Range membership is not the criterion; the FIRST-PARENT chain is.** Asking
+    only for parents outside ``base..tip`` sounds equivalent and is not: an
+    imported upstream commit is reachable from the tip and unreachable from the
+    base, so it is squarely inside the range and that test answers "nothing was
+    imported". What separates the two is which side of a merge the range's own
+    development went down. This change's own history is the first-parent chain
+    from the tip; everything a merge on that chain joined from the other side is
+    an ancestry the range imported rather than authored. The chain is also what
+    keeps the walk cheap and bounded -- it stops at the base rather than at the
+    root.
+
+    Topology alone cannot answer one case, and it is the expensive one. A PR
+    branch and an upstream branch both merely SHARE a fork point with the base,
+    so on GitHub's synthetic ``pull_request`` merge ref the second parent -- the
+    PR itself -- looks exactly like imported history, and accepting it would
+    accept every line the PR adds. That ref is therefore recognised for what it
+    is (:func:`_tip_is_pr_merge_ref`) and its other parents are seeded as own
+    history, so the walk descends THROUGH the PR and still names the upstream
+    ancestry a fork-sync merge inside it imported.
+
+    A parent the base already contains is not imported either: a
+    ``git merge origin/main`` into the branch brought in nothing the base lacked.
+    An empty list whenever the range holds no merge at all, so an ordinary
+    fast-forward change inherits nothing.
     """
-    tip_ref = _MERGE_TIPS.get(scope_label)
-    if tip_ref is None:
+    endpoints = _scope_endpoints(scope_label)
+    if endpoints is None:
         return []
-    base = _rev("HEAD^1")
-    tip = _rev(tip_ref)
-    if base is None or tip is None:
+    base, tip, _content = endpoints
+    # One call for the whole range's topology. Per-commit `rev-list -n 1` was
+    # affordable only while the walk was three commits long; bounded by the
+    # range, it is still the walk's entire cost.
+    code, out = _git("rev-list", "--parents", f"{base}..{tip}")
+    if code != 0:
         return []
-    synthetic = tip_ref == "HEAD" and _tip_is_pr_merge_ref()
-    own: set[str] = {base}
-    imported: list[str] = []
+    parents_of: dict[str, list[str]] = {}
+    for line in out.splitlines():
+        fields = line.split()
+        if fields:
+            parents_of[fields[0]] = fields[1:]
+
+    own: set[str] = set()
     pending = [tip]
+    if _tip_is_pr_merge_ref():
+        # The merge ref's other parents are the change, not history it imported.
+        pending.extend(parents_of.get(tip, [])[1:])
     while pending:
         commit: str | None = pending.pop()
-        while commit is not None and commit not in own:
+        # Leaving the range means the base's own history: stop rather than walk
+        # to the root.
+        while commit is not None and commit in parents_of and commit not in own:
             own.add(commit)
-            parents = _parents(commit)
-            for parent in parents[1:]:
-                if commit == tip and synthetic:
-                    pending.append(parent)  # the PR itself, not imported history
-                elif _git("merge-base", "--is-ancestor", parent, base)[0] == 0:
-                    continue  # the base already contains it
-                elif parent not in imported:
-                    imported.append(parent)
-            # ``rev-list --parents`` already prints full hashes, so the chain
-            # walks on without another rev-parse round trip.
-            commit = parents[0] if parents else None
+            chain = parents_of[commit]
+            commit = chain[0] if chain else None
+
+    imported: list[str] = []
+    for commit in sorted(own):
+        for parent in parents_of.get(commit, [])[1:]:
+            if parent in own or parent in imported:
+                continue
+            if _git("merge-base", "--is-ancestor", parent, base)[0] == 0:
+                continue  # the base already contains it
+            imported.append(parent)
     return imported
 
 
 def _tip_is_pr_merge_ref() -> bool:
-    """True when HEAD is GitHub's SYNTHETIC ``pull_request`` merge commit.
+    """True when HEAD may be GitHub's SYNTHETIC ``pull_request`` merge commit.
+
+    A True answer only ever moves HEAD's own non-first parents from "imported"
+    to "own history", so it is inert when HEAD is not a merge -- which is why it
+    can be asked unconditionally.
 
     This has to be answered from outside git, because inside git it is not
     answerable: the merge ref and a real ``git merge`` of a fork's upstream have
@@ -309,22 +364,29 @@ def _tip_is_pr_merge_ref() -> bool:
 
 
 def scope_bases(scope_label: str) -> list[str]:
-    """Every commit whose content a MERGE-scoped change inherited rather than wrote.
+    """Every commit whose content this change inherited rather than wrote.
 
-    The base plus :func:`imported_parents`. A count-baseline ratchet reads this
-    to answer "was this file's violation count already this high in something
-    that predates the merge?" -- the count half of the same correction
-    :func:`imported_parents` makes for added lines. Deliberately NOT the merge's
-    literal parent list: on CI's merge ref one of those parents is the PR head,
-    and taking its counts as a ceiling would accept any regression the PR
-    introduced.
+    The base, plus each ancestry :func:`imported_parents` names. A count-baseline
+    ratchet reads this to answer "was this file's count already this high in
+    something that predates the change?" -- the count half of the correction
+    :func:`imported_parents` makes for added lines.
 
-    Empty for a non-merge scope, where the baseline is the only ceiling.
+    The BASE belongs here for the same reason its imports do. Once a merge has
+    legitimately raised a file's count on the base branch, and the baseline
+    cannot be raised to match, every later change needs somewhere honest to
+    inherit that number from; the base is a real commit that predates the change
+    and cannot contain anything the change wrote. What is deliberately NOT here
+    is the tip's literal parent list: on GitHub's merge ref one of those is the
+    PR head, and taking its counts as a ceiling would accept any regression the
+    PR introduced.
+
+    Empty only for an undeterminable scope, where the caller already judges the
+    whole tree.
     """
-    if scope_label not in _MERGE_TIPS:
+    endpoints = _scope_endpoints(scope_label)
+    if endpoints is None:
         return []
-    base = _rev("HEAD^1")
-    return ([base] if base else []) + imported_parents(scope_label)
+    return [endpoints[0]] + imported_parents(scope_label)
 
 
 def _batch_show(commit: str, paths: list[str]):
@@ -410,27 +472,23 @@ def added_lines(scope_label: str) -> dict[str, set[int]] | None:
     a failing git) degrades to None -- the added-line rule is then skipped
     rather than guessed, and a caller's count rules still apply.
 
-    On a merge scope the answer is narrowed by :func:`_narrow_to_unwritten`: a
-    line whose text a pre-existing ancestry already carried in the same file was
-    not written here. This is a narrowing, not an exemption -- a line no ancestry
-    carried, which is exactly what a conflict resolution writes, survives it and
-    is still reported.
+    The answer is then narrowed by :func:`_narrow_to_unwritten`: a line whose
+    text a commit this change inherited already carried in the same file was not
+    written here. This is a narrowing, not an exemption -- a line no ancestry
+    carried, which is exactly what a conflict resolution or a hand edit writes,
+    survives it and is still reported.
     """
-    if scope_label == "merge HEAD^1..HEAD":
-        # Base to WORKING TREE, matching changed_paths' endpoints for this label.
-        args = ["diff", "--unified=0", "HEAD^1"]
-    elif scope_label == "merge parents":
-        args = ["diff", "--unified=0", "HEAD^1", "HEAD^2"]
-    elif scope_label.endswith("...HEAD"):
-        args = ["diff", "--unified=0", scope_label]
-    else:
+    endpoints = _scope_endpoints(scope_label)
+    if endpoints is None:
         return None
+    base, tip, content_tip = endpoints
+    # A second endpoint only where the working tree is not the tip. Everywhere
+    # else the diff runs to the tree, which is what the gates scan.
+    args = ["diff", "--unified=0", base] + ([tip] if content_tip is not None else [])
     added = _added_from_diff(args)
     if added is None:
         return None
-    if scope_label not in _MERGE_CONTENT_TIPS:
-        return added
-    return _narrow_to_unwritten(_MERGE_CONTENT_TIPS[scope_label], scope_bases(scope_label), added)
+    return _narrow_to_unwritten(content_tip, scope_bases(scope_label), added)
 
 
 def _narrow_to_unwritten(

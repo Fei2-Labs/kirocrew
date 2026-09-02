@@ -412,17 +412,20 @@ class TestMergeInheritsTwoAncestries:
         assert base not in parents
         assert scope.scope_bases(label) == [base, imported]
 
-    def test_a_non_merge_scope_names_no_ancestry(self, repo: Path) -> None:
-        # The fast-forward shape every ordinary PR takes: nothing about its
-        # judgment may move, so both helpers must answer empty.
+    def test_a_range_with_no_merge_in_it_imports_no_ancestry(self, repo: Path) -> None:
+        # The fast-forward shape every ordinary PR takes. Nothing was imported,
+        # so `imported_parents` is empty -- but the BASE is still a ceiling,
+        # because it is a real commit predating the change that cannot contain
+        # anything the change wrote.
         _set_origin_main(repo)
         _git(repo, "checkout", "feature")
+        base = _git(repo, "merge-base", "origin/main", "HEAD")
 
         _, label = scope.changed_paths()
 
         assert label == "origin/main...HEAD"
         assert scope.imported_parents(label) == []
-        assert scope.scope_bases(label) == []
+        assert scope.scope_bases(label) == [base]
 
     def test_a_non_merge_scope_still_reports_a_plain_added_line(self, repo: Path) -> None:
         # The counterpart: the added-line answer for a non-merge scope is the
@@ -490,3 +493,91 @@ class TestMergeInheritsTwoAncestries:
 
         assert label == "merge HEAD^1..HEAD"
         assert scope.imported_parents(label) == []
+
+    @staticmethod
+    def _import_merge_on_a_side_branch(repo: Path) -> str:
+        """The same fork-sync shape, but on a branch ``main`` never reaches.
+
+        The on-main variant above cannot express a merge buried in the RANGE:
+        committing on main afterwards moves the base past the merge, so the base
+        contains it and every commit of interest is between it and the tip.
+
+        ``consumer.py`` is seeded ON MAIN, so it predates the base: a line only
+        MOVED by the merge has to be a line the base already had, and a file
+        created inside the range is wholly new to it. Returns the imported
+        branch's tip; ``main`` is left where the seed put it, so a caller sets
+        ``origin/main`` AFTER calling this.
+        """
+        (repo / "consumer.py").write_text("original = 1\n", encoding="utf-8")
+        _git(repo, "add", "consumer.py")
+        _git(repo, "commit", "-m", "seed the consumer on the base")
+        _git(repo, "checkout", "-b", "work", "main")
+        _git(repo, "checkout", "-b", "imported-upstream")
+        (repo / "consumer.py").write_text("original = 1\nfrom_upstream = 2\n", encoding="utf-8")
+        _git(repo, "commit", "-am", "upstream adds a line")
+        imported = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "work")
+        (repo / "consumer.py").write_text("inserted_above = 0\noriginal = 1\n", encoding="utf-8")
+        _git(repo, "commit", "-am", "the fork inserts above")
+        _git(repo, "merge", "--no-ff", "-m", "sync", "imported-upstream", "--no-edit")
+        return imported
+
+    def test_a_non_merge_tip_still_inherits_a_merge_inside_its_range(self, repo: Path) -> None:
+        # The defect that survived keying on "HEAD is a merge": one ordinary
+        # commit on top of a fork-sync merge makes HEAD single-parent, and the
+        # whole imported diff was attributed to the change again. The merge is
+        # still in the range, so the ancestry it imported is still inherited.
+        imported = self._import_merge_on_a_side_branch(repo)
+        _set_origin_main(repo)
+        _commit_file(repo, "afterwards.txt", "an ordinary commit on top of the merge")
+        assert len(_git(repo, "log", "-1", "--format=%p").split()) == 1, "tip must be non-merge"
+
+        _, label = scope.changed_paths()
+
+        assert label == "origin/main...HEAD"
+        assert scope.imported_parents(label) == [imported]
+
+    def test_the_narrowing_still_applies_through_a_non_merge_tip(self, repo: Path) -> None:
+        # The same generalization, end to end, with the merge buried behind an
+        # ordinary commit instead of sitting at the tip. `consumer.py` ends as
+        #   1 inserted_above = 0   <- written on this branch, inside the range
+        #   2 original = 1         <- the base's line, only MOVED down by (1)
+        #   3 from_upstream = 2    <- the imported ancestry's line
+        # so exactly one of the three is this change's to answer for. Line 2 is
+        # the one the correction exists for: nothing but its position changed.
+        self._import_merge_on_a_side_branch(repo)
+        _set_origin_main(repo)
+        _commit_file(repo, "afterwards.txt", "an ordinary commit on top of the merge")
+
+        _, label = scope.changed_paths()
+
+        assert scope.added_lines(label).get("consumer.py") == {1}
+
+        # And a line no ancestry carried is still reported when it lands beside
+        # them, which is what stops this being an exemption.
+        (repo / "consumer.py").write_text(
+            "inserted_above = 0\noriginal = 1\nfrom_upstream = 2\nwritten_by_hand = 3\n",
+            encoding="utf-8",
+        )
+        assert scope.added_lines(label).get("consumer.py") == {1, 4}
+
+    def test_a_merge_deep_in_the_range_is_found_from_a_ci_merge_ref_too(self, repo: Path) -> None:
+        # Both generalizations at once: a fork-sync merge, an ordinary commit on
+        # top of it, and THEN GitHub's merge ref over that. The walk must
+        # descend through the PR head, past the ordinary commit, and still name
+        # the imported ancestry -- while never treating the PR head itself as
+        # pre-existing.
+        imported = self._import_merge_on_a_side_branch(repo)
+        _commit_file(repo, "afterwards.txt", "the PR's own commit")
+        pr_head = _git(repo, "rev-parse", "HEAD")
+        _git(repo, "checkout", "main")
+        _commit_file(repo, "base-moved.txt", "the base moves after the branch point")
+        _set_origin_main(repo)
+        _git(repo, "checkout", "--detach", "main")
+        _git(repo, "merge", "--no-ff", "-m", "merge ref", "work", "--no-edit")
+
+        _, label = scope.changed_paths()
+
+        assert label == "merge HEAD^1..HEAD"
+        assert scope.imported_parents(label) == [imported]
+        assert pr_head not in scope.scope_bases(label)
