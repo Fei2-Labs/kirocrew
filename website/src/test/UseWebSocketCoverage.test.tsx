@@ -245,9 +245,13 @@ describe('useWebSocket frame router', () => {
     }
   })
 
-  it('applies the yolo and channel-trust side channels riding a slots frame', () => {
+  it('applies slots-frame side channels without discarding dashboard status', () => {
     const { ws } = mount()
     act(() => {
+      ws.simulateMessage({
+        type: 'dashboard',
+        data: { version: '1.0.0', yolo: false, yolo_duration: 'until_shutdown' },
+      })
       ws.simulateMessage({
         type: 'slots',
         data: [slotFixture(ACTIVE)],
@@ -257,6 +261,7 @@ describe('useWebSocket frame router', () => {
     })
     expect(dash().slots.map(s => s.key)).toEqual([ACTIVE])
     expect(dash().approvalMode).toBe('yolo')
+    expect(dash().status).toMatchObject({ yolo: true, yolo_duration: 'until_shutdown' })
     expect(dash().channelTrusted).toBe(true)
   })
 

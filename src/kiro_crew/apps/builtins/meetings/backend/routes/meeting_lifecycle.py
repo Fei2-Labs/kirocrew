@@ -9,6 +9,8 @@
 ``DELETE …/{id}``             permanently remove an inactive meeting
 ``GET  …/{id}/transcript``     finalized speech and typed broadcasts
 ``GET  …/{id}/outputs``       batch-read every agent output + tasks.json
+``PUT  …/{id}/outputs``       save the user's edit of one agent's output (sidecar)
+``DELETE …/{id}/outputs``     revert to what the agent itself last wrote
 ``POST …/{id}/attachments``   add/remove context attachments
 """
 
@@ -24,6 +26,7 @@ from aiohttp import web
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain import session as sess
+from kiro_crew.apps.builtins.meetings.backend.domain import translate
 from kiro_crew.apps.builtins.meetings.backend.routes import tasks as task_routes
 from kiro_crew.apps.builtins.meetings.backend.routes._common import (
     ACTIVE,
@@ -142,17 +145,21 @@ async def handle_get_meeting(request: web.Request) -> web.Response:
     live_payload = None
     if live is not None:
         live_payload = live.status()
-        # Whether a dispatch sent NOW would be admitted, from the same holder flag
-        # ``get_for_dispatch`` reads. The status is persisted ``active`` before
-        # ``init_agents`` runs, so status alone overstates readiness for the whole
-        # initialization window (~tens of seconds) while every dispatch 409s. The
-        # frontend polls this endpoint to decide when to open the microphone, and
-        # this field is the only per-poll answer to "would speech land?" — the
-        # start response alone cannot be, because it can be lost in transit while
-        # the server side succeeded. Plain attribute read on the single-threaded
-        # loop, same as the ``ACTIVE.get`` above; the value is a snapshot and may
-        # change by the next poll, which is exactly what a poll is for.
+        # Whether a dispatch sent NOW would be fanned out DIRECTLY, from the same
+        # holder flag ``get_for_dispatch`` reads. The status is persisted ``active``
+        # before ``init_agents`` runs, so status alone overstates readiness for the
+        # whole initialization window (~tens of seconds). Plain attribute read on
+        # the single-threaded loop, same as the ``ACTIVE.get`` above; the value is a
+        # snapshot and may change by the next poll, which is exactly what a poll is
+        # for.
         live_payload["accepting_dispatches"] = ACTIVE.accepting_dispatches
+        # And whether it would be HELD rather than refused (issue #4610). The
+        # frontend polls this endpoint to decide when to open the microphone, and
+        # "would speech land?" is now these two ORed: during initialization the
+        # answer is yes-by-holding. Reported separately rather than folded into the
+        # flag above, because that one is also the gate ``get_for_dispatch`` reads —
+        # making it true here would send lines to agents that are not ready.
+        live_payload["buffering_dispatches"] = ACTIVE.buffering_dispatches
     return web.json_response(
         {
             "meta": meta,
@@ -304,6 +311,9 @@ async def handle_start_meeting(request: web.Request) -> web.Response:
             hooks=hooks_of(request),
             agents_enabled=agents_enabled,
             config=config,
+            # Threaded through for the translation worker's writes, which are the
+            # only ones a live session makes on its own rather than via a handler.
+            root=root,
         )
         session.muted_agents = set(muted)
         # Drain the OUTGOING session before this one replaces it. `set()` cancels the
@@ -320,9 +330,16 @@ async def handle_start_meeting(request: web.Request) -> web.Response:
         outgoing = await ACTIVE.drain_and_clear()
         async with DISPATCH_LOCK:
             ACTIVE.set(session)
-            # Agent initialization may await several model turns. Keep ingress
-            # closed until every enabled agent knows its output contract.
-            ACTIVE.suspend_dispatches(session)
+            # Agent initialization may await several model turns. Keep DIRECT
+            # fan-out closed until every enabled agent knows its output contract —
+            # but HOLD what is said meanwhile instead of refusing it.
+            #
+            # Refusing was measured at ~46s of a real meeting (issue #4610): the
+            # speaker opens with the agenda, every line 409s, and the notes and
+            # tasks begin partway through the first topic with nothing to show a
+            # turn was lost. The hold is bounded and drains in arrival order right
+            # after `init_agents` returns, below.
+            ACTIVE.suspend_dispatches(session, buffer_speech=True)
 
         # A replacement of a DIFFERENT meeting is a teardown of that meeting, so its
         # metadata needs the same terminal status every other teardown writes.
@@ -370,6 +387,30 @@ async def handle_start_meeting(request: web.Request) -> web.Response:
             await sess.broadcast_system(session, k.SYSTEM_MEETING_RESTARTED)
         async with DISPATCH_LOCK:
             ACTIVE.resume_dispatches(session)
+            # Drain under the SAME acquisition that reopened ingress. A live
+            # dispatch needs this lock too, so nothing spoken after the reopen can
+            # overtake speech that was held while it was shut — releasing between
+            # the two would let the meeting's opening land after its second topic.
+            buffered, dropped = session.drain_init_buffer()
+        if buffered or dropped:
+            logger.info(
+                "meetings: %r delivered %d line(s) held during agent init, %d dropped",
+                meeting_id,
+                buffered,
+                dropped,
+            )
+        if dropped:
+            # Off the lock (this is disk IO) but still inside START_LOCK. Recorded
+            # so the human transcript states the loss too: the agents were told by
+            # `drain_init_buffer`, and a gap only one reader can see is the silent
+            # truncation the bound exists to avoid.
+            await asyncio.to_thread(
+                store.append_transcript,
+                meeting_id,
+                k.SYSTEM_INIT_BUFFER_OVERFLOW.format(count=dropped, limit=k.MAX_INIT_BUFFER_LINES),
+                k.TRANSCRIPT_SOURCE_SYSTEM,
+                root,
+            )
 
     audit("meetings.start", meeting_id, outcome="ok")
     return web.json_response(
@@ -498,8 +539,19 @@ async def handle_stop_meeting(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "status": k.STATUS_ENDED, "meta": meta})
 
 
-def _collect_outputs(meeting_id: str, root: Any) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Read every configured agent's output and the task list. BLOCKING.
+def _is_editable(agent_def: dict[str, Any]) -> bool:
+    """Whether this agent's output is one the user may edit.
+
+    See :data:`constants.EDITABLE_WIDGET_TYPE`. Used by the read overlay AND the
+    write gate, so "editable" means the same thing in both directions.
+    """
+    return str(agent_def.get("widget_type") or k.DEFAULT_WIDGET_TYPE) == k.EDITABLE_WIDGET_TYPE
+
+
+def _collect_outputs(
+    meeting_id: str, root: Any
+) -> tuple[dict[str, str], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Read every agent's EFFECTIVE output, the edit metadata, and the tasks. BLOCKING.
 
     Runs on a worker thread, never the event loop: the note-taker is prompted to
     rewrite its WHOLE file after each transcription batch, so these reads are
@@ -508,8 +560,23 @@ def _collect_outputs(meeting_id: str, root: Any) -> tuple[dict[str, str], list[d
     meeting, so doing it inline would stall every other task on the loop —
     including the liveness heartbeat — on a repeating timer.
 
-    Both halves are redacted. The outputs are model-generated prose; the tasks
-    come from `tasks.json`, which an agent writes, so they go through the task
+    A user EDIT of an agent's output takes precedence over the generated text, so
+    ``outputs`` is what the meeting actually shows and the client needs no merge
+    step. ``edits`` carries only the ``stale`` metadata, because
+    the content is already in ``outputs`` and sending it twice would double the
+    poll for the app's largest field.
+
+    **The generated half is redacted and the edited half is not**, which looks
+    inconsistent and is not:
+
+    * agent output is model-generated prose the user has never vetted, so it is
+      scrubbed on every read (unchanged from before this feature);
+    * an edit is owner-authored text, not untrusted model output. The editor can
+      accept arbitrary pasted text, including text that merely resembles a
+      credential, so it must be stored and returned byte-for-byte. Re-scrubbing
+      it would silently modify the user's document.
+
+    Tasks come from `tasks.json`, which an agent writes, so they go through the task
     module's own normalizer (which redacts every field and drops a malformed
     record) rather than being forwarded raw.
     """
@@ -519,15 +586,166 @@ def _collect_outputs(meeting_id: str, root: Any) -> tuple[dict[str, str], list[d
         agent_id: redact(content)
         for agent_id, content in store.read_agent_outputs(meeting_id, agents, root).items()
     }
-    return outputs, task_routes.read_normalized(meeting_id, root)
+    # Only EDITABLE agents are consulted, using the same predicate the write gate
+    # does. Filtering here as well as there is what keeps a sidecar written while an
+    # agent was markdown from being served after its widget_type is changed to html —
+    # at which point the user's markdown would be handed to the iframe renderer.
+    edits = store.read_agent_edits(meeting_id, [a for a in agents if _is_editable(a)], root)
+    for agent_id, edit in edits.items():
+        outputs[agent_id] = str(edit.pop("content", ""))
+    return outputs, edits, task_routes.read_normalized(meeting_id, root)
 
 
 async def handle_get_outputs(request: web.Request) -> web.Response:
-    """Batch-read every configured agent's output plus the task list."""
+    """Batch-read every configured agent's effective output plus the task list."""
     meeting_id = _meeting_id(request)
     root = data_root(request)
-    outputs, tasks = await asyncio.to_thread(_collect_outputs, meeting_id, root)
-    return web.json_response({"outputs": outputs, "tasks": tasks})
+    outputs, edits, tasks = await asyncio.to_thread(_collect_outputs, meeting_id, root)
+    return web.json_response({"outputs": outputs, "edits": edits, "tasks": tasks})
+
+
+def _editable_agent(agent_id: str, root: Any) -> dict[str, Any]:
+    """The agent definition *agent_id* names, if its output can be edited. BLOCKING.
+
+    Raises rather than returning None, because the two failures are distinct answers
+    the dashboard acts on differently: an unknown agent is a 404, and an agent whose
+    output is not prose is a 409 (see :data:`constants.EDITABLE_WIDGET_TYPE`).
+    """
+    config = store.read_config(root)
+    agent_def = next(
+        (a for a in (config.get("meeting_agents") or []) if a.get("id") == agent_id), None
+    )
+    if agent_def is None:
+        raise BadRequest("unknown agent", status=404, code="agent_not_found")
+    if not _is_editable(agent_def):
+        raise BadRequest(
+            "only a markdown agent's output can be edited",
+            status=409,
+            code="agent_output_not_editable",
+        )
+    return agent_def
+
+
+def _save_edit(meeting_id: str, agent_id: str, content: str, root: Any) -> None:
+    """Validate the agent, then persist the edit. BLOCKING.
+
+    The meeting existence check and the write share the metadata transaction with
+    deletion. Without it, a PUT for an unknown meeting created an orphan ``edits/``
+    directory, and a concurrent delete could remove ``session.json`` just before the
+    write recreated that same orphan. The agent definition is one authorization
+    snapshot; the read overlay re-applies the editable predicate on every poll.
+    """
+    with store.meta_transaction():
+        if store.read_meeting_meta(meeting_id, root) is None:
+            raise BadRequest("meeting not found", status=404, code="meeting_not_found")
+        store.write_agent_edit(meeting_id, _editable_agent(agent_id, root), content, root)
+
+
+def _drop_edit(meeting_id: str, agent_id: str, root: Any) -> bool:
+    """Validate the meeting and agent, then delete its edit sidecar. BLOCKING."""
+    with store.meta_transaction():
+        if store.read_meeting_meta(meeting_id, root) is None:
+            raise BadRequest("meeting not found", status=404, code="meeting_not_found")
+        return store.revert_agent_edit(meeting_id, _editable_agent(agent_id, root), root)
+
+
+async def handle_put_output(request: web.Request) -> web.Response:
+    """Save the user's edit of one agent's output — the editable minutes.
+
+    The edit lands in a SIDECAR, never in the agent's file (see the block comment
+    above ``store.agent_edits_dir``). So the agent keeps writing its own document
+    throughout, the next outputs poll's ``stale`` flag is how the user learns it
+    has, and ``DELETE`` restores the generated text by deleting one file.
+
+    Not redacted (the asymmetry ``_collect_outputs`` spells out), and validated by
+    hand rather than with ``field_str``, for two reasons: ``field_str`` treats a
+    non-string as MISSING (so a malformed body would answer 200 having replaced the
+    minutes with ``""``) and it ``strip()``s, which would eat the trailing newline
+    of every markdown document it touched.
+    """
+    meeting_id = _meeting_id(request)
+    root = data_root(request)
+    # A whole document, not a short field — hence the raised cap. See
+    # `constants.MAX_MINUTES_BODY_BYTES` for why the default 256 KiB is wrong here.
+    body = await json_body(request, max_bytes=k.MAX_MINUTES_BODY_BYTES)
+    agent_id = store.safe_agent_id(field_str(body, "agent_id", required=True, max_len=64))
+    content = body.get("content")
+    if not isinstance(content, str):
+        raise BadRequest("content must be a string")
+    if len(content) > k.MAX_MINUTES_CHARS:
+        raise BadRequest(f"content must be at most {k.MAX_MINUTES_CHARS} characters", status=413)
+    # JSON's ``\udXXX`` escapes can decode into UNPAIRED surrogates, which are
+    # valid Python str but not encodable UTF-8 — the sidecar write would then
+    # raise mid-request and the user would see a 500 for a malformed input.
+    # Reject it here as the client error it is.
+    try:
+        content.encode("utf-8")
+    except UnicodeEncodeError:
+        raise BadRequest(
+            "content contains unpaired surrogate characters", code="content_not_unicode"
+        )
+
+    await asyncio.to_thread(_save_edit, meeting_id, agent_id, content, root)
+    audit("meetings.edit_output", f"{meeting_id} agent:{agent_id}", outcome="ok")
+    return web.json_response({"ok": True, "agent_id": agent_id})
+
+
+async def handle_delete_output(request: web.Request) -> web.Response:
+    """Revert one agent's output to what the agent itself last wrote.
+
+    ``reverted: false`` for an agent with no edit is a success, not a 404: the
+    request asked for "no edit on this agent" and that is the state afterwards.
+    """
+    meeting_id = _meeting_id(request)
+    root = data_root(request)
+    body = await json_body(request)
+    agent_id = store.safe_agent_id(field_str(body, "agent_id", required=True, max_len=64))
+
+    reverted = await asyncio.to_thread(_drop_edit, meeting_id, agent_id, root)
+    audit("meetings.revert_output", f"{meeting_id} agent:{agent_id}", outcome="ok")
+    return web.json_response({"ok": True, "agent_id": agent_id, "reverted": reverted})
+
+
+def _read_translations_since(meeting_id: str, since: int, root: Any) -> dict[str, Any]:
+    """Translated lines with ``n >= since``, plus the cursor to ask for next. BLOCKING."""
+    doc = store.read_translations(meeting_id, root)
+    lines = [
+        line
+        for line in doc.get("lines", [])
+        if isinstance(line, dict) and int(line.get("n", -1)) >= since
+    ]
+    language = str(doc.get("language", "") or "")
+    return {
+        "language": language,
+        # Resolved here rather than in the frontend: the accepted languages and
+        # their endonyms are published by the backend (see GET /config), so a
+        # second copy in the client would be the thing that drifts.
+        "language_label": translate.language_label(language) if language else "",
+        "lines": lines,
+        "next_n": int(doc.get("next_n", 0)),
+    }
+
+
+async def handle_get_translations(request: web.Request) -> web.Response:
+    """Live-translation lines for a meeting, newer than a client cursor.
+
+    A cursor rather than the whole document: a long meeting accumulates hundreds
+    of lines and the panel polls while it is open, so resending everything each
+    time would grow linearly for no benefit. ``next_n`` is what the client sends
+    back as ``since``.
+
+    Separate from ``…/outputs`` on purpose. Outputs is polled for every meeting;
+    this is polled only while the panel is open, and translation is off by default.
+    """
+    meeting_id = _meeting_id(request)
+    root = data_root(request)
+    since = query_int(request, "since", default=0, low=0, high=10_000_000)
+    payload = await asyncio.to_thread(_read_translations_since, meeting_id, since, root)
+    live = ACTIVE.get(meeting_id)
+    queue = live.translations if live is not None else None
+    payload["pending"] = queue.pending if queue is not None else 0
+    payload["dropped"] = queue.dropped if queue is not None else 0
+    return web.json_response(payload)
 
 
 def _apply_attachments(

@@ -74,6 +74,7 @@ agent loads only the one it needs.
 | [app-kit-platform.md](app-kit-platform.md) | App contracts: MCP scoping, agent JSON composition, permissions, and dependencies. |
 | [mcp-apps.md](mcp-apps.md) | Apps that surface as MCP servers. |
 | [mcp-shareability.md](mcp-shareability.md) | Predicting which MCP servers can share one backend, from local evidence. |
+| [mcp-gateway-backend-replacement.md](mcp-gateway-backend-replacement.md) | Validating a replacement MCP backend's tool set before a live session adopts it. |
 | [artifacts.md](artifacts.md) | Artifact identity, versioning, and the companion chat panel. |
 | [themes.md](themes.md) | The theme tier model and the CSS variable contract. |
 | [md-notebook.md](md-notebook.md) | The inline markdown viewer and editor. |

@@ -414,8 +414,11 @@ def _maybe_setup_cloud() -> None:
     print("  AWS account; credentials stay in the aws CLI — never stored here).")
     try:
         answer = input("  Launch KiroCrew on AWS now? [y/N]: ").strip().lower()
-    except EOFError:
-        # Piped/non-interactive setup — take the default (skip).
+    except (EOFError, UnicodeDecodeError):
+        # Piped/non-interactive setup or a non-UTF-8 locale (e.g. C/POSIX on
+        # Amazon Linux Cloud Desktop) — input() decodes stdin with the locale
+        # encoding and can raise UnicodeDecodeError before it ever returns a
+        # string. Treat it like EOF: no usable answer, so take the default.
         answer = ""
     if answer not in ("y", "yes"):
         print("  ⏭  Skipped. Launch later: kirocrew cloud launch\n")
@@ -713,12 +716,14 @@ def _input_or_skip(prompt: str) -> str | None:
     as "keep the default / skip this step". A closed/piped stdin is a different
     condition and must not be silently coerced to ``""`` (that used to admit an
     empty default and cascade the failure into the NEXT step's bare
-    ``input()``) — see ``_SetupAborted``.
+    ``input()``) — see ``_SetupAborted``. A non-UTF-8 locale (e.g. C/POSIX)
+    makes ``input()`` raise ``UnicodeDecodeError`` the same way, so it is
+    treated identically.
     """
 
     try:
         answer = input(prompt).strip()
-    except EOFError as exc:
+    except (EOFError, UnicodeDecodeError) as exc:
         raise _SetupAborted("stdin closed; setup cannot continue") from exc
     return answer or None
 

@@ -30,8 +30,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKENDS_KNOWN,
-    ACP_BACKENDS_SELECTABLE,
 )
+from kiro_crew.acp_backends import selectable_backends
 
 
 def test_descriptors_and_known_ids_agree_in_both_directions() -> None:
@@ -46,7 +46,7 @@ def test_descriptors_and_known_ids_agree_in_both_directions() -> None:
 
 def test_every_selectable_backend_has_a_descriptor() -> None:
     """An operator can never persist a value with no descriptor behind it."""
-    for backend in ACP_BACKENDS_SELECTABLE:
+    for backend in selectable_backends():
         assert backends.descriptor_for(backend).id == backend
 
 
@@ -250,7 +250,7 @@ def test_session_config_routing_names_an_option_and_an_exact_value() -> None:
 
 
 def test_selectability_is_a_separate_axis_from_being_described() -> None:
-    """Selectability is owned by ACP_BACKENDS_SELECTABLE alone.
+    """Selectability is owned by selectable_backends() alone.
 
     Asserts the invariant that survives membership changes, rather than naming a
     withheld backend: this test named KAS, then codex, then derived the example
@@ -259,8 +259,8 @@ def test_selectability_is_a_separate_axis_from_being_described() -> None:
     something unknown — which is what keeps the two concepts from collapsing into
     one when a registry adapter arrives described but not yet selectable.
     """
-    assert ACP_BACKENDS_SELECTABLE <= ACP_BACKENDS_KNOWN
-    for backend in sorted(ACP_BACKENDS_SELECTABLE):
+    assert selectable_backends() <= ACP_BACKENDS_KNOWN
+    for backend in sorted(selectable_backends()):
         descriptor = backends.descriptor_for(backend)
         assert descriptor.label, backend
         assert descriptor.id == backend

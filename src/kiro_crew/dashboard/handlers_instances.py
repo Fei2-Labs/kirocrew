@@ -50,6 +50,7 @@ from kiro_crew.instances.registry import (
     validate_ttl,
 )
 from kiro_crew.instances.ssh_tunnel_manager import ProxyRequestError, TunnelState
+from kiro_crew.instances.warm_set import resolve_warm_set_cap
 from kiro_crew.sel import sel
 from kiro_crew.validation import sanitize_string
 
@@ -210,6 +211,11 @@ async def api_instances_list(request: web.Request) -> web.Response:
     # instances.json under a threading lock a to_thread worker may hold across
     # its fsync — so every registry touch in these handlers goes off the loop.
     items = [_instance_view(state, i) for i in await asyncio.to_thread(reg.list)]
+    # Resolved here rather than served raw: the automatic mode (0) means "as many
+    # as are connected", and this is the only place that holds both the stored
+    # value and the live per-instance status. The browser therefore always
+    # receives a concrete integer and needs no notion of automatic.
+    connected = sum(1 for i in items if (i.get("status") or {}).get("state") == "connected")
     _audit("list", "success")
     return web.json_response(
         {
@@ -220,7 +226,9 @@ async def api_instances_list(request: web.Request) -> web.Response:
             # active, the UI shows a "restart the gateway to activate" hint.
             "active": getattr(state, "instances_manager", None) is not None,
             "instances": items,
-            "warm_set_cap": KiroCrewConfig.load().instances.warm_set_cap,
+            "warm_set_cap": resolve_warm_set_cap(
+                KiroCrewConfig.load().instances.warm_set_cap, connected
+            ),
         }
     )
 
@@ -267,9 +275,11 @@ async def api_instances_add(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
+        return web.json_response({"error": "invalid JSON body", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
-        return web.json_response({"error": "body must be an object"}, status=400)
+        return web.json_response(
+            {"error": "body must be an object", "code": "invalid_body"}, status=400
+        )
     try:
         inst = await asyncio.to_thread(
             reg.add,
@@ -285,12 +295,20 @@ async def api_instances_add(request: web.Request) -> web.Response:
             aws_region=str(body.get("aws_region", "")),
             instance_id=body.get("id"),
         )
-    except (DuplicateInstanceError, InvalidInstanceError) as e:
+    except DuplicateInstanceError as e:
+        # Split from InvalidInstanceError because the two are different user
+        # actions: a name collision is resolved by renaming, a rejected field by
+        # correcting it. A client that cannot tell them apart has to parse prose.
         _audit("add", "denied", error=str(e))
-        return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"error": str(e), "code": "instance_duplicate"}, status=400)
+    except InvalidInstanceError as e:
+        _audit("add", "denied", error=str(e))
+        return web.json_response({"error": str(e), "code": "instance_invalid"}, status=400)
     except (TypeError, ValueError) as e:
         _audit("add", "denied", error=str(e))
-        return web.json_response({"error": f"invalid field: {e}"}, status=400)
+        return web.json_response(
+            {"error": f"invalid field: {e}", "code": "invalid_field"}, status=400
+        )
     _audit("add", "success", request_id=inst.id)
     return web.json_response(_instance_view(state, inst), status=201)
 
@@ -545,6 +563,25 @@ async def api_instances_remove(request: web.Request) -> web.Response:
     return web.json_response({"removed": instance_id})
 
 
+def _connect_failure_code(body: dict, fallback: str) -> str:
+    """Machine-readable ``code`` for a failed connect response.
+
+    Promotes the failure-diagnosis ladder's own verdict (``ssh_unreachable``,
+    ``remote_down``, ``tunnel_down``, …) to the top level, where a client reads
+    it without walking into ``diagnosis``. Only a verdict that is present AND
+    negative is promoted: the stored diagnosis is the last ladder RUN, so a stale
+    ``ok`` from before the failure would otherwise be published as this call's
+    reason. Without a usable verdict the caller's *fallback* names the stage that
+    failed instead.
+    """
+    diagnosis = body.get("diagnosis")
+    if isinstance(diagnosis, dict) and not diagnosis.get("ok"):
+        code = diagnosis.get("code")
+        if isinstance(code, str) and code:
+            return code
+    return fallback
+
+
 async def api_instances_connect(request: web.Request) -> web.Response:
     """POST /api/instances/{id}/connect — open tunnel + mint token.
 
@@ -559,12 +596,15 @@ async def api_instances_connect(request: web.Request) -> web.Response:
     mgr = getattr(state, "instances_manager", None)
     if mgr is None:
         _audit("connect", "denied", request_id=instance_id, error="manager unavailable")
-        return web.json_response({"error": "instances manager not running"}, status=503)
+        return web.json_response(
+            {"error": "instances manager not running", "code": "instances_manager_unavailable"},
+            status=503,
+        )
     try:
         status = await mgr.connect(instance_id)
     except KeyError:
         _audit("connect", "denied", request_id=instance_id, error="not found")
-        return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"error": "not found", "code": "instance_not_found"}, status=404)
     body = status.to_dict()
     if status.state.value == "connected":
         token = mgr.get_token(instance_id)
@@ -590,11 +630,13 @@ async def api_instances_connect(request: web.Request) -> web.Response:
                     error="token unconfirmed and re-mint failed",
                 )
                 body["error"] = "token expired and re-mint failed"
+                body["code"] = _connect_failure_code(body, "instance_token_unconfirmed")
                 return web.json_response(body, status=502)
         body["token"] = token  # delivered to owner only
         _audit("connect", "success", request_id=instance_id)
         return web.json_response(body)
     _audit("connect", "failure", request_id=instance_id, error=status.error)
+    body["code"] = _connect_failure_code(body, "instance_connect_failed")
     return web.json_response(body, status=502)
 
 
@@ -945,12 +987,13 @@ async def api_instances_send_session(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # The source is NOT flushed before bundling. A copy leaves the source
-    # untouched, and build_transfer_bundle already merges the on-disk transcript
-    # with the unflushed in-memory tail — so a flush here would add nothing
-    # except a duplication bug: save_slot_off_loop writes the tail to disk
-    # without clearing ``_dirty``, after which the bundle re-appends that same
-    # tail from memory and every unsaved turn lands twice in the copy.
+    # No flush HERE: the builder owns it. ``build_transfer_bundle_async`` flushes
+    # a dirty slot itself (best_effort=False) and only then takes its boundary
+    # slice, so by that point the tail is empty and the bundle comes wholly from
+    # disk. A flush at this call site would add nothing — and the version of this
+    # code that flushed here and then sliced on ``_resumed_count``, which the save
+    # does NOT advance, is what re-appended the same tail from memory and landed
+    # every unsaved turn twice in the copy.
     try:
         bundle = await build_transfer_bundle_async(state, slot, origin=local_instance_label())
     except SnapshotUnstable:
@@ -1049,16 +1092,37 @@ _PROXY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._~:@!$&'()*+,;=-]+$")
 # The peer surface the proxy will forward, as canonical segment prefixes — a
 # positive ALLOWLIST, one named prefix per row. The proxy carries the
 # remote-crew chat view and nothing else, so only the peer's `api/chat`
-# subtree is reachable (a prefix grant: every route under it, including
-# mutating ones — that breadth is the chat feature's own wire surface).
+# subtree and its `api/stream` event feed are reachable (each a prefix grant:
+# every route under it, including mutating ones — that breadth is the chat
+# feature's own wire surface).
 # Everything outside the named prefixes is refused — including the peer's own
 # `api/instances` control plane (no chaining a hub through a peer into a
 # third machine) and the peer's token-minting routes, whose JSON replies
 # would otherwise carry a minted peer credential back through the hub
-# in-band. When the event-stream view lands, its `("api", "ws")` row is added
-# HERE explicitly, never by widening the policy back to deny-only. The
-# constant's exact value and row shape are pinned by tests.
-_PROXY_ALLOWED_PREFIXES: tuple[tuple[str, ...], ...] = (("api", "chat"),)
+# in-band.
+#
+# `api/stream` is the peer's own SSE broadcast endpoint (its `api_stream`
+# handler), the out-of-turn half of the chat view: the per-turn reply streams
+# back from `api/chat`, while session-list and slot-state changes arrive here.
+# It is deliberately SSE and not the sibling `api/ws`: a WebSocket row would
+# need a `101 Switching Protocols` to cross this proxy, and the reply
+# content-type gate below exists precisely to stop a peer serving anything but
+# JSON/SSE onto the authenticated hub origin — an upgrade would tunnel straight
+# through it. A GET returning `text/event-stream` needs no such exception.
+#
+# Note what this row admits: that feed is per-CLIENT but not per-slot, so a hub
+# holding it receives the peer's whole notification/slot broadcast, not only the
+# session on screen. That is peer content crossing to a hub user who is already
+# the peer's owner (this route is owner-only), so it widens VOLUME, not
+# privilege — but it is the reason this is a named row rather than a blanket
+# `api/` grant.
+#
+# A new prefix is added HERE explicitly, never by widening the policy back to
+# deny-only. The constant's exact value and row shape are pinned by tests.
+_PROXY_ALLOWED_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("api", "chat"),
+    ("api", "stream"),
+)
 
 # Derived from the allowlist so the refusal (and its SEL audit line) stays
 # honest as rows are added.

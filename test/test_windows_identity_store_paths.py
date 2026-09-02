@@ -22,8 +22,10 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from kiro_crew import identity_stores as ids
 from kiro_crew import kiro_prerequisite as kp
 from kiro_crew.dashboard.handlers import kiro_usage_api as usage_api
+from kiro_crew.identity_stores import Trust
 from kiro_crew.security import _SENSITIVE_HOME_DIRS
 
 # The two roots the installed CLI is observed using, for each product whose store
@@ -249,3 +251,55 @@ class TestStagingToleratesTheUnusedAppDataRoot:
 
         staged_db = Path(workspace.root) / "AppData" / "Roaming" / "kiro-cli" / kp._AUTH_SQLITE_DB
         assert staged_db.exists()
+
+
+class TestReadersAgreeWithCanonicalTable:
+    """The six former copies are now projections of ``identity_stores`` (#6352).
+
+    These re-point the ratchet at the single canonical table: every reader must
+    equal the projection it now wraps, so drift is impossible by construction
+    rather than by remembering to update N hardcoded lists.
+    """
+
+    def test_fence_identity_dirs_come_from_the_table(self) -> None:
+        """Every fenced identity dir is a canonical row, and vice versa."""
+
+        fenced_identity = {
+            entry for entry in _SENSITIVE_HOME_DIRS if entry in set(ids.fenced_home_dirs())
+        }
+        assert fenced_identity == set(ids.fenced_home_dirs())
+
+    def test_usage_read_lists_are_the_projections(self) -> None:
+        assert usage_api._CLI_SQLITE_DBS == ids.sqlite_dbs(Trust.TRUSTED)
+        assert usage_api._OTHER_SQLITE_DBS == ids.sqlite_dbs(Trust.OTHER)
+
+    def test_identity_store_path_matches_selected_store(self, tmp_path: Path) -> None:
+        for platform in ("darwin", "linux", "win32"):
+            assert kp.kiro_identity_store_path(platform, tmp_path, {}) == (
+                ids.selected_store(platform, tmp_path)
+            )
+
+    def test_state_dbs_match_the_projection(self, tmp_path: Path) -> None:
+        from kiro_crew import kiro_cli
+
+        for platform in ("darwin", "linux", "win32"):
+            assert kiro_cli.kiro_cli_state_dbs(platform, tmp_path, {}) == (
+                ids.state_db_candidates(platform, tmp_path, {})
+            )
+
+    def test_auth_sqlite_db_constant_is_the_alias(self) -> None:
+        assert kp._AUTH_SQLITE_DB == ids.AUTH_SQLITE_DB
+        from kiro_crew import kiro_cli
+
+        assert kiro_cli.KIRO_CLI_STATE_DB == ids.AUTH_SQLITE_DB
+
+    def test_staging_sources_track_the_table_on_win32(self, tmp_path: Path) -> None:
+        """Staging's win32 source dirs are the table's win32 mapping sources."""
+
+        staged = {
+            m.source.relative_to(tmp_path).as_posix()
+            for m in kp._auth_store_mappings("win32", tmp_path, {})
+            if m.source.is_relative_to(tmp_path / "AppData")
+        }
+        table = {m.staged_relative.as_posix() for m in ids.store_mappings("win32", tmp_path, {})}
+        assert staged == table

@@ -115,6 +115,10 @@ async function renderWith(count: number) {
 }
 
 const src = () => readFileSync(join(__dirname, '..', 'pages', 'ArtifactsPage.tsx'), 'utf8')
+// WidgetThumb and its THUMB_HEIGHT_SPACE key space were extracted into the
+// shared components/library/ArtifactThumbs.tsx module (so DrivePage can render
+// identical previews); the thumbnail-height assertions below read it there.
+const thumbsSrc = () => readFileSync(join(__dirname, '..', 'components', 'library', 'ArtifactThumbs.tsx'), 'utf8')
 
 describe('ArtifactsPage keeps the axis on the page at one column', () => {
   beforeEach(() => {
@@ -219,8 +223,8 @@ describe('ArtifactsPage keeps the axis on the page at one column', () => {
     // into a scroller that keeps getting shorter as you scroll. Measured over
     // eight swipes: 4530px of height change on the pre-change build, 1188px with
     // the cache warm, and the scroller's total drift 1332px -> 181px.
-    const text = src()
-    const thumb = text.slice(text.indexOf('function WidgetThumb('), text.indexOf('function GridCard('))
+    const text = thumbsSrc()
+    const thumb = text.slice(text.indexOf('function WidgetThumb('), text.indexOf('function ContentThumb('))
     // Cache first, then the median of the SAME key space, then the ceiling.
     expect(thumb).toMatch(/getWidgetHeight\(heightKey\) \?\? Math\.min\(VIEWPORT_H, estimateWidgetHeight\(THUMB_HEIGHT_SPACE, VIEWPORT_H\)\)/)
     // ...and the measurement has to be written back, or the cache never warms.
@@ -235,8 +239,8 @@ describe('ArtifactsPage keeps the axis on the page at one column', () => {
     // A different placeholder height that is swapped once the blob URL resolves
     // is a SECOND height change per card, on top of the report — and in a
     // virtualized list every one of those re-lays out everything below it.
-    const text = src()
-    const thumb = text.slice(text.indexOf('function WidgetThumb('), text.indexOf('function GridCard('))
+    const text = thumbsSrc()
+    const thumb = text.slice(text.indexOf('function WidgetThumb('), text.indexOf('function ContentThumb('))
     expect(thumb).toMatch(/style=\{\{ height: scaledH \}\}/)
     expect(thumb).not.toMatch(/height: blobUrl \? scaledH/)
   })

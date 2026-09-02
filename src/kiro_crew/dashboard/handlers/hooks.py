@@ -15,7 +15,7 @@ from aiohttp import web
 
 from kiro_crew import webhooks
 from kiro_crew.agent import _VALID_HOOK_EVENTS, _shipped_defaults, kiro_agents_dir_path
-from kiro_crew.agent_discovery import list_agents
+from kiro_crew.agent_discovery import _read_agent_spec, list_agents
 from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import run_in_embed_pool
@@ -102,10 +102,30 @@ async def api_kiro_hooks(request: web.Request) -> web.Response:
     from kiro_crew.platform import redact_via_context as redact
 
     agent_cfg = kiro_agents_dir_path() / "kirocrew.json"
-    try:
-        raw = json.loads(agent_cfg.read_text())
-        hooks = raw.get("hooks", {}) if isinstance(raw, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    # ``kirocrew.json`` lives in the user-writable, tool-shared agents dir, so
+    # the read goes through the hardened agents-dir reader (size cap, symlink
+    # and sensitive-target screens, explicit UTF-8, non-object rejection).
+    # ``None`` covers every case the old ``except (OSError, JSONDecodeError)``
+    # caught — plus the ones it missed, e.g. non-UTF-8 bytes, which previously
+    # escaped as an unhandled 500 — and degrades the same way: no user hooks.
+    # Off-loop: the reader stats + reads up to the size cap, and this handler
+    # runs on the gateway event loop (review-adopted, no-blocking-call rule).
+    # The labels are passed explicitly: they name the SEL denial event's
+    # operation and interface channel, and without them a refusal here is
+    # recorded under the reader's ``list_agents`` defaults -- attributing a
+    # hooks request's denial to an agent-listing cache warm, the exact
+    # misattribution the labels exist to prevent.
+    raw = await asyncio.to_thread(
+        _read_agent_spec,
+        agent_cfg,
+        operation="api_kiro_hooks",
+        source="dashboard",
+    )
+    # The reader guarantees the TOP level is an object, not the "hooks" value:
+    # a user-writable {"hooks": []} would reach hooks.items() below and escape
+    # as a 500. Same degrade-as-absent rule as every other unusable shape.
+    hooks = raw.get("hooks") if raw is not None else None
+    if not isinstance(hooks, dict):
         hooks = {}
     # Load bundled defaults to tag source
     try:

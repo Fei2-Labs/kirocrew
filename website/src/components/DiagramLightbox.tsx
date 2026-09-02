@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, useReducedMotion } from 'framer-motion'
-import { X } from 'lucide-react'
+import { Minus, Plus, Search, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
-import { usePinchZoom } from '../hooks/usePinchZoom'
+import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../hooks/usePinchZoom'
+import { Btn, IconButton } from './ui'
 
 /** Diagram zoom bounds. `1` is fit-to-viewport. The ceiling is higher than the
  *  image viewer's because the content is vector: a mermaid label at 8px in a
@@ -13,16 +14,16 @@ import { usePinchZoom } from '../hooks/usePinchZoom'
  *  and scaling an SVG costs no resolution. */
 const DIAGRAM_ZOOM_MIN = 1
 const DIAGRAM_ZOOM_MAX = 8
-/** Zoom a double-tap toggles to, when starting from fit. */
-const DIAGRAM_ZOOM_DOUBLE_TAP = 2.5
-/** Two taps count as a double-tap within this window, and within this distance of
- *  each other — the distance test is what keeps two deliberate taps on different
- *  parts of a large diagram from reading as one double-tap. */
-const DOUBLE_TAP_MS = 300
-const DOUBLE_TAP_SLOP = 32
+const DIAGRAM_ZOOM_STEP = 0.5
 /** Travel a one-finger drag must cover before it counts as a pan rather than a
  *  tap — below it the double-tap and click-out paths are left alone. */
 const DRAG_SLOP = 6
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null
+  if (!el || typeof el.tagName !== 'string') return false
+  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable === true
+}
 
 /**
  * Full-viewport viewer for an inline-rendered SVG diagram (mermaid).
@@ -117,7 +118,7 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
     // label the user aimed at under their finger rather than at the centre.
     const cx = window.innerWidth / 2
     const cy = window.innerHeight / 2
-    const z = DIAGRAM_ZOOM_DOUBLE_TAP
+    const z = DOUBLE_TAP_ZOOM
     setZoom(z)
     setPan(clampPan((e.clientX - cx) * (1 - z), (e.clientY - cy) * (1 - z), z))
   }, [zoom, setZoom, setPan, clampPan])
@@ -192,17 +193,41 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
     }
   }, [svg])
 
-  // While the viewer is open, claim Escape so an enclosing <Modal> (e.g. the
-  // skill/MCP browsers, which guard on !e.defaultPrevented) does not also
-  // dismiss itself on the same keypress. useDialogFocusTrap still receives the
-  // event (both listeners are capture-phase) and closes this viewer.
+  const zoomIn = useCallback(
+    () => setZoom(z => Math.min(DIAGRAM_ZOOM_MAX, +(z + DIAGRAM_ZOOM_STEP).toFixed(2))),
+    [setZoom],
+  )
+  const zoomOut = useCallback(
+    () => setZoom(z => Math.max(DIAGRAM_ZOOM_MIN, +(z - DIAGRAM_ZOOM_STEP).toFixed(2))),
+    [setZoom],
+  )
+  const resetZoom = useCallback(() => {
+    setZoom(DIAGRAM_ZOOM_MIN)
+    setPan({ x: 0, y: 0 })
+  }, [setZoom, setPan])
+
+  // While the viewer is open, claim Escape so an enclosing <Modal> does not also
+  // dismiss itself on the same keypress. Also handle zoom keyboard shortcuts (+, -, 0).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') e.preventDefault()
+      if (e.key === 'Escape') {
+        e.preventDefault()
+      } else if (!fitted || isEditableTarget(e.target) || e.metaKey || e.ctrlKey || e.altKey) {
+        return
+      } else if (e.key === '+' || e.key === '=') {
+        e.preventDefault()
+        zoomIn()
+      } else if (e.key === '-' || e.key === '_') {
+        e.preventDefault()
+        zoomOut()
+      } else if (e.key === '0') {
+        e.preventDefault()
+        resetZoom()
+      }
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [])
+  }, [fitted, zoomIn, zoomOut, resetZoom])
 
   return createPortal(
     <motion.div
@@ -215,7 +240,7 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
       animate={{ opacity: 1 }}
       transition={{ duration: 0.15 }}
       // Click-out dismissal: any click that is not on the diagram itself (or on
-      // the close button, which handles itself) closes the viewer. Escape is
+      // the controls, which handle themselves) closes the viewer. Escape is
       // handled by useDialogFocusTrap plus the preventDefault claim above.
       onClick={e => {
         // A pinch, drag or double-tap just finished — that click is gesture residue.
@@ -224,7 +249,18 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
         if (!el.closest('svg') && !el.closest('button')) onClose()
       }}
     >
-      <div className="flex items-center justify-end px-4 h-12 shrink-0">
+      <div className="flex items-center justify-end gap-2 px-4 h-12 shrink-0">
+        {fitted && zoom > DIAGRAM_ZOOM_MIN && (
+          <Btn
+            aria-label={t('components.markdownRenderer.reset_zoom')}
+            title={t('components.markdownRenderer.reset_zoom')}
+            className="px-2 py-1.5 border-none text-muted hover:text-text"
+            onClick={(e) => { e.stopPropagation(); resetZoom() }}
+          >
+            <Search className="lucide-inline" aria-hidden="true" />
+            <span>{t('components.markdownRenderer.reset_zoom')}</span>
+          </Btn>
+        )}
         <button
           aria-label={t('components.diagramLightbox.close')}
           title={t('components.diagramLightbox.close')}
@@ -234,6 +270,28 @@ export default function DiagramLightbox({ svg, onClose }: { svg: string; onClose
           <X className="lucide-inline" aria-hidden="true" />
         </button>
       </div>
+      {fitted && (
+        <div className="fixed bottom-safe-offset-6 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1 rounded-full bg-bg-elevated/90 backdrop-blur-md ring-1 ring-border shadow-lg px-2 py-1">
+          <IconButton
+            aria-label={t('components.markdownRenderer.zoom_out')}
+            title={t('components.markdownRenderer.zoom_out')}
+            disabled={zoom <= DIAGRAM_ZOOM_MIN}
+            className="p-1.5 rounded-full disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-default"
+            onClick={(e) => { e.stopPropagation(); zoomOut() }}
+          >
+            <Minus className="lucide-inline" aria-hidden="true" />
+          </IconButton>
+          <IconButton
+            aria-label={t('components.markdownRenderer.zoom_in')}
+            title={t('components.markdownRenderer.zoom_in')}
+            disabled={zoom >= DIAGRAM_ZOOM_MAX}
+            className="p-1.5 rounded-full disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-default"
+            onClick={(e) => { e.stopPropagation(); zoomIn() }}
+          >
+            <Plus className="lucide-inline" aria-hidden="true" />
+          </IconButton>
+        </div>
+      )}
       {/* min-h-0 lets the flex child shrink to the viewport. overflow-auto is
           retained as the escape hatch for a no-viewBox SVG kept at natural size —
           that case is NOT fit-scaled, so scrolling (not zoom) is what reaches its

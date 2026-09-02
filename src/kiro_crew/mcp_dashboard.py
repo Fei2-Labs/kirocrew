@@ -87,6 +87,7 @@ from kiro_crew.validation import (
     CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     CHAT_FOLDER_TREE_SCHEMA,
     MCP_DASHBOARD_SCHEMAS,
+    SESSION_CLOSE_SCHEMA,
     SESSION_CREATE_SCHEMA,
     SESSION_READ_MESSAGE_SCHEMA,
     SESSION_SEND_SCHEMA,
@@ -108,6 +109,7 @@ SERVER_VERSION = "1.0.0"
 SESSION_CONTROL_TOOLS: tuple[str, ...] = (
     "session_create",
     "session_stop",
+    "session_close",
     "session_send",
     "session_read_message",
 )
@@ -256,12 +258,38 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "Stop another session's in-flight turn — the same thing as pressing Stop "
                 "in that tab. Use it when a peer session is working on something you now "
                 "know is wrong or already done, and letting it finish would waste the run "
-                "or make a conflicting change. The first call cancels cooperatively; "
-                "calling again while that is still pending escalates to a hard kill. "
+                "or make a conflicting change. The stop is cooperative and safe to "
+                "re-send: a repeat within two minutes reports that the earlier stop is "
+                "still in progress instead of escalating to a hard kill, so retrying a "
+                "call that timed out cannot discard the target's queued messages. "
                 "A stop card appears in the "
                 "target's transcript so the person reading it sees what happened. Stopping "
                 "discards the turn's work, so read the session first when you are not sure "
                 "what it is doing."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
+            "name": "session_close",
+            "description": (
+                "Close another session — the same thing as pressing the ✕ on that tab. "
+                "The conversation is archived to history (it can be reopened later); "
+                "this is NOT a permanent delete, but it does dismiss the live tab and, "
+                "if the target is mid-turn, cancels that turn first and discards its "
+                "work. Use it to tidy up a peer session you created and are done with "
+                "(a finished watcher, a workstream you handed off), not to interrupt one "
+                "you might still need — for that, session_stop only cancels the turn and "
+                "leaves the tab open. Read the session first when you are unsure what it "
+                "is doing."
             ),
             "inputSchema": {
                 "type": "object",
@@ -470,9 +498,13 @@ def _resolve_chat_folder_ref(
     paths = _chat_folder_paths(folders)
     exact = sorted(fid for fid, p in paths.items() if p.strip().lower() == ref.lower())
     if len(exact) > 1:
-        return "", [], (
-            f"{len(exact)} folders render the same path {redact(ref)} "
-            f"({', '.join(exact)}) — pass the folder id instead of a path"
+        return (
+            "",
+            [],
+            (
+                f"{len(exact)} folders render the same path {redact(ref)} "
+                f"({', '.join(exact)}) — pass the folder id instead of a path"
+            ),
         )
 
     # Reading 3: walk the segments. When the exact reading already resolved, the
@@ -486,9 +518,13 @@ def _resolve_chat_folder_ref(
         return "", created, walk_err
 
     if exact and walked and walked != exact[0]:
-        return "", [], (
-            f"{redact(ref)} is ambiguous: it is both a folder's own name "
-            f"({exact[0]}) and a nested path ({walked}) — pass the folder id"
+        return (
+            "",
+            [],
+            (
+                f"{redact(ref)} is ambiguous: it is both a folder's own name "
+                f"({exact[0]}) and a nested path ({walked}) — pass the folder id"
+            ),
         )
     if exact:
         return exact[0], [], None
@@ -581,9 +617,7 @@ def _ensure_chat_folder_path(
     segments are real folders, and each must be created under the identity the
     caller's gate verified rather than one the write helper re-derives.
     """
-    return _resolve_chat_folder_ref(
-        ref, folders, create_missing=True, session_key=session_key
-    )
+    return _resolve_chat_folder_ref(ref, folders, create_missing=True, session_key=session_key)
 
 
 def _resolve_chat_slot_key(ref: str, slots: list[dict]) -> tuple[str, str | None]:
@@ -795,8 +829,7 @@ def _refuse_tree_shaping_if_unverifiable(verb: str) -> tuple[str, str | None]:
         return "", (
             f"Error: cannot verify which session is calling, so {verb} is "
             "refused — reshaping the shared folder tree requires a caller "
-            "identity the gateway can vouch for."
-            + strict_identity_diagnosis(SERVER_NAME)
+            "identity the gateway can vouch for." + strict_identity_diagnosis(SERVER_NAME)
         )
     rows, err = _get_rows("/api/chat/slots")
     if err:
@@ -884,10 +917,31 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         target = resp.get("target", args["target"])
         info = resp.get("info")
         if info:
-            # The target was not running (or a stop was already in flight) — say
-            # so rather than implying a turn was cancelled.
+            # Two different facts share this reply and must not read alike. A
+            # target that was never running has nothing to stop; one whose
+            # cooperative cancel is still in flight IS stopping, and after #5074 a
+            # re-sent stop lands there routinely — telling that caller "nothing to
+            # stop" would report the opposite of what happened and invite it to
+            # act as though the target were still free-running.
+            if resp.get("already_stopping"):
+                return f"\u2139\ufe0f `{target}`: {info} — the earlier stop still stands."
             return f"\u2139\ufe0f `{target}`: {info} — nothing to stop."
         return f"\U0001f6d1 Stop sent to `{target}`. Its transcript now shows the stop card."
+
+    if name == "session_close":
+        args = validate_tool_args(args, SESSION_CLOSE_SCHEMA)
+        resp = _post(
+            "/api/session-control/close",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not close that session: {resp['error']}"
+        target = resp.get("target", args["target"])
+        return (
+            f"\U0001f5d1\ufe0f Closed `{target}` — the tab is dismissed and the "
+            "conversation archived to history (it can be reopened later)."
+        )
 
     if name == "session_send":
         args = validate_tool_args(args, SESSION_SEND_SCHEMA)

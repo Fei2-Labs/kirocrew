@@ -377,6 +377,68 @@ class TestListSection:
 # ---------------------------------------------------------------------------
 
 
+class TestListLibraryFolders:
+    """The IDENTITY read behind the Library reconcile.
+
+    Distinct from list_section on three points a reconcile depends on, each
+    pinned here: unredacted names, a complete answer rather than a page, and a
+    RAISE rather than an empty list when the response cannot be read.
+    """
+
+    def test_returns_raw_folder_names_and_anchors_the_library_prefix(self):
+        # CommonPrefixes carry the full key prefix; the caller compares these
+        # against ledger keys, so the prefix and the trailing slash both have to
+        # come off. The prefix is anchored INSIDE (there is no section argument),
+        # so a caller cannot point this read at another section.
+        payload = json.dumps(["artifacts/alpha/", "artifacts/beta-two/"])
+        with mock.patch.object(storage, "_checked", return_value=payload) as checked:
+            folders = storage.list_library_folders(
+                "prof", "us-west-2", "bkt", account="111122223333"
+            )
+        assert folders == ["alpha", "beta-two"]
+        argv = checked.call_args.args[0]
+        # Delimiter + prefix make it a one-level listing, and the query pulls
+        # CommonPrefixes so the CLI's auto-pagination merges every page into it.
+        assert "--delimiter" in argv and argv[argv.index("--delimiter") + 1] == "/"
+        assert argv[argv.index("--prefix") + 1] == "artifacts/"
+        assert argv[argv.index("--query") + 1] == "CommonPrefixes[].Prefix"
+        # Owner-pinned like every other call: a bucket name that changed hands
+        # must not answer for this account.
+        assert argv[argv.index("--expected-bucket-owner") + 1] == "111122223333"
+        # NO --max-items: passing one turns the CLI to client-side pagination and
+        # this answer would become a first page the caller would read as the
+        # whole prefix.
+        assert "--max-items" not in argv
+
+    def test_an_empty_library_is_an_empty_list(self):
+        # No CommonPrefixes at all: --query renders null, which must read as "no
+        # folders" rather than raising.
+        with mock.patch.object(storage, "_checked", return_value="null"):
+            assert (
+                storage.list_library_folders("prof", "us-west-2", "bkt", account="111122223333")
+                == []
+            )
+
+    def test_foreign_and_bare_prefix_rows_are_dropped(self):
+        # A row outside the prefix (another section leaking into the response)
+        # and the prefix placeholder itself carry no folder name; neither may
+        # become an empty-string "folder" the caller then reasons about.
+        payload = json.dumps(["drive/other/", "artifacts/", "artifacts//", "artifacts/real/"])
+        with mock.patch.object(storage, "_checked", return_value=payload):
+            assert storage.list_library_folders(
+                "prof", "us-west-2", "bkt", account="111122223333"
+            ) == ["real"]
+
+    def test_unreadable_response_raises_instead_of_reading_as_empty(self):
+        # THE case this function exists for. An empty answer means "nothing in
+        # the cloud", and the reconcile acts on that by dropping every record it
+        # holds -- so a garbled response must fail loudly, the opposite of
+        # usage()'s deliberate degrade-to-empty.
+        with mock.patch.object(storage, "_checked", return_value="{not json"):
+            with pytest.raises(AWSError, match="could not be read as JSON"):
+                storage.list_library_folders("prof", "us-west-2", "bkt", account="111122223333")
+
+
 class TestObjectIO:
     def test_put_file_is_owner_pinned_and_section_scoped(self, tmp_path):
         # s3api put-object, NOT `s3 cp`: no `aws s3` command accepts

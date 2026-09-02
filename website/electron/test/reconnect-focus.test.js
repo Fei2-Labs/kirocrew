@@ -104,7 +104,10 @@ describe("main.js wiring (source pins)", () => {
 
   it("showLoadingThenConnect routes its initial reveal through the helper", () => {
     const body = fnBody("showLoadingThenConnect");
-    assert.match(body, /async function showLoadingThenConnect\(win, backendUrl = BACKEND_URL, \{ reconnect = false \} = \{\}\)/);
+    assert.match(
+      body,
+      /async function showLoadingThenConnect\([\s\S]*?\{ reconnect = false, initialPath = "" \} = \{\},[\s\S]*?\)/,
+    );
     assert.match(body, /revealWindowForConnect\(win, \{ reconnect \}\)/);
   });
 

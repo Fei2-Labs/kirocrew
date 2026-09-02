@@ -55,6 +55,14 @@ describe('readSendReceipt', () => {
     expect((await readSendReceipt(res(true, async () => ({ queued: true })))).outcome).toBe('accepted')
   })
 
+  it('surfaces the server-minted mid from an immediate-dispatch receipt', async () => {
+    // The mid is what the client stamps on the optimistic bubble to make the
+    // just-sent message pinnable this turn; it must survive parsing.
+    const receipt = await readSendReceipt(res(true, async () => ({ ok: true, slot: 's1', mid: 'm-abc123' })))
+    expect(receipt.outcome).toBe('accepted')
+    expect(receipt.body.mid).toBe('m-abc123')
+  })
+
   it('reads an explicit refusal, and keeps the reason the server sent', async () => {
     const receipt = await readSendReceipt(res(false, async () => ({ ok: false, error: 'slot agent mismatch' })))
     expect(receipt.outcome).toBe('refused')

@@ -258,6 +258,76 @@ describe('DiagramLightbox magnification', () => {
     act(() => { fireEvent.click(overlay()) })
     expect(onClose).not.toHaveBeenCalled()
   })
+
+  it('zooms in, out, and resets via toolbar buttons', () => {
+    render(<DiagramLightbox svg={WITH_VIEWBOX} onClose={vi.fn()} />)
+    const findBtn = (pattern: RegExp) =>
+      [...document.body.querySelectorAll('[role="dialog"] button')].find(b =>
+        pattern.test(b.getAttribute('aria-label') || ''),
+      ) as HTMLButtonElement
+
+    const zoomInBtn = findBtn(/zoom in/i)
+    const zoomOutBtn = findBtn(/zoom out/i)
+
+    expect(zoomOutBtn.disabled).toBe(true)
+    expect(zoomInBtn.disabled).toBe(false)
+
+    act(() => { fireEvent.click(zoomInBtn) })
+    expect(host().style.transform).toContain('scale(1.5)')
+    expect(zoomOutBtn.disabled).toBe(false)
+
+    const resetBtn = findBtn(/reset/i)
+    expect(resetBtn).not.toBeNull()
+
+    act(() => { fireEvent.click(zoomInBtn) })
+    expect(host().style.transform).toContain('scale(2)')
+
+    act(() => { fireEvent.click(zoomOutBtn) })
+    expect(host().style.transform).toContain('scale(1.5)')
+
+    act(() => { fireEvent.click(resetBtn) })
+    expect(host().style.transform).toContain('scale(1)')
+    expect(zoomOutBtn.disabled).toBe(true)
+  })
+
+  it('zooms in, out, and resets via keyboard shortcuts (+, -, 0)', () => {
+    render(<DiagramLightbox svg={WITH_VIEWBOX} onClose={vi.fn()} />)
+    act(() => { fireEvent.keyDown(window, { key: '+' }) })
+    expect(host().style.transform).toContain('scale(1.5)')
+
+    act(() => { fireEvent.keyDown(window, { key: '=' }) })
+    expect(host().style.transform).toContain('scale(2)')
+
+    act(() => { fireEvent.keyDown(window, { key: '-' }) })
+    expect(host().style.transform).toContain('scale(1.5)')
+
+    act(() => { fireEvent.keyDown(window, { key: '0' }) })
+    expect(host().style.transform).toContain('scale(1)')
+  })
+
+  it('gates zoom controls and keyboard shortcuts on fitted diagrams', () => {
+    // A no-viewBox SVG is not fitted; zoom buttons must be absent and keys ignored
+    render(<DiagramLightbox svg={NO_VIEWBOX} onClose={vi.fn()} />)
+    const hasZoomIn = [...document.body.querySelectorAll('button')].some(button =>
+      /zoom in/i.test(button.getAttribute('aria-label') || ''),
+    )
+    expect(hasZoomIn).toBe(false)
+
+    act(() => { fireEvent.keyDown(window, { key: '+' }) })
+    expect(host().style.transform).toBe('')
+  })
+
+  it('ignores zoom keys when focus is inside an editable input target', () => {
+    render(
+      <div>
+        <input data-testid="inp" aria-label="test input" />
+        <DiagramLightbox svg={WITH_VIEWBOX} onClose={vi.fn()} />
+      </div>,
+    )
+    const inp = document.querySelector('[data-testid="inp"]') as HTMLInputElement
+    act(() => { fireEvent.keyDown(inp, { key: '+' }) })
+    expect(host().style.transform).not.toContain('scale(1.5)')
+  })
 })
 
 describe('the magnify-surface rule is enforced by count, not by example', () => {
@@ -286,24 +356,37 @@ describe('the magnify-surface rule is enforced by count, not by example', () => 
      *  An entry here is a visible debt with an owner; deleting the entry is part
      *  of that issue's work. Do NOT add one to make a red sweep green — the
      *  point of the sweep is that a NEW overlay cannot ship without the hook. */
-    const deferred = new Map([['pages/AppDetailPage.tsx', '#6162']])
+    const deferred = new Map<string, string>()
     const offenders: string[] = []
     const magnifySurfaces: string[] = []
     let seen = 0
+    const files: string[] = []
     for await (const file of glob(['components/**/*.tsx', 'pages/**/*.tsx'], { cwd: root, withFileTypes: false })) {
-      const src = await readFile(join(root, String(file)), 'utf8')
-      if (!/fixed inset-0[^"'`]*z-\[9999\]/.test(src)) continue
-      seen++
-      // A magnify overlay either uses the shared hook, or is one of the overlays
-      // that never magnifies (a popover, a confirm sheet, a menu scrim). The
-      // discriminator is whether it renders a single piece of CONTENT scaled to
-      // fit — an `<img>`, or an SVG it fit-scales itself. It is content-based
-      // rather than a sizing-utility scan because a `max-h-[…]` means only "this
-      // has a maximum height": a menu carries one and is not a magnifier.
-      const magnifies = /<img|querySelector\('svg'\)|preserveAspectRatio|object-contain/.test(src)
-      if (!magnifies) continue
-      magnifySurfaces.push(String(file))
-      if (!src.includes('usePinchZoom') && !deferred.has(String(file))) offenders.push(String(file))
+      const normFile = String(file).replace(/\\/g, '/')
+      files.push(normFile)
+    }
+    // OneDrive, antivirus and network-backed worktrees can make a sequential
+    // read of the whole TSX population exceed the generic 15s unit-test budget.
+    // Read in bounded batches: enough concurrency to avoid a filesystem-latency
+    // sum, but not an unbounded Promise.all that can exhaust Windows handles.
+    for (let start = 0; start < files.length; start += 32) {
+      const batch = await Promise.all(
+        files.slice(start, start + 32).map(async file => [file, await readFile(join(root, file), 'utf8')] as const),
+      )
+      for (const [file, src] of batch) {
+        if (!/fixed inset-0[^"'`]*z-\[9999\]/.test(src)) continue
+        seen++
+        // A magnify overlay either uses the shared hook, or is one of the overlays
+        // that never magnifies (a popover, a confirm sheet, a menu scrim). The
+        // discriminator is whether it renders a single piece of CONTENT scaled to
+        // fit — an `<img>`, or an SVG it fit-scales itself. It is content-based
+        // rather than a sizing-utility scan because a `max-h-[…]` means only "this
+        // has a maximum height": a menu carries one and is not a magnifier.
+        const magnifies = /<img|querySelector\('svg'\)|preserveAspectRatio|object-contain/.test(src)
+        if (!magnifies) continue
+        magnifySurfaces.push(file)
+        if (!src.includes('usePinchZoom') && !deferred.has(file)) offenders.push(file)
+      }
     }
     // Prove the sweep reached the tree rather than passing on an empty match set.
     expect(seen, 'no full-viewport overlay matched — the shape detector broke').toBeGreaterThan(1)

@@ -49,6 +49,7 @@ from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
     sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -749,17 +750,27 @@ def _load_agent_config(*, user_home: Path | None = None) -> dict[str, Any]:
 
     # Installed agent config (always check for mcpServers)
     from kiro_crew.agent import AGENT_FILENAME  # circular import: agent imports mcp_discovery
+    from kiro_crew.agent_discovery import _read_agent_spec
 
     installed = (
         (user_home / ".kiro" / "agents") if user_home else kiro_agents_dir()
     ) / AGENT_FILENAME
     if installed.is_file():
-        try:
-            loaded = json.loads(installed.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                configs.append(loaded)
-        except (json.JSONDecodeError, OSError):
-            pass
+        # The agents dir is user-writable and shared with other tools, so this
+        # goes through the hardened agent-spec reader (size cap,
+        # sensitive-symlink screen, non-object rejection, SEL denial event)
+        # rather than a bare read_text + json.loads. It also closes a hole the
+        # old ``except`` could not: ``encoding="utf-8"`` on a non-UTF-8 spec
+        # raises UnicodeDecodeError, a ValueError rather than an OSError or a
+        # JSONDecodeError, so it escaped this handler entirely. ``None``
+        # degrades as absent, exactly as the swallowed exceptions did.
+        loaded = _read_agent_spec(
+            installed,
+            operation="mcp_discovery_agent_config",
+            source="unknown",
+        )
+        if loaded is not None:
+            configs.append(loaded)
 
     if not configs:
         return {}
@@ -975,16 +986,28 @@ _MANAGED_SERVERS_CALLER_AWARE: frozenset[str] = frozenset(
 #: not-session-bound classification but not sufficient. ``kirocrew-computer``
 #: consumes the injected caller block (its pooled attribution is correct for
 #: every caller the gateway can name), but a caller the gateway CANNOT name
-#: proceeds under ``unresolved:<pid>`` by product decision — and on a pooled
-#: backend that pid is the shared process, so two unnamed co-tenants collapse
-#: onto one ``SnapshotIndex`` namespace and can act on each other's element
-#: indices (#5322). Unnamed is the NORMAL case on macOS, the only platform
-#: with a computer-use driver, so recommending co-tenancy would recommend the
-#: collision. Contrast ``kirocrew-dashboard``, which refuses an unidentified
-#: caller and is therefore safe to classify shareable. Remove this exception
-#: when #5322 gives unnamed callers isolated namespaces;
-#: ``test_mcp_managed_caller_identity.py`` pins it so it cannot silently
-#: persist or silently widen.
+#: proceeds under ``unresolved:<pid>`` by product decision — and unnamed is the
+#: NORMAL case on macOS, the only platform with a computer-use driver.
+#:
+#: #5322 gave those unnamed callers a per-CONNECTION nonce, so on a CURRENT
+#: gateway they no longer collapse onto one ``SnapshotIndex`` namespace. The
+#: entry stays because that is not the whole precondition. This set feeds
+#: ``managed_server_is_session_bound``, which feeds the shareability verdict,
+#: which ``mcp_gateway/seed.py`` turns into a CONFIG WRITE (``recommend_share``
+#: -> ``apply_seed``): promoting a name here can switch sharing ON for an
+#: operator who never chose it. And the daemon that would then serve those
+#: shared frames is not necessarily the one this code shipped with —
+#: ``mcp_gateway/manager.py`` ADOPTS whatever healthy daemon already holds the
+#: socket, so a gatewayd that outlived a package upgrade keeps running and
+#: injects no nonce (which is exactly why ``REGISTERED_CAPABILITIES`` exists).
+#: Promotion therefore has to wait until a nonce-blind gateway cannot serve a
+#: POOLED computer backend at all — negotiated, not assumed. Tracked as the
+#: #5322 follow-up.
+#:
+#: Contrast ``kirocrew-dashboard``, which refuses an unidentified caller and is
+#: therefore safe to classify shareable regardless of the daemon's generation.
+#: ``test_mcp_managed_caller_identity.py`` pins this so the entry can neither
+#: silently persist past its reason nor silently widen.
 _MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD: frozenset[str] = frozenset(
     {"kirocrew-computer"}
 )
@@ -1808,7 +1831,7 @@ async def probe_server(
         # start?" probe runs for real instead of fail-closing. Third-party
         # probes (and any customized managed command/args/env) pass False and
         # keep the full fail-close + opt-in behavior.
-        wrapped_argv, env, sandbox_cleanup = sandboxed_spawn_argv(
+        wrapped_argv, env, sandbox_cleanup = await sandboxed_spawn_argv_async(
             [resolved, *(server.args or [])],
             mode="standard",
             env=env,
@@ -1816,6 +1839,7 @@ async def probe_server(
             first_party_fixed_argv=_is_first_party_managed_argv(
                 server.name, server.command, server.args or [], server.env or {}
             ),
+            _prepare=sandboxed_spawn_argv,
         )
         # Probe temp containment (#5064): each probe gets its OWN private dir
         # under the managed root, cleaned in this function's finally -- unlike

@@ -111,14 +111,6 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
     useCases: ['apps.autoResearch.manifest.use_case_1'],
     configuration: ['apps.autoResearch.manifest.configuration_1'],
   },
-  'auto-triage-pipeline': {
-    displayName: 'apps.autoTriagePipeline.manifest.display_name',
-    description: 'apps.autoTriagePipeline.manifest.description',
-    pageLabel: 'apps.autoTriagePipeline.manifest.page_label',
-    highlights: [],
-    useCases: ['apps.autoTriagePipeline.manifest.use_case_1'],
-    configuration: ['apps.autoTriagePipeline.manifest.configuration_1'],
-  },
   'aws-control': {
     displayName: 'apps.awsControl.manifest.display_name',
     description: 'apps.awsControl.manifest.description',
@@ -287,6 +279,7 @@ export const APP_MANIFEST_KEY: Record<string, ManifestKeys> = {
       'apps.meetings.manifest.highlight_3',
       'apps.meetings.manifest.highlight_4',
       'apps.meetings.manifest.highlight_5',
+      'apps.meetings.manifest.highlight_6',
     ],
     useCases: ['apps.meetings.manifest.use_case_1'],
     configuration: ['apps.meetings.manifest.configuration_1'],

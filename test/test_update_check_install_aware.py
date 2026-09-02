@@ -57,6 +57,15 @@ def _manifest(**overrides: object) -> bytes:
     return json.dumps(body).encode()
 
 
+def _request() -> MagicMock:
+    """A request stub for ``api_update_check``: only ``.app["state"]`` is read."""
+    req = MagicMock()
+    state = MagicMock()
+    state._background_tasks = set()
+    req.app = {"state": state}
+    return req
+
+
 def _stub_feed(monkeypatch, *, status: int = 200, body: bytes | None = None, exc=None):
     """Replace the single network seam. Records the URL that was requested."""
     seen: dict[str, str] = {}
@@ -274,6 +283,80 @@ class TestWheelInstallCheck:
         assert info["check_status"] == "succeeded"  # optional field, not a hard failure
 
 
+class TestChannelMovePending:
+    """The running build is ahead of everything the FOLLOWED lane publishes.
+
+    That is the state a channel switcher leaves behind on an install whose bytes
+    it cannot replace: the feed answers honestly ("nothing newer for you"), and
+    the panel must still say the install is not on the chosen lane yet. It is
+    derived from the feed comparison rather than from the version's prerelease
+    stamp because promotion never re-stamps -- see ``_channel_move_pending``.
+    """
+
+    def _run(self, monkeypatch, tmp_path, *, channel: str, local: str, remote: str) -> dict:
+        (tmp_path / "channel").write_text(f"{channel}\n")
+        _stub_feed(monkeypatch, body=_manifest(channel=channel, version=remote))
+        monkeypatch.setattr(updates, "_local_version", local)
+        asyncio.run(updates._do_update_check())
+        return updates.get_update_info()
+
+    def test_insider_bytes_following_stable_report_a_pending_move(self, monkeypatch, tmp_path):
+        info = self._run(
+            monkeypatch, tmp_path, channel="stable", local="0.5.0rc3", remote="0.4.1rc1"
+        )
+        assert info["channel_move_pending"] is True
+        # No update is available, and that is not a contradiction: the lane has
+        # nothing NEWER. Both facts ride the status frame so the panel can show
+        # "not on stable yet" instead of a green "up to date".
+        assert info["update_available"] is False
+        fields = updates.status_update_fields()
+        assert fields["update_channel_move_pending"] is True
+        assert fields["update_channel"] == "stable"
+        # The move's target, folded for display, so the note can name it.
+        assert fields["update_latest_version_display"] == "0.4.1"
+        # ...and the running build keeps its own stamp rather than being renamed
+        # to a stable release that was never published.
+        assert fields["version_display"] == "0.5.0rc3"
+
+    def test_a_promoted_stable_install_is_not_mid_switch(self, monkeypatch, tmp_path):
+        # The regression this predicate exists for: comparing the followed channel
+        # against the version-derived lane reported `insider != stable` here, so
+        # the whole promoted-stable population saw the switch note permanently.
+        info = self._run(
+            monkeypatch, tmp_path, channel="stable", local="0.4.1rc1", remote="0.4.1rc1"
+        )
+        assert info["channel_move_pending"] is False
+        assert updates.status_update_fields()["version_display"] == "0.4.1"
+
+    def test_running_behind_is_an_update_not_a_move(self, monkeypatch, tmp_path):
+        info = self._run(
+            monkeypatch, tmp_path, channel="stable", local="0.4.0rc14", remote="0.4.1rc1"
+        )
+        assert info["update_available"] is True
+        assert info["channel_move_pending"] is False
+
+    def test_nightly_bytes_following_stable_report_a_pending_move(self, monkeypatch, tmp_path):
+        info = self._run(
+            monkeypatch,
+            tmp_path,
+            channel="stable",
+            local="0.6.0.dev20260829060906",
+            remote="0.4.1rc1",
+        )
+        assert info["channel_move_pending"] is True
+
+    def test_a_failed_check_reports_no_move(self, monkeypatch, tmp_path):
+        (tmp_path / "channel").write_text("stable\n")
+        _stub_feed(monkeypatch, status=503)
+        monkeypatch.setattr(updates, "_local_version", "0.5.0rc3")
+        asyncio.run(updates._do_update_check())
+        info = updates.get_update_info()
+        assert info["check_status"] == "failed"
+        # A verdict the check never reached must not be inferred from the stamp.
+        assert info["channel_move_pending"] is False
+        assert updates.status_update_fields()["version_display"] == "0.5.0"
+
+
 class TestFeedMinVersion:
     """The feed's optional ``min_version`` floor drives the mandatory-update verdict.
 
@@ -392,6 +475,65 @@ class TestFeedMinVersion:
         monkeypatch.setattr(updates, "_local_version", "0.2.0rc7")
         asyncio.run(updates._do_update_check())
         assert updates.status_update_fields()["update_required"] is True
+
+    def test_available_update_on_stable_stays_raw_for_arm_but_folds_for_display(
+        self, monkeypatch, tmp_path
+    ):
+        """The feed check's `_update_info["latest_version"]` MUST stay the raw
+        stamp (``0.4.0rc14``): `api_update_arm` arms against it verbatim, and
+        the shadow-venv apply step compares it byte-for-byte against the
+        installed build's own `__version__`, which is never folded either
+        (promotion never re-stamps the bytes). A folded value there would make
+        every stable in-app apply fail with a version mismatch.
+
+        The clean release version for the About panel comes from a SEPARATE
+        display-only field on the `/api/update/check` response,
+        `latest_version_display`, folded the same way `_display_local_version`
+        folds the running build."""
+        (tmp_path / "channel").write_text("stable\n")
+        _stub_feed(
+            monkeypatch,
+            body=_manifest(channel="stable", version="0.4.0rc14"),
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+
+        info = updates.get_update_info()
+        assert info["channel"] == "stable"
+        assert info["check_status"] == "succeeded"
+        assert info["latest_version"] == "0.4.0rc14"  # RAW -- what arm/apply use
+
+        resp = asyncio.run(updates.api_update_check(_request()))
+        payload = json.loads(resp.body.decode())
+        assert payload["latest_version"] == "0.4.0rc14"  # still raw on the wire
+        assert payload["latest_version_display"] == "0.4.0"  # folded for display
+
+        # Same fold applies on the unparseable-local-version failure branch,
+        # and `latest_version` there stays raw too.
+        monkeypatch.setattr(updates, "_local_version", "not-a-version")
+        asyncio.run(updates._do_update_check())
+        info = updates.get_update_info()
+        assert info["check_status"] == "failed"
+        assert info["latest_version"] == "0.4.0rc14"
+        resp = asyncio.run(updates.api_update_check(_request()))
+        payload = json.loads(resp.body.decode())
+        assert payload["latest_version_display"] == "0.4.0"
+
+        # An insider feed keeps its full stamp everywhere -- the fold is
+        # stable-only, both raw and display agree.
+        (tmp_path / "channel").write_text("insider\n")
+        _stub_feed(
+            monkeypatch,
+            body=_manifest(channel="insider", version="0.4.0-insider.14"),
+        )
+        monkeypatch.setattr(updates, "_local_version", "0.3.0")
+        asyncio.run(updates._do_update_check())
+        info = updates.get_update_info()
+        assert info["channel"] == "insider"
+        assert info["latest_version"] == "0.4.0-insider.14"
+        resp = asyncio.run(updates.api_update_check(_request()))
+        payload = json.loads(resp.body.decode())
+        assert payload["latest_version_display"] == "0.4.0-insider.14"
 
     def test_governance_pin_alone_also_reads_required(self, monkeypatch):
         """The two authorities are OR'd: the enterprise pin needs no feed floor."""

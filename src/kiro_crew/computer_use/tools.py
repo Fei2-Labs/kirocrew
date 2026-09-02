@@ -274,11 +274,6 @@ _SECURE_TARGET_TOOLS: frozenset[str] = frozenset(
         TOOL_SCROLL,
     }
 )
-# Tools that synthesize KEYSTROKES. Both are element-targeted, and both are refused
-# outright without an index (see 3b in ``_dispatch``) — including
-# ``computer_press_key``, because ``press_key('tab')`` can MOVE focus onto a
-# password box and the next keystroke would land there.
-_KEYBOARD_TOOLS: frozenset[str] = frozenset({TOOL_TYPE_TEXT, TOOL_PRESS_KEY})
 
 
 def dispatch_tool(
@@ -471,7 +466,9 @@ def _dispatch(
             )
         request = built_drag
 
-    # (4) AUTHORIZATION — fail-closed, before any accessibility or capture call.
+    # (4) AUDIT — recorded before any accessibility or capture call, so the record
+    # exists even when the driver then fails. This step returns no decision: the
+    # fail-closed authorization is the keystone primary enable at step (1).
     denial = gate.require_computer_use(
         tool_name,
         session_key=session_key,

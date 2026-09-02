@@ -774,6 +774,43 @@ function initAutoUpdate(deps) {
   // back out so the renderer can replay it on mount, which keeps the boot path
   // untouched (the renderer already requests the info payload).
   let lastEmittedState = null;
+  // The version the FOLLOWED channel's feed last reported, and the channel it was
+  // reported FOR. Recorded because promotion never re-stamps: the stable feed's
+  // current release is literally `0.4.1-insider.1`, so `channelForVersion` cannot
+  // tell a promoted-stable install from an insider one, and every surface that
+  // asked the version string "which lane am I on" answered `insider` for the whole
+  // promoted-stable population. The feed's own answer is the only honest input, so
+  // it is kept for the display layer.
+  let laneVersion = null;
+  let laneChannel = null;
+  /**
+   * The lane pair, or UNKNOWN. Reported as unknown unless the recorded version
+   * was read for the channel this install follows RIGHT NOW: a switch makes the
+   * old lane's answer describe a lane nobody is on, and `update:set-channel`
+   * returns `getInfo()` synchronously while its re-check is still in flight, so a
+   * read-time comparison is what closes that window rather than clearing state on
+   * an ordering assumption. Concretely, without it: flip insider -> stable on an
+   * up-to-date insider build while the follow-up check cannot reach the feed
+   * (offline), and a retained `runningAheadOfLane: false` tells the panel these
+   * bytes ARE the stable release — folding the chip to a version that does not
+   * exist and suppressing the prerelease ask, i.e. the very bug this pair exists
+   * to fix. `null` means no usable answer and must never read as "ahead".
+   */
+  function laneSnapshot() {
+    if (!laneVersion || laneChannel !== currentChannel()) {
+      return { laneVersion: "", runningAheadOfLane: null };
+    }
+    return { laneVersion, runningAheadOfLane: isNewerVersion(app.getVersion(), laneVersion) };
+  }
+  /** Record what the lane just answered, attributed to the lane that answered. */
+  function recordLaneVersion(version) {
+    if (!version) return;
+    laneVersion = version;
+    // The channel the FETCH was configured for, not a live read: the preference
+    // can flip while a check is in flight, and attributing that answer to the new
+    // lane is the same mis-pairing `shouldAutoOffer` avoids with `feedChannel`.
+    laneChannel = feedChannel || currentChannel();
+  }
   // Single channel resolver used for the feed AND everything reported to
   // the UI. Read the preference FRESH on every call: configureFeed() runs
   // per check, so a Settings channel switch takes effect on the next check
@@ -797,6 +834,12 @@ function initAutoUpdate(deps) {
       installHandoff: osPlatform === "win32" && !managed
         ? "windows-installer"
         : "automatic-relaunch",
+      // Display inputs for the version chip and the prerelease note (see
+      // laneSnapshot). Carried on every lifecycle payload as well as getInfo()
+      // so a renderer driven by pushes alone never falls back to the
+      // stamp-based guess this pair replaces -- and so a renderer that mounted
+      // before the latest check does not keep rendering that older answer.
+      ...laneSnapshot(),
       ...extra,
     };
     // Remembered even when the push below throws: a renderer that missed the
@@ -826,6 +869,13 @@ function initAutoUpdate(deps) {
       stampedChannel: stamped,
       channelSwitchable: !managed && (stamped === "insider" || stamped === "stable"),
       channelPreference: getChannelPreference() || "",
+      // What the FOLLOWED channel publishes, and whether these bytes are ahead
+      // of it — i.e. that lane never shipped this build, so the install is not
+      // on it. Both come from the feed rather than from `stampedChannel`, which
+      // a promoted stable release makes unusable for the question (its bytes
+      // keep the soaked candidate's insider stamp). "" / null until a check has
+      // completed FOR THE CHANNEL THIS INSTALL FOLLOWS (see laneSnapshot).
+      ...laneSnapshot(),
       // Current auto-download policy, so About renders the toggle from the
       // value the updater will actually act on rather than from its own copy
       // of the store. Read through the same guard as the event path: a
@@ -1698,6 +1748,11 @@ function initAutoUpdate(deps) {
   autoUpdater.on("update-not-available", () => {
     downloading = false;
     foundVersion = null;
+    // The feed's gate is DIFFERENCE-based (allowDowngrade=true), so "not
+    // available" means the followed lane publishes exactly the running version:
+    // record that, which is what makes the lane pair a definite not-ahead
+    // instead of an unknown for the whole up-to-date population.
+    recordLaneVersion(app.getVersion());
     // Clear the STAGED state too, not just the found state. The feed reporting
     // "no update" while something is staged is exactly the retraction path
     // (a feed repointed to the running version) and the channel-switch-back
@@ -1722,6 +1777,14 @@ function initAutoUpdate(deps) {
   // and the consent paths share one guarded entry point (startDownload).
   autoUpdater.on("update-available", (info) => {
     foundVersion = (info && info.version) || null;
+    // What the followed lane publishes, recorded BEFORE the direction gate
+    // below can null `foundVersion` out. The suppressed case is precisely the
+    // one the display layer needs it for: an insider build whose preference was
+    // flipped to stable reaches here with the stable lane's OLDER release, is
+    // (correctly) not auto-offered, and must still be able to say "stable
+    // publishes 0.4.1; you are running bytes it never shipped" instead of
+    // folding its version to a stable release that does not exist.
+    recordLaneVersion(foundVersion);
     // Direction gate — the fix for the "update to an OLDER version" nag.
     // electron-updater fires this for ANY feed version that DIFFERS from the
     // running one, because allowDowngrade=true — so on a build running ahead of

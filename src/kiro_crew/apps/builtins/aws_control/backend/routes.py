@@ -13,7 +13,7 @@ READS
 ``GET /drive/{account}/list``                  one listing page (?section&path&token)
 ``GET /drive/{account}/download``              short-lived download URL (?section&key)
 ``GET /costs/{account}``                       cached bill (?refresh=1 re-queries CE)
-``GET /library/{account}``                     local artifacts + push state
+``GET /library/{account}``                     local artifacts + reconciled push state
 ``GET /backup/{account}``                      backup state + remote archive listing
 ``GET /shares``                                live share ledger (?account=)
 ``GET /iam-policy``                            drive-tier policy JSON (local render)
@@ -27,6 +27,7 @@ MUTATIONS (also restricted-session refused + SEL-audited)
 ``POST /drive/{account}/share``                mint a presigned share + ledger entry
 ``POST /shares/{id}/forget``                   drop a ledger entry (link lives to expiry)
 ``POST /library/{account}/push``               push one artifact to the cloud library
+``POST /library/{account}/remove``             delete a cloud copy + forget its record
 ``POST /backup/{account}/run``                 run a backup (snapshot | sessions)
 ``POST /backup/{account}/nightly``             toggle the nightly snapshot
 ``POST /backup/{account}/restore``             download an archive to the staging dir
@@ -54,6 +55,7 @@ GUARDS, in order, and why each exists:
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
 import shutil
@@ -106,7 +108,33 @@ Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 #: be stale; the identity of the bucket we write to cannot.
 #: Serializes drive creation (see _handle_drive_bootstrap). LoopBoundLock so
 #: the module global never binds an import-time loop (#4800).
+#: How long the RENDER path waits for the Library lock before giving up on the
+#: reconcile. The lock is also held across a push, whose upload allows up to 600s,
+#: so waiting on it unbounded would let one large push hang every Library page
+#: render for the length of that upload. Errors on this path already degrade to
+#: `reconciled: false`; slowness has to degrade the same way or the degradation is
+#: only half real. Skipping costs nothing durable -- the reconcile is
+#: self-correcting, so the next render does it.
+_LIBRARY_RECONCILE_LOCK_WAIT_SECS = 5.0
+
 _bootstrap_lock = LoopBoundLock()
+
+#: Serializes the Library's own operations on one drive: a push, a removal, and
+#: the reconcile that repairs the ledger. Each is a network round trip followed
+#: by a ledger write, and interleaving two of them corrupts state that neither
+#: half can detect on its own -- a push completing between the reconcile's
+#: listing and its prune has its fresh record deleted, and a push racing a
+#: removal of the same slug can leave one uploaded object behind the delete
+#: sweep. The ledger's own file lock cannot serialize these: it deliberately
+#: covers a sub-second read plus rename, and stretching it across S3 would make
+#: a concurrent caller fail closed on Windows.
+#:
+#: Coarse on purpose -- one lock, not one per slug. This is an owner-only
+#: surface where a human clicks buttons, so the contention is theoretical, and a
+#: per-slug map would need eviction to stay bounded. LoopBoundLock for the same
+#: reason ``_bootstrap_lock`` uses it: a module global must not bind an
+#: import-time loop (#4800).
+_library_lock = LoopBoundLock()
 
 #: The provider name this app's egress paths answer to under the shared
 #: publish-governance gate (``capabilities.publish`` ∩ ``destinations:<id>``).
@@ -691,27 +719,20 @@ async def _handle_drive_upload(request: web.Request) -> web.Response:
         if received == 0:
             return _bad_request("empty upload", "empty_upload")
         # A 512 MB stream can take minutes: the authorization resolved before
-        # the transfer may no longer hold. Re-check the app gate, then RE-RESOLVE
-        # the identity, then consent -- in that order, because consent is asked
-        # ABOUT a profile and region, so verifying it against a stale pair proves
-        # nothing about where the bytes are going. A profile repointed A -> B
-        # during the spool would have had consent verified for B while `put_file`
-        # still wrote into A's bucket (reachable whenever B holds cross-account
-        # access), so the write must be refused unless the SAME triple the
-        # request was authorized for still resolves.
-        if not await asyncio.to_thread(is_app_enabled, APP_NAME):
-            _audit("drive_upload", request.path, "denied", error="app_disabled")
-            return _forbidden("aws-control is disabled", "app_disabled")
-        recheck = await _account_target(request)
-        if isinstance(recheck, web.Response):
-            return recheck
-        if recheck != (account, profile, region):
-            _audit("drive_upload", request.path, "denied", error="account_mismatch")
-            return _conflict(
-                "this connection changed while the file was uploading; nothing was written",
-                "account_mismatch",
-            )
-        denied = await _consent(aws_consent.SERVICE_S3, profile, region)
+        # the transfer may no longer hold. The spool is the same post-wait gap
+        # the Library operations cross under their lock, so the SAME helper
+        # re-runs the full re-authorization: app gate, live identity re-probe,
+        # consent, and the drive bucket itself -- the piece an identity check
+        # cannot cover, because tag discovery can move the drive to a different
+        # bucket while the identity is unchanged, and a name held across the
+        # spool is exactly the staleness the module's no-cache rule forbids. A
+        # pass means the pre-spool ``bucket`` still names the account's current
+        # drive, so the put below writes to the post-spool resolution; anything
+        # else is refused with nothing written. No publish gate: an upload does
+        # not consult it on the way in, so the re-check does not add it.
+        denied = await _reauthorize_in_lock(
+            request, "drive_upload", account, profile, region, bucket, publish=False
+        )
         if denied:
             return denied
         try:
@@ -934,10 +955,249 @@ async def _handle_costs(request: web.Request) -> web.Response:
 # --------------------------------------------------------------------------
 
 
+async def _reauthorize_in_lock(
+    request: web.Request,
+    operation: str,
+    account: str,
+    profile: str,
+    region: str,
+    bucket: str,
+    *,
+    publish: bool,
+) -> web.Response | None:
+    """Re-run the authorization a waiting caller may have outlived.
+
+    Something makes a handler WAIT -- ``_library_lock`` queues the Library
+    operations, and the upload spool holds ``_handle_drive_upload`` for as long
+    as a 512 MB transfer takes -- and the wait sits between the checks
+    ``_require_drive`` ran and the AWS call they authorized. In that gap the app
+    can be disabled, the profile can be repointed at another account, consent
+    can be withdrawn, publish governance can start denying, or the drive tags
+    can move to a different bucket -- and the call would then run on an
+    authorization that no longer holds.
+
+    The order is deliberate: app, then IDENTITY, then consent. Consent is asked
+    ABOUT a profile and region, so verifying it against a stale pair proves
+    nothing about where the bytes are going -- the identity has to be
+    re-resolved first, and must still be the triple the request was authorized
+    for.
+
+    The BUCKET is re-resolved too, which the identity check does not cover: tag
+    discovery can return a different bucket while the identity is unchanged. This
+    module keeps no bucket-name cache precisely because "numbers can be stale; the
+    identity of the bucket we write to cannot" (see the module's cache comment),
+    and a queued caller holding a name resolved before the wait is the same
+    staleness that comment forbids.
+
+    ``publish`` adds the egress gate, for the push. Removal and the reconcile read
+    send nothing out, so they do not consult that gate here any more than they do
+    on the way in.
+    """
+    if not await asyncio.to_thread(is_app_enabled, APP_NAME):
+        _audit(operation, request.path, "denied", error="app_disabled")
+        return _forbidden("aws-control is disabled", "app_disabled")
+    recheck = await _account_target(request)
+    if isinstance(recheck, web.Response):
+        # A permission DECISION, and it must reach SEL from HERE rather than
+        # relying on the caller. The two mutations return this response and
+        # `_mutating` records their outcome, but the reconcile READ converts it
+        # into a degraded 200 -- so without an audit at the point of decision the
+        # denial disappears entirely on that path.
+        _audit(operation, request.path, "denied", error="account_unavailable")
+        return recheck
+    if recheck != (account, profile, region):
+        _audit(operation, request.path, "denied", error="account_mismatch")
+        return _conflict(
+            "this connection changed while the request was queued; nothing was written",
+            "account_mismatch",
+        )
+    denied = await _consent(aws_consent.SERVICE_S3, profile, region)
+    if denied:
+        return denied
+    try:
+        current = await _drive_bucket(account, profile, region)
+    except AWSError as exc:
+        return _aws_failed(exc)
+    if current != bucket:
+        _audit(operation, request.path, "denied", error="drive_changed")
+        return _conflict(
+            "this account's drive changed while the request was queued; nothing was written",
+            "drive_changed",
+        )
+    if publish:
+        return await _publish_gate(request, operation)
+    return None
+
+
+async def _reconciled_remote_slugs(request: web.Request) -> tuple[set[str] | None, str]:
+    """Read the account's cloud library and reconcile the ledger against it.
+
+    Returns the slugs the bucket holds, or ``(None, reason)`` when it could not
+    be read. A NON-FATAL variant of the drive preamble: the Library list must
+    keep rendering local artifacts for an account that is disconnected, has not
+    confirmed S3, or has no drive yet -- the same shape
+    ``_handle_backup_status`` uses for its remote half. Every failure comes back
+    as a reason rather than as a response, and the caller reports it instead of
+    implying an answer.
+
+    The listing and the prune run under ``_library_lock`` as ONE step. They are
+    a read of remote state followed by a decision about local state, and a push
+    completing between them would have its fresh record pruned on a snapshot
+    taken before it existed -- the bucket backs that record, so deleting it
+    breaks reconcile's own rule that it only drops what the bucket has
+    disproven. ``observed_at`` is passed through as a second, cross-process
+    guard; see :func:`library.reconcile`.
+    """
+    target = await _account_target(request)
+    if isinstance(target, web.Response):
+        # A permission DECISION, even though this route degrades instead of
+        # failing: the profile became unavailable or now names another account,
+        # and _guarded's own rule is that such a decision reaches SEL. Degrading
+        # quietly would drop the one event an incident review asks about.
+        _audit("library_list", request.path, "denied", error="account_unavailable")
+        return None, "no working connection for this account"
+    account, profile, region = target
+    if await _consent(aws_consent.SERVICE_S3, profile, region) is not None:
+        return None, "S3 is not confirmed for the account in use"
+    try:
+        bucket = await _drive_bucket(account, profile, region)
+    except AWSError as exc:
+        return None, _safe_error(exc)
+    if not bucket:
+        return None, "this account has no drive yet"
+    # Taken BEFORE the listing, never after: the cutoff must not postdate the
+    # snapshot it describes. Reading it early only widens the set of records the
+    # prune leaves alone, which is the safe direction.
+    observed_at = dt.datetime.now(dt.timezone.utc)
+    try:
+        # BOUNDED wait, unlike the two mutations, which are user-initiated actions
+        # that may legitimately queue. This is a page render: a push holding the
+        # lock through a 600s upload must not hang it. Giving up here loses
+        # nothing durable -- the reconcile is self-correcting, so the next render
+        # performs it -- and it is reported rather than silently skipped.
+        await asyncio.wait_for(_library_lock.acquire(), timeout=_LIBRARY_RECONCILE_LOCK_WAIT_SECS)
+    except asyncio.TimeoutError:
+        return None, "another library operation is in progress; the bucket was not re-read"
+    try:
+        # The lock is a WAIT, so the consent and identity resolved above may have
+        # expired while queued -- and a listing is still a call into a paid
+        # service, which this app never makes on a withdrawn grant. Same re-check
+        # the two mutations run; failure degrades to "not reconciled" rather than
+        # to an error, because this route's local half must still render.
+        if (
+            await _reauthorize_in_lock(
+                request, "library_list", account, profile, region, bucket, publish=False
+            )
+            is not None
+        ):
+            return None, "authorization changed while this request was queued"
+        try:
+            # list_library_folders, NOT the paged display listing: this answer is
+            # compared against ledger KEYS and reasoned about as absence, so it
+            # must be unredacted and complete. See its docstring.
+            folders = await asyncio.to_thread(
+                storage_mod.list_library_folders,
+                profile,
+                region,
+                bucket,
+                account=account,
+            )
+        except AWSError as exc:
+            return None, _safe_error(exc)
+        slugs = {f for f in folders if library_mod.valid_slug(f)}
+        try:
+            await asyncio.to_thread(library_mod.reconcile, account, slugs, observed_at=observed_at)
+        except OSError as exc:
+            # The reconcile WRITES, and this route is best-effort by contract. An
+            # unwritable ledger directory, or a lock this platform refuses to
+            # take, must not turn a page render into a 500: the rows are still
+            # renderable, they are just unverified. Reported as a reason rather
+            # than swallowed, so the payload does not claim a reconcile happened.
+            logger.warning("aws-control library reconcile could not write: %s", exc)
+            return None, "the local sync ledger could not be updated"
+    finally:
+        _library_lock.release()
+    return slugs, ""
+
+
 async def _handle_library_list(request: web.Request) -> web.Response:
+    """Local artifacts + push state, with the ledger reconciled first.
+
+    The reconcile is BEST-EFFORT and its outcome is REPORTED, never implied.
+    ``reconciled`` says whether the bucket was actually read; when it is false
+    the rows are the ledger's unverified claim and ``remoteError`` says why. A
+    caller that cannot tell "no cloud copy" from "cloud state unknown" is how a
+    destructive control gets offered for an item nothing is known about, so the
+    distinction is in the payload rather than left to be inferred from an empty
+    list.
+
+    This GET writes local state, which is deliberate and narrow: reconcile only
+    ever DELETES a claim the bucket has already disproven. It touches no object,
+    removes no data, and takes nothing from the request -- the bucket listing is
+    its only input, so a caller cannot steer it. Doing it here is the point: the
+    stale record's whole symptom (a push refused because the ledger insists the
+    copy is already there) is only observable on the render that reads it.
+    """
     account = request.match_info.get("account", "")
+    remote, reason = await _reconciled_remote_slugs(request)
+    payload: dict[str, Any] = {"reconciled": remote is not None}
+    if remote is None:
+        payload["remoteError"] = reason
     rows = await asyncio.to_thread(library_mod.list_pushable, account)
-    return web.json_response({"artifacts": rows})
+    if remote is not None:
+        # Cloud copies with no local artifact row: pushed from another machine,
+        # or the local artifact has since been deleted. list_pushable walks the
+        # LOCAL store, so these have no row to carry them and would otherwise be
+        # unreachable from the console -- the exact "filled it, cannot empty it"
+        # gap. Slugs only; a version would cost one GET per copy on a render.
+        local = {str(row.get("slug", "")) for row in rows}
+        payload["remoteOnly"] = sorted(remote - local)
+    return web.json_response({"artifacts": rows, **payload})
+
+
+async def _handle_library_remove(request: web.Request) -> web.Response:
+    """Delete one artifact's cloud copy and forget its ledger record.
+
+    No publish gate: that gate governs bytes LEAVING the box (a push, a
+    presigned link), and this route sends nothing out. It is a mutation, so it
+    carries the restricted-session refusal and the SEL audit every mutation
+    does. Single-call like the Drive's own file and folder deletes -- the
+    two-call confirm is for creating a BILLABLE resource, and the dashboard
+    confirms deletions itself.
+    """
+    ctx = await _require_drive(request)
+    if isinstance(ctx, web.Response):
+        return ctx
+    account, profile, region, bucket = ctx
+    body = await _body(request)
+    slug = str(body.get("slug", ""))
+    # An artifact slug, not a free-form key: the slug becomes an object prefix,
+    # and the validator refuses the empty and '/'-bearing values that would
+    # widen that prefix beyond one artifact. library_remove re-checks it, so the
+    # blast radius does not depend on this route being the only caller.
+    if not library_mod.valid_slug(slug):
+        return _bad_request("slug must be an artifact slug", "invalid_slug")
+    try:
+        # Under _library_lock, for the mirror of the push case: the delete sweep
+        # and the ledger write are two steps, and a push of the same slug
+        # interleaving can land an object after the sweep has finished looking.
+        async with _library_lock:
+            # A queued delete can outlive its own authorization the same way a
+            # queued push can; a delete under withdrawn consent is still an
+            # unauthorized call into the account.
+            denied = await _reauthorize_in_lock(
+                request, "library_remove", account, profile, region, bucket, publish=False
+            )
+            if denied:
+                return denied
+            result = await asyncio.to_thread(
+                library_mod.library_remove, profile, region, bucket, account, slug
+            )
+    except ValueError as exc:
+        return _bad_request(_safe_error(exc), "invalid_slug")
+    except AWSError as exc:
+        return _aws_failed(exc)
+    return web.json_response({"removed": True, **result})
 
 
 async def _handle_library_push(request: web.Request) -> web.Response:
@@ -957,9 +1217,21 @@ async def _handle_library_push(request: web.Request) -> web.Response:
     from kiro_crew.artifacts import ArtifactNotFoundError
 
     try:
-        record = await asyncio.to_thread(
-            library_mod.push_artifact, profile, region, bucket, account, slug
-        )
+        # Under _library_lock: the upload and the ledger write are two steps, and
+        # a removal of the same slug interleaving between them can sweep one of
+        # the two uploaded objects and then forget a record this push is about to
+        # rewrite. See the lock's own comment.
+        async with _library_lock:
+            # The lock is a WAIT, so the authorization above may have expired
+            # while queued. Re-run it before a byte moves.
+            denied = await _reauthorize_in_lock(
+                request, "library_push", account, profile, region, bucket, publish=True
+            )
+            if denied:
+                return denied
+            record = await asyncio.to_thread(
+                library_mod.push_artifact, profile, region, bucket, account, slug
+            )
     except ArtifactNotFoundError:
         return _not_found("unknown artifact", "unknown_artifact")
     except ValueError as exc:
@@ -1123,6 +1395,10 @@ def register_routes(app: web.Application) -> None:
     r.add_post(
         f"{_BASE}/library/{{account}}/push",
         _guarded(_mutating("library_push")(_handle_library_push)),
+    )
+    r.add_post(
+        f"{_BASE}/library/{{account}}/remove",
+        _guarded(_mutating("library_remove")(_handle_library_remove)),
     )
     r.add_post(
         f"{_BASE}/backup/{{account}}/run",

@@ -230,7 +230,9 @@ class TestClaudeRows:
         An operator who never installed ``claude-agent-acp`` otherwise only
         learns at spawn, after they already picked the backend.
         """
-        monkeypatch.setattr("kiro_crew.acp.client._resolve_claude_acp_bin", lambda: None)
+        monkeypatch.setattr(
+            "kiro_crew.acp.client._resolve_claude_acp_bin", lambda: (None, "/usr/bin")
+        )
         text, issues = _run(ACP_BACKEND_CLAUDE, tmp_path)
         assert "adapter:     ❌" in text
         assert any("adapter not found" in i for i in issues)
@@ -240,7 +242,7 @@ class TestClaudeRows:
     ) -> None:
         monkeypatch.setattr(
             "kiro_crew.acp.client._resolve_claude_acp_bin",
-            lambda: ["/usr/bin/node", "/opt/claude-agent-acp/dist/index.js"],
+            lambda: (["/usr/bin/node", "/opt/claude-agent-acp/dist/index.js"], "/usr/bin"),
         )
         text, issues = _run(ACP_BACKEND_CLAUDE, tmp_path)
         assert "claude-agent-acp" in text or "/opt/claude-agent-acp" in text
@@ -251,7 +253,7 @@ class TestClaudeRows:
     ) -> None:
         monkeypatch.setattr(
             "kiro_crew.acp.client._resolve_claude_acp_bin",
-            lambda: ["/usr/bin/node", "/opt/claude-agent-acp/dist/index.js"],
+            lambda: (["/usr/bin/node", "/opt/claude-agent-acp/dist/index.js"], "/usr/bin"),
         )
         claude.ensure_routed_settings(tmp_path)
         text, issues = _run(ACP_BACKEND_CLAUDE, tmp_path)

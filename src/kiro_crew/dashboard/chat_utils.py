@@ -667,6 +667,48 @@ def effective_session_key(slot: _ChatSlot) -> str:
     return getattr(slot, "linked_session_key", "") or _history_key_for(slot.key)
 
 
+def subagents_attached(
+    state: DashboardState, slot: _ChatSlot, session_key: str, operation: str
+) -> bool:
+    """Whether sub-agent children are attached to *session_key*.
+
+    True means an action that tears the session down, or dispatches into it,
+    would discard a child's work. Every such caller shares THIS predicate: a
+    second copy is how the probes diverge, and both callers must fail toward
+    keeping a child's work.
+
+    Three probes, none optional:
+
+    * ``running_agents_for`` on the true session key. QUEUED children count too:
+      a spawn that hit the concurrency/stagger gate is deliberately absent from
+      ``_agents`` (see ``SubagentInfo.queued``), yet it WILL start on its own.
+    * IN-FLIGHT RESULT DELIVERY: the last child can finish — emptying both
+      probes — while its ``[Subagent completion event]`` injection is still
+      landing, and that injection needs both the transcript order and the
+      session it reports to.
+    * Fail closed on a None running-probe: that is the probe FAILING, not a slot
+      with no children, and mistaking the two is exactly the hazard this guard
+      exists to prevent.
+
+    A state with no ``subagents`` registry answers False — there is no runtime
+    for a child to be attached to.
+    """
+    subs = getattr(state, "subagents", None)
+    if subs is None:
+        return False
+    running = subs.running_agents_for(session_key)
+    queued = 0
+    if running is not None:
+        try:
+            queued = subs._queued_depth(session_key)
+        except Exception:
+            # An unreadable queue is unknown children, not zero children.
+            logger.debug("%s: queued-depth probe failed", operation, exc_info=True)
+            queued = 1
+    inflight = getattr(slot, "_subagent_deliveries_inflight", 0)
+    return bool(running is None or running or queued or inflight)
+
+
 def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | None:
     """The slot holding *session_key*'s Slack OPTIONS state, if one exists.
 
@@ -2094,6 +2136,10 @@ def is_system_injection(content: str) -> bool:
 
 #: Structural queue-entry kind for runner-injected recovery instructions.
 SYNTHETIC_RECOVERY_KIND = "synthetic_recovery"
+
+#: Row-level kind for the `error` notice appended when a recovery has ALREADY
+#: been queued, so the frontend can tell a pending retry from a terminal failure.
+TRANSIENT_RETRY_KIND = "transient_retry"
 
 #: Structural queue-entry kinds for system injections.  Classification by kind
 #: tag — set at enqueue time — is unforgeable: a user typing the same prefix

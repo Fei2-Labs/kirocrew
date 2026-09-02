@@ -209,8 +209,13 @@ release that changed it. `superseded_default_drift(base_data)` returns the entri
 whose stored value equals the old default, comparing type as well as value so a
 stored `0` is not read as `False`.
 
-Registered so far: `mcp_gateway.forward_declared_env` (False -> True, #4566) and
-`session.autocompact_pct` (90.0 -> 70.0, #4388).
+Registered so far: `mcp_gateway.forward_declared_env` (False -> True, #4566),
+`session.autocompact_pct` (90.0 -> 70.0, #4388), `stt.streaming` (False -> True,
+0.5.0) and `stt.model` ("turbo" -> "base", 0.5.0).
+
+`stt.provider` is deliberately absent even though its default moved to `local`:
+`_validated_stt_provider` coerces a retired value at parse time, so the stored
+value never wins and there is no drift for an operator to adopt.
 
 Both sides of an entry are **history**, so both are literals: a later change to
 the same key APPENDS a new entry rather than editing an existing one, which keeps
@@ -731,11 +736,19 @@ class ChannelConfig:
 
 @dataclass
 class SttConfig:
-    enabled: bool = True           # enabled by default; gated by whisper availability
-    whisper_path: str = ""         # auto-detected if empty
-    model: str = "turbo"           # turbo (~1.6 GB, 809M params, ~8x faster than large)
-    device: str = "cpu"            # "cpu" or "cuda"
+    enabled: bool = True           # on by default: the default provider needs no account
+    provider: str = "local"        # "local" | "apple" | "transcribe"; a retired value degrades to "local"
+    model: str = "base"            # a kiro_crew.stt.models CATALOG name; a superseded name resolves via its alias table
+    language_code: str = "en-US"
+    streaming: bool = True         # live partials; every provider produces them
+    silence_ms: int = 700          # end-of-phrase pause; clamped to _STT_INTERVAL_MS_MIN.._MAX
+    partial_interval_ms: int = 400 # live-transcript refresh cadence; same clamp
+    idle_evict_secs: int = 600     # release the resident local model after this idle; 0 = at end of recording
+    endpointing: bool = False      # semantic auto-submit on a complete utterance; needs streaming
+    dictation_panel: bool = True   # animated recording panel; falls back to the status bar
     timeout_secs: int = 300
+    transcribe_region: str = "us-east-1"   # transcribe provider only
+    transcribe_profile: str = ""           # transcribe provider only; empty = default credential chain
 
 @dataclass
 class ComputerUseConfig:
@@ -930,6 +943,52 @@ could exhaust host memory/CPU/the process table (DoS). The dashboard write gate
 (`dashboard/handlers/core.py`) and the runtime pool cap **import these same
 constants**, so write-gate / load-clamp / runtime-cap cannot drift apart —
 closing the direct-config-edit DoS gap.
+
+### `resource_limits`: one block, three mechanisms, two meanings of `0`
+
+`ResourceLimitsConfig` (`config/loader.py`) carries the kernel confinement
+ceilings for spawned agent processes. It is the one config block whose keys are
+read by more than one enforcement mechanism, and two of those keys mean
+**different things** to two of them:
+
+| Key | POSIX rlimit (`security.apply_resource_limits`) | cgroup v2 scope (`sandbox.cgroup_scope_argv`) | xdist (`resource_status`) |
+|---|---|---|---|
+| `max_open_files` | `RLIMIT_NOFILE`; `0` = leave inherited | — | — |
+| `max_processes` | `RLIMIT_NPROC`; `0` = leave inherited | `TasksMax` (counts THREADS); `0` = use default | — |
+| `max_memory_mb` | `RLIMIT_AS`; `0` = leave inherited | `MemoryMax`; `0` = use default | — |
+| `max_cpu_seconds` | `RLIMIT_CPU`; `0` = leave inherited | — | — |
+| `cpu_weight` | — | `CPUWeight`, 1..10000 | — |
+| `max_cpu_percent` | — | `CPUQuota`, opt-in: unset emits no property | — |
+| `max_total_memory_mb` | — | slice `MemoryMax` (all trees together) | — |
+| `max_total_processes` | — | slice `TasksMax` | — |
+| `xdist_auto_cap` | — | — | `-1` auto, `0` off, `N` fixed |
+
+`0` cannot be normalised away in either direction. On the rlimit path it is a
+documented request ("leave the inherited limit unchanged") with existing configs
+behind it; on the cgroup path systemd **rejects** a zero property and the scope
+never starts, so `0` there has to mean "use the module default" and the ceiling
+is never left unset. Every field is therefore `int | None`, and `None` ("not
+configured") stays distinct from `0`.
+
+Defaults deliberately do NOT live in the dataclass. Each mechanism keeps its own
+(`security._RLIMIT_DEFAULTS`, `sandbox._CGROUP_DEFAULT_*` /
+`_default_max_memory_mb()`), because a copy here would be a third default set
+that could drift from both.
+
+**Single parse site.** `ResourceLimitsConfig.from_raw()` is the only code that
+coerces these keys; `_limit_int` is its rule. Before #3474 six readers each had
+their own, which is how the two meanings of `0` drifted apart with nothing
+recording it. The rule: bools are not numbers (`True` would become a 1-task
+ceiling); a non-integral float truncates toward zero (`512.5` -> `512`, so a
+stricter parse can never loosen a ceiling); a value in `(0, 1)` is REFUSED
+because `int()` would turn it into the `0` that already means something else;
+NaN and `±Infinity` (both producible by `json.loads`) are refused before `int()`
+can raise on them; and an out-of-range value is refused rather than clamped, so
+a confinement ceiling is never silently moved away from the number in the
+operator's file. Every refusal is logged once per key per process.
+
+`test_resource_limits_schema.py::TestSingleParseSite` fails if a seventh reader
+appears.
 
 ### Dashboard theme persistence
 

@@ -54,6 +54,7 @@ from kiro_crew.artifacts import (
     get_default_folder_store,
     get_default_store,
     is_document_path,
+    slugify,
     webapp_metadata_from_dict,
 )
 from kiro_crew.dashboard.chat_folders import generate_emoji_for_name
@@ -745,7 +746,14 @@ def _collect_session_docs(
             modified = 0.0
         session_title = sess.get("title") or key
         try:
-            msgs = conversation_log.read_messages(key)
+            file_change_reader = getattr(
+                conversation_log, "read_file_change_messages", None
+            )
+            msgs = (
+                file_change_reader(key)
+                if callable(file_change_reader)
+                else conversation_log.read_messages(key)
+            )
         except Exception:  # noqa: BLE001 — skip an unreadable session, keep scanning
             continue
         for m in msgs:
@@ -1465,7 +1473,23 @@ async def api_artifacts_create(request: web.Request) -> web.Response:
     )
     # New library entries appear live in every open window.
     _notify_artifact_update(state, art.slug, art.version)
-    return _json_response(_serialize(art, include_content=True), status=201)
+    # Report a de-duplicated slug to the CLI and the MCP tool, both of which are
+    # HTTP clients and so cannot see the store's log line. Create-only: the value
+    # describes this call, and a GET or LIST would carry it empty forever.
+    #
+    # Derived from ``art.name`` (post-validation) rather than the raw body, so the
+    # comparison uses the exact string the store slugified. Guarded on an absent
+    # ``slug``: an explicit one legitimately differs from the name, and the store
+    # refuses it on collision rather than renaming, so comparing there would warn
+    # about a collision that never happened.
+    payload = _serialize(art, include_content=True)
+    collided_with = ""
+    if not body.get("slug"):
+        requested = slugify(art.name)
+        if art.slug != requested:
+            collided_with = requested
+    payload["slug_collided_with"] = collided_with
+    return _json_response(payload, status=201)
 
 
 # ── Item: read / update / delete ──────────────────────────────────────────────

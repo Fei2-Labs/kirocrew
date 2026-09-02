@@ -25,8 +25,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKENDS_KNOWN,
-    ACP_BACKENDS_SELECTABLE,
 )
+from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.dashboard.handlers import acp_backends as handler
 
 
@@ -53,7 +53,7 @@ class TestTheCardsOfferAndTheSaveAllowlistAgree:
     Found by clicking the real card in an isolated gateway. THREE independent
     allowlists govern one setting, and they had drifted apart:
 
-      1. ACP_BACKENDS_SELECTABLE      what the endpoint advertises
+      1. selectable_backends()      what the endpoint advertises
       2. _EDITABLE_CONFIG             what the config PATCH will accept
       3. the AgentConfig schema enum  what survives the next config LOAD
 
@@ -75,7 +75,7 @@ class TestTheCardsOfferAndTheSaveAllowlistAgree:
             "card can offer a choice the API refuses to persist"
         )
         assert set(spec["values_fn"]()) == set(backends.selectable_ids()), (
-            "the writable set and ACP_BACKENDS_SELECTABLE disagree; a value the "
+            "the writable set and selectable_backends() disagree; a value the "
             "card offers would be refused, or one it hides would be accepted"
         )
 
@@ -187,13 +187,13 @@ class TestDescriptorPayload:
     def test_selectable_reflects_the_gate_not_the_descriptor(self) -> None:
         """Having a descriptor must not imply an operator may choose it.
 
-        The payload's flag mirrors ACP_BACKENDS_SELECTABLE for every known
+        The payload's flag mirrors selectable_backends() for every known
         backend, whatever that set currently contains — so this keeps holding as
         backends graduate into it.
         """
         for backend in sorted(ACP_BACKENDS_KNOWN):
             payload = handler._descriptor_payload(backend)
-            assert payload["selectable"] is (backend in ACP_BACKENDS_SELECTABLE)
+            assert payload["selectable"] is (backend in selectable_backends())
 
     def test_selectable_can_be_false_while_described(self, monkeypatch) -> None:
         """The two facts stay independent even when nothing is withheld today.

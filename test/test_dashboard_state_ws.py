@@ -183,6 +183,100 @@ class TestSlotsBroadcastCarriesFolders:
         frame = json.loads(ws.send_str.call_args[0][0])
         assert frame["folders"] == []
 
+    def test_frame_carries_the_folder_generation(self, state: DashboardState) -> None:
+        # The tree alone is not a change signal — this frame fires on routine
+        # session activity — so the client needs the generation to tell "the
+        # store changed" from "a session blinked".
+        state.serialize_slots = MagicMock(return_value=[])  # type: ignore[method-assign]
+        state._folders_generation = 3
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+
+        state._do_slots_broadcast()
+
+        frame = json.loads(ws.send_str.call_args[0][0])
+        assert frame["foldersGeneration"] == 3
+
+    def test_slot_activity_alone_does_not_advance_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # THE guardrail. The client refetches whenever this number moves, so a
+        # generation that crept up on ordinary slot churn would refetch the
+        # session-scanning GET /api/chat/folders on every session event and land
+        # that refetch over any in-flight optimistic folder edit.
+        state.serialize_slots = MagicMock(return_value=[{"key": "chat-1"}])  # type: ignore[method-assign]
+        state._folders = [{"id": "f1", "name": "Work", "order": 0}]
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+
+        state._do_slots_broadcast()
+        state.serialize_slots = MagicMock(  # type: ignore[method-assign]
+            return_value=[{"key": "chat-1", "title": "renamed"}, {"key": "chat-2"}]
+        )
+        state._do_slots_broadcast()
+
+        generations = [
+            json.loads(call[0][0])["foldersGeneration"] for call in ws.send_str.call_args_list
+        ]
+        assert len(generations) == 2
+        assert generations[0] == generations[1]
+
+    @pytest.mark.asyncio
+    async def test_folder_mutation_advances_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # Bumped in the mutate_folders funnel rather than at each call site, so a
+        # new folder-writing endpoint cannot forget to do it.
+        before = state.folders_generation()
+
+        await state.mutate_folders(
+            lambda folders: (True, folders.append({"id": "f9", "name": "New", "order": 0}))
+        )
+
+        state.serialize_slots = MagicMock(return_value=[])  # type: ignore[method-assign]
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+        state._do_slots_broadcast()
+
+        frame = json.loads(ws.send_str.call_args[0][0])
+        assert frame["foldersGeneration"] == before + 1
+        assert frame["folders"] == [{"id": "f9", "name": "New", "order": 0}]
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_folder_transaction_does_not_advance_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # `changed=False` returns before the write; nothing changed, so no client
+        # should be told to refetch.
+        before = state.folders_generation()
+
+        await state.mutate_folders(lambda folders: (False, None))
+
+        assert state.folders_generation() == before
+
+    @pytest.mark.asyncio
+    async def test_a_failed_folder_transaction_does_not_advance_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        before = state.folders_generation()
+        state._folders = [{"id": "f1", "name": "Existing", "order": 0}]
+
+        def fail_write(*_args: object) -> None:
+            raise OSError("disk full")
+
+        state._write_folders_confirmed = fail_write  # type: ignore[method-assign]
+
+        with pytest.raises(OSError, match="disk full"):
+            await state.mutate_folders(
+                lambda folders: (
+                    True,
+                    folders.append({"id": "f2", "name": "Rolled back", "order": 1}),
+                )
+            )
+
+        assert state.folders_generation() == before
+        assert state._folders == [{"id": "f1", "name": "Existing", "order": 0}]
+
 
 class TestOwnerScopedBroadcast:
     """Owner-only typed broadcast + its delivery count (PR #461)."""
@@ -826,10 +920,56 @@ class TestOwnerSourceStatusTransport:
         assert len(generic_messages) == 1
         assert "ci" not in str(generic_messages[0]["data"])
         assert "state" not in generic_messages[0]["data"][0]["source_links"][0]
-        assert len(owner_messages) == 2
-        assert "ci" not in str(owner_messages[0]["data"])
-        assert owner_messages[1]["data"][0]["source_links"][0]["ci"] == "passed"
-        assert owner_messages[1]["data"][0]["source_links"][0]["state"] == "OPEN"
+        # EXACTLY ONE frame for the owner, and it is the enriched one. Two frames
+        # delivered the same list twice, the first without `ci`/`state`, and the
+        # client replaces its slot list per frame — so every decorated PR chip lost
+        # its status glyph on frame one and regained it on frame two, re-wrapping
+        # the sidebar chip strip on every push.
+        assert len(owner_messages) == 1
+        assert owner_messages[0]["data"][0]["source_links"][0]["ci"] == "passed"
+        assert owner_messages[0]["data"][0]["source_links"][0]["state"] == "OPEN"
+        # The owner frame is now the owner's only one, so it must carry every key
+        # the generic frame does. Asserted as SET EQUALITY over the whole envelope,
+        # not as a list of the keys known today: `_send_ws_all` skips owner sockets
+        # for `slots`, so the generic frame no longer backstops an owner, and a key
+        # added to one site and not the other would silently deprive every owner
+        # window. Both frames come from `_slots_ws_frame`, which makes that
+        # impossible by construction; this pins the property so a future site that
+        # hand-builds the envelope again fails here instead of in production.
+        assert set(owner_messages[0]) == set(generic_messages[0])
+        assert owner_messages[0]["folders"] == generic_messages[0]["folders"]
+        assert (
+            owner_messages[0]["gitlabHostsGeneration"]
+            == generic_messages[0]["gitlabHostsGeneration"]
+        )
+
+    def test_owner_sockets_still_receive_non_slot_broadcasts(
+        self, state: DashboardState, monkeypatch
+    ) -> None:
+        """The `slots` exclusion must not silence an owner socket generally.
+
+        The generic fan-out skips owner sockets for `slots` alone, because that is
+        the one message type they receive twice. Every other type has no
+        owner-specific frame to fall back on, so a skip that keyed on the socket
+        rather than on the message type would drop it entirely — an owner window
+        that stops seeing refreshes, with nothing raised anywhere. This is the
+        control for that: it fails if the exclusion is ever widened.
+        """
+        sent: list[tuple[object, dict]] = []
+        monkeypatch.setattr(
+            state,
+            "_spawn_ws_send",
+            lambda client, message: sent.append((client, json.loads(message))),
+        )
+        owner_ws = MagicMock(closed=False)
+        state.register_ws(owner_ws, owner=True)
+
+        state._broadcast({"_type": "refresh", "kinds": "crons,agents"})
+
+        owner_messages = [message for client, message in sent if client is owner_ws]
+        assert len(owner_messages) == 1
+        assert owner_messages[0]["type"] == "refresh"
+        assert owner_messages[0]["data"]["kinds"] == ["crons", "agents"]
 
     @pytest.mark.parametrize(
         ("claims", "owner_request"),

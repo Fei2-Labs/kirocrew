@@ -108,6 +108,45 @@ class TestArtifactReferenceLink:
         assert ARTIFACT_ROUTE_PREFIX not in result
         assert "<mcwidget" in result
 
+    def test_save_hints_when_the_slug_was_suffixed(self) -> None:
+        # given a markdown save whose derived slug was already taken. The
+        # name-based dedup probe is scoped to chat widgets and stays silent
+        # here, so the store's report is the only signal.
+        with patch(
+            "kiro_crew.mcp_core._post",
+            return_value={
+                "slug": "run-summary-2",
+                "version": 1,
+                "name": "Run Summary",
+                "kind": "markdown",
+                "slug_collided_with": "run-summary",
+            },
+        ):
+            # when the save tool result is rendered
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Run Summary", "content": "# corrected", "kind": "markdown"},
+            )
+        # then it names the taken slug and the verb that versions in place
+        assert "'run-summary'" in result
+        assert "artifact_update" in result
+
+    def test_save_omits_the_hint_when_the_slug_was_free(self) -> None:
+        with patch(
+            "kiro_crew.mcp_core._post",
+            return_value={
+                "slug": "run-summary",
+                "version": 1,
+                "name": "Run Summary",
+                "kind": "markdown",
+            },
+        ):
+            result = _call_tool_inner(
+                "artifact_save",
+                {"name": "Run Summary", "content": "# notes", "kind": "markdown"},
+            )
+        assert "already taken" not in result
+
     def test_get_non_widget_emits_markdown_link(self) -> None:
         # given a fetched markdown artifact
         with patch(

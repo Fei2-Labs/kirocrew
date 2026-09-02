@@ -13,12 +13,15 @@ import importlib
 import json
 import logging
 import mimetypes
+import os
 import posixpath
 import re
 import shutil
+import stat
 import sys
 import time
 import urllib.parse
+from email.utils import formatdate
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,7 @@ import yarl
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.apps import official_catalog
 from kiro_crew.apps.backend import (
     get_app_backend_port,
     list_app_processes,
@@ -40,7 +44,6 @@ from kiro_crew.apps.bridges import (
     deregister_app,
     deregister_app_crons_from_service,
     register_app,
-    reregister_app_mcp_servers,
 )
 from kiro_crew.apps.builtins import BUILTIN_NAMES
 from kiro_crew.apps.dependencies import clean_dependencies
@@ -51,6 +54,7 @@ from kiro_crew.apps.dependency_ledger import (
     classify_for_uninstall,
     declared_capability_keys,
 )
+from kiro_crew.apps.dev_mode import dev_mode_granted_root, is_dev_mode_cached
 from kiro_crew.apps.event_bus import build_broadcast_fn
 from kiro_crew.apps.execution import app_execution_denied
 from kiro_crew.apps.hooks_integration import (
@@ -80,7 +84,9 @@ from kiro_crew.apps.manager import (
     update_app,
 )
 from kiro_crew.apps.manifest import Dependencies, PlatformConfig
+from kiro_crew.apps.official_category_order import forget_cache as forget_category_order_cache
 from kiro_crew.apps.official_category_order import load_category_order
+from kiro_crew.apps.official_editorial import forget_cache as forget_editorial_cache
 from kiro_crew.apps.official_editorial import load_sections
 from kiro_crew.apps.registry import (
     _REGISTRY_TRUST_TIERS,
@@ -111,7 +117,7 @@ from kiro_crew.apps.registry import (
     resolve_installed_trust_repository,
 )
 from kiro_crew.apps.spawn_sdk import build_spawn_impl
-from kiro_crew.apps.teardown import teardown_app_runtime
+from kiro_crew.apps.teardown import forget_app_hooks, teardown_app_runtime
 from kiro_crew.apps.version import check_min_version as _check_min_version_str
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
@@ -123,8 +129,20 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.hooks import _fd_real_path
+from kiro_crew.pinned_fs import (
+    PinnedPathRefusal,
+    is_reparse_point,
+    open_in_pinned_parent,
+    supports_pinned_walk,
+)
 from kiro_crew.publish_governance import DEPLOY_WEB_PROVIDER_ID, publish_denied_reason
-from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+from kiro_crew.sandbox import (
+    cgroup_scope_argv,
+    create_subprocess_limited,
+    wrap_argv,
+    wrap_argv_async,
+)
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -184,9 +202,10 @@ def _unregister_notification_channels(request: web.Request, name: str) -> None:
 def _sync_builtin_config(name: str, *, enabled: bool) -> None:
     """Update config.json for a builtin app so gateway reads the right state on restart.
 
-    Blocking: performs a file-locked read-modify-write of config.json and, on
-    Windows, spawns ``icacls`` (``restrict_to_owner``). Callers on the event
-    loop must offload this through ``asyncio.to_thread``.
+    Blocking: performs a file-locked read-modify-write of config.json and then,
+    on Windows, applies the owner-only lockdown (``restrict_to_owner``,
+    in-process — but a possible SMB round-trip on a network-homed data home).
+    Callers on the event loop must offload this through ``asyncio.to_thread``.
     """
     cfg_key, _ = _BUILTIN_SERVICE_APPS.get(name, (None, None))
     if cfg_key is None:
@@ -210,13 +229,17 @@ def _sync_builtin_config(name: str, *, enabled: bool) -> None:
         raise OSError(f"Could not read config.json: {exc}") from exc
     if not platform_compat.IS_POSIX:  # pragma: no cover — exercised on Windows CI
         # POSIX mode bits are meaningless on Windows, so the preserved mode
-        # protects nothing there, and the shared helpers deliberately apply
-        # no DACL themselves because they are also called from loop-reachable
-        # paths (restrict_to_owner spawns icacls, a blocking subprocess).
-        # This caller runs off-loop (to_thread), so it applies the owner
-        # lockdown here: config.json can hold inline credentials. Warn rather
-        # than raise — the settings write itself succeeded, and the callers
-        # must still notify the service of the new enabled state.
+        # protects nothing there. update_config_locked's write path
+        # (write_config_atomically) applies the owner-only DACL itself on a
+        # LOCAL volume, but deliberately skips it on a network-homed data home
+        # (it can be reached from the event loop, and a DACL write to a UNC or
+        # mapped-drive path costs an unbounded SMB round-trip). This caller
+        # runs off-loop (to_thread), so it can afford that round-trip and
+        # applies the lockdown unconditionally — on a network-homed data home
+        # this is the only lockdown config.json gets, and config.json can hold
+        # inline credentials. Warn rather than raise — the settings write
+        # itself succeeded, and the callers must still notify the service of
+        # the new enabled state.
         try:
             platform_compat.restrict_to_owner(config_path())
         except OSError:
@@ -322,7 +345,10 @@ async def handle_list_apps(request: web.Request) -> web.Response:
         proc = procs.get(app["name"])
         if proc:
             app["backend_status"] = {
-                "running": True,
+                # Both flags come from the tracking record rather than being asserted
+                # from its mere presence: a tracked backend can have exited (running) or
+                # stopped answering its health endpoint (healthy) since it was started.
+                "running": proc["running"],
                 "port": proc["port"],
                 "healthy": proc["healthy"],
                 "pid": proc["pid"],
@@ -476,7 +502,7 @@ async def handle_publish_providers(request: web.Request) -> web.Response:
     # Gate 1 — platform: advertising a destination whose every mutating route
     # refuses is worse than not advertising it. In a worker thread with the
     # registry read below: the admission path can initialize the SEL audit log,
-    # which shells out on a fresh Windows gateway.
+    # which is blocking file IO on a fresh gateway.
     admits_cloud = await asyncio.to_thread(admits_cloud_deployment, "aws")
 
     # Gate 2 — operator: governance ceiling ∩ publish.allowed_destinations. Only
@@ -503,11 +529,11 @@ async def handle_publish_providers(request: web.Request) -> web.Response:
                 squatter.get("app", "?"),
                 DEPLOY_WEB_PROVIDER_ID,
             )
-        return web.json_response({
-            "providers": [
-                p for p in providers if p.get("id") != DEPLOY_WEB_PROVIDER_ID
-            ],
-        })
+        return web.json_response(
+            {
+                "providers": [p for p in providers if p.get("id") != DEPLOY_WEB_PROVIDER_ID],
+            }
+        )
     try:
         from kiro_crew.deploy import profiles as _deploy_profiles
 
@@ -543,9 +569,7 @@ async def handle_get_app(request: web.Request) -> web.Response:
         if name == "deploy-web":
             raise web.HTTPTemporaryRedirect(location="/api/deploy/list")
         return web.json_response({"error": f"app {name!r} not installed"}, status=404)
-    return web.json_response(
-        await asyncio.to_thread(_stamp_installed_trust_repository, info)
-    )
+    return web.json_response(await asyncio.to_thread(_stamp_installed_trust_repository, info))
 
 
 async def handle_get_manifest(request: web.Request) -> web.Response:
@@ -674,9 +698,7 @@ async def handle_install_app(request: web.Request) -> web.Response:
     # so a concurrent uninstall cannot deregister between our copy and our
     # register, leaving a running backend for a removed app.
     async with app_lifecycle_lock(lock_name):
-        startup_refusal = await _refuse_while_startup_hook_runs(
-            lock_name, action="install"
-        )
+        startup_refusal = await _refuse_while_startup_hook_runs(lock_name, action="install")
         if startup_refusal is not None:
             return startup_refusal
 
@@ -715,9 +737,7 @@ async def handle_install_app(request: web.Request) -> web.Response:
     )
 
 
-async def _refuse_while_startup_hook_runs(
-    name: str, *, action: str
-) -> web.Response | None:
+async def _refuse_while_startup_hook_runs(name: str, *, action: str) -> web.Response | None:
     """Refuse destructive lifecycle work while retained app code is still live."""
     stopped = await stop_retained_startup_hooks(name, bounded=True)
     if stopped:
@@ -785,11 +805,16 @@ async def handle_update_app(request: web.Request) -> web.Response:
                     error=reg_install.get("error", ""),
                 )
                 return web.json_response(reg_install, status=400)
-            # Install succeeded — now safe to swap resources
-            await _deregister_app_off_loop(name)
+            # Install succeeded — now safe to swap resources. Stop the backend BEFORE
+            # deregistering, matching uninstall and the disable rollback: stopping pops
+            # the tracking record, which is what stops the health watch from
+            # re-registering the OLD manifest's MCP servers in the window between the
+            # two (see app-kit-platform §17). Deregistering first leaves that window
+            # open, and the entries the update removed would survive it.
             await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), stop_app_backend, name
             )
+            await _deregister_app_off_loop(name)
             if info.get("enabled"):
                 reg_result = await _register_app_off_loop(name)
                 await asyncio.get_running_loop().run_in_executor(
@@ -813,17 +838,18 @@ async def handle_update_app(request: web.Request) -> web.Response:
     # ``.{name}-data-tmp`` path, so an interleaving can destroy it.
     # (The registry branch above holds the same lock around install_from_registry.)
     async with app_lifecycle_lock(name):
-        startup_refusal = await _refuse_while_startup_hook_runs(
-            name, action="update"
-        )
+        startup_refusal = await _refuse_while_startup_hook_runs(name, action="update")
         if startup_refusal is not None:
             return startup_refusal
 
-        # Deregister old resources before update
-        await _deregister_app_off_loop(name)
+        # Stop the backend, then deregister old resources — same order as uninstall and
+        # the disable rollback. Stopping pops the tracking record, so the health watch
+        # can no longer re-register the OLD manifest's MCP servers after the scrub
+        # (see app-kit-platform §17).
         await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), stop_app_backend, name
         )
+        await _deregister_app_off_loop(name)
 
         # Off-loop: blocking filesystem copy (see handle_install_app).
         # expected_name makes update_app itself reject a source whose
@@ -1080,9 +1106,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
         # A retained startup hook still owns the old app's AppContext. Bound the
         # wait and refuse the uninstall if it remains live; deleting files or
         # withdrawing trust first would falsely report that old code is gone.
-        startup_refusal = await _refuse_while_startup_hook_runs(
-            name, action="uninstall"
-        )
+        startup_refusal = await _refuse_while_startup_hook_runs(name, action="uninstall")
         if startup_refusal is not None:
             return startup_refusal
 
@@ -1377,6 +1401,12 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
         return web.json_response(result.to_dict(), status=400)
     invalidate_app_secret_cache(name)
     _unregister_notification_channels(request, name)
+    # Same reason as the line above, for the hook registries: uninstall is the
+    # terminal path, so an entry left behind is a closure over a store this
+    # handler is about to delete. A surviving slot-close hook makes the app's
+    # leftover tabs UNDISMISSABLE -- `notify_slot_closed` returns False when the
+    # hook raises and `api_chat_slot_delete` refuses the close on that.
+    forget_app_hooks(name)
 
     if dropped:
         uninstall_log.append(f"Dropped {dropped} conversation pointer(s)")
@@ -1489,20 +1519,16 @@ async def handle_enable_app(request: web.Request) -> web.Response:
             backend = await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), start_app_backend, name
             )
-            # MCP re-registration is HEALTH-GATED. register_app ran before
-            # the backend was up, so an HTTP MCP server with backend.port:"auto" carries the
-            # manifest's illustrative port. The backend's health-check loop calls
-            # _gate_mcp_registration once /health passes, rewriting the url to the real allocated
-            # port (and scrubbing it if the backend never becomes healthy — the dead-url shape
-            # that broke kiro-cli). EXCEPTION: an adopted already-healthy instance runs no health
-            # loop, so register it synchronously here.
-            if backend is not None and getattr(backend, "healthy", False):
-                try:
-                    reregister_app_mcp_servers(name, live_port=getattr(backend, "port", None))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "MCP re-registration after backend start failed for %s: %s", name, exc
-                    )
+            # MCP re-registration is HEALTH-GATED and happens inside start_app_backend,
+            # not here. register_app ran before the backend was up, so an HTTP MCP server
+            # with backend.port:"auto" still carries the manifest's illustrative port; the
+            # health-check loop rewrites it to the real allocated port once /health passes
+            # (and scrubs it if the backend never becomes healthy — the dead-url shape
+            # that broke kiro-cli). An ADOPTED instance runs no health loop, so the
+            # adoption path registers it through the same serialized transition before
+            # arming its watch. Re-registering here instead would race that watch: the
+            # call is queued after this handler returns, so a demotion could scrub in
+            # between and the queued write would restore the dead url.
             resp["registration"] = reg.to_dict()
             if backend:
                 resp["backend"] = backend.to_dict()
@@ -1620,9 +1646,32 @@ async def handle_enable_app(request: web.Request) -> web.Response:
         origin = info.get("origin", "")
         if origin == "builtin" and name in _BUILTIN_SERVICE_APPS:
             try:
-                # to_thread: the sync helper does file I/O and, on Windows,
-                # spawns icacls — neither may run on the event loop.
-                await asyncio.to_thread(_sync_builtin_config, name, enabled=True)
+                # ``run_config_write``, not a bare ``to_thread``: the helper is a
+                # read-modify-write of the SAME ``config.json`` the legacy dashboard
+                # writers (agents endpoint, updates.py, security.py, messaging.py,
+                # mcp.py, core.py STT) mutate while holding ONLY the loop-side
+                # ``_get_config_lock``. ``update_config_locked`` inside the helper
+                # takes only the sidecar advisory flock, which excludes nothing that
+                # family respects -- so a settings PUT landing mid-write commits from
+                # a snapshot taken before it and silently reverts this app's enabled
+                # flag, or loses the user's settings. ``run_config_write`` is the one
+                # entry point that holds BOTH generations, and it still hands the
+                # blocking work (the flock wait, and on Windows the owner-only
+                # lockdown's possible SMB round-trip) to a worker, so the loop never
+                # stalls -- the property the previous ``to_thread`` was there for.
+                #
+                # Lock order is app_lifecycle_lock -> config lock, matching
+                # ``handle_app_uninstall`` above, which already nests them that way
+                # for the same reason. Verified across the tree: 14 functions take
+                # ``app_lifecycle_lock`` and none of them is reachable from inside a
+                # config-lock block, so the reverse order does not exist.
+                #
+                # Call-time import for the layering reason documented at the
+                # ``_get_config_lock`` import above: ``apps`` sits below
+                # ``dashboard`` and must not depend on it at load time.
+                from kiro_crew.dashboard.chat_utils import run_config_write
+
+                await run_config_write(_sync_builtin_config, name, enabled=True)
             except OSError as exc:
                 logger.warning("Failed to sync config.json for %s: %s", name, exc)
                 resp.setdefault("warnings", []).append(
@@ -1658,9 +1707,7 @@ async def handle_disable_app(request: web.Request) -> web.Response:
     # resources — must not interleave with a concurrent install/update/
     # uninstall/enable of the same app.
     async with app_lifecycle_lock(name):
-        startup_refusal = await _refuse_while_startup_hook_runs(
-            name, action="disable"
-        )
+        startup_refusal = await _refuse_while_startup_hook_runs(name, action="disable")
         if startup_refusal is not None:
             return startup_refusal
 
@@ -1714,9 +1761,32 @@ async def handle_disable_app(request: web.Request) -> web.Response:
         origin = info.get("origin", "")
         if origin == "builtin" and name in _BUILTIN_SERVICE_APPS:
             try:
-                # to_thread: the sync helper does file I/O and, on Windows,
-                # spawns icacls — neither may run on the event loop.
-                await asyncio.to_thread(_sync_builtin_config, name, enabled=False)
+                # ``run_config_write``, not a bare ``to_thread``: the helper is a
+                # read-modify-write of the SAME ``config.json`` the legacy dashboard
+                # writers (agents endpoint, updates.py, security.py, messaging.py,
+                # mcp.py, core.py STT) mutate while holding ONLY the loop-side
+                # ``_get_config_lock``. ``update_config_locked`` inside the helper
+                # takes only the sidecar advisory flock, which excludes nothing that
+                # family respects -- so a settings PUT landing mid-write commits from
+                # a snapshot taken before it and silently reverts this app's enabled
+                # flag, or loses the user's settings. ``run_config_write`` is the one
+                # entry point that holds BOTH generations, and it still hands the
+                # blocking work (the flock wait, and on Windows the owner-only
+                # lockdown's possible SMB round-trip) to a worker, so the loop never
+                # stalls -- the property the previous ``to_thread`` was there for.
+                #
+                # Lock order is app_lifecycle_lock -> config lock, matching
+                # ``handle_app_uninstall`` above, which already nests them that way
+                # for the same reason. Verified across the tree: 14 functions take
+                # ``app_lifecycle_lock`` and none of them is reachable from inside a
+                # config-lock block, so the reverse order does not exist.
+                #
+                # Call-time import for the layering reason documented at the
+                # ``_get_config_lock`` import above: ``apps`` sits below
+                # ``dashboard`` and must not depend on it at load time.
+                from kiro_crew.dashboard.chat_utils import run_config_write
+
+                await run_config_write(_sync_builtin_config, name, enabled=False)
             except OSError as exc:
                 logger.warning("Failed to sync config.json for %s: %s", name, exc)
                 warnings.append(_redact_warning(f"config sync failed: {exc}"))
@@ -1797,7 +1867,9 @@ async def handle_open_app(request: web.Request) -> web.Response:
 
     try:
         base_cmd = ["/bin/sh", "-c", open_cmd]
-        sandboxed_cmd, _cleanup = wrap_argv(base_cmd, mode="standard")
+        sandboxed_cmd, _cleanup = await wrap_argv_async(
+            base_cmd, mode="standard", _prepare=wrap_argv
+        )
         sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
         proc = await create_subprocess_limited(
             *sandboxed_cmd,
@@ -1849,9 +1921,7 @@ async def handle_registry(request: web.Request) -> web.Response:
         return_exceptions=True,
     )
     if isinstance(order_result, BaseException):
-        logger.warning(
-            "ignoring the published category order", exc_info=order_result
-        )
+        logger.warning("ignoring the published category order", exc_info=order_result)
         category_order: list = []
     else:
         category_order = order_result
@@ -1868,6 +1938,45 @@ async def handle_registry(request: web.Request) -> web.Response:
             "editorialSections": sections,
         }
     )
+
+
+async def handle_registry_refresh(request: web.Request) -> web.Response:
+    """POST /api/app-store/refresh — drop the published-document caches.
+
+    Drops the on-disk caches of all three published documents (catalog,
+    category order, editorial), so the NEXT ``GET /api/apps/registry`` is
+    rebuilt from fresh fetches. This exists because the caches degrade
+    SILENTLY: a failed fetch overwrites the catalog cache with a failure
+    sentinel and the store quietly falls back to the seed listing, and without
+    an explicit refresh the user's only remedy is waiting out ``CACHE_TTL``.
+
+    Deliberately OUTSIDE ``/api/apps/``: token_auth's ``_app_owns_path``
+    grants an app token implicit ownership of everything under
+    ``/api/apps/<its-own-name>/``, so a path like
+    ``/api/apps/registry/refresh`` would hand any app that names itself
+    ``registry`` the power to purge the shared catalog caches without
+    declaring the permission. Under ``/api/app-store/`` no app name can
+    collide, so an app token reaches this endpoint only through an explicit
+    ``permissions.api`` grant.
+
+    Two more deliberate shapes:
+
+    - A POST, not a ``?refresh=1`` on the GET: deleting caches and triggering
+      outbound fetches is a state change, and a state-changing GET is reachable
+      by cross-site top-level navigation with a valid SameSite=Lax cookie --
+      exactly the request the CSRF middleware never sees.
+    - It only DROPS caches -- it never fetches. The follow-up GET pays the
+      fetch on the exact same code path as a cold start, so refresh cannot
+      behave differently from the load it is trying to repair.
+    """
+    # Off the event loop like every other disk touch on these routes; three
+    # unlinks gathered because none depends on another.
+    await asyncio.gather(
+        asyncio.to_thread(official_catalog.forget_cache),
+        asyncio.to_thread(forget_category_order_cache),
+        asyncio.to_thread(forget_editorial_cache),
+    )
+    return web.json_response({"ok": True})
 
 
 async def handle_registry_install(request: web.Request) -> web.Response:
@@ -2122,6 +2231,287 @@ _CONTENT_TYPES = {
 }
 
 
+#: Store-art fields an installed app's manifest may declare. A path under
+#: ``/apps/{name}/art/`` is servable ONLY when it is one of these values
+#: verbatim, which is what makes the route need no traversal reasoning of its
+#: own: the manifest, not the request, chooses the file.
+#:
+#: Deliberately NOT a path filter rooted at the install directory. That
+#: directory is the app's whole checkout and ``_ALLOWED_EXTENSIONS`` admits
+#: ``.json``, so a filter would also serve ``installed.json``, ``app.json`` and
+#: every other JSON in the tree — a widening nobody asked for to display an icon.
+_ART_MANIFEST_FIELDS = (
+    "iconPath",
+    "iconPathDark",
+    "heroImage",
+    "heroImageDark",
+    "heroImageDetail",
+    "heroImageDetailDark",
+)
+
+#: The same, for the fields that hold a LIST of paths.
+_ART_MANIFEST_LIST_FIELDS = ("screenshots", "screenshotsDark")
+
+#: Images only — narrower than ``_ALLOWED_EXTENSIONS`` on purpose. Store art is
+#: rendered into an ``<img>``, so nothing script-shaped (``.mjs``/``.js``) or
+#: data-shaped (``.json``) belongs here. ``.svg`` stays because an SVG loaded as
+#: an ``<img>`` source cannot execute script.
+#:
+#: ONE set for both art paths — this route for an installed app, the blob proxy
+#: for a not-installed external-registry row. The parity is load-bearing rather
+#: than incidental: the route REPLACES the proxy per surface, so a file the proxy
+#: would serve and this refuses (or the reverse) means the same app's art renders
+#: or 403s depending only on whether it happens to be installed. Two frozensets
+#: spelled separately were identical member-for-member and nothing pinned them,
+#: which is a divergence waiting for whoever edits one of them next.
+_ART_IMAGE_EXTENSIONS = frozenset({".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico"})
+
+
+def _declared_art_paths(name: str) -> set[str]:
+    """The art paths *name*'s own installed manifest declares.
+
+    Blocking (reads the manifest off disk) — callers must offload it.
+    """
+    manifest = get_app_manifest(name)
+    if manifest is None:
+        return set()
+    extra = getattr(manifest, "extra", None)
+    fields: dict[str, Any] = extra if isinstance(extra, dict) else {}
+    declared: set[str] = set()
+    for key in _ART_MANIFEST_FIELDS:
+        value = fields.get(key)
+        if isinstance(value, str) and value:
+            declared.add(value[2:] if value.startswith("./") else value)
+    for key in _ART_MANIFEST_LIST_FIELDS:
+        values = fields.get(key)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, str) and value:
+                declared.add(value[2:] if value.startswith("./") else value)
+    return declared
+
+
+#: Ceiling on one art file this route will hold. The bytes are read under a pinned
+#: descriptor rather than streamed from a path (see :func:`_read_declared_art`), so
+#: without a cap an app could make the gateway buffer an arbitrarily large file by
+#: declaring one. Generous against the publishing guide's own limits — a 512px
+#: icon, a 16:9 hero — so a real asset never meets it.
+_ART_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _read_declared_art(name: str, file_path: str) -> tuple[bytes, str] | None:
+    """The BYTES of *file_path* and a validator for them, or None to refuse.
+
+    Returning bytes rather than a path is the security-relevant part. Validating a
+    path and then handing it to ``FileResponse`` opens it a SECOND time, so the app
+    that owns this directory can swap a declared name for a symlink between the
+    check and that open and have the gateway read the target instead — and the
+    gateway is NOT sandboxed, so this would launder a read the app's own code can be
+    refused. Checking a path and acting on a re-resolution of it is worse than no
+    check, because it reports success.
+
+    One open, validated as a DESCRIPTOR, is the only shape without that window.
+    :func:`open_in_pinned_parent` does one ``openat`` per component carrying
+    ``O_NOFOLLOW``, so a component swapped for a link after the parent was resolved
+    fails instead of being followed, and the final name is refused if it is a link
+    at all. Everything after that reads the descriptor, which cannot be re-pointed.
+
+    One thread hop for the whole decision — manifest read, declaration check, open,
+    stat and read — because every part is a blocking syscall and the gateway runs on
+    one event loop (``no-blocking-call-on-event-loop``).
+    """
+    if file_path not in _declared_art_paths(name):
+        return None
+    root = apps_dir() / name
+    target = root / file_path
+    try:
+        # Resolved ONCE, here, because `pin_parent` requires the CALLER to do it:
+        # resolving inside would re-follow whatever an ancestor points at by then,
+        # which is the mistake that makes a guard look defensible and do nothing.
+        resolved_root = Path(os.path.realpath(root))
+        resolved_parent = Path(os.path.realpath(target.parent))
+        resolved_parent.relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        # `RuntimeError` because `Path`/`realpath` resolution raises THAT -- not an
+        # OSError -- on a symlink loop, and the app that plants one is the app whose
+        # art this serves. All three mean the path is not servable, which is the same
+        # answer as undeclared and missing.
+        return None
+
+    # `O_NONBLOCK` is not an optimisation, it is what makes the descriptor checks
+    # REACHABLE. Opening a FIFO blocks until a writer appears, and this runs inside
+    # `asyncio.to_thread` -- so an app declaring a FIFO as its icon path parks a
+    # thread-pool worker forever, and enough such requests starve every other
+    # blocking call in the gateway. Measured: the open hangs indefinitely without
+    # this flag, returns immediately with it, and then `S_ISREG` below refuses the
+    # FIFO. On an ordinary file it changes nothing -- the read returns the same bytes.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    if supports_pinned_walk():
+        try:
+            fd = open_in_pinned_parent(
+                str(resolved_parent),
+                Path(file_path).name,
+                flags=flags,
+                mode=0o600,
+                what="app art file",
+            )
+        except (PinnedPathRefusal, OSError, ValueError):
+            # `ValueError` is NOT redundant with `OSError`: `os.open` raises it --
+            # never an OSError -- for a name the OS layer cannot even encode. Two
+            # reachable classes, both measured: an embedded NUL raises `ValueError`
+            # ("embedded null character in path"), and a lone surrogate raises
+            # `UnicodeEncodeError`, which is a ValueError SUBCLASS. Screening NUL at
+            # the door would therefore be INCOMPLETE -- the surrogates carry no NUL.
+            #
+            # Reachable because such a name survives every earlier check: the
+            # extension allowlist reads the suffix AFTER the bad byte
+            # (`bad\x00.png` -> `.png`), and containment resolves the PARENT, which
+            # is clean when the bad byte sits in the final component. So the first
+            # thing that touches it is this open, and uncaught it is a 500 on a
+            # route whose every other refusal is a clean status.
+            return None
+    else:
+        # Windows: no `O_NOFOLLOW` and no descriptor-relative open, so the pinned
+        # walk is unavailable. An unprivileged process there cannot create a FILE
+        # symlink at all (that needs elevation, which is why `symlink_or_junction`
+        # exists), so the reachable swap is a junction on an ancestor -- refused by
+        # the reparse-point probe below. The window is narrowed rather than closed,
+        # and it is narrowed against what the platform actually permits.
+        try:
+            if any(
+                is_reparse_point(p)
+                for p in (target, *target.parents)
+                if p == resolved_root or resolved_root in p.parents or p == target
+            ):
+                return None
+            fd = os.open(target, flags)
+        except (OSError, ValueError):
+            # Same unencodable-name classes as the pinned branch above: this open
+            # takes the whole path rather than a name under a descriptor, so it is
+            # reachable the same way and needs the same tuple.
+            return None
+
+    try:
+        st = os.fstat(fd)
+        # `st_nlink != 1` is the third gate, and it is the only one that can see a
+        # HARDLINK. An alias shares the target's inode, so every path-based guard is
+        # blind to it: `is_symlink()` is False, `realpath` yields the alias's own name
+        # (so containment passes), and `O_NOFOLLOW` has no link to refuse. Measured:
+        # a declared `assets/icon.webp` hardlinked to a file outside the install
+        # directory opens cleanly, reports S_ISREG, sits under the size cap, and its
+        # bytes are served with a 200 -- laundering, through an unsandboxed gateway, a
+        # read the app's own sandboxed code can be refused.
+        #
+        # Checked on the DESCRIPTOR, which is what makes it race-free: this fd already
+        # refers to the inode being judged. Every other descriptor-validated read in
+        # the tree applies the same gate (`hooks.py`, `memory.py`, `spec_builder`,
+        # `onboarding_import.py`, `pinned_fs.copy_file_pinned`), so this route was the
+        # outlier rather than a new rule.
+        #
+        # Inline rather than `pinned_fs.refuse_hardlink_alias`, which is the same
+        # check behind an exception: that helper CLOSES the fd before raising, and this
+        # function closes in a `finally`, so routing through it would double-close --
+        # and a reused fd number makes that a worse bug than the one being fixed. The
+        # inline spelling is what the sibling sites above use for the same reason:
+        # their refusal is a return value, not a raise.
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > _ART_MAX_BYTES:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = fh.read(_ART_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > _ART_MAX_BYTES:
+        return None
+    # Validator derived from the DESCRIPTOR we actually read, not from a second stat
+    # of the path. `no-cache` means the browser revalidates every load, and the rail
+    # renders on every load, so without a validator each one would be a full 200.
+    validator = f'"{st.st_ino:x}-{st.st_size:x}-{st.st_mtime_ns:x}"'
+    return data, validator
+
+
+async def handle_app_art_file(request: web.Request) -> web.Response:
+    """GET /apps/{name}/art/{path:.*} — an installed app's own store art.
+
+    The bytes of an installed app's icon, hero and screenshots are already on
+    local disk, inside the directory the install created. Reaching them through
+    ``/api/apps/blob`` instead means a git clone gated by an SSRF allowlist,
+    which is why a catalog-listed app's art could 403 on a cold load: the
+    allowlist is warmed by a network fetch that a page can outrun. Reading the
+    file the gateway itself wrote has no such ordering, needs no network,
+    survives a CDN outage, and adds no SSRF surface — the request never names a
+    host.
+
+    Mirrors :func:`handle_app_ui_file`'s shape (that route already serves an
+    app's UI-bundle assets, and ``AppDetailPage`` already resolves a page icon
+    through it) with two deliberate narrowings: images only, and the path must
+    be one the app's manifest declares.
+    """
+    name = request.match_info["name"]
+    file_path = request.match_info.get("path", "")
+    # Cheap rejections first, before any syscall: these cannot be reached by a
+    # declared path anyway, so answering here keeps a hostile request off the
+    # thread pool entirely.
+    if not file_path or ".." in file_path or file_path.startswith("/"):
+        return web.json_response({"error": "invalid path", "code": "art_path_invalid"}, status=400)
+    ext = Path(file_path).suffix.lower()
+    if ext not in _ART_IMAGE_EXTENSIONS:
+        return web.json_response(
+            {"error": f"file type {ext!r} not allowed", "code": "art_type_not_allowed"},
+            status=403,
+        )
+    full_path = await asyncio.to_thread(_read_declared_art, name, file_path)
+    if full_path is None:
+        # One answer for "not declared", "outside the install dir", "not a plain
+        # file", "over the size ceiling" and "missing", so a probe cannot use the
+        # status to map which paths a manifest names. One `code` for the same
+        # reason: a caller that could tell them apart from the code would have the
+        # mapping the shared status withholds.
+        return web.json_response({"error": "not found", "code": "art_not_found"}, status=404)
+    data, validator = full_path
+    content_type = _CONTENT_TYPES.get(ext, "application/octet-stream")
+    # `no-cache`, not a long max-age: an app update rewrites these bytes in place
+    # under the same URL, so the browser must revalidate. The validator comes from
+    # the descriptor the bytes were read from, so an unchanged icon still costs one
+    # 304 rather than a full body — which matters because the rail re-renders on
+    # every dashboard load.
+    #
+    # The CSP is load-bearing, not decoration. `.svg` is in the allowlist because an
+    # SVG in an `<img>` is script-inert, but a TOP-LEVEL NAVIGATION to this URL is a
+    # different thing: the response becomes a DOCUMENT on the dashboard's own origin,
+    # and the dashboard's base CSP is deliberately permissive there
+    # (`script-src 'self' 'unsafe-inline'`, so widget and MCP-app iframes can run
+    # inline script), so it would NOT stop a scripted SVG an app declared as its art.
+    # Same-origin script then reaches the authenticated dashboard API with the
+    # viewer's session.
+    #
+    # `sandbox` with no tokens gives the document an opaque origin and no script at
+    # all, and `default-src 'none'` stops it fetching anything; a response CSP does
+    # not apply when the bytes are consumed as an `<img>` subresource, so the store's
+    # own rendering is unaffected. `nosniff` matters because the Content-Type here is
+    # derived from the EXTENSION, not the bytes: without it, art named `.png` whose
+    # content is markup could still be sniffed into a document.
+    #
+    # Set on the response rather than in the middleware because the middleware uses
+    # `setdefault` precisely so a handler can tighten its own answer.
+    headers = {
+        "Cache-Control": "no-cache",
+        "ETag": validator,
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if request.headers.get("If-None-Match") == validator:
+        return web.Response(status=304, headers=headers)
+    return web.Response(body=data, headers={**headers, "Content-Type": content_type})
+
+
 async def handle_app_config(request: web.Request) -> web.Response:
     """GET/PUT /api/apps/{name}/config — read or write app config.json.
 
@@ -2183,40 +2573,321 @@ async def handle_app_config(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "name": name})
 
 
-async def handle_app_ui_file(request: web.Request) -> web.Response:
-    """GET /apps/{name}/ui/{path:.*} — serve app UI bundle files."""
+#: Ceiling on one UI-bundle file this route will serve. With streaming (see
+#: :func:`handle_app_ui_file`) the ceiling no longer bounds gateway memory —
+#: per-request memory is one :data:`_UI_STREAM_CHUNK` regardless of file size —
+#: it bounds the WORK one unauthenticated request can command (bytes read and
+#: sent per request; the route bypasses token auth). Measured reality: the
+#: largest UI asset a bundled app in this tree ships is ~9 KB
+#: (``website/public/apps/agent-worlds/ui/index.mjs`` — the scaffold's vite
+#: config externalizes react/react-dom/the SDK, so bundles stay small). 8 MiB
+#: is ~900x that, matches the posture already accepted for ``_ART_MAX_BYTES``
+#: above, and still clears any plausible self-bundled entry chunk. The one
+#: class it can refuse is the sourcemap of an app that bundles a very heavy
+#: dependency — a ``.map`` 404 degrades only devtools debugging of that app,
+#: never the app itself.
+_UI_MAX_BYTES = 8 * 1024 * 1024
+
+#: Read granularity when streaming a UI file from its validated descriptor.
+#: This — not the file size — is what one in-flight request pins in memory, so
+#: N slow clients cost N chunks, not N files. 256 KiB keeps the thread-hop
+#: count low (an 8 MiB worst case is 32 hops) while staying far below any
+#: amplification concern.
+_UI_STREAM_CHUNK = 256 * 1024
+
+#: Max concurrent requests HOLDING AN OPEN DESCRIPTOR on this route. Acquired
+#: before `_open_ui_file` and released after the descriptor closes: bounding
+#: only the streaming loop would let every QUEUED request already hold an fd
+#: while waiting for a slot, so slow-paced unauthenticated GETs could walk the
+#: gateway to `EMFILE`. Under this scope at most 8 descriptors exist at once
+#: and everyone else waits fd-less. It also bounds the per-chunk `to_thread`
+#: hops on the SHARED default executor (same reason `_BLOB_FETCH_SEMAPHORE`
+#: bounds git fetches). Refusals and body-less 304s hold a slot only for
+#: microseconds; 8 comfortably covers a dashboard loading assets in parallel.
+_UI_STREAM_SEMAPHORE = asyncio.Semaphore(8)
+
+
+def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str:
+    """An OPEN validated descriptor for *file_path* under *name*'s ui/ root
+    plus its ``fstat``, or a refusal code: ``"invalid"`` (containment failure
+    -> 400, the status this route has always answered escapes with) or
+    ``"not_found"`` (-> 404). On the tuple path the CALLER owns closing the fd.
+
+    Handing back the descriptor rather than a path is the security-relevant
+    part, and it is the same fix :func:`_read_declared_art` carries (#6794):
+    validating a path and then handing it to ``FileResponse`` opens it a SECOND
+    time, so the app that owns this directory can swap a validated name for a
+    symlink between the check and that open and have the gateway read the
+    target instead — and the gateway is NOT sandboxed, so this launders a read
+    the app's own code can be refused. This route serves the SAME app-owned
+    directory with a BROADER extension allowlist (``.json``, ``.mjs``), so it
+    must not keep the weaker open. One open, validated as a DESCRIPTOR, is the
+    only shape without that window; everything after it reads the fd, which
+    cannot be re-pointed.
+
+    One thread hop for the whole decision — resolve, containment, open and
+    stat — because every part is a blocking syscall and the gateway runs on one
+    event loop (``no-blocking-call-on-event-loop``).
+    """
+    ui_root = apps_dir() / name / "ui"
+    target = ui_root / file_path
+    try:
+        # Resolved ONCE, here, because `pin_parent` requires the CALLER to do
+        # it: resolving inside would re-follow whatever an ancestor points at by
+        # then. The ui root itself is resolved THROUGH: the documented dev-mode
+        # setup links ui/ at the developer's source tree, so the ROOT being a
+        # link is legitimate — containment is proven against wherever it really
+        # lands, not against the link's own name.
+        resolved_root = Path(os.path.realpath(ui_root))
+        # But a root that lands OUTSIDE the app's own install directory is only
+        # legitimate under the OPERATOR's dev-mode grant. Without this check an
+        # app could ship `ui` as a symlink to a credential directory
+        # (`ui -> ~/.docker`) and have this UNAUTHENTICATED route (the
+        # `/apps/{name}/ui/` token-auth bypass) serve `config.json` — `.json`
+        # is in the allowlist — laundering a read the app's own sandboxed code
+        # is refused. `dev_mode_granted_root`, not `is_dev_mode`: the latter
+        # reads only the app's own writable `installed.json`, which the app
+        # could edit to authorize itself — the grant is the operator record
+        # at the apps ROOT (written by the dev-mode toggle, never by the
+        # startup reconcile, and refused outright for sensitive targets), and
+        # it BINDS the specific resolved root granted: the current root must
+        # EQUAL it, so a grant left behind by a crash, an update, or a
+        # reinstall authorizes only the exact tree the operator approved,
+        # never wherever `ui` points now. The disk reads are paid only on
+        # this exceptional path.
+        #
+        # The containment ANCHOR resolves only the gateway-owned apps root
+        # and then appends the literal `name` — it must NOT re-resolve
+        # through the app's own entry (`realpath(apps_dir()/name)`): the two
+        # realpath calls in this function would then race, and an app
+        # alternating its install entry between them could get an escaping
+        # `resolved_root` accepted as "inside the install". The apps root
+        # itself is not app-writable, so this anchor cannot be swapped; an
+        # install entry that IS a link makes its resolved ui root land
+        # outside this anchor and take the grant path like any other escape.
+        resolved_install = Path(os.path.realpath(apps_dir())) / name
+        try:
+            resolved_root.relative_to(resolved_install)
+        except ValueError:
+            if str(resolved_root) != dev_mode_granted_root(name):
+                return "invalid"
+        resolved_parent = Path(os.path.realpath(target.parent))
+        # The PARENT containment is load-bearing, not belt-and-braces:
+        # `pin_parent`'s contract is that a component swapped BEFORE parent
+        # resolution is followed by that resolution, so an already-symlinked
+        # ancestor is caught only here.
+        resolved_parent.relative_to(resolved_root)
+        # The full path too: a link at the FINAL name whose target escapes the
+        # root is answered 400 like every other escape (the contract this route
+        # has always had). This is a pre-check, not the enforcement — the pinned
+        # open below refuses ANY link at the final name, escaping or not.
+        Path(os.path.realpath(target)).relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        # `RuntimeError` because path resolution raises THAT — not an OSError —
+        # on a symlink loop, and the app that plants one is the app whose UI
+        # this serves.
+        return "invalid"
+
+    # `O_NONBLOCK` is what makes the descriptor checks REACHABLE, not an
+    # optimisation: opening a FIFO blocks until a writer appears, and this runs
+    # inside `asyncio.to_thread`, so an app shipping a FIFO as a UI asset would
+    # park a thread-pool worker forever. With the flag the open returns
+    # immediately and `S_ISREG` below refuses it. On a plain file it changes
+    # nothing. Same rationale as `_read_declared_art`.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    if supports_pinned_walk():
+        try:
+            fd = open_in_pinned_parent(
+                str(resolved_parent),
+                Path(file_path).name,
+                flags=flags,
+                mode=0o600,
+                what="app UI bundle file",
+            )
+        except (PinnedPathRefusal, OSError, ValueError):
+            # `ValueError` is NOT redundant with `OSError`: `os.open` raises it
+            # — never an OSError — for a name the OS layer cannot encode (an
+            # embedded NUL, a lone surrogate). Such a name survives every
+            # earlier check: the extension allowlist reads the suffix AFTER the
+            # bad byte, and containment resolves the PARENT, which is clean when
+            # the bad byte sits in the final component.
+            return "not_found"
+    else:
+        # Windows: no `O_NOFOLLOW` and no descriptor-relative open, so the
+        # pinned walk is unavailable. An unprivileged process there cannot
+        # create a FILE symlink at all, so the reachable swap is a junction —
+        # refused by the reparse-point probe. Same degradation as the art
+        # route; the ui-root link (dev mode) sits ABOVE the resolved root and
+        # is deliberately outside the screen. The probe is name-based, so a
+        # junction planted BETWEEN the probe and the open would still be
+        # followed — which is why the DESCRIPTOR's own final path is
+        # validated below, after the open, closing the residual window on
+        # the descriptor rather than the name.
+        try:
+            if any(
+                is_reparse_point(p)
+                for p in (target, *target.parents)
+                if p == resolved_root or resolved_root in p.parents or p == target
+            ):
+                return "not_found"
+            fd = os.open(target, flags)
+        except (OSError, ValueError):
+            return "not_found"
+        # Race-free containment on the OPENED handle: resolve the descriptor's
+        # final path (`GetFinalPathNameByHandleW` there; /proc/F_GETPATH on
+        # the POSIX hosts the tests run on) and require it to still sit under
+        # the resolved root. Fail closed when it cannot be read — on this
+        # branch the descriptor is the only trustworthy witness.
+        fd_real = _fd_real_path(fd)
+        if fd_real is None:
+            os.close(fd)
+            return "not_found"
+        try:
+            Path(fd_real).relative_to(resolved_root)
+        except ValueError:
+            os.close(fd)
+            return "not_found"
+
+    try:
+        st = os.fstat(fd)
+        # `st_nlink != 1` is the one gate that can see a HARDLINK: the alias
+        # shares the target's inode, so `is_symlink()` is False, `realpath`
+        # yields the alias's own name (containment passes), and `O_NOFOLLOW`
+        # has no link to refuse. Checked on the DESCRIPTOR, which is what makes
+        # it race-free. Inline rather than `pinned_fs.refuse_hardlink_alias`
+        # for the same double-close reason `_read_declared_art` documents.
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > _UI_MAX_BYTES:
+            os.close(fd)
+            return "not_found"
+    except OSError:
+        os.close(fd)
+        return "not_found"
+    return fd, st
+
+
+async def handle_app_ui_file(request: web.Request) -> web.StreamResponse:
+    """GET /apps/{name}/ui/{path:.*} — serve app UI bundle files.
+
+    Serves bytes STREAMED from a pinned descriptor (see :func:`_open_ui_file`)
+    rather than handing a validated path to ``FileResponse``, which re-opens it
+    and re-introduces the check-then-reopen window #6794 closed on the art
+    route. Streaming rather than buffering is itself load-bearing: this route
+    is UNAUTHENTICATED (the ``/apps/{name}/ui/`` token-auth bypass), so a
+    buffered body would let N outstanding requests each pin a whole file in
+    gateway memory — with streaming, per-request memory is one chunk
+    (:data:`_UI_STREAM_CHUNK`) regardless of file size or client speed.
+    Behaviour contract preserved: 400 on ``..``/absolute/escaping paths, 403 on
+    a disallowed extension, 404 on a missing file, Content-Type from
+    ``_CONTENT_TYPES``, and conditional requests (If-None-Match /
+    If-Modified-Since) still answer a body-less 304.
+    """
     name = request.match_info["name"]
     file_path = request.match_info.get("path", "")
     if ".." in file_path or file_path.startswith("/"):
         return web.json_response({"error": "invalid path"}, status=400)
-    from pathlib import Path
-
     ext = Path(file_path).suffix.lower()
     if ext not in _ALLOWED_EXTENSIONS:
         return web.json_response({"error": f"file type {ext!r} not allowed"}, status=403)
-    full_path = apps_dir() / name / "ui" / file_path
-    if not full_path.is_file():
-        return web.json_response({"error": "not found"}, status=404)
-    ui_root = (apps_dir() / name / "ui").resolve()
-    try:
-        full_path.resolve().relative_to(ui_root)
-    except ValueError:
-        return web.json_response({"error": "invalid path"}, status=400)
-    content_type = _CONTENT_TYPES.get(ext, "application/octet-stream")
-    # Dev-mode apps: never cache — the file-watch live-reload reloads on every
-    # change and must always see the latest bytes. Use the in-memory cache
-    # (maintained by the dev-mode watcher) so this hot path does NO disk IO on
-    # the event loop for every asset served (no-blocking-call-on-event-loop).
-    # Everything else: no-cache (NOT no-store) — the browser may cache but MUST
-    # revalidate each load. FileResponse answers conditional requests
-    # (If-Modified-Since / If-None-Match from its Last-Modified/ETag) with a
-    # body-less 304, so unchanged files stay cheap while app updates are picked
-    # up on a plain refresh. A long ``public,max-age=...`` instead would serve an
-    # app's UI stale for that whole window after an update.
-    from kiro_crew.apps.dev_mode import is_dev_mode_cached
-
-    cache = "no-store" if is_dev_mode_cached(name) else "no-cache"
-    return web.FileResponse(full_path, headers={"Content-Type": content_type, "Cache-Control": cache})  # type: ignore[return-value]
+    # The semaphore is acquired BEFORE the descriptor exists and released only
+    # after it is closed. Bounding just the streaming loop would cap streams at
+    # 8 while every QUEUED request already held an open fd waiting for a slot —
+    # an unauthenticated client could then drive the gateway to `EMFILE` with
+    # slow-paced GETs. Under this scope, at most 8 requests hold a descriptor
+    # at any instant and everyone else waits fd-less. The refusal paths inside
+    # (400/403/404, body-less 304) hold their slot only microseconds.
+    async with _UI_STREAM_SEMAPHORE:
+        result = await asyncio.to_thread(_open_ui_file, name, file_path)
+        if result == "invalid":
+            return web.json_response({"error": "invalid path"}, status=400)
+        if isinstance(result, str):
+            return web.json_response({"error": "not found"}, status=404)
+        fd, st = result
+        try:
+            content_type = _CONTENT_TYPES.get(ext, "application/octet-stream")
+            # Dev-mode apps: never cache — the file-watch live-reload reloads on
+            # every change and must always see the latest bytes. `is_dev_mode_cached`
+            # is the watcher-maintained in-memory flag, so this hot path does NO
+            # disk IO on the event loop for the mode lookup
+            # (no-blocking-call-on-event-loop). Everything else: no-cache (NOT
+            # no-store) — the browser may cache but MUST revalidate each load. The
+            # validators are derived from the DESCRIPTOR being served, not a second
+            # stat of the path, so unchanged files stay a body-less 304 while app
+            # updates are picked up on a plain refresh. A long
+            # ``public,max-age=...`` instead would serve an app's UI stale for that
+            # whole window after an update.
+            cache = "no-store" if is_dev_mode_cached(name) else "no-cache"
+            etag_value = f"{st.st_ino:x}-{st.st_size:x}-{st.st_mtime_ns:x}"
+            # `nosniff` because the Content-Type is derived from the EXTENSION, not
+            # the bytes; the CSP neuters a scripted `.svg` opened as a TOP-LEVEL
+            # document on the dashboard's own origin (a response CSP does not apply
+            # when the bytes are consumed as a subresource, so module/style/img
+            # loads are unaffected). Same pair, same reasons, as the art route.
+            headers = {
+                "Cache-Control": cache,
+                "ETag": f'"{etag_value}"',
+                "Last-Modified": formatdate(st.st_mtime, usegmt=True),
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+                "X-Content-Type-Options": "nosniff",
+            }
+            # aiohttp's parsed accessors, not raw header strings: If-None-Match may
+            # carry a list, a weak `W/"..."` form, or `*`, and If-Modified-Since
+            # needs HTTP-date parsing that forces UTC (a raw `parsedate_to_datetime`
+            # hands back a NAIVE datetime for `-0000`/asctime forms, which
+            # `.timestamp()` then reads as server-LOCAL time — a stale 304 for up to
+            # a whole UTC offset after an app update). Mirrors what `FileResponse`
+            # did.
+            if_none_match = request.if_none_match
+            if if_none_match:
+                # RFC 7232 §3.2: If-None-Match uses the WEAK comparison, so a weak
+                # form of the current tag matches too.
+                if (len(if_none_match) == 1 and if_none_match[0].value == "*") or any(
+                    t.value == etag_value for t in if_none_match
+                ):
+                    return web.Response(status=304, headers=headers)
+            else:
+                # RFC 7232 §3.3: If-Modified-Since is evaluated only when no
+                # If-None-Match was sent. Both sides are second-granular (HTTP
+                # dates carry no sub-second part, so `st_mtime` is truncated).
+                since = request.if_modified_since
+                if since is not None and int(st.st_mtime) <= since.timestamp():
+                    return web.Response(status=304, headers=headers)
+            resp = web.StreamResponse(status=200, headers={**headers, "Content-Type": content_type})
+            # Length pinned to the fstat that was validated: a file the app GROWS
+            # after the open must not stream past the length the client was told,
+            # so the loop below caps at `remaining` as well as EOF.
+            resp.content_length = st.st_size
+            await resp.prepare(request)
+            remaining = st.st_size
+            # The enclosing `_UI_STREAM_SEMAPHORE` scope (acquired before the
+            # open, released after the close) is what bounds this loop's
+            # `to_thread` hops on the shared default executor — no second
+            # acquisition here: a nested acquire under the same semaphore
+            # would deadlock once 8 holders each waited for a 9th permit.
+            while remaining > 0:
+                chunk = await asyncio.to_thread(os.read, fd, min(_UI_STREAM_CHUNK, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                await resp.write(chunk)
+            await resp.write_eof()
+            return resp
+        finally:
+            # Off the loop: `os.close` is on the no-blocking-call-on-event-loop
+            # deny list (it can block in the kernel), and this `finally` runs on
+            # the loop for every request, error paths included. `shield` is
+            # load-bearing, not decoration: a client disconnect CANCELS this
+            # handler, and an unshielded `to_thread` awaited during cancellation
+            # can have its work item cancelled while still queued — the close
+            # never runs and the descriptor leaks, on an UNAUTHENTICATED route
+            # where repeated connect-then-drop would walk the gateway into
+            # RLIMIT_NOFILE. Shielded, the close task runs to completion even
+            # when this await is interrupted.
+            await asyncio.shield(asyncio.to_thread(os.close, fd))
 
 
 async def handle_app_dev_mode(request: web.Request) -> web.Response:
@@ -2311,7 +2982,6 @@ _SAFE_SSH_URL_RE = re.compile(
 # other `$`-anchored request-path patterns exist elsewhere, e.g. papyrus's GIT_URL_RE.)
 _SAFE_REF_RE = re.compile(r"^[A-Za-z0-9._/-]+\Z")
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+\Z")
-_BLOB_ALLOWED_EXT = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico"})
 
 
 def _is_safe_repo_identifier(repo: str) -> bool:
@@ -2579,9 +3249,7 @@ async def _fetch_git_blob(
                     "git fetch failed for %s/%s: %s",
                     _strip_git_target_userinfo(repo),
                     file_path,
-                    _loggable_git_transport_output(
-                        "\n".join(fetch_log), credentialed=True
-                    ),
+                    _loggable_git_transport_output("\n".join(fetch_log), credentialed=True),
                 )
                 return False
         else:
@@ -2596,7 +3264,9 @@ async def _fetch_git_blob(
                 git_url,
                 tmp_root,
             ]
-            sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=clone_mode)
+            sandboxed_cmd, _cleanup = await wrap_argv_async(
+                clone_cmd, mode=clone_mode, _prepare=wrap_argv
+            )
             sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
             proc = await create_subprocess_limited(
                 *sandboxed_cmd,
@@ -2605,9 +3275,7 @@ async def _fetch_git_blob(
                 env=clone_env,
             )
             try:
-                _, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=_BLOB_FETCH_TIMEOUT
-                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=_BLOB_FETCH_TIMEOUT)
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.communicate()
@@ -2719,7 +3387,7 @@ async def handle_blob_proxy(request: web.Request) -> web.Response:
         return web.json_response({"error": "hidden path segments not allowed"}, status=400)
 
     ext = Path(file_path).suffix.lower()
-    if ext not in _BLOB_ALLOWED_EXT:
+    if ext not in _ART_IMAGE_EXTENSIONS:
         return web.json_response({"error": f"file type {ext!r} not allowed"}, status=403)
 
     # SECURITY: Only allow repos that appear in the registry (prevents SSRF)
@@ -3251,9 +3919,7 @@ async def handle_registries(request: web.Request) -> web.Response:
         # vetted full git URL. Reuse the blob-proxy validator, which rejects
         # shell metacharacters / traversal and owner/repo shorthand.
         if not _is_safe_repo_identifier(repo):
-            return _deny(
-                f"invalid repo URL or name: {public_repo!r}", f"repo={public_repo}"
-            )
+            return _deny(f"invalid repo URL or name: {public_repo!r}", f"repo={public_repo}")
         if repo in _blocked_repos:
             return _deny(
                 f"{public_repo!r} is the core registry — no need to add it",
@@ -3463,6 +4129,10 @@ def register_app_routes(app: web.Application) -> None:
     app.router.add_put("/api/apps/registries", handle_registries)
     app.router.add_post("/api/apps/registries/refresh", handle_registries_refresh)
     app.router.add_get("/api/apps/blob", handle_blob_proxy)
+    # Outside /api/apps/ on purpose: _app_owns_path would grant an app named
+    # `registry` implicit ownership of /api/apps/registry/* -- see the
+    # handler's docstring.
+    app.router.add_post("/api/app-store/refresh", handle_registry_refresh)
     app.router.add_post("/api/apps/registry/install", handle_registry_install)
     app.router.add_post("/api/apps/registry/install-stream", handle_registry_install_stream)
     app.router.add_post("/api/apps/install", handle_install_app)
@@ -3479,5 +4149,6 @@ def register_app_routes(app: web.Application) -> None:
     app.router.add_post("/api/apps/{name}/dev", handle_app_dev_mode)
     app.router.add_delete("/api/apps/{name}/migrate-cleanup", handle_migrate_cleanup)
     app.router.add_get("/apps/{name}/ui/{path:.*}", handle_app_ui_file)
+    app.router.add_get("/apps/{name}/art/{path:.*}", handle_app_art_file)
     # Reverse proxy: dashboard app UI → app backend (same-origin, avoids CORS)
     app.router.add_route("*", "/apps/{name}/api/{path:.*}", handle_app_api_proxy)

@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 from typing import Any, Collection
 
+from kiro_crew import mcp_apps_render
 from kiro_crew.acp.types import (
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -1143,7 +1144,19 @@ def _build_tool_result_event(update: dict[str, Any]) -> AcpEvent | None:
                                 output_parts.append(json.dumps(j, default=str)[:4000])
     if not output_parts:
         return None
-    final_output = _redact("\n".join(output_parts)[:8000])
+    joined = "\n".join(output_parts)
+    final_output = _redact(joined[:8000])
+    # An MCP App render marker lives at offset 0 of its own text part, but the
+    # 8000-char join cut is applied to the CONCATENATION of all parts: when the
+    # marker part is preceded by other (up to 4000-char) parts, its offset in
+    # the joined string can exceed 8000 and the slice drops it, so
+    # ``mcp_apps_render.find_marker`` never sees it and the app never mounts.
+    # If the pre-slice text carried a marker that the slice removed, re-inject
+    # it at offset 0 so it stays under any cut and remains detectable. The
+    # marker is a fixed control token, not sensitive, so it needs no redaction.
+    marker_match = mcp_apps_render.MARKER_RE.search(joined)
+    if marker_match and mcp_apps_render.find_marker(final_output) is None:
+        final_output = f"{marker_match.group(0)} {final_output}"
     return AcpEvent(
         kind=EVENT_TOOL_RESULT,
         tool_call_id=tool_use_id,
@@ -1578,38 +1591,71 @@ def parse_usage_update(update: dict[str, Any]) -> tuple[int | float | None, int 
     return _token_count(used), _token_count(size)
 
 
-def parse_usage_cost(update: dict[str, Any]) -> tuple[float | None, str]:
-    """Parse a ``usage_update``'s optional ``cost`` block into ``(amount, currency)``.
+def parse_usage_cost(update: dict[str, Any]) -> float | None:
+    """Parse a ``usage_update``'s session-cumulative cost into a validated float.
 
-    Separate from :func:`parse_usage_update` rather than widening its tuple: that
-    return shape has two consumers, and cost is optional in a way tokens are not —
-    only some adapters send it, so a caller that does not care should not have to
-    unpack it.
-
-    Adapters differ, and the differences are why this is validated rather than
-    trusted: claude-agent-acp sends ``cost: {amount, currency}`` with a real USD
-    figure, codex-acp sends no cost at all, and goose carries richer per-message
-    cost behind an unstable extension method Kiro Crew does not speak. So a missing
-    block is the norm, not an error.
-
-    The amount is deliberately NOT run through ``_token_count``: that helper rejects
-    non-integers and clamps, which is right for token counts and wrong for a
-    fractional currency amount. A negative or non-finite value is refused instead,
-    since a cost that runs backwards would corrupt any total built from it.
+    The claude-agent-acp adapter reports billing as ``cost: {amount, currency}``
+    on ``usage_update`` (session-cumulative). kiro-cli never sends the key, so
+    the kiro path always reads None here. Same defensive posture as
+    ``parse_usage_update`` (the other consumer of this frame): the value comes
+    straight from the agent process, so a malformed shape (non-dict cost,
+    str/list/bool amount, NaN/Infinity, negative) must degrade to "absent",
+    never raise inside the prompt-turn dispatch path. Both consumers store
+    the result in USD-denominated fields, so a present ``currency`` other
+    than exact ``"USD"`` (ISO 4217 uppercase; an absent currency is accepted
+    for adapters that omit it) also degrades the whole cost to absent rather
+    than mislabeling a non-USD amount as USD. Flat-primary with a nested
+    ``update.usage.cost`` fallback, mirroring ``parse_usage_update``.
     """
     if not isinstance(update, dict):
-        return None, ""
-    block = update.get("cost")
-    if not isinstance(block, dict):
-        return None, ""
-    raw = block.get("amount")
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None, ""
-    amount = float(raw)
-    if amount < 0 or amount != amount or amount in (float("inf"), float("-inf")):
-        return None, ""
-    currency = block.get("currency")
-    return amount, currency if isinstance(currency, str) else ""
+        return None
+    cost = update.get("cost")
+    if cost is None:
+        nested = update.get("usage")
+        if isinstance(nested, dict):
+            cost = nested.get("cost")
+    if not isinstance(cost, dict):
+        return None
+    currency = cost.get("currency")
+    if currency is not None and currency != "USD":
+        logger.debug("acp usage cost: non-USD currency %s, dropping cost", repr(currency)[:40])
+        return None
+    amount = _token_count(cost.get("amount"))
+    if amount is None or amount < 0:
+        return None
+    return float(amount)
+
+
+def parse_prompt_token_usage(result: Any) -> tuple[int, int, int, int] | None:
+    """Parse a PromptResponse's turn-scoped token counts.
+
+    The claude-agent-acp adapter reports per-turn token counts on the prompt
+    RESPONSE (``inputTokens`` / ``outputTokens`` / ``cachedReadTokens`` /
+    ``cachedWriteTokens``); kiro-cli's response carries only ``stopReason``.
+    Returns ``(input, output, cache_read, cache_write)`` with each field
+    validated via ``_token_count`` (bool excluded, finite) plus non-negative,
+    coerced to int; an absent or malformed field reads 0. Returns None when
+    NONE of the four keys is present, so the kiro path never touches the
+    per-turn stats (harness parity: byte-identical behavior for a backend
+    that sends no token counts). Flat-primary with a nested ``result.usage``
+    fallback, mirroring ``parse_usage_update``'s dual-shape read.
+    """
+    if not isinstance(result, dict):
+        return None
+    nested = result.get("usage")
+    nested = nested if isinstance(nested, dict) else {}
+    keys = ("inputTokens", "outputTokens", "cachedReadTokens", "cachedWriteTokens")
+    if not any(k in result or k in nested for k in keys):
+        return None
+
+    def _count(key: str) -> int:
+        value = result.get(key, nested.get(key))
+        n = _token_count(value)
+        if n is None or n < 0:
+            return 0
+        return int(n)
+
+    return _count(keys[0]), _count(keys[1]), _count(keys[2]), _count(keys[3])
 
 
 # Above this magnitude a `resetsAt` is read as milliseconds rather than seconds.
@@ -1697,6 +1743,7 @@ __all__ = [
     "parse_rate_limit",
     "parse_usage_cost",
     "parse_usage_update",
+    "parse_prompt_token_usage",
     "parse_text_chunk",
     "make_unified_diff",
     "select_tool_title",

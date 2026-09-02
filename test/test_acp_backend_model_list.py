@@ -17,8 +17,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_AUTO_MODEL,
-    ACP_BACKENDS_SELECTABLE,
 )
+from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.dashboard.handlers import agents as agents_handler
 from kiro_crew.providers.base import LLMEvent, LLMProvider
 
@@ -239,7 +239,7 @@ class TestAutoModelMembership:
 
     def test_membership_is_a_deliberate_subset_of_selectable(self) -> None:
         """A backend nobody can select cannot claim a capability."""
-        assert ACP_BACKENDS_AUTO_MODEL <= ACP_BACKENDS_SELECTABLE
+        assert ACP_BACKENDS_AUTO_MODEL <= selectable_backends()
 
     def test_a_new_backend_does_not_inherit_the_capability(self) -> None:
         """The whole point of opt-in membership.

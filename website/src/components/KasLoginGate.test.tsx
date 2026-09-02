@@ -40,21 +40,19 @@ describe('KasLoginGate', () => {
     kasLoginBeginDevice.mockClear()
   })
 
-  it('renders the chooser with the two wired sign-in options', async () => {
+  it('renders the chooser with all four sign-in options', async () => {
     renderWithProviders(<KasLoginGate />)
 
     expect(
       await screen.findByRole('button', { name: 'Continue with Google' }),
     ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Continue with GitHub' })).toBeInTheDocument()
-    // Unwired providers (backend accepts only google/github) must not render:
-    // a visible button whose click can only 400 is a guaranteed dead end.
     expect(
-      screen.queryByRole('button', { name: 'Continue with AWS Builder ID' }),
-    ).not.toBeInTheDocument()
+      screen.getByRole('button', { name: 'Continue with AWS Builder ID' }),
+    ).toBeInTheDocument()
     expect(
-      screen.queryByRole('button', { name: 'Continue with your work account' }),
-    ).not.toBeInTheDocument()
+      screen.getByRole('button', { name: 'Continue with company SSO' }),
+    ).toBeInTheDocument()
     expect(
       screen.getByRole('heading', { name: 'Sign in to Kiro' }),
     ).toBeInTheDocument()
@@ -66,7 +64,7 @@ describe('KasLoginGate', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Continue with Google' }))
 
     expect(await screen.findByTestId('kas-login-user-code')).toHaveTextContent('ABCD-EFGH')
-    expect(kasLoginBeginDevice).toHaveBeenCalledWith('google')
+    expect(kasLoginBeginDevice).toHaveBeenCalledWith('google', undefined)
     expect(
       screen.getByRole('heading', { name: 'Finish signing in on your phone or another computer' }),
     ).toBeInTheDocument()
@@ -163,5 +161,66 @@ describe('KasLoginGate', () => {
       </KasLoginGate>,
     )
     expect(await screen.findByText('app-content')).toBeInTheDocument()
+  })
+
+  it('starts a Builder ID device flow directly from its button', async () => {
+    renderWithProviders(<KasLoginGate />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with AWS Builder ID' }))
+    expect(await screen.findByTestId('kas-login-user-code')).toHaveTextContent('ABCD-EFGH')
+    expect(kasLoginBeginDevice).toHaveBeenCalledWith('builder_id', undefined)
+  })
+
+  it('company SSO expands a form and only begins once a start URL is supplied', async () => {
+    renderWithProviders(<KasLoginGate />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with company SSO' }))
+    // The form replaces the button; nothing has begun yet.
+    const form = await screen.findByTestId('kas-login-sso-form')
+    expect(form).toBeInTheDocument()
+    expect(kasLoginBeginDevice).not.toHaveBeenCalled()
+    // Empty start URL keeps the submit disabled — no dead-end 400 round-trip.
+    const submit = screen.getByRole('button', { name: 'Continue' })
+    expect(submit).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Company sign-in URL'), {
+      target: { value: '  https://acme.awsapps.com/start  ' },
+    })
+    expect(submit).toBeEnabled()
+    fireEvent.click(submit)
+    expect(await screen.findByTestId('kas-login-user-code')).toHaveTextContent('ABCD-EFGH')
+    // Trimmed URL travels; the blank region field is omitted, not sent empty.
+    expect(kasLoginBeginDevice).toHaveBeenCalledWith('idc', {
+      start_url: 'https://acme.awsapps.com/start',
+    })
+  })
+
+  it('company SSO form sends a supplied region and can be cancelled back to the chooser', async () => {
+    renderWithProviders(<KasLoginGate />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue with company SSO' }))
+    await screen.findByTestId('kas-login-sso-form')
+    fireEvent.change(screen.getByLabelText('Company sign-in URL'), {
+      target: { value: 'https://acme.awsapps.com/start' },
+    })
+    fireEvent.change(screen.getByLabelText('AWS Region (optional)'), {
+      target: { value: 'eu-west-1' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    // Cancel collapses the form without beginning anything and restores the button.
+    expect(kasLoginBeginDevice).not.toHaveBeenCalled()
+    expect(
+      await screen.findByRole('button', { name: 'Continue with company SSO' }),
+    ).toBeInTheDocument()
+    // Re-open: the form starts fresh; fill both fields and submit.
+    fireEvent.click(screen.getByRole('button', { name: 'Continue with company SSO' }))
+    fireEvent.change(screen.getByLabelText('Company sign-in URL'), {
+      target: { value: 'https://acme.awsapps.com/start' },
+    })
+    fireEvent.change(screen.getByLabelText('AWS Region (optional)'), {
+      target: { value: 'eu-west-1' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(await screen.findByTestId('kas-login-user-code')).toHaveTextContent('ABCD-EFGH')
+    expect(kasLoginBeginDevice).toHaveBeenCalledWith('idc', {
+      start_url: 'https://acme.awsapps.com/start',
+      region: 'eu-west-1',
+    })
   })
 })

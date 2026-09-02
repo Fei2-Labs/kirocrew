@@ -593,6 +593,19 @@ class SQLiteRunCoordinator:
             process_owned,
         )
 
+    async def clear_recovered_process(
+        self,
+        run_id: str,
+        fence: RunFence,
+        expected_version: int,
+    ) -> CoordinatorResult[RunRecord]:
+        return await self._offload(
+            "clear_recovered_process",
+            run_id,
+            fence,
+            expected_version,
+        )
+
     async def complete(
         self, completion: RunCompletion, fence: RunFence, expected_version: int
     ) -> CoordinatorResult[OutboxEvent]:

@@ -24,6 +24,7 @@
     "hide_full_changelog": "▾ Hide Full Changelog",
     "i_d_like_to_request_a_feature": "I’d like to request a feature!",
     "iam_identity_center": "IAM Identity Center",
+    "kiro_credit_usage_api_key": "Kiro credit usage — not available with API key authentication",
     "kiro_credit_usage_unavailable": "Kiro credit usage — unavailable",
     "memory_unavailable": "Memory: unavailable",
     "metrics_are_stale_latest_fetch_failed": "Metrics are stale, latest fetch failed",
@@ -65,7 +66,7 @@
     "focus_mode": "Focus mode",
     "focus_mode_title": "Focus mode · Alt+Shift+M",
     "focus_mode_title_mac": "Focus mode · ⌥⇧M",
-    "kiro_credit_usage_api_key": "Kiro credit usage — not available with API key authentication",
+    "connect_your_phone": "Connect your phone",
     "active_harness": "New sessions use {{label}}. Open chats keep the harness they started with.",
     "harness_new_sessions": "New sessions"
   },
@@ -310,6 +311,7 @@
       "components": {
         "agentSessionButton": {
           "already_finished_its_session_was_closed": "Already finished — transcript under Older Sessions.",
+          "open_older_sessions": "Open Older Sessions",
           "resume": "Resume",
           "start_over": "Start over"
         },
@@ -576,7 +578,8 @@
         },
         "registry": {
           "overview": "Overview",
-          "tagging": "Tagging"
+          "tagging": "Tagging",
+          "pipeline": "Pipeline"
         },
         "crews": {
           "desk": {
@@ -731,6 +734,10 @@
           "sub_paused": "Paused — not taking new issues",
           "rail_sort": "Sort",
           "rail_filters": "Filters"
+        },
+        "pipelineDashboard": {
+          "github_only": "The triage pipeline runs on GitHub repositories",
+          "github_only_hint": "Its scheduled jobs read and write GitHub only, so this board has no pipeline data for this repository."
         }
       },
       "api": {
@@ -1239,6 +1246,10 @@
       "run_named_now": "Run {{name}} now",
       "running": "running"
     },
+    "rejectDropdown": {
+      "reject_all": "Reject all — refuse the rest without asking",
+      "reject_once": "Reject once — keep asking about the rest"
+    },
     "tailnetMobile": {
       "automatic_https": "After HTTPS is enabled for this tailnet, Tailscale creates and renews the private certificate automatically.",
       "setting_up": "Setting up phone access…",
@@ -1283,6 +1294,11 @@
     "appHost": {
       "not_installed": "\"{{name}}\" is not installed"
     },
+    "approvalCard": {
+      "approval_no_longer_pending": "This approval has expired or was already decided — the agent is no longer waiting on it.",
+      "decision_failed": "This decision may not have been recorded — the request failed.",
+      "decision_not_recorded_error": "This decision wasn't recorded: {{error}}"
+    },
     "approvalModePicker": {
       "approval_mode_aria": "Approval mode: {{mode}}",
       "normal_label": "Normal",
@@ -1298,7 +1314,7 @@
       "yolo_tooltip": "In every chat, {{productName}} works without asking you first",
       "yolo_desc": "In every chat, {{productName}} works without asking you first",
       "configure_duration": "Configure duration",
-      "yolo_expiration_until_shutdown": "Stays on until Kiro Crew restarts — no timed expiry.",
+      "yolo_expiration_until_shutdown": "Stays on until {{productName}} restarts — no timed expiry.",
       "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again."
     },
     "appstore": {
@@ -1307,12 +1323,9 @@
       },
       "installedAppCard": {
         "app_cannot_be_opened_kirocrew_is_running_in_a_he": "App cannot be opened — {{productName}} is running in a headless environment.",
-        "collapse_details": "Collapse details",
         "disable": "Disable",
-        "disabled": "Disabled",
         "enable": "Enable",
         "enabled": "Enabled",
-        "expand_details": "Expand details",
         "update_to": "Update to v{{version}}"
       },
       "sourcesPopover": {
@@ -1354,7 +1367,9 @@
       }
     },
     "artifactBody": {
-      "artifact": "Artifact: {{slug}}"
+      "artifact": "Artifact: {{slug}}",
+      "no_longer_showing": "This artifact is no longer showing",
+      "show_artifact": "Show artifact"
     },
     "artifactChatPanel": {
       "agent_chat": "Agent chat",
@@ -1376,6 +1391,9 @@
       "goal_active_cycle": "Goal active (cycle {{cycle}})",
       "goal_interrupted_cycle": "Goal loop armed (cycle {{cycle}}) — last turn was interrupted; resume the chat or wait for the next cycle",
       "never": "never",
+      "next_cycle_due": "Next cycle due, fires after the current turn",
+      "next_cycle_in": "Next cycle in {{time}}",
+      "next_cycle_unscheduled": "Next cycle not yet scheduled",
       "save": "Save",
       "start_loop": "Start loop"
     },
@@ -1384,6 +1402,13 @@
       "terminal": "Terminal"
     },
     "chatInput": {
+      "send_a_message_or_tap_the_mic_for_voice": "Send a message, or tap the mic for voice",
+      "release_to_transcribe": "Release to transcribe",
+      "hold_to_talk": "Hold to talk",
+      "release_to_cancel": "Release to cancel",
+      "slide_up_to_cancel": "Slide up to cancel",
+      "switch_to_keyboard": "Switch to keyboard",
+      "switch_to_voice": "Switch to voice",
       "drop_to_attach": "Drop to attach",
       "agent": "Agent: {{name}}",
       "approve_sub_agent": "Approve sub-agent: {{name}}",
@@ -1424,13 +1449,6 @@
       "queue": "Queue",
       "queue_run_after_the_current_work_finishes_desc": "Run after the current work finishes",
       "steer_act_on_this_right_away_desc": "Act on this right away",
-      "send_a_message_or_tap_the_mic_for_voice": "Send a message, or tap the mic for voice",
-      "release_to_transcribe": "Release to transcribe",
-      "hold_to_talk": "Hold to talk",
-      "release_to_cancel": "Release to cancel",
-      "slide_up_to_cancel": "Slide up to cancel",
-      "switch_to_keyboard": "Switch to keyboard",
-      "switch_to_voice": "Switch to voice",
       "finishing": "Finishing…",
       "keep_holding_to_record": "Keep holding to record",
       "plan_limit": "Plan limit",
@@ -1450,7 +1468,10 @@
       "copied": "Copied",
       "copy": "Copy",
       "copy_failed": "Copy failed",
+      "disconnected_message": "Terminal disconnected",
       "failed_retry": "Failed — retry",
+      "reconnect": "Reconnect",
+      "reconnecting": "Reconnecting…",
       "redaction_failed_retry": "Redaction failed — retry",
       "send_selection_to_chat": "Send selection to chat",
       "send_to_chat": "Send to chat",
@@ -1497,7 +1518,7 @@
           "kirocrew_agents": "{{productName}} Agents",
           "logs": "Logs",
           "pages": "Pages",
-          "remote_crew": "Remote Crew",
+          "remote_crew": "Remote Instances",
           "tasks": "Tasks"
         },
         "promptsProvider": {
@@ -1636,6 +1657,12 @@
       "save_changes": "Save changes",
       "save_failed": "Could not save the folder.",
       "set_color_to_name": "Set color to {{name}}",
+      "tags": "Tags",
+      "tags_hint": "Applied to every new chat created in this folder. Subfolders don't inherit.",
+      "tags_empty_hint": "No tags yet — create them from any chat's tag menu, then pick them here to auto-tag new chats created in this folder.",
+      "tags_loading_hint": "Loading tags…",
+      "tags_error_hint": "Tags couldn't load.",
+      "tags_retry": "Retry",
       "top_level": "Top level"
     },
     "folderColorNames": {
@@ -1651,9 +1678,6 @@
       "red": "Red",
       "teal": "Teal",
       "violet": "Violet"
-    },
-    "folderSuggestionCard": {
-      "move_to_folder_question": "Move this session to <folder/>?"
     },
     "followUpBar": {
       "click_to_add_to_input_double_click_to_select_and": "Click to add to input (double-click to select and send)",
@@ -1762,8 +1786,8 @@
       "failed_to_load_history": "Failed to load history"
     },
     "kasLogin": {
-      "aside_body": "Sign in to Kiro right here — no CLI to install, no terminal to open. Kiro Crew handles the rest.",
-      "aside_footnote": "Your sign-in stays on this machine — nothing is sent to Kiro Crew's servers.",
+      "aside_body": "{{productName}} runs agents using your Kiro account.",
+      "aside_footnote": "Your sign-in stays on this machine — nothing is sent to {{productName}}'s servers.",
       "aside_headline": "Sign in to start",
       "browser_note": "Each option starts Kiro sign-in and walks you through the next step.",
       "check_again": "Check again",
@@ -1772,7 +1796,7 @@
       "copied": "Copied",
       "copy_link": "Copy link",
       "could_not_start_sign_in": "Could not start the sign-in. Check your connection and try again.",
-      "device_aside_body": "Kiro Crew is running on a different computer, so it can't open a browser window for you. Open the link below on any device — your phone works — and enter the code.",
+      "device_aside_body": "{{productName}} is running on a different computer, so it can't open a browser window for you. Open the link below on any device — your phone works — and enter the code.",
       "device_aside_footnote": "The code is valid for 5 minutes.",
       "device_aside_headline": "Approve in your browser",
       "enter_the_code_in_your_browser": "Finish signing in on your phone or another computer",
@@ -1795,7 +1819,15 @@
       "start_over": "Start over",
       "the_code_expired": "The code expired",
       "the_code_expired_body": "That sign-in code is no longer valid",
-      "waiting_for_you_to_approve": "Waiting for you to approve…"
+      "waiting_for_you_to_approve": "Waiting for you to approve…",
+      "continue_with_builder_id": "Continue with AWS Builder ID",
+      "continue_with_company_sso": "Continue with company SSO",
+      "sso_start_url_label": "Company sign-in URL",
+      "sso_start_url_placeholder": "https://your-company.awsapps.com/start",
+      "sso_helper": "Paste the AWS access portal URL your company gave you.",
+      "sso_region_label": "AWS Region (optional)",
+      "sso_continue": "Continue",
+      "sso_cancel": "Cancel"
     },
     "kiroPrerequisiteGate": {
       "agent_specs_missing": "Agent specs missing",
@@ -1871,6 +1903,8 @@
       "adding_2": "Adding...",
       "already_in_library": "Already in Library",
       "cannot_read_file": "Cannot read file",
+      "diff_failed_to_compute": "Couldn't compute the diff — git failed for this file",
+      "diff_no_baseline_not_git": "This file isn't in a git repository, so there is no baseline to diff against",
       "discard_changes_button": "Discard changes",
       "download_failed": "Download failed",
       "edit": "Edit",
@@ -2075,7 +2109,9 @@
       "state_closed": "Closed",
       "state_draft": "Draft",
       "state_merged": "Merged",
-      "state_open": "Open"
+      "state_open": "Open",
+      "owner_not_configured_guidance": "This action needs a configured owner, which {{productName}} identifies by Slack member ID. Set \"Owner Slack member ID\" in Settings → Channels → Slack, restart the gateway, then sign in again.",
+      "open_slack_settings": "Open Slack settings"
     },
     "registryManager": {
       "adding": "Adding…",
@@ -2184,6 +2220,15 @@
       "command_completions": "Command completions"
     },
     "terminalKeyBar": {
+      "select": "Select",
+      "select_line_short": "Line · tap for all",
+      "select_all_short": "All · tap for line",
+      "copy": "Copy",
+      "copy_failed": "Copy failed",
+      "copy_needs_https": "Copy needs a secure (HTTPS) connection",
+      "copy_no_selection": "Tap Select, then Copy",
+      "copy_done": "Copied",
+      "copy_permission_needed": "Allow clipboard access",
       "paste": "Paste",
       "paste_clipboard_empty": "Clipboard is empty",
       "paste_failed": "Paste failed",
@@ -2485,11 +2530,6 @@
       "webhook_unbound_short": "No tokens bound",
       "wire_what_it_works_with": "What it works with"
     },
-    "approvalCard": {
-      "approval_no_longer_pending": "This approval has expired or was already decided — the agent is no longer waiting on it.",
-      "decision_failed": "This decision may not have been recorded — the request failed.",
-      "decision_not_recorded_error": "This decision wasn't recorded: {{error}}"
-    },
     "confirmDialog": {
       "cancel": "Cancel"
     },
@@ -2521,6 +2561,33 @@
       "status_running": "working",
       "status_unread": "unread",
       "tab_name_with_status": "{{name}} — {{status}}"
+    },
+    "mobileConnect": {
+      "use_kiro_crew_on_your_phone": "Use {{productName}} on your phone",
+      "close": "Close",
+      "scan_with_your_phone_camera_to_continue_with_the_s": "Scan with your phone camera to open {{productName}} in your mobile browser. Everything stays in sync with this computer.",
+      "generating": "Generating…",
+      "show_qr_code": "Show QR code",
+      "qr_code_for_mobile_access": "QR code for mobile access",
+      "copy_link": "Copy link",
+      "could_not_generate_a_code_try_again": "Could not generate a code — try again.",
+      "remote_access_is_not_set_up_yet_finish_setup_to_ge": "Remote access is not set up yet. Finish setup to get a scannable code.",
+      "or_create_a_one_time_sign_in_link_to_send_to_yours": "No camera handy? Create a one-time link to send to yourself — it works once, then expires.",
+      "creating": "Creating…",
+      "create_sign_in_link": "Create sign-in link",
+      "could_not_create_a_link_check_that_an_external_add": "Could not create a link — check that an external address is configured for this dashboard.",
+      "mobile_access_link": "Mobile access link",
+      "one_time_sign_in_link": "One-time sign-in link",
+      "checking_remote_access": "Checking remote access…",
+      "create_a_one_time_sign_in_link_to_send_to_yourself": "Create a one-time sign-in link to send to yourself — it works once, then expires.",
+      "the_link_works_once_and_expires_in_about_minutes": "The link works once and expires in about {{minutes}} minutes.",
+      "try_again": "Try again",
+      "new_code": "New code",
+      "could_not_check_remote_access": "Could not check remote access.",
+      "the_code_signs_you_in_automatically_and_expires_in": "The code signs you in automatically and expires in about {{minutes}} minutes.",
+      "copy_failed_select_the_link_and_copy_it_manually": "Copy failed — select the link and copy it manually.",
+      "could_not_create_a_link_try_again": "Could not create a link — try again.",
+      "phone_connection_is_disabled_by_policy_on_this_dep": "Phone connection is disabled by policy on this deployment."
     }
   },
   "hooks": {
@@ -2548,7 +2615,7 @@
       "group_actions": "Actions",
       "group_chat_navigation": "Chat Navigation",
       "group_panel_navigation": "Panel Navigation",
-      "group_remote_crews": "Remote Crews",
+      "group_remote_crews": "Remote Instances",
       "jump_to_chat": "Jump to chat {{n}}",
       "last_visited_chat_mru": "Last visited chat (MRU)",
       "next_chat": "Next chat",
@@ -2564,7 +2631,7 @@
       "projects_panel": "Projects panel",
       "schedule_panel": "Schedule panel",
       "switch_to_local": "Switch to Local",
-      "switch_to_remote_crew": "Switch to remote crew {{n}}",
+      "switch_to_remote_crew": "Switch to remote instance {{n}}",
       "walk_back_mru_history": "Walk back MRU history",
       "stop_speaking": "Stop speaking",
       "toggle_focus_mode": "Toggle focus mode",
@@ -2642,7 +2709,6 @@
     "agent_capabilities": "Agent Capabilities",
     "artifacts": "Artifacts",
     "discover": "Discover",
-    "knowledge": "Knowledge",
     "library": "Library",
     "notifications": "Notifications",
     "schedule": "Schedule",
@@ -2706,7 +2772,6 @@
       "failed_to_uninstall": "Failed to uninstall {{name}}",
       "failed_to_update": "Failed to update: {{names}}",
       "find_apps_in_the_discover_tab_or_install_from_a": "Find apps on the Discover page, or install from a local path via Sources there.",
-      "hidden_you_can_re_enable_it_from_the_discover_ta": "Disabled. You can re-enable it from the Discover page.",
       "keep_dependency": "Keep dependency {{name}}",
       "kirocrew_registry": "{{productName}} registry",
       "library": "Library",
@@ -2886,7 +2951,12 @@
       "prompts_label": "Prompts",
       "prompts_description": "Reusable prompt templates from {{registry}}",
       "workflows_label": "Workflows",
-      "workflows_description": "Create, edit, and run reusable agent workflows"
+      "workflows_description": "Create, edit, and run reusable agent workflows",
+      "knowledge_label": "Knowledge",
+      "knowledge_description": "Documents and sources your agent can search when answering",
+      "group_agent": "Agent",
+      "group_knowledge_instructions": "Knowledge & instructions",
+      "group_automation": "Automation"
     },
     "channelPage": {
       "agent_joining_one": "{{count}} agent joining",
@@ -2902,6 +2972,7 @@
       "reply_2_other": "{{count}} replies",
       "listen_all": "all",
       "listen_mention": "mention",
+      "listen_mode": "Listen mode",
       "listen_silent": "silent",
       "preset_custom_empty": "Custom (empty)",
       "preset_incident_response": "Incident Response",
@@ -2960,6 +3031,7 @@
         "subagents": "Subagents",
         "model_label": "Model: {{model}}",
         "model_downgraded": "Requested {{requested}}, served {{resolved}}",
+        "model_effective": "Running on {{model}} (backend selects the model)",
         "workflows": "Workflows",
         "workspace_empty": "No files in this workspace yet",
         "workspace_truncated": "Large workspace — showing the first 10,000 files"
@@ -3296,6 +3368,7 @@
       "session_source": "Session",
       "new": "New",
       "new_chat": "New chat",
+      "new_chat_on_crew": "New chat on crew",
       "no_inactive_sessions_to_archive": "No inactive sessions to archive.",
       "older": "Older",
       "show": "Show",
@@ -3370,9 +3443,11 @@
       "connections": "Connections",
       "could_not_load_status": "Connection status could not be loaded. Cards may be out of date.",
       "disconnect": "Disconnect",
-      "disconnect_entry_left_alone": "The configured server under this name points elsewhere and was left alone.",
-      "disconnect_entry_not_ours": "The stored grant was removed, but the configured server under this name points elsewhere and was left alone.",
-      "disconnect_grant_shared": "The stored grant was kept because another server uses the same endpoint.",
+      "disconnect_census_incomplete": "The stored grant was kept because a configuration source could not be read to rule out another server using it. Check your server configuration and disconnect again.",
+      "disconnect_census_incomplete_source": "The stored grant was kept because {{source}} could not be read to rule out another server using it. Fix or remove that file and disconnect again.",
+      "disconnect_entry_left_alone": "Your server configuration was left unchanged. You can manage this entry from the MCP Servers tab.",
+      "disconnect_entry_not_ours": "The stored grant was removed. Your server configuration was left unchanged. You can manage this entry from the MCP Servers tab.",
+      "disconnect_grant_shared": "The stored grant was kept because the same endpoint is also configured by: {{names}}. Revoking at the provider would cut off their access too.",
       "disconnect_grant_survived": "Part of the stored grant could not be removed. Revoke access at the provider.",
       "disconnected_locally": "Disconnected locally. Revoke access at the provider to cancel the grant completely.",
       "documentation": "Documentation",
@@ -3428,6 +3503,7 @@
       "conflicts_aborted": "Conflicts — aborted",
       "created_recently": "created recently",
       "delete_anyway": "Delete anyway",
+      "discard_untracked_files": "Also discards untracked files ({{count}}), including: {{files}}",
       "empty_worktree_cannot_be_undone": "Empty worktree. Cannot be undone.",
       "every_git_worktree_of_the_main_checkout_pull_bui": "Every git worktree of the main checkout. Pull+Build syncs main; pods are isolated gateways booted from a worktree.",
       "expand": "Expand",
@@ -3446,6 +3522,7 @@
       "hide_legacy_worktrees": "Hide {{n}} legacy worktrees",
       "hide_logs": "Hide logs",
       "just_now": "just now",
+      "kept_discard_untracked_hint": "Rows held up only by untracked scratch: checking one discards the files listed on that row.",
       "kept_force_hint": "Check to force remove — deletes unmerged work.",
       "legacy_worktrees_hidden_show": "{{n}} legacy worktrees hidden · Show",
       "load_pod_logs": "Load pod logs",
@@ -3549,11 +3626,6 @@
       "no_checkout_found_env_example": "KIROCREW_DEVFLEET_REPO=/path/to/your/checkout",
       "no_checkout_found_action": "Set the environment variable below, or add dev_fleet.repo_path to config.json in your {{productName}} data directory (~/.kiro/crew by default) to make it stick, then restart the gateway."
     },
-    "developer": {
-      "featurePreviewsTab": {
-        "experimental_acp_backends_claude_code": "Claude Code as an alternative to Kiro CLI. Experimental — safety refusals work; end-to-end sessions are not yet verified."
-      }
-    },
     "developerPage": {
       "tabs": {
         "agentBackend": {
@@ -3653,7 +3725,11 @@
       "name_is_required": "Name is required",
       "select_an_agent_template": "Select an agent template…",
       "subdirectory_inside_kiro_crew_where_this_workspa": "Subdirectory inside ~/.kiro/crew where this workspace stores its data (chat history, lessons, projects). Each workspace gets its own isolated directory.",
-      "workspace_name_is_required": "Workspace name is required"
+      "workspace_name_is_required": "Workspace name is required",
+      "session_color": "Session Color",
+      "session_color_hint": "Sessions this agent starts use this color unless the session has a color of its own. Editing it re-tints those sessions. Leave empty for no agent color.",
+      "session_color_hex": "Session color hex value",
+      "session_color_clear": "Clear"
     },
     "knowledge": {
       "detailView": {
@@ -3682,7 +3758,15 @@
         "sources_tab": "Sources",
         "settings_tab": "Settings",
         "status_active": "Active",
-        "status_archived": "Archived"
+        "status_archived": "Archived",
+        "stats_items_one": "{{count}} item",
+        "stats_items_other": "{{count}} items",
+        "stats_entities_one": "{{count}} entity",
+        "stats_entities_other": "{{count}} entities",
+        "stats_relations_one": "{{count}} relation",
+        "stats_relations_other": "{{count}} relations",
+        "stats_sources_one": "{{count}} source",
+        "stats_sources_other": "{{count}} sources"
       },
       "sourceGroup": {
         "items_count": "({{count}} items)",
@@ -3767,6 +3851,19 @@
         "load_failed": "Failed to load settings.",
         "retry": "Retry"
       }
+    },
+    "libraryPage": {
+      "pin": "Pin",
+      "pin_to_sidebar": "Pin {{name}} to the sidebar",
+      "tile_actions": "Actions for {{name}}",
+      "tile_details": "Details",
+      "tile_disabled": "Disabled",
+      "tile_more_actions": "More actions for {{name}}",
+      "tile_no_sidebar_page": "No sidebar page",
+      "tile_pinned": "In sidebar",
+      "tile_unpinned": "Not in sidebar",
+      "unpin": "Unpin",
+      "unpin_from_sidebar": "Unpin {{name}} from the sidebar"
     },
     "logsPage": {
       "latest_first": "Latest: first",
@@ -3890,7 +3987,7 @@
         "adapted_from": "Adapted from",
         "create_draft": "Create draft",
         "create_title": "Create a reusable workflow",
-        "description": "Saved workflows are global to Kiro Crew and work with every supported agent harness. New drafts can adapt matching saved workflows without changing them.",
+        "description": "Saved workflows are global to {{productName}} and work with every supported agent harness. New drafts can adapt matching saved workflows without changing them.",
         "empty": "No saved workflows found.",
         "intent": "What should this workflow do?",
         "loading": "Loading workflows…",
@@ -3950,7 +4047,7 @@
         "pending_enable_click_to_revert": "Pending: enable (click to revert)",
         "pending_uninstall": "{{label}} — pending uninstall",
         "unknown": "Unknown",
-        "servers_scope_tip": "MCP servers across Kiro Crew and your interactive {{provider}}/Kiro globals. The Kiro Crew badge shows if it'll load in Kiro Crew sessions; the Globals badge shows if it's shared to your interactive Kiro global. Click to toggle, then Apply.",
+        "servers_scope_tip": "MCP servers across {{productName}} and your interactive {{provider}}/Kiro globals. The {{productName}} badge shows if it'll load in {{productName}} sessions; the Globals badge shows if it's shared to your interactive Kiro global. Click to toggle, then Apply.",
         "sign_in_required": "Sign-in required",
         "sign_in_required_help": "This server uses OAuth and nobody has signed in yet. <chatLink>Go to chat</chatLink>, start a new session, and send any message — you'll be asked to approve the sign-in in chat. Then probe to refresh this list.",
         "sign_in": "Sign in",
@@ -3971,7 +4068,7 @@
       },
       "memoryGraphTab": {
         "all_count": "All ({{count}})",
-        "gpu_rendered_visualization_of_all_kirocrew_memor": "GPU-rendered visualization of all Kiro Crew memory. Nodes are color-coded by type. Zoom in to reveal labels, click a node to inspect, use filters to focus.",
+        "gpu_rendered_visualization_of_all_kirocrew_memor": "GPU-rendered visualization of all {{productName}} memory. Nodes are color-coded by type. Zoom in to reveal labels, click a node to inspect, use filters to focus.",
         "group_history_count": "History ({{count}})",
         "group_lessons_count": "Lessons ({{count}})",
         "group_preferences_count": "Preferences ({{count}})",
@@ -4008,7 +4105,7 @@
         "select": "Select {{name}}",
         "skills_count": "Skills ({{count}})",
         "skills_from_read_only": "Skills from {{name}} — read-only",
-        "skills_tip": "On-demand skills loaded when the agent determines they're relevant. Skills with the 'auto' badge are always injected into every session. Skills are discovered from Kiro Crew, kiro-cli (~/.kiro/skills), and AIM packages.",
+        "skills_tip": "On-demand skills loaded when the agent determines they're relevant. Skills with the 'auto' badge are always injected into every session. Skills are discovered from {{productName}}, kiro-cli (~/.kiro/skills), and AIM packages.",
         "auto_generated_skill_candidates_awaiting_your_ap": "Auto-generated skill candidates awaiting your approval. Click Review to inspect the SKILL.md and any bundled script before approving. Approve makes the skill live (and marks scripts executable); dismiss discards it. Nothing goes live until you approve it.",
         "hide": "Hide",
         "linked_candidate_no_longer_pending": "That skill candidate is no longer awaiting review. It was approved or dismissed.",
@@ -4137,7 +4234,7 @@
     },
     "popoutFrame": {
       "session": "Session",
-      "window_title": "{{label}} — Kiro Crew"
+      "window_title": "{{label}} — {{productName}}"
     },
     "projectDetailPage": {
       "export_yaml": "Export YAML",
@@ -4282,6 +4379,19 @@
       "script_source_failed": "Could not load the script source.",
       "script_source_truncated": "Truncated — the script is larger than the preview limit."
     },
+    "servicesTab": {
+      "channels": "Channels",
+      "connect_error": "Connection error",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
+      "webex": "Webex",
+      "wecom": "WeCom",
+      "weixin": "WeChat",
+      "whatsapp": "WhatsApp",
+      "feishu": "Feishu"
+    },
     "sessionArchive": {
       "no_matches_for_query": "No matches for \"{{query}}\".",
       "truncated_showing_first_200kb": "… truncated (showing first 200KB) …"
@@ -4380,7 +4490,12 @@
         "applying_update": "Applying the update…",
         "applying_restart_note": "The gateway restarts itself when the new version is ready; this page reconnects automatically.",
         "approval_window_expired": "The approval window expired without an approval. Arm the update again when ready.",
-        "try_again": "Try again"
+        "try_again": "Try again",
+        "not_on_channel_yet": "Not on {{channel}}",
+        "channel_explainer_gateway_switch_note_version": "Switching only changes which channel is checked for updates. The {{channel}} channel currently publishes v{{version}}, which is OLDER than the build you are running — run the command below to actually move this install onto it.",
+        "channel_publishes_older_version": "The {{channel}} channel currently publishes v{{version}}, which is older than the build you are running, so it has no update to offer. <link>Download v{{version}}</link> to move onto that channel.",
+        "switch_to_version": "Switch to v{{version}}",
+        "in_app_channel_move_intro": "The chosen channel's release installs beside the current one and switches over atomically. Applying takes one approval command on the gateway host."
       },
       "computerUsePanel": {
         "computer_use_lets_the_agent_read_any_app_window": "Computer use lets the agent read any app window and send clicks and keystrokes into it. Most clicks are delivered straight to the app and leave your pointer alone, but the agent can ask to move the real pointer when a target needs it. Password fields are never read; nothing else limits which apps it may drive.",
@@ -4395,7 +4510,7 @@
         "macos_only": "macOS only",
         "not_applicable": "Not applicable",
         "not_detected": "Not detected",
-        "not_detected_does_not_always_mean_unavailable_ma": "Not detected does not always mean unavailable — macOS attributes a permission grant to the process that launched Kiro Crew, not to Kiro Crew itself.",
+        "not_detected_does_not_always_mean_unavailable_ma": "Not detected does not always mean unavailable — macOS attributes a permission grant to the process that launched {{productName}}, not to {{productName}} itself.",
         "open_system_settings_for": "Open System Settings for {{label}}",
         "takes_focus_and_cursor": "Focus + cursor",
         "on_windows_keystrokes_take_your_keyboard_focus": "On Windows, keystrokes take your keyboard focus and coordinate clicks move your real cursor — there is no per-app input route on this platform.",
@@ -4477,14 +4592,6 @@
         "model_for_spawned_sub_agents": "Model for spawned sub-agents.",
         "role_model_auto_hint": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it.",
         "failed_to_save_role_model": "Failed to save role model",
-        "agent_backend": "Agent Backend",
-        "agent_backend_description": "Which command-line agent actually drives your sessions. Kiro CLI is the default; GitHub Copilot CLI, KAS, and OpenCode are alternate backends — switching requires that CLI to already be installed and signed in on this machine. OpenCode serves any OpenAI-compatible endpoint you configure in it (BYOK).",
-        "backend_kiro_cli": "Kiro CLI (default)",
-        "backend_claude_code": "Claude Code",
-        "backend_copilot": "GitHub Copilot CLI",
-        "backend_kas": "KAS (kiro-agent)",
-        "backend_opencode": "OpenCode (BYOK)",
-        "failed_to_save_agent_backend": "Failed to save agent backend",
         "disabled_by_instance_config_tips_enabled_false": "Disabled by instance config (tips_enabled: false)",
         "enter_for_newline": "Enter for newline",
         "enter_sends": "Enter sends",
@@ -4538,7 +4645,15 @@
         "fallback_auto_hint": "Auto (default) lets the backend route to an available model. A fallback swap is announced in chat and sticks until your model recovers. Disabled turns fallback off.",
         "fallback_disabled": "Disabled",
         "fallback_auto": "Auto (recommended)",
-        "failed_to_save_fallback_model": "Failed to save fallback model"
+        "failed_to_save_fallback_model": "Failed to save fallback model",
+        "session_card_source_links": "PR and Issue Chips on Session Cards",
+        "session_card_source_links_desc": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
+        "agent_backend_description": "Which command-line agent actually drives your sessions. Kiro CLI is the default; GitHub Copilot CLI, KAS, and OpenCode are alternate backends — switching requires that CLI to already be installed and signed in on this machine. OpenCode serves any OpenAI-compatible endpoint you configure in it (BYOK).",
+        "backend_kiro_cli": "Kiro CLI (default)",
+        "backend_claude_code": "Claude Code",
+        "backend_copilot": "GitHub Copilot CLI",
+        "backend_kas": "KAS (kiro-agent)",
+        "backend_opencode": "OpenCode (BYOK)"
       },
       "displayPanel": {
         "color": "Color {{n}}",
@@ -4568,7 +4683,7 @@
         "terminal_shell_save_failed": "Could not save the shell setting"
       },
       "instancesPanel": {
-        "add_remote_crew": "Add remote crew",
+        "add_remote_crew": "Add remote instance",
         "adding": "Adding…",
         "connect": "Connect",
         "connect_failed": "Connect to {{id}} failed: {{error}}",
@@ -4581,15 +4696,19 @@
         "disable": "Disable",
         "disabling": "Disabling…",
         "disconnect_failed": "Disconnect of {{id}} failed: {{error}}",
-        "enable_remote_crew_management": "Enable remote crew management",
+        "enable_remote_crew_management": "Enable remote instance management",
         "enabling": "Enabling…",
-        "failed_to_add_remote_crew": "Failed to add remote crew",
-        "failed_to_load_remote_crews": "Failed to load remote crews",
+        "failed_to_add_remote_crew": "Failed to add remote instance",
+        "failed_to_load_remote_crews": "Failed to load remote instances",
         "remove": "Remove {{name}}",
         "remove_failed": "Remove of {{id}} failed: {{error}}",
         "token_left": "· token {{time}} left",
         "unknown_error": "unknown error",
         "update_setting_failed": "Failed to update setting: {{error}}"
+      },
+      "remoteCrewPanel": {
+        "chat_on_a_crew": "Chat on a crew",
+        "chat_on_a_crew_desc": "Adds “New chat on crew” to the create menu, which starts a session that runs on a connected crew. Unfinished: it opens in that crew’s own pane, and sessions running on a crew are not listed here yet."
       },
       "privacyPanel": {
         "recordMetricsLabel": "Record metrics",
@@ -4607,6 +4726,8 @@
         "channel_not_active_app_disabled_setting_retained": "Channel not active (app disabled) — setting retained",
         "default_priority": "Default priority: {{priority}}",
         "failed_to_load_channels": "Failed to load channels",
+        "category_agent": "Proactive agent messages",
+        "category_agent_description": "When the agent proactively messages you outside a chat",
         "category_all": "Default (all categories)",
         "category_all_description": "Fallback sound when no category-specific override is set",
         "category_approval": "Approval",
@@ -4617,6 +4738,8 @@
         "category_heartbeat_description": "Heartbeat task results",
         "category_hook": "Webhook",
         "category_hook_description": "External hook triggers",
+        "category_skills": "Skills",
+        "category_skills_description": "New skill candidates awaiting your approval",
         "category_subagent": "Subagent",
         "category_subagent_description": "Background subagent completions",
         "category_taskrunner": "Tasks",
@@ -4650,12 +4773,27 @@
         "other_surfaces_have_their_own_profiles": "A surface with its own profile can allow what the host cannot: {{surfaces}}.",
         "disabled_for_this_surface": "Disabled for the host surface",
         "profile_unusable_title": "Fallback profile in effect",
-        "profile_unusable_body": "A profile named below could not be loaded, so its surface is held at the policy fallback ceiling — deny-all unless a looser fallback is declared. Correct the file in the profiles folder of your Kiro Crew data home — it is reloaded automatically.",
+        "profile_unusable_body": "A profile named below could not be loaded, so its surface is held at the policy fallback ceiling — deny-all unless a looser fallback is declared. Correct the file in the profiles folder of your {{productName}} data home — it is reloaded automatically.",
         "profile_unusable_detail": "The file was unreadable, failed to parse, or extends a profile that is missing. A restart is only needed if the file is already valid for a newer build than the one running.",
         "profile_unusable_which": "Affected: {{profiles}}.",
+        "disabling_all_built_in_denies_removes_kirocrew_s": "Disabling all built-in denies removes {{productName}}’s protection against destructive and credential-exfiltration commands. Some commands may stay blocked by independent defense-in-depth controls (sensitive paths, IMDS, git-publish).",
         "unknown_scopes_title": "Profile scopes not in this build",
         "unknown_scopes_tip": "These profiles name capability scopes this build does not register — typically scopes a companion edition adds, though a misspelled scope key lands here too. They are skipped and have no effect in this build.",
-        "disabling_all_built_in_denies_removes_kirocrew_s": "Disabling all built-in denies removes Kiro Crew’s protection against destructive and credential-exfiltration commands. Some commands may stay blocked by independent defense-in-depth controls (sensitive paths, IMDS, git-publish).",
+        "distribution_title": "Central policy distribution",
+        "distribution_tip": "Your administrator publishes one policy centrally. This host fetches it, keeps the last copy so an outage cannot remove the ceiling, and re-fetches on a schedule. The address is not shown.",
+        "distribution_source": "Source: {{scheme}}",
+        "distribution_polling": "Refreshed every {{interval}}",
+        "distribution_polling_stopped": "Background refresh is not running — changes apply at next restart",
+        "distribution_boot_only": "Fetched at startup only",
+        "distribution_cache_age": "Cached copy is {{age}} old",
+        "distribution_cache_none": "No cached copy",
+        "distribution_refresh_applied": "Last refresh installed a new ceiling",
+        "distribution_refresh_unchanged": "Last refresh found no change",
+        "distribution_refresh_rejected": "Last refresh was refused — run `kirocrew policy fetch` for the reason",
+        "distribution_refresh_unreachable": "Source was unreachable on the last refresh",
+        "distribution_refresh_not_configured": "No central source to refresh from",
+        "distribution_error_misconfigured": "Distribution settings could not be read",
+        "distribution_awaiting_policy": "Set up to fetch a central policy, but none is in effect yet. No enterprise ceiling restricts the host surface until one applies.",
         "enabled": "Enabled",
         "expand_category_rules": "Expand {{category}} rules",
         "hide_pattern": "Hide pattern",
@@ -4689,7 +4827,7 @@
         "feature_sel_audit": "SEL Audit Logging",
         "feature_sel_audit_description": "Immutable, HMAC-chained security event trail with credential redaction before forwarding",
         "feature_sensitive_paths": "Sensitive Path Blocking",
-        "feature_sensitive_paths_description": "Credential directories and Kiro Crew trust roots blocked at the hook layer before tool execution",
+        "feature_sensitive_paths_description": "Credential directories and {{productName}} trust roots blocked at the hook layer before tool execution",
         "feature_suspicious_patterns": "Suspicious Bash Patterns",
         "feature_suspicious_patterns_description": "Detects deletion, exfiltration, and pipe-execution attack shapes in shell commands",
         "feature_token_auth": "Dashboard Token Auth",
@@ -4722,7 +4860,7 @@
         "gov_scope_tools": "Tools",
         "layer_auth": "Auth",
         "layer_n": "Layer {{n}}",
-        "enforced_by_floor": "Enforced by an always-on protection built into Kiro Crew",
+        "enforced_by_floor": "Enforced by an always-on protection built into {{productName}}",
         "pinned_by_policy": "Enforced by your organization's security policy",
         "pinned_for_the_host_surface": "Set by the host-surface profile. This is the ceiling for in-process host actions only — other surfaces have their own profiles and may allow this.",
         "yolo_duration_title": "How long auto-approve stays on",
@@ -4732,16 +4870,16 @@
         "yolo_duration_6h": "6 hours",
         "yolo_duration_12h": "12 hours",
         "yolo_duration_24h": "24 hours",
-        "yolo_duration_until_shutdown": "Until Kiro Crew restarts",
+        "yolo_duration_until_shutdown": "Until {{productName}} restarts",
         "yolo_duration_locked": "Disabled by your organization's policy",
         "yolo_duration_next_activation_note": "Applies the next time you turn auto-approve on.",
         "failed_to_save_yolo_duration": "Could not save the duration.",
-        "yolo_active_until_restart": "Auto-approve is on and stays on until Kiro Crew restarts.",
+        "yolo_active_until_restart": "Auto-approve is on and stays on until {{productName}} restarts.",
         "yolo_active_expires_at": "Auto-approve is on until {{time}}.",
         "third_party_apps_section": "Third-party apps",
         "third_party_apps_state_unknown": "Unavailable",
         "third_party_apps_unavailable": "Could not read the current setting, so it cannot be shown or changed here. If it was already on, third-party apps stay allowed — reload the page to try again.",
-        "third_party_apps_on_warning": "This trusts every third-party app, including ones you install later — not just the one you were trying to start. A trusted app runs with the same access Kiro Crew has: your files, your saved credentials, and the internet.",
+        "third_party_apps_on_warning": "This trusts every third-party app, including ones you install later — not just the one you were trying to start. A trusted app runs with the same access {{productName}} has: your files, your saved credentials, and the internet.",
         "third_party_apps_scope_note": "Takes effect immediately. Switching it back off also stops the apps it was admitting — their shutdown hooks run, their backends are stopped, and anything that could not be stopped is reported back to you.",
         "third_party_apps_save_failed": "Could not save this setting.",
         "section_group_status": "Status",
@@ -4772,9 +4910,9 @@
         "tailnet_desc": "Adds this machine's Tailscale MagicDNS name to the dashboard's allowed origins, so a request arriving through tailscale serve passes the CSRF origin check instead of being refused.",
         "tailnet_open": "Open",
         "tailnet_origin_label": "Dashboard origin",
-        "tailnet_pin_caveat": "The per-device session pin cannot bind behind tailscale serve: every request reaches Kiro Crew from 127.0.0.1, so a dashboard link works from any device on your tailnet, not only the one it was opened on. Treat the link as a password.",
+        "tailnet_pin_caveat": "The per-device session pin cannot bind behind tailscale serve: every request reaches {{productName}} from 127.0.0.1, so a dashboard link works from any device on your tailnet, not only the one it was opened on. Treat the link as a password.",
         "tailnet_pin_caveat_link": "Tracking issue #1762",
-        "tailnet_restart_note": "The name is resolved once, when Kiro Crew starts, so a change here takes effect on the next restart.",
+        "tailnet_restart_note": "The name is resolved once, when {{productName}} starts, so a change here takes effect on the next restart.",
         "tailnet_section": "Tailnet origin",
         "tailnet_state_active": "Active",
         "tailnet_state_off": "Off",
@@ -4782,7 +4920,7 @@
         "tailnet_tip": "This only affects the origin allow-list. It does not start Tailscale, open a port, or share the dashboard with anyone; you still run tailscale serve yourself.",
         "tailnet_title": "Trust this machine's tailnet name",
         "tailnet_unavailable": "Could not read the tailnet setting, so it cannot be shown or changed here. If it was already on, the tailnet name stays allowed; reload the page to try again.",
-        "tailnet_unresolved_note": "This is on, but no tailnet name was resolved when Kiro Crew started, so nothing was added to the allowed origins. A dashboard reached through tailscale serve is still refused by the origin check. Restart Kiro Crew once the name is available.",
+        "tailnet_unresolved_note": "This is on, but no tailnet name was resolved when {{productName}} started, so nothing was added to the allowed origins. A dashboard reached through tailscale serve is still refused by the origin check. Restart {{productName}} once the name is available.",
         "trustedApps": {
           "description": "Apps you have allowed to run their own code on this computer. Trust covers one app at a time; every other third-party app stays blocked.",
           "empty": "No apps trusted yet.",
@@ -4797,10 +4935,10 @@
           "revoke_confirm_title": "Remove trust from “{{name}}”?",
           "revoke_confirm_body": "“{{name}}” will be switched off and stop working. It stays installed, and you can trust it again later.",
           "revoke_confirm_ok": "Remove trust and switch off",
-          "allow_all_confirm_body": "Allowing every third-party app lets any app you install run its own code inside Kiro Crew, with the same access Kiro Crew has — your files, your saved credentials, and the internet. Trusting one app at a time is safer.",
-          "allow_all_confirm_ack": "I understand every third-party app I install will be able to run its own code with Kiro Crew's access.",
+          "allow_all_confirm_body": "Allowing every third-party app lets any app you install run its own code inside {{productName}}, with the same access {{productName}} has — your files, your saved credentials, and the internet. Trusting one app at a time is safer.",
+          "allow_all_confirm_ack": "I understand every third-party app I install will be able to run its own code with {{productName}}'s access.",
           "ineffective_label": "Saved but not working",
-          "ineffective_description": "These names were saved as trusted, but Kiro Crew does not accept them, so the apps are still blocked. Remove them to tidy the list."
+          "ineffective_description": "These names were saved as trusted, but {{productName}} does not accept them, so the apps are still blocked. Remove them to tidy the list."
         }
       },
       "skillsPanel": {
@@ -4808,34 +4946,33 @@
       },
       "sttSettings": {
         "failed_to_save_stt_config": "Failed to save STT config",
-        "install_failed": "Install failed",
-        "installs_mlx_whisper_via_pipx_ffmpeg_apple_silic": "Installs mlx-whisper via pipx + ffmpeg. Apple Silicon (arm64) only.",
-        "installs_openai_whisper_ffmpeg_uses_system_pytho": "Installs openai-whisper + ffmpeg. Uses system python3 (≥ 3.10).",
         "microphone_2": "Microphone {{n}}",
         "system_default": "System default",
-        "whisper_installed_but_ffmpeg_is_missing_voice_tr": "Whisper installed but ffmpeg is missing — voice transcription needs ffmpeg.",
         "endpointing": "Auto-submit when I finish speaking",
         "endpointing_desc": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
-        "provider_mlx": "Whisper MLX (local — Apple Silicon only)",
         "provider_apple": "Apple Speech (on-device — macOS 26+)",
         "provider_transcribe": "Transcribe (AWS)",
-        "provider_whisper": "Whisper (local)",
-        "step_checking": "Finding Python…",
-        "step_done": "Done!",
-        "step_error": "Failed",
-        "step_installing_brew": "Installing Homebrew…",
-        "step_installing_ffmpeg": "Installing ffmpeg…",
-        "step_installing_mlx": "Installing mlx-whisper…",
-        "step_installing_python": "Installing Python…",
-        "step_installing_whisper": "Installing whisper (~1.6 GB)…",
-        "step_installing_xcode": "Installing Xcode CLI Tools…",
-        "step_starting": "Starting…",
         "voice_input_remote_instance_note": "Voice input on a remote instance requires microphone permission delegation across the iframe boundary. If the mic doesn't respond here, use the local (parent) dashboard instead.",
-        "provider_faster": "faster-whisper (local — no separate ffmpeg install)",
-        "install_faster_whisper": "Install faster-whisper",
-        "installs_faster_whisper_no_ffmpeg_needed": "Installs faster-whisper via pip. No separate ffmpeg install: it decodes audio in-process through PyAV's bundled FFmpeg. Not available on Windows on ARM.",
-        "step_installing_faster": "Installing faster-whisper…",
-        "faster_unsupported_windows_arm": "faster-whisper is not available on Windows on ARM — no CTranslate2 wheel exists for this platform. Use the whisper (local) or AWS Transcribe provider instead."
+        "provider_local": "Local (runs on this machine)",
+        "provider_desc": "Local speech recognition runs on this machine and sends nothing anywhere. Transcribe uploads your audio to AWS.",
+        "streaming_desc": "Show the transcript in the input box as you speak, instead of only when you stop.",
+        "model_option": "{{name}} ({{size}})",
+        "model_downloaded": "This model is already on this machine.",
+        "model_download_prompt": "Not on this machine yet: a one-time {{size}} download. Fetching it now avoids a wait during your first dictation.",
+        "download_model": "Download now",
+        "download_failed": "The download could not be started.",
+        "download_failed_reason": "The download failed: {{error}}",
+        "silence_ms": "Pause that ends a phrase (ms)",
+        "silence_ms_desc": "How much silence commits what you just said. Lower reacts sooner; higher tolerates thinking pauses.",
+        "partial_interval_ms": "Live transcript refresh (ms)",
+        "partial_interval_ms_desc": "How often the transcript is redrawn while you speak. Lower feels more immediate and costs more processing.",
+        "unavailable_disabled": "Speech-to-text is turned off. Switch it on above.",
+        "unavailable_extra_missing": "The voice packages are not installed in the gateway's Python environment.",
+        "unavailable_no_wheel": "There is no prebuilt speech recogniser for this platform. Install a C++ compiler and CMake, then reinstall the voice packages.",
+        "unavailable_import_failed": "The speech recogniser is installed but could not be loaded on this machine.",
+        "unavailable_model_missing": "The speech model is not on this machine yet. Download it below.",
+        "unavailable_apple_unsupported": "Apple Speech needs macOS 26 or newer. Choose the local provider instead.",
+        "unavailable_apple_needs_toolchain": "Apple Speech needs the Xcode command line tools. Install them, then reload this page."
       },
       "teamsPanel": {
         "active": "Active",
@@ -4883,7 +5020,7 @@
         "handle_placeholder": "+15551234567",
         "loading": "Loading iMessage config…",
         "macos_only": "iMessage needs macOS with Messages signed in, and the gateway must run on that Mac. This host cannot reach iMessage, so these settings are read-only.",
-        "managed_locally": "iMessage settings are managed on the machine running Kiro Crew, so they are read-only from a remote session.",
+        "managed_locally": "iMessage settings are managed on the machine running {{productName}}, so they are read-only from a remote session.",
         "needs_setup": "Needs setup",
         "not_active": "Not active",
         "prerequisites_body": "No bot and no token: the agent reaches your own Messages app through a local bridge, so the transport involves no third party. Your prompts still go to the model provider the agent is configured with, as on any channel. You need macOS 14 or newer signed in to Messages, the imsg CLI installed, and two one-time macOS permissions — Full Disk Access and Automation for Messages.",
@@ -5033,7 +5170,7 @@
         "thinking_label": "Show thinking",
         "thread_allowlist_description": "Optional. Approved users may run the agent only in these exact Discord threads. Empty = DMs only.",
         "thread_help": "With Developer Mode on, right-click the thread → <mono>Copy Channel ID</mono>. Use the thread's ID, not its parent channel ID.",
-        "thread_warning": "Thread mode enables Discord's global Message Content intent. Discord delivers content from every server channel the bot can see; Kiro Crew discards traffic outside approved threads. Everyone who can view an approved thread can read agent replies and tool output.",
+        "thread_warning": "Thread mode enables Discord's global Message Content intent. Discord delivers content from every server channel the bot can see; {{productName}} discards traffic outside approved threads. Everyone who can view an approved thread can read agent replies and tool output.",
         "threshold_description": "Prompt to !compact or !new when the session context passes this percentage.",
         "token_description": "From the Developer Portal's Bot page (Reset Token to view it once).",
         "token_placeholder": "Paste Discord bot token"
@@ -5129,7 +5266,7 @@
         "engine_needed_for_attach": "needed for attach",
         "node_missing": "Needs Node.js 20 or newer, and no Node was found on this machine.",
         "node_how": "Install it, then reopen this page. <dl>Download Node.js</dl>",
-        "node_no_admin": "On a machine where you cannot install Node — no admin rights, or a registry that needs a login — run the command below on the machine where Kiro Crew is running. The script installs Node and the CLI into your home directory, and tells you how to fix it if your network blocks the download.",
+        "node_no_admin": "On a machine where you cannot install Node — no admin rights, or a registry that needs a login — run the command below on the machine where {{productName}} is running. The script installs Node and the CLI into your home directory, and tells you how to fix it if your network blocks the download.",
         "copy_command": "Copy command",
         "copied": "Copied"
       }
@@ -5143,18 +5280,10 @@
       "hide_controls": "Hide controls",
       "show_controls": "Show controls"
     },
-    "servicesTab": {
-      "channels": "Channels",
-      "connect_error": "Connection error",
-      "discord": "Discord",
-      "imessage": "iMessage",
-      "teams": "Microsoft Teams",
-      "telegram": "Telegram",
-      "webex": "Webex",
-      "wecom": "WeCom",
-      "weixin": "WeChat",
-      "whatsapp": "WhatsApp",
-      "feishu": "Feishu"
+    "developer": {
+      "featurePreviewsTab": {
+        "experimental_acp_backends_claude_code": "Claude Code as an alternative to Kiro CLI. Experimental — safety refusals work; end-to-end sessions are not yet verified."
+      }
     }
   },
   "privacyDisclosure": {
@@ -5195,7 +5324,7 @@
         "auto": "Auto",
         "description": "Language for the dashboard interface.",
         "label": "Language",
-        "sync_failed": "Couldn't save this to your Kiro Crew config — the language applies in this browser only and may reset on reload."
+        "sync_failed": "Couldn't save this to your {{productName}} config — the language applies in this browser only and may reset on reload."
       }
     },
     "groups": {
@@ -5232,12 +5361,12 @@
         "label": "Display"
       },
       "imports": {
-        "description": "Bring data from another AI agent, and back up or restore Kiro Crew configuration",
+        "description": "Bring data from another AI agent, and back up or restore {{productName}} configuration",
         "label": "Import / Export"
       },
       "instances": {
-        "description": "Manage remote crews over SSH tunnels; switch between them from the top header",
-        "label": "Remote Crew"
+        "description": "Manage remote instances over SSH tunnels; switch between them from the top header",
+        "label": "Remote Instances"
       },
       "notifications": {
         "description": "Sound effects and per-source alert preferences",
@@ -5396,6 +5525,9 @@
       "max": "Max",
       "medium": "Medium",
       "xhigh": "Extra High"
+    },
+    "sttProviders": {
+      "downloading_speech_model": "Downloading the speech model: {{pct}} ({{done}} of {{total}})"
     }
   },
   "autoImprovement": {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -809,13 +810,26 @@ class TestSafeReadFile:
 class TestShouldAutoApproveSpawn:
     """Test _should_auto_approve_spawn helper from handler.py."""
 
+    @staticmethod
+    def _spawn_event(**overrides):
+        base = {
+            "tool_name": "spawn_run",
+            "mcp_server_name": "kirocrew-core",
+            "mcp_identity_trusted": True,
+            "title": "spawn_run",
+            "is_shell": False,
+            "shell_classified": True,
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
     def test_approves_spawn_run_when_flag_true(self):
         from kiro_crew.hooks import HookManager
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is True
+        assert _should_auto_approve_spawn(ctx, self._spawn_event()) is True
 
     def test_rejects_when_flag_false(self):
         from kiro_crew.hooks import HookManager
@@ -823,7 +837,7 @@ class TestShouldAutoApproveSpawn:
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": False}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is False
+        assert _should_auto_approve_spawn(ctx, self._spawn_event()) is False
 
     def test_rejects_non_spawn_tool(self):
         from kiro_crew.hooks import HookManager
@@ -831,7 +845,121 @@ class TestShouldAutoApproveSpawn:
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run_privileged") is False
+        event = self._spawn_event(tool_name="spawn_run_privileged", title="spawn_run_privileged")
+        assert _should_auto_approve_spawn(ctx, event) is False
+
+    def test_rejects_shell_event_with_forged_spawn_title(self):
+        """The issue's attack: a SHELL event titled spawn_run must not ride
+        the spawn rung — the title is model-authored."""
+        from kiro_crew.hooks import HookManager
+        from kiro_crew.slack.handler import _should_auto_approve_spawn
+
+        ctx = MagicMock()
+        ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
+        event = self._spawn_event(
+            tool_name="", mcp_server_name="", title="spawn_run", is_shell=True
+        )
+        assert _should_auto_approve_spawn(ctx, event) is False
+
+
+class TestEventIsSpawnRun:
+    """The canonical spawn identity predicate the rung keys on.
+
+    Mutation pin: reverting any consumer to a title-only check must fail the
+    forged-shell and canonical-mismatch directions below.
+    """
+
+    @staticmethod
+    def _event(**fields):
+        return SimpleNamespace(
+            tool_name=fields.get("tool_name", ""),
+            mcp_server_name=fields.get("mcp_server_name", ""),
+            mcp_identity_trusted=fields.get("mcp_identity_trusted", False),
+            title=fields.get("title", ""),
+            is_shell=fields.get("is_shell", False),
+            shell_classified=fields.get("shell_classified", False),
+        )
+
+    def _genuine(self, **overrides):
+        fields = dict(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+        )
+        fields.update(overrides)
+        return self._event(**fields)
+
+    def test_canonical_trusted_core_spawn_is_genuine(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine()) is True
+
+    def test_rephrased_title_falls_to_the_ladder_despite_canonical_identity(self):
+        # A genuine spawn whose display title was rephrased does NOT ride the
+        # rung: the channel deny plane keys on the title, so approving here
+        # would bypass a title-keyed deny rule. Falling to the ladder is a
+        # downgrade (prompt/trust), never a hard block.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(title="Spawn agents")) is False
+
+    def test_canonical_mismatch_refuses_regardless_of_a_forged_title(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._genuine(tool_name="execute_bash")
+        assert event_is_spawn_run(event) is False
+
+    def test_untrusted_identity_provenance_fails_closed(self):
+        # tool_name non-emptiness alone is not proof of provenance: a future
+        # inline population path leaves the flag False and must fail closed.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_identity_trusted=False)) is False
+
+    def test_foreign_server_spawn_run_tool_is_refused(self):
+        # A third-party MCP server exposing a tool literally named spawn_run
+        # must not ride the crew's spawn rung.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_server_name="evil-server")) is False
+
+    def test_builtin_named_spawn_run_without_a_server_is_refused(self):
+        # kiro-cli sets tool_name for built-ins too, with an empty server
+        # name — a built-in cannot satisfy the MCP-server pin.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_server_name="")) is False
+
+    def test_shell_event_with_forged_title_refuses_without_canonical_identity(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", is_shell=True, shell_classified=True)
+        assert event_is_spawn_run(event) is False
+
+    def test_unclassified_event_with_forged_title_fails_closed(self):
+        # The correlated cache miss: tool_name empty AND shell_classified
+        # False AND is_shell miss-default False. Canonical-only means no
+        # evidence -> refuse.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", shell_classified=False)
+        assert event_is_spawn_run(event) is False
+
+    def test_non_shell_event_with_forged_title_fails_closed(self):
+        # CI GPT-lane finding: a no-_meta.kiro NON-shell tool (e.g. send_file
+        # re-titled "spawn_run") must not ride the rung either — there is no
+        # title fallback. The rung not firing is a downgrade to the channel's
+        # normal ladder, never a hard block.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", is_shell=False, shell_classified=True)
+        assert event_is_spawn_run(event) is False
+
+    def test_plain_non_spawn_title_refuses(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._event(tool_name="", title="grep")) is False
 
 
 class TestMutatingKindBeatsTheTitle:
@@ -967,14 +1095,30 @@ class TestMutatingKindBeatsTheTitle:
     def test_rejects_none_context(self):
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
-        assert _should_auto_approve_spawn(None, "spawn_run") is False
+        event = SimpleNamespace(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+            is_shell=False,
+            shell_classified=True,
+        )
+        assert _should_auto_approve_spawn(None, event) is False
 
     def test_rejects_none_hooks(self):
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
         ctx = MagicMock()
         ctx.hooks = None
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is False
+        event = SimpleNamespace(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+            is_shell=False,
+            shell_classified=True,
+        )
+        assert _should_auto_approve_spawn(ctx, event) is False
 
 
 class TestCanonicalMcpIdentityGoverned:
@@ -1804,3 +1948,140 @@ class TestTargetPathSpellings:
         assert target_paths({"path": {"nested": 1}, "filePath": "   "}) == []
         assert target_paths(None) == []
         assert target_paths({"path": "/a", "file_path": "/a"}) == ["/a"], "deduped"
+
+
+class TestTargetPathNestedExtraction:
+    """``target_paths`` read only the TOP-LEVEL ``TARGET_PATH_KEYS`` string
+    values, so a tool that nests its path inside an array argument — the batch
+    read shape ``{"operations": [{"mode": "Line", "path": …}]}`` — yielded ``[]``
+    and the sensitive-path keystone in ``on_tool_call`` never saw the target.
+    Worse than a missed deny: a read-kind call with the nested spelling was
+    AUTO-APPROVED while the flat spelling of the same path is denied (#6543).
+
+    The fix recurses into dict/list values (depth-bounded) and stays
+    extract-only; ``cli_chat``'s consent prompt shares the helper, so the
+    disclosure and the gate widen together.
+    """
+
+    @staticmethod
+    def _gate():
+        from kiro_crew.hooks import HookManager, HooksConfig
+
+        return HookManager(HooksConfig.from_dict({}))
+
+    def test_a_sensitive_path_nested_in_an_array_argument_is_denied(self):
+        """The reported fence miss, end to end through the gate."""
+        from kiro_crew.hooks import TOOL_DENY
+
+        decision = self._gate().on_tool_call(
+            "Read the notes",
+            session_key="cli_chat",
+            tool_kind="read",
+            raw_params={"operations": [{"mode": "Line", "path": "~/.ssh/id_rsa"}]},
+        )
+        assert decision.action == TOOL_DENY, (
+            "a sensitive path nested in an array argument reached no check; "
+            "the call would be auto-approved"
+        )
+
+    def test_single_op_array_extraction(self):
+        from kiro_crew.hooks import target_paths
+
+        params = {"operations": [{"mode": "Line", "path": "~/.ssh/id_rsa"}]}
+        assert target_paths(params) == ["~/.ssh/id_rsa"]
+
+    def test_two_op_array_extraction_preserves_order_and_dedups(self):
+        from kiro_crew.hooks import target_paths
+
+        params = {
+            "operations": [
+                {"mode": "Line", "path": "/tmp/a.txt"},
+                {"mode": "Line", "file_path": "~/.aws/credentials"},
+                {"mode": "Line", "path": "/tmp/a.txt"},
+            ]
+        }
+        assert target_paths(params) == ["/tmp/a.txt", "~/.aws/credentials"]
+
+    def test_negative_control_pattern_only_yields_nothing(self):
+        """A search-shaped call with no path key emits no candidates — the
+        widening must not start inventing targets from unrelated arguments."""
+        from kiro_crew.hooks import target_paths
+
+        assert target_paths({"pattern": "x"}) == []
+        assert target_paths({"operations": [{"mode": "Directory", "depth": 2}]}) == []
+
+    def test_list_of_strings_directly_under_a_path_key_is_collected(self):
+        from kiro_crew.hooks import target_paths
+
+        assert target_paths({"path": ["/tmp/a", "~/.ssh/id_rsa"]}) == [
+            "/tmp/a",
+            "~/.ssh/id_rsa",
+        ]
+
+    def test_an_ordinary_nested_path_is_still_allowed(self):
+        """The absence direction: recursing must not start denying ordinary
+        batch reads, or the gate would refuse most real multi-file calls."""
+        from kiro_crew.hooks import TOOL_DENY
+
+        decision = self._gate().on_tool_call(
+            "Read the notes",
+            session_key="cli_chat",
+            tool_kind="read",
+            raw_params={"operations": [{"mode": "Line", "path": "/tmp/notes.md"}]},
+        )
+        assert decision.action != TOOL_DENY, "ordinary nested path wrongly denied"
+
+    def test_a_deeply_nested_path_is_still_found_without_raising(self):
+        """The walk is iterative and exhaustive: depth alone cannot hide a
+        path (no RecursionError, no fail-open depth bound)."""
+        from kiro_crew.hooks import target_paths
+
+        deep: dict = {"path": "~/.ssh/id_rsa"}
+        for _ in range(1000):
+            deep = {"wrapper": [deep]}
+        result = target_paths(deep)
+        assert result == ["~/.ssh/id_rsa"]
+        assert result.truncated is False
+
+    def test_work_cap_fails_closed_as_truncated_and_the_gate_denies(self):
+        """An attacker-shaped payload that exhausts the work caps must mark the
+        result truncated, and the gate must DENY the unverifiable call rather
+        than trust a partial scan — deny-by-default, never silent fail-open."""
+        from kiro_crew.hooks import (
+            _TARGET_PATH_MAX_PATHS,
+            TOOL_DENY,
+            target_paths,
+        )
+
+        # Path-count cap: more distinct candidates than the cap.
+        flood = {"path": [f"/n/a/{i}" for i in range(_TARGET_PATH_MAX_PATHS + 10)]}
+        result = target_paths(flood)
+        assert result.truncated is True
+        assert len(result) == _TARGET_PATH_MAX_PATHS
+
+        # Node-budget cap: a huge container structure with no paths at all is
+        # still unverifiable — the walk stopped before proving absence.
+        wide: dict = {"blobs": [{"x": i} for i in range(20_000)]}
+        assert target_paths(wide).truncated is True
+
+        decision = self._gate().on_tool_call(
+            "Read the notes",
+            session_key="cli_chat",
+            tool_kind="read",
+            raw_params=flood,
+        )
+        assert decision.action == TOOL_DENY, (
+            "a truncated (unverifiable) argument scan must deny, or the cap "
+            "becomes a bypass: park a sensitive path beyond it"
+        )
+
+    def test_ordinary_calls_are_nowhere_near_the_work_caps(self):
+        """The caps must not start refusing real batch reads."""
+        from kiro_crew.hooks import target_paths
+
+        params = {
+            "operations": [{"mode": "Line", "path": f"/tmp/f{i}.txt"} for i in range(40)]
+        }
+        result = target_paths(params)
+        assert len(result) == 40
+        assert result.truncated is False

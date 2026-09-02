@@ -1413,6 +1413,52 @@ class TestTheVerifiedCallerKeyReachesTheRequest:
         # `_get` takes the key positionally, matching its signature.
         assert get.call_args.args[1] == self.VERIFIED
 
+    def test_a_re_sent_stop_is_not_reported_as_nothing_to_stop(self):
+        """A de-duplicated retry (#5074) lands on the no-op reply routinely.
+
+        Its earlier cooperative stop IS still in flight, so rendering it the way a
+        never-running target is rendered would tell the caller the opposite of what
+        happened — and invite it to act as though the target were free-running.
+
+        Mutation guard: ignoring `already_stopping` restores "nothing to stop".
+        """
+        with (
+            patch(
+                "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
+            ),
+            patch(
+                "kiro_crew.mcp_dashboard._post",
+                return_value={
+                    "ok": True,
+                    "target": "peer",
+                    "info": "stop already in progress",
+                    "already_stopping": True,
+                },
+            ),
+        ):
+            out = _call_tool_inner("session_stop", {"target": "peer"})
+        assert "stop already in progress" in out
+        assert "nothing to stop" not in out
+        assert "the earlier stop still stands" in out
+
+    def test_a_target_that_was_never_running_still_says_nothing_to_stop(self):
+        with (
+            patch(
+                "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
+            ),
+            patch(
+                "kiro_crew.mcp_dashboard._post",
+                return_value={
+                    "ok": True,
+                    "target": "peer",
+                    "info": "not running",
+                    "already_stopping": False,
+                },
+            ),
+        ):
+            out = _call_tool_inner("session_stop", {"target": "peer"})
+        assert "nothing to stop" in out
+
     def test_an_empty_window_still_hands_back_the_cursor(self):
         """A poll loop's commonest answer is empty, and it must not lose its place.
 
@@ -1481,6 +1527,7 @@ class TestAdvertisedSet:
             "chat_folder_move_session",
             "session_create",
             "session_stop",
+            "session_close",
             "session_send",
             "session_read_message",
         }

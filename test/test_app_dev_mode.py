@@ -760,3 +760,239 @@ def test_reconcile_scans_inside_lock_preserves_racing_toggle(tmp_path, monkeypat
     assert reconciled == {"dev-mode-app"}
     assert _read_dev_sentinel() == {"dev-mode-app"}
     assert is_dev_mode_cached("dev-mode-app") is True
+
+
+# ---------------------------------------------------------------------------
+# Operator grant record (#6809) — the authorization half the reconcile never
+# writes. These lock in that a forged installed.json `dev: true` gains WATCHING
+# at most across a restart, never `dev_mode_granted_root`.
+# ---------------------------------------------------------------------------
+
+
+def test_set_dev_mode_writes_and_revokes_the_grant(tmp_path, monkeypatch):
+    """The operator toggle is the ONLY writer of the grant record, and the
+    grant binds the ui root's resolved path at toggle time."""
+    import os
+
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+
+    assert dev_mode.dev_mode_granted_root("dev-mode-app") is None
+    set_dev_mode("dev-mode-app", True)
+    expected_root = os.path.realpath(dev_mode.apps_dir() / "dev-mode-app" / "ui")
+    assert dev_mode._read_dev_grants() == {"dev-mode-app": expected_root}
+    assert dev_mode.dev_mode_granted_root("dev-mode-app") == expected_root
+    assert dev_mode.dev_mode_granted_root("dev-mode-app") is not None
+    set_dev_mode("dev-mode-app", False)
+    assert dev_mode._read_dev_grants() == {}
+    assert dev_mode.dev_mode_granted_root("dev-mode-app") is None
+
+
+def test_reconcile_never_launders_a_forged_dev_flag_into_a_grant(tmp_path, monkeypatch):
+    """The #6809 GPT-review vector, closed at the root.
+
+    An app writes ``dev: true`` to its OWN ``installed.json`` (app-writable)
+    and waits for a gateway restart. The startup reconcile rebuilds the WATCH
+    sentinel from that metadata — documented behavior, kept — but must not
+    thereby authorize the app: ``dev_mode_granted_root`` reads the separate
+    grant record the reconcile never creates, so the forged flag buys watching
+    and no-store serving at most, never an out-of-install ui root.
+    """
+    import kiro_crew.apps.dev_mode as dev_mode
+    from kiro_crew.apps.manager import _write_installed
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+
+    # The app forges its own metadata (no operator toggle ran).
+    meta = _read_installed("dev-mode-app")
+    meta.dev = True
+    _write_installed("dev-mode-app", meta)
+
+    # Restart: the reconcile honors the documented field for WATCHING...
+    reconciled = _reconcile_sentinel_from_installed()
+    assert reconciled == {"dev-mode-app"}
+    assert _read_dev_sentinel() == {"dev-mode-app"}
+
+    # ...but the AUTHORIZATION is not derivable from app-writable state.
+    assert dev_mode._read_dev_grants() == {}
+    assert dev_mode.dev_mode_granted_root("dev-mode-app") is None
+
+
+def test_reconcile_prunes_grants_for_absent_apps_but_keeps_live_ones(
+    tmp_path, monkeypatch
+):
+    """Remove-only grant maintenance at startup, keyed on VALID metadata.
+
+    A crash between an uninstall and ``remove_dev_app``'s revoke can leave a
+    grant for an app that is gone; a later reinstall under the same name must
+    not inherit it. The prune tests ``_read_installed`` rather than the
+    directory's existence because an uninstall with ``keep_data`` leaves (or
+    recreates) the directory for preserved data while ``installed.json`` is
+    gone — the ghost here has exactly that shape. A grant whose app still
+    exists survives.
+    """
+    import os
+
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    set_dev_mode("dev-mode-app", True)
+    live_root = os.path.realpath(dev_mode.apps_dir() / "dev-mode-app" / "ui")
+    # The crash leftover: a grant for an app whose DIRECTORY still exists
+    # (keep_data) but whose installed.json is gone.
+    (dev_mode.apps_dir() / "ghost-app" / "data").mkdir(parents=True)
+    dev_mode._write_dev_grants(
+        {"dev-mode-app": live_root, "ghost-app": str(tmp_path / "anywhere")}
+    )
+
+    _reconcile_sentinel_from_installed()
+
+    assert dev_mode._read_dev_grants() == {"dev-mode-app": live_root}
+    assert dev_mode.dev_mode_granted_root("dev-mode-app") is not None
+    assert dev_mode.dev_mode_granted_root("ghost-app") is None
+
+
+def test_uninstall_revokes_the_grant(tmp_path, monkeypatch):
+    """``remove_dev_app`` (the uninstall hook) revokes the operator grant."""
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    set_dev_mode("dev-mode-app", True)
+    assert set(dev_mode._read_dev_grants()) == {"dev-mode-app"}
+
+    dev_mode.remove_dev_app("dev-mode-app")
+
+    assert dev_mode._read_dev_grants() == {}
+    assert _read_dev_sentinel() == set()
+    assert is_dev_mode_cached("dev-mode-app") is False
+
+
+def test_disable_revokes_the_grant_FIRST(tmp_path, monkeypatch):
+    """Crash-ordering on disable fails CLOSED.
+
+    The grant is the authorization, so on disable it must be the FIRST write:
+    a crash after any prefix of the toggle's writes then leaves watching
+    without authorization (harmless), never a live grant on a still-installed
+    app — which the reconcile would never expire, and which the app could
+    re-arm by forging ``dev: true`` back into its own metadata. Simulated by
+    making the metadata write (the SECOND step) blow up and checking the
+    grant is already gone.
+    """
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    set_dev_mode("dev-mode-app", True)
+    assert set(dev_mode._read_dev_grants()) == {"dev-mode-app"}
+
+    def _crash(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dev_mode, "_write_installed", _crash)
+    with pytest.raises(OSError):
+        set_dev_mode("dev-mode-app", False)
+
+    # The crash interrupted the toggle AFTER the revoke: fail-closed state.
+    assert dev_mode._read_dev_grants() == {}
+    assert dev_mode.dev_mode_granted_root("dev-mode-app") is None
+
+
+def test_enable_refuses_to_bind_a_sensitive_escaping_root(tmp_path, monkeypatch):
+    """A ui root escaping the install dir INTO A SENSITIVE LOCATION is never
+    grantable — not even by the real operator: no dev workflow legitimately
+    serves credential stores over the unauthenticated UI route. The toggle is
+    rolled back whole (no grant, no metadata flag, no sentinel entry)."""
+    import kiro_crew.apps.dev_mode as dev_mode
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    # Repoint ui outside the install dir; mark the target sensitive.
+    app_ui = dev_mode.apps_dir() / "dev-mode-app" / "ui"
+    import shutil
+
+    shutil.rmtree(app_ui)
+    outside = tmp_path / "credential-store"
+    outside.mkdir()
+    from conftest import make_dir_link
+
+    make_dir_link(app_ui, outside)
+    monkeypatch.setattr(dev_mode, "is_sensitive_path", lambda p: True)
+
+    result = set_dev_mode("dev-mode-app", True)
+
+    assert "error" in result and "sensitive location" in result["error"]
+    assert dev_mode._read_dev_grants() == {}
+    assert _read_dev_sentinel() == set()
+    assert is_dev_mode("dev-mode-app") is False
+
+
+def test_a_refused_reenable_preserves_prior_dev_state(tmp_path, monkeypatch):
+    """A refusal validates BEFORE writing, so prior state survives it.
+
+    An app already in dev mode (contained root, valid grant) repoints ``ui``
+    to a sensitive root; the operator re-toggles enable and is refused. The
+    refusal must be a pure no-op on the prior state: metadata still says
+    dev, the sentinel still carries the name (watching continues), and the
+    OLD grant — bound to the previously-approved root — is untouched. The
+    earlier shape wrote metadata/sentinel first and "rolled back" by
+    unconditionally disabling, silently tearing down working dev mode.
+    """
+    import shutil
+
+    import kiro_crew.apps.dev_mode as dev_mode
+    from conftest import make_dir_link
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    set_dev_mode("dev-mode-app", True)
+    prior_grants = dev_mode._read_dev_grants()
+    assert set(prior_grants) == {"dev-mode-app"}
+
+    # The app repoints ui at a (simulated) sensitive root...
+    app_ui = dev_mode.apps_dir() / "dev-mode-app" / "ui"
+    shutil.rmtree(app_ui)
+    outside = tmp_path / "credential-store"
+    outside.mkdir()
+    make_dir_link(app_ui, outside)
+    monkeypatch.setattr(dev_mode, "is_sensitive_path", lambda p: True)
+
+    # ...and the re-toggle is refused WITHOUT touching prior state.
+    result = set_dev_mode("dev-mode-app", True)
+
+    assert "error" in result and "sensitive location" in result["error"]
+    assert is_dev_mode("dev-mode-app") is True, "metadata dev flag preserved"
+    assert _read_dev_sentinel() == {"dev-mode-app"}, "watching preserved"
+    assert dev_mode._read_dev_grants() == prior_grants, "old grant untouched"
+
+
+def test_enable_refuses_a_root_CONTAINING_sensitive_leaves(tmp_path, monkeypatch):
+    """The reverse direction of the screen: a root that is not itself on the
+    sensitive list but CONTAINS a credential leaf (``~/.docker`` is clean,
+    ``~/.docker/config.json`` is not; ``~`` contains everything) is equally
+    ungrantable — the UI route would serve the leaf out of an allowlisted
+    extension."""
+    import shutil
+
+    import kiro_crew.apps.dev_mode as dev_mode
+    from conftest import make_dir_link
+
+    _setup_env(tmp_path, monkeypatch)
+    install_app(str(_make_app_source(tmp_path)))
+    app_ui = dev_mode.apps_dir() / "dev-mode-app" / "ui"
+    shutil.rmtree(app_ui)
+    outside = tmp_path / "contains-credentials"
+    outside.mkdir()
+    make_dir_link(app_ui, outside)
+    monkeypatch.setattr(dev_mode, "is_sensitive_path", lambda p: False)
+    monkeypatch.setattr(dev_mode, "path_contains_sensitive", lambda p: True)
+
+    result = set_dev_mode("dev-mode-app", True)
+
+    assert "error" in result and "sensitive location" in result["error"]
+    assert dev_mode._read_dev_grants() == {}
+    assert is_dev_mode("dev-mode-app") is False

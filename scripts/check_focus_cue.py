@@ -84,6 +84,7 @@ the real cue lives.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import subprocess
@@ -105,10 +106,17 @@ POS_TABINDEX = re.compile(r"tabIndex\s*=\s*\{?\s*[\"']?0")
 
 # Utilities that REMOVE a focus cue rather than add one. Everything else with a
 # focus variant is treated as a cue.
-SUPPRESSORS = frozenset({
-    "outline-none", "outline-0", "outline-transparent",
-    "ring-0", "ring-transparent", "shadow-none", "border-transparent",
-})
+SUPPRESSORS = frozenset(
+    {
+        "outline-none",
+        "outline-0",
+        "outline-transparent",
+        "ring-0",
+        "ring-transparent",
+        "shadow-none",
+        "border-transparent",
+    }
+)
 NATIVE_FOCUSABLE = frozenset({"input", "textarea", "select", "button", "a"})
 
 # A cue has to be something a person can SEE change. Treating "any focus:
@@ -123,8 +131,20 @@ NATIVE_FOCUSABLE = frozenset({"input", "textarea", "select", "button", "a"})
 # over-rejecting invents a blocking failure on correct code -- and this gate
 # already shipped one of those.
 CUE_FAMILIES = (
-    "ring", "border", "outline", "shadow", "bg", "text", "opacity", "rounded",
-    "underline", "decoration", "not-sr-only", "from", "to", "via",
+    "ring",
+    "border",
+    "outline",
+    "shadow",
+    "bg",
+    "text",
+    "opacity",
+    "rounded",
+    "underline",
+    "decoration",
+    "not-sr-only",
+    "from",
+    "to",
+    "via",
 )
 # `text-` also spells size and alignment, which change nothing about focus.
 NON_VISUAL_TEXT = re.compile(
@@ -203,8 +223,10 @@ class Violation:
     suppressors: tuple[str, ...]
 
     def render(self) -> str:
-        return (f"  {self.path}:{self.line}  <{self.tag}> suppresses the focus "
-                f"outline ({', '.join(self.suppressors)}) with no cue in its place")
+        return (
+            f"  {self.path}:{self.line}  <{self.tag}> suppresses the focus "
+            f"outline ({', '.join(self.suppressors)}) with no cue in its place"
+        )
 
 
 def blank_comments(src: str) -> str:
@@ -217,7 +239,7 @@ def blank_comments(src: str) -> str:
     out = list(src)
     i, n = 0, len(src)
     while i < n:
-        two = src[i:i + 2]
+        two = src[i : i + 2]
         if two == "/*":
             j = src.find("*/", i + 2)
             j = n if j < 0 else j + 2
@@ -283,7 +305,7 @@ def owning_tag(src: str, pos: int) -> tuple[str, str, int]:
     if tag is None:
         return "?", "", pos
     close = src.find(">", pos)
-    return tag.group(1), src[at:close if close > 0 else pos], at
+    return tag.group(1), src[at : close if close > 0 else pos], at
 
 
 def descendant_supplies_cue(src: str, value: str, tag_end: int) -> bool:
@@ -297,10 +319,7 @@ def descendant_supplies_cue(src: str, value: str, tag_end: int) -> bool:
     if GROUP_MARKER.search(value) is None:
         return False
     lines = src[tag_end:].split("\n")[:DESCENDANT_CUE_WINDOW]
-    return any(
-        is_cue(util)
-        for util in DESCENDANT_CUE.findall("\n".join(lines))
-    )
+    return any(is_cue(util) for util in DESCENDANT_CUE.findall("\n".join(lines)))
 
 
 def still_open_at(src: str, opened_at: int, pos: int) -> bool:
@@ -317,8 +336,7 @@ def still_open_at(src: str, opened_at: int, pos: int) -> bool:
     carry focus utilities, so they cannot change the answer.
     """
     depth = 1
-    for m in re.finditer(r"</\s*[A-Za-z][\w.-]*\s*>|/>|<\s*[A-Za-z][\w.-]*",
-                         src[opened_at:pos]):
+    for m in re.finditer(r"</\s*[A-Za-z][\w.-]*\s*>|/>|<\s*[A-Za-z][\w.-]*", src[opened_at:pos]):
         depth += -1 if m.group().startswith(("</", "/>")) else 1
         if depth <= 0:
             return False
@@ -341,8 +359,11 @@ def ancestor_supplies_cue(src: str, tag_at: int) -> bool:
       and no cue at all.
     """
     lines = src[:tag_at].split("\n")
-    window_at = len("\n".join(lines[:-(ANCESTOR_CUE_WINDOW + 1)])) if (
-        len(lines) > ANCESTOR_CUE_WINDOW + 1) else 0
+    window_at = (
+        len("\n".join(lines[: -(ANCESTOR_CUE_WINDOW + 1)]))
+        if (len(lines) > ANCESTOR_CUE_WINDOW + 1)
+        else 0
+    )
     for m in re.finditer(r'\bclassName\s*=\s*"([^"]*)"', src[window_at:tag_at]):
         if not any(is_cue(util) for util in ANCESTOR_CUE.findall(m.group(1))):
             continue
@@ -367,7 +388,7 @@ def scan_source(path: str, raw: str) -> list[tuple[Violation, set[int]]]:
         span = region_span(src, m.end())
         if span is None:
             continue
-        value = src[span[0]:span[1]]
+        value = src[span[0] : span[1]]
         utils = UTIL.findall(value)
         suppressors = [f"{v}:{u}" for v, u in utils if u in SUPPRESSORS]
         cues = [f"{v}:{u}" for v, u in utils if is_cue(u)]
@@ -391,14 +412,17 @@ def scan_source(path: str, raw: str) -> list[tuple[Violation, set[int]]]:
         if ancestor_supplies_cue(src, tag_at):
             continue
         first = raw[:tag_at].count("\n") + 1
-        last = raw[:span[1]].count("\n") + 1
-        if MARKER in "\n".join(raw.splitlines()[first - 1:last]):
+        last = raw[: span[1]].count("\n") + 1
+        if MARKER in "\n".join(raw.splitlines()[first - 1 : last]):
             continue
-        found.append((
-            Violation(path, raw[:m.start()].count("\n") + 1, tag,
-                      tuple(sorted(set(suppressors)))),
-            set(range(first, last + 1)),
-        ))
+        found.append(
+            (
+                Violation(
+                    path, raw[: m.start()].count("\n") + 1, tag, tuple(sorted(set(suppressors)))
+                ),
+                set(range(first, last + 1)),
+            )
+        )
     return found
 
 
@@ -412,8 +436,12 @@ def read_text(path: str) -> str | None:
 
 def git(args: list[str]) -> str:
     return subprocess.run(
-        ["git", *args], cwd=REPO_ROOT, capture_output=True, check=True,
-        encoding="utf-8", errors="replace",
+        ["git", *args],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=True,
+        encoding="utf-8",
+        errors="replace",
     ).stdout
 
 
@@ -421,63 +449,79 @@ def in_scope(path: str) -> bool:
     return path.startswith(SCAN_ROOT) and path.endswith(".tsx")
 
 
+_SCOPE_MODULE = None
+
+
+def _scope():
+    """The shared diff plumbing (see ``scripts/ratchet_scope.py``).
+
+    Loaded by path, not imported: ``scripts/`` is not a package, so a plain
+    import would resolve only by accident of ``sys.path[0]``. Shared so the
+    env-base gates and the merge-ref ratchets agree on what a change added; a
+    private copy per gate is how they would come to disagree. Loaded lazily so
+    the ``--test`` mode's RULE probes do not require it — the deletion probe
+    does, since it exercises the real parsing chain through this loader.
+    """
+    global _SCOPE_MODULE
+    if _SCOPE_MODULE is None:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ratchet_scope.py")
+        spec = importlib.util.spec_from_file_location("ratchet_scope", script)
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"cannot load {script}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SCOPE_MODULE = module
+    return _SCOPE_MODULE
+
+
+# One decision, made once: a deletion-only hunk is ANCHORED, not dropped. Both
+# consumers below reference this constant so the self-test's deletion probe
+# (which goes through ``hunk_touched_lines``) covers the production path
+# (``touched_lines``) — two independent keyword arguments would let the
+# production one be dropped with the probe still green, silently restoring the
+# exact failure the anchoring exists to prevent.
+_ANCHOR_DELETIONS = True
+
+
 def diff_base(base: str) -> str:
     """The commit to measure against; a shallow CI clone may have no merge-base."""
-    try:
-        return git(["merge-base", base, "HEAD"]).strip()
-    except subprocess.CalledProcessError:
-        return base
+    return _scope().resolve_base(base)
 
 
 def changed_paths(frm: str) -> list[str]:
-    """In-scope paths this change touches. ``-z`` so odd bytes cannot hide one."""
+    """In-scope paths this change touches (``ratchet_scope.changed_paths_at``)."""
     try:
-        out = git(["diff", "--name-only", "-z", "--diff-filter=d", frm])
+        paths = _scope().changed_paths_at(frm)
     except subprocess.CalledProcessError as exc:
         raise SystemExit(
             f"::error::focus-cue gate: cannot diff against {frm} — the base commit "
             f"is not present. Fetch it before running, or unset FOCUS_CUE_BASE_REF "
             f"to report whole-tree counts without enforcing.\n{exc.stderr}"
         )
-    return [p for p in out.split("\0") if p and in_scope(p)]
+    return [p for p in paths if in_scope(p)]
 
 
 def hunk_touched_lines(diff: str) -> set[int]:
     """1-based line numbers the hunk headers in ``diff`` mark as touched.
 
-    Split out from ``touched_lines`` so the zero-count rule below is testable
-    without a repository: a probe that re-implements this parsing would pass while
-    the real parser stayed broken.
+    Delegates to ``ratchet_scope.parse_added_lines`` with
+    ``_ANCHOR_DELETIONS``, and stays a named seam so the self-test's
+    deletion-only probe exercises the REAL parsing chain without a repository.
+    The anchoring is this gate's one semantic difference from its siblings: a
+    deletion-only hunk reads ``+<start>,0`` — the change removed lines and
+    added none — and the edit that most often removes a focus cue is exactly a
+    deletion. Delete the line carrying ``focus-visible:ring-2`` from a
+    multi-line className and the element's own lines are all unchanged, so no
+    purely-added line intersects it and the gate that exists to catch a lost
+    cue would let the loss straight through. ``start`` is where the removed
+    lines sat, so the hunk is anchored there.
     """
-    touched: set[int] = set()
-    for raw in diff.splitlines():
-        if not raw.startswith("@@"):
-            continue
-        m = re.search(r"\+(\d+)(?:,(\d+))?", raw)
-        if not m:
-            continue
-        start = int(m.group(1))
-        count = int(m.group(2)) if m.group(2) is not None else 1
-        if count == 0:
-            # A deletion-only hunk reads `+<start>,0`: the change removed lines and
-            # added none. `range(start, start)` is empty, so a naive read reports
-            # NOTHING as touched -- and the edit that most often removes a focus cue
-            # is exactly a deletion. Delete the line carrying
-            # `focus-visible:ring-2` from a multi-line className and the element's
-            # own lines are all unchanged, so no touched line intersects it and the
-            # gate that exists to catch a lost cue lets the loss straight through.
-            # `start` is where the removed lines sat, so anchor the hunk there.
-            touched.add(start)
-            continue
-        touched.update(range(start, start + count))
-    return touched
+    return _scope().parse_added_lines(diff, anchor_deletions=_ANCHOR_DELETIONS)
 
 
 def touched_lines(frm: str, path: str) -> set[int]:
-    """1-based line numbers this change adds to ``path`` (base to working tree)."""
-    return hunk_touched_lines(
-        git(["diff", "--unified=0", "--no-color", "--text", frm, "--", path])
-    )
+    """1-based line numbers this change touched in ``path`` (base to working tree)."""
+    return _scope().added_lines_at(frm, path, anchor_deletions=_ANCHOR_DELETIONS)
 
 
 def global_ring_is_live() -> bool:
@@ -504,19 +548,18 @@ def global_ring_is_live() -> bool:
 def remedies() -> str:
     """The fix guidance shown on a gate failure, ordered by what actually works."""
     inherit = (
-        "drop the suppressor and inherit the global `:focus-visible` outline from "
-        "index.css; or "
+        "drop the suppressor and inherit the global `:focus-visible` outline from " "index.css; or "
         if global_ring_is_live()
         else ""
     )
     unavailable = (
         ""
         if global_ring_is_live()
-        else "\n\nNOTE: dropping the suppressor to \"inherit the global "
-             "`:focus-visible` outline\" is NOT a fix at this commit — that rule is "
-             "currently commented out in index.css, so removing a suppressor turns "
-             "this gate green while a keyboard user still sees nothing. Use one of "
-             "the options above until the global rule is restored."
+        else '\n\nNOTE: dropping the suppressor to "inherit the global '
+        '`:focus-visible` outline" is NOT a fix at this commit — that rule is '
+        "currently commented out in index.css, so removing a suppressor turns "
+        "this gate green while a keyboard user still sees nothing. Use one of "
+        "the options above until the global rule is restored."
     )
     return (
         f"\nPick whichever fits the element: {inherit}add the `focus-ring` "
@@ -532,22 +575,26 @@ def remedies() -> str:
     )
 
 
-def report(violations: Iterable[Violation], *, enforcing: bool,
-           base: str | None) -> int:
+def report(violations: Iterable[Violation], *, enforcing: bool, base: str | None) -> int:
     violations = list(violations)
     if not violations:
         scope = f"elements touched since {base}" if enforcing else "whole tree"
-        print(f"focus-cue gate: every Tab-reachable element in the {scope} "
-              f"keeps a focus cue OK")
+        print(
+            f"focus-cue gate: every Tab-reachable element in the {scope} " f"keeps a focus cue OK"
+        )
         return 0
     if enforcing:
-        print(f"::error::focus-cue gate: {len(violations)} element(s) this change "
-              f"touched drop the focus outline and put nothing in its place, so a "
-              f"keyboard user cannot see them take focus.")
+        print(
+            f"::error::focus-cue gate: {len(violations)} element(s) this change "
+            f"touched drop the focus outline and put nothing in its place, so a "
+            f"keyboard user cannot see them take focus."
+        )
     else:
-        print(f"::notice::focus-cue gate report: {len(violations)} pre-existing "
-              f"element(s) drop the focus outline with no cue in its place. Not "
-              f"enforced here; only elements a change touches are gated.")
+        print(
+            f"::notice::focus-cue gate report: {len(violations)} pre-existing "
+            f"element(s) drop the focus outline with no cue in its place. Not "
+            f"enforced here; only elements a change touches are gated."
+        )
     shown = 200 if enforcing else 40
     for violation in violations[:shown]:
         print(violation.render())
@@ -575,8 +622,10 @@ def enforce_diff(base: str) -> int:
         # opening tag or className, because that is where a cue is added or lost.
         found.extend(v for v, span in scan_source(path, raw) if span & lines)
     if unreadable:
-        print("::error::focus-cue gate: cannot read these changed files as UTF-8, "
-              "so their focus cues were never checked:")
+        print(
+            "::error::focus-cue gate: cannot read these changed files as UTF-8, "
+            "so their focus cues were never checked:"
+        )
         for path in unreadable:
             print(f"  {path}")
         return 1
@@ -602,136 +651,215 @@ def report_tree() -> int:
 # silently disables an exemption, or promotes a suppressor to a cue, fails here
 # instead of shipping green.
 PROBES: list[tuple[str, str, bool]] = [
-    ("input suppresses, no cue",
-     '<input className="border outline-none" />', True),
-    ("focus:outline-none is a suppressor, not a cue",
-     '<button className="px-2 focus:outline-none">x</button>', True),
-    ("template literal className, no cue",
-     '<input className={`border outline-none ${wide ? "w-4" : "w-2"}`} />', True),
-    ("cn() className, no cue",
-     '<input className={cn("border", "outline-none")} />', True),
-    ("div made focusable by tabIndex={0}",
-     '<div tabIndex={0} className="outline-none">x</div>', True),
-    ("div made focusable by onClick",
-     '<div onClick={go} className="outline-none">x</div>', True),
-    ("cue via focus-visible: utility",
-     '<input className="outline-none focus-visible:border-accent" />', False),
-    ("cue via focus: utility",
-     '<input className="outline-none focus:border-accent" />', False),
-    ("cue via the focus-ring class",
-     '<input className="outline-none focus-ring" />', False),
-    ("tabIndex={-1} is a programmatic focus target",
-     '<h1 tabIndex={-1} className="outline-none">x</h1>', False),
-    ("plain div Tab cannot reach",
-     '<div className="outline-none">x</div>', False),
-    ("cue on a later line of a className that spans lines",
-     '<input\n  aria-label="q"\n  className={`outline-none\n'
-     '    focus-visible:ring-accent`}\n/>', False),
-    ("commented-out className is not live code",
-     '{/* <input className="outline-none" /> */}', False),
-    (f"{MARKER} marker opts the element out",
-     f'<input className="outline-none" />  // {MARKER}: parent paints it', False),
-    ("no suppressor at all",
-     '<input className="border focus-visible:border-accent" />', False),
+    ("input suppresses, no cue", '<input className="border outline-none" />', True),
+    (
+        "focus:outline-none is a suppressor, not a cue",
+        '<button className="px-2 focus:outline-none">x</button>',
+        True,
+    ),
+    (
+        "template literal className, no cue",
+        '<input className={`border outline-none ${wide ? "w-4" : "w-2"}`} />',
+        True,
+    ),
+    ("cn() className, no cue", '<input className={cn("border", "outline-none")} />', True),
+    (
+        "div made focusable by tabIndex={0}",
+        '<div tabIndex={0} className="outline-none">x</div>',
+        True,
+    ),
+    ("div made focusable by onClick", '<div onClick={go} className="outline-none">x</div>', True),
+    (
+        "cue via focus-visible: utility",
+        '<input className="outline-none focus-visible:border-accent" />',
+        False,
+    ),
+    ("cue via focus: utility", '<input className="outline-none focus:border-accent" />', False),
+    ("cue via the focus-ring class", '<input className="outline-none focus-ring" />', False),
+    (
+        "tabIndex={-1} is a programmatic focus target",
+        '<h1 tabIndex={-1} className="outline-none">x</h1>',
+        False,
+    ),
+    ("plain div Tab cannot reach", '<div className="outline-none">x</div>', False),
+    (
+        "cue on a later line of a className that spans lines",
+        '<input\n  aria-label="q"\n  className={`outline-none\n'
+        "    focus-visible:ring-accent`}\n/>",
+        False,
+    ),
+    (
+        "commented-out className is not live code",
+        '{/* <input className="outline-none" /> */}',
+        False,
+    ),
+    (
+        f"{MARKER} marker opts the element out",
+        f'<input className="outline-none" />  // {MARKER}: parent paints it',
+        False,
+    ),
+    ("no suppressor at all", '<input className="border focus-visible:border-accent" />', False),
     # --- the group/peer mechanism: the cue is on a DESCENDANT ----------------
-    ("group ancestor whose child carries the cue is already cued",
-     '<div role="slider" tabIndex={0} className="group outline-none">\n'
-     '  <div className="h-1 bg-border" />\n'
-     '  <div className="w-4 h-4 group-focus-visible:ring-2 '
-     'group-focus-visible:ring-[var(--ring)]" />\n'
-     '</div>', False),
-    ("peer marker is NOT a recognised carrier — zero consumers in the tree",
-     '<label className="peer outline-none" tabIndex={0}>\n'
-     '  <span className="peer-focus-visible:border-accent" />\n'
-     '</label>', True),
+    (
+        "group ancestor whose child carries the cue is already cued",
+        '<div role="slider" tabIndex={0} className="group outline-none">\n'
+        '  <div className="h-1 bg-border" />\n'
+        '  <div className="w-4 h-4 group-focus-visible:ring-2 '
+        'group-focus-visible:ring-[var(--ring)]" />\n'
+        "</div>",
+        False,
+    ),
+    (
+        "peer marker is NOT a recognised carrier — zero consumers in the tree",
+        '<label className="peer outline-none" tabIndex={0}>\n'
+        '  <span className="peer-focus-visible:border-accent" />\n'
+        "</label>",
+        True,
+    ),
     # ...but neither half alone is a cue: the mechanism needs both, and a
     # `group-*` utility that is itself a suppressor is not a replacement.
-    ("group marker with NO group-keyed descendant cue is still a violation",
-     '<div role="slider" tabIndex={0} className="group outline-none">\n'
-     '  <div className="w-4 h-4 bg-white" />\n'
-     '</div>', True),
-    ("descendant group cue without the group marker on the ancestor",
-     '<div role="slider" tabIndex={0} className="outline-none">\n'
-     '  <div className="group-focus-visible:ring-2" />\n'
-     '</div>', True),
-    ("a group-keyed SUPPRESSOR on the descendant is not a cue",
-     '<div role="slider" tabIndex={0} className="group outline-none">\n'
-     '  <div className="group-focus-visible:ring-0" />\n'
-     '</div>', True),
-    ("peer- cue does not satisfy a group marker",
-     '<div role="slider" tabIndex={0} className="group outline-none">\n'
-     '  <div className="peer-focus-visible:ring-2" />\n'
-     '</div>', True),
+    (
+        "group marker with NO group-keyed descendant cue is still a violation",
+        '<div role="slider" tabIndex={0} className="group outline-none">\n'
+        '  <div className="w-4 h-4 bg-white" />\n'
+        "</div>",
+        True,
+    ),
+    (
+        "descendant group cue without the group marker on the ancestor",
+        '<div role="slider" tabIndex={0} className="outline-none">\n'
+        '  <div className="group-focus-visible:ring-2" />\n'
+        "</div>",
+        True,
+    ),
+    (
+        "a group-keyed SUPPRESSOR on the descendant is not a cue",
+        '<div role="slider" tabIndex={0} className="group outline-none">\n'
+        '  <div className="group-focus-visible:ring-0" />\n'
+        "</div>",
+        True,
+    ),
+    (
+        "peer- cue does not satisfy a group marker",
+        '<div role="slider" tabIndex={0} className="group outline-none">\n'
+        '  <div className="peer-focus-visible:ring-2" />\n'
+        "</div>",
+        True,
+    ),
     # --- a cue must be something the user can SEE change --------------------
-    ("focus:cursor-pointer is not a cue — nothing visible changes",
-     '<input className="outline-none focus:cursor-pointer" />', True),
-    ("focus:z-10 is not a cue",
-     '<button className="outline-none focus:z-10">x</button>', True),
-    ("focus:text-sm is a size, not a focus cue",
-     '<input className="outline-none focus:text-sm" />', True),
-    ("focus-visible:text-danger IS a cue — a colour change is visible",
-     '<input className="outline-none focus-visible:text-danger" />', False),
-    ("focus:not-sr-only IS a cue — it reveals a hidden element",
-     '<a href="#main" className="sr-only outline-none focus:not-sr-only">skip</a>',
-     False),
-    ("focus-visible:opacity-100 IS a cue",
-     '<button className="outline-none opacity-0 focus-visible:opacity-100">x</button>',
-     False),
-    ("a group descendant cue must also be visible, not just non-suppressing",
-     '<div role="slider" tabIndex={0} className="group outline-none">\n'
-     '  <div className="group-focus-visible:cursor-pointer" />\n'
-     '</div>', True),
-
+    (
+        "focus:cursor-pointer is not a cue — nothing visible changes",
+        '<input className="outline-none focus:cursor-pointer" />',
+        True,
+    ),
+    ("focus:z-10 is not a cue", '<button className="outline-none focus:z-10">x</button>', True),
+    (
+        "focus:text-sm is a size, not a focus cue",
+        '<input className="outline-none focus:text-sm" />',
+        True,
+    ),
+    (
+        "focus-visible:text-danger IS a cue — a colour change is visible",
+        '<input className="outline-none focus-visible:text-danger" />',
+        False,
+    ),
+    (
+        "focus:not-sr-only IS a cue — it reveals a hidden element",
+        '<a href="#main" className="sr-only outline-none focus:not-sr-only">skip</a>',
+        False,
+    ),
+    (
+        "focus-visible:opacity-100 IS a cue",
+        '<button className="outline-none opacity-0 focus-visible:opacity-100">x</button>',
+        False,
+    ),
+    (
+        "a group descendant cue must also be visible, not just non-suppressing",
+        '<div role="slider" tabIndex={0} className="group outline-none">\n'
+        '  <div className="group-focus-visible:cursor-pointer" />\n'
+        "</div>",
+        True,
+    ),
     # The wrapper (`focus-within:`) mechanism. The search-pill idiom: the cue is
     # on the parent and the child suppresses its own outline so the two do not
     # stack, which is correct and must not be reported.
-    ("a wrapper focus-within cue exempts the input inside it",
-     '<div className="border border-border focus-within:border-accent">\n'
-     '  <input className="bg-transparent outline-none" />\n'
-     '</div>', False),
-    ("a focus-within SUPPRESSOR is not a cue",
-     '<div className="border focus-within:ring-0">\n'
-     '  <input className="bg-transparent outline-none" />\n'
-     '</div>', True),
-    ("focus-within:border-transparent is not a cue",
-     '<div className="border focus-within:border-transparent">\n'
-     '  <input className="bg-transparent outline-none" />\n'
-     '</div>', True),
-    ("a non-visual focus-within utility is not a cue",
-     '<div className="flex focus-within:w-auto">\n'
-     '  <input className="bg-transparent outline-none" />\n'
-     '</div>', True),
-    ("a wrapper cue beyond the window does not reach the input",
-     '<div className="border focus-within:border-accent">\n'
-     '  <span />\n  <span />\n  <span />\n  <span />\n  <span />\n'
-     '  <input className="bg-transparent outline-none" />\n'
-     '</div>', True),
+    (
+        "a wrapper focus-within cue exempts the input inside it",
+        '<div className="border border-border focus-within:border-accent">\n'
+        '  <input className="bg-transparent outline-none" />\n'
+        "</div>",
+        False,
+    ),
+    (
+        "a focus-within SUPPRESSOR is not a cue",
+        '<div className="border focus-within:ring-0">\n'
+        '  <input className="bg-transparent outline-none" />\n'
+        "</div>",
+        True,
+    ),
+    (
+        "focus-within:border-transparent is not a cue",
+        '<div className="border focus-within:border-transparent">\n'
+        '  <input className="bg-transparent outline-none" />\n'
+        "</div>",
+        True,
+    ),
+    (
+        "a non-visual focus-within utility is not a cue",
+        '<div className="flex focus-within:w-auto">\n'
+        '  <input className="bg-transparent outline-none" />\n'
+        "</div>",
+        True,
+    ),
+    (
+        "a wrapper cue beyond the window does not reach the input",
+        '<div className="border focus-within:border-accent">\n'
+        "  <span />\n  <span />\n  <span />\n  <span />\n  <span />\n"
+        '  <input className="bg-transparent outline-none" />\n'
+        "</div>",
+        True,
+    ),
     # Both conditional shapes: a cue on only some branches proves nothing about
     # the branches that lack it, so it must not exempt.
-    ("a wrapper cue inside a template literal does not exempt",
-     '<div className={`border ${docked ? "" : "focus-within:border-accent"}`}>\n'
-     '  <input className="bg-transparent outline-none" />\n'
-     '</div>', True),
-    ("a wrapper cue inside a ternary does not exempt",
-     "<div className={docked ? 'flex w-full' : 'border focus-within:border-accent'}>\n"
-     '  <input className="bg-transparent outline-none" />\n'
-     '</div>', True),
+    (
+        "a wrapper cue inside a template literal does not exempt",
+        '<div className={`border ${docked ? "" : "focus-within:border-accent"}`}>\n'
+        '  <input className="bg-transparent outline-none" />\n'
+        "</div>",
+        True,
+    ),
+    (
+        "a wrapper cue inside a ternary does not exempt",
+        "<div className={docked ? 'flex w-full' : 'border focus-within:border-accent'}>\n"
+        '  <input className="bg-transparent outline-none" />\n'
+        "</div>",
+        True,
+    ),
     # Proximity is not enclosure. A CLOSED sibling must not lend its cue, or the
     # exemption becomes a false NEGATIVE -- the one direction it must never take.
-    ("a closed sibling wrapper does not exempt the element after it",
-     '<div className="border focus-within:border-accent">\n'
-     '  <input className="bg-transparent outline-none" />\n'
-     '</div>\n'
-     '<input className="bg-transparent outline-none" />', True),
-    ("a self-closed sibling wrapper does not exempt the element after it",
-     '<div className="border focus-within:border-accent" />\n'
-     '<input className="bg-transparent outline-none" />', True),
-    ("a cue two levels up still exempts",
-     '<div className="border focus-within:border-accent">\n'
-     '  <span className="flex">\n'
-     '    <input className="bg-transparent outline-none" />\n'
-     '  </span>\n'
-     '</div>', False),
+    (
+        "a closed sibling wrapper does not exempt the element after it",
+        '<div className="border focus-within:border-accent">\n'
+        '  <input className="bg-transparent outline-none" />\n'
+        "</div>\n"
+        '<input className="bg-transparent outline-none" />',
+        True,
+    ),
+    (
+        "a self-closed sibling wrapper does not exempt the element after it",
+        '<div className="border focus-within:border-accent" />\n'
+        '<input className="bg-transparent outline-none" />',
+        True,
+    ),
+    (
+        "a cue two levels up still exempts",
+        '<div className="border focus-within:border-accent">\n'
+        '  <span className="flex">\n'
+        '    <input className="bg-transparent outline-none" />\n'
+        "  </span>\n"
+        "</div>",
+        False,
+    ),
 ]
 
 
@@ -760,13 +888,16 @@ def self_test() -> int:
     if not live:
         first_option = text.split("element:", 1)[1][:60]
         if "inherit" in first_option:
-            failures.append("  ring is commented out yet the remedy still leads with "
-                            "the inherit option")
+            failures.append(
+                "  ring is commented out yet the remedy still leads with " "the inherit option"
+            )
         if "NOT a fix at this commit" not in text:
             failures.append("  ring is commented out but the remedy does not say so")
     if "say in it where the real cue lives" not in text:
-        failures.append("  the focus-cue-ok hatch is offered without its audit "
-                        "requirement in the same sentence")
+        failures.append(
+            "  the focus-cue-ok hatch is offered without its audit "
+            "requirement in the same sentence"
+        )
 
     # A deletion-only hunk (`+N,0`) must still mark line N as touched. The edit
     # that most often removes a focus cue IS a deletion, so a zero-count hunk that
@@ -794,8 +925,10 @@ def self_test() -> int:
         run("config", "user.name", "probe")
         target = os.path.join(repo, "a.tsx")
         with open(target, "w", encoding="utf-8") as handle:
-            handle.write('<input\n  className="outline-none\n'
-                         '    focus-visible:ring-accent\n    text-sm"\n/>\n')
+            handle.write(
+                '<input\n  className="outline-none\n'
+                '    focus-visible:ring-accent\n    text-sm"\n/>\n'
+            )
         run("add", "a.tsx")
         run("commit", "-qm", "base")
         base_sha = run("rev-parse", "HEAD").strip()
@@ -805,15 +938,17 @@ def self_test() -> int:
             handle.write('<input\n  className="outline-none\n    text-sm"\n/>\n')
         run("add", "a.tsx")
         run("commit", "-qm", "drop the cue line")
-        diff = run("diff", "--unified=0", "--no-color", base_sha, "HEAD", "--",
-                   "a.tsx")
-        if not any(re.search(r"\+\d+,0", ln)
-                   for ln in diff.splitlines() if ln.startswith("@@")):
-            failures.append("  the deletion-only probe stopped producing a `+N,0` "
-                            "hunk, so it no longer tests what it claims")
+        diff = run("diff", "--unified=0", "--no-color", base_sha, "HEAD", "--", "a.tsx")
+        if not any(re.search(r"\+\d+,0", ln) for ln in diff.splitlines() if ln.startswith("@@")):
+            failures.append(
+                "  the deletion-only probe stopped producing a `+N,0` "
+                "hunk, so it no longer tests what it claims"
+            )
         elif not hunk_touched_lines(diff):
-            failures.append("  a deletion-only hunk reports no touched lines, so "
-                            "removing a focus cue would pass the gate unseen")
+            failures.append(
+                "  a deletion-only hunk reports no touched lines, so "
+                "removing a focus cue would pass the gate unseen"
+            )
 
     # The real tree must be scannable and the reported line must be the
     # className's own line, so a violation is navigable from CI output.
@@ -828,8 +963,10 @@ def self_test() -> int:
             failures.append(f"  className line number wrong: expected 4, got {got}")
 
     if failures:
-        print(f"::error::focus-cue gate self-test: {len(failures)} probe(s) "
-              f"disagree with the rules:")
+        print(
+            f"::error::focus-cue gate self-test: {len(failures)} probe(s) "
+            f"disagree with the rules:"
+        )
         for line in failures:
             print(line)
         return 1

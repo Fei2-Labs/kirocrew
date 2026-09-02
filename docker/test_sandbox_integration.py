@@ -1,3 +1,4 @@
+# testpaths-ok: manual Docker probe run via `python docker/test_sandbox_integration.py <step>`, not pytest
 """
 Integration test for sandbox Docker detection fix (issue #1617).
 
@@ -16,6 +17,7 @@ Run inside a container:
         -v .:/repo -w /repo python:3.12-slim \
         bash -c "pip install -e . -q && python docker/test_sandbox_integration.py step3"
 """
+
 import sys
 
 
@@ -52,7 +54,8 @@ def step1_reproduce_issue():
         checks = {
             "mentions seccomp profile": "seccomp" in msg,
             "mentions KIROCREW_ALLOW_UNSANDBOXED": "KIROCREW_ALLOW_UNSANDBOXED" in msg,
-            "does NOT say 'install a supported sandbox backend'": "install a supported sandbox backend" not in msg,
+            "does NOT say 'install a supported sandbox backend'": "install a supported sandbox backend"
+            not in msg,
             "mentions docs/guides/docker.md": "docs/guides/docker.md" in msg,
         }
         print()
@@ -109,7 +112,9 @@ def step3_unsandboxed_consent():
 
     print(f"  in_container              : {is_docker_container()}")
     print(f"  backend                   : {detect_backend()}")
-    print(f"  KIROCREW_ALLOW_UNSANDBOXED: {os.environ.get('KIROCREW_ALLOW_UNSANDBOXED', '(not set)')}")
+    print(
+        f"  KIROCREW_ALLOW_UNSANDBOXED: {os.environ.get('KIROCREW_ALLOW_UNSANDBOXED', '(not set)')}"
+    )
     print()
     print("  Note: KIROCREW_ALLOW_UNSANDBOXED=1 is processed by the container")
     print("  entrypoint, which writes sandbox_allow_unsandboxed_exec=true into")
@@ -119,6 +124,7 @@ def step3_unsandboxed_consent():
 
     # Patch the config-read function directly since we have no entrypoint here.
     import kiro_crew.sandbox as _sandbox
+
     original = _sandbox._allow_unsandboxed_exec
     _sandbox._allow_unsandboxed_exec = lambda: True
     try:

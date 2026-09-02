@@ -278,8 +278,37 @@ class Driver:
             guardrail_tolerances=self.guardrail_tolerances,
             logger=self.log,
             direct_commit=self.direct_commit,
+            retire_if_unsafe=self._retire_if_unsafe,
         )
         self._stop = False
+        self._repository_retired = False
+
+    def _retire_if_unsafe(self, stage: str) -> bool:
+        """Stop and atomically retire the clone if post-agent validation fails."""
+        from ..backend.clone_setup import _repository_is_isolated, _retire_unsafe_clone
+
+        if _repository_is_isolated(self.clone):
+            return False
+        retained = _retire_unsafe_clone(self.clone)
+        self._repository_retired = True
+        self._stop = True
+        if retained is None:
+            self.log.error(
+                "repository safety changed after %s; run stopped and clone left unsafe in place",
+                stage,
+            )
+        else:
+            self.log.error(
+                "repository safety changed after %s; run stopped and clone retained at %s",
+                stage,
+                retained,
+            )
+        self._progress(
+            stage="repository_unsafe",
+            error="repository safety changed after agent-controlled execution",
+            retained_clone=str(retained or ""),
+        )
+        return True
 
     # ── boot-time safety preconditions (M0 exit criterion) ──────────────
 
@@ -296,6 +325,13 @@ class Driver:
         valid direct-commit authorization; a protected/blank branch is refused by
         :func:`.push_policy.authorize_direct_push` regardless. We fail CLOSED: any
         ambiguity → the original refusal stands."""
+        from ..backend.clone_setup import _repository_is_safe
+
+        if not _repository_is_safe(self.clone):
+            raise PushEnabledError(
+                f"SAFETY: repository metadata for clone {self.clone} failed validation — "
+                "refusing to start"
+            )
         if self.profile.isolation.push_disabled():
             return
         if self.direct_commit:
@@ -427,6 +463,65 @@ class Driver:
         except Exception:  # noqa: BLE001
             self.log.debug("on_progress sink failed", exc_info=True)
 
+    def _fan_out_checked(self, *, fresh_candidates: list, base_sha: str, cycle: int) -> list | None:
+        """Run proposer agents, then validate before re-raising any post-agent error."""
+        proposals: list = []
+        error: Exception | None = None
+        try:
+            proposals = self.proposer.fan_out(
+                profile=self.profile,
+                candidates=fresh_candidates,
+                base_sha=base_sha,
+                cycle=cycle,
+                stop_check=lambda: self._stop,
+            )
+        except Exception as exc:  # noqa: BLE001 - validate before interpreting
+            error = exc
+        if self._retire_if_unsafe("proposal"):
+            return None
+        if error is not None:
+            raise error
+        return proposals
+
+    def _work_one_proposal_checked(
+        self,
+        prop: Proposal,
+        *,
+        base_sha: str,
+        cycle: int,
+        proposals: list,
+        perf_survivors: list,
+        bug_winners: list,
+        gated_sha: dict,
+    ) -> bool:
+        """Run one candidate and validate before fallible error bookkeeping."""
+        error: Exception | None = None
+        try:
+            self._work_one_proposal(
+                prop,
+                base_sha=base_sha,
+                cycle=cycle,
+                proposals=proposals,
+                perf_survivors=perf_survivors,
+                bug_winners=bug_winners,
+                gated_sha=gated_sha,
+            )
+        except Exception as exc:  # noqa: BLE001 - one candidate must not kill the run
+            error = exc
+        if self._retire_if_unsafe("candidate gate/measure"):
+            return False
+        if error is not None:
+            self.log.error(
+                "cycle %d: candidate %s errored: %s: %s",
+                cycle,
+                prop.cand_id,
+                type(error).__name__,
+                error,
+            )
+            self.stats.errors += 1
+            self._record(prop, L.STATUS_ERROR, f"{type(error).__name__}: {error}")
+        return True
+
     def run_cycle(self, cycle: int) -> int:
         """Run one Profile→Propose→Gate→Measure→Keep pass. Returns the number of
         FRESH (not-yet-seen) candidates this cycle (drives quiescence)."""
@@ -464,6 +559,8 @@ class Driver:
             known_loci=known,
             agent_runner=self._agent_runner,
         )
+        if self._retire_if_unsafe("discovery"):
+            return 0
         self.stats.discovered += len(disc.candidates)
         fresh_candidates = []
         for cand in disc.candidates:
@@ -499,13 +596,13 @@ class Driver:
         # Phase B — propose (fan-out wide + deep; each in its own worktree).
         # The stop_check lets a clean-stop request abort the fan-out mid-loop, so we
         # don't keep spawning expensive agent subprocesses after the user clicked Stop.
-        proposals = self.proposer.fan_out(
-            profile=self.profile,
-            candidates=fresh_candidates,
+        proposals = self._fan_out_checked(
+            fresh_candidates=fresh_candidates,
             base_sha=base_sha,
             cycle=cycle,
-            stop_check=lambda: self._stop,
         )
+        if proposals is None:
+            return 0
         self._progress(
             cycle=cycle,
             stage="gate",
@@ -525,28 +622,16 @@ class Driver:
             for prop in proposals:
                 if self._stop:
                     break
-                try:
-                    self._work_one_proposal(
-                        prop,
-                        base_sha=base_sha,
-                        cycle=cycle,
-                        proposals=proposals,
-                        perf_survivors=perf_survivors,
-                        bug_winners=bug_winners,
-                        gated_sha=gated_sha,
-                    )
-                except Exception as e:  # noqa: BLE001 — one bad candidate must NEVER
-                    # kill the whole run (the original autoloop recorded status=error and
-                    # continued; without this a gate/measure exception aborts the run).
-                    self.log.error(
-                        "cycle %d: candidate %s errored: %s: %s",
-                        cycle,
-                        prop.cand_id,
-                        type(e).__name__,
-                        e,
-                    )
-                    self.stats.errors += 1
-                    self._record(prop, L.STATUS_ERROR, f"{type(e).__name__}: {e}")
+                if not self._work_one_proposal_checked(
+                    prop,
+                    base_sha=base_sha,
+                    cycle=cycle,
+                    proposals=proposals,
+                    perf_survivors=perf_survivors,
+                    bug_winners=bug_winners,
+                    gated_sha=gated_sha,
+                ):
+                    return 0
 
             # Phase E — perf keep / revert (one decision; archive all perf survivors).
             self._progress(cycle=cycle, stage="keep")
@@ -590,8 +675,11 @@ class Driver:
                 self._apply_bug_winner(cycle, prop, bug_res)
             return kept_count
         finally:
-            for prop in proposals:
-                self.proposer.teardown(prop)
+            if not self._repository_retired:
+                for prop in proposals:
+                    self.proposer.teardown(prop)
+            else:
+                self.log.warning("proposal teardown skipped because repository safety failed")
 
     def _work_one_proposal(
         self,
@@ -726,7 +814,9 @@ class Driver:
             return False
         return True
 
-    def _push_with_rebase(self, fetch_url: str, dest: str, target: str):
+    def _push_with_rebase(
+        self, fetch_url: str, dest: str, target: str
+    ) -> subprocess.CompletedProcess | None:
         """Push HEAD to ``dest``, rebasing ONCE onto the remote if it moved meanwhile.
 
         A run takes tens of minutes, so the branch can legitimately advance between the
@@ -756,6 +846,8 @@ class Driver:
         its own pre-push snapshot: a rebase rewrites HEAD, so the pre-rebase sha names a
         commit that does not exist on the remote.
         """
+        if self._retire_if_unsafe("direct-push preflight"):
+            return None
         require_pinned(self.clone)
         push = subprocess.run(
             [
@@ -784,7 +876,10 @@ class Driver:
                 _git(["rebase", "--abort"], self.clone)
                 self.log.warning("direct-push: rebase onto %s conflicted — not pushing", dest)
                 return push
-            if not self._reverify_head():
+            verified = self._reverify_head()
+            if self._retire_if_unsafe("post-rebase verification"):
+                return None
+            if not verified:
                 return push  # rebased tree is unverified — return the original rejection
             require_pinned(self.clone)
             push = subprocess.run(
@@ -937,6 +1032,9 @@ class Driver:
             diff_ref=winner_diff_ref,
             base_anchor=f"{self.branch} @ {base_sha[:12]}",
         )
+        if outcome.repository_retired:
+            self.stats.kept -= 1
+            return fresh_count
         if outcome.filed or outcome.committed_ready:
             # AMEND the provisional commit with the §2.4 attributable message, derived from
             # the SAME measured numbers as the CR (§3.2 end). The pipeline's INDEPENDENT
@@ -955,9 +1053,10 @@ class Driver:
                 # F10 direct-commit: push the verified commit to the authorized branch and
                 # record ``committed`` with the real sha (only on a successful push — a
                 # refused/failed push already recorded ``error`` and nothing left the sandbox).
-                if self._direct_push(
+                pushed = self._direct_push(
                     fp=outcome.fp, kind="perf", target=winner.candidate.target, sha=committed
-                ):
+                )
+                if pushed is True:
                     # `pushed_sha`, not `committed`: a rebase-and-retry inside the push
                     # rewrites HEAD, and recording the pre-rebase sha would point the
                     # ledger at a commit that is not in the remote's history.
@@ -980,7 +1079,7 @@ class Driver:
                         self.branch,
                         landed,
                     )
-                else:
+                elif pushed is False:
                     # ROLL BACK the refused commit. Leaving it at HEAD is a credential LEAK,
                     # not just untidy bookkeeping: the direct-push scan range is
                     # `HEAD~1..HEAD` (one commit), so the NEXT winner's scan does not see this
@@ -990,6 +1089,10 @@ class Driver:
                     # Raised by the GPT review of this branch.
                     self._reset_provisional(pre_sha)
                     self.stats.kept -= 1  # push refused/failed → not a realized outcome
+                else:
+                    # The clone was atomically retired; any Git rollback would trust
+                    # metadata that just failed validation.
+                    self.stats.kept -= 1
                 return fresh_count
             self.stats.filed += 1
             self.log.info(
@@ -1187,7 +1290,7 @@ class Driver:
             return True, "full suite green"
         return False, f"{len(failing)} failing test(s): {', '.join(failing[:3])}"
 
-    def _direct_push(self, *, fp: str, kind: str, target: str, sha: str) -> bool:
+    def _direct_push(self, *, fp: str, kind: str, target: str, sha: str) -> bool | None:
         """F10: push the just-committed verified change to the operator-authorized branch.
 
         Returns True iff the push succeeded. Re-checks authorization at push time (never
@@ -1225,6 +1328,17 @@ class Driver:
         # PRE-PUSH REVIEW GATE (fail-closed): a direct-pushed commit gets no human review,
         # so the automated reviewer must clear it before it lands on the shared branch.
         clean, note = self._prepush_review_clean(target=target, base_ref=self.branch)
+        if self._retire_if_unsafe("pre-push review"):
+            self.ledger.record(
+                L.LedgerEntry(
+                    fp=fp,
+                    kind=kind,
+                    target=target,
+                    status=L.STATUS_ERROR,
+                    note="direct-push refused: repository safety changed after review",
+                )
+            )
+            return None
         if not clean:
             self.log.warning("direct-push BLOCKED by review gate for %s: %s", target, note)
             self.ledger.record(
@@ -1296,9 +1410,23 @@ class Driver:
             _git(["rev-parse", "--verify", "--quiet", "HEAD~1"], self.clone).returncode == 0
         )
         proc = (
-            _git(["diff", "HEAD~1..HEAD"], self.clone)
+            _git(
+                ["-c", "diff.external=", "diff", "--no-ext-diff", "HEAD~1..HEAD"],
+                self.clone,
+            )
             if has_parent
-            else _git(["show", "--format=", "--root", "HEAD"], self.clone)
+            else _git(
+                [
+                    "-c",
+                    "diff.external=",
+                    "show",
+                    "--no-ext-diff",
+                    "--format=",
+                    "--root",
+                    "HEAD",
+                ],
+                self.clone,
+            )
         )
         if proc.returncode != 0:
             self.log.error(
@@ -1334,6 +1462,17 @@ class Driver:
             return False
 
         push = self._push_with_rebase(fetch_url, dest, target)
+        if push is None:
+            self.ledger.record(
+                L.LedgerEntry(
+                    fp=fp,
+                    kind=kind,
+                    target=target,
+                    status=L.STATUS_ERROR,
+                    note="direct-push refused: repository retired after safety change",
+                )
+            )
+            return None
         # Read the sha back from the clone: a rebase inside `_push_with_rebase` rewrites
         # HEAD, so the caller's pre-push snapshot would name a commit that is NOT on the
         # remote. `self.pushed_sha` is what the ledger records. Fall back to the snapshot
@@ -1597,9 +1736,10 @@ class Driver:
             if outcome.committed_ready:
                 # F10 direct-commit (bug track): push the verified RED→GREEN fix to the
                 # authorized branch; record ``committed`` only on a successful push.
-                if self._direct_push(
+                pushed = self._direct_push(
                     fp=outcome.fp, kind="bug", target=winner.candidate.target, sha=committed
-                ):
+                )
+                if pushed is True:
                     # See the perf track: record the sha that LANDED, not the pre-rebase one.
                     landed = self.pushed_sha or committed
                     self.ledger.record(
@@ -1621,7 +1761,7 @@ class Driver:
                         self.branch,
                         landed,
                     )
-                else:
+                elif pushed is False:
                     # Same rollback as the perf twin, and for the same reason: a refused
                     # commit left at HEAD is invisible to the NEXT winner's `HEAD~1..HEAD`
                     # scan but still published by its push. This branch had no `else` at
@@ -1776,6 +1916,21 @@ class Driver:
             )
         return _git(["rev-parse", "--short", "HEAD"], self.clone).stdout.strip()
 
+    def _preflight_checked(self) -> PreflightResult | None:
+        """Run perf preflight, then attest/retire before any later host Git."""
+        result: PreflightResult | None = None
+        error: Exception | None = None
+        try:
+            result = self.preflight()
+        except Exception as exc:  # noqa: BLE001 - attest before interpreting
+            error = exc
+        if self._retire_if_unsafe("perf preflight"):
+            return None
+        if error is not None:
+            raise error
+        assert result is not None
+        return result
+
     # ── the durable loop ────────────────────────────────────────────────
 
     def run(self, *, dry_run: bool = False, preflight: bool | None = None) -> Stats:
@@ -1803,7 +1958,9 @@ class Driver:
             )
             run_preflight = False
         if run_preflight:
-            res = self.preflight()  # raises (HALT/BLOCK) if the ruler is not proven
+            res = self._preflight_checked()
+            if res is None:
+                return self.stats
             # Surface the MEASURED calibration results (the band, the baseline rep
             # count, the canary's observed delta, the per-guardrail baseline medians)
             # to the progress sink so the UI's measurement battery can show real

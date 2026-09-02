@@ -45,6 +45,7 @@ from kiro_crew.acp.types import (
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.history import ConversationLog
+from kiro_crew.metrics import turns as turns_mod
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.security import oauth_url_contains_credential
 from kiro_crew.trust_patterns import canonical_non_shell_trust_key, exact_trust_pattern
@@ -68,6 +69,12 @@ def _state(tmp_path, **kwargs) -> DashboardState:
     sessions.set_slack_link = MagicMock()
     sessions.get_mirror_link = MagicMock(return_value=None)
     sessions.reset = AsyncMock()
+    # Returns whether it tore down; False means skip_if_busy refused.
+    sessions.discard_conversation = AsyncMock(return_value=True)
+    # Production returns None when no session is live for the key. Left as a bare
+    # MagicMock it would answer a truthy provider whose has_active_turn() is also
+    # truthy, so every busy-probe would read "turn in flight" on an idle state.
+    sessions.get_provider = MagicMock(return_value=None)
     sessions.remove = AsyncMock()
     sessions.record_failure = AsyncMock()
     sessions.remove_if_unclaimed = AsyncMock(return_value=False)
@@ -307,9 +314,14 @@ class TestTurnMetric:
 
     def test_session_source_attribute_is_attached(self):
         recorder = MagicMock()
+        # The emit and its source derivation moved to ``metrics/turns.py`` so
+        # every dispatch surface could reach them (they used to sit in
+        # chat_runner, which only the dashboard turn loop runs). The source now
+        # comes from ``telemetry_channel_of``, which — unlike infer_use_case —
+        # knows the background surfaces this metric was widened to cover.
         with (
-            patch.object(chat_runner, "infer_use_case", return_value="cron"),
-            patch.object(chat_runner, "get_recorder", return_value=recorder),
+            patch.object(turns_mod, "telemetry_channel_of", return_value="cron"),
+            patch.object(turns_mod, "get_recorder", return_value=recorder),
         ):
             chat_runner._emit_turn_metric(0, "end_turn", "cron:job", elapsed_ms=12)
 
@@ -321,8 +333,8 @@ class TestTurnMetric:
         """A broken source lookup must still leave the histogram emitted."""
         recorder = MagicMock()
         with (
-            patch.object(chat_runner, "infer_use_case", side_effect=RuntimeError("boom")),
-            patch.object(chat_runner, "get_recorder", return_value=recorder),
+            patch.object(turns_mod, "telemetry_channel_of", side_effect=RuntimeError("boom")),
+            patch.object(turns_mod, "get_recorder", return_value=recorder),
         ):
             chat_runner._emit_turn_metric(50, "end_turn", "dashboard:x")
 
@@ -1196,7 +1208,7 @@ class TestConsumePendingReset:
     async def test_no_pending_key_is_a_noop(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        await chat_runner._consume_pending_reset(state, slot)
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
 
         state.sessions.reset.assert_not_awaited()
 
@@ -1205,7 +1217,7 @@ class TestConsumePendingReset:
         state, slot = _state(tmp_path), _slot()
         slot._pending_reset_history_key = "dashboard:chat-cov-1"
 
-        await chat_runner._consume_pending_reset(state, slot)
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
 
         state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
         assert slot._pending_reset_history_key is None
@@ -1220,7 +1232,7 @@ class TestConsumePendingReset:
 
         state.sessions.reset = AsyncMock(side_effect=_reset)
 
-        await chat_runner._consume_pending_reset(state, slot)
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
 
         assert slot._pending_reset_history_key == "newer-key"
 
@@ -1230,9 +1242,353 @@ class TestConsumePendingReset:
         slot._pending_reset_history_key = "old-key"
         state.sessions.reset = AsyncMock(side_effect=RuntimeError("no session"))
 
-        await chat_runner._consume_pending_reset(state, slot)
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
 
         assert slot._pending_reset_history_key == "old-key"
+
+    @pytest.mark.asyncio
+    async def test_no_pending_discard_is_a_noop(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_discard_passes_replay_through_and_clears_the_flag(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+        assert slot._pending_discard_conversation_key is None
+
+    @pytest.mark.asyncio
+    async def test_the_discard_always_asks_for_no_replay(self, tmp_path):
+        """One value, not a plumbed choice: replaying the transcript into the
+        fresh conversation returns most of what the reset reclaimed. The manager
+        keeps the flag for the HTTP route, which does let a caller choose."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_discard_failure_leaves_the_flag_armed(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "old-key"
+        state.sessions.discard_conversation = AsyncMock(side_effect=RuntimeError("no session"))
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert slot._pending_discard_conversation_key == "old-key"
+
+    @pytest.mark.asyncio
+    async def test_a_discard_key_queued_during_the_await_is_not_clobbered(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "old-key"
+
+        async def _discard(_key, **_kw):
+            slot._pending_discard_conversation_key = "newer-key"
+
+        state.sessions.discard_conversation = AsyncMock(side_effect=_discard)
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert slot._pending_discard_conversation_key == "newer-key"
+
+    @pytest.mark.asyncio
+    async def test_both_deferrals_run_because_neither_subsumes_the_other(self, tmp_path):
+        """A project reset recreates the session but leaves replay suppression
+        alone, so skipping the discard would hand the next turn a rebuilt
+        [CONVERSATION HISTORY] block for the conversation that was discarded."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_reset_history_key = "dashboard:chat-cov-1"
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+        assert slot._pending_reset_history_key is None
+        assert slot._pending_discard_conversation_key is None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_project_reset_does_not_block_the_discard(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_reset_history_key = "old-key"
+        slot._pending_discard_conversation_key = "old-key"
+        state.sessions.reset = AsyncMock(side_effect=RuntimeError("no session"))
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once()
+        assert slot._pending_reset_history_key == "old-key"
+        assert slot._pending_discard_conversation_key is None
+
+
+def _subs(running, *, queued: int = 0):
+    """A subagent registry stub shaped like the two probes the guard reads."""
+    subs = MagicMock()
+    subs.running_agents_for = MagicMock(return_value=running)
+    subs._queued_depth = MagicMock(return_value=queued)
+    return subs
+
+
+class TestConsumePendingDiscardBoundary:
+    """The discard is a full provider teardown, so it is consumed ONLY at the
+    end-of-turn boundary. The other two consume points run just before a turn
+    acquires the session — a channel turn (Slack, Discord) runs on the linked
+    session with no dashboard task at all, so a teardown there lands under a
+    reply that is still streaming and loses it."""
+
+    @pytest.mark.asyncio
+    async def test_default_caller_may_not_consume_a_discard(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+        assert torn_down is False
+
+    @pytest.mark.asyncio
+    async def test_the_end_of_turn_caller_may(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_the_default_caller_still_consumes_a_project_reset(self, tmp_path):
+        """Scope pin: only the DISCARD moved to the end-of-turn boundary. The
+        project reset must still run before get_or_create or the turn would reuse
+        the stale session for one turn."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_reset_history_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_the_discard_goes_through_the_atomic_skip_if_busy_path(self, tmp_path):
+        """The busy-check and the teardown must be ONE step under the session
+        lock. Probing here and tearing down afterwards leaves a window in which a
+        channel turn acquires the session's semaphore and begins streaming, and
+        the teardown then removes its provider. So the consumer must delegate the
+        check rather than perform it."""
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "slack:C1:123"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "slack:C1:123", replay=False, skip_if_busy=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_manager_refusal_leaves_the_discard_armed(self, tmp_path):
+        """False from the manager means it refused under the lock — a turn was in
+        flight. Nothing was torn down, so the flag must stay armed."""
+        state, slot = _state(tmp_path), _slot()
+        state.sessions.discard_conversation = AsyncMock(return_value=False)
+        slot._pending_discard_conversation_key = "slack:C1:123"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert slot._pending_discard_conversation_key == "slack:C1:123"
+        assert torn_down is False
+
+    @pytest.mark.asyncio
+    async def test_a_refused_discard_lands_at_a_later_boundary(self, tmp_path):
+        """The refusal is a wait, not a cancellation."""
+        state, slot = _state(tmp_path), _slot()
+        state.sessions.discard_conversation = AsyncMock(return_value=False)
+        slot._pending_discard_conversation_key = "slack:A"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+        assert slot._pending_discard_conversation_key == "slack:A"
+
+        state.sessions.discard_conversation = AsyncMock(return_value=True)
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert slot._pending_discard_conversation_key is None
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_an_accepted_discard_reports_a_teardown(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        assert torn_down is True
+        assert slot._pending_discard_conversation_key is None
+
+
+class TestConsumePendingDiscardWaitsForSubagents:
+    """``discard_conversation`` releases the shared runtime sub-agent children
+    run on, and turn end is exactly when they outlive their parent — the parent
+    turn ends first, so ``slot.running`` is already False while they keep going.
+    Consuming the discard there would kill their work, so an attached child
+    leaves the flag ARMED and a later consume applies it."""
+
+    @pytest.mark.asyncio
+    async def test_running_child_leaves_the_discard_armed(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([{"id": "a1"}])
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+        assert torn_down is False
+
+    @pytest.mark.asyncio
+    async def test_queued_child_leaves_the_discard_armed(self, tmp_path):
+        """A spawn held by the concurrency gate is absent from the running list
+        yet WILL start on its own, so it counts as attached."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([], queued=2)
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+    @pytest.mark.asyncio
+    async def test_inflight_result_delivery_leaves_the_discard_armed(self, tmp_path):
+        """The last child can finish — emptying both probes — while its
+        completion-event injection is still landing."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([])
+        slot._subagent_deliveries_inflight = 1
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+    @pytest.mark.asyncio
+    async def test_a_failing_running_probe_leaves_the_discard_armed(self, tmp_path):
+        """A None running-probe is the probe FAILING, not a slot with no
+        children. Fail closed — unknown children are not zero children."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs(None)
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_queue_leaves_the_discard_armed(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        subs = _subs([])
+        subs._queued_depth = MagicMock(side_effect=RuntimeError("queue unreadable"))
+        state.subagents = subs
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+
+    @pytest.mark.asyncio
+    async def test_the_armed_discard_lands_once_the_children_are_gone(self, tmp_path):
+        """The deferral is a wait, not a cancellation: the caller's reset still
+        happens, at the next consume that finds no children."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([{"id": "a1"}])
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+        state.sessions.discard_conversation.assert_not_awaited()
+
+        state.subagents = _subs([])
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+        assert slot._pending_discard_conversation_key is None
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_no_children_applies_the_discard(self, tmp_path):
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([])
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once_with(
+            "dashboard:chat-cov-1", replay=False, skip_if_busy=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_project_reset_is_not_gated_on_children(self, tmp_path):
+        """Scope pin: the guard covers the conversation discard this change
+        introduced. The pre-existing project-change reset keeps its behaviour."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([{"id": "a1"}])
+        slot._pending_reset_history_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        assert slot._pending_reset_history_key is None
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_discard_does_not_hide_a_project_reset(self, tmp_path):
+        """Both queued, children attached: the project reset still runs and the
+        discard stays armed, so neither deferral swallows the other."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = _subs([{"id": "a1"}])
+        slot._pending_reset_history_key = "dashboard:chat-cov-1"
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        torn_down = await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.reset.assert_awaited_once_with("dashboard:chat-cov-1")
+        state.sessions.discard_conversation.assert_not_awaited()
+        assert slot._pending_reset_history_key is None
+        assert slot._pending_discard_conversation_key == "dashboard:chat-cov-1"
+        assert torn_down is True
+
+    @pytest.mark.asyncio
+    async def test_no_registry_abstains_rather_than_blocking_forever(self, tmp_path):
+        """No registry means no runtime for a child to be attached to. Blocking
+        on that would arm a discard that could never land."""
+        state, slot = _state(tmp_path), _slot()
+        state.subagents = None
+        slot._pending_discard_conversation_key = "dashboard:chat-cov-1"
+
+        await chat_runner._consume_pending_reset(state, slot, allow_discard=True)
+
+        state.sessions.discard_conversation.assert_awaited_once()
 
 
 # ── eager spawn / resume prefetch ─────────────────────────────────────────

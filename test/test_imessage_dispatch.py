@@ -8,6 +8,7 @@ import pytest
 
 from kiro_crew.imessage.client import IMessageInbound
 from kiro_crew.imessage.transport_dispatch import IMessageDispatcher
+from kiro_crew.session_allocation import SessionClosingError
 
 HANDLE = "+15551234567"
 
@@ -52,6 +53,10 @@ class FakeProvider:
 class FakeSessions:
     def __init__(self) -> None:
         self.busy: set[str] = set()
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self.providers: dict[str, Any] = {}
         self.sessions: set[str] = set()
         self.acquired: list[str] = []
@@ -73,6 +78,12 @@ class FakeSessions:
             return False
         self.acquired.append(key)
         return True
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     def release(self, key: str) -> None:
         self.released.append(key)

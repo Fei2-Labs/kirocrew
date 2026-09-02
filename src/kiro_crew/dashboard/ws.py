@@ -433,6 +433,13 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         # malformed entry (see its docstring).
         if ws.get("_is_dashboard_user", False):
             envelope_extras["folders"] = _safe_folder_tree(getattr(state, "_folders", None))
+            # Baseline for the change comparison, alongside the tree it describes
+            # — the client treats a connection's first generation as "unknown,
+            # refetch", so this seeds the number a later bump is measured against.
+            # Gated with `folders` rather than sent unconditionally: an app token
+            # never receives the tree, so its generation would describe data the
+            # app does not have.
+            envelope_extras["foldersGeneration"] = state.folders_generation()
         if not ws.get("_is_dashboard_user", False) and "yolo" in envelope_extras:
             # Handing an app token the live blanket-approval override is a
             # grant of operator security posture, not slot data, and this

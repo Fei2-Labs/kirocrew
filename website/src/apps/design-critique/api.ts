@@ -1,4 +1,5 @@
 import { AGENT } from './constants'
+import { toApiError } from '../../api/apiError'
 import type { SlotData } from './types'
 
 // These hit the dashboard's own chat endpoints (NOT an app-scoped reverse proxy),
@@ -7,8 +8,7 @@ import type { SlotData } from './types'
 async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const r = await fetch(path, { credentials: 'same-origin', ...init })
   if (!r.ok) {
-    const body = await r.text().catch(() => '')
-    throw new Error(body || `HTTP ${r.status}`)
+    throw await toApiError(r)
   }
   if (r.status === 204 || r.status === 205) return undefined as T
   const text = await r.text()
@@ -65,7 +65,7 @@ export const designCritiqueApi = {
     const fd = new FormData()
     files.forEach(f => fd.append('file', f))
     const up = await fetch('/api/upload/file', { method: 'POST', body: fd, credentials: 'same-origin' })
-    if (!up.ok) throw new Error('upload failed (' + up.status + ')')
+    if (!up.ok) throw await toApiError(up)
     return up.json()
   },
 }

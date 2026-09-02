@@ -700,12 +700,28 @@ def artifact_save(name: str, args: dict[str, Any]) -> str:
             )
     # Widgets re-surface via the re-emit tag; only non-widgets need the link.
     ref_link = "" if kind == "widget" else f"{mcp_core._artifact_ref_link(slug, name)}\n\n"
+    # The store had to suffix the derived slug, so this is a new artifact rather
+    # than a new version of the one already at that slug. Reported by the store,
+    # so it holds for every kind — the dedup probe above is a name-based
+    # pre-check scoped to chat widgets, and stays silent for a markdown or text
+    # deliverable saved under a name that is already in use. Suppressed when
+    # that probe already fired, so a colliding widget gets one warning.
+    collision_hint = ""
+    taken = d.get("slug_collided_with")
+    if taken and not dedup_hint:
+        collision_hint = (
+            f"\n\n⚠️  slug {taken!r} is already taken, so this is a NEW artifact "
+            f"at slug={slug!r} — not a new version of {taken!r}. If you meant to "
+            f"revise that artifact, delete this one and call `artifact_update` on "
+            f"{taken!r}. If both are genuinely needed, rename one to disambiguate."
+        )
     return (
         f"Saved artifact: slug={slug} version={version}\n\n"
         f"{ref_link}"
         f"{mcp_core._artifact_reemit_hint(slug, name, kind)}"
         f"{dedup_hint}"
         f"{cost_hint}"
+        f"{collision_hint}"
     )
 
 

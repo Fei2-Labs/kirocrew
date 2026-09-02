@@ -177,6 +177,38 @@ def test_monitor_state_survives_store_round_trip(tmp_path) -> None:
     assert restored.stopped_reason == "token_budget"
 
 
+@pytest.mark.asyncio
+async def test_failed_loop_update_restores_typed_monitor_state(tmp_path, monkeypatch) -> None:
+    """A failed registry write must leave the live typed record unchanged."""
+    monitor = MonitorState(
+        kind="github_pull_request",
+        target="owner/repo#123",
+        objective="review_ready",
+        created_ts=1_000.0,
+    )
+    loop = NudgeLoop(
+        id="monitor-update-failure",
+        slot_key="chat-1-123",
+        message="inspect the pull request",
+        next_due_ts=1_500.0,
+        monitor=monitor,
+    )
+    service = AutoNudgeService(base_dir=tmp_path)
+    service._loops[loop.id] = loop
+
+    def fail_write(_payload) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service, "_write_state", fail_write)
+
+    with pytest.raises(OSError, match="disk full"):
+        await service.update(loop.id, active=False)
+
+    assert loop.active
+    assert loop.next_due_ts == 1_500.0
+    assert loop.monitor is monitor
+
+
 def test_unknown_monitor_version_is_inspectable_and_inert_without_losing_active_intent(
     tmp_path,
 ) -> None:
@@ -338,6 +370,43 @@ def test_malformed_monitor_cannot_rearm_after_restart(tmp_path) -> None:
     service._save()
     persisted = json.loads((tmp_path / "autonudge.json").read_text(encoding="utf-8"))
     assert persisted["loops"][0]["monitor"] == malformed_monitor
+
+
+def test_oversized_monitor_timestamp_is_quarantined_without_data_loss(tmp_path) -> None:
+    """An integer too large for float conversion remains inspectable and inert."""
+    malformed_monitor = {
+        "version": 1,
+        "kind": "github_pull_request",
+        "target": "owner/repo#123",
+        "objective": "review_ready",
+        "created_ts": 10**400,
+    }
+    store = {
+        "version": 1,
+        "loops": [
+            {
+                "id": "broken-large-timestamp",
+                "slot_key": "chat-1-123",
+                "message": "unsafe instructions",
+                "idle_secs": 300,
+                "active": True,
+                "monitor": malformed_monitor,
+            }
+        ],
+    }
+    path = tmp_path / "autonudge.json"
+    path.write_text(json.dumps(store), encoding="utf-8")
+    service = AutoNudgeService(base_dir=tmp_path)
+
+    service._load()
+
+    restored = service._loops["broken-large-timestamp"]
+    assert not restored.active
+    assert restored.monitor is not None
+    assert restored.monitor.created_ts == 0.0
+    assert restored.monitor.outcome is MonitorOutcome.BLOCKED
+    assert restored.monitor.stopped_reason == "invalid_monitor_record"
+    assert service._serialize_state()["loops"][0]["monitor"] == malformed_monitor
 
 
 def test_malformed_current_outcome_cannot_rearm_after_restart(tmp_path) -> None:

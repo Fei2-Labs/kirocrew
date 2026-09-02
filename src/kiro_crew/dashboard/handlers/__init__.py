@@ -55,7 +55,6 @@ from kiro_crew.dashboard.handlers._shared import (  # noqa: E402, F401
 
 # ── Agents (extracted to handlers/agents.py) ──
 from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
-    _auto_install_agent,
     _find_agent_config,
     _get_config_lock,
     _installed_agent_config,
@@ -136,6 +135,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_dashboard_config,
     api_file_diff,
     api_file_download,
+    api_file_office_preview,
     api_file_raw,
     api_file_read,
     api_file_search,
@@ -218,6 +218,7 @@ from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
 
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
+    api_member_activity,
     api_member_thread,
     api_members,
 )
@@ -404,6 +405,7 @@ from kiro_crew.dashboard.handlers.tailnet import (  # noqa: E402, F401
     api_tailnet_status,
 )
 from kiro_crew.dashboard.handlers.tailnet_mobile import (  # noqa: E402, F401
+    api_tailnet_mobile_configure,
     api_tailnet_mobile_publish,
     api_tailnet_mobile_qr,
     api_tailnet_mobile_status,
@@ -620,9 +622,6 @@ from kiro_crew.dashboard.handlers.computer_use import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     _DIST_DIR,
     _STATIC_DIR,
-    _build_stt_install_script,
-    _find_suitable_python,
-    _is_al2023,
     _stt_prereq_commands,
     api_app_token,
     api_branding,
@@ -641,7 +640,9 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_session_agents_list,
     api_shutdown,
     api_stt_config,
-    api_stt_install,
+    api_stt_prepare,
+    api_stt_prewarm,
+    api_stt_status,
     api_stt_transcribe,
     api_theme_boot,
     api_theme_config,

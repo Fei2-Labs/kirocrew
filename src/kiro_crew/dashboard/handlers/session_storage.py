@@ -942,8 +942,42 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             refresh=_build_index,
         )
     except SessionStorageError as exc:
+        # Audited before returning. A refusal from inside the move is the same
+        # security-relevant outcome as the pre-flight one above -- someone asked to
+        # remove specific conversations and was told no -- and it is the ONLY record
+        # for the case where every selected session was protected, which returns
+        # here rather than through the success path. Resources names the selection
+        # rather than a per-uid reason: which one tripped it is in the message, and
+        # the whole batch was refused either way.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.trash",
+            outcome="denied",
+            source="dashboard",
+            resources=",".join(eligible)[:512],
+        )
         return _refused(exc, "trash_refused")
 
+    # A session resumed while the batch was being staged was left in place, and
+    # this endpoint's contract is that anything not taken is named. It joins the
+    # same list under the same code the pre-flight uses for a live session: the
+    # mechanism differs (caught by mtime during the move, not by the index before
+    # it) but the fact the reader needs is identical — it is in use, so it stayed.
+    revived_refusals = [{"uid": uid, "reason": "in_use"} for uid in batch.revived]
+    if revived_refusals:
+        # Audited for the same reason the pre-flight refusal above is, and it has
+        # to be its own event: that one is emitted before the move, so a session
+        # protected DURING the move would otherwise appear in the record only
+        # inside a "success", leaving the protection itself unlogged. Emitted
+        # before the success event so the trail reads in the same order as the
+        # pre-flight path.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.trash",
+            outcome="denied",
+            source="dashboard",
+            resources=",".join(f"{r['uid']}:{r['reason']}" for r in revived_refusals)[:512],
+        )
     _sel().log_api_access(
         caller=_read_session_key(request),
         operation="session_storage.trash",
@@ -956,6 +990,6 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             "sessions": batch.sessions,
             "bytes": batch.bytes,
             "batch_id": batch.batch_id,
-            "refused": refused,
+            "refused": refused + revived_refusals,
         }
     )

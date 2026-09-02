@@ -1160,7 +1160,7 @@ class TestBuildRecoPrompt(unittest.TestCase):
 
 
 class TestAiPromptLocalization(unittest.TestCase):
-    """The three one-shot prompts localize their PROSE to the dashboard language.
+    """The four one-shot prompts localize their PROSE to the dashboard language.
 
     Two invariants: an EMPTY tag (the follow-the-browser sentinel) leaves each
     prompt BYTE-IDENTICAL to what unconfigured installs have always sent, and a
@@ -1170,6 +1170,7 @@ class TestAiPromptLocalization(unittest.TestCase):
     DETAIL = {"number": 7, "title": "crash", "body": "boom", "labels": []}
     PR_DETAIL = {"number": 12, "title": "t", "body": "b", "state": "open"}
     RECO_ISSUES = [{"number": 7, "title": "t", "body": "b", "labels": ["bug"]}]
+    TAG_ISSUES = [{"number": 7, "title": "t", "body": "b", "labels": []}]
 
     def test_an_empty_tag_leaves_the_issue_prompt_byte_identical(self):
         legacy = routes._build_ai_prompt("o", "r", self.DETAIL, LABELS, [])
@@ -1220,6 +1221,42 @@ class TestAiPromptLocalization(unittest.TestCase):
         # name/description become repo content via /labels/create when a
         # proposal is applied, so the directive must explicitly exempt them.
         self.assertIn('"name" and "description"', tail)
+
+    def test_an_empty_tag_leaves_the_tagging_prompt_byte_identical(self):
+        legacy = routes._build_tagging_prompt("o", "r", LABELS, self.TAG_ISSUES)
+        self.assertEqual(
+            routes._build_tagging_prompt("o", "r", LABELS, self.TAG_ISSUES, ui_language=""),
+            legacy,
+        )
+
+    def test_a_tag_localizes_only_the_tagging_reason(self):
+        # The fourth builder, and the one this class used to be missing: the
+        # tagging queue renders each `reason` as a tooltip, so an unsteered prompt
+        # left that tooltip English inside a localized UI.
+        legacy = routes._build_tagging_prompt("o", "r", LABELS, self.TAG_ISSUES)
+        got = routes._build_tagging_prompt(
+            "o", "r", LABELS, self.TAG_ISSUES, ui_language="zh-CN"
+        )
+        self.assertTrue(got.startswith(legacy))
+        tail = got[len(legacy):]
+        self.assertIn("BCP-47 tag zh-CN", tail)
+        self.assertIn('"reason"', tail)
+        # The directive lands AFTER the </issues> fence, so attacker-controlled
+        # issue text cannot present itself as part of the instruction.
+        self.assertNotIn("</issues>", tail)
+
+    def test_the_tagging_directive_never_steers_the_label_names(self):
+        # Names are intersected against the repo's real label set downstream, so a
+        # translated name would be discarded as invented and the issue would come
+        # back unlabelled. The shared directive exempts everything it does not
+        # name, which is what makes this safe -- pinned because the failure is
+        # silent (fewer suggestions, no error).
+        got = routes._build_tagging_prompt(
+            "o", "r", LABELS, self.TAG_ISSUES, ui_language="zh-CN"
+        )
+        tail = got[len(routes._build_tagging_prompt("o", "r", LABELS, self.TAG_ISSUES)):]
+        self.assertIn("Everything else is never", tail)
+        self.assertNotIn('"name"', tail)
 
 
 class TestPrAiFingerprintLanguage(unittest.TestCase):

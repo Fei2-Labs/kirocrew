@@ -220,6 +220,32 @@ describe('ChatPage follow-up option toggle', () => {
     expect(composer().value).toBe('Deploy, Retry')
   })
 
+  it('unselecting removes the appended option, not a matching substring in the draft', async () => {
+    // Regression: `indexOf(', ' + option)` matched the ", Go" inside
+    // "Please, Google" before the option the handler appended at the end.
+    await renderPage('Ready to proceed.\n\n[OPTIONS: Go | Stay]', '', 'Go')
+    fireEvent.change(composer(), { target: { value: 'Please, Google' } })
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    expect(composer().value).toBe('Please, Google, Go')
+    await act(async () => { clickOption('Go') })
+    expect(composer().value).toBe('Please, Google')
+  })
+
+  it('leaves earlier draft text alone when the user already deleted the appended option', async () => {
+    await renderPage('Ready to proceed.\n\n[OPTIONS: Go | Stay]', '', 'Go')
+    fireEvent.change(composer(), { target: { value: 'Discuss, Go home' } })
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    expect(composer().value).toBe('Discuss, Go home, Go')
+
+    // The chip remains selected, but the user removes its generated tail by hand.
+    // Unselecting must not fall back to the earlier ", Go" inside their draft.
+    fireEvent.change(composer(), { target: { value: 'Discuss, Go home' } })
+    await act(async () => { clickOption('Go') })
+    expect(composer().value).toBe('Discuss, Go home')
+  })
+
   it('re-adds the option on a third click', async () => {
     await renderPage()
     vi.useFakeTimers()

@@ -507,6 +507,26 @@ class TestSetupClone:
         assert response.status == 400
         assert _json_of(response)["code"] == "url_required"
 
+    async def test_passes_noncreating_scratch_path_to_setup(
+        self, data_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scratch = data_root / "scratch"
+        monkeypatch.setattr(store, "scratch_path", lambda: scratch)
+        monkeypatch.setattr(
+            store,
+            "scratch_dir",
+            lambda: (_ for _ in ()).throw(AssertionError("scratch_dir created too early")),
+        )
+
+        def _fake(_url: str, received: Path, **_kw: Any) -> tuple[dict, str]:
+            assert received == scratch
+            assert not scratch.exists()
+            return {}, "controlled refusal"
+
+        monkeypatch.setattr(clone_setup, "setup_safe_clone", _fake)
+        response = await routes._handle_setup_clone(_request("POST", body={"url": self.URL}))
+        assert response.status == 400
+
     async def test_refuses_while_a_run_is_live(self, supervisor: FakeSupervisor) -> None:
         supervisor._status = runner.STATUS_RUNNING
         response = await routes._handle_setup_clone(_request("POST", body={"url": self.URL}))
@@ -971,6 +991,8 @@ def draft_stubs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         return mock.Mock(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(commit_mod, "_git", _git)
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+    monkeypatch.setattr(clone_setup, "_push_disabled", lambda _clone: True)
     monkeypatch.setattr(
         commit_mod, "materialize_queued_diff", lambda **_kw: dict(state["materialize"])
     )

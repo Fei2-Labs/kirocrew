@@ -21,6 +21,7 @@ from kiro_crew.agent import (
     kiro_agents_dir_path,
     rebuild_agent_config,
 )
+from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     FORWARD_DECLARED_ENV_DEFAULT,
@@ -32,6 +33,8 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.env import emit_env
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.mcp_discovery import (
+    SCOPE_KIRO_GLOBAL,
+    SCOPE_KIROCREW,
     managed_server_is_session_bound,
     probe_metadata,
     redact_mcp_error,
@@ -779,15 +782,18 @@ async def api_mcp_active(request: web.Request) -> web.Response:
     # Non-kirocrew agent: read from agent config
     if agent and agent != "kirocrew":
         for f in kiro_agents_dir_path().glob("*.json"):
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                if data.get("name") == agent:
-                    agent_mcps = data.get("mcpServers", {})
-                    return web.json_response(
-                        [{"name": n, "enabled": True} for n in sorted(agent_mcps)]
-                    )
-            except (json.JSONDecodeError, OSError):
+            spec = _read_agent_spec(
+                f,
+                operation="api_mcp_active",
+                source="dashboard",
+            )
+            if spec is None:
                 continue
+            if spec.get("name") == agent:
+                agent_mcps = spec.get("mcpServers", {})
+                return web.json_response(
+                    [{"name": n, "enabled": True} for n in sorted(agent_mcps)]
+                )
         return web.json_response([])
 
     # Kirocrew / default: read from global mcp.json
@@ -1717,17 +1723,41 @@ def _find_server_spec_anywhere(name: str) -> dict | None:
     edition-contributed provider scopes.  Returns a shallow copy with
     ``disabled`` stripped (the caller decides whether to disable in its target
     scope).
+
+    The agents-dir candidate is an AGENT SPEC and is read through the hardened
+    reader (size cap, sensitive-symlink screen, non-object rejection, SEL denial
+    event) rather than the plain loader. It is statically first in merge order,
+    so it is read before the loop instead of being tagged inside one -- a
+    refused spec then degrades exactly as ``_load_json_or_empty``'s ``{}`` did,
+    contributing nothing and falling through to the next scope. The remaining
+    candidates are provider ``mcp.json`` files, not agent specs, so the
+    agent-spec reader does not describe them.
     """
-    candidates = [
-        kiro_agents_dir() / "kirocrew.json",
+
+    def _usable(data: dict[str, Any]) -> dict | None:
+        spec = data.get("mcpServers", {}).get(name)
+        if isinstance(spec, dict) and (spec.get("command") or spec.get("url")):
+            return {k: v for k, v in spec.items() if k != "disabled"}
+        return None
+
+    found = _usable(
+        _read_agent_spec(
+            kiro_agents_dir() / "kirocrew.json",
+            operation="mcp_find_server_spec",
+            source="dashboard",
+        )
+        or {}
+    )
+    if found is not None:
+        return found
+    for path in (
         _kirocrew_mcp_json(),
         _GLOBAL_MCP_JSON,
         *[s.global_json for s in _extra_mcp_scopes()],
-    ]
-    for p in candidates:
-        spec = _load_json_or_empty(p).get("mcpServers", {}).get(name)
-        if isinstance(spec, dict) and (spec.get("command") or spec.get("url")):
-            return {k: v for k, v in spec.items() if k != "disabled"}
+    ):
+        found = _usable(_load_json_or_empty(path))
+        if found is not None:
+            return found
     return None
 
 
@@ -1828,15 +1858,40 @@ def _remove_from_agent_file(path: Path, name: str) -> bool:
     — the rebuild uses the existing agent file as its merge base, so without
     this targeted delete, additive merging would keep the entry alive.
     Returns True when the file was modified.
+
+    Read AND write under THIS FILE's own sidecar lock (``bridges._mcp_lock``,
+    ``<path>.lock``), which the MCP transaction lock every caller already holds
+    does NOT cover: that one guards ``~/.kiro/settings/mcp.lock``, while
+    ``apps/bridges.py`` does whole-file read-modify-writes of this same rendered
+    file under ``~/.kiro/agents/kirocrew.lock`` (app enable/disable, MCP
+    (de)registration). Unlocked, an app registration that read the file BEFORE
+    this delete and wrote its whole map back AFTER resurrects the entry — and a
+    caller that pairs the purge with a grant revoke (Disconnect) has by then
+    unlinked the artifacts, leaving a configured provider with a dead
+    credential. Nothing heals it: ``rebuild_agent_config`` takes this same file
+    as its merge base and reconciles only ``app:server`` keys under that lock.
+
+    Order is transaction-lock-then-file-lock, the same order every other
+    settings-lock holder uses when it reaches a kirocrew.json writer, and no
+    path in the tree takes the file lock first — so there is no ABBA cycle. The
+    flock is blocking, which is legal here because every caller of
+    :func:`_purge_server_config` runs it in a worker thread
+    (``_offload_config_write``, or the sweep's executor), never on the event loop.
+
+    ``bridges._mcp_lock`` is imported lazily: ``apps.bridges`` imports back into
+    the dashboard handlers, so a module-level import is circular.
     """
     if not path.is_file():
         return False
-    data = _load_json_or_empty(path)
-    servers = data.get("mcpServers", {})
-    if not isinstance(servers, dict) or name not in servers:
-        return False
-    del servers[name]
-    _atomic_write(path, data)
+    from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
+
+    with _agent_file_lock(target=path):
+        data = _load_json_or_empty(path)
+        servers = data.get("mcpServers", {})
+        if not isinstance(servers, dict) or name not in servers:
+            return False
+        del servers[name]
+        _atomic_write(path, data)
     return True
 
 
@@ -1875,8 +1930,8 @@ def _set_scope_entry(path: Path, name: str, *, enabled: bool, spec: dict | None 
     return "removed"
 
 
-def _purge_server_config(name: str) -> dict[str, str]:
-    """Remove a server's config from EVERY scope + rendered agent file.
+def _purge_server_config(name: str, *, scopes: Collection[str] | None = None) -> dict[str, str]:
+    """Remove a server's config from every scope + rendered agent file.
 
     The config-side half of an uninstall, factored out so the normal
     per-change path and the guaranteed-cleanup sweep (see ``api_mcp_apply``)
@@ -1885,12 +1940,31 @@ def _purge_server_config(name: str) -> dict[str, str]:
     it a second time (e.g. the sweep re-purging a name the loop already handled)
     changes nothing. MUST be called under the MCP file lock. Returns the
     per-scope action labels for the response outcome.
+
+    ``scopes`` restricts the purge to the named scopes -- the same labels this
+    returns, which are also :func:`_load_mcp_json_by_source`'s keys, so a caller
+    that judged ownership per scope acts on exactly the scopes it judged. ``None``
+    means every scope, which is what an uninstall wants: the NAME is going away,
+    so no scope may keep a definition of it. A caller that owns one ENDPOINT under
+    a shared name must pass its scopes, because a same-named entry in another
+    scope can be a different server whose config this must not delete.
+
+    The rendered agent files are stripped whenever any scope was purged, and not
+    at all otherwise: they are Kiro Crew's own merge output rather than a scope a
+    user edits, and leaving the entry there lets the next rebuild resurrect what
+    was just removed.
     """
     actions: dict[str, str] = {}
-    actions["kirocrew"] = "removed" if _remove_kirocrew_entry(name) else "noop"
-    actions["kiroGlobal"] = _set_scope_entry(_GLOBAL_MCP_JSON, name, enabled=False)
+    if scopes is None or SCOPE_KIROCREW in scopes:
+        actions[SCOPE_KIROCREW] = "removed" if _remove_kirocrew_entry(name) else "noop"
+    if scopes is None or SCOPE_KIRO_GLOBAL in scopes:
+        actions[SCOPE_KIRO_GLOBAL] = _set_scope_entry(_GLOBAL_MCP_JSON, name, enabled=False)
     for scope in _extra_mcp_scopes():
-        actions[f"{scope.id}Global"] = _set_scope_entry(scope.global_json, name, enabled=False)
+        label = f"{scope.id}Global"
+        if scopes is None or label in scopes:
+            actions[label] = _set_scope_entry(scope.global_json, name, enabled=False)
+    if not actions:
+        return actions
     # Also strip the entry directly from the rendered agent files so the next
     # rebuild doesn't resurrect it via the "start from existing agent config"
     # base. Without this the additive merge keeps the entry around.
@@ -2690,11 +2764,12 @@ def _collect_server_rows() -> dict[str, dict[str, Any]]:
     if not agents_dir.is_dir():
         return rows
     for path in sorted(agents_dir.glob("*.json")):
-        try:
-            spec = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(spec, dict):
+        spec = _read_agent_spec(
+            path,
+            operation="mcp_server_rows",
+            source="dashboard",
+        )
+        if spec is None:
             continue
         agent_name = spec.get("name") or path.stem
         mcp_servers = spec.get("mcpServers")
@@ -2756,11 +2831,12 @@ def _launch_specs_for(names: set[str]) -> dict[str, list[SimpleNamespace]]:
     if not agents_dir.is_dir():
         return specs
     for path in sorted(agents_dir.glob("*.json")):
-        try:
-            spec = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(spec, dict):
+        spec = _read_agent_spec(
+            path,
+            operation="mcp_stub_eligibility",
+            source="dashboard",
+        )
+        if spec is None:
             continue
         mcp_servers = spec.get("mcpServers")
         if not isinstance(mcp_servers, dict):

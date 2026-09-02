@@ -41,6 +41,7 @@ sparingly: it is unscoped and silences the whole line.
 from __future__ import annotations
 
 import bisect
+import importlib.util
 import math
 import os
 import re
@@ -137,8 +138,7 @@ CHANNEL_SUFFIX = re.compile(r" (?:[Nn]ightly|[Ii]nsider|[Ss]table)(?![A-Za-z0-9]
 # position instead of one per character. Without it, `finditer` would re-walk the
 # run from every offset and a single long token would cost O(len²).
 URL_START = re.compile(
-    r"https?://|git@|ssh://|(?<![A-Za-z0-9.-])[A-Za-z0-9][A-Za-z0-9.-]*"
-    r"\.(?:com|dev|io|org)/"
+    r"https?://|git@|ssh://|(?<![A-Za-z0-9.-])[A-Za-z0-9][A-Za-z0-9.-]*" r"\.(?:com|dev|io|org)/"
 )
 
 # Characters that end a URL. Markup and punctuation around a link are not part of
@@ -462,67 +462,58 @@ def tracked_files() -> list[str]:
     return [p for p in git(["ls-files"]).splitlines() if in_scope(p)]
 
 
-def diff_base(base: str) -> str:
-    """The commit to measure against.
+_SCOPE_MODULE = None
 
-    ``merge-base`` is the honest divergence point, but a shallow CI clone fetches
-    the base commit as its own tip with no shared history, so it often has none.
-    The base tip is then the fallback.
+
+def _scope():
+    """The shared diff plumbing (see ``scripts/ratchet_scope.py``).
+
+    Loaded by path, not imported: ``scripts/`` is not a package, so a plain
+    import would resolve only by accident of ``sys.path[0]`` — and not at all
+    when a test loads this gate by path. Shared because the env-base gates
+    (this one, ``check_harness_parity.py``, ``check_focus_cue.py``) and the
+    merge-ref ratchets must agree on what a change added; a private copy per
+    gate is how they would come to disagree. Loaded lazily so the explicit-file
+    and ``--test`` modes, which never touch git, do not require it.
     """
-    try:
-        return git(["merge-base", base, "HEAD"]).strip()
-    except subprocess.CalledProcessError:
-        return base
+    global _SCOPE_MODULE
+    if _SCOPE_MODULE is None:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ratchet_scope.py")
+        spec = importlib.util.spec_from_file_location("ratchet_scope", script)
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"cannot load {script}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SCOPE_MODULE = module
+    return _SCOPE_MODULE
+
+
+def diff_base(base: str) -> str:
+    """The commit to measure against (see ``ratchet_scope.resolve_base``)."""
+    return _scope().resolve_base(base)
 
 
 def changed_paths(frm: str) -> list[str]:
-    """In-scope paths this change touches.
-
-    ``-z`` is what makes this trustworthy: without it git quotes any path holding
-    a non-ASCII or unusual byte (``"b/docs/\\346\\227\\245.md"``), and a parser
-    reading ``+++ b/`` lines then silently drops that file — a gate that skips a
-    changed file is worse than no gate.
-    """
+    """In-scope paths this change touches (``ratchet_scope.changed_paths_at``)."""
     try:
-        out = git(["diff", "--name-only", "-z", "--diff-filter=d", frm])
+        paths = _scope().changed_paths_at(frm)
     except subprocess.CalledProcessError as exc:
         raise SystemExit(
             f"::error::brand gate: cannot diff against {frm} — the base commit is not "
             f"present. Fetch it before running, or unset BRAND_BASE_REF to report "
             f"whole-tree counts without enforcing.\n{exc.stderr}"
         )
-    return [p for p in out.split("\0") if p and enforced(p)]
+    return [p for p in paths if enforced(p)]
 
 
 def added_lines(frm: str, path: str) -> set[int]:
     """1-based line numbers this change adds to ``path``.
 
-    The diff runs base-to-**working-tree**. CI checks out a clean tree, so that is
-    the same as base-to-``HEAD`` there; locally it means the gate sees edits that
-    are not committed yet, which is the only form in which a local run is useful.
-    A brand-new *untracked* file is the one gap, and it is caught on the commit
-    that tracks it.
-
-    ``--text`` forces hunks even for a path that ``.gitattributes`` marks
-    ``-diff``: git would otherwise report only "Binary files differ", leaving
-    nothing to scan and passing the file silently. ``in_scope`` has already
-    dropped the genuinely binary suffixes.
+    Delegates to ``ratchet_scope.added_lines_at``: base-to-working-tree (a
+    local run sees uncommitted edits), ``--text`` so a ``-diff`` gitattribute
+    cannot hide a file, and a pure deletion contributes nothing.
     """
-    diff = git(["diff", "--unified=0", "--no-color", "--text", frm, "--", path])
-    added: set[int] = set()
-    for raw in diff.splitlines():
-        if not raw.startswith("@@"):
-            continue
-        # `@@ -old,count +new,count @@` — the `+` side is the post-image, and a
-        # missing count means exactly one line. A pure deletion reports `+n,0`,
-        # which correctly contributes nothing.
-        m = re.search(r"\+(\d+)(?:,(\d+))?", raw)
-        if not m:
-            continue
-        start = int(m.group(1))
-        count = int(m.group(2)) if m.group(2) is not None else 1
-        added.update(range(start, start + count))
-    return added
+    return _scope().added_lines_at(frm, path)
 
 
 # ---------------------------------------------------------------------------
@@ -692,25 +683,33 @@ def self_test() -> int:
             break
 
     if (base_found, doubled_found) != (base_count, base_count * 2):
-        print(f"  FAIL repeated-brands: found {base_found}/{doubled_found}, "
-              f"want {base_count}/{base_count * 2}")
+        print(
+            f"  FAIL repeated-brands: found {base_found}/{doubled_found}, "
+            f"want {base_count}/{base_count * 2}"
+        )
         failures += 1
     elif base_time < _PERF_MIN_BASE_SECS:
         # Even the largest workload was too fast to measure. Quadratic growth at
         # that size costs orders of magnitude more than the floor, so this cannot
         # be hiding a regression -- report the fact rather than dividing noise by
         # noise.
-        print(f"  ok   repeated-brands (baseline {base_time * 1000:.1f}ms at {base_count} "
-              f"brands still below the {_PERF_MIN_BASE_SECS * 1000:.0f}ms measurement "
-              f"floor; ratio not judged)")
+        print(
+            f"  ok   repeated-brands (baseline {base_time * 1000:.1f}ms at {base_count} "
+            f"brands still below the {_PERF_MIN_BASE_SECS * 1000:.0f}ms measurement "
+            f"floor; ratio not judged)"
+        )
     elif ratio > 3.0:
-        print(f"  FAIL repeated-brands: doubling the input cost {ratio:.1f}x CPU time "
-              f"(best of {_PERF_ATTEMPTS}, baseline {base_time:.3f}s at {base_count} "
-              f"brands); linear is ~2x, so a per-match scan of the line has come back")
+        print(
+            f"  FAIL repeated-brands: doubling the input cost {ratio:.1f}x CPU time "
+            f"(best of {_PERF_ATTEMPTS}, baseline {base_time:.3f}s at {base_count} "
+            f"brands); linear is ~2x, so a per-match scan of the line has come back"
+        )
         failures += 1
     else:
-        print(f"  ok   repeated-brands (doubling cost {ratio:.1f}x at {base_count} "
-              f"brands, linear)")
+        print(
+            f"  ok   repeated-brands (doubling cost {ratio:.1f}x at {base_count} "
+            f"brands, linear)"
+        )
 
     # A wider fence is not closed by a narrower run inside it, so a doc can quote
     # a fenced example without exposing its contents as prose.
@@ -739,12 +738,16 @@ def report(violations: Iterable[Violation], *, enforcing: bool, base: str | None
         return 0
 
     if enforcing:
-        print(f"::error::brand gate: {len(violations)} line(s) added by this change "
-              f"spell the product name wrong. It is {CORRECT!r} — two words, capital K.")
+        print(
+            f"::error::brand gate: {len(violations)} line(s) added by this change "
+            f"spell the product name wrong. It is {CORRECT!r} — two words, capital K."
+        )
     else:
-        print(f"::notice::brand gate report: {len(violations)} pre-existing line(s) "
-              f"spell the product name something other than {CORRECT!r}. Not enforced "
-              f"here; only lines a change adds are gated.")
+        print(
+            f"::notice::brand gate report: {len(violations)} pre-existing line(s) "
+            f"spell the product name something other than {CORRECT!r}. Not enforced "
+            f"here; only lines a change adds are gated."
+        )
     # The listing is path-sorted, so a silently-truncated report shows only the
     # alphabetically-first paths — '.github/' and '.kiro/' alone exceed the report
     # budget, which is how a backlog of UI-visible strings under 'src/' and

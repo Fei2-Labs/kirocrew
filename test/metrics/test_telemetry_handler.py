@@ -951,23 +951,29 @@ def test_fault_rate_counts_exhausted_stall_turns_as_faults(tmp_path: Path):
 
 
 def test_every_turn_outcome_label_is_classified_fault_or_excluded():
-    """Cross-module drift gate between _turn_outcome and the fault allowlist.
+    """Cross-module drift gate between turn_outcome and the fault allowlist.
 
-    ``_turn_outcome`` (chat_runner) mints the labels; ``_TERMINAL_FAULT_OUTCOMES``
+    ``metrics.turns.turn_outcome`` mints the labels; ``_TERMINAL_FAULT_OUTCOMES``
     (telemetry) decides which count toward fault_rate. They are hand-synced lists
     in different modules, and because the aggregator is an allowlist, a label
     added to the emitter but classified in neither set would silently fall out of
     the fault_rate numerator while still growing the denominator — an optimistic
-    dashboard with no failing test. Labels are harvested from _turn_outcome's
-    return statements via AST so a new branch cannot dodge this gate."""
+    dashboard with no failing test. Labels are harvested from turn_outcome's
+    return statements via AST so a new branch cannot dodge this gate.
+
+    Harvested from ``metrics.turns`` rather than ``chat_runner``: the mapping
+    moved there when the emit was widened to every dispatch surface, and
+    ``chat_runner._turn_outcome`` is now a delegate whose source carries no label
+    constants at all — pointed at it, this gate would harvest an empty set and
+    pass no matter what the emitter did."""
     import ast
     import inspect
 
-    from kiro_crew.dashboard.chat_runner import _turn_outcome
     from kiro_crew.dashboard.handlers.telemetry import _TERMINAL_FAULT_OUTCOMES
+    from kiro_crew.metrics.turns import turn_outcome
 
     labels: set[str] = set()
-    for node in ast.walk(ast.parse(inspect.getsource(_turn_outcome))):
+    for node in ast.walk(ast.parse(inspect.getsource(turn_outcome))):
         if isinstance(node, ast.Return) and node.value is not None:
             labels |= {
                 c.value
@@ -980,9 +986,11 @@ def test_every_turn_outcome_label_is_classified_fault_or_excluded():
 
     # Non-faults, each with its exclusion reason pinned by the tests above:
     # "ok" succeeded; "tool_stall"/"stale_recover" are recovered-in-place stalls
-    # tracked under kirocrew.watchdog.recovery.outcome. Add a new label here or
+    # tracked under kirocrew.watchdog.recovery.outcome; "unclassified" is a turn
+    # whose surface had no stop reason to give, so calling it a fault would
+    # invent one for every clean background turn. Add a new label here or
     # to _TERMINAL_FAULT_OUTCOMES — never leave it unclassified.
-    excluded = {"ok", "tool_stall", "stale_recover"}
+    excluded = {"ok", "tool_stall", "stale_recover", "unclassified"}
     unclassified = labels - _TERMINAL_FAULT_OUTCOMES - excluded
     assert not unclassified, (
         f"_turn_outcome label(s) {sorted(unclassified)} are neither terminal "

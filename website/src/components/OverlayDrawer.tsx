@@ -21,6 +21,12 @@ interface Props {
    * animation of its own.
    */
   slideX?: MotionValue<number>
+  /**
+   * Slide mode only: the panel element, so the caller can hand it to
+   * `registerDrawerTargets` and let the settle run on the compositor. Without
+   * it the settle falls back to sampling the MotionValue on the main thread.
+   */
+  slideRef?: React.Ref<HTMLDivElement>
   /** Morph mode: the panel's visible window (clip-path) collapses into
    *  `morphTarget` and expands back out — the content itself never moves or
    *  deforms. The outer width still animates for layout reflow. */
@@ -45,7 +51,7 @@ interface Props {
 const EASE = [0.32, 0.72, 0, 1] as const
 const DUR = 0.24
 
-export default function OverlayDrawer({ open, width, dragging, slideX, morph, morphTarget, expandFrom, contentH, className, children }: Props) {
+export default function OverlayDrawer({ open, width, dragging, slideX, slideRef, morph, morphTarget, expandFrom, contentH, className, children }: Props) {
   const reduce = useReducedMotion()
   // Gesture end settles from the live presentation value via a critically
   // damped spring (no overshoot, no visible jump) — never a fixed ease tween.
@@ -73,6 +79,7 @@ export default function OverlayDrawer({ open, width, dragging, slideX, morph, mo
         {open && (
           <motion.div
             key="drawer-slide"
+            ref={slideRef}
             style={{ width, x: slideX }}
             className={`shrink-0 pb-2 overflow-hidden ${className || ''}`}
           >

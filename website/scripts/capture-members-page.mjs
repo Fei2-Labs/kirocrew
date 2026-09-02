@@ -22,9 +22,9 @@ const OUT = process.argv[3] || '../temp-screenshots/crew-members'
 mkdirSync(OUT, { recursive: true })
 
 const MEMBERS = [
-  { name: 'radar', slug: 'radar', bound: true, slot_key: 'member-radar', running: true, kiro_agent: 'kirocrew-autofix', workspace: 'autofix', memory_store: 'default', model: '' },
+  { name: 'radar', slug: 'radar', bound: true, slot_key: 'member-radar', running: true, kiro_agent: 'kirocrew-autofix', workspace: 'autofix', memory_store: 'default', model: '', last_active_ts: 1000, last_message: 'Six new issues: four covered by open PRs.' },
   { name: 'scout', slug: 'scout', bound: false, slot_key: '', running: false, kiro_agent: 'kirocrew-research', workspace: 'default', memory_store: 'default', model: 'claude-opus-5' },
-  { name: 'fixer', slug: 'fixer', bound: true, slot_key: 'member-fixer', running: false, kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'default', model: '' },
+  { name: 'fixer', slug: 'fixer', bound: true, slot_key: 'member-fixer', running: false, kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'default', model: '', last_active_ts: 900, last_message: 'Two PRs opened for the queue.' },
   { name: 'scribe', slug: 'scribe', bound: false, slot_key: '', running: false, kiro_agent: 'kirocrew-lite', workspace: 'docs', memory_store: 'default', model: '' },
 ]
 
@@ -48,10 +48,38 @@ async function newPage(theme, viewport = { width: 1280, height: 820 }) {
     if (path === '/api/members') {
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ members: MEMBERS, default_agent: 'kirocrew' }) })
     }
+    if (path === '/api/crons') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ jobs: [
+        { id: 'j1', name: 'nightly-triage', message: '', enabled: true, schedule: '0 2 * * *', last_status: 'ok', agent: 'radar' },
+        { id: 'j2', name: 'queue-scan', message: '', enabled: false, schedule: '*/15 * * * *', last_status: 'ok', agent: 'radar' },
+      ] }) })
+    }
+    if (path === '/api/webhooks') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ tokens: [
+        { id: 'w1', label: 'ci-callback', display_prefix: 'kc_whk_4f2b', last4: 'a9c1', created_at: 0, last_used_at: null, require_signature: true, agent: 'radar', enabled: true },
+      ] }) })
+    }
+    if (path === '/api/agents') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ agents: [], default_agent: 'kirocrew' }) })
+    }
     const thread = path.match(/^\/api\/members\/([^/]+)\/thread$/)
     if (thread) {
       const slug = decodeURIComponent(thread[1])
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ slot_key: `member-${slug}`, slug, member: slug, created: false }) })
+    }
+    if (/^\/api\/members\/[^/]+\/activity$/.test(path)) {
+      const now = Date.now() / 1000
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        slug: 'radar',
+        member: 'radar',
+        capped: false,
+        entries: [
+          { ts: now - 180, via: 'chat', project: '' },
+          { ts: now - 2700, via: 'select_crew', project: 'demo-app' },
+          { ts: now - 7200, via: 'chat', project: '' },
+          { ts: now - 86400, via: 'chat', project: 'demo-app' },
+        ],
+      }) })
     }
     if (/^\/api\/chat\/slots\/[^/]+$/.test(path)) {
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
@@ -75,8 +103,14 @@ async function newPage(theme, viewport = { width: 1280, height: 820 }) {
   const page = await newPage('dark')
   const rows = await page.getByRole('listitem').count()
   check('01-roster rows', rows >= 4, `listitems=${rows}`)
-  const working = await page.getByText('Working').count()
-  check('01-roster live presence', working >= 1, `working-labels=${working} (store-driven dot for member-radar)`)
+  const statusLabels = await page.getByText(/^(Working|Idle)$/).count()
+  check('01-roster no status labels', statusLabels === 0, `status-labels=${statusLabels} (presence rides the avatar dot)`)
+  const preview = await page.getByText('Six new issues: four covered by open PRs.').count()
+  check('01-roster last-message preview', preview >= 1, `preview-rows=${preview}`)
+  const search = await page.getByTestId('member-search').count()
+  check('01-roster search box', search === 1, `search-inputs=${search}`)
+  const dots = await page.getByTestId('member-presence-dot').count()
+  check('01-roster presence dot only when running', dots === 1, `dots=${dots} (radar runs; idle rows show none)`)
   await page.screenshot({ path: `${OUT}/01-roster-dark.png` })
   await page.close()
 }
@@ -85,13 +119,29 @@ async function newPage(theme, viewport = { width: 1280, height: 820 }) {
 {
   const page = await newPage('dark')
   await page.getByText('radar', { exact: true }).first().click()
-  await page.getByTestId('member-pin-chip').waitFor()
-  const chip = await page.getByTestId('member-pin-chip').textContent()
-  check('02-thread pin chip', /radar/.test(chip || ''), `chip=${JSON.stringify(chip)}`)
+  // No pin chip: the pin is an invariant of every member thread, so the
+  // header no longer announces it. The drawer toggle is the one header action.
   await page.getByTestId('member-drawer').waitFor()
+  const chipGone = !(await page.getByTestId('member-pin-chip').isVisible())
+  check('02-thread no pin chip', chipGone, 'header carries no pin chip')
   const drawer = await page.getByTestId('member-drawer').textContent()
   check('02-thread drawer config', /kirocrew-autofix/.test(drawer || ''), 'agent template shown')
   check('02-thread shared-memory note', /share one memory/i.test(drawer || ''), 'disclosure present')
+  // Activity additions: honest counters + the recorded timeline. Four fixture
+  // entries; the routed one carries its project label.
+  await page.getByTestId('member-activity').waitFor()
+  const activityRows = await page.getByTestId('member-activity').locator('li').count()
+  check('02-thread activity timeline', activityRows === 4, `entries=${activityRows}`)
+  const stats = await page.getByTestId('member-stats').textContent()
+  check('02-thread stat cards', /Today/.test(stats || '') && /Past 7 days/.test(stats || ''), 'both honest counters labeled')
+  const status = await page.getByTestId('member-drawer-status').textContent()
+  check('02-thread drawer status', /Working/.test(status || ''), `status=${(status || '').trim()}`)
+  // Wake sources: two schedules (one paused) + one webhook bound to radar.
+  await page.getByTestId('member-wake-sources').waitFor()
+  const wakeRows = await page.getByTestId('member-wake-sources').locator('li').count()
+  const wakeText = await page.getByTestId('member-wake-sources').textContent()
+  check('02-thread wake sources', wakeRows === 3, `rows=${wakeRows}`)
+  check('02-thread wake content', /nightly-triage/.test(wakeText || '') && /ci-callback/.test(wakeText || '') && /paused/.test(wakeText || ''), 'schedule + webhook + paused marker present')
   await page.screenshot({ path: `${OUT}/02-thread-drawer-dark.png` })
   await page.close()
 }
@@ -108,15 +158,15 @@ async function newPage(theme, viewport = { width: 1280, height: 820 }) {
   await page.getByText('radar', { exact: true }).first().click()
   await page.getByTestId('member-back').waitFor()
   const backVisible = await page.getByTestId('member-back').isVisible()
-  // The pin chip AND the header Edit button are DELIBERATELY hidden below
-  // md/sm (chip wrapped the header into three lines; a third peer action
-  // beside Back + Details clips — the drawer carries the Edit jump instead).
+  // The pin chip and the header Edit button no longer exist at ANY width:
+  // the pin is an invariant (nothing to announce) and Edit lives in the
+  // drawer as a secondary action. Assert their absence stayed absent.
   const editHidden = !(await page.getByTestId('member-edit-jump').isVisible())
   const chipHidden = !(await page.getByTestId('member-pin-chip').isVisible())
   check(
     '03b-mobile selected single-pane',
     backVisible && editHidden && chipHidden,
-    'back visible; edit + chip hidden (drawer carries edit)',
+    'back visible; no header edit, no pin chip (drawer carries edit)',
   )
   await page.screenshot({ path: `${OUT}/03b-mobile-390-thread.png` })
   await page.close()
@@ -126,8 +176,34 @@ async function newPage(theme, viewport = { width: 1280, height: 820 }) {
 {
   const page = await newPage('light')
   await page.getByText('radar', { exact: true }).first().click()
-  await page.getByTestId('member-pin-chip').waitFor()
+  await page.getByTestId('member-drawer').waitFor()
   await page.screenshot({ path: `${OUT}/04-thread-light.png` })
+  await page.close()
+}
+
+// 05 — wide viewport: the DM transcript carries the main chat's reading
+// measure — the user's Content width setting resolved through CONTENT_WIDTH;
+// a fresh profile is the compact default, 800px. Only visible on a wide
+// column, hence the 1920px frame; the assertion reads the computed style so
+// a silently dropped prop cannot pass.
+{
+  const page = await newPage('dark', { width: 1920, height: 900 })
+  await page.getByText('radar', { exact: true }).first().click()
+  await page.getByTestId('chat-pane-stub').waitFor().catch(() => {})
+  await page.getByText('What did you triage tonight?').waitFor()
+  const cap = await page.evaluate(() => {
+    const row = document.querySelector('[data-chat-pane] .mx-auto.w-full')
+    return row ? getComputedStyle(row).maxWidth : ''
+  })
+  check('05-wide transcript reading width', cap === '800px', `maxWidth=${cap}`)
+  // Both halves of the measure: the composer follows the setting's input
+  // width too (compact = 816px), not its 900px CSS-var fallback.
+  const inputCap = await page.evaluate(() => {
+    const el = document.querySelector('[data-chat-pane] .input-area')
+    return el ? getComputedStyle(el).maxWidth : ''
+  })
+  check('05-wide composer input width', inputCap === '816px', `maxWidth=${inputCap}`)
+  await page.screenshot({ path: `${OUT}/05-thread-wide-1920.png` })
   await page.close()
 }
 

@@ -29,6 +29,7 @@ from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState
 from kiro_crew.dashboard.token_auth import (
     MAX_SESSION_TTL_SECS,
     _b64url_decode,
+    required_peer_key_unverified,
 )
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.messaging.privacy_mode import hydrate as _hydrate_conv_flags
@@ -73,39 +74,101 @@ _MAX_BODY_BYTES = 64 * 1024
 
 
 async def read_bounded_json(
-    request: web.Request, max_bytes: int = _MAX_BODY_BYTES
+    request: web.Request,
+    max_bytes: int | None = _MAX_BODY_BYTES,
+    *,
+    allow_absent: bool = False,
 ) -> tuple[dict[str, Any] | None, web.Response | None]:
     """Read and parse a JSON *object* request body, capped at *max_bytes*.
 
     Returns ``(body, None)`` on success, or ``(None, error_response)`` when the
-    caller should return early. The cap is enforced BEFORE decoding: a
-    Content-Length precheck rejects an oversized declared body, and the stream
-    is then read incrementally so a chunked body (which carries no
-    Content-Length) cannot buffer past ``max_bytes + one chunk`` on the
-    event-loop thread. Consolidates the previously-duplicated block in
-    ``messaging.api_notification_agent_push`` and
-    ``notifications_push.api_push_notification`` so the cap and the 413/400
-    contract stay identical across both (issue #490).
+    caller should return early. This owns the parse-and-shape guard for the
+    endpoints routed through it: ``await request.json()`` happily returns a
+    list, string, or number for a body that is valid JSON but not an object, and
+    a handler that then calls ``.get()`` on the result turns a client mistake
+    into a 500 (issue #5587).
+
+    NOT yet the dashboard's only such guard. Four siblings survive and diverge:
+    ``handlers_channel._json_object`` (same ``invalid_json``/``body_not_object``
+    codes, but raises ``HTTPBadRequest`` instead of returning the response),
+    ``handlers/hooks.py::_json_object`` (``default_empty=True`` collapses a
+    MALFORMED body to defaults -- the defect this issue fixed in
+    ``api_memory_promote``), ``handlers/session_storage.py::_json_body``
+    (deliberately different: an empty body is legitimate there, and it
+    documents why), and ``handlers/artifacts.py::_read_json_body`` (raises
+    ``ArtifactValidationError``, carries its own cap). Folding or narrowing each
+    is tracked on issue #5587 alongside the remaining handler sweep -- claiming
+    one owner before that is done would be a claim the tree does not support.
+
+    The cap is enforced BEFORE decoding: a Content-Length precheck rejects an
+    oversized declared body, and the stream is then read incrementally so a
+    chunked body (which carries no Content-Length) cannot buffer past
+    ``max_bytes + one chunk`` on the event-loop thread. That bound is the point
+    of the helper for the strict-internal notification routes (issue #490).
+
+    ``max_bytes=None`` reads the body whole with no pre-decode ceiling, for the
+    endpoints that have no principled byte limit today (a knowledge bundle
+    import has no defensible maximum size). It is deliberately explicit rather
+    than the default: an endpoint opting out of the cap should say so at the
+    call site, and giving one of those endpoints a real ceiling later is then a
+    one-argument change here instead of a re-plumb.
+
+    Which one a converting caller wants is a real choice, not a default to
+    inherit: take the cap when the body is a fixed set of control fields (an
+    identifier, a flag, a number), and ``None`` only when the body legitimately
+    carries user content of unbounded size (file contents, an export, a fetched
+    document). Note that switching a site TO the cap also moves it off
+    ``request.json()`` onto the streaming read, so that handler's unit tests
+    must feed ``content``/``content_length`` rather than mocking ``json``.
+
+    *allow_absent* treats a request with no readable body as an empty object,
+    for endpoints whose fields all have defaults. A body that is *present but
+    malformed* is still a 400 -- "the client sent nothing" and "the client sent
+    garbage" are different facts, and only the first one can be defaulted.
+
+    Decoding matches ``request.json()`` on both paths -- ``decode(charset or
+    utf-8)`` then ``loads`` -- so the two differ only in whether the read is
+    bounded, and the declared ``charset=`` is honoured either way. The uncapped
+    path calls ``request.json()`` itself rather than reimplementing it, which is
+    what makes converting a ``try: await request.json()`` site a drop-in: no
+    handler and no test harness sees a different read.
+
+    The catch is narrowed to the three client-input failures -- ``ValueError``
+    (which covers ``json.JSONDecodeError`` and ``UnicodeDecodeError``),
+    ``LookupError`` (an unknown ``charset=`` codec), and ``RecursionError`` (a
+    deeply nested document blowing the parser's stack). Transport failures (a
+    disconnect mid-body, a read timeout) deliberately propagate: they are not a
+    client JSON mistake and keep their 500 status class.
     """
-    if request.content_length and request.content_length > max_bytes:
-        return None, web.json_response(
-            {"error": "payload too large", "code": "payload_too_large"}, status=413
-        )
-    chunks: list[bytes] = []
-    received = 0
-    async for chunk in request.content.iter_chunked(8192):
-        received += len(chunk)
-        if received > max_bytes:
+    if allow_absent and not request.can_read_body:
+        return {}, None
+    if max_bytes is None:
+        try:
+            body = await request.json()
+        except (LookupError, RecursionError, ValueError):
+            return None, web.json_response(
+                {"error": "invalid JSON", "code": "invalid_json"}, status=400
+            )
+    else:
+        if request.content_length and request.content_length > max_bytes:
             return None, web.json_response(
                 {"error": "payload too large", "code": "payload_too_large"}, status=413
             )
-        chunks.append(chunk)
-    try:
-        body = json.loads(b"".join(chunks))
-    except Exception:
-        return None, web.json_response(
-            {"error": "invalid JSON body", "code": "invalid_json"}, status=400
-        )
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.content.iter_chunked(8192):
+            received += len(chunk)
+            if received > max_bytes:
+                return None, web.json_response(
+                    {"error": "payload too large", "code": "payload_too_large"}, status=413
+                )
+            chunks.append(chunk)
+        try:
+            body = json.loads(b"".join(chunks).decode(request.charset or "utf-8"))
+        except (LookupError, RecursionError, ValueError):
+            return None, web.json_response(
+                {"error": "invalid JSON", "code": "invalid_json"}, status=400
+            )
     if not isinstance(body, dict):
         return None, web.json_response(
             {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
@@ -1429,7 +1492,6 @@ def list_skill_tree(skill_root: Path) -> list[dict[str, Any]]:
     real path escapes *skill_root* are omitted.
     """
     out: list[dict[str, Any]] = []
-    skipped = 0
     for dirpath, dirnames, filenames in os.walk(skill_root, followlinks=False):
         # Stable order — reproducible across runs / tests.
         dirnames.sort()
@@ -1446,18 +1508,15 @@ def list_skill_tree(skill_root: Path) -> list[dict[str, Any]]:
         for f in filenames:
             full = Path(dirpath) / f
             if is_sensitive_path(str(full)):
-                skipped += 1
                 continue
             try:
                 if full.is_symlink():
                     real = full.resolve(strict=True)
                     real.relative_to(skill_root.resolve(strict=True))
                     if is_sensitive_path(str(real)):
-                        skipped += 1
                         continue
                 stat = full.stat()
             except (OSError, ValueError):
-                skipped += 1
                 continue
             rel = full.relative_to(skill_root).as_posix()
             out.append({"path": rel, "type": "file", "size": int(stat.st_size)})
@@ -1523,9 +1582,10 @@ def _caller_bounds(request: web.Request) -> tuple[dict[str, str], int]:
     copied verbatim (same rule as the link→session exchange in ``token_auth``),
     ``no_refresh`` copied so the recipient session never grows a refresh chain,
     and the remaining ``session_exp`` becomes the TTL ceiling so a short-lived
-    caller cannot mint a longer-lived credential. Fail-closed on an unreadable
-    payload: a caller whose bounds cannot be established gets a bounded
-    (no-refresh, default-TTL-capped) link rather than an unbounded one.
+    caller cannot mint a longer-lived credential. ``require_peer`` and its
+    signed ``peer_key`` move as one inseparable device bound. Fail-closed on an
+    unreadable payload: a caller whose bounds cannot be established gets a
+    bounded (no-refresh, default-TTL-capped) link rather than an unbounded one.
 
     **Read the credential the middleware VALIDATED, not a re-extracted one.**
     Only that credential has a verified signature; the other one was never
@@ -1562,6 +1622,13 @@ def _caller_bounds(request: web.Request) -> tuple[dict[str, str], int]:
             carried["boot"] = boot
         if str(data.get("no_refresh", "")) == "1":
             carried["no_refresh"] = "1"
+        if str(data.get("require_peer", "")) == "1":
+            carried["require_peer"] = "1"
+            # Middleware refuses a claimless require_peer cookie, so the
+            # fallback is unreachable on a real authenticated request. Keep it
+            # fail-closed for direct test doubles or future alternate auth:
+            # an impossible key mints an unusable child instead of widening it.
+            carried["peer_key"] = required_peer_key_unverified(token) or "unverified"
         session_exp = float(data.get("session_exp", 0.0))
         if session_exp:
             remaining = int(session_exp - time.time())
@@ -1846,9 +1913,8 @@ async def require_owner_dashboard_request(
         return None
 
     # Off the loop: the FIRST sel() of a process CONSTRUCTS the log (trust-dir
-    # creation, key validation, on Windows an icacls subprocess), so on a fresh
-    # gateway whose first mutating request is non-owner this would stall every
-    # other request.
+    # creation, key validation — blocking file IO), so on a fresh gateway whose
+    # first mutating request is non-owner this would stall every other request.
     caller = str(request.get("user") or "unknown")
     try:
         from kiro_crew.sel import sel as _sel

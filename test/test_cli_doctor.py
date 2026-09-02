@@ -19,6 +19,43 @@ from conftest import requires_symlinks
 from kiro_crew import cli_doctor, cron
 
 
+class TestManagedServicePolicyDoctor:
+    def test_no_service_is_silent(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_doctor.service_controller,
+            "installed_service_has_managed_marker",
+            lambda: None,
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_managed_service_policy(issues)
+        assert capsys.readouterr().out == ""
+        assert issues == []
+
+    def test_stale_service_names_the_one_time_fix(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_doctor.service_controller,
+            "installed_service_has_managed_marker",
+            lambda: False,
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_managed_service_policy(issues)
+        output = capsys.readouterr().out
+        assert "kirocrew service install" in output
+        assert "managed-service defaults" in output
+        assert issues == ["managed service definition is outdated"]
+
+    def test_current_service_reports_managed_policy(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli_doctor.service_controller,
+            "installed_service_has_managed_marker",
+            lambda: True,
+        )
+        issues: list[str] = []
+        cli_doctor._doctor_managed_service_policy(issues)
+        assert "managed-service policy marker installed" in capsys.readouterr().out
+        assert issues == []
+
+
 class TestFixHint:
     """OS-aware `kirocrew doctor` fix hints."""
 
@@ -1500,11 +1537,13 @@ class TestEffectiveModelSection:
         monkeypatch.setattr(cli_doctor, "project_agent_files", lambda d: [hostile])
         monkeypatch.setattr(cli_doctor, "project_agent_name", lambda p: "kirocrew")
         # Only the injected path is faked; the user-level spec still goes through
-        # the real reader so the report's own self-check is not disturbed.
+        # the real reader so the report's own self-check is not disturbed. The
+        # stub forwards **kw because the reader takes keyword-only SEL
+        # attribution labels (#6722) that this test does not care about.
         monkeypatch.setattr(
             cli_doctor,
             "_read_agent_spec",
-            lambda p: {"model": "m"} if p == hostile else real_reader(p),
+            lambda p, **kw: {"model": "m"} if p == hostile else real_reader(p, **kw),
         )
         issues: list[str] = []
 

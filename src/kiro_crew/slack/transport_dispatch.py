@@ -17,6 +17,7 @@ unaffected (they don't go through events.py Slack dispatch).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -38,6 +39,7 @@ from kiro_crew.messaging.link import canonical_key
 from kiro_crew.platform import current_context
 from kiro_crew.providers.acp import provider_label
 from kiro_crew.sel import sel
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.slack.handler import (
     _get_default_agent,
     _hydrate_conv_flags,
@@ -136,6 +138,7 @@ async def handle_message_transport(
     consolidator: HistoryConsolidator | None = None,
     user_display_name: str | None = None,
     gateway: Any | None = None,
+    from_trusted_bot: bool = False,
 ) -> None:
     """Drive a Slack message through the new transport path end-to-end.
 
@@ -613,8 +616,10 @@ async def handle_message_transport(
             decider=decider,
             # Preserve native handle_message's auto_approve_subagent_spawn hook:
             # auto-approve spawn_run when the context builder's hook is enabled,
-            # regardless of the interactive ladder.
-            auto_approve_tool=lambda title: _should_auto_approve_spawn(context_builder, title),
+            # regardless of the interactive ladder. The predicate takes the
+            # permission EVENT so identity comes from event.tool_name/is_shell,
+            # never the model-authored title.
+            auto_approve_tool=lambda event: _should_auto_approve_spawn(context_builder, event),
             # Per-session Trust (set via the Trust button) auto-approves all
             # subsequent tools for THIS session, mirroring native. Checked per
             # permission request so a mid-turn Trust click takes effect for the
@@ -632,6 +637,9 @@ async def handle_message_transport(
             directive_consumer=build_directive_consumer(
                 session_key=session_key, sessions=sessions, dispatcher=gateway
             ),
+            audit_session_key=session_key,
+            audit_agent=_agent or "kirocrew",
+            closing_gate=lambda: sessions.begin_turn(session_key),
         )
         # The thread's owner as of the moment the turn starts producing output.
         # A dashboard link landing during the run moves the conversation to a
@@ -868,16 +876,41 @@ async def handle_message_transport(
                 exc_info=True,
             )
 
+    except SessionClosingError:
+        # Shutdown began between the claim and the dispatch, so no turn opened.
+        # Mirrors the native handler's own gate: clear the thread status and
+        # return quietly. Deliberately NOT the generic branch below -- a restart
+        # is not a session fault (record_failure counts toward tripping the
+        # circuit breaker on a session that never misbehaved), is not a failed
+        # message, and does not warrant an error posted into the thread.
+        logger.info("Aborting Slack dispatch for %s — gateway is shutting down", session_key)
+        with contextlib.suppress(Exception):
+            await slack.set_thread_status(channel, reply_ts, "")
     except Exception:
         logger.exception("transport_dispatch: error handling message")
         Stats().inc_message_failed()
         if client and _acquired:
             await sessions.record_failure(session_key)
-        # Post error to Slack so user knows something went wrong
-        try:
-            await slack.post_message(
-                channel, "🔧 Something went wrong (transport path). Please try again.", reply_ts
+        # Post error to Slack so user knows something went wrong. The error
+        # MESSAGE is suppressed for trusted-bot messages: in a mutual-mesh
+        # setup (A trusts B, B trusts A) an error reply is itself a
+        # bot-authored event the peer admits, so replying would open an
+        # unbounded error-reply ping-pong. Mirrors the native path's guard in
+        # handler.py (from_trusted_bot and _had_error). The thread STATUS is
+        # cleared unconditionally — skipping it would leave a stale "working"
+        # status pinned to the thread forever.
+        if from_trusted_bot:
+            logger.info(
+                "Suppressing transport error reply to trusted bot message (echo-loop guard)"
             )
+        else:
+            try:
+                await slack.post_message(
+                    channel, "🔧 Something went wrong (transport path). Please try again.", reply_ts
+                )
+            except Exception:
+                pass
+        try:
             await slack.set_thread_status(channel, reply_ts, "")
         except Exception:
             pass

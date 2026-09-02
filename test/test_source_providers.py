@@ -1265,6 +1265,17 @@ async def test_fetch_github_normalizes_commits_checks_comments_and_files(monkeyp
     )
 
     assert data["provider"] == "github"
+    # The plugin contract (`SourceChangePayload`) is defined as "what the
+    # built-in fetchers produce", so the two must not drift: a key added to or
+    # removed from `_fetch_github` without the schema (or vice versa) breaks
+    # every downstream plugin silently. Exact equality, both directions (the
+    # GitHub fetcher emits none of the `total=False` extras).
+    assert set(data) == set(source.SourceChangePayload.__required_keys__)
+    assert set(data["commits"][0]) == set(source.SourceChangeCommit.__annotations__)
+    assert set(data["files"][0]) == set(source.SourceChangeFile.__annotations__)
+    assert {frozenset(comment) for comment in data["comments"]} == {
+        frozenset(source.SourceChangeComment.__annotations__)
+    }
     assert data["mergeable"] == "conflicting"
     assert data["mergeStateStatus"] == "dirty"
     assert data["commits"][0]["sha"] == "abc123"
@@ -3656,11 +3667,11 @@ async def test_gitlab_allowlist_never_reads_config_on_the_event_loop(monkeypatch
     in a worker thread; the sync accessor every URL parse uses is cache-only."""
     calls: list[str] = []
 
-    def fake_load() -> tuple[frozenset[str], frozenset[str]]:
+    def fake_load() -> tuple[frozenset[str], frozenset[str], bool]:
         calls.append("load")
-        return frozenset({"gitlab.acme.internal"}), frozenset()
+        return frozenset({"gitlab.acme.internal"}), frozenset(), True
 
-    monkeypatch.setattr(source, "_load_provider_hosts", fake_load)
+    monkeypatch.setattr(source, "_load_source_link_settings", fake_load)
     monkeypatch.setattr(source, "_gitlab_hosts_snapshot", frozenset())
     monkeypatch.setattr(source, "_gitlab_hosts_loaded_at", 0.0)
     to_thread_calls: list[object] = []
@@ -3959,20 +3970,20 @@ async def test_concurrent_allowlist_refresh_cannot_restore_a_revoked_host(monkey
     release = source.asyncio.Event()
     loads = {"n": 0}
 
-    def slow_stale_load() -> tuple[frozenset[str], frozenset[str]]:
+    def slow_stale_load() -> tuple[frozenset[str], frozenset[str], bool]:
         loads["n"] += 1
         # asyncio.Event is not thread-safe: this runs in a worker thread, so the
         # set() must be marshalled back onto the loop.
         loop.call_soon_threadsafe(started.set)
         # Block inside the worker thread so a second waiter queues on the lock.
         source.asyncio.run_coroutine_threadsafe(_noop(), loop).result(timeout=5)
-        return frozenset({"gitlab.acme.internal"}), frozenset()
+        return frozenset({"gitlab.acme.internal"}), frozenset(), True
 
     async def _noop() -> None:
         await release.wait()
 
     loop = source.asyncio.get_running_loop()
-    monkeypatch.setattr(source, "_load_provider_hosts", slow_stale_load)
+    monkeypatch.setattr(source, "_load_source_link_settings", slow_stale_load)
     monkeypatch.setattr(source, "_gitlab_hosts_snapshot", frozenset())
     monkeypatch.setattr(source, "_gitlab_hosts_loaded_at", 0.0)
     monkeypatch.setattr(source, "_gitlab_hosts_lock", source.asyncio.Lock())
@@ -4938,7 +4949,9 @@ async def test_resolve_handler_denies_local_token_when_no_owner(
     monkeypatch, _mock_source_sel
 ) -> None:
     """The local no-owner fallback is scoped to reads: the resolve *mutation*
-    stays owner-only, so a local-app token with no owner still fails closed."""
+    stays owner-only, so a local-app token with no owner still fails closed —
+    but the refusal names the remedy with a machine-readable code, because this
+    caller class saw live buttons whose reads already succeeded."""
     resolve = AsyncMock()
     monkeypatch.setattr(source, "resolve_pull_request_thread", resolve)
 
@@ -4948,7 +4961,9 @@ async def test_resolve_handler_denies_local_token_when_no_owner(
             json={"url": "https://github.com/acme/repo/pull/1", "threadId": "PRRT_1"},
         )
         assert response.status == 403
-        assert (await response.json()) == {"error": "forbidden"}
+        body = await response.json()
+        assert body["code"] == source.OWNER_NOT_CONFIGURED_CODE
+        assert "Owner Slack member ID" in body["error"]
 
     resolve.assert_not_awaited()
 
@@ -5209,12 +5224,47 @@ async def test_action_handlers_deny_local_token_when_no_owner(
     monkeypatch, _mock_source_sel, path: str, action_name: str
 ) -> None:
     """The local no-owner fallback is scoped to reads: these mutations stay
-    owner-only, so a local-app token with no owner still fails closed."""
+    owner-only, so a local-app token with no owner still fails closed — with
+    the coded, actionable body reserved for signed local dashboard sessions."""
     action = AsyncMock()
     monkeypatch.setattr(source, action_name, action)
 
     async with TestClient(TestServer(_app(owner_id="", user="local-app", app_name=""))) as client:
         response = await client.post(path, json={"url": "https://github.com/acme/repo/pull/1"})
+        assert response.status == 403
+        body = await response.json()
+        assert body["code"] == source.OWNER_NOT_CONFIGURED_CODE
+        assert "Owner Slack member ID" in body["error"]
+
+    action.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "app_kwargs",
+    [
+        # A non-local subject must not learn which denial class it hit.
+        {"owner_id": "", "user": "U_OTHER", "app_name": ""},
+        # Nor an app token, even one carrying a local-shaped subject.
+        {"owner_id": "", "user": "local-app", "app_name": "app-X"},
+        # Nor an unauthenticated caller with no user claim at all.
+        {"owner_id": "", "user": "", "app_name": ""},
+    ],
+)
+async def test_no_owner_mutation_code_reserved_for_signed_local_subjects(
+    monkeypatch, _mock_source_sel, app_kwargs: dict
+) -> None:
+    """The ``owner_not_configured`` discriminator is scoped exactly like
+    ``stale_owner_session_response``: every caller that is not a signed
+    machine-local dashboard session keeps the generic body."""
+    action = AsyncMock()
+    monkeypatch.setattr(source, "enable_pull_request_auto_merge", action)
+
+    async with TestClient(TestServer(_app(**app_kwargs))) as client:
+        response = await client.post(
+            "/api/source/pull-request/auto-merge",
+            json={"url": "https://github.com/acme/repo/pull/1"},
+        )
         assert response.status == 403
         assert (await response.json()) == {"error": "forbidden"}
 
@@ -5805,6 +5855,59 @@ def test_self_hosted_jira_rejected_when_allowlist_empty(monkeypatch) -> None:
     monkeypatch.setattr(source, "_jira_hosts_snapshot", frozenset())
     with pytest.raises(ValueError, match="dashboard.jira_hosts"):
         source.parse_source_url("https://jira.acme.internal/browse/PROJ-1")
+
+
+class TestSourceRefLabel:
+    """``source_ref_label`` -- what a sidebar chip is CALLED.
+
+    These assertions were previously spread across the sidebar's own render
+    fixtures, where each provider's punctuation was rebuilt by a template
+    string. They live here now because this is the side that knows the
+    convention, and the renderer prints whatever it is handed.
+    """
+
+    def test_github_uses_hash_for_both_namespaces(self) -> None:
+        """GitHub writes ``#123`` for a pull request and an issue alike -- the two
+        namespaces share one number counter, and the provider does not
+        distinguish them in writing either."""
+        pull = source.parse_source_url("https://github.com/acme/widgets/pull/123")
+        issue = source.parse_source_url("https://github.com/acme/widgets/issues/124")
+        assert source.source_ref_label(pull) == "#123"
+        assert source.source_ref_label(issue) == "#124"
+
+    def test_gitlab_bangs_only_the_merge_request(self) -> None:
+        """``!7`` is GitLab's mark for a MERGE REQUEST specifically; its issues
+        are ``#7``. Labelling a GitLab issue ``!7`` names an unrelated object
+        that usually also exists, which is why the split is pinned rather than
+        left to whichever renderer formats the chip."""
+        mr = source.parse_source_url("https://gitlab.com/acme/service/-/merge_requests/7")
+        issue = source.parse_source_url("https://gitlab.com/acme/service/-/issues/7")
+        assert source.source_ref_label(mr) == "!7"
+        assert source.source_ref_label(issue) == "#7"
+
+    def test_jira_label_is_the_whole_key(self) -> None:
+        """Jira has no bare number: ``PROJ-123`` is the identifier. This is the
+        case that had the serializer shipping a project key purely so the
+        renderer could paste it back on."""
+        ref = source.parse_source_url("https://acme.atlassian.net/browse/PROJ-123")
+        assert source.source_ref_label(ref) == "PROJ-123"
+
+    def test_unknown_provider_borrows_no_vendor_punctuation(self) -> None:
+        """A provider this build does not know gets ``#``, the most widely shared
+        convention -- never ``!``, which would assert it is GitLab. Constructed
+        directly because ``parse_source_url`` cannot yet produce such a ref; the
+        point is that the label function is total over its input rather than
+        exhaustive over today's three providers."""
+        ref = source.SourceRef(
+            "acme-review",
+            "https://review.acme.internal/c/4821",
+            "review.acme.internal",
+            "acme",
+            "widgets",
+            4821,
+            kind="change",
+        )
+        assert source.source_ref_label(ref) == "#4821"
 
 
 @pytest.mark.parametrize(

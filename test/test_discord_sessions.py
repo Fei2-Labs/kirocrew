@@ -20,6 +20,7 @@ from kiro_crew.messaging import session_resume as session_resume_core
 from kiro_crew.messaging.link import UNBIND_REASON_UNSPECIFIED, ChannelLink
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import _opt_out_key
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 
@@ -114,6 +115,10 @@ class _Sessions:
 
     def __init__(self) -> None:
         self.mirror_links: dict[str, ChannelLink] = {}
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self.flushed: list[dict] = []
         self.flush_error: Exception | None = None
         self.origin_links: dict[str, ChannelLink] = {}
@@ -220,6 +225,16 @@ class _Sessions:
         self.last_key = key
         self.last_agent = kwargs.get("agent")
         return self.provider, getattr(self, "is_new_result", False), True
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate.
+
+        ``closing`` mirrors SessionManager._closing so this refuses the dispatch
+        the way the real gate does once close_all has run.
+        """
+        self.begin_turns = getattr(self, "begin_turns", 0) + 1
+        if getattr(self, "closing", False):
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel: str) -> None:
         self.set_channel_calls = getattr(self, "set_channel_calls", [])

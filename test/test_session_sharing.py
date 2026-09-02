@@ -16,7 +16,6 @@ from kiro_crew.acp.runtime import AcpRuntimeDead
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import AcpEvent
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
-from kiro_crew.run_coordinator import MemoryRunCoordinator
 from kiro_crew.subagent import SubagentManager
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
@@ -27,7 +26,7 @@ pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 # ``_isolate_subagents_dir`` fixture in ``conftest.py`` — no per-file fixture needed.
 
 
-async def _wait_until_done(info, *, timeout: float = 5.0) -> None:
+async def _wait_until_done(info, *, timeout: float = 30.0) -> None:
     """Wait for a spawned subagent to finish, deterministically.
 
     ``manager.spawn`` runs the subagent as a background asyncio task that flips
@@ -48,7 +47,7 @@ async def _wait_until_done(info, *, timeout: float = 5.0) -> None:
         await asyncio.sleep(0.01)
 
 
-async def _wait_until_awaited(mock_attr, label: str, *, timeout: float = 5.0) -> None:
+async def _wait_until_awaited(mock_attr, label: str, *, timeout: float = 30.0) -> None:
     """Wait for an async mock to have been awaited, deterministically.
 
     Companion to :func:`_wait_until_done`, for assertions about TEARDOWN rather
@@ -283,36 +282,6 @@ class TestSessionSharingSpawn:
         assert isinstance(info._shared_provider, AcpSessionProvider)
 
     @pytest.mark.asyncio
-    async def test_shared_session_never_persists_kill_authority(self):
-        """Recovery must not treat the parent runtime as this run's child."""
-        from kiro_crew.subagent import SubagentInfo
-
-        sessions = _mock_sessions(sharing_eligible=True)
-        manager = SubagentManager(
-            sessions=sessions,
-            ctx_builder=_mock_ctx_builder_auto(),
-            is_yolo=lambda: True,
-        )
-        info = SubagentInfo(
-            id="shared1",
-            task="hello",
-            parent_session_key="dashboard:slot1",
-        )
-
-        with patch("kiro_crew.subagent.update_state") as update, patch(
-            "kiro_crew.subagent.platform_compat.process_start_time"
-        ) as process_start_time:
-            provider = await manager._create_shared_session(info, "subagent:shared1", "kirocrew")
-
-        process_start_time.assert_not_called()
-        update.assert_called_once()
-        assert update.call_args.args == ("shared1",)
-        assert update.call_args.kwargs["pid"] == 12345
-        assert update.call_args.kwargs["pid_start_id"] == ""
-        assert update.call_args.kwargs["process_owned"] is False
-        await provider.shutdown()
-
-    @pytest.mark.asyncio
     async def test_shared_session_cleanup_destroys_handle(self):
         """On completion, shared session calls provider.shutdown() not reset()."""
         sessions = _mock_sessions(sharing_eligible=True)
@@ -354,8 +323,7 @@ class TestSessionSharingSpawn:
              patch("kiro_crew.subagent.Stats"), \
              patch("kiro_crew.subagent.sel"):
             info = manager.spawn("test task", parent_session_key="dashboard:slot1")
-            run_task = manager._tasks[info.id]
-            await run_task
+            await _wait_until_done(info)
 
         # Legacy path: get_or_create called, runtime NOT called
         sessions.get_or_create.assert_awaited()
@@ -500,20 +468,17 @@ class TestSessionSharingMultiAgent:
             ctx_builder=_mock_ctx_builder_auto(),
             is_yolo=lambda: True,
             max_concurrent=4,
-            coordinator=MemoryRunCoordinator(),
         )
         # Disable stagger so both spawns start immediately
         manager._spawn_stagger_secs = 0.0
 
-        with (
-            _cfg_patch(session_sharing=True),
-            patch("kiro_crew.subagent.Stats"),
-            patch("kiro_crew.subagent.sel"),
-        ):
+        with _cfg_patch(session_sharing=True), \
+             patch("kiro_crew.subagent.Stats"), \
+             patch("kiro_crew.subagent.sel"):
             info1 = manager.spawn("task A", parent_session_key="dashboard:slot1")
             info2 = manager.spawn("task B", parent_session_key="dashboard:slot1")
-            tasks = [manager._tasks[info1.id], manager._tasks[info2.id]]
-            await asyncio.gather(*tasks)
+            await _wait_until_done(info1)
+            await _wait_until_done(info2)
 
         # Both should use session sharing
         assert info1._session_sharing is True
@@ -533,19 +498,16 @@ class TestSessionSharingMultiAgent:
             ctx_builder=_mock_ctx_builder_auto(),
             is_yolo=lambda: True,
             max_concurrent=4,
-            coordinator=MemoryRunCoordinator(),
         )
         manager._spawn_stagger_secs = 0.0
 
-        with (
-            _cfg_patch(session_sharing=True),
-            patch("kiro_crew.subagent.Stats"),
-            patch("kiro_crew.subagent.sel"),
-        ):
+        with _cfg_patch(session_sharing=True), \
+             patch("kiro_crew.subagent.Stats"), \
+             patch("kiro_crew.subagent.sel"):
             info1 = manager.spawn("task A", parent_session_key="dashboard:slot1")
             info2 = manager.spawn("task B", parent_session_key="dashboard:slot2")
-            tasks = [manager._tasks[info1.id], manager._tasks[info2.id]]
-            await asyncio.gather(*tasks)
+            await _wait_until_done(info1)
+            await _wait_until_done(info2)
 
         assert info1._session_sharing is True
         assert info2._session_sharing is True

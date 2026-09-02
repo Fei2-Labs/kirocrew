@@ -52,8 +52,9 @@ def single_completion_meta(
     can fold it into the payload without re-reading the header line. Empty on the
     ordinary completion path, where the status word is redundant with the chip.
 
-    ``requested_model`` is the model the spawn PINNED (``""`` ⇒ none, deferring
-    to the provider default); ``resolved_model`` is the model the session
+    ``requested_model`` is the model the spawn PINNED (``"auto"`` ⇒ unpinned,
+    deferring to the provider default; ``""`` means not yet populated by legacy
+    callers); ``resolved_model`` is the model the session
     ACTUALLY served (``""`` ⇒ unknown/inconclusive, never a wildcard). The card
     shows the resolved model and flags a mismatch when both are known and differ
     — making a model-pinned review's real model auditable (issue #3582). Both

@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -373,7 +374,11 @@ def create_aws_profile(name: str, region: str, *, account: str = "",
             '"SessionToken":c["SessionToken"],'
             '"Expiration":c["Expiration"]}))'
         )
-        cred_proc = f"{python_bin} -c '{script}'"
+        # Both tokens are shlex-quoted: botocore splits this line with shlex,
+        # and an interpreter path containing a space (a checkout under
+        # "My Apps", a macOS framework path) would otherwise split into two
+        # argv words and the profile would fail to mint credentials at all.
+        cred_proc = f"{shlex.quote(python_bin)} -c {shlex.quote(script)}"
         if err := _configure_set("credential_process", cred_proc, name):
             return err
     return None

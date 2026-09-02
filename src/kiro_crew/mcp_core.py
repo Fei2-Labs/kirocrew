@@ -2075,11 +2075,11 @@ def run_mcp_core_server() -> None:
         _call_tool,
         # Pooled-operation opt-in: kirocrew-core consumes the per-call
         # ``kirocrew.caller`` identity (see _resolve_session_key*), so it is
-        # safe to share one backend across sessions. kirocrew-cron advertises
-        # too, for the same reason. The two managed servers that do not --
-        # kirocrew-computer and kirocrew-dashboard -- are pooled all the same
-        # (nothing declines to pool an unadvertised backend; see
-        # ``rewriter.UNPOOLABLE_SERVERS``), so what they lack is the injected
-        # block, not co-tenancy.
+        # safe to share one backend across sessions. All four managed servers
+        # advertise today -- kirocrew-cron since #4622, kirocrew-computer and
+        # kirocrew-dashboard since #4659 -- and what advertising buys is the
+        # injected block, not co-tenancy: a backend that does NOT advertise is
+        # pooled all the same (nothing declines to pool one; see
+        # ``rewriter.UNPOOLABLE_SERVERS``) and simply never receives an identity.
         advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
     )

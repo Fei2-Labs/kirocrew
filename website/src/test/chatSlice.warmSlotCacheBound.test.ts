@@ -142,8 +142,8 @@ describe('warmSlotCache hydrate bound', () => {
     expect(store.getState().chat.slotPaneHasMore['bg-slot']).toBe(false)
   })
 
-  // A streaming response lives as many raw chunk rows that only collapse after the
-  // server slices, so bounding a running slot would hydrate just its tail.
+  // Unbounded while streaming is deliberate, not a raw-row guard: the handler
+  // collapses chunk runs BEFORE computing total and slicing, even mid-stream.
   it('warms a streaming slot unbounded', async () => {
     ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue(detail)
     const store = makeStore('active-slot', { slotRun: { 'bg-slot': { state: 'streaming' } } })
@@ -730,8 +730,8 @@ describe('switching away from a pane whose own fetch has not landed', () => {
   })
 
   // A count taken while the turn is RUNNING is not comparable with a settled
-  // one: the server counts raw rows, so a streaming response is inflated by rows
-  // that collapse when the turn ends. Retaining it makes the next warm read that
+  // one: an unbounded read counts raw rows, so a streaming response is inflated by
+  // rows that collapse at turn end. Retaining it makes the next warm read that
   // normal collapse as a truncation, and the suppression then DROPS a live row --
   // the opposite direction to the re-append this baseline exists to prevent.
   it('does not retain a count from a running response, so a later collapse is not read as a rewind', async () => {

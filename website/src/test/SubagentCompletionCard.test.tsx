@@ -577,6 +577,35 @@ describe('model provenance on the completion card (#3582)', () => {
     )
     expect(container.querySelector('[data-testid="subagent-completion-model"]')).toBeNull()
   })
+
+  it('shows a neutral muted chip when requestedModel is "auto" and resolved is empty', () => {
+    // Unpinned spawn: backend sets requested_model="auto", resolved="". The card
+    // should show a neutral chip displaying "auto" (not accent, not amber) so the
+    // user sees the subagent ran but no model was pinned.
+    renderWithProviders(
+      <SubagentCompletionCard message={msg(SINGLE, { meta: metaWith('auto', '') })} />,
+      { store: store() },
+    )
+    const chip = screen.getByTestId('subagent-completion-model')
+    expect(chip.textContent).toContain('auto')
+    // Neutral styling: not the accent (resolved-known) path, not warn (downgrade).
+    expect(chip.className).not.toContain('text-accent')
+    expect(chip.className).not.toContain('text-warn')
+    // Tooltip uses model_effective ("backend selects the model") for the auto sentinel.
+    expect(chip.getAttribute('title')).toContain('backend selects')
+  })
+
+  it('uses model_label tooltip for a concrete requested-only chip (pinned, unresolved)', () => {
+    // A pinned completion where the resolved model is unknown (""). Per the
+    // convergent UX+FP fix: a concrete pinned id renders NO chip before resolution —
+    // showing an unconfirmed pin as fact is misleading. The chip appears once the
+    // model resolves.
+    const { container } = renderWithProviders(
+      <SubagentCompletionCard message={msg(SINGLE, { meta: metaWith('gpt-5.6-sol', '') })} />,
+      { store: store() },
+    )
+    expect(container.querySelector('[data-testid="subagent-completion-model"]')).toBeNull()
+  })
 })
 
 describe('isModelDowngrade / normalizeModelId (GPT review on #3582)', () => {

@@ -72,7 +72,14 @@ from kiro_crew.env import (
     spec_path_key,
 )
 from kiro_crew.mcp_cleanup import purge_deleted_proxy_from_config
-from kiro_crew.mcp_provenance import without_marker
+from kiro_crew.mcp_provenance import (
+    DERIVED_KEY,
+    command_is_ours,
+    record_derived,
+    recorded_source,
+    source_view,
+    without_marker,
+)
 from kiro_crew.mcp_utils import kiro_oauth_wire_entry, mcp_server_alias
 from kiro_crew.platform import current_context
 from kiro_crew.platform import redact_via_context as redact
@@ -752,6 +759,88 @@ def _computer_use_spec_gate() -> bool:
         return False
 
 
+def _mcp_spec_gate_open(name: str, spec: dict) -> bool:
+    """Whether *spec*'s ``spec_gate`` permits emission RIGHT NOW (absent = open).
+
+    The single place a gate is called. A gate that raises is reported CLOSED, for
+    the same fail-closed reason the computer-use gate itself is: emitting the
+    entry is what makes kiro-cli spawn the backend, and a keystone we could not
+    read is not evidence that the capability is on.
+    """
+    gate = spec.get("spec_gate")
+    if gate is None:
+        return True
+    try:
+        return bool(gate())
+    except Exception:
+        logger.debug("spec gate for %s raised; treating as closed", name, exc_info=True)
+        return False
+
+
+def _mcp_server_emission_eligible(
+    name: str, spec: object, *, gated_off: "frozenset[str] | None" = None
+) -> bool:
+    """Whether a FRESH spec build would EMIT this MCP server entry.
+
+    THE single definition of "the rebuild re-adds this", and it has exactly two
+    disqualifiers, both owned by the entry's own spec:
+
+    * ``opt_in`` — an assignable set, never auto-emitted. ``build_agent_config``
+      skips it outright and ``_refresh_dynamic_fields`` keeps an EXISTING grant
+      current without ever re-introducing one, so nothing re-adds a grant the
+      user removed.
+    * a CLOSED ``spec_gate`` — both writers ``pop`` the entry while the gate is
+      shut, so the rebuild actively withholds it rather than merely skipping it.
+
+    Both spec writers consult this, and so does the dashboard PUT's merge-on-write
+    host set (``handlers/agents.py::_app_or_host_owned``). That co-tenancy is the
+    whole point of the helper rather than a convenience: the merge preserves an
+    absent managed entry *because* a rebuild would re-add it, so if the two ever
+    disagreed the merge would resurrect entries the rebuild withholds — an
+    ``opt_in`` grant the user revoked through the only surface that can revoke it,
+    or a gate-closed server whose backend the gate exists to keep unspawned.
+
+    *gated_off* is a caller's ONE-PER-REBUILD gate snapshot
+    (:func:`_gated_off_servers`); passing it keeps a rebuild's emit path and its
+    withhold audit agreeing on one reading, which is why that snapshot exists.
+    Omitted (the merge's case, which audits nothing), the gate is read live.
+
+    A spec that is not a mapping at all is reported ELIGIBLE. Only the host can
+    produce that shape — the managed map is a module constant and the extras come
+    from an edition adapter — the name is host-owned either way, and this keeps
+    the merge's pre-existing verdict for it instead of raising ``AttributeError``
+    out of a commit unit contracted to leave its targets byte-identical.
+    """
+    if not isinstance(spec, dict):
+        return True
+    if spec.get("opt_in"):
+        return False
+    if gated_off is not None:
+        return name not in gated_off
+    return _mcp_spec_gate_open(name, spec)
+
+
+def emission_eligible_mcp_servers() -> frozenset[str]:
+    """Every MCP server name a fresh spec build would emit right now.
+
+    Managed servers and the edition's extras under ONE predicate — extras get no
+    exemption, so an extra that ever carries ``opt_in`` or a gate is withheld
+    here for the same reason a managed one is. Today they carry neither, so this
+    is every extra plus the always-emitted managed entries.
+
+    Exported (no leading underscore) because ``handlers/agents.py``'s
+    merge-on-write is a legitimate out-of-module consumer: it must preserve
+    exactly the set a rebuild would re-add, and computing that itself is what let
+    the two drift. Read live rather than cached — a keystone flip between two PUTs
+    must change the answer.
+    """
+    return frozenset(
+        name
+        for name, spec in (*_MANAGED_MCP_SERVERS.items(), *_extra_mcp_servers().items())
+        if _mcp_server_emission_eligible(name, spec)
+    )
+
+
 def _gated_off_servers() -> frozenset[str]:
     """Managed servers whose ``spec_gate`` is CLOSED right now.
 
@@ -763,20 +852,12 @@ def _gated_off_servers() -> frozenset[str]:
     record is read during incident response, against the config it describes.
 
     A gate that raises is treated as closed, for the same fail-closed reason the
-    computer-use gate itself is.
+    computer-use gate itself is — see :func:`_mcp_spec_gate_open`, which is where
+    that call now lives so the merge-on-write host set reads the gate the same way.
     """
-    closed: set[str] = set()
-    for name, spec in _MANAGED_MCP_SERVERS.items():
-        gate = spec.get("spec_gate")
-        if gate is None:
-            continue
-        try:
-            if not gate():
-                closed.add(name)
-        except Exception:
-            logger.debug("spec gate for %s raised; treating as closed", name, exc_info=True)
-            closed.add(name)
-    return frozenset(closed)
+    return frozenset(
+        name for name, spec in _MANAGED_MCP_SERVERS.items() if not _mcp_spec_gate_open(name, spec)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2020,20 +2101,23 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     if gated_off is None:
         gated_off = _gated_off_servers()
     for name, spec in _MANAGED_MCP_SERVERS.items():
-        if name in gated_off:
-            # The gate is the whole point of this branch: emitting the entry is
-            # what makes kiro-cli spawn the backend, so a closed gate must not
-            # emit one. ``pop`` as well as ``continue`` because the base here is
-            # shipped defaults merged with the user override file, and an entry
-            # arriving from there would otherwise slip past a platform gate that
-            # exists because the capability has no driver on this OS.
-            mcp.pop(name, None)
-            continue
-        # An opt-in server is an assignable set: it belongs to the agents whose
-        # own spec references it, so a freshly built default spec must not carry
-        # it. kiro-cli loads a server only when ``tools`` names it, and the
-        # shipped template names only the always-on ones.
-        if spec.get("opt_in"):
+        if not _mcp_server_emission_eligible(name, spec, gated_off=gated_off):
+            # NOT eligible, and the two reasons part company on one point: a
+            # closed gate must RETRACT the entry, an opt-in one is merely never
+            # introduced.
+            if name in gated_off:
+                # The gate is the whole point of this branch: emitting the entry is
+                # what makes kiro-cli spawn the backend, so a closed gate must not
+                # emit one. ``pop`` as well as ``continue`` because the base here is
+                # shipped defaults merged with the user override file, and an entry
+                # arriving from there would otherwise slip past a platform gate that
+                # exists because the capability has no driver on this OS.
+                mcp.pop(name, None)
+            # An opt-in server is an assignable set: it belongs to the agents whose
+            # own spec references it, so a freshly built default spec must not carry
+            # it. kiro-cli loads a server only when ``tools`` names it, and the
+            # shipped template names only the always-on ones. Left in place rather
+            # than popped: an entry already on disk is a grant the user made.
             continue
         if "invocation_fn" in spec:
             cmd, args = spec["invocation_fn"]()
@@ -2094,7 +2178,8 @@ def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" 
     if gated_off is None:
         gated_off = _gated_off_servers()
     for name, spec in _MANAGED_MCP_SERVERS.items():
-        if name in gated_off:
+        eligible = _mcp_server_emission_eligible(name, spec, gated_off=gated_off)
+        if not eligible and name in gated_off:
             # RETRACT, not merely skip: an earlier refresh wrote this entry while
             # the gate was open, and leaving it would mean turning the feature
             # off never reclaims the backend process turning it on started.
@@ -2117,8 +2202,12 @@ def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" 
         is_new = name not in mcp
         # An opt-in server is granted by the spec itself, so a refresh keeps an
         # entry the user put there current but never introduces one: adding it
-        # back would re-grant a set on every gateway start.
-        if is_new and spec.get("opt_in"):
+        # back would re-grant a set on every gateway start. Spelled through the
+        # shared eligibility predicate (the gate half is already spent above, so
+        # what remains of ineligibility here is exactly ``opt_in``) rather than
+        # re-reading the flag, so the rule cannot drift from the emitter's or the
+        # dashboard merge's reading of it.
+        if is_new and not eligible:
             continue
         if not is_new and spec.get("opt_in") and not isinstance(mcp.get(name), dict):
             # A hand-written entry that is not an object at all. Refreshing it
@@ -2352,10 +2441,20 @@ def _norm_mcp_spec(spec: Any) -> Any:
     collapse onto the canonical alias. An empty ``env``/``args`` is a launch
     no-op for kiro-cli (missing == empty), so this is also the cleaner spec to
     persist.
+
+    :data:`~kiro_crew.mcp_provenance.DERIVED_KEY` is excluded for the same reason,
+    and it is load-bearing: the record is our bookkeeping about which field this
+    rebuild computed, not part of how the server launches, so an entry carrying one
+    and an otherwise-identical re-merged copy without one ARE the same server.
+    Comparing it would make them differ and mint the ever-growing suffix this
+    function exists to prevent -- and it would do so asymmetrically, since only the
+    population with no other config source is ever recorded.
     """
     if not isinstance(spec, dict):
         return spec
-    return {k: v for k, v in spec.items() if not (k in ("env", "args") and not v)}
+    return {
+        k: v for k, v in spec.items() if k != DERIVED_KEY and not (k in ("env", "args") and not v)
+    }
 
 
 def _alias_family_base(key: str) -> str:
@@ -2649,15 +2748,26 @@ def migrate_agent_specs() -> int:
     agent loads. Idempotent and cheap (a handful of small JSON files); safe to
     run on every gateway start. Returns the number of spec files cleaned.
     """
-    if not kiro_agents_dir_path().is_dir():
+    agents_dir = kiro_agents_dir_path()
+    if not agents_dir.is_dir():
         return 0
     cleaned = 0
-    for spec_path in sorted(kiro_agents_dir_path().glob("*.json")):
-        try:
-            data = json.loads(spec_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+    for spec_path in sorted(agents_dir.glob("*.json")):
+        # This read is followed by a rewrite, so the hardened reader's
+        # sensitive-target refusal is not sufficient on its own: refuse every
+        # symlink, escape and sensitive path before reading to prevent copy-out.
+        if not _spec_path_is_safe(spec_path, agents_dir):
             continue
-        if not isinstance(data, dict):
+        # The hardened reader (size cap, AppleDouble/sensitive-symlink and
+        # non-object refusal). This site also WRITES below: a spec the reader
+        # refuses is now never rewritten at all, whereas the old read_text
+        # path read -- and then rewrote -- whatever the file or link named.
+        data = _read_agent_spec(
+            spec_path,
+            operation="migrate_agent_specs",
+            source="unknown",
+        )
+        if data is None:
             continue
         if "model_managed" not in data and "cc_model" not in data:
             continue
@@ -2711,7 +2821,7 @@ def _read_spec_capped(path: Path) -> dict | None:
     A thin wrapper rather than a direct call at each site, so the reason the
     capped reader is used lives in one place.
     """
-    return _read_agent_spec(path)
+    return _read_agent_spec(path, operation="agent_spec_lookup", source="unknown")
 
 
 def _spec_path_is_safe(path: Path, agents_dir: Path) -> bool:
@@ -3321,6 +3431,70 @@ def _reconcile_tool_aliases_from_disk(path: Path, config: dict) -> bool:
     return existed
 
 
+#: Generation of the ceiling the on-disk ``allowedTools`` was last derived under. Compared
+#: for equality only, per ``governance_generation``'s contract.
+_projected_ceiling_generation: int | None = None
+
+
+def prime_ceiling_projection() -> None:
+    """Record the ceiling generation boot projected the agent config under.
+
+    Called once, before the central-distribution poller starts. Seeding here rather than on
+    :func:`reproject_for_ceiling_change`'s first call is the difference between "nothing has
+    changed since boot" and "nothing has changed since the first poll" — and the first poll
+    can install a new ceiling, so the latter would record that generation and skip the very
+    rebuild it needed.
+    """
+    global _projected_ceiling_generation
+    from kiro_crew.platform.context import governance_generation
+
+    _projected_ceiling_generation = governance_generation()
+
+
+def reproject_for_ceiling_change() -> None:
+    """Re-derive the on-disk ``allowedTools`` when the governance ceiling has moved.
+
+    ``allowedTools`` is kiro-cli's blanket auto-approve list, and it is **materialised**: the
+    five writers of it consult the ceiling when they write, and kiro-cli then reads the FILE.
+    So a ceiling that comes to deny a tool mid-flight does not narrow a list already on disk,
+    and every session started afterwards would keep auto-approving what the fleet now
+    forbids — the tool short-circuits inside the harness and never reaches Kiro Crew's own
+    PreToolUse gate.
+
+    Registered as a post-install hook on the central-distribution refresher, alongside the
+    tailnet revocation and for the same reason: before a live refresh existed the ceiling
+    only changed at boot, and boot projects the config anyway.
+
+    **Bounded to an actual change.** Hooks run on every confirming poll, so an unconditional
+    rebuild would rewrite a file kiro-cli watches every refresh interval, for nothing. The
+    baseline is seeded by :func:`prime_ceiling_projection` BEFORE the poller starts, not on
+    the first call: the first poll can itself install a new ceiling, and a first-call baseline
+    would record that generation and skip the very rebuild it needed.
+
+    **The memo advances only after a successful rebuild.** A failure raises through the hook
+    runner, which logs it and moves on — and if the generation had already been marked
+    synchronised, the retry the next poll would otherwise give us is lost, leaving forbidden
+    auto-approvals on disk for the process lifetime.
+
+    An unseeded baseline rebuilds once on the first call rather than skipping, which is the
+    safe direction: a redundant rewrite costs a file write, a skipped one costs the tighten.
+
+    What this cannot do is narrow a session ALREADY negotiated: kiro-cli holds the grants it
+    was given, and no policy mechanism reaches into a running one. That limit is the same
+    shape as an already-running process keeping its own sandbox, and a restart is its only
+    answer — which is why removing live refresh would not close it either.
+    """
+    global _projected_ceiling_generation
+    from kiro_crew.platform.context import governance_generation
+
+    generation = governance_generation()
+    if _projected_ceiling_generation == generation:
+        return
+    logger.info("the governance ceiling moved; re-deriving the agent config's auto-approvals")
+    rebuild_agent_config()
+    _projected_ceiling_generation = generation
+
+
 def rebuild_agent_config(*, clean: bool = False) -> Path:
     """Rebuild and write the merged kirocrew.json to ~/.kiro/agents/.
 
@@ -3547,9 +3721,106 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         if isinstance(_s, dict):
             _store_by_alias.setdefault(mcp_server_alias(_n), []).append(_s)
     _cfg_servers: dict[str, Any] = config.get("mcpServers", {})
+    # One spelling of the scope chain, in priority order, for BOTH consumers below:
+    # the live-value probe that keeps a rebuild-authored field re-derivable, and the
+    # resolution candidate list. The probe's correctness is "this is the value the
+    # chain would have resolved", so two separate spellings could drift apart.
+    _scopes: tuple[tuple[str, dict], ...] = (
+        ("kirocrew", kirocrew_mcp),
+        ("kiro-global", shared_mcp),
+        ("provider-global", extra_shared_mcp),
+    )
     for name, spec in _cfg_servers.items():
         if not isinstance(spec, dict):
             continue
+        # This file is BOTH this function's output and, here, one of its inputs: the
+        # entry is read back so a field the user set and we never model survives. One
+        # field below is ours, not the user's -- the resolved absolute ``command`` --
+        # and reading our own computed value back as if it were authored is what made
+        # it permanent: ``_resolve_command`` takes an absolute path without searching,
+        # so no later change to how commands resolve could rebind one stored once.
+        #
+        # The record applies ONLY to a server no other source declares -- the one
+        # whose sole persisted home is this file, and which therefore has nothing to
+        # lose a conflict to. For a scope-owned server, choosing between the record
+        # and the live declaration correctly means selecting a per-field source AFTER
+        # resolution (the merge picks a winner by which command resolves, then adopts
+        # that winner's args/env as a unit), which is a merge-precedence change rather
+        # than a provenance one; it is tracked separately. Excluding that population
+        # leaves it behaving exactly as it does today.
+        #
+        # The test is deliberately CONSERVATIVE, and compares by alias rather than by
+        # raw key. A scope keys entries by their own raw name while ``name`` here is
+        # the config's, whose slash-containing spellings an earlier pass rewrote to
+        # aliases (see the ``_store_by_alias`` note above), so a raw-key probe would
+        # miss the owner of an aliased entry and wrongly read it as having no other
+        # home. Over-matching only declines to apply the record -- today's behavior,
+        # and safe. Under-matching would let the record shadow a live declaration.
+        #
+        # A scope owns the COMMAND only when it actually supplies one. A dict alone is
+        # not enough: a same-named URL-only entry, or an empty one, declares nothing
+        # about ``command``, so treating it as a competing source would strip the
+        # record off an agent-only stdio server and strand its stale path forever.
+        # A non-dict value supplies nothing either, and the candidate chain below
+        # skips it for the same reason (``isinstance(alt, dict)``).
+        #
+        # This stays a yes/no ownership question -- does any other source declare a
+        # command? -- and never a choice BETWEEN two declared values. Choosing would
+        # need the after-resolution ordering this PR is scoped out of.
+        _alias_here = mcp_server_alias(name)
+        _scope_owned = any(
+            any(
+                mcp_server_alias(k) == _alias_here
+                and isinstance(v, dict)
+                and isinstance(v.get("command"), str)
+                and v["command"]
+                for k, v in _scope.items()
+            )
+            for _label, _scope in _scopes
+        )
+        # Captured BEFORE the view rewrites anything: what the entry carried on the
+        # way in, and the record's own pair. Together they decide what may be
+        # recorded on the way out -- see the emit site below.
+        _owned_in = command_is_ours(spec) if not _scope_owned else False
+        _pre_cmd = spec.get("command")
+        _pair = recorded_source(spec)
+        # PRESERVED, never stripped. A scope-owned server's record is not acted on --
+        # no restoration, see above -- but destroying it would be a decision in its
+        # own right, and the wrong one: a scope command that does not resolve, or a
+        # scope entry that later goes away, would leave the server agent-only again
+        # with its only re-derivation source deleted, so a relocated binary could
+        # never rebind. Keeping it inert costs nothing, because the ownership guard
+        # re-checks the emitted value before anything is ever restored from it, so a
+        # record that has gone stale in the meantime is simply not used.
+        #
+        # Deciding this by which candidate WINS resolution would be the other way to
+        # rule out a non-resolving scope command, and that is the after-resolution
+        # per-field source selection this change is deliberately scoped out of; it
+        # belongs with the agent-config ownership work. Preserving is the part that
+        # needs no ordering at all.
+        _keep_record: tuple[str, str] | None = _pair if _scope_owned else None
+        if not _scope_owned:
+            _viewed = source_view(spec)
+            if not _owned_in or _pair is None:
+                # Nothing of ours to restore; the view only strips the key.
+                spec = _viewed
+            elif _resolve_command(_pair[0], _viewed.get("env"))[0]:
+                # The source still resolves, so re-derive from it: that is the whole
+                # point, and it is what rebinds a moved binary.
+                spec = _viewed
+            else:
+                # It does NOT resolve, and for this population the emitted config is
+                # the entry's only copy -- so re-deriving would drop the server from
+                # the map, the file would be rewritten without it, and the next
+                # rebuild would have nothing to read. A stale-but-working command
+                # beats a deleted server, so keep what we emitted.
+                #
+                # The record is re-recorded VERBATIM below rather than refreshed from
+                # the value we kept: re-deriving must stay possible once whatever
+                # broke the source clears, and recording the emitted path as its own
+                # source would retire the record's only useful fact.
+                _keep_record = _pair
+                spec = {k: v for k, v in spec.items() if k != DERIVED_KEY}
         # Remote Streamable HTTP servers — preserved as-is except for the OAuth
         # hints, which are renamed to the fields kiro-cli actually deserializes.
         # This is the one boundary where the internal spelling (``scopes`` /
@@ -3612,11 +3883,7 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         # Build candidate specs in priority order: the merged winner first,
         # then the same server from each source as a resolution fallback.
         candidates: list[tuple[str, dict]] = [("winner", spec)]
-        for label, src in (
-            ("kirocrew", kirocrew_mcp),
-            ("kiro-global", shared_mcp),
-            ("provider-global", extra_shared_mcp),
-        ):
+        for label, src in _scopes:
             alt = src.get(name)
             if isinstance(alt, dict) and alt is not spec:
                 candidates.append((label, alt))
@@ -3664,7 +3931,31 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
             spec_env = merged.get("env")
             if isinstance(spec_env, dict):
                 merged["env"] = emit_env(spec_env)
-            valid_servers[name] = merged
+            # Record only for a server with no other source, and only a field this
+            # pass may honestly claim: one the record already proved ours on the way
+            # in, or one whose emitted value DIFFERS from what the entry carried, so
+            # we computed it.
+            #
+            # The excluded case is a value we merely passed through -- a hand edit,
+            # or an already-absolute declaration nothing was derived from. It survives
+            # this rebuild either way, but a record written over it would read as
+            # proof on the NEXT pass, which is how a claim we never earned turns into
+            # a value we overwrite. Unrecorded means it stays the user's.
+            #
+            # Read from the candidate that WON: on a fallback the command came from
+            # ``chosen``, so recording ``spec``'s would name a source this entry was
+            # not derived from. ``None`` records "the source carried no such field".
+            _derived: tuple[str, str] | None = _keep_record
+            if _keep_record is None and not _scope_owned and (_owned_in or resolved != _pre_cmd):
+                _cmd_source = chosen.get("command")
+                # Non-empty by construction -- ``resolved`` is truthy, and it came
+                # from resolving THIS candidate's command -- but assert it in the
+                # type rather than in a comment: a record whose source is blank is
+                # unreadable on the way back, so writing one would silently disable
+                # the fix instead of failing here.
+                if isinstance(_cmd_source, str) and _cmd_source:
+                    _derived = (_cmd_source, resolved)
+            valid_servers[name] = record_derived(merged, _derived)
         elif not had_any_command:
             # No candidate defined a command at all — distinct from a command
             # that was defined but couldn't be resolved.
@@ -4260,16 +4551,6 @@ def _install_aim_capabilities() -> None:
     _install_lite_agent_fallback()
 
 
-def _remove_bare_lite_if_aim_installed() -> None:
-    """No-op on public installs (AIM package manager absent).
-
-    Symbol preserved for backward compatibility.  Previously removed the
-    bare ``kirocrew-lite.json`` when an AIM-installed duplicate existed; with
-    AIM install neutralized there is no AIM-managed copy to deduplicate.
-    """
-    return None
-
-
 def _install_lite_agent_fallback() -> None:
     """Write a bare kirocrew-lite config (cheap background agent)."""
     lite_path = kiro_agents_dir_path() / _LITE_AGENT_FILENAME
@@ -4465,8 +4746,9 @@ Your tools:
 - State that outlives a round — `session_ledger_read`, `session_ledger_record`.
 - Patrol — `monitor_start`, `monitor_update`, `autonudge_stop`, `wait`.
 - Capacity, before standing up several sessions at once — `resource_status`.
-- Talking to the person — `ask_question` for a blocking decision that is not
-  yours to make, `send_message` / `send_notification` to report.
+- Talking to the person — `ask_question` puts a decision that is not yours to
+  make to them as a card, after which you END your turn and their answer
+  arrives as the next message; `send_message` / `send_notification` to report.
 - Naming the right skill in a seed message — `skill_search`, `skill_fetch`.
 - Reading — `fs_read`, `web_fetch`.
 - `tool_search` loads a tool that is not in your list yet.
@@ -4561,8 +4843,10 @@ item, which you handle immediately.
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
 #: * ``session_stop`` — WITHHELD. Ends another session's in-flight turn and
-#:   DISCARDS its work (``stop_target``: "A first call cancels cooperatively;
-#:   calling again while that is pending escalates to a hard kill").
+#:   DISCARDS its work (``stop_target``: "A stop cancels cooperatively", and the
+#:   cancelled turn's work is gone either way — the retry de-duplication that
+#:   keeps a re-sent stop from ALSO discarding the queue does not make the verb
+#:   non-destructive).
 #:
 #: Every withheld verb stays MOUNTED (``@kirocrew-dashboard`` is still in
 #: ``tools``) — it just passes through ``hooks.on_tool_call`` like any ungranted
@@ -4826,9 +5110,17 @@ def _install_heartbeat_agent() -> None:
     # agent's ``--include-tools``/``--include-tool-tags``/``--exclude-tools``
     # filters so all read tools surface to the heartbeat agent — security is
     # enforced gateway-side against ``HEARTBEAT_SAFE_TOOLS`` via
-    # ``_heartbeat_approval``, not by per-agent MCP filtering.
-    main_config = _load_json(kiro_agents_dir_path() / AGENT_FILENAME)
-    main_mcp = main_config.get("mcpServers", {}) or {}
+    # ``_heartbeat_approval``, not by per-agent MCP filtering. Read through the
+    # capped reader (#6736): a refused main spec degrades as absent, but with an
+    # operator-visible signal, because the result is a heartbeat agent with no
+    # MCP servers -- a worker that fails every task.
+    main_path = kiro_agents_dir_path() / AGENT_FILENAME
+    main_config = _read_spec_capped(main_path)
+    if main_config is None and main_path.exists():
+        logger.warning(
+            "Main agent spec %s unusable; heartbeat agent installs with no MCP servers", main_path
+        )
+    main_mcp = (main_config or {}).get("mcpServers", {}) or {}
 
     _strip_flags = ("--include-tools", "--include-tool-tags", "--exclude-tools")
     mcp: dict[str, dict] = {}

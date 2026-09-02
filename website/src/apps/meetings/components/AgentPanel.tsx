@@ -31,25 +31,53 @@
 // declarative `div.mermaid` markup the agent is instructed to emit, so removing
 // the model's own JS costs the feature nothing. See ../lib/sketchSrcdoc.ts for
 // each directive's rationale and the full vector list.
+//
+// The markdown mode is also EDITABLE — the minutes the user can correct. The panel
+// only ever shows one copy: an edit takes precedence server-side, so `output` is
+// already whatever should be on screen and there is no merge to do here. What this
+// component owns is the draft (local, seeded when edit mode opens, so the 5-second
+// outputs poll cannot type over the user) and the two states a reader has to be able
+// to tell apart: that they are looking at their own text rather than the agent's, and
+// that the agent has written more since. HTML and chat agents are not editable; see
+// `EDITABLE_WIDGET_TYPE` in the backend constants for why.
 
 import { useRef, useState } from 'react'
-import { FileText, MessageSquare, Volume2, VolumeX } from 'lucide-react'
+import {
+  FileText,
+  MessageSquare,
+  Pencil,
+  RotateCcw,
+  Volume2,
+  VolumeX,
+} from 'lucide-react'
 
 import { i18nT } from '../../../i18n/t'
+import { useConfirm } from '../../../components/ConfirmDialog'
 import MarkdownRenderer from '../../../components/MarkdownRenderer'
 import { Btn, Card, CardTitle, Input, SendBtn } from '../../../components/ui'
-import type { AgentDef } from '../api'
+import type { AgentDef, OutputEdit } from '../api'
 import { buildSketchSrcdoc } from '../lib/sketchSrcdoc'
 import { useImeGuard } from '../../../hooks/useImeGuard'
 
 interface Props {
   agent: AgentDef
+  /** The EFFECTIVE output: the user's edit when one exists, otherwise the agent's. */
   output: string
   listening: boolean
   chatView: boolean
+  /**
+   * Set when the user has edited this agent's output. Its `content` is not carried —
+   * `output` above is already the edited text.
+   */
+  edit?: OutputEdit
+  /** True while a save or revert is in flight (for any panel). */
+  editSaving?: boolean
   onToggleListening: () => void
   onToggleChatView: () => void
   onSendMessage: (text: string) => void
+  /** Absent for an agent whose output is not editable (html widgets, chat agents). */
+  onSaveOutput?: (content: string) => Promise<unknown>
+  onRevertOutput?: () => void
 }
 
 export default function AgentPanel({
@@ -57,15 +85,55 @@ export default function AgentPanel({
   output,
   listening,
   chatView,
+  edit,
+  editSaving = false,
   onToggleListening,
   onToggleChatView,
   onSendMessage,
+  onSaveOutput,
+  onRevertOutput,
 }: Props) {
   const ime = useImeGuard()
+  const { confirm, confirmDialog } = useConfirm()
   const inputRef = useRef<HTMLInputElement>(null)
   const [sent, setSent] = useState<string[]>([])
+  // `null` means "not editing". One piece of state rather than a boolean plus a
+  // string, so the two can never disagree about whether there is a draft.
+  //
+  // Seeded when edit mode OPENS and never from a poll, which is what makes the
+  // outputs query safe to keep refetching underneath: a 5-second poll landing
+  // mid-sentence cannot overwrite what the user is typing.
+  const [draft, setDraft] = useState<string | null>(null)
   const isChatAgent = agent.widget_type === 'chat'
   const showChat = chatView || isChatAgent
+  const editable = onSaveOutput != null && !showChat
+  const editing = draft !== null
+
+  const saveDraft = async () => {
+    if (draft === null || onSaveOutput == null) return
+    const submittedDraft = draft
+    try {
+      await onSaveOutput(submittedDraft)
+    } catch {
+      // The session hook reports the transport error. Keep the draft open: closing
+      // here would turn a failed save into permanent loss of the user's correction.
+      return
+    }
+    // Saving is asynchronous but the textarea remains editable. Only close the
+    // exact snapshot the request persisted; text typed while it was in flight is
+    // still a local draft and must stay on screen.
+    setDraft(current => current === submittedDraft ? null : current)
+  }
+
+  const requestRevert = async () => {
+    if (onRevertOutput == null) return
+    const confirmed = await confirm({
+      title: i18nT('apps.meetings.agentPanel.revert'),
+      body: i18nT('apps.meetings.agentPanel.revertHint', { name: agent.name }),
+      confirmLabel: i18nT('apps.meetings.agentPanel.revert'),
+    })
+    if (confirmed) onRevertOutput()
+  }
 
   const send = () => {
     const text = inputRef.current?.value.trim()
@@ -77,9 +145,20 @@ export default function AgentPanel({
 
   const header = (
     <div className="flex items-center justify-between gap-2">
-      <CardTitle>{agent.name}</CardTitle>
+      <div className="flex items-center gap-2 min-w-0">
+        <CardTitle>{agent.name}</CardTitle>
+        {/* Which copy is on screen is the first thing to know about an edited panel,
+            so it is stated next to the name rather than hidden in a tooltip. */}
+        {edit && !editing && (
+          <span className="flex-none px-1.5 py-0.5 rounded text-[11px] bg-accent/15 border border-accent/20 text-text">
+            {i18nT('apps.meetings.agentPanel.edited')}
+          </span>
+        )}
+      </div>
       <div className="flex items-center gap-1">
-        {!isChatAgent && (
+        {/* Hidden while editing: switching to the chat view would unmount the
+            textarea and take the draft with it, silently. */}
+        {!isChatAgent && !editing && (
           <Btn
             onClick={onToggleChatView}
             aria-label={
@@ -199,9 +278,71 @@ export default function AgentPanel({
     )
   }
 
+  if (editing) {
+    return (
+      <Card className="col-span-2 flex flex-col gap-2">
+        {header}
+        <textarea
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          // Distinct from the card's title on purpose: the region and the control are
+          // different things, and giving both the same accessible name makes them
+          // indistinguishable to a screen reader.
+          aria-label={i18nT('apps.meetings.agentPanel.editorLabel', { name: agent.name })}
+          spellCheck
+          className="min-h-[280px] max-h-[520px] resize-y bg-transparent border border-border rounded-md outline-none p-3 text-[13px] leading-relaxed text-text font-body focus-ring"
+        />
+        <div className="flex items-center justify-end gap-2">
+          <Btn onClick={() => setDraft(null)} disabled={editSaving}>
+            {i18nT('apps.meetings.agentPanel.cancel')}
+          </Btn>
+          <SendBtn
+            onClick={saveDraft}
+            disabled={editSaving}
+          >
+            {i18nT('apps.meetings.agentPanel.save')}
+          </SendBtn>
+        </div>
+      </Card>
+    )
+  }
+
   return (
     <Card className="col-span-2 flex flex-col gap-2 max-h-[520px] overflow-y-auto">
       {header}
+      {(editable || (edit && onRevertOutput)) && (
+        <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-border">
+          {editable && (
+            <Btn
+              onClick={() => setDraft(output)}
+              aria-label={i18nT('apps.meetings.agentPanel.edit')}
+            >
+              <Pencil className="lucide-inline" />
+              {i18nT('apps.meetings.agentPanel.edit')}
+            </Btn>
+          )}
+          {edit && onRevertOutput && (
+            <Btn
+              danger
+              onClick={() => void requestRevert()}
+              disabled={editSaving}
+              aria-label={i18nT('apps.meetings.agentPanel.revert')}
+              title={i18nT('apps.meetings.agentPanel.revertHint', { name: agent.name })}
+            >
+              <RotateCcw className="lucide-inline" />
+              {i18nT('apps.meetings.agentPanel.revert')}
+            </Btn>
+          )}
+        </div>
+      )}
+      {/* The honest half of the sidecar bargain. The edit keeps winning — that is the
+          feature — so a panel whose agent has moved on must SAY so, or it looks like
+          the agent simply stopped writing. */}
+      {edit?.stale && (
+        <p className="flex-none text-[12px] text-muted">
+          {i18nT('apps.meetings.agentPanel.staleEdit', { name: agent.name })}
+        </p>
+      )}
       {output ? (
         <MarkdownRenderer content={output} />
       ) : (
@@ -209,6 +350,7 @@ export default function AgentPanel({
           {i18nT('apps.meetings.agentPanel.awaitingOutput', { name: agent.name })}
         </p>
       )}
+      {confirmDialog}
     </Card>
   )
 }

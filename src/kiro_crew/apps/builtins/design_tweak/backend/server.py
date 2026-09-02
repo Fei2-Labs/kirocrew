@@ -1444,6 +1444,14 @@ class _DevProxyHandler(BaseHTTPRequestHandler):
             # would let it append headers or a second body (response splitting).
             if not _HEADER_NAME_RE.match(key):
                 continue
+            # The upstream is the project's own dev server but still an unaudited
+            # process, so its media type SELECTS one of our literals instead of
+            # being echoed -- which is what `_PROXY_CTYPES` and
+            # `_safe_upstream_ctype` are for. Forwarding it verbatim lost the
+            # charset normalisation: an upstream `text/html; charset=iso-8859-1`
+            # reached the browser as sent.
+            if key.lower() == "content-type":
+                value = _safe_upstream_ctype(value, self.path)
             # A redirect naming the dev server's OWN origin would take the iframe
             # off this proxy and onto the bare upstream port — and because cookies
             # are host-scoped but PORT-agnostic, the browser would then attach the
@@ -3944,11 +3952,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_raw(self, code: int, ctype: str, body: bytes) -> None:
         self.send_response(code)
-        # Every caller passes either a string literal, a `_guess_ctype` constant
-        # (closed extension map — no value is derived from the request path), or
-        # `_safe_upstream_ctype()` output. `_header_value` stays as defence in
-        # depth at the sink: a single CR/LF reaching send_header would let a
-        # caller append headers or a second response body (response splitting).
+        # Every caller passes either a string literal or a `_guess_ctype` constant
+        # (closed extension map — no value is derived from the request path). The
+        # proxied reply does not come through here: it applies
+        # `_safe_upstream_ctype` at its own `send_header` in `_DevProxyHandler`.
+        # `_header_value` stays as defence in depth at the sink: a single CR/LF
+        # reaching send_header would let a caller append headers or a second
+        # response body (response splitting).
         self.send_header("Content-Type", _header_value(ctype))
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")

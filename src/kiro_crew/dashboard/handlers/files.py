@@ -30,6 +30,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.multipart import BodyPartReader
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write, open_access_control_source
 from kiro_crew.config import loader as config_loader
 from kiro_crew.config.loader import KiroCrewConfig, WorkspaceConfig, config_dir, data_home
 from kiro_crew.dashboard import part_stream
@@ -37,6 +38,7 @@ from kiro_crew.dashboard.chat_utils import dashboard_slot_key
 from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
 from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.doc_parser import extract_text
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
 from kiro_crew.messaging import upload_gate
 from kiro_crew.messaging.display_safety import redact_for_display
@@ -58,6 +60,7 @@ from kiro_crew.validation import (
     ValidationError,
     validate_tool_args,
 )
+from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory_bytes
 
 # Register OOXML office MIME types explicitly. The system mimetypes
 # database on AL2/AL2023 build hosts does NOT include .docx, .xlsx, or
@@ -775,10 +778,10 @@ async def api_channel_upload_file(request: web.Request) -> web.Response:
     renderers' extraction path enforces, on the same shared predicate. The
     destination comes exclusively from the caller's session map entry — a
     request cannot name an arbitrary conversation, which is what keeps this
-    endpoint from being a broadcast primitive. Delivery today: Telegram via
-    the purpose-built ``send_document`` (name-preserving); Discord is an
-    explicit skip until its transport grows a document verb that preserves an
-    admitted filename (see the delivery-branch comment below).
+    endpoint from being a broadcast primitive. Delivery today: Telegram and
+    Discord, each via its own purpose-built name-preserving ``send_document``
+    (see the delivery-branch comment below); every other channel is a skip
+    until its transport grows that verb.
 
     "Cannot deliver here" is a SKIP (``delivered: false``), not an error: most
     sessions mirror nowhere, and the caller falls back to the dashboard card
@@ -840,15 +843,13 @@ async def api_channel_upload_file(request: web.Request) -> web.Response:
     ):
         return _skip("restricted_session")
     deliver = None
-    if link.channel_type == "telegram":
+    # Both legs resolve the SAME purpose-built verb: a name-preserving document
+    # send, distinct from each transport's extraction upload whose filename
+    # sanitizer maps any non-raster mime to `.bin` (`upload_filename`) — correct
+    # for LLM-authored reference paths, wrong for a name this endpoint's gate
+    # already scanned. A channel is listed here only once it has that verb.
+    if link.channel_type in ("telegram", "discord"):
         deliver = getattr(transport, "send_document", None)
-    # Discord is deliberately NOT wired: its transport upload verb serves the
-    # image-extraction pipeline, whose filename sanitizer maps any non-raster
-    # mime to `.bin` (`upload_filename`) — correct for LLM-authored reference
-    # paths, but it would deliver `report.pdf` as `report.bin` here. Until the
-    # transport grows a document verb that preserves an ADMITTED name (the
-    # gate already scanned it), Discord callers keep the dashboard-link
-    # fallback rather than a corrupted attachment.
     if deliver is None:
         return _skip(f"channel_upload_unsupported:{link.channel_type}")
     # Off-loop: the gate reads up to MAX_FILE_BYTES and regex-scans the content
@@ -2341,6 +2342,241 @@ async def api_file_download(request: web.Request) -> web.Response:
     )
 
 
+# Extensions previewable via kiro_crew.doc_parser (OOXML docx/pptx). Legacy
+# binary formats (.doc, .ppt), the OpenDocument family (.odt/.ods/.odp), and
+# spreadsheet formats (.xls/.xlsx) fall through to the download card because
+# doc_parser only understands ZIP+XML OOXML, and adding openpyxl or a legacy
+# OLE reader would grow the dependency tree noticeably for a preview feature.
+_OFFICE_PREVIEWABLE_EXT = {".docx", ".pptx"}
+# Cap the returned text so a huge .docx doesn't blow the JSON payload / DOM.
+# Mirrors api_file_read's 512 KB read cap. Anything larger is truncated and
+# the frontend shows a "Download for full contents" affordance.
+_OFFICE_PREVIEW_CAP = 512_000
+
+
+class _PreviewUnsupported(Exception):
+    """The validated path's extension is outside :data:`_OFFICE_PREVIEWABLE_EXT`.
+
+    Endpoint-local, mirroring :class:`_SheetRefusal`: ``_OpenDenied``'s codes
+    are the SHARED file-serving boundary's vocabulary, and this is this
+    endpoint's own FORMAT policy rather than a security refusal, so it does
+    not belong in that enum. Raised from inside the worker callback so the
+    checked file object is closed by its ``with`` block on the same thread.
+    """
+
+
+async def api_file_office_preview(request: web.Request) -> web.Response:
+    """GET /api/file-office-preview?path=... — extract inline text preview from a .docx/.pptx.
+
+    Sibling of /api/file-download. file-download streams original bytes for
+    saving to disk; this endpoint returns plaintext extracted from the
+    OOXML XML inside so the dashboard can render a scrollable preview of
+    the document contents in place of the "can't view a binary" download
+    card — a common ask for anyone browsing shared reports in the file
+    tree without wanting to save each one.
+
+    Uses ``kiro_crew.doc_parser.extract_text`` which parses the .docx /
+    .pptx ZIP+XML with hardened defusedxml (XXE-safe) and returns "" on
+    any failure. python-docx / python-pptx are not required.
+
+    Not supported (fall through to download): .doc, .ppt, .xls, .xlsx,
+    .odt, .ods, .odp. The frontend keeps the download card for these.
+
+    Security: the open-and-check prefix is the SHARED
+    :func:`_open_checked_file` (dashboard path validation, sensitive-path
+    block, is-file, symlink-refusing ``_open_rb_nofollow`` — atomic
+    O_NOFOLLOW on POSIX, lstat guard on Windows — then fstat), never a
+    hand-rolled second spelling of it, so a future hardening change to that
+    boundary lands here too. This endpoint's own POLICY on top is the 50 MB
+    ``fstat_cap``, the ``.docx``/``.pptx`` format gate, the aggregate
+    extraction budget, and credential redaction before the preview cap is
+    applied. All of it — validation, open, fstat, ZIP+XML parsing,
+    redaction — runs in ONE worker-thread hop, like ``api_file_sheet``.
+    """
+    raw_path = request.query.get("path", "")
+
+    def _log(outcome: str, res: str, error: str = "") -> None:
+        kw = {"error": error} if error else {}
+        _sel().log_tool_invocation(
+            session_key="dashboard", tool_name="file_office_preview",
+            outcome=outcome, resources=res, **kw,
+        )
+
+    # Resolve relative paths against project dir when resolve=1. Uses the
+    # shared helper (same as api_file_read / api_file_download / file-raw):
+    # it passes Windows-absolute/UNC shapes through to the validator, whose
+    # network-path gate runs BEFORE realpath — never re-implement this inline.
+    if request.query.get("resolve") == "1":
+        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        if _resolve_err == "cannot_resolve":
+            _log("denied", request.query.get("path", ""), "cannot_resolve")
+            return web.json_response(
+                {"error": "cannot resolve: no project dir configured", "code": "no_project_dir"},
+                status=400,
+            )
+        if _resolve_err == "outside_project":
+            _log("denied", request.query.get("path", ""), "outside_project")
+            return web.json_response(
+                {"error": "path outside project directory", "code": "path_outside_project"},
+                status=400,
+            )
+
+    try:
+        validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
+    except ValidationError:
+        _log("denied", raw_path)
+        return web.json_response({"error": "invalid input", "code": "invalid_input"}, status=400)
+
+    # The validated path once the shared prefix produces one -- exported by
+    # the worker callback so the exception handlers log the same SEL resource
+    # the success path does.
+    res_path = raw_path
+
+    def _open_and_extract() -> dict[str, object] | _OpenDenied:
+        """Open-and-check plus extract, in ONE worker-thread hop.
+
+        Everything here is blocking I/O or CPU-bound — realpath validation,
+        the sensitive-path screen, the open, the fstat, ZIP decompression,
+        XML parsing, redaction — so none of it may run on the event loop: an
+        NFS/FUSE-backed document makes even the validate/open envelope block
+        for seconds, stalling every session's streaming and the liveness
+        heartbeat.
+
+        The checked open file object never crosses back to the event loop:
+        every path that opens it also closes it on THIS thread (refusals
+        close inside the prefix; the ``with`` block below covers the rest,
+        the format refusal included). A cancellation of the awaiting task
+        therefore cannot strand an open file in a discarded future or
+        finalize one on the loop — the future's result is only ever a
+        payload dict or a typed refusal.
+        """
+        nonlocal res_path
+        # fstat_cap is this endpoint's size gate, enforced on the fd BEFORE
+        # any ZIP parsing: zipfile.ZipFile materializes the archive's central
+        # directory in memory, bounded only by the file itself, so a crafted
+        # archive could otherwise exhaust memory before doc_parser's
+        # per-entry and aggregate budgets ever apply. Same 50 MB ceiling as
+        # file uploads. log_open_failure=False: this endpoint answers a coded
+        # refusal, so a request loop against a known-unreadable path cannot
+        # amplify into the log.
+        checked = _open_checked_file(
+            raw_path,
+            tool_name="file_office_preview",
+            fstat_cap=_MAX_UPLOAD_BYTES,
+            log_open_failure=False,
+        )
+        if isinstance(checked, _OpenDenied):
+            return checked
+        res_path = checked.path
+        with checked.file as fobj:
+            if os.path.splitext(checked.path)[1].lower() not in _OFFICE_PREVIEWABLE_EXT:
+                raise _PreviewUnsupported(checked.path)
+            # extract_text parses through the SAME handle the prefix opened
+            # and fstat-ed (its opt-in fileobj parameter), so the bytes
+            # parsed are exactly the bytes measured — no stat→open TOCTOU
+            # window. max_chars bounds AGGREGATE extraction (cap + 1 keeps
+            # the truncation flag detectable): a deck with thousands of
+            # slides stops parsing at the budget instead of accumulating
+            # unbounded text. It never raises — returns "" on any failure.
+            text = extract_text(
+                checked.path,
+                filename=os.path.basename(checked.path),
+                max_chars=_OFFICE_PREVIEW_CAP + 1,
+                fileobj=fobj,
+            )
+        truncated = len(text) > _OFFICE_PREVIEW_CAP
+        # Redact BEFORE truncating: slicing first could cut a credential
+        # across the cap boundary, leaving an unmatched prefix the redactor
+        # no longer recognizes. Redaction may change the length, so the
+        # truncation flag is computed from the raw extraction above.
+        text = redact(text)
+        if truncated:
+            text = text[:_OFFICE_PREVIEW_CAP]
+        return {
+            "text": text,
+            "truncated": truncated,
+            # No `empty` field: doc_parser returns "" for both a genuinely
+            # blank document and a parse failure, so the two are
+            # indistinguishable here. The frontend treats empty `text` as
+            # "no preview available" and falls back to the download card.
+        }
+
+    try:
+        result = await asyncio.to_thread(_open_and_extract)
+    except asyncio.CancelledError:
+        # Gateway shutdown / client disconnect while the worker thread is
+        # parsing: the access attempt already happened, so record it before
+        # propagating — CancelledError is a BaseException and would bypass
+        # the Exception handler below, leaving the access unaudited. No
+        # resource handling here: the worker callback owns the file's whole
+        # lifetime.
+        _log("cancelled", res_path)
+        raise
+    except _PreviewUnsupported:
+        # 415 (not 400) so the frontend can distinguish "unsupported format,
+        # keep showing the download card" from "invalid input, something's
+        # actually wrong". The frontend short-circuits known-unsupported
+        # extensions client-side, so this branch is the safety net (direct
+        # API calls, frontend/backend list drift).
+        _log("denied", res_path, "unsupported_preview_format")
+        return web.json_response(
+            {
+                "error": "unsupported format for inline preview",
+                "code": "unsupported_preview_format",
+            },
+            status=415,
+        )
+    except Exception:  # noqa: BLE001  # last-resort guard; doc_parser already logs
+        logger.exception("file_office_preview extract_text failed for %s", res_path)
+        _log("failure", res_path)
+        return web.json_response(
+            {"error": "failed to extract preview", "code": "preview_extraction_failed"},
+            status=500,
+        )
+    if isinstance(result, _OpenDenied):
+        # The shared prefix's typed refusals, mapped onto this endpoint's SEL
+        # outcomes and response vocabulary — the part that legitimately
+        # differs per endpoint.
+        code, res = result.code, result.path
+        if code == "invalid_path":
+            _log("denied", res)
+            return web.json_response(
+                {"error": "invalid or forbidden path", "code": "forbidden_path"}, status=400,
+            )
+        if code == "sensitive_path":
+            _log("denied", res, "sensitive_path")
+            return web.json_response(
+                {"error": "sensitive path blocked", "code": "sensitive_path"}, status=403,
+            )
+        if code == "not_found":
+            _log("not_found", res)
+            return web.json_response({"error": "not found", "code": "not_found"}, status=404)
+        if code == "symlink_refused":
+            _log("denied", res, "symlink_rejected")
+            return web.json_response(
+                {"error": "symlinks not allowed", "code": "symlink_rejected"}, status=403,
+            )
+        if code == "file_too_large":
+            _log("denied", res, "file_too_large")
+            return web.json_response(
+                {
+                    "error": (
+                        "file too large for preview "
+                        f"(max {_MAX_UPLOAD_BYTES // 1024 // 1024}MB)"
+                    ),
+                    "code": "file_too_large",
+                },
+                status=413,
+            )
+        # read_failed: the residual code.
+        _log("failure", res)
+        return web.json_response(
+            {"error": "cannot read file", "code": "file_read_failed"}, status=500,
+        )
+    _log("success", res_path)
+    return web.json_response(result)
+
+
 async def api_file_raw(request: web.Request) -> web.Response:
     """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
     # Envelope (validate -> sensitive -> nofollow-open -> bounded read) is
@@ -2696,6 +2932,58 @@ async def api_file_stream(request: web.Request) -> web.StreamResponse:
             await asyncio.to_thread(f.close)
 
 
+def _file_write_blocking(path: str, content: str) -> str | None:
+    """Replace *path*'s contents atomically, carrying its access controls.
+
+    Returns ``None`` on success or ``"notfound"`` when the target was rejected;
+    any other failure propagates for the caller to log.
+
+    Split out of :func:`api_file_write` so the whole transaction runs OFF the
+    event loop. Every call in here is a blocking filesystem call, and on a
+    network-backed path (an SMB share, a stalled FUSE mount) each one can take
+    seconds, which on the loop thread freezes chat and the heartbeat alongside
+    it. Being on a worker thread also re-arms the Windows rename retry inside
+    ``atomic_write``, which deliberately degrades to a single attempt when it
+    finds a running loop in its own thread.
+
+    Routing through ``open_access_control_source`` rather than a bare ``os.open``
+    is what keeps this working on Windows: it returns ``None`` where the xattr
+    syscalls do not exist, and a read handle held open across the write would
+    make ``os.replace`` fail with ``PermissionError`` on every save there.
+
+    ``path`` is already canonicalized by ``_validate_dashboard_path``
+    (``realpath``), so its final component is symlink-free and the helper's
+    ``O_NOFOLLOW`` rejects nothing legitimate -- it closes the window where that
+    component is swapped for a link after the check. That refusal is a rejected
+    target rather than a server fault, hence ``"notfound"`` and not an exception.
+    """
+    try:
+        src_fd = open_access_control_source(path)
+    except OSError:
+        return "notfound"
+    try:
+        src_stat = os.fstat(src_fd) if src_fd is not None else os.stat(path)
+        # mode= keeps the previous copymode behaviour (permission bits), and
+        # preserve_access_control_from is ADDITIVE to it: copymode carried BITS
+        # only, so a named POSIX ACL (system.posix_acl_access) the owner set was
+        # silently dropped the moment the replace installed a fresh inode. The
+        # carry is allowlisted to the ACL and user.* names -- it must NOT replay a
+        # privilege-bearing security.capability onto caller-supplied content.
+        atomic_write(
+            path,
+            content,
+            mode=_stat_mod.S_IMODE(src_stat.st_mode),
+            preserve_access_control_from=src_fd,
+        )
+    finally:
+        if src_fd is not None:
+            try:
+                os.close(src_fd)
+            except OSError:
+                pass
+    return None
+
+
 async def api_file_write(request: web.Request) -> web.Response:
     """POST /api/file-write — write file content from the markdown panel."""
     from kiro_crew.validation import (  # noqa: F811
@@ -2740,24 +3028,17 @@ async def api_file_write(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "not found"}, status=404)
     try:
-        import shutil  # noqa: F811
-        import tempfile  # noqa: F811
-
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
-        try:
-            try:
-                shutil.copymode(path, tmp_path)
-            except OSError:
-                pass
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-                f.write(body.get("content", ""))
-            os.replace(tmp_path, path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        # Off the event loop: see _file_write_blocking's own note on why the
+        # whole transaction is offloaded rather than each call individually.
+        outcome = await asyncio.to_thread(_file_write_blocking, path, body.get("content", ""))
+        if outcome == "notfound":
+            _sel().log_tool_invocation(
+                session_key="dashboard",
+                tool_name="file_write",
+                outcome="not_found",
+                resources=path,
+            )
+            return web.json_response({"error": "not found", "code": "not_found"}, status=404)
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="file_write", outcome="success", resources=path
         )
@@ -3079,6 +3360,14 @@ async def api_file_diff(request: web.Request) -> web.Response:
                 cwd=dirpath, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=5, check=True, env=_env,
             )
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, UnicodeDecodeError):
+            # Only a failed repository preflight may claim "not a git repo":
+            # the client renders not_git as "there is no baseline", which is a
+            # statement about the file, not about git's health. Failures past
+            # this point (a timeout on a slow repo, git disappearing mid-flight)
+            # are computation failures and must report "error" instead.
+            return {"diff": "", "original": "", "status": "not_git"}
+        try:
             # Get HEAD content
             root = subprocess.run(
                 [*_git, "rev-parse", "--show-toplevel"],
@@ -3114,10 +3403,21 @@ async def api_file_diff(request: web.Request) -> web.Response:
                     )
                     diff = r3.stdout if r3.stdout else ""
                     return {"diff": diff, "original": "", "status": "untracked"}
+            if r.returncode != 0:
+                # `git diff` failed and the untracked probe above did not claim
+                # the file. This must stay distinguishable from a genuinely
+                # unmodified file: falling through would report status "clean",
+                # presenting a git failure as "no changes" — a false negative on
+                # a question users act on. The probe runs FIRST because the
+                # dominant non-zero exit is `fatal: bad revision 'HEAD'` in a
+                # freshly-initialized repo with no commits, where every file is
+                # simply untracked and the all-added diff is the true answer.
+                # Still HTTP 200: the request succeeded, only the diff did not.
+                return {"diff": "", "original": original, "status": "error"}
             status = "modified" if diff else "clean"
             return {"diff": diff, "original": original, "status": status}
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError, UnicodeDecodeError):
-            return {"diff": "", "original": "", "status": "not_git"}
+            return {"diff": "", "original": "", "status": "error"}
 
     result = await asyncio.to_thread(_run)
     _sel().log_api_access(caller=request.get("user", "dashboard"), operation="file_diff", outcome="allowed", resources=f"path={raw_path}")
@@ -3515,7 +3815,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
             )
             return web.json_response({"error": "request body must be a JSON object"}, status=400)
-        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled"}
+        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled", "session_card_source_links"}
         # One-release backward-compat shim for removed key; delete after all clients update.
         deprecated_ignored_keys = {"tail_fork_head_handling"}
         # Read-only keys the GET exposes: both settings surfaces save with
@@ -3699,6 +3999,20 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["auto_open_git_panel"] = val
+        if "session_card_source_links" in body:
+            val = body["session_card_source_links"]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "session_card_source_links must be a boolean",
+                        "code": "invalid_session_card_source_links",
+                    },
+                    status=400,
+                )
+            updates["session_card_source_links"] = val
         # Serialize the read-modify-write under BOTH config locks so no concurrent
         # writer -- in-process OR another process -- can clobber it:
         #  * update_config_locked holds the cross-process advisory file lock
@@ -3769,6 +4083,38 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="dashboard_config_write", outcome="success"
         )
+        chips_written = updates.get("session_card_source_links")
+        if isinstance(chips_written, bool):
+            # Publish the new value NOW instead of leaving it to the next
+            # allowlist refresh. That refresh is on a 30s TTL, so without this
+            # the sidebar keeps rendering chips for up to half a minute after an
+            # explicit click -- the switch acknowledges itself instantly and
+            # nothing appears to happen, which reads as broken. This handler
+            # already knows the value, so polling for it is the wrong shape.
+            #
+            # The push is the other half: the publisher bumps the shared
+            # generation, but the owner websocket only compares that generation
+            # once per TTL round, so a push here is what re-serializes the slots
+            # with the new answer.
+            #
+            # The value is read OUTSIDE the try on purpose: only the publish and
+            # the push may fail silently, so a body that never carried this key
+            # cannot reach the publisher at all -- and a test can tell the two
+            # apart instead of a swallowed KeyError standing in for the guard.
+            try:
+                from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
+                    publish_session_card_chips_now,
+                )
+
+                await publish_session_card_chips_now(chips_written)
+                state = request.app.get("state")
+                if state is not None:
+                    state.push_slots_update()
+            except Exception:
+                # Best-effort: the write itself succeeded, and the next refresh
+                # round picks the value up within one TTL. Failing the request
+                # here would report a saved setting as unsaved.
+                logger.debug("chip-switch snapshot publish failed", exc_info=True)
         return web.json_response({"ok": True})
     _sel().log_tool_invocation(
         session_key="dashboard", tool_name="dashboard_config_read", outcome="success"
@@ -3785,6 +4131,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "session_grid": cfg.dashboard.session_grid,
             "mcp_app_panel": cfg.dashboard.mcp_app_panel,
             "auto_open_git_panel": cfg.dashboard.auto_open_git_panel,
+            "session_card_source_links": cfg.dashboard.session_card_source_links,
             "tail_fork_enabled": cfg.dashboard.tail_fork_enabled,
             "link_previews": cfg.dashboard.link_previews,
             "folder_suggestions_enabled": cfg.dashboard.folder_suggestions_enabled,
@@ -3927,33 +4274,25 @@ def _vet_zip_eocd(data: bytes) -> None:
     """Refuse archives whose end-of-central-directory record declares an
     oversized inventory, BEFORE zipfile.ZipFile is constructed.
 
-    ZipFile.__init__ walks the whole central directory and allocates a
-    ZipInfo per entry, so a crafted archive with hundreds of thousands of
-    entries exhausts memory during construction -- ahead of any infolist()
-    check. The EOCD carries both the entry count and the central-directory
-    byte size; capping both bounds that allocation regardless of which field
-    lies (zipfile itself iterates the directory by its byte size).
+    Delegates to the shared vet (kiro_crew.zip_vet) so this endpoint, knowledge
+    ingest, and document parsing share one implementation of the preflight --
+    only the caps and the error channel stay per-caller. This endpoint's
+    observable behaviour is unchanged: a tail with no usable EOCD still reads as
+    "not a spreadsheet" (415), an over-cap inventory as an expansion refusal
+    (413).
     """
-    # EOCD (PK\x05\x06) sits within the last 22 + 65535 bytes (fixed record
-    # plus maximum comment length).
-    tail_start = max(0, len(data) - (22 + 65535))
-    eocd = data.rfind(b"PK\x05\x06", tail_start)
-    if eocd < 0 or len(data) < eocd + 22:
-        raise _SheetRefusal(415, "not an OOXML spreadsheet", "not_a_spreadsheet")
-    count = int.from_bytes(data[eocd + 10 : eocd + 12], "little")
-    cdir_size = int.from_bytes(data[eocd + 12 : eocd + 16], "little")
-    if count == 0xFFFF or cdir_size == 0xFFFFFFFF:
-        # Saturated classic fields mean the archive declares >= 65535 entries
-        # or a >= 4 GiB central directory -- both orders of magnitude past
-        # this endpoint's caps, so the ZIP64 records that would carry the
-        # real numbers can never change the verdict. Refusing outright keeps
-        # the vet free of a second record-location protocol to get right.
-        raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
-    if (
-        count > _SHEET_MAX_MEMBERS
-        or cdir_size > _SHEET_MAX_MEMBERS * _SHEET_MAX_CDIR_ENTRY_BYTES
-    ):
-        raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
+    try:
+        vet_zip_inventory_bytes(
+            data,
+            max_members=_SHEET_MAX_MEMBERS,
+            max_cdir_entry_bytes=_SHEET_MAX_CDIR_ENTRY_BYTES,
+        )
+    except ZipInventoryRejected as exc:
+        if exc.reason in ("missing_eocd", "truncated_eocd", "unreadable"):
+            raise _SheetRefusal(
+                415, "not an OOXML spreadsheet", "not_a_spreadsheet") from exc
+        raise _SheetRefusal(
+            413, "workbook expands too large", "workbook_expands_too_large") from exc
 
 
 def _parse_workbook_grid(data: bytes) -> dict:

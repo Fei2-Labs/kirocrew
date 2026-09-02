@@ -747,6 +747,59 @@ class MemoryRunCoordinator:
                 CoordinatorDecision.APPLIED, CoordinatorReason.TRANSITIONED, updated
             )
 
+    async def clear_recovered_process(
+        self,
+        run_id: str,
+        fence: RunFence,
+        expected_version: int,
+    ) -> CoordinatorResult[RunRecord]:
+        """Clear protected process identity after terminal teardown succeeds."""
+        async with self._lock:
+            validated = self._validate_transition(run_id, fence, expected_version)
+            if isinstance(validated, CoordinatorResult):
+                current = self._runs.get(run_id)
+                if not (
+                    validated.reason is CoordinatorReason.VERSION_CONFLICT
+                    and current is not None
+                    and current.version == expected_version + 1
+                    and current.observed_state is ObservedState.TERMINAL
+                    and current.process_id == 0
+                    and not current.process_start_id
+                    and not current.process_owned
+                ):
+                    return validated
+                return self._result(
+                    CoordinatorDecision.UNCHANGED,
+                    CoordinatorReason.TRANSITIONED,
+                    current,
+                )
+            if validated.observed_state is not ObservedState.TERMINAL:
+                return self._result(
+                    CoordinatorDecision.REJECTED, CoordinatorReason.INVALID_TRANSITION
+                )
+            if (
+                validated.process_id == 0
+                and not validated.process_start_id
+                and not validated.process_owned
+            ):
+                return self._result(
+                    CoordinatorDecision.UNCHANGED,
+                    CoordinatorReason.TRANSITIONED,
+                    validated,
+                )
+            updated = replace(
+                validated,
+                process_id=0,
+                process_start_id="",
+                process_owned=False,
+                version=validated.version + 1,
+                updated_at=self._clock(),
+            )
+            self._runs[updated.run_id] = updated
+            return self._result(
+                CoordinatorDecision.APPLIED, CoordinatorReason.TRANSITIONED, updated
+            )
+
     async def complete(
         self, completion: RunCompletion, fence: RunFence, expected_version: int
     ) -> CoordinatorResult[OutboxEvent]:

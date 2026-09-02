@@ -22,6 +22,9 @@ export interface KiroCrewAgent {
    *  older payloads predate the field, and it falls back to `description`. */
   triggers?: string
   source: string
+  /** Default session color (#rrggbb hex) applied to new sessions using this
+   *  agent. Empty or absent means no agent color. */
+  session_color?: string
 }
 
 interface Props {

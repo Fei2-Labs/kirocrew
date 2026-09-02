@@ -60,7 +60,7 @@ vi.mock('../pages/chat/ChatSettings', () => ({
   saveChatConfig: vi.fn(),
 }))
 
-const mocks = vi.hoisted(() => ({ createChatSlot: vi.fn() }))
+const mocks = vi.hoisted(() => ({ createChatSlot: vi.fn(), instancesCreateRemoteSlot: vi.fn(), listInstances: vi.fn() }))
 vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
   api: new Proxy(mocks as Record<string, unknown>, {
@@ -78,8 +78,11 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatSidebar from '../pages/ChatSidebar'
+// Not mocked: the gate reads real localStorage, so the fixture that turns crew
+// on is the same write the Developer > Feature Previews toggle performs.
+import { PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT } from '../utils/previewFlags'
 
-function renderSidebar() {
+function renderSidebar(opts: { warm?: Record<string, unknown> } = {}) {
   const store = createTestStore({
     dashboard: {
       status: {}, connected: false, slots: [], approvalMode: 'normal',
@@ -88,6 +91,10 @@ function renderSidebar() {
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
     } as unknown as RootState['dashboard'],
     chat: { activeSlot: null } as unknown as RootState['chat'],
+    // Omitted entirely unless a test asks for a connected peer, which is also
+    // the shape every other sidebar harness renders under — the sidebar's read
+    // of the instances slice has to stay guarded.
+    ...(opts.warm ? { instances: { warm: opts.warm } as unknown as RootState['instances'] } : {}),
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
@@ -117,6 +124,11 @@ beforeEach(() => {
   localStorage.clear()
   cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
   mocks.createChatSlot.mockResolvedValue({ key: 'chat-new-1' })
+  mocks.instancesCreateRemoteSlot.mockResolvedValue({ key: 'chat-7' })
+  mocks.listInstances.mockResolvedValue({
+    active: true, warm_set_cap: 5, sso: {},
+    instances: [{ id: 'i-nobita', name: 'nobita' }, { id: 'i-gian', name: 'gian' }],
+  })
 })
 afterEach(() => vi.clearAllMocks())
 
@@ -132,6 +144,10 @@ describe('create-button caret menu', () => {
     // The moment a user cannot tell Autopilot from Crew Mode is the moment this
     // menu opens. Before this, the only explanation was a native title= on the
     // sidebar badge — i.e. visible only after the session already existed.
+    //
+    // Crew is preview-gated, so the flag is part of the fixture: the contrast
+    // this test is about only exists once both modes are on offer.
+    localStorage.setItem(PREVIEW_CREW, '1')
     renderSidebar()
     openCreateMenu()
     await screen.findByText('New autopilot chat')
@@ -176,12 +192,30 @@ describe('create-button caret menu', () => {
     expect(mocks.createChatSlot.mock.calls.some(c => c.includes('orchestrator'))).toBe(true)
   })
 
+  it('hides the Crew Mode entry until the preview flag is on', async () => {
+    // Crew is unreleased, so the create menu must not offer it by default —
+    // a user who never opted in should not be able to reach the mode at all.
+    // Asserted on a plain `localStorage.clear()` (the beforeEach), which is the
+    // state a fresh install is in.
+    renderSidebar()
+    openCreateMenu()
+    // Anchor on a sibling entry first: an empty query below would also pass if
+    // the menu simply failed to open.
+    await screen.findByText('New autopilot chat')
+    expect(screen.queryByTestId('new-crew-chat')).toBeNull()
+    expect(screen.queryByText('New Crew Mode chat')).toBeNull()
+  })
+
   it('tags Crew Mode experimental where the mode is chosen, and only there', async () => {
     // Crew Mode dispatches every message to a sub-session and relays a summary
     // rather than the reply, so it does not yet read like a conversation. Until
     // that is fixed the mode has to announce itself, and the only moment that
     // helps is BEFORE the click — a warning on the resulting session's badge is
     // read once the session already exists.
+    //
+    // The entry is preview-gated, so the flag is part of the fixture: without it
+    // there is no row to carry the tag.
+    localStorage.setItem(PREVIEW_CREW, '1')
     renderSidebar()
     openCreateMenu()
     const crewItem = (await screen.findByText('New Crew Mode chat')).closest('[role="menuitem"]')
@@ -194,5 +228,55 @@ describe('create-button caret menu', () => {
     // a targeted caution into noise on a shipped feature.
     const autopilotItem = screen.getByText('New autopilot chat').closest('[role="menuitem"]')
     expect(autopilotItem?.querySelector('[data-testid="crew-experimental-tag"]')).toBeNull()
+  })
+
+  // "New chat on crew" — creating a session that runs on a connected peer. The
+  // row mirrors "New chat in folder": a dynamic list behind one submenu. It is
+  // preview-gated on its OWN flag (not Crew Mode's), so both conditions have to
+  // hold: a warm peer AND the opt-in.
+  it('offers no crew entry when no peer holds a live tunnel', async () => {
+    // Absent, not disabled. A disabled row on a single-machine install
+    // advertises a capability that install may never have, and every existing
+    // sidebar harness renders with no instances slice at all — so this is also
+    // the shape that proves the slice read stays guarded.
+    localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
+    renderSidebar()
+    openCreateMenu()
+    await screen.findByText('New chat')
+    expect(screen.queryByTestId('new-chat-on-crew')).toBeNull()
+    expect(screen.queryByText('New chat on crew')).toBeNull()
+  })
+
+  it('offers no crew entry on a fresh install even with a peer connected', async () => {
+    // The gate is the point: a connected crew alone must not surface the entry,
+    // because the landing is what is unfinished. Anchored on a sibling entry so
+    // an empty query cannot pass on a menu that simply failed to open.
+    renderSidebar({ warm: { 'i-nobita': { local_port: 7879, token: 't' } } })
+    openCreateMenu()
+    await screen.findByText('New chat')
+    expect(screen.queryByTestId('new-chat-on-crew')).toBeNull()
+  })
+
+  it('lists each connected crew and creates the session on the one picked', async () => {
+    localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
+    renderSidebar({ warm: { 'i-nobita': { local_port: 7879, token: 't' } } })
+    openCreateMenu()
+    // The trigger names the action; the crew names live one level down, so a
+    // second connected peer never lengthens the top-level menu.
+    const trigger = await screen.findByTestId('new-chat-on-crew')
+    expect(trigger.textContent).toContain('New chat on crew')
+    fireEvent.keyDown(trigger, { key: 'ArrowRight' })
+
+    // Only the WARM peer is offered: `listInstances` also returns gian, which
+    // holds no tunnel, and a row for it would fail the moment it was clicked.
+    const row = await screen.findByTestId('new-chat-on-crew-i-nobita')
+    expect(row.textContent).toContain('nobita')
+    expect(screen.queryByTestId('new-chat-on-crew-i-gian')).toBeNull()
+
+    fireEvent.click(row)
+    // Routed to the peer's own create endpoint through the proxy — NOT through
+    // createChatSlot, which would build a local slot and defeat the point.
+    await waitFor(() => expect(mocks.instancesCreateRemoteSlot).toHaveBeenCalledWith('i-nobita'))
+    expect(mocks.createChatSlot).not.toHaveBeenCalled()
   })
 })

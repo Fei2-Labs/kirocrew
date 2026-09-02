@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -45,7 +46,9 @@ class TestConfig:
 
         c = InstancesConfig()
         assert c.enabled is False
-        assert c.warm_set_cap == DEFAULT_WARM_SET_CAP == 5
+        # 0 == automatic: the cap follows the connected crew count (resolved per
+        # request by resolve_warm_set_cap), so no connected crew is ever evicted.
+        assert c.warm_set_cap == DEFAULT_WARM_SET_CAP == 0
         assert c.tunnel_base_port == DEFAULT_TUNNEL_BASE_PORT == 7778
         assert DEFAULT_CONNECT_TIMEOUT_SECS == 15.0
         assert c.connect_timeout_secs is None
@@ -55,9 +58,16 @@ class TestConfig:
     def test_clamps_out_of_range(self):
         from kiro_crew.config.loader import InstancesConfig
 
-        c = InstancesConfig(warm_set_cap=0, tunnel_base_port=99999)
-        assert c.warm_set_cap == 1
+        # 0 is a legal value (automatic), so only a negative cap is clamped, and
+        # it falls back to automatic rather than to the tightest possible cap.
+        c = InstancesConfig(warm_set_cap=-3, tunnel_base_port=99999)
+        assert c.warm_set_cap == 0
         assert c.tunnel_base_port == 7778
+
+    def test_zero_warm_set_cap_is_kept_as_automatic(self):
+        from kiro_crew.config.loader import InstancesConfig
+
+        assert InstancesConfig(warm_set_cap=0).warm_set_cap == 0
 
     def test_roundtrip_and_schema(self):
         from kiro_crew.config.loader import KiroCrewConfig
@@ -66,7 +76,7 @@ class TestConfig:
         d = KiroCrewConfig().to_dict()
         assert d["instances"] == {
             "enabled": False,
-            "warm_set_cap": 5,
+            "warm_set_cap": 0,
             "tunnel_base_port": 7778,
             "ssh_compression": True,
             "connect_timeout_secs": None,
@@ -346,6 +356,142 @@ class TestPortAllocator:
         port = s.getsockname()[1]
         s.close()
         assert _is_port_free(port) is True
+
+    @pytest.mark.skipif(not socket.has_ipv6, reason="host has no IPv6 support")
+    def test_is_port_free_rejects_port_held_on_ipv6_loopback_only(self):
+        """A port free on 127.0.0.1 but LISTENing on ::1 counts as in use.
+
+        The forward binds one address, so leaving the other loopback family to a
+        foreign listener makes `localhost:<port>` resolve to whichever socket the
+        client's resolver and the platform's bind precedence pick. The probe must
+        therefore clear every loopback address, not just IPv4.
+        """
+        from kiro_crew.instances.port_allocator import _is_addr_free, _is_port_free
+
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            s.bind(("::1", 0))
+        except OSError:  # ::1 not configured on this host
+            s.close()
+            pytest.skip("::1 is not assignable here")
+        s.listen(1)
+        port = s.getsockname()[1]
+        try:
+            # Quick check: the IPv4 half really is free, so only the ::1 half can be
+            # what makes the aggregate probe say "in use".
+            assert _is_addr_free(port, "127.0.0.1") is True
+            assert _is_port_free(port) is False
+        finally:
+            s.close()
+
+    def test_is_port_free_treats_unassignable_address_as_free(self, monkeypatch):
+        """EADDRNOTAVAIL means the address does not exist, not that it is taken.
+
+        Without this, a host with IPv6 compiled in but ::1 not configured would
+        see every candidate port as occupied and connect would never allocate one.
+        """
+        import kiro_crew.instances.port_allocator as pa
+
+        real_socket = socket.socket
+
+        def fake_socket(family, type_):
+            sock = real_socket(family, type_)
+            if family == socket.AF_INET6:
+                sock.close()
+
+                class _Unassignable:
+                    def setsockopt(self, *a):
+                        pass
+
+                    def bind(self, *a):
+                        raise OSError(errno.EADDRNOTAVAIL, "Cannot assign address")
+
+                    def close(self):
+                        pass
+
+                return _Unassignable()
+            return sock
+
+        monkeypatch.setattr(pa.socket, "socket", fake_socket)
+
+        s = real_socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        assert pa._is_port_free(port) is True
+
+    @pytest.mark.parametrize(
+        "creation_errno",
+        [errno.EMFILE, errno.ENFILE, errno.ENOBUFS],
+        ids=["EMFILE", "ENFILE", "ENOBUFS"],
+    )
+    def test_is_port_free_propagates_when_the_probe_cannot_run(self, monkeypatch, creation_errno):
+        """A probe that could not RUN answers neither "free" nor "in use".
+
+        Reading it as free would hand out a port a listener on the unprobed
+        family may hold; reading it as in use would send the allocator through
+        every candidate and fail with a port-exhaustion message naming the wrong
+        cause. So it propagates, which is also what the pre-dual-stack code did
+        (a creation error was never caught).
+        """
+        import kiro_crew.instances.port_allocator as pa
+
+        real_socket = socket.socket
+
+        def fake_socket(family, type_):
+            if family == socket.AF_INET6:
+                raise OSError(creation_errno, "probe could not be run")
+            return real_socket(family, type_)
+
+        monkeypatch.setattr(pa.socket, "socket", fake_socket)
+
+        s = real_socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        with pytest.raises(OSError) as excinfo:
+            pa._is_port_free(port)
+        assert excinfo.value.errno == creation_errno
+
+    @pytest.mark.parametrize(
+        "creation_errno",
+        [errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT],
+        ids=["EAFNOSUPPORT", "EPROTONOSUPPORT"],
+    )
+    def test_is_port_free_treats_absent_family_as_free(self, monkeypatch, creation_errno):
+        """A family the kernel will not create cannot be holding the port.
+
+        Both errnos are reported by IPv6-less kernels depending on the stack.
+        Failing closed here would refuse every candidate port on such a host and
+        `connect` would never allocate one.
+        """
+        import kiro_crew.instances.port_allocator as pa
+
+        real_socket = socket.socket
+
+        def fake_socket(family, type_):
+            if family == socket.AF_INET6:
+                raise OSError(creation_errno, "no such protocol family")
+            return real_socket(family, type_)
+
+        monkeypatch.setattr(pa.socket, "socket", fake_socket)
+
+        s = real_socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        assert pa._is_port_free(port) is True
+
+    def test_allocate_skips_port_held_on_one_loopback_family(self, monkeypatch):
+        """The allocator climbs past a port the aggregate probe rejects."""
+        import kiro_crew.instances.port_allocator as pa
+
+        base = 41000
+        monkeypatch.setattr(
+            pa, "_is_addr_free", lambda port, host: not (port == base and host == "::1")
+        )
+        assert pa.PortAllocator(base_port=base).allocate() == base + 1
 
 
 # ── token mint ──────────────────────────────────────────────────────────────
@@ -987,8 +1133,6 @@ class TestRegistry:
             reg.update("cd-1", id="nope")
         with pytest.raises(InstanceNotFoundError):
             reg.update("ghost", name="z")
-        reg.set_last_active("cd-1")
-        assert reg.get_last_active().id == "cd-1"
 
     def test_update_mark_last_active_is_one_mutation(self, tmp_path):
         """update(mark_last_active=True) records the auto-revive target in the
@@ -1009,7 +1153,7 @@ class TestRegistry:
     def test_remove_clears_last_active_and_reload(self, tmp_path):
         reg = self._reg(tmp_path)
         reg.add(name="CD", ssh_host="cd-1", instance_id="cd-1")
-        reg.set_last_active("cd-1")
+        reg.update("cd-1", mark_last_active=True)
         assert reg.remove("cd-1") is True
         assert reg.remove("cd-1") is False
         assert reg.get_last_active() is None
@@ -1602,9 +1746,37 @@ class _State:
         self.instances_manager = manager
 
 
-def _enable(tmp_path: Path, monkeypatch, *, enabled=True):
+class _ConnectedMgr:
+    """Manager stub where the named instances report a live tunnel.
+
+    Only the three members ``_status_for`` touches are implemented, which is
+    what the warm-set-cap tests need: the cap is derived from how many instances
+    come back ``connected``.
+    """
+
+    def __init__(self, connected):
+        self._connected = set(connected)
+
+    def status(self, instance_id):
+        if instance_id not in self._connected:
+            return None
+        return types.SimpleNamespace(
+            to_dict=lambda: {"instance_id": instance_id, "state": "connected"}
+        )
+
+    def token_ttl_remaining(self, instance_id):
+        return None
+
+    def last_error(self, instance_id):
+        return None
+
+
+def _enable(tmp_path: Path, monkeypatch, *, enabled=True, warm_set_cap=None):
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
-    (tmp_path / "config.json").write_text(json.dumps({"instances": {"enabled": enabled}}))
+    section: dict = {"enabled": enabled}
+    if warm_set_cap is not None:
+        section["warm_set_cap"] = warm_set_cap
+    (tmp_path / "config.json").write_text(json.dumps({"instances": section}))
     from kiro_crew.config import loader
 
     loader._invalidate_config_cache()
@@ -1945,9 +2117,40 @@ class TestHandlers:
         assert r.status == 201
         r = asyncio.run(handlers.api_instances_list(_FakeReq(state)))
         b = _body(r)
-        assert b["warm_set_cap"] == 5 and len(b["instances"]) == 1
+        # Automatic cap with nothing connected floors at 1 (the active pane is
+        # always warm), so the browser still gets a cap it can honour.
+        assert b["warm_set_cap"] == 1 and len(b["instances"]) == 1
         # no manager on this state => enabled-in-config but not active (needs restart)
         assert b["active"] is False
+
+    def test_automatic_cap_tracks_the_connected_count(self, tmp_path, monkeypatch):
+        """The served cap covers every connected crew, so none is ever evicted.
+
+        Eviction unmounts the pane and cold-boots the remote SPA on the next
+        click, which reads as a disconnect — so a cap below the connected count
+        makes ordinary tab switching look like a connection flap.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        for name in ("a", "b", "c"):
+            reg.add(name=name, ssh_host=f"{name}-alias")
+        state = _State(reg, _ConnectedMgr(["a", "c"]))
+        b = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))
+        assert len(b["instances"]) == 3
+        assert b["warm_set_cap"] == 2
+
+    def test_explicit_cap_is_served_even_below_the_connected_count(self, tmp_path, monkeypatch):
+        """An operator's own number is the budget and is not widened for them."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch, warm_set_cap=1)
+        reg = self._reg(tmp_path)
+        for name in ("a", "b"):
+            reg.add(name=name, ssh_host=f"{name}-alias")
+        state = _State(reg, _ConnectedMgr(["a", "b"]))
+        assert _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))["warm_set_cap"] == 1
 
     def test_list_active_reflects_manager_running(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
@@ -2092,6 +2295,95 @@ class TestHandlers:
         assert "token" not in _body(r)  # never serve a token we couldn't confirm
         assert "STALE_TOK" not in r.body.decode()
 
+    def test_connect_failure_promotes_the_diagnosis_verdict_to_a_top_level_code(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed connect names WHICH link broke where a client can read it.
+
+        The ladder's verdict already travels in ``diagnosis.code``, but the
+        dashboard's error journal reads a top-level ``code`` — so without the
+        promotion the one field that distinguishes "cannot SSH at all" from "SSH
+        works, the remote gateway is down" never reaches the surface that offers to
+        act on it. Only a NEGATIVE verdict is promoted: the stored diagnosis is the
+        last ladder run, so a stale ``ok`` must not be published as this call's
+        reason.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState, TunnelStatus
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        def connect_returning(status):
+            class FakeMgr:
+                async def connect(self, iid):
+                    return status
+
+            return asyncio.run(
+                handlers.api_instances_connect(
+                    _FakeReq(_State(reg, FakeMgr()), match={"id": "cd-1"})
+                )
+            )
+
+        diagnosed = connect_returning(
+            TunnelStatus(
+                "cd-1",
+                TunnelState.ERROR,
+                error="tunnel failed",
+                diagnosis={
+                    "code": "ssh_unreachable",
+                    "ok": False,
+                    "reason": "Can't SSH to the host",
+                    "probes": [{"name": "ssh", "ok": False}],
+                },
+            )
+        )
+        assert diagnosed.status == 502 and _body(diagnosed)["code"] == "ssh_unreachable"
+
+        # No diagnosis on record — the response still names the stage that failed
+        # rather than leaving the client to parse prose.
+        undiagnosed = connect_returning(
+            TunnelStatus("cd-1", TunnelState.ERROR, error="tunnel failed")
+        )
+        assert undiagnosed.status == 502
+        assert _body(undiagnosed)["code"] == "instance_connect_failed"
+
+        # A stale healthy verdict is not this failure's reason.
+        stale_ok = connect_returning(
+            TunnelStatus(
+                "cd-1",
+                TunnelState.ERROR,
+                error="tunnel failed",
+                diagnosis={"code": "ok", "ok": True, "reason": "all good", "probes": []},
+            )
+        )
+        assert _body(stale_ok)["code"] == "instance_connect_failed"
+
+    def test_connect_missing_manager_and_unknown_id_carry_codes(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="CD", ssh_host="cd-1-alias", instance_id="cd-1")
+
+        no_mgr = asyncio.run(
+            handlers.api_instances_connect(_FakeReq(_State(reg), match={"id": "cd-1"}))
+        )
+        assert no_mgr.status == 503
+        assert _body(no_mgr)["code"] == "instances_manager_unavailable"
+
+        class MissingMgr:
+            async def connect(self, iid):
+                raise KeyError(iid)
+
+        ghost = asyncio.run(
+            handlers.api_instances_connect(
+                _FakeReq(_State(reg, MissingMgr()), match={"id": "ghost"})
+            )
+        )
+        assert ghost.status == 404 and _body(ghost)["code"] == "instance_not_found"
+
     def test_status_404(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
 
@@ -2171,6 +2463,44 @@ class TestHandlers:
         assert asyncio.run(handlers.api_instances_add(_FakeReq(state))).status == 400
         # body not an object -> 400
         assert asyncio.run(handlers.api_instances_add(_FakeReq(state, body=["x"]))).status == 400
+
+    def test_add_error_bodies_carry_a_machine_readable_code(self, tmp_path, monkeypatch):
+        """Every add rejection names its cause in ``code``, not only in prose.
+
+        The dashboard reads this field (``utils/errorReport``'s ``parseErrorCode``)
+        to attach the failure's cause to an agent hand-off, and a first-time setup
+        rejection is exactly the case where the user cannot diagnose it alone. A
+        duplicate is kept distinct from an invalid field because the two are
+        different user actions — rename versus correct — and a client that cannot
+        tell them apart has to match on prose.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        state = _State(self._reg(tmp_path))
+        body = {"name": "CD", "ssh_host": "cd-1-alias", "id": "cd-1"}
+        assert asyncio.run(handlers.api_instances_add(_FakeReq(state, body=body))).status == 201
+
+        dup = asyncio.run(handlers.api_instances_add(_FakeReq(state, body=body)))
+        assert dup.status == 400 and _body(dup)["code"] == "instance_duplicate"
+
+        no_json = asyncio.run(handlers.api_instances_add(_FakeReq(state)))
+        assert no_json.status == 400 and _body(no_json)["code"] == "invalid_json"
+
+        not_object = asyncio.run(handlers.api_instances_add(_FakeReq(state, body=["x"])))
+        assert not_object.status == 400 and _body(not_object)["code"] == "invalid_body"
+
+        bad_field = asyncio.run(
+            handlers.api_instances_add(
+                _FakeReq(state, body={"name": "Bad", "ssh_host": "h", "remote_port": "not-a-port"})
+            )
+        )
+        assert bad_field.status == 400 and _body(bad_field)["code"] == "invalid_field"
+
+        rejected = asyncio.run(
+            handlers.api_instances_add(_FakeReq(state, body={"name": "", "ssh_host": ""}))
+        )
+        assert rejected.status == 400 and _body(rejected)["code"] == "instance_invalid"
 
     def test_update_paths(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
@@ -4778,6 +5108,59 @@ class TestSsmTunnelProcessGroup:
         assert seen["start_new_session"] is False
         assert seen["creationflags"] == 0
 
+    @pytest.mark.asyncio
+    async def test_ssm_child_gets_plugin_search_path_and_ssh_inherits(self, monkeypatch, tmp_path):
+        """The SSM child needs a PATH that can find session-manager-plugin.
+
+        The argv head is resolved absolutely, but the aws CLI then looks the
+        plugin up BY NAME on this child's own PATH — under a GUI-launched gateway
+        the minimal launchd one — so the tunnel died inside a correctly resolved
+        ``aws`` (#5392). SSH keeps ``env=None`` (inherit): its binary lives in
+        the system bin dir and widening a tunnel child's PATH without a reason to
+        is the opposite of what this fix argues for.
+        """
+        import kiro_crew.instances.ssh_tunnel_manager as mod
+        from kiro_crew.deploy import engine
+
+        seen = {}
+
+        async def fake_exec(*argv, **kw):
+            seen.update(kw)
+            raise OSError("stop here — we only care about the spawn kwargs")
+
+        # tmp_path stand-ins: a host path literal would flake and is unrunnable
+        # on Windows, which this class deliberately also exercises. `aws` sits on
+        # the inherited PATH so the head resolves absolutely (a PATH hit needs no
+        # provenance check), which is what makes the widening applicable. Windows
+        # resolves executables by PATHEXT rather than the exec bit, so the planted
+        # file differs there — otherwise the head falls back to the bare name and
+        # the widening is (correctly) withheld.
+        inherited = tmp_path / "sysbin"
+        inherited.mkdir()
+        if os.name == "nt":
+            fake_aws = inherited / "aws.cmd"
+            fake_aws.write_text("@echo off\n")
+            monkeypatch.setenv("PATHEXT", ".cmd")
+        else:
+            fake_aws = inherited / "aws"
+            fake_aws.write_text("#!/bin/sh\n")
+            fake_aws.chmod(0o755)
+        install_dir = tmp_path / "install"
+        monkeypatch.setenv("PATH", str(inherited))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install_dir),))
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(mod.platform_compat, "IS_POSIX", True)
+
+        await self._tunnel("ssm").start()
+        child_path = seen["env"]["PATH"].split(os.pathsep)
+        assert str(install_dir) in child_path
+        # Appended: the inherited PATH still wins every name it can resolve.
+        assert child_path.index(str(inherited)) < child_path.index(str(install_dir))
+
+        seen.clear()
+        await self._tunnel("ssh").start()
+        assert seen["env"] is None
+
     def test_teardown_routes_through_the_platform_shim(self, monkeypatch):
         """Not raw os.killpg — that leaves the plugin alive on Windows."""
         import kiro_crew.instances.ssh_tunnel_manager as mod
@@ -5004,6 +5387,44 @@ class TestSsmTransportSelection:
         await mgr2.connect("ec2b")
         assert seen["timeout_secs"] == 45.0
         await mgr2.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_plugin_probe_runs_off_the_event_loop(self, tmp_path, monkeypatch):
+        """#5392: the prerequisite probe must not block the gateway event loop.
+
+        The probe resolves the plugin through the deploy engine's shared resolver
+        — PATH scan, then the well-known install dirs, then executable-provenance
+        validation — so a stalled network mount on any of those would freeze every
+        request and heartbeat. Pinned by the THREAD it actually runs on rather
+        than by source inspection, so an edit that drops the offload fails here
+        even if it keeps the wording.
+        """
+        import threading
+
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        loop_thread = threading.get_ident()
+        ran_on: dict = {}
+
+        def _probe():
+            ran_on["thread"] = threading.get_ident()
+            return False  # short-circuit: no tunnel spawn, error status asserted
+
+        monkeypatch.setattr("kiro_crew.cloud.ssm.session_manager_plugin_installed", _probe)
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(
+            name="EC2",
+            connection_method="ssm",
+            ssm_target="i-0123456789abcdef0",
+            instance_id="ec2",
+            remote_port=53514,
+        )
+
+        st = await mgr.connect("ec2")
+
+        assert st.state == TunnelState.ERROR
+        assert ran_on["thread"] != loop_thread
+        await mgr.shutdown()
 
     @pytest.mark.asyncio
     async def test_ssm_connect_fails_clean_without_plugin(self, tmp_path, monkeypatch):
@@ -5749,6 +6170,46 @@ class TestOrphanForwarderReclaim:
         finally:
             self._cleanup(proc)
 
+    @pytest.mark.skipif(not socket.has_ipv6, reason="host has no IPv6 support")
+    def test_reclaim_ignores_a_foreign_ipv6_listener_on_the_same_port(self, monkeypatch):
+        """A reclaim asks whether OUR forwarder released ITS port, not whether the
+        port is free for a new one.
+
+        An ``ssh -L`` child binds 127.0.0.1 alone, so an unrelated listener on
+        ``::1`` says nothing about whether the orphan let go. Probing both
+        families here would report a fully reclaimed forwarder as ``not_gone``
+        and record that wrong outcome in the SEL audit.
+        """
+        import kiro_crew.instances.ssh_tunnel_manager as stm
+        from kiro_crew import platform_compat as pc
+
+        squatter = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        squatter.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        try:
+            squatter.bind(("::1", 0))
+        except OSError:
+            squatter.close()
+            pytest.skip("::1 is not assignable here")
+        squatter.listen(1)
+        port = squatter.getsockname()[1]
+
+        monkeypatch.setattr(pc, "process_start_time", lambda pid: "identity-A")
+        monkeypatch.setattr(pc, "process_argv_matches_exact", lambda pid, argv: True)
+        monkeypatch.setattr(pc, "pid_exists", lambda pid: False)  # child already exited
+        monkeypatch.setattr(pc, "kill_pid", lambda pid, sig: True)
+        monkeypatch.setattr(stm, "_RECLAIM_TERM_GRACE_SECS", 0.05)
+
+        try:
+            outcome = stm._verify_and_reclaim_forwarder(
+                4242, "identity-A", ["ssh", "-N"], port, False, "instance=t pid=4242"
+            )
+        finally:
+            squatter.close()
+
+        assert (
+            outcome == "reclaimed"
+        ), "a foreign ::1 listener must not make a released IPv4 forward read as not_gone"
+
     def test_sigkill_withheld_when_identity_changes_during_grace(self, monkeypatch):
         """Open-box guard test: if the pid stops matching its recorded
         start-time identity during the TERM grace (exit + recycle inside a
@@ -6316,16 +6777,53 @@ class TestProxyHandlerPolicy:
         assert _proxy_canonical_path("api/chat") == ("api/chat", "")
         assert _proxy_canonical_path("/api/chat/") == ("api/chat", "")
 
+    def test_event_stream_prefix_is_forwarded(self):
+        """`GET /api/stream` is the out-of-turn half of the chat view: the peer's
+        own SSE broadcast, carrying session-list and slot-state changes while the
+        per-turn reply streams back from `api/chat`. It is a leaf endpoint, so
+        the bare prefix is the whole surface this row grants."""
+        from kiro_crew.dashboard.handlers_instances import _proxy_canonical_path
+
+        assert _proxy_canonical_path("api/stream") == ("api/stream", "")
+        assert _proxy_canonical_path("/api/stream/") == ("api/stream", "")
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "api/ws",  # the SSE sibling: an upgrade cannot cross this proxy
+            "api/ws/stt",
+            "api/streaming",  # whole-segment match, not a string prefix
+            "api/stream-x",
+            "api/file-stream",  # a DIFFERENT endpoint that merely ends in stream
+        ],
+    )
+    def test_stream_row_does_not_admit_its_neighbours(self, raw):
+        """The row is `("api", "stream")` — whole segments, nothing adjacent.
+
+        `api/ws` is the one to keep refused on purpose: it is the same event bus
+        over WebSocket, and admitting it would require a `101 Switching
+        Protocols` to pass the reply content-type gate that exists to stop a peer
+        serving active content onto the authenticated hub origin.
+        """
+        from kiro_crew.dashboard.handlers_instances import (
+            _PROXY_PATH_DENIED_REASON,
+            _proxy_canonical_path,
+        )
+
+        path, reason = _proxy_canonical_path(raw)
+        assert path == ""
+        assert reason == _PROXY_PATH_DENIED_REASON
+
     def test_allowlist_constant_is_pinned_exactly(self):
         """Widening the proxied surface must be a REVIEWED act: this pins the
-        constant's exact value, so adding a row (e.g. the deferred api/ws)
-        fails here until the test is updated alongside it. The shape floor
-        (every row >= 2 segments, rooted at `api`) guards the fail-open edits
-        an exact pin alone would also catch — kept separate so the failure
-        message names the broken invariant."""
+        constant's exact value, so adding a row fails here until the test is
+        updated alongside it. The shape floor (every row >= 2 segments, rooted
+        at `api`) guards the fail-open edits an exact pin alone would also
+        catch — kept separate so the failure message names the broken
+        invariant."""
         from kiro_crew.dashboard.handlers_instances import _PROXY_ALLOWED_PREFIXES
 
-        assert _PROXY_ALLOWED_PREFIXES == (("api", "chat"),)
+        assert _PROXY_ALLOWED_PREFIXES == (("api", "chat"), ("api", "stream"))
         for prefix in _PROXY_ALLOWED_PREFIXES:
             # An empty row prefix-matches EVERYTHING and a one-segment row
             # restores the whole peer /api/ surface; both must be impossible.

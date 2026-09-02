@@ -1526,6 +1526,10 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
                 if (e.key === 'ArrowDown') { e.preventDefault(); setCmdIdx(i => (i + 1) % filtered.length); return }
                 if (e.key === 'ArrowUp') { e.preventDefault(); setCmdIdx(i => (i - 1 + filtered.length) % filtered.length); return }
                 if (e.key === 'Tab') {
+                  // Tab accepts the highlighted command INTO the composer, so an
+                  // IME cycling its candidate list with Tab must not rewrite the
+                  // draft mid-composition. Claimed like the Enter branch below.
+                  if (!ime.claimKey(e)) return
                   e.preventDefault(); setInput(filtered[cmdIdx].cmd); setCmdIdx(0); return
                 }
                 // While the picker is open Enter belongs to it, so the key is claimed

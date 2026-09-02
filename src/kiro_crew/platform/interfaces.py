@@ -93,6 +93,14 @@ class ProviderRegistry(Protocol):
         """Register any extra ACP backends.
 
         Consumed at boot by ``bootstrap_context`` after the context installs.
+
+        An implementation MUST also call
+        ``acp_backends.register_selectable_backend(<id>)`` for anything an operator
+        should be able to choose. Registering the provider alone leaves the harness
+        runnable but unreachable: the dashboard's backend switch, its PATCH
+        allowlist and the config load path all derive from that registry, so an
+        unregistered id renders as "not enabled in this build" and is coerced back
+        to the default on load.
         """
         ...
 
@@ -991,6 +999,53 @@ class TunnelProvider(Protocol):
         never provisions anything and behaves byte-identically. A companion
         drives its real install-and-enable pipeline here (v1 addition; no
         ``CONTRACT_VERSION`` bump).
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class MobileConnectMethod:
+    """One way the current deployment hands a phone a live dashboard session.
+
+    A descriptor says WHICH method exists — never how to mint the credential.
+    Minting stays on the method's own endpoint (the tailnet QR handler, the
+    one-time mobile-link handler, a companion's own route), where the caller
+    bounds, owner checks, restricted-session refusals and SEL audits already
+    live; a seam that returned URLs or tokens would move credential minting
+    behind an interface the core cannot audit.
+
+    ``id`` is the governed identifier: the ``methods`` ruleset of the
+    ``capabilities.mobile_connect`` scope narrows on it, and the methods
+    endpoint drops a denied id before the dashboard ever sees it.  ``kind``
+    names the frontend renderer; the dashboard skips a kind it does not
+    recognise (an older frontend renders an edition's new method as absent,
+    never as a broken panel).
+    """
+
+    id: str
+    kind: str
+
+
+class MobileConnectProvider(Protocol):
+    """Edition-contributed phone-connection methods.
+
+    Public default = the personal-install pair (tailnet QR + one-time login
+    link), reproducing today's behavior.  An enterprise companion replaces the
+    list with its own method(s) — or returns ``[]``, which hides the
+    dashboard's "Connect your phone" entry entirely (governance can also pin
+    the capability off without an edition swap; both paths converge on an
+    empty methods list).
+    """
+
+    def connect_methods(self) -> List[MobileConnectMethod]:
+        """Return the deployment's methods, BEFORE governance filtering.
+
+        WIRED: ``dashboard/handlers/mobile_connect.py::api_mobile_connect_methods``
+        reads this via ``safe_context_call`` (fallback: ``[]``, hiding the
+        entry rather than guessing) and filters each id through the
+        ``capabilities.mobile_connect`` governance scope; the mint endpoints
+        re-check the same scope per id, so the filtered list is presentation,
+        never the control.
         """
         ...
 

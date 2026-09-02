@@ -31,7 +31,7 @@ from ..spine.push_policy import (
     scan_content_for_secrets,
 )
 from . import store
-from .clone_setup import resolve_origin_url
+from .clone_setup import _repository_is_isolated, resolve_origin_url
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +238,15 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     ok, reason = authorize_direct_push(direct_commit=True, branch=branch)
     if not ok:
         return {"ok": False, "error": f"branch refused by push policy: {reason}"}
+    # Deliberately the sole repository-safety gate for this operation. The production
+    # route proves the runner is idle while holding `clone_lock`, then this check runs
+    # before materialization or any other Git mutation. No agent-authored step runs
+    # inside the critical section, so config/metadata cannot legitimately change before
+    # push. Rechecking only after creating the provisional commit is unsound: once that
+    # check fails, rollback Git would itself trust the repository just declared unsafe,
+    # while returning without rollback leaves a rejected commit as a future baseline.
+    if not _repository_is_isolated(clone):
+        return {"ok": False, "error": "repository isolation check failed — re-run setup"}
 
     diff_text = diff_path.read_text(encoding="utf-8")
     if not diff_text.strip():
@@ -266,7 +275,15 @@ def _commit_finding_locked(fp: str) -> dict[str, object]:
     # roll the commit back so the tree is clean for a retry or the draft-PR path, exactly
     # as the failed-apply and failed-commit branches above do.
 
-    scanned = _git(clone, "diff", f"{base_ref_local}..HEAD", timeout=_GIT_TIMEOUT_S)
+    scanned = _git(
+        clone,
+        "-c",
+        "diff.external=",
+        "diff",
+        "--no-ext-diff",
+        f"{base_ref_local}..HEAD",
+        timeout=_GIT_TIMEOUT_S,
+    )
     if scanned.returncode == 0:
         clean, code = scan_content_for_secrets(scanned.stdout or "")
         # Fixed code -> fixed literal: the message returned to the operator carries

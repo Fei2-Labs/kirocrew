@@ -13,6 +13,18 @@
  * Both paths honour ``iconUrlDark``: the inline path rarely needs it (theme
  * tokens already repaint first-party SVGs), but a raster icon has fixed bytes,
  * so an app that wants to read well on both backgrounds ships two files.
+ *
+ * An optional ``iconUrlFallback``/``iconUrlFallbackDark`` pair gives the raster
+ * path a second chance when the resolved URL fails to LOAD (as opposed to not
+ * being declared): the detail page hands an installed app's own local art route
+ * here, so an unreachable registry CDN degrades to the app's real mark instead
+ * of the generic glyph. Omitted, the pair is inert and behaviour is unchanged.
+ *
+ * The two paths also differ in GEOMETRY, which is what ``rasterFill`` exists
+ * for: a glyph is line art that needs air around it and is always inset at
+ * ``size``, while an app-supplied raster icon is a finished square tile that a
+ * plate-drawing caller wants bled to the edges. The flag reaches only the
+ * ``<img>`` branches, so no caller can accidentally crop a glyph with it.
  */
 import { useEffect, useId, useMemo, useState } from 'react'
 import DOMPurify from 'dompurify'
@@ -63,7 +75,10 @@ export default function AppIcon({
   icon,
   iconUrl,
   iconUrlDark,
+  iconUrlFallback,
+  iconUrlFallbackDark,
   size = 20,
+  rasterFill = false,
   selected = false,
 }: {
   icon?: string
@@ -80,7 +95,48 @@ export default function AppIcon({
    * both appearances. It exists for the raster path, where the bytes are fixed.
    */
   iconUrlDark?: string
+  /**
+   * Optional second-chance URL pair, consulted only when the resolved primary
+   * URL fails to LOAD. The detail page passes the installed app's own on-disk
+   * art route here, so an offline dashboard still shows the app's real mark —
+   * while the registry's immutable content-addressed asset stays the primary
+   * ``src`` and keeps its cache-forever win (a precedence flip is exactly what
+   * issue #6804 rejects). Theme resolution mirrors ``iconUrl``/``iconUrlDark``,
+   * falling back in both directions. When the fallback also fails, the
+   * component degrades to the lucide glyph exactly as before. The fallback
+   * always renders on the raster ``<img>`` path — an ``/app-assets/`` SVG value
+   * here is not inlined, so it paints with its literal fills, not theme tokens.
+   */
+  iconUrlFallback?: string
+  iconUrlFallbackDark?: string
   size?: number
+  /**
+   * Let a RASTER icon bleed to the edges of its container instead of sitting
+   * inset at ``size``. An app-supplied icon file is a finished tile — the
+   * publishing guide asks for a 512x512 opaque square — so on any surface that
+   * already draws a rounded plate for it the icon IS the plate, and rendering it
+   * inset leaves the app looking like a small sticker stuck on that plate.
+   *
+   * Deliberately scoped to the raster ``<img>`` branches, so it CANNOT change
+   * the two glyph paths: a first-party ``/app-assets/`` SVG and a lucide
+   * ``ICON_MAP`` fallback are line-art marks drawn to be read with air around
+   * them, and bleeding those to the edge would crop their strokes against the
+   * plate's border. That split is the whole reason this is one flag on the
+   * component rather than a size the caller raises to the container's width.
+   *
+   * Fills by ``object-cover``, so an off-spec non-square icon is centre-cropped
+   * rather than letterboxed.
+   *
+   * CALLER CONTRACT — the plate must be BOTH ``relative`` and
+   * ``overflow-hidden``. The image is absolutely inset, so an unpositioned plate
+   * hands it to the nearest positioned ancestor instead and the icon escapes the
+   * plate entirely (on the store's spotlight that ancestor is the 16:9 art
+   * panel, so the icon would render as hero art); and the clip is what makes the
+   * bled image take the plate's own radius. A test pins both classes at every
+   * call site that passes this flag, because neither failure is visible in the
+   * diff — only in the render.
+   */
+  rasterFill?: boolean
   /** Lit (accent-dominant) vs idle (muted + accent highlight). */
   selected?: boolean
 }) {
@@ -88,7 +144,11 @@ export default function AppIcon({
   const url = (theme === 'dark'
     ? (iconUrlDark || iconUrl)
     : (iconUrl || iconUrlDark)) || undefined
+  const fallbackUrl = (theme === 'dark'
+    ? (iconUrlFallbackDark || iconUrlFallback)
+    : (iconUrlFallback || iconUrlFallbackDark)) || undefined
   const [imgFailed, setImgFailed] = useState(false)
+  const [fallbackFailed, setFallbackFailed] = useState(false)
   const [markup, setMarkup] = useState<string | null>(
     isAppAssetSvg(url) ? svgCache.get(url) ?? null : null,
   )
@@ -112,7 +172,11 @@ export default function AppIcon({
     // icon or a sticky failure when its icon changes — including a THEME flip,
     // which changes ``url`` without any prop the parent re-keys on. Hydrate
     // synchronously from cache when available; otherwise clear and fetch below.
+    // A changed icon clears BOTH failure latches: an app update rewrites the
+    // local file in place, so a stale fallback latch would be the same
+    // sticky-failure bug this reset exists to prevent.
     setImgFailed(false)
+    setFallbackFailed(false)
     const cached = isAppAssetSvg(url) ? svgCache.get(url) ?? null : null
     setMarkup(cached)
     if (!isAppAssetSvg(url) || svgCache.has(url)) return
@@ -128,6 +192,26 @@ export default function AppIcon({
       .catch(() => { if (!cancelled) setImgFailed(true) })
     return () => { cancelled = true }
   }, [url])
+
+  useEffect(() => {
+    // The same per-URL reset discipline for the fallback latch alone: the
+    // fallback candidate can change independently of the primary (a theme flip
+    // where only the fallback pair has a dark variant, an install completing
+    // while the page is open) and must never inherit a stale failure.
+    setFallbackFailed(false)
+  }, [fallbackUrl])
+
+  // Raster geometry, shared by BOTH <img> branches so the second-chance
+  // fallback can never render at a different size than the icon it stands in
+  // for. Inset at ``size`` is the default; under ``rasterFill`` the image is
+  // absolutely inset to the container's edges and carries NO radius of its own
+  // — the container is ``overflow-hidden`` and already has one, and a second
+  // radius here would disagree with it (the Library's tile is 15px, the store's
+  // rows are 8px).
+  const rasterClass = rasterFill
+    ? 'absolute inset-0 w-full h-full object-cover'
+    : 'rounded-lg object-contain'
+  const rasterStyle = rasterFill ? undefined : { width: size, height: size }
 
   // Themeable inline SVG path. The `.app-icon` class sets idle tokens
   // (--ico-a: muted, --ico-b: accent); `data-selected` OR an ancestor
@@ -155,9 +239,29 @@ export default function AppIcon({
       <img
         src={url}
         alt=""
-        className="rounded-lg object-contain"
-        style={{ width: size, height: size }}
+        className={rasterClass}
+        style={rasterStyle}
         onError={() => setImgFailed(true)}
+      />
+    )
+  }
+
+  // Second chance: the primary URL failed to LOAD and the caller supplied a
+  // fallback (an installed app's own local bytes). Skipped when it matches the
+  // failed primary — retrying the identical URL that just errored is a second
+  // doomed request — and once it has itself failed, so the escape below stays
+  // the terminal state and no broken-image frame is ever left on screen.
+  if (imgFailed && fallbackUrl && fallbackUrl !== url && !fallbackFailed) {
+    return (
+      // onError is an image-load lifecycle handler (degrade to the glyph), the
+      // same non-interactive use the hero image documents on AppDetailPage.
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
+      <img
+        src={fallbackUrl}
+        alt=""
+        className={rasterClass}
+        style={rasterStyle}
+        onError={() => setFallbackFailed(true)}
       />
     )
   }

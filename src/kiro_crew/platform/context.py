@@ -18,6 +18,7 @@ See ``docs/system-specs/modules/platform-context.md``.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple, TypeVar
 
@@ -41,6 +42,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         JailProvider,
         KnowledgeProvider,
         McpToolingProvider,
+        MobileConnectProvider,
         PackageManager,
         PromptSourceProvider,
         ProviderRegistry,
@@ -301,6 +303,7 @@ class PlatformContext:
     telemetry: "TelemetryProvider"
     dashboard: "DashboardContributor"
     jail: "JailProvider"
+    mobile_connect: "MobileConnectProvider"
 
     # ── bundled feature apps ──
     feature_apps: "Tuple[FeatureApp, ...]"  # [RESERVED] — see RESERVED_SLOTS
@@ -363,11 +366,51 @@ class PlatformContext:
 # and reset around the test (see the reset_platform_context fixture).
 _ACTIVE: Optional[PlatformContext] = None
 
+# Bumped on EVERY install of ``_ACTIVE``, so a consumer that caches something
+# derived from ``ctx.governance`` can tell that the ceiling underneath it moved.
+#
+# The ceiling was boot-frozen when this counter did not exist, so nothing needed
+# it: a cache built after boot was built against the final answer.  Central
+# policy distribution breaks that — ``policy_distribution`` installs a re-fetched
+# ceiling mid-session — and the one cache that matters,
+# ``governance_profiles.ProfileStore``, folds this into its freshness key.  A
+# boolean "is a fallback declared" cannot carry the fact on its own: swapping one
+# declared fallback for a different one leaves that boolean True on both sides, so
+# the store would keep serving profiles composed against the retired ceiling.
+#
+# Incremented by :func:`_install`, which is the ONLY writer of ``_ACTIVE`` —
+# including the lazy default and the test reset — so no future install site can
+# forget to bump it.
+_GOVERNANCE_GENERATION = 0
+_GENERATION_LOCK = threading.Lock()
+
+
+def _install(ctx: Optional[PlatformContext]) -> None:
+    """Assign ``_ACTIVE`` and bump the generation.  The single writer."""
+    global _ACTIVE, _GOVERNANCE_GENERATION
+    with _GENERATION_LOCK:
+        _ACTIVE = ctx
+        _GOVERNANCE_GENERATION += 1
+
+
+def governance_generation() -> int:
+    """Monotonic counter of how many contexts have been installed this process.
+
+    Read by caches keyed on the active ceiling (see ``_GOVERNANCE_GENERATION``).
+    Opaque and comparison-only: callers may test it for equality with a value they
+    stored, never interpret its magnitude.
+    """
+    with _GENERATION_LOCK:
+        return _GOVERNANCE_GENERATION
+
 
 def set_context(ctx: PlatformContext) -> None:
-    """Install the process-global active context (called once at boot)."""
-    global _ACTIVE
-    _ACTIVE = ctx
+    """Install the process-global active context (called once at boot).
+
+    Also called by ``policy_distribution.apply_ceiling`` when a centrally-fetched
+    policy replaces the ceiling mid-session — the one supported post-boot install.
+    """
+    _install(ctx)
 
 
 def installed_context() -> Optional[PlatformContext]:
@@ -414,7 +457,6 @@ def current_context() -> PlatformContext:
     raise :class:`PlatformCompositionError`.  Defense-in-depth so a future
     swallowing caller cannot reintroduce the silent fail-open.
     """
-    global _ACTIVE
     if _ACTIVE is None:
         # deferred (not a cycle): keep config import off the module-load path so
         # importing kiro_crew.platform stays cheap; only the lazy-default path needs it.
@@ -438,14 +480,18 @@ def current_context() -> PlatformContext:
                 "open-source defaults (fail-closed). Boot did not run or failed "
                 "to compose the companion."
             )
-        _ACTIVE = build_default_context(cfg, profile=PROFILE_STANDALONE)
+        ctx = build_default_context(cfg, profile=PROFILE_STANDALONE)
+        _install(ctx)
+        # Return the value just built rather than re-reading the global: the read
+        # would need a narrowing cast, and another thread could have installed a
+        # different context between the install and the read.
+        return ctx
     return _ACTIVE
 
 
 def reset_context() -> None:
     """Clear the active context (test helper)."""
-    global _ACTIVE
-    _ACTIVE = None
+    _install(None)
 
 
 _T = TypeVar("_T")
@@ -608,3 +654,74 @@ def redact_via_context(text: str) -> str:
         from kiro_crew.security import redact as _security_redact
 
         return _security_redact(text)
+
+
+#: Substituted for a log line's text when redaction could not be composed. Names
+#: the cause, because on the host where this fires the operator's real problem is
+#: the failed companion composition, not the missing line.
+LOG_WITHHELD_PLACEHOLDER = "<withheld: redaction unavailable>"
+
+
+def redact_log_via_context(text: str) -> str:
+    """Context-aware redaction for an operational LOG line, which must not raise.
+
+    Same redaction as :func:`redact_via_context` -- so a loaded companion's extra
+    credential/cookie regexes apply instead of the OSS baseline -- but it never
+    propagates :class:`PlatformCompositionError` to the caller.
+
+    Why a log site needs its own spelling. ``redact_via_context`` re-raises that
+    error deliberately: for an EGRESS sink, refusing to send is both safe and the
+    whole point. A gate-side log line is not an egress boundary, and there the
+    same raise buys nothing while costing availability -- several of these sites
+    log from a path whose failure is worse than a missing line (a background
+    drain, a boot-time install step, an audit write).
+
+    The two no-companion states are NOT the same, and conflating them is what
+    makes this helper subtle:
+
+    * **A context is installed but its policy could not be composed.** The host
+      is known to be non-standalone and its companion genuinely failed, so the
+      baseline would be a real downgrade -- exactly what
+      ``redact_via_context``'s fail-closed contract exists to forbid. The line's
+      TEXT is withheld (:data:`LOG_WITHHELD_PLACEHOLDER`): strictly safer than
+      either raising or downgrading, and the caller's own log call still records
+      that a line arrived and why its content is absent. Same shape as
+      ``auto_improvement.backend.mcp_server._redact_result``.
+    * **No context is installed at all.** Nothing here evidences a companion,
+      the full OSS pass still runs, and this is byte-for-byte what the site did
+      before it adopted this helper -- so withholding would DESTROY diagnostics
+      to protect against a companion that may not exist. Baseline it is. A
+      process that deliberately does not compose (``mcp_gateway.gatewayd`` is
+      one: see ``mcp_gateway/app_call.py``, "this daemon is not the composition
+      process") therefore keeps its logs, and closing that residual properly
+      means handing such a process a composed context -- a separate change, and
+      the same remedy that module already names for the security ceiling.
+
+    Transient (non-composition) adapter errors degrade to baseline, inherited
+    from ``redact_via_context``, so a merely flaky companion does not blank the
+    logs either.
+
+    Costs NO I/O per call. ``installed_context()`` is a bare attribute read, and
+    it is the right primitive here for the reason its own contract gives -- the
+    no-context answer is the SAME as the default-context answer, since
+    ``DefaultCredentialPolicy.redact`` delegates to ``security.redact``, so
+    resolving one would be pure cost. That matters because
+    ``current_context()`` never memoizes its fail-closed verdict on a
+    non-standalone profile, so a per-line caller reaching it would re-pay a
+    config load and an entry-point discovery for every line on the event loop
+    (``docs/system-specs/modules/platform-context.md`` calls this out). Once a
+    context IS installed the delegation below is also just an attribute read, so
+    no path resolves.
+
+    Callers keep their own truncation, and must apply it AFTER this returns:
+    slicing a redacted string is what keeps a credential from surviving as an
+    unmatchable fragment.
+    """
+    if installed_context() is None:
+        from kiro_crew.security import redact as _security_redact
+
+        return _security_redact(text)
+    try:
+        return redact_via_context(text)
+    except PlatformCompositionError:
+        return LOG_WITHHELD_PLACEHOLDER

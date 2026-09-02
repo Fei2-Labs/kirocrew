@@ -457,8 +457,21 @@ When a subagent's tool call triggers `EVENT_PERMISSION_REQUEST`, approval
 is decided in strict priority order:
 
 1. **Hook deny** — `hooks.on_tool_call()` returns `TOOL_DENY` → reject
-2. **YOLO mode** — `is_yolo()` (live check) → auto-approve
-3. **Parent policy** — `parent_policy == "auto"` (snapshot at spawn) → auto-approve
+2. **Hook auto-approve** — `hooks.on_tool_call()` returns `TOOL_AUTO_APPROVE`
+   (the `auto_approve_tools` globs / read-only allowlist — a grant made by
+   program NAME), honoured only after `name_grant.refusal_for_event(event)`
+   confirms each program name in the shell command still resolves to the
+   program it appears to name. A refusal DOWNGRADES to rungs 3–5 (never a hard
+   block) and is audited as `outcome=auto_approve_declined` with
+   `reason=name_grant`, the refusal code, and `tier=hook_auto_approve`. This
+   matters most here: the subagent surface runs unattended, so an unverified
+   shadowed name would be honoured with nobody watching. On Windows the check
+   cannot model the shell's lookup at all, so it declines every name-based
+   shell grant there — a headless subagent (no parent `auto` policy, no
+   interactive approver) then rejects shell tools its allowlist used to grant.
+3. **Parent policy** — `parent_policy == "auto"` → auto-approve. Resolved once
+   at `_run_inner` start (see the chain below); an active global YOLO folds
+   into this snapshot rather than being re-read per event.
 4. **Interactive callback** — `on_tool_approval` (races dashboard + Slack, 2h timeout)
 5. **Deny by default** — none of the above matched → reject
 
@@ -487,8 +500,9 @@ no agent-authored event data, only the
 arguments remain unverified. The hook auto-approve (title-pattern-matched) and
 every content-matching path stay fail-closed on the composite fidelity.
 
-The `is_yolo()` check in the cascade is live (reads current gateway state),
-providing coverage if YOLO is toggled mid-execution.
+The `is_yolo()` read happens once, when `parent_policy` is resolved at
+`_run_inner` start — a YOLO toggle mid-execution takes effect on the next
+subagent run, not on the current run's remaining tools.
 
 ### `cancel_all() -> None`
 Cancels all running subagents, stops the reaper loop and command-authority lease
@@ -638,7 +652,8 @@ Every subagent card names the model the run actually ran on, so a model-pinned
 review's real model is auditable. `SubagentInfo` carries two fields: `requested_model`
 — the EFFECTIVE pin, i.e. the per-spawn `model` OR, when empty, the
 `agent.role_models['subagent']` config pin (AGENTS.md's documented way to pin a
-subagent model), resolved once at spawn — and `resolved_model`, the id the live
+subagent model), resolved once at spawn; `"auto"` when completely unpinned (no
+per-spawn model, no role pin) — and `resolved_model`, the id the live
 session actually served, read via the provider's public `served_model` accessor
 (`_resolved_model_of`, which normalizes the `DEFAULT_MODEL` "auto" sentinel to `""`
 = unknown). `resolved_model` is captured at spawn (ACP reports it immediately) and
@@ -657,8 +672,10 @@ agent pill and flags a **downgrade** — an amber chip plus a persistent
 on BOTH the completion card AND the **live** Subagents-panel row (`ActivityViewer`),
 so a mis-pinned run is visible mid-flight, not only at completion. Because the pin
 rides `subagent_done` (and its reconnect replay), a downgraded run that completes
-before a reconnect rehydrates its card with the amber flag intact. "Same model" is
-decided by the shared `normalizeModelKey`
+before a reconnect rehydrates its card with the amber flag intact. For unpinned
+spawns `requested_model="auto"` records the sentinel so the frontend shows a neutral
+chip rather than hiding the column. "Same model" is decided by the shared
+`normalizeModelKey`
 (`website/src/lib/model.ts`, mirroring the backend `_normalize_model_key`): dotted vs
 dashed spellings and case fold, and `auto`/`default` fold to "no pin", so an honored
 pin whose wire spelling differs does not false-flag. Wave-digest completions

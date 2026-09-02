@@ -18,7 +18,8 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew import __version__ as _mc_version
-from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox
+from kiro_crew import agent as _agent
+from kiro_crew import agent_state, dep_sync, diagnostics, platform_compat, sandbox, stt
 from kiro_crew._bootstrap import _source_checkout_root
 from kiro_crew.acp.client import KIRO_CLI_BIN
 from kiro_crew.acp.kas_transport import (
@@ -98,12 +99,7 @@ from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as service_linux
 from kiro_crew.session_pid_sig import signing_health
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
-from kiro_crew.transcribe import (
-    _faster_whisper_model,
-    _find_parakeet_mlx,
-    _find_whisper,
-    ensure_ffmpeg_in_path,
-)
+from kiro_crew.transcribe import _find_ffmpeg, availability_detail, ensure_ffmpeg_in_path
 from kiro_crew.validation import _AGENT_NAME_RE
 
 logger = logging.getLogger(__name__)
@@ -173,7 +169,7 @@ def _doctor_effective_model(cfg: KiroCrewConfig, project_dir: str, issues: list[
         checks here would be a second, weaker copy of a reader that already
         exists.
         """
-        data = _read_agent_spec(path)
+        data = _read_agent_spec(path, operation="doctor", source="cli")
         if data is None:
             # An ABSENT spec is not a fault -- a clean install has none, and the
             # resolver simply falls through to the bundled default. Only a file
@@ -448,7 +444,7 @@ def _agent_spec_model_problems(
             *((path, False) for path in global_specs),
             *((path, True) for path in project_specs),
         ):
-            data = _read_agent_spec(path)
+            data = _read_agent_spec(path, operation="doctor", source="cli")
             if data is None:
                 return None
             model = normalize_agent_model(data.get("model"))
@@ -485,17 +481,85 @@ def _format_model_pin_problem(name: str, pin: str, correction: str) -> tuple[str
     )
 
 
-def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
+def _spec_gate_closed(name: str) -> bool:
+    """Whether *name*'s spec-emission gate reports CLOSED right now.
+
+    Spec emission consults each managed server's ``spec_gate``
+    (``agent._MANAGED_MCP_SERVERS``): a closed gate means the ``mcpServers``
+    entry is deliberately omitted from every emitted spec — and retracted from
+    an existing one on refresh — so on such a host the entry's absence is the
+    HEALTHY state, not a broken install. Doctor's static checks must consult
+    the same predicate or the two sides drift apart, producing the unfixable
+    "missing from mcpServers (re-run `kirocrew setup`)" loop on every host
+    where the gate is closed (#6548). Resolving the gate through the registry
+    keeps them pinned together: a future server gaining a gate needs no edit
+    here, and a server without one reports open, exactly as emission treats it.
+
+    The ``except`` covers gate-CONTRACT failures only — a registry entry that
+    is not a dict, or a gate callable that raises past its own handling. For
+    those, the fail direction is deliberately the OPPOSITE of emission's
+    ``agent._gated_off_servers()``: there, a gate that raises is treated as
+    closed, because the open position hands out a backend the operator may not
+    want running; here it reports NOT closed, because "closed" is what
+    silences the missing-entry error. Each side fails toward its own safe
+    state. Note the scope honestly: the shipped computer-use gate catches its
+    own internal errors and ANSWERS ``False`` (its documented fail-closed
+    posture — an unreadable keystone must never hand out the desktop), so an
+    unreadable keystone is indistinguishable from policy-closed through the
+    boolean, by the gate's own design. That answer is still the
+    emission-CONSISTENT one to report: in that state the entry genuinely is
+    omitted from every emitted spec, so the ℹ️ line describes what the system
+    actually does, even when the underlying cause is a broken enable-state
+    read rather than a decision.
+
+    Never loads a native driver: the computer-use gate reads only the enable
+    keystone and platform flags (see ``agent._computer_use_spec_gate``), which
+    is what makes it safe to evaluate on doctor's diagnostic path.
+    """
+    try:
+        spec = _agent._MANAGED_MCP_SERVERS.get(name) or {}
+        gate = spec.get("spec_gate")
+        if gate is None:
+            return False
+        return not gate()
+    except Exception:
+        logger.debug("spec gate for %s unreadable; doctor treats it as open", name, exc_info=True)
+        return False
+
+
+def _doctor_gated_off_mcps() -> frozenset[str]:
+    """Doctor's per-run snapshot of managed servers whose spec gate is closed.
+
+    Evaluated ONCE per doctor run and threaded into both MCP sections, for the
+    same reason ``agent._gated_off_servers()`` snapshots once per rebuild: the
+    reads are cheap, agreeing is the point. A keystone flip landing between
+    the `MCP Tools` and `MCP Governance` sections would otherwise produce a
+    self-contradicting report — one saying "gated off by design", the other
+    "markers missing — re-run `kirocrew setup --agent-only`". Not reused from
+    ``_gated_off_servers()`` itself because the two snapshots fail in opposite
+    directions on an unreadable gate (see :func:`_spec_gate_closed`).
+    """
+    return frozenset(name for name in _MANAGED_MCPS if _spec_gate_closed(name))
+
+
+def _doctor_mcp_tools(
+    agent_path: Path, issues: list[str], *, gated_off: "frozenset[str] | None" = None
+) -> None:
     """Render the `MCP Tools` section of `kirocrew doctor`.
 
     Two passes scoped to the managed servers (`kirocrew-core`,
     `kirocrew-cron`, `kirocrew-computer`):
 
-    1. Static sanity check of the agent config: each server must be present
-       in ``mcpServers`` and ``tools``. Missing ``tools`` entries — and
-       ``allowedTools`` entries for every server outside
-       :data:`_NO_BLANKET_ALLOW_MCPS` — are auto-appended and the file is
-       rewritten atomically. A missing ``mcpServers`` entry cannot be
+    1. Static coherence check of the agent config: each always-on server whose
+       ``spec_gate`` is open — or that has no gate — must be present in
+       ``mcpServers`` and ``tools``. A gated-off server (feature disabled, or
+       no driver for this platform) is deliberately absent from every emitted
+       spec, so its absence is reported as informational, never as an issue —
+       and a stale entry left from when the gate was open is neither mounted
+       into ``tools`` nor probed (see :func:`_spec_gate_closed`). Missing
+       ``tools`` entries — and ``allowedTools`` entries for every server
+       outside :data:`_NO_BLANKET_ALLOW_MCPS` — are auto-appended and the file
+       is rewritten atomically. A missing ``mcpServers`` entry cannot be
        auto-added because the command path is install-specific.
     2. Live handshake probe via :func:`mcp_discovery.probe_server`. Reports
        per-server status with tool count on success, and on failure shows
@@ -525,8 +589,11 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
     config_changed = False
 
     probe_targets = []
+    if gated_off is None:
+        gated_off = _doctor_gated_off_mcps()
     for name in _MANAGED_MCPS:
         ref = f"@{name}"
+        gate_closed = name in gated_off
         if name not in mcps:
             # An opt-in set is granted per agent, so its absence from THIS spec is
             # the normal state, not a broken install. Say nothing and probe
@@ -542,6 +609,27 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
                         "— add the server entry, or drop the ref"
                     )
                 continue
+            if gate_closed:
+                # Spec emission consults this same gate and deliberately omits
+                # the entry, so absence is the healthy state here — the hard
+                # error below would be unfixable ("re-run setup" writes the
+                # same gated spec back). Informational, never an issue. A stale
+                # `@ref` in ``tools`` is NOT the opt-in "half a grant" warning:
+                # emission deliberately leaves the ref alone when it retracts
+                # the entry (a dangling ref mounts nothing, and dropping it
+                # would destroy a grant the user may have narrowed by hand), so
+                # ref-present-entry-absent is the designed steady state on a
+                # gated-off host and advising "add the server entry" would
+                # defeat the gate. No governance-ceiling revoke is needed on
+                # this path either: with no ``mcpServers`` entry kiro-cli has
+                # nothing to launch, so a leftover ``allowedTools`` ref cannot
+                # auto-approve anything — the stale-ENTRY branch below is the
+                # one window where a grant is live, and the revoke runs there.
+                print(
+                    f"  {ref}: ℹ️  gated off on this host (feature disabled or "
+                    "no driver for this platform) — absent from mcpServers by design"
+                )
+                continue
             print(f"  {ref}: ❌ missing from mcpServers (re-run `kirocrew setup`)")
             issues.append(f"{ref} config")
             continue
@@ -555,7 +643,21 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
             if name not in _OPT_IN_MCPS:
                 issues.append(f"{ref} config")
             continue
-        if ref not in tools and name not in _OPT_IN_MCPS:
+        if gate_closed:
+            # A stale entry from before the gate closed (feature turned off, or
+            # a config copied from a host that has a driver). The next config
+            # refresh retracts it; until then doctor must not deepen the hole:
+            # no mounting the ref (kiro-cli would spawn a backend emission
+            # decided against), no minting `allowedTools`, no probe (nothing
+            # SHOULD launch). The governance-ceiling revoke below still runs —
+            # the entry is live in this spec until the retraction, so an
+            # auto-approve exemption would be real for exactly that window.
+            print(
+                f"  {ref}: ℹ️  gated off on this host (feature disabled or no "
+                "driver for this platform) — stale mcpServers entry is "
+                "retracted on the next `kirocrew setup` or gateway start"
+            )
+        elif ref not in tools and name not in _OPT_IN_MCPS:
             # Mounting an opt-in server IS granting it: the `@` ref is what makes
             # kiro-cli load it. Doctor repairs a broken always-on mount, but it
             # must never hand an agent a set the user did not assign.
@@ -611,13 +713,20 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
             # enabled still prompts on every call — say it once, here, so
             # `kirocrew doctor` explains it.
             print(f"  {ref}: 🔒 auto-approve withheld by security policy — calls will prompt")
-        elif ref not in allowed and name not in _NO_BLANKET_ALLOW_MCPS:
+        elif ref not in allowed and name not in _NO_BLANKET_ALLOW_MCPS and not gate_closed:
             # Computer use is never blanket-allowed here: see _NO_BLANKET_ALLOW_MCPS.
             # A pre-existing user-made grant is left alone (doctor never REMOVES a
-            # decision the user owns); doctor simply never mints one.
+            # decision the user owns); doctor simply never mints one. A gated-off
+            # server never gets one minted either: granting auto-approve to a
+            # server emission has decided against is the wrong direction.
             allowed.append(ref)
             config_changed = True
 
+        if gate_closed:
+            # Nothing should launch: no emitted spec defines this server, so a
+            # handshake probe would spawn a backend for a capability that is off
+            # or has no driver here — and report its result either way.
+            continue
         spec = mcps[name]
         probe_targets.append(
             McpServerInfo(
@@ -692,7 +801,9 @@ def _doctor_mcp_tools(agent_path: Path, issues: list[str]) -> None:
 # Non-secret rows kiro-cli writes when the signed-in identity came from IAM
 # Identity Center. Presence is the signal; the values (a start URL and a region)
 # are never read into a message, and no token key is touched.
-def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
+def _doctor_mcp_governance(
+    agent_path: Path, issues: list[str], *, gated_off: "frozenset[str] | None" = None
+) -> None:
     """Render the `MCP Governance` section of `kirocrew doctor`.
 
     Speaks up in two situations: governance can reach this identity (Identity
@@ -714,11 +825,14 @@ def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
         logger.debug("config load failed in governance check", exc_info=True)
         declared = False
 
-    try:
-        spec = json.loads(agent_path.read_text(encoding="utf-8"))
-        servers = spec.get("mcpServers") or {}
-    except Exception:
-        servers = {}
+    # Same hardened reader as this file's other spec reads: the agents dir is
+    # user-writable, so an oversized or sensitively-symlinked spec is refused
+    # (and audited) rather than parsed. No try/except: the reader's contract is
+    # return-``None``-never-raise, which the five sibling sites migrated
+    # alongside this one also rely on bare. ``None`` degrades to no declared
+    # servers, exactly as the blanket ``except`` here used to.
+    spec = _read_agent_spec(agent_path, operation="doctor", source="cli")
+    servers = (spec or {}).get("mcpServers") or {}
     if not isinstance(servers, dict):
         # `or {}` only replaces a FALSY value, so a string or list here survives
         # and the membership walk below would raise, aborting the whole doctor
@@ -730,10 +844,20 @@ def _doctor_mcp_governance(agent_path: Path, issues: list[str]) -> None:
     # would report every governed install as half-marked; dropping the always-on
     # ones from the denominator would make a spec that declares NOTHING — a
     # malformed or emptied ``mcpServers`` — read as fully marked, which is the
-    # exact failure this section exists to catch.
-    expected = list(_ALWAYS_ON_MCPS) + [
-        name for name in _OPT_IN_MCPS if isinstance(servers.get(name), dict)
-    ]
+    # exact failure this section exists to catch. One exception, same rule as
+    # the MCP Tools section above: an always-on server whose spec gate is
+    # closed is deliberately absent from every emitted spec, so demanding a
+    # registry marker for it would re-create the unfixable "re-run setup" loop
+    # (#6548). A STALE entry still counts while it exists — kiro-cli drops an
+    # unmarked entry at session assembly, so the marker matters for exactly as
+    # long as the entry does.
+    if gated_off is None:
+        gated_off = _doctor_gated_off_mcps()
+    expected = [
+        name
+        for name in _ALWAYS_ON_MCPS
+        if isinstance(servers.get(name), dict) or name not in gated_off
+    ] + [name for name in _OPT_IN_MCPS if isinstance(servers.get(name), dict)]
     marked = sorted(
         name
         for name in expected
@@ -860,6 +984,20 @@ def _doctor_data_home() -> None:
         f"  legacy:      ⏹ {legacy} present but not the data home — safe to "
         f"delete once you have confirmed it holds nothing you need"
     )
+
+
+def _doctor_managed_service_policy(issues: list[str]) -> None:
+    """Surface installed service definitions that predate launch-class policy."""
+    state = service_controller.installed_service_has_managed_marker()
+    if state is None:
+        return
+    print("\nManaged Service")
+    if state:
+        print("  watchdog:    ✅ managed-service policy marker installed")
+        return
+    print("  watchdog:    ⚠️  installed definition predates managed-service defaults")
+    print("               Fix: run `kirocrew service install` once, then restart the service")
+    issues.append("managed service definition is outdated")
 
 
 def _doctor_path_launcher() -> None:
@@ -2517,6 +2655,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Stored defaults a release has since changed (#5244) ──
     render_doctor_section(issues)
 
+    # ── Installed services must carry the launch-class marker (#6651) ──
+    _doctor_managed_service_policy(issues)
+
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
     _doctor_path_launcher()
@@ -2565,10 +2706,14 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── MCP Tools ──
     print("\nMCP Tools")
     if agent_path.exists():
-        _doctor_mcp_tools(agent_path, issues)
+        # One gate snapshot for both sections, so a keystone flip landing
+        # between them cannot make the report contradict itself (see
+        # _doctor_gated_off_mcps).
+        gated_off = _doctor_gated_off_mcps()
+        _doctor_mcp_tools(agent_path, issues, gated_off=gated_off)
         # After the probe, deliberately: the probe reporting green is the exact
         # condition this section exists to explain.
-        _doctor_mcp_governance(agent_path, issues)
+        _doctor_mcp_governance(agent_path, issues, gated_off=gated_off)
 
     # ── Python Runtime ──
     print("\nRuntime")
@@ -2717,62 +2862,65 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Speech-to-Text (optional) ──
     print("\nSpeech-to-Text")
     stt_active = cfg.stt.enabled
-    needs_whisper = stt_active and cfg.stt.provider == "whisper"
-    # Every provider but ``faster`` shells out to something that needs the system
-    # ffmpeg; faster-whisper decodes in-process through PyAV's bundled copy, so
-    # reporting a missing ffmpeg as an ISSUE there would send the user to install a
-    # binary their configuration never calls.
-    needs_ffmpeg = stt_active and cfg.stt.provider != "faster"
 
     if not stt_active:
-        print("  status:      ⏹ disabled (enable from dashboard → Overview → Slack)")
+        print("  status:      ⏹ disabled (enable from dashboard → Settings → Speech-to-Text)")
     else:
         print(f"  provider:    ✅ {cfg.stt.provider}")
 
-    # STT ships enabled-by-default, but neither whisper nor ffmpeg is on a stock
-    # Windows box and neither is a KiroCrew dependency there. Reporting them as
-    # hard issues makes `kirocrew doctor` exit 1 on a healthy first install, so
-    # the guide's `kirocrew doctor && kirocrew gateway` never launches the
-    # gateway. On Windows treat them as non-fatal notes; POSIX keeps failing so
-    # a real STT setup gap is still surfaced.
+    # Source installs may omit the optional voice extra. Preserve Windows's
+    # historical non-fatal report for that case so an enabled-by-default feature
+    # cannot block gateway startup; desktop releases gate both native components
+    # at build time and should never reach the missing branches.
     stt_fatal = not platform_compat.IS_WINDOWS
     stt_mark = "❌" if stt_fatal else "⚠️ "
 
-    whisper_bin = _find_whisper(cfg.stt.whisper_path)
-    if whisper_bin:
-        print(f"  whisper:     ✅ {whisper_bin}")
-    elif needs_whisper:
-        mark = stt_mark
-        print(f"  whisper:     {mark} not found")
-        print(
-            "               Fix: "
-            + _os_fix_hint(
-                "brew install openai-whisper",
-                "pipx install openai-whisper  (or pip install --user openai-whisper)",
-                windows="pip install openai-whisper",
+    if stt_active and cfg.stt.provider == "local":
+        engine = availability_detail(cfg.stt)
+        if engine.ok:
+            print("  engine:      ✅ local recogniser loadable (whisper.cpp, in-process)")
+        else:
+            print(f"  engine:      {stt_mark} {engine.detail}")
+            if stt_fatal:
+                issues.append(f"speech recogniser ({engine.code})")
+        # The weights are fetched on first use, so "not downloaded" is the normal
+        # first-run state and never an issue. Naming the size is the useful part,
+        # because that transfer is what a first dictation waits on.
+        model = stt.resolve_model(cfg.stt.model)
+        if stt.is_present(model):
+            print(f"  model:       ✅ {model.name} at {stt.models_dir() / model.filename}")
+        else:
+            print(
+                f"  model:       ⏹ {model.name} not downloaded yet "
+                f"({model.size_bytes // 1_000_000} MB, fetched on first use)"
             )
-        )
-        if stt_fatal:
-            issues.append("whisper")
-    else:
-        print("  whisper:     ⏭  not installed (not needed)")
 
     ensure_ffmpeg_in_path()
-    ffmpeg_bin = shutil.which("ffmpeg")
+    # The same resolver the transcode path uses, so what doctor REPORTS is what would
+    # actually be exec'd. A bare `which` here reported a PATH-chosen ffmpeg that
+    # `_find_ffmpeg` would decline, which is the more misleading of the two failures.
+    ffmpeg_bin = _find_ffmpeg()
     if ffmpeg_bin:
-        print(f"  ffmpeg:      ✅ {ffmpeg_bin}")
-    elif needs_ffmpeg:
-        mark = stt_mark
-        print(f"  ffmpeg:      {mark} not found")
-        print(
-            "               Fix: "
-            + _os_fix_hint(
-                "brew install ffmpeg",
-                "drop a static ffmpeg build into ~/.local/bin "
-                "(not in AL2023 repos; KiroCrew auto-detects it)",
-                windows="winget install Gyan.FFmpeg",
+        # The resolved path can contain a username or a credential-bearing mount
+        # name. Doctor only needs to confirm the exact resolver found a decoder.
+        print("  ffmpeg:      ✅ available")
+    elif stt_active:
+        # A prerequisite of every provider, not of one of them: a Slack voice memo
+        # arrives as ogg/Opus and the dashboard records webm, so the only input
+        # that reaches a recogniser without ffmpeg is a 16 kHz mono WAV.
+        print(f"  ffmpeg:      {stt_mark} not found")
+        if platform_compat.is_bundled_interpreter():
+            print("               Fix: reinstall Kiro Crew (the bundled audio decoder is missing)")
+        else:
+            print(
+                "               Fix: "
+                + _os_fix_hint(
+                    "brew install ffmpeg",
+                    "drop a static ffmpeg build into ~/.local/bin "
+                    "(not in AL2023 repos; Kiro Crew auto-detects it)",
+                    windows="winget install Gyan.FFmpeg",
+                )
             )
-        )
         if stt_fatal:
             issues.append("ffmpeg")
     else:
@@ -2798,52 +2946,23 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  boto3:       ⏹ optional AWS SDK not installed")
             print("               Install: pip install 'kirocrew[voice]'")
 
-    # Parakeet (NVIDIA Parakeet via parakeet-mlx) is Apple-Silicon-only and, like
-    # mlx_whisper, installed out-of-band — so report its CLI the same way.
-    if stt_active and cfg.stt.provider == "parakeet":
-        parakeet_bin = _find_parakeet_mlx()
-        if parakeet_bin:
-            print(f"  parakeet:    ✅ {parakeet_bin}")
+    # Apple's on-device speech is a host capability rather than an install, so the
+    # only useful thing to print is the reason it cannot run. Reaching a not-ok
+    # state here means the operator selected a provider this machine does not
+    # support, which is a real configuration fault and not a first-run state.
+    #
+    # Deliberately fatal on EVERY platform, so it does not take the Windows
+    # downgrade above. That carve-out exists for prerequisites a user can simply
+    # install; this is a provider that cannot be made to work on the host at all,
+    # and reporting it as a note would have `kirocrew doctor` exit 0 on a
+    # configuration that can only ever fail at the first recording.
+    if stt_active and cfg.stt.provider == "apple":
+        apple = availability_detail(cfg.stt)
+        if apple.ok:
+            print("  apple:       ✅ on-device SpeechAnalyzer available")
         else:
-            mark = stt_mark
-            print(f"  parakeet:    {mark} parakeet-mlx not found")
-            print("               Fix: pipx install parakeet-mlx  (Apple Silicon only)")
-            if stt_fatal:
-                issues.append("parakeet-mlx")
-
-    # faster-whisper (CTranslate2) is installed on demand, not as a declared extra,
-    # so an unavailable library is the expected first-run state rather than a broken
-    # install. Windows on ARM is called out separately because no CTranslate2 wheel
-    # exists there at all — the install button cannot fix it, and telling the user to
-    # retry would waste their time instead of naming a provider that does work.
-    if stt_active and cfg.stt.provider == "faster":
-        if _faster_whisper_model() is not None:
-            print("  faster:      ✅ faster-whisper importable")
-        elif platform_compat.is_windows_on_arm():
-            # Deliberately NOT routed through ``stt_mark``/``stt_fatal``. That
-            # Windows downgrade exists because whisper and ffmpeg are absent from a
-            # stock Windows box yet trivially installable, so failing a first-run
-            # doctor over them is noise. This is the opposite case: ``faster`` is
-            # never the default, so reaching here means the user explicitly selected
-            # a provider that CANNOT be made to work on this machine. That is a real
-            # configuration fault, and the whole point of naming the alternatives is
-            # that the run should not exit 0 as if nothing were wrong.
-            print("  faster:      ❌ not available (Windows on ARM — no CTranslate2 wheel)")
-            print(
-                "               Alternatives: set stt.provider to 'whisper' "
-                "(local) or 'transcribe' (AWS)"
-            )
-            issues.append("faster-whisper: unavailable on Windows ARM")
-        else:
-            # The ordinary not-yet-installed state, which the install button DOES
-            # fix — so this one follows the platform convention like whisper above.
-            print(f"  faster:      {stt_mark} not installed")
-            print(
-                "               Install from dashboard → Settings → "
-                "Speech-to-Text, or: pip install faster-whisper"
-            )
-            if stt_fatal:
-                issues.append("faster-whisper")
+            print(f"  apple:       ❌ {apple.detail}")
+            issues.append(f"apple speech ({apple.code})")
 
     # ── Slack (optional) ──
     print("\nSlack Integration")

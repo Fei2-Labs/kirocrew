@@ -347,10 +347,25 @@ class GitHubPRRecipe:
         try:
             if base:
                 # The full range this push would publish, against the base the PR targets.
-                proc = self._git("diff", f"{base}...HEAD", timeout=_PUSH_TIMEOUT_S)
+                proc = self._git(
+                    "-c",
+                    "diff.external=",
+                    "diff",
+                    "--no-ext-diff",
+                    f"{base}...HEAD",
+                    timeout=_PUSH_TIMEOUT_S,
+                )
             else:
                 # `--format=` prints the commit's PATCH and nothing else.
-                proc = self._git("show", "--format=", "HEAD", timeout=_PUSH_TIMEOUT_S)
+                proc = self._git(
+                    "-c",
+                    "diff.external=",
+                    "show",
+                    "--no-ext-diff",
+                    "--format=",
+                    "HEAD",
+                    timeout=_PUSH_TIMEOUT_S,
+                )
         except (OSError, subprocess.SubprocessError):
             logger.warning("could not read the pushable diff — refusing the push", exc_info=True)
             return False, "could not read the pushable diff"
@@ -370,6 +385,10 @@ class GitHubPRRecipe:
 
     def _push_fix_branch(self, *, branch: str) -> tuple[bool, str]:
         """Push HEAD to ``branch`` on the fetch url. Returns (ok, note)."""
+        from ...backend.clone_setup import _repository_is_isolated
+
+        if not _repository_is_isolated(self.clone_path):
+            return False, "repository isolation changed after review"
         url = self._resolve_fetch_url()
         if not url:
             return False, "no pushable origin fetch url (clone fully push-disabled)"

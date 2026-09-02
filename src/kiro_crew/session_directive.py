@@ -29,13 +29,11 @@ FORGERY: the marker payload is model-visible (it comes back as the tool result
 text), so a model *could* emit the literal bytes. The consumer defends by
 honouring a directive ONLY when the tool call it arrived under was recorded — by
 KiroCrew observing the tool CALL — as an MCP-served call whose CANONICAL name
-(``event.tool_name``, with ``event.mcp_server_name`` set) is one of
-:data:`DIRECTIVE_TOOLS`. That identity comes from kiro-cli's out-of-band
-``_meta.kiro`` channel, or — when ``_meta.kiro`` is absent and ``kind`` is
-present and not execute — from a spec-adapter ``mcp__<server>__<tool>`` title.
-A kiro-cli ``title`` is LLM-authored prose and is never parsed (a shell command
-titled ``"monitor_start"`` whose stdout forges the marker must NOT be honoured).
-The gate fails closed when neither identity channel is present. The payload
+(``_meta.kiro.toolName``, with ``_meta.kiro.mcpServerName`` set) is one of
+:data:`DIRECTIVE_TOOLS`. That identity comes from kiro-cli's out-of-band ``_meta``
+channel, NOT the ``title`` (which is LLM-authored prose for shell tools — a shell
+command titled ``"monitor_start"`` whose stdout forges the marker must NOT be
+honoured). The gate fails closed when ``_meta`` identity is absent. The payload
 never carries a session key (the session is supplied by the consumer), and the
 consumer additionally refuses native-sub-agent tool calls, which surface as flat
 events in the parent loop but have no independently bindable slot. A model
@@ -46,6 +44,7 @@ directive tool and is ignored.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 # The stateless, session-bound tools. ``ask_question`` joins
@@ -62,6 +61,7 @@ DIRECTIVE_TOOLS: frozenset[str] = frozenset(
         "set_project",
         "suggest_followup",
         "ask_question",
+        "reset_conversation",
     }
 )
 
@@ -104,6 +104,12 @@ MAX_DIRECTIVE_CHARS = 3800
 # no payload and grants no effect, so a model emitting the literal bytes can only
 # change how a log line reads, never what gets applied.
 _REFUSAL_SENTINEL = "[[KIROCREW_SESSION_DIRECTIVE_REFUSED]]"
+# A server-qualified canonical tool name separates server from tool with a RUN
+# of underscores, and the run length is transport-specific ("___" from kiro-cli,
+# "__" in the canonical MCP prefix form). Matching the run rather than one
+# spelling is what lets :func:`match_tool` accept both without widening to a
+# bare suffix match. Mirrors ``channel._MCP_SEPARATOR_RE``.
+_MCP_SEPARATOR_RE = re.compile(r"_{2,}")
 
 
 def encode(kind: str, args: dict[str, Any], human: str) -> str:
@@ -131,6 +137,19 @@ def encode(kind: str, args: dict[str, Any], human: str) -> str:
     return out
 
 
+def has_marker(text: str | None) -> bool:
+    """True iff *text* carries the directive marker sentinel.
+
+    Used ONLY for diagnostics — never to authorize anything. A marker is
+    model-visible text, so its presence proves nothing about provenance; what it
+    does tell an operator is that a directive was EXPECTED here, which is the
+    signal that made an identity-gate drop invisible (the gate returns ``""``
+    with no log, so a backend that omits ``_meta.kiro`` produced silence rather
+    than a diagnosis).
+    """
+    return bool(text) and _SENTINEL in (text or "")
+
+
 def is_refusal(text: str | None) -> bool:
     """True iff *text* is an :func:`encode` refusal — a validated directive that
     was deliberately NOT emitted because its payload exceeded
@@ -154,7 +173,7 @@ def decode(text: str, expected_tool: str) -> dict[str, Any] | None:
     idx = text.find(_SENTINEL)
     if idx < 0:
         return None
-    line = text[idx + len(_SENTINEL) :].split("\n", 1)[0]
+    line = text[idx + len(_SENTINEL):].split("\n", 1)[0]
     try:
         block = json.loads(line)
     except (ValueError, TypeError):
@@ -169,22 +188,29 @@ def match_tool(raw: str) -> str:
     """Return the directive-tool name a recorded CANONICAL tool name refers to,
     or ``""``.
 
-    ``raw`` MUST be the trusted canonical tool name (NOT a kiro-cli LLM-authored
-    title): ``_meta.kiro.toolName``, or the tool half of a spec-adapter
-    ``mcp__<server>__<tool>`` title recovered by ``acp._dispatch``. For an MCP
-    tool that name is the bare tool name (``"monitor_start"``); some transports
-    server-qualify it as ``"<server>___<name>"``. Accept exact membership plus
-    that single ``___`` split — nothing wider, so a crafted string cannot
-    smuggle a directive name in as a path/namespace tail.
+    ``raw`` MUST be the trusted ``_meta.kiro.toolName`` (NOT the LLM-authored
+    title). For an MCP tool that name is the bare tool name (``"monitor_start"``);
+    some transports server-qualify it, and the separator is NOT one fixed
+    spelling: kiro-cli reports ``"<server>___<name>"`` while the canonical MCP
+    prefix form is ``"mcp__<server>__<name>"``. Split on the LAST run of two or
+    more underscores so BOTH qualified forms resolve — the same normalization
+    ``channel._blocked_tool_named`` already applies for the same reason, which
+    this deliberately mirrors rather than re-inventing.
+
+    Still nothing wider than that: the separator must be a run of >= 2
+    underscores, so a crafted path/namespace tail (``"a/b/monitor_start"``,
+    ``"do_monitor_start"``) cannot smuggle a directive name in. The tool half
+    never authenticates the SERVER either way — :func:`directive_tool_for`
+    checks ``mcp_server_name`` independently, and that is the check a
+    third-party server fails.
     """
     if not raw:
         return ""
     if raw in DIRECTIVE_TOOLS:
         return raw
-    if "___" in raw:
-        tail = raw.rsplit("___", 1)[-1]
-        if tail in DIRECTIVE_TOOLS:
-            return tail
+    parts = _MCP_SEPARATOR_RE.split(raw)
+    if len(parts) > 1 and parts[-1] in DIRECTIVE_TOOLS:
+        return parts[-1]
     return ""
 
 

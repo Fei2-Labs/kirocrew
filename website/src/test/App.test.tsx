@@ -483,16 +483,17 @@ describe('App routing', () => {
     expect(screen.getByRole('button', { name: /create report/i })).toBeInTheDocument()
   })
 
-  it('renders the registry-derived Artifacts and Knowledge nav items', () => {
+  it('renders the registry-derived Artifacts nav item, without a Knowledge rail item', () => {
     // Regression guard for the aaf7cfe stale-branch merge, which reverted the
     // registry-driven rail (`NAV_ITEMS = getBuiltinSurfaces().map(...)`) back
-    // to a hardcoded array that omitted Artifacts and Knowledge. Both are
-    // registered unconditionally in `surfaces/builtins.tsx`, so they must
-    // always appear in the rail. Asserting them by label catches a future
-    // hardcoded-array regression that the isolated surfaces.test.tsx cannot.
+    // to a hardcoded array that omitted Artifacts. Artifacts is registered
+    // unconditionally in `surfaces/builtins.tsx`, so it must always appear in
+    // the rail. Knowledge is the opposite pin: it deliberately has NO rail
+    // item — it lives as a tab inside Agent Capabilities and /knowledge
+    // redirects there — so a rail entry reappearing is itself a regression.
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByText('Artifacts')).toBeInTheDocument()
-    expect(screen.getByText('Knowledge')).toBeInTheDocument()
+    expect(screen.queryByText('Knowledge')).not.toBeInTheDocument()
   })
 
   it('does not double-render Secretary when the builtin Secretary app is enabled', async () => {

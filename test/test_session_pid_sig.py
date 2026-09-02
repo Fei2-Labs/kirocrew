@@ -300,12 +300,14 @@ class TestDomainSeparation:
 
 
 class TestTrustRootRecovery:
-    """The resolved trust-root path is frozen at ``SecurityEventLog`` init and
-    never re-resolved, while SEL keeps signing from key bytes it cached at that
-    moment. So a key file that later moves (a concurrent legacy -> ``trust/``
-    migration), is deleted, loses read permission, or is truncated silently
-    takes this protocol down for the life of the process — with a healthy audit
-    chain giving no hint. Recovery reads the same bytes SEL validated at init.
+    """SEL signs from key bytes it cached at init, while this protocol re-reads
+    the file on every call. Since #2588 the shared accessor re-resolves a key
+    that MOVED (a concurrent legacy -> ``trust/`` migration), so what reaches
+    recovery is the residue no path can resolve: a key deleted, unreadable,
+    truncated, or replaced by bytes that are not the anchor. Those would
+    otherwise take this protocol down for the life of the process — with a
+    healthy audit chain giving no hint. Recovery reads the same bytes SEL
+    validated at init.
     """
 
     def test_missing_file_recovers_from_live_sel_key(self, cfg):
@@ -376,6 +378,48 @@ class TestTrustRootRecovery:
         session_pid_sig.publish_session_pid(4242, SESSION_KEY)
         assert not (cfg / "session_pid_4242.sig").exists()
         assert session_pid_sig.verify_session_pid(4242) == ""
+
+
+class TestTrustRootRelocationIsFollowed:
+    """#2588 item 1, from the dependent protocol's side.
+
+    Deliberately does NOT use the ``cfg`` fixture: that fixture patches
+    ``sel_hmac_key_path`` to a fixed path, which is exactly the seam under test.
+    A real singleton is required because re-resolution is verified against the
+    key bytes it validated at init.
+    """
+
+    def test_a_relocated_key_is_read_from_the_file_not_memory(self, tmp_path):
+        """The class is closed rather than worked around: the accessor follows
+        the moved file, so a verifier in ANOTHER process resolves the same bytes.
+        The memory fallback is stubbed to different bytes, so a result equal to
+        the real key can only have come from the file."""
+        from kiro_crew.sel import SecurityEventLog
+
+        SecurityEventLog._instance = None
+        SecurityEventLog._initialized = False
+        try:
+            log = SecurityEventLog(base_dir=tmp_path, sync=True)
+            key = log._hmac_key
+            # A failed migration left this process naming the legacy location;
+            # the key actually lives in trust/ because a sibling completed it.
+            log._hmac_key_file = tmp_path / "sel_hmac.key"
+            assert not (tmp_path / "sel_hmac.key").exists()
+
+            with patch.object(
+                session_pid_sig, "config_dir", return_value=tmp_path
+            ), patch.object(
+                session_pid_sig, "_sel_hmac_key_bytes", return_value=b"\xfe" * 32
+            ):
+                session_pid_sig._reported.clear()
+                loaded = session_pid_sig._load_hmac_key()
+                session_pid_sig._reported.clear()
+
+            assert loaded == key
+            assert loaded != b"\xfe" * 32
+        finally:
+            SecurityEventLog._instance = None
+            SecurityEventLog._initialized = False
 
 
 class TestSigningUnavailableReport:

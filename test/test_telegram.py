@@ -35,6 +35,7 @@ from kiro_crew.messaging.renderer import (
 )
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import BACKGROUND_KEY, _opt_out_key
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 from kiro_crew.telegram.client import (
     TELEGRAM_CHUNK_LIMIT,
@@ -310,6 +311,10 @@ class FakeSessions:
         self.last_agent: Any = None
         self.last_model: Any = None
         self.raise_on_get = raise_on_get
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self._busy = False
         self._has = True
         self.queued: list = []
@@ -337,6 +342,12 @@ class FakeSessions:
         if self.raise_on_get:
             raise RuntimeError("cold-start failed")
         return FakeProvider(), True, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel: str) -> None:
         return None
@@ -2649,6 +2660,46 @@ class TestDispatcher:
         asyncio.run(_go())
         assert cli.final_text() == "Answer: hello world"
         assert sess.successes == ["telegram:kirocrew:direct:7"]
+        assert sess.released == ["telegram:kirocrew:direct:7"]
+        # Pins that the pre-dispatch closing gate is consulted on the normal
+        # path, so it cannot be dropped or renamed into a no-op unnoticed.
+        assert sess.begin_turns == 1
+
+    def test_a_shutdown_between_the_claim_and_the_dispatch_never_opens_the_turn(self) -> None:
+        """The lease-dispatch race gate.
+
+        ``get_or_create`` guards the CLAIM, but the turn only opens at
+        ``driver.run``, and the context build between them is wide enough for a
+        gateway restart to land in. Opening a turn then registers it behind the
+        drain snapshot ``close_all`` has already taken, so it is killed
+        mid-flight holding its native lock and reaches the user as an empty
+        response instead of this channel's notice.
+        """
+        d, cli, sess = _dispatcher({7})
+        # get_or_create deliberately ignores `closing`, so the CLAIM still
+        # succeeds here. That is the race being pinned: a refused claim was
+        # always handled, an accepted claim whose DISPATCH loses was not.
+        sess.closing = True
+
+        async def _go() -> None:
+            await d.handle_message(
+                InboundMessage(
+                    channel_type="telegram", user_id="7", conversation_id="7", text="hello world"
+                )
+            )
+
+        asyncio.run(_go())
+
+        assert "Answer: hello world" not in (
+            cli.final_text() or ""
+        ), "the turn must not open behind close_all's drain snapshot"
+        assert sess.begin_turns == 1
+        # A restart is neither a success nor a session fault: charging it to the
+        # circuit breaker would count toward resetting a session that never
+        # misbehaved.
+        assert sess.successes == []
+        assert sess.failures == []
+        # Refused is not leaked -- the session-keyed semaphore still comes back.
         assert sess.released == ["telegram:kirocrew:direct:7"]
 
     def test_agent_resolves_to_kirocrew_when_unset(self) -> None:

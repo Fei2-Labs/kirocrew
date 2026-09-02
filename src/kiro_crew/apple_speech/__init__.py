@@ -541,10 +541,17 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
     if Path(audio_path).suffix.lower() in _NATIVE_AUDIO_SUFFIXES:
         return audio_path, False
 
-    from kiro_crew.transcribe import _find_ffmpeg, ensure_ffmpeg_in_path
+    from kiro_crew.transcribe import (
+        _close_ffmpeg_for_execution,
+        _create_ffmpeg_subprocess,
+        _resolve_ffmpeg_for_execution,
+        ensure_ffmpeg_in_path,
+    )
 
     await asyncio.to_thread(ensure_ffmpeg_in_path)
-    ffmpeg = _find_ffmpeg()
+    # A bundled decoder is 49-88 MB and is SHA-256 authenticated on every
+    # execution. Keep that blocking read off the gateway event loop.
+    ffmpeg = await _resolve_ffmpeg_for_execution()
     if not ffmpeg:
         logger.warning(
             "apple_speech: %s needs transcoding but ffmpeg was not found",
@@ -555,7 +562,11 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
     # Both syscalls in ONE thread hop. `os.close` alone is trivial, but
     # `tempfile.mkstemp` is the heavier half — it creates a file — and leaving it
     # on the loop while offloading only the close would be the worse split.
-    out = await asyncio.to_thread(_mkstemp_path, ".wav")
+    try:
+        out = await asyncio.to_thread(_mkstemp_path, ".wav")
+    except BaseException:
+        await _close_ffmpeg_for_execution(ffmpeg, preserve_active_exception=True)
+        raise
     # The `.wav` stays invocation-owned until the success return below hands it
     # to the caller. A spawn failure or a cancellation (`CancelledError` is a
     # `BaseException`, so `except Exception` would miss it) never transfers
@@ -565,7 +576,7 @@ async def _to_native_audio(audio_path: str) -> tuple[str, bool]:
     # still-running child can race the removal. Every cleanup step is
     # best-effort — the exception in flight is the one that must surface.
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await _create_ffmpeg_subprocess(
             ffmpeg,
             "-y",
             "-i",
@@ -789,8 +800,25 @@ class StreamingSession:
             return "streaming speech helper could not be built"
         try:
             try:
+                # `--fast` inserts `.frequentFinalization` into the transcriber's
+                # reporting options so the helper emits mid-stream FINAL segments
+                # while the audio stream is still open. Without it the default
+                # DictationTranscriber produces only volatile partials until the
+                # stream closes, so the dashboard's semantic endpointer — which
+                # schedules its utterance-complete judgment exclusively from
+                # note_final() — never fires and auto-submit is impossible. The
+                # one-shot batch path deliberately omits it: its final arrives
+                # when the stream closes, and frequent finalization can trade
+                # accuracy for latency it has no use for.
                 stream_argv, stream_env, self._sb_cleanup = await _sandboxed_off_loop(
-                    [helper, "--locale", self.locale, "--sample-rate", str(self.sample_rate)]
+                    [
+                        helper,
+                        "--locale",
+                        self.locale,
+                        "--sample-rate",
+                        str(self.sample_rate),
+                        "--fast",
+                    ]
                 )
             except sandbox.SandboxUnavailableError as exc:
                 return f"{_NO_SANDBOX_HINT}{exc}"

@@ -40,11 +40,13 @@
     "verify:flex-input-min-w-0": "node scripts/capture-flex-input-min-w-0.mjs",
     "verify:trackpad-zoom": "node scripts/capture-trackpad-zoom.mjs",
     "verify:hold-to-talk": "node scripts/capture-hold-to-talk.mjs",
+    "verify:legacy-default-agent-label": "node scripts/capture-legacy-default-agent-label.mjs",
     "verify:followup-chip-columns": "node scripts/capture-followup-chip-columns.mjs",
     "verify:path-chips": "node scripts/capture-path-chips.mjs",
     "verify:registry-pinned-row": "node scripts/capture-registry-pinned-row.mjs",
     "verify:reveal-fade": "node scripts/probe-reveal-fade.mjs",
     "verify:tool-row-narrow-stack": "node scripts/capture-tool-row-narrow-stack.mjs",
+    "verify:tool-blocked-cause": "node scripts/capture-tool-blocked-cause.mjs",
     "verify:topbar-badge-overhang": "node scripts/capture-topbar-badge-overhang.mjs",
     "verify:user-bubble-mobile-overflow": "node scripts/capture-user-bubble-mobile-overflow.mjs",
     "pretest": "npm run jscpd"
@@ -109,7 +111,8 @@
     "unified": "^11.0.5",
     "vis-data": "^8.0.3",
     "vis-network": "^10.0.2",
-    "vscode-jsonrpc": "8.2.0"
+    "vscode-jsonrpc": "8.2.0",
+    "yaml": "2.9.0"
   },
   "devDependencies": {
     "@axe-core/react": "^4.10.1",
@@ -154,6 +157,7 @@
     "@inquirer/type": "4.0.4",
     "@mermaid-js/parser": "1.2.0",
     "@mswjs/interceptors": "0.41.3",
+    "@pierre/theming": "1.0.1",
     "@smithy/types": "4.13.1",
     "@tanstack/query-core": "5.96.0",
     "@types/node": "24.13.3",

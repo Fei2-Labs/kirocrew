@@ -267,6 +267,22 @@ class ShadowRunCoordinator:
             ),
         )
 
+    async def clear_recovered_process(
+        self,
+        run_id: str,
+        fence: RunFence,
+        expected_version: int,
+    ) -> CoordinatorResult[RunRecord]:
+        return cast(
+            CoordinatorResult[RunRecord],
+            await self._mirror(
+                "clear_recovered_process",
+                run_id,
+                fence,
+                expected_version,
+            ),
+        )
+
     async def complete(
         self, completion: RunCompletion, fence: RunFence, expected_version: int
     ) -> CoordinatorResult[OutboxEvent]:

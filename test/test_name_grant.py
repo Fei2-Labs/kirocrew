@@ -247,21 +247,19 @@ class TestProgramNames:
 class TestLoopSafety:
     """The check does filesystem work, so it must only ever run off the loop."""
 
-    def test_the_dashboard_downgrade_helper_runs_it_in_a_thread(self):
-        # Every rung reaches this check through ONE off-loop entry point, and
-        # that entry point is what hands it to a worker thread. Pinning both
-        # facts here is what keeps a future edit from calling it straight from
-        # the loop -- the shape GPT flagged when the hook layer did exactly that.
+    def test_the_downgrade_helper_runs_it_in_a_thread(self):
+        # Every rung on every surface reaches this check through ONE off-loop
+        # entry point, and that entry point is what hands it to a worker
+        # thread. Pinning both facts here is what keeps a future edit from
+        # calling it straight from the loop -- the shape GPT flagged when the
+        # hook layer did exactly that.
         import inspect
 
-        from kiro_crew.dashboard import chat_runner
-
-        entry = chat_runner._name_grant_refusal_off_loop
+        entry = name_grant.refusal_for_command_off_loop
         assert inspect.iscoroutinefunction(entry)
         assert "asyncio.to_thread(name_grant_refusal" in inspect.getsource(entry)
-        # And no rung may spawn its own thread instead of using it.
-        runner_source = inspect.getsource(chat_runner)
-        assert runner_source.count("asyncio.to_thread(name_grant_refusal") == 1
+        # And it is the only thread dispatch in the module.
+        assert inspect.getsource(name_grant).count("asyncio.to_thread(name_grant_refusal") == 1
 
     def test_the_loop_bound_hook_no_longer_resolves_anything(self):
         # `HookManager.on_tool_call` is synchronous and called on the loop, so it

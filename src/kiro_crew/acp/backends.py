@@ -667,10 +667,14 @@ def selectable_ids() -> frozenset[str]:
 
     Registry data still feeds discovery and descriptors, but launch metadata is
     not validation evidence and cannot widen the reviewed selection set.
-    """
-    from kiro_crew.acp.types import ACP_BACKENDS_SELECTABLE
 
-    return ACP_BACKENDS_SELECTABLE
+    The set is READ PER CALL from the registry rather than snapshotted: an
+    edition registers its backends during boot, so a module-level copy is
+    frozen before that registration lands and silently misses it.
+    """
+    from kiro_crew.acp_backends import selectable_backends
+
+    return selectable_backends()
 
 
 def credential_leaves() -> tuple[str, ...]:

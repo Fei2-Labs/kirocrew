@@ -30,7 +30,7 @@ from typing import Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.cloud import aws
-from kiro_crew.deploy.engine import resolve_aws_bin
+from kiro_crew.deploy.engine import aws_spawn_env, resolve_aws_bin, resolve_aws_tool_bin
 
 logger = logging.getLogger(__name__)
 
@@ -191,24 +191,19 @@ def build_port_forward_argv(
     return argv
 
 
-def build_interactive_session_argv(
-    instance_id: str, profile: str = "", region: str = ""
-) -> list[str]:
-    """Build the plain ``aws ssm start-session`` argv (interactive shell).
-
-    Same absolute CLI resolution as :func:`build_port_forward_argv` (#4770).
-    """
-    argv = [resolve_aws_bin(), "ssm", "start-session", "--target", instance_id]
-    if region:
-        argv += ["--region", region]
-    if profile:
-        argv += ["--profile", profile]
-    return argv
-
-
 def session_manager_plugin_installed() -> bool:
-    """True when the local AWS Session Manager plugin is available."""
-    return shutil.which(_SESSION_MANAGER_PLUGIN) is not None
+    """True when the local AWS Session Manager plugin is available.
+
+    Resolved through the deploy engine's shared resolver, not a bare
+    ``shutil.which``: the plugin's own installers target ``/usr/local/bin`` (and
+    the Homebrew cask the brew prefix), neither of which is on the minimal
+    launchd ``PATH`` a Finder/Dock-launched gateway inherits — so the bare probe
+    reported "not installed" for a plugin that was installed, and
+    :func:`require_session_manager_plugin` refused every SSM tunnel before one
+    was attempted (#5392). Same resolution the ``start-session`` argv head
+    already uses, so probe and spawn can no longer disagree (#4770, #5360).
+    """
+    return shutil.which(resolve_aws_tool_bin(_SESSION_MANAGER_PLUGIN)) is not None
 
 
 def session_manager_plugin_install_hint() -> str:
@@ -338,6 +333,14 @@ def open_port_forward(
     caller drains the pipes (they block on ``wait()``), so PIPE would deadlock
     the tunnel once the OS pipe buffer fills. Tunnel liveness is verified via
     :func:`wait_for_local_port`, not by parsing plugin output.
+
+    The child gets :func:`~kiro_crew.deploy.engine.aws_spawn_env` rather than a
+    bare inherited env: the ``aws`` head is resolved absolutely, but the CLI then
+    looks ``session-manager-plugin`` up by name on its OWN ``PATH``, which under a
+    GUI-launched gateway is the minimal launchd one (#5392). The resolved head is
+    handed over so the widening is withheld when it is a bare name — a bare name
+    means provenance REFUSED the candidate in those dirs, and widening would put
+    it back within ``execvp``'s reach.
     """
     # Streaming child — bypasses the run_aws chokepoint, so carry the same
     # human-action guard here (opening a tunnel to the box is a sensitive,
@@ -349,7 +352,11 @@ def open_port_forward(
         "opening SSM port-forward %s: local %d -> remote %d", instance_id, local_port, remote_port
     )
     return subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-        argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+        argv,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=aws_spawn_env(argv[0]),
     )
 
 
@@ -501,11 +508,6 @@ def instance_is_managed(instance_id: str, profile: str = "", region: str = "") -
 
 
 # --- small helpers ---------------------------------------------------------
-
-
-def _shq(s: str) -> str:
-    """Single-quote a string for safe embedding in a bash -lc argument."""
-    return "'" + s.replace("'", "'\\''") + "'"
 
 
 def _wrap_remote_command(command: str, run_as: str) -> str:

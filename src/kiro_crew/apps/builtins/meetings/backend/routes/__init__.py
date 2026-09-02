@@ -209,6 +209,19 @@ def register_routes(app: web.Application) -> None:
     router.add_get(
         BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_get_outputs)
     )
+    router.add_get(
+        BASE + "/meetings/{meeting_id}/translations",
+        route(lifecycle_routes.handle_get_translations),
+    )
+    # Editable minutes. PUT/DELETE on the same path as the GET, with the agent id in
+    # the body — the shape the task routes already use, and the reason there is no
+    # `{agent_id}` path segment to validate.
+    router.add_put(
+        BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_put_output)
+    )
+    router.add_delete(
+        BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_delete_output)
+    )
     router.add_post(
         BASE + "/meetings/{meeting_id}/attachments",
         route(lifecycle_routes.handle_attachments),

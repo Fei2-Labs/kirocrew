@@ -68,7 +68,13 @@ from functools import partial, wraps
 
 from aiohttp import web
 
-from kiro_crew.apps.builtins.issue_radar.backend import github_client, provider, store, watch
+from kiro_crew.apps.builtins.issue_radar.backend import (
+    github_client,
+    pipeline_routes,
+    provider,
+    store,
+    watch,
+)
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.context import ui_language_tag
@@ -3645,14 +3651,23 @@ def _untagged(issues: list[dict]) -> list[dict]:
     return rows
 
 
-def _build_tagging_prompt(owner: str, repo: str, labels: list[dict], issues: list[dict]) -> str:
+def _build_tagging_prompt(
+    owner: str, repo: str, labels: list[dict], issues: list[dict], *, ui_language: str = ""
+) -> str:
     """Assemble the batched "label these untagged issues" prompt.
 
     Issue text is UNTRUSTED (anyone can open an issue containing prompt-injection
     text), so it is fenced and marked as data. The output is constrained
     downstream too: every proposed name is intersected with the repo's real label
     set, so an injected "add label X" cannot invent a label, and the issue numbers
-    are intersected with the batch, so it cannot reach issues it wasn't shown."""
+    are intersected with the batch, so it cannot reach issues it wasn't shown.
+
+    ``ui_language`` is a validated BCP-47 tag (see :func:`_ui_language`); ``""``
+    omits the language directive entirely, leaving the prompt byte-identical to
+    what it was before this argument existed. Only the ``reason`` is steered — the
+    label NAMES must stay exactly as the repository spells them, because the
+    validator intersects them against the real label set and a translated name
+    would be dropped as invented."""
     label_lines = (
         "\n".join(
             f"- {lab.get('name')}"
@@ -3695,11 +3710,18 @@ def _build_tagging_prompt(owner: str, repo: str, labels: list[dict], issues: lis
         "</issues>\n\n"
         'Respond with ONLY the JSON object, e.g. {"assignments": [{"number": 12, '
         '"labels": [{"name": "bug", "reason": "reports a crash"}]}]}.'
+        + _language_directive(ui_language, 'each "reason"')
     )
 
 
 async def _compute_tagging_suggestions(
-    request: web.Request, owner: str, repo: str, labels: list[dict], issues: list[dict]
+    request: web.Request,
+    owner: str,
+    repo: str,
+    labels: list[dict],
+    issues: list[dict],
+    *,
+    ui_language: str = "",
 ) -> dict[str, list[dict]]:
     """One batched, tool-less, ephemeral-session model call proposing labels for
     ``issues``; returns ``{"<number>": [{name, reason}]}``.
@@ -3707,13 +3729,17 @@ async def _compute_tagging_suggestions(
     Runs through :func:`_run_oneshot_model` exactly like the issue-triage and
     taxonomy paths. Output is validated: names are intersected with the repo's
     real labels, numbers with the batch that was actually shown, text is redacted
-    and clamped, and issues that got no valid label are dropped."""
+    and clamped, and issues that got no valid label are dropped.
+
+    ``ui_language`` is resolved by the caller (``_handle_generate_tagging``) rather
+    than here, so one request's prompt and the cache entry it produces cannot
+    disagree about the language — the same split the issue-ai path uses."""
     import uuid
 
     from kiro_crew.llm_helpers import parse_llm_json
     from kiro_crew.security import redact
 
-    prompt = _build_tagging_prompt(owner, repo, labels, issues)
+    prompt = _build_tagging_prompt(owner, repo, labels, issues, ui_language=ui_language)
     key = f"issue-radar-tagging:{owner}/{repo}:{uuid.uuid4().hex}"
     text = await _run_oneshot_model(request, key, prompt)
 
@@ -3790,6 +3816,17 @@ async def _handle_get_tagging(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=502)
 
     cached = await _st(key, store.read_tagging_cache, owner, repo)
+    # Each cached suggestion carries `reason` prose, and the queue renders it as a
+    # tooltip. A suggestion generated before a language switch would keep that
+    # tooltip in the old language indefinitely -- and worse than plainly foreign,
+    # because the tooltip TEMPLATE around it is localized by the frontend, so the
+    # row reads half-translated. Serving nothing instead offers the user the
+    # regenerate they can actually act on. Resolved off-loop (config-file I/O) and
+    # compared exactly as the issue-ai cache does; a legacy entry carries no tag and
+    # reads as "", so installs that never set a language keep their suggestions.
+    lang = await asyncio.to_thread(_ui_language)
+    if cached is not None and str(cached.get("ui_language") or "") != lang:
+        cached = None
     suggestions = cached["suggestions"] if cached else {}
     rows = [
         {
@@ -3896,6 +3933,10 @@ async def _handle_generate_tagging(request: web.Request) -> web.Response:
         )
 
     untagged = _untagged(issues)
+    # Resolved once per request, off-loop (config-file I/O — see _ui_language), and
+    # used for all three of: which issues still count as un-analysed, steering the
+    # generation, and stamping what the cache is written in.
+    lang = await asyncio.to_thread(_ui_language)
     # `is not None`, not truthiness: an explicit empty `numbers` array means
     # "analyse exactly these (none)", and treating it as an omission started a
     # whole automatic batch the caller never asked for.
@@ -3906,13 +3947,23 @@ async def _handle_generate_tagging(request: web.Request) -> web.Response:
         batch = [i for i in untagged if i.get("number") in wanted]
     else:
         cached = await _st(key, store.read_tagging_cache, owner, repo)
-        done = set((cached or {}).get("suggestions") or {})
+        # An entry written in another language is NOT analysed for this purpose.
+        # Counting it would make "next un-analysed slice" skip exactly the rows
+        # whose reason the switch invalidated, so those rows could never be
+        # re-earned by the automatic batch — the queue would advance past them and
+        # leave them permanently blank.
+        stale_lang = cached is not None and str(cached.get("ui_language") or "") != lang
+        done = set() if stale_lang else set((cached or {}).get("suggestions") or {})
         batch = [i for i in untagged if str(i.get("number")) not in done]
     remaining = max(0, len(batch) - _TAG_BATCH_MAX)
     batch = batch[:_TAG_BATCH_MAX]
 
     if not batch:
         cached = await _st(key, store.read_tagging_cache, owner, repo)
+        # Same language gate as the GET route: nothing was generated, so the only
+        # thing to return is the cache, and it is servable only if it matches.
+        if cached is not None and str(cached.get("ui_language") or "") != lang:
+            cached = None
         return web.json_response(
             {
                 "owner": owner,
@@ -3925,7 +3976,9 @@ async def _handle_generate_tagging(request: web.Request) -> web.Response:
         )
 
     try:
-        produced = await _compute_tagging_suggestions(request, owner, repo, labels, batch)
+        produced = await _compute_tagging_suggestions(
+            request, owner, repo, labels, batch, ui_language=lang
+        )
     except Exception:
         logger.exception("tagging: computation failed for %s/%s", owner, repo)
         return web.json_response(
@@ -3939,7 +3992,50 @@ async def _handle_generate_tagging(request: web.Request) -> web.Response:
     # never advance.
     analyzed = [int(i["number"]) for i in batch if isinstance(i.get("number"), int)]
     merged_batch = {str(n): produced.get(str(n), []) for n in analyzed}
-    result = await _st(key, store.merge_tagging_suggestions, owner, repo, merged_batch)
+    result = await _st(
+        key,
+        store.merge_tagging_suggestions,
+        owner,
+        repo,
+        merged_batch,
+        ui_language=lang,
+        verify_language=_ui_language,
+    )
+    # The store refused under its own lock: the configured language moved before
+    # the write. This is the ONLY language guard on the write path, and it belongs
+    # in the lock -- a pre-check out here would be strictly weaker, because it and
+    # the write are not atomic, so a switch landing between them would still let a
+    # stale generation replace a newer-language one that had already landed. Since
+    # the merge REPLACES on a language change, that lost race is lost DATA.
+    #
+    # Nothing was persisted, so nothing is claimed as analysed and the slice stays
+    # in `remaining` for the next call to re-generate under the current language.
+    #
+    # Returns NO suggestions, deliberately. The untouched document this refusal
+    # protected may still be in the language the switch just left, and handing it
+    # back would put exactly the stale prose this route exists to withhold into the
+    # client's cache -- the GET route gates on the language for that reason, and an
+    # error path that skips the gate reintroduces the defect through the back door.
+    # An empty answer cannot be wrong, and the client's next GET serves whatever is
+    # genuinely current under the gate that already exists there.
+    if result.get("stale_language"):
+        logger.info(
+            "tagging: store refused a batch for %s/%s generated under %r; the "
+            "dashboard language moved before the write",
+            owner,
+            repo,
+            lang or "(unset)",
+        )
+        return web.json_response(
+            {
+                "owner": owner,
+                "repo": repo,
+                "suggestions": {},
+                "analyzed": [],
+                "remaining": remaining + len(analyzed),
+                "generated_at": None,
+            }
+        )
     return web.json_response(
         {
             "owner": owner,
@@ -5341,6 +5437,13 @@ def register_routes(app: web.Application) -> None:
     from . import crew_routes
 
     crew_routes.register_crew_routes(app)
+
+    # The pipeline dashboard's routes, same arrangement and for the same reason:
+    # its own module, registered HERE so this function stays the one place that
+    # lists this app's routes. Unlike crew_routes this import is NOT circular --
+    # pipeline_routes depends only on its fold and on `store` for the app name --
+    # so it is imported at module scope with the rest.
+    pipeline_routes.register_routes(app)
 
     # Background new-issue watcher: a single in-process asyncio loop (NOT a cron
     # job) that polls opted-in repos every ~60s and pushes a KiroCrew

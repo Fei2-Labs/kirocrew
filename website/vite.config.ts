@@ -617,7 +617,14 @@ export default defineConfig({
     // 3 is both the fastest and cheaper in memory than 4; peak single-fork RSS
     // was ~1.0-1.4 GB against the 3072 MB per-fork heap ceiling below.
     maxWorkers: 3,
-    execArgv: ['--max-old-space-size=3072'],
+    // Node 25 enables its process-global experimental Web Storage in forks but
+    // gives those workers no persistence path, emitting one
+    // "--localstorage-file ... without a valid path" warning per test file.
+    // happy-dom supplies the window-scoped Storage this suite actually tests,
+    // and setup.ts replaces it with a deterministic in-memory implementation,
+    // so disable the unrelated Node global instead of sharing a disk file
+    // across concurrent workers.
+    execArgv: ['--max-old-space-size=3072', '--no-experimental-webstorage'],
     // Default 5s is too tight for tests that ``await import(...)`` inside the
     // body: under a full concurrent forks run the collect phase can starve the
     // dynamic import past 5s and it times out. 15s gives headroom for
@@ -771,6 +778,17 @@ export default defineConfig({
           // remark/rehype/unified pipeline).
           if (/[\\/]node_modules[\\/](katex|highlight\.js|lowlight|refractor|react-markdown|remark-[^\\/]+|rehype-[^\\/]+|mdast-[^\\/]+|hast-[^\\/]+|micromark[^\\/]*|unified|unist-[^\\/]+)[\\/]/.test(id)) {
             return 'vendor-markdown'
+          }
+          // The YAML document parser, reached only by the skill editor's
+          // frontmatter round-trip (`SkillForm.tsx`). Bucketed like every other
+          // vendor library here because the App chunk is meant to hold FIRST-PARTY
+          // code -- its budget comment in scripts/check-bundle-size.mjs says as
+          // much -- and it is the ceiling that ordinary feature PRs trip. Measured
+          // 93.7 KB raw / 29 KB gzip, far under the gate's 500 KB default, so it
+          // needs no CHUNK_BUDGETS entry of its own. The leading separator keeps
+          // this off `js-yaml`, which is mermaid's and belongs in mermaid's chunk.
+          if (/[\\/]node_modules[\\/]yaml[\\/]/.test(id)) {
+            return 'vendor-yaml'
           }
         },
       },

@@ -13,7 +13,7 @@
  * View-local state (search query, category pick, sort, action loading) stays
  * in each page — this hook owns data identity, not presentation.
  */
-import { useMemo } from 'react'
+import { useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { i18nT } from '../../i18n/t'
@@ -214,20 +214,58 @@ export type UpdatableInstalledRow = Pick<
 /**
  * Whether an installed app belongs in the Library list.
  *
- * A disabled builtin is normally hidden: the wheel ships ~20 of them default-off
- * and listing every one would bury the apps a reader actually uses. An app that
- * REPLACES a host surface is the exception, because it is the only class a reader
- * can turn off and then need to find again -- its own copy tells them to disable
- * it to get the old surface back, and with the row gone from Library and no
- * catalog row in Discover that would be a one-way switch. Keyed on `ui.overlays`
- * rather than on the app id so the rule belongs to the capability, not to a name.
+ * Every installed app belongs here except a disabled hidden builtin. Discover is
+ * built from published catalog rows and deliberately does not synthesize rows
+ * from local manifests, so hiding an ordinary default-off builtin here can make a
+ * shipped app unreachable from both surfaces. `hidden` is still honoured for a
+ * builtin because concealment is the wheel's product decision; it is not honoured
+ * for a third-party manifest, which must not be able to hide itself from the only
+ * surface that can enable or uninstall it.
  *
  * Exported so its test exercises this predicate rather than a copy of it.
  */
 export function keepInLibrary(
   app: Pick<InstalledApp, 'origin' | 'enabled' | 'manifest'>,
 ): boolean {
-  return !(app.origin === 'builtin' && !app.enabled && !app.manifest?.ui?.overlays?.length)
+  return app.enabled || app.origin !== 'builtin' || !app.manifest?.hidden
+}
+
+/** One app's Library placement, decided for the visit and then held. */
+export type LibrarySlot = { listed: boolean; wasEnabled: boolean }
+
+/**
+ * Build the Library rows without moving or removing the control just clicked.
+ *
+ * Listing default-off builtins adds roughly 20 rows, so a fresh visit puts
+ * enabled apps first. Both that group and the hidden-builtin admission decision
+ * are held across refetches: enabling or disabling a row updates its controls in
+ * place instead of moving it off-screen or deleting it. A previously concealed
+ * row is promoted if an out-of-band action enables it, so the per-visit cache
+ * cannot keep an enabled app unreachable. Uninstalled rows are forgotten.
+ */
+export function libraryView<
+  T extends Pick<InstalledApp, 'origin' | 'enabled' | 'manifest'> & { name: string },
+>(apps: T[], view: Map<string, LibrarySlot>): T[] {
+  const live = new Set(apps.map(app => app.name))
+  for (const name of view.keys()) {
+    if (!live.has(name)) view.delete(name)
+  }
+  for (const app of apps) {
+    const slot = view.get(app.name)
+    if (!slot) {
+      view.set(app.name, { listed: keepInLibrary(app), wasEnabled: !!app.enabled })
+    } else if (!slot.listed && keepInLibrary(app)) {
+      slot.listed = true
+      // The row was not previously visible, so this is its first placement in
+      // the visit. It appears enabled and belongs with the enabled group.
+      slot.wasEnabled = !!app.enabled
+    }
+  }
+  const rows = apps.filter(app => view.get(app.name)?.listed)
+  return [
+    ...rows.filter(app => view.get(app.name)?.wasEnabled),
+    ...rows.filter(app => !view.get(app.name)?.wasEnabled),
+  ]
 }
 
 /** name → new version for every registry row with an update available. */
@@ -355,6 +393,7 @@ export async function registryQueryFn(): Promise<{
 }
 
 export default function useAppsData(): AppsData {
+  const libraryViewRef = useRef(new Map<string, LibrarySlot>())
   const { data: apps = [], isLoading: appsLoading, error: appsError } = useQuery<InstalledApp[]>({
     queryKey: ['apps'],
     queryFn: () => api.listApps(),
@@ -409,9 +448,9 @@ export default function useAppsData(): AppsData {
   //
   // Offline, the shelf is whatever the server can still answer with — the
   // catalog's cache, then the bundled seed. It is deliberately NOT topped up
-  // from local manifests: nothing is installable offline anyway, and installed
-  // built-ins remain fully visible and manageable under Library, which reads
-  // `GET /api/apps` locally.
+  // from local manifests: nothing is installable offline anyway, and Library
+  // reads `GET /api/apps` locally and lists every installed app except a disabled
+  // hidden builtin (see `keepInLibrary`).
   const browseApps: RegistryApp[] = useMemo(() => {
     const hiddenBuiltins = new Set(
       apps.filter(a => a.origin === 'builtin' && a.manifest?.hidden).map(a => a.name),
@@ -546,8 +585,7 @@ export default function useAppsData(): AppsData {
   const updateMap = useMemo(() => buildUpdateMap(registry), [registry])
   const installedApps: LibraryApp[] = useMemo(
     () =>
-      apps
-        .filter(keepInLibrary)
+      libraryView(apps, libraryViewRef.current)
         .map(a => ({
           ...a,
           updateAvailable: updateMap.has(a.name),
@@ -556,8 +594,13 @@ export default function useAppsData(): AppsData {
     [apps, updateMap],
   )
   const updatables = useMemo(
-    () => installedApps.filter(a => isUpdatable(a, updateMap)),
-    [installedApps, updateMap],
+    // Keep this live-filtered rather than visit-held: `countUpdatables` powers
+    // the shell badge from the same raw cache and must equal the Updates list.
+    () => apps
+      .filter(keepInLibrary)
+      .map(a => ({ ...a, updateAvailable: updateMap.has(a.name), _newVersion: updateMap.get(a.name) }))
+      .filter(a => isUpdatable(a, updateMap)),
+    [apps, updateMap],
   )
 
   return {

@@ -26,7 +26,7 @@ import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAppSelector, useAppDispatch, store } from '../store'
 import { PANE_HYDRATE_LIMIT, retireStatelessQuestion, captureStatelessCard, capturePendingAskId, confirmOptimisticSend, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, requestStop, cancelQueuedMessage, editQueuedMessage, setAgentSwitchNotice, pendingQuestionFor } from '../store/chatSlice'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
-import { loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
+import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { tryQuickSend } from '../lib/quickSend'
 import { confirmedDelivered, readSendReceipt } from '../utils/sendDelivery'
 import { mergeRecoveredDraft } from '../utils/chatDrafts'
@@ -65,6 +65,8 @@ export default function ChatPane({
   onSplitDown,
   onOpenFull,
   agentLocked,
+  frameless,
+  followContentWidth,
 }: {
   slotKey: string
   focused?: boolean
@@ -80,6 +82,19 @@ export default function ChatPane({
    *  the agent picker is not offered at all, instead of offering a control
    *  whose every selection the backend 409s. */
   agentLocked?: boolean
+  /** Embedded-in-a-page mode (member DM threads): the HOST renders the
+   *  identity header, so the pane's own title bar and its card chrome
+   *  (border, rounded corners) would duplicate it. Split-view panes keep
+   *  the chrome — there the bar IS the pane's identity. */
+  frameless?: boolean
+  /** The pane follows the user's Content width setting (transcript AND
+   *  composer, both halves of CONTENT_WIDTH), resolved from the pane's own
+   *  live chatConfig. Defaults to false = both variables pinned to '100%':
+   *  a split-view pane is already narrow, so capping inside it wastes
+   *  width. A full-width host (the Members page's DM column) sets it so
+   *  long transcripts keep the same user-configured measure as the main
+   *  chat. */
+  followContentWidth?: boolean
 }) {
   // One instance covers both dropdown filter inputs (never open at once).
   const dispatch = useAppDispatch()
@@ -230,8 +245,8 @@ export default function ChatPane({
   // One-time hydrate of this slot's message history via React Query + the api
   // client (caching + cross-pane dedup; staleTime Infinity keeps it one-shot —
   // live updates arrive through the WS store routing, not a refetch).
-  // Bounding a streaming slot would slice its in-flight response: the limit cuts
-  // RAW rows and the chunk run only collapses after, leaving the tail alone.
+  // Unbounded while streaming is deliberate, not a raw-row guard: the handler
+  // collapses chunk runs BEFORE computing total and slicing, even mid-stream.
   // A background slot's stream state reads idle until an SSE frame arrives, so
   // the slot record is the signal; latch only once unbounded so a turn that starts
   // while the bounded fetch is still in flight can still upgrade it.
@@ -543,7 +558,7 @@ export default function ChatPane({
         // "no card and no ask" skipped the body entirely, which would have skipped
         // this confirmation too. `confirmedDelivered` accepts only an IMMEDIATE
         // dispatch: a queued acceptance is not a receipt for this bubble.
-        if (confirmedDelivered(body)) dispatch(confirmOptimisticSend({ slot: slotKey, sendId }))
+        if (confirmedDelivered(body)) dispatch(confirmOptimisticSend({ slot: slotKey, sendId, mid: typeof body.mid === 'string' ? body.mid : undefined }))
         if (!cardAtSend && !askAtSend) return
         // `ok` only: a QUEUED acceptance is still cancellable — the queued
         // path retires at its queue_pop instead (removeQueuedMessage).
@@ -654,9 +669,19 @@ export default function ChatPane({
            auditing focus behaviour. */
         data-chat-pane={focused ? 'focused' : ''}
         {...dropTargetProps}
-        className={`relative flex flex-col h-full min-h-0 rounded-lg overflow-hidden bg-bg border transition-colors ${focused ? 'border-accent' : 'border-border'}`}
-        style={{ '--mc-content-width': '100%' } as React.CSSProperties}
+        className={`relative flex flex-col h-full min-h-0 overflow-hidden bg-bg ${
+          frameless
+            ? ''
+            : `rounded-lg border transition-colors ${focused ? 'border-accent' : 'border-border'}`
+        }`}
+        style={{
+          '--mc-content-width': followContentWidth ? CONTENT_WIDTH[chatConfig.contentWidth].messages : '100%',
+          // Split-view panes leave --mc-input-width UNSET so ChatInput keeps
+          // its own fallback — byte-for-byte the pre-prop behavior.
+          ...(followContentWidth ? { '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input } : {}),
+        } as React.CSSProperties}
       >
+        {!frameless && (
         <div className="relative z-50 flex items-center gap-2 px-3 py-2 border-b border-border bg-card shrink-0">
           <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-ok animate-pulse' : 'bg-accent'}`} />
           <span className="text-[13px] font-semibold text-text-strong truncate min-w-0">{title}</span>
@@ -686,6 +711,7 @@ export default function ChatPane({
             </button>
           )}
         </div>
+        )}
 
         <ChatDropOverlay active={dragOver} />
 

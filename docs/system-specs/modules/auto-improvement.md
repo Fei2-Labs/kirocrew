@@ -89,7 +89,7 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 
 | Control | Where | Behavior |
 |---|---|---|
-| Push-disabled clone | `backend/clone_setup.py:_disable_push` + `spine/driver.py:assert_push_disabled` | **BOTH** origin urls are `DISABLED_NO_PUSH`; the run refuses to start otherwise. The real remote lives in config (`origin_url`), handed only to the trusted publishers |
+| Push-disabled clone | `backend/clone_setup.py:_disable_push` + `profiles/github_repo/profile.py:RepoIsolation.push_disabled` | **Every** configured fetch/push URL is replaced with exactly one `DISABLED_NO_PUSH` value; setup and runtime fail closed on extra values. The real remote lives in config (`origin_url`), handed only to trusted publishers |
 | Draft-only PRs | `profiles/github_repo/pr_recipe.py` | `gh pr create --draft`; never `--web`, merge, ready, or auto-merge |
 | Generated head branch | same | `auto-improvement/<kind>-<fingerprint>`; never a human's branch |
 | Protected-branch denylist | `spine/push_policy.py` | non-overridable; a hand-edited config cannot widen it |
@@ -105,6 +105,48 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 | Pre-push content scan | `spine/push_policy.py:scan_content_for_secrets` | ONE scanner behind all three exits — draft-PR push, F10 direct push, one-click commit. The full pushed range is scanned; a hit **refuses** the push and the change stays in the local queue; **fail-closed** |
 | Audited subprocess agent (NOT SELECTED) | `spine/agent_runner.py:_audit_unattended_agent` | same — retained for a future caller. The `claude -p` path passes `--dangerously-skip-permissions`, so the launch is one blanket approval — logged `critical=True` before the spawn, and an unwritable audit REFUSES to launch |
 | Redacted PR prose | same, `_redact_prose` | title and description are redacted (prose survives rewriting; a diff does not) |
+
+### Clone setup and reuse contract
+
+`setup_safe_clone` derives the canonical destination from the validated GitHub
+`owner/repo`; it never treats clone contents as trusted. The improvement agent is
+expected to edit that checkout, so reuse attests only properties the host can
+enforce: the scratch root/destination and Git metadata contain no links or
+redirections, local Git config has no includes/URL rewrites/worktree override,
+and every origin fetch/push URL is exactly `DISABLED_NO_PUSH`.
+
+A documented setup re-run accepts that sentinel and reasserts the controls, which
+is the idempotency guarantee. A live mismatched or multi-valued fetch origin,
+unsafe Git metadata/config, linked scratch path, or non-repository destination is
+refused without mutation. Push URL values are instead always replaced with
+exactly one sentinel before success is reported. Initial clone ignores
+global/system Git config, pins hooks and fsmonitor off, allows only the validated
+transport, and removes partial output on failure. Branch listing, checkout, and
+runtime isolation repeat the metadata and URL-set checks. Git metadata entries must
+be regular files (object files may remain hardlinked); FIFOs, sockets, devices,
+links, and hardlinked non-object metadata are refused before host Git. Repository integrity
+is an unconditional runner startup prerequisite; direct-commit authorization can
+relax only push posture, never metadata/config validation. The attributes pin is
+published by atomic replacement, so a hardlinked path cannot truncate another
+inode. Each trusted publisher validates full repository isolation (metadata/config
+safety plus exact disabled URL sets) after the agent's final write and before its
+first trusted Git scan/mutation. Perf preflight uses the same capture → attest/retire
+→ interpret ordering before progress, archive, or HEAD reads. The one-click route holds
+the clone lock and proves the runner idle for that whole critical section; the
+driver additionally revalidates after a rebase before its retry push. Local
+configuration that can invoke host-side helpers (including diff, filter, merge,
+editor, askpass, hook, fsmonitor, proxy, signing, attributes-file, and
+excludes-file helpers) is refused; trusted Git pins both external paths to Git's
+cross-platform `/dev/null` spelling, and content scans additionally clear `diff.external` and disable external diffs. If safety
+changes after an agent/build step, the run stops before further Git, atomically
+moves the canonical clone into a private `.unsafe-*` incident directory, reports
+the retained path, and caps those incident copies at three per repository;
+ordinary setup mismatch never creates these copies.
+
+This contract deliberately makes no HMAC or clean-checkout claim: clone content
+and history remain agent-writable, while trusted publishing is contained by
+protected-branch policy, content scanning, final repository-config validation,
+and explicit config-held push destinations.
 
 ### Why the unattended runner consults the platform governance gate
 

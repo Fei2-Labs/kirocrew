@@ -99,8 +99,49 @@ class SecretVault:
         entries = self._load_entries()
         if name not in entries:
             return None
-        plaintext = self._decrypt_entry(name, entries[name])
+        key = self._get_or_create_key()
+        plaintext = self._decrypt_entry(name, entries[name], key)
         return SecretValue(plaintext.decode("utf-8"))
+
+    def get_many(self, names: list[str]) -> dict[str, Optional[SecretValue]]:
+        """Batch-retrieve secrets, loading the store and key exactly once.
+
+        Returns a mapping from each requested name to its :class:`SecretValue`,
+        or ``None`` for names not present in the store — the same
+        per-name found/missing semantics as :meth:`get`, but without re-reading
+        ``secrets.enc`` (``_load_entries``) and the key file
+        (``_get_or_create_key``) once per name. On the spawn path K secret
+        references would otherwise cost K full store loads plus K key reads.
+
+        Like :meth:`get`, this is lock-free by design: ``_load_entries`` reads
+        the store atomically (writers commit via ``os.replace``, so a torn read
+        is impossible), and the key file is immutable once created. All names
+        resolve against the SAME on-disk snapshot, which is the intended
+        behaviour for a single spawn.
+
+        The vault key is only loaded when at least one requested name is
+        present, so a call for names none of which exist on a fresh vault does
+        not create a key file (matching :meth:`get`, which returns before
+        ``_get_or_create_key`` for a missing name).
+        """
+        entries = self._load_entries()
+        result: dict[str, Optional[SecretValue]] = {}
+        key: Optional[bytes] = None
+        for name in names:
+            # Membership, then index: a corrupt store can hold a JSON ``null``
+            # entry, and ``entries.get(name)`` would misclassify it as MISSING
+            # (wrong remediation: "store the secret") instead of MALFORMED
+            # (the store is corrupt) — ``_decrypt_entry`` raises the
+            # descriptive fail-closed ValueError for it.
+            if name not in entries:
+                result[name] = None
+                continue
+            entry = entries[name]
+            if key is None:
+                key = self._get_or_create_key()
+            plaintext = self._decrypt_entry(name, entry, key)
+            result[name] = SecretValue(plaintext.decode("utf-8"))
+        return result
 
     async def set(self, name: str, value: str) -> None:
         """Store or overwrite a secret."""
@@ -297,11 +338,24 @@ class SecretVault:
         ct = aesgcm.encrypt(nonce, plaintext, self._aad_for(name))
         return {"nonce": nonce.hex(), "ct": ct.hex()}
 
-    def _decrypt_entry(self, name: str, entry: dict[str, str]) -> bytes:
-        key = self._get_or_create_key()
+    def _decrypt_entry(self, name: str, entry: dict[str, str], key: bytes) -> bytes:
         aesgcm = AESGCM(key)
-        nonce = bytes.fromhex(entry["nonce"])
-        ct = bytes.fromhex(entry["ct"])
+        # A corrupt / hand-edited store can make ``entry`` any shape (a string,
+        # a list, a dict missing ``nonce``/``ct``, or one whose values are not
+        # valid hex). Guard the extraction so callers see the module's
+        # fail-closed descriptive ValueError instead of a raw TypeError /
+        # KeyError / non-hex ValueError. The message names the entry but NEVER
+        # includes ciphertext or plaintext material.
+        try:
+            nonce = bytes.fromhex(entry["nonce"])
+            ct = bytes.fromhex(entry["ct"])
+        except (TypeError, KeyError, ValueError, AttributeError) as exc:
+            # No entry name in the message: names are caller-supplied strings
+            # that may contain anything, and this error propagates into spawn
+            # logs. The resolution caller already names the env-var key.
+            raise ValueError(
+                f"Vault store corrupt: an entry is malformed ({type(exc).__name__})."
+            ) from None
         return aesgcm.decrypt(nonce, ct, self._aad_for(name))
 
     # ── Store I/O ──
@@ -320,7 +374,17 @@ class SecretVault:
                 f"got {envelope.get('backend')!r}"
             )
 
-        return dict(envelope.get("entries", {}))
+        entries = envelope.get("entries", {})
+        # A corrupt / hand-edited store can carry a non-mapping ``entries``
+        # (a list, a string, null). Fail closed with a descriptive ValueError
+        # rather than letting ``dict(entries)`` raise a raw ValueError/TypeError
+        # deep in an unrelated caller. No store content is echoed.
+        if not isinstance(entries, dict):
+            raise ValueError(
+                f"Vault store corrupt: 'entries' must be an object, "
+                f"got {type(entries).__name__}."
+            )
+        return dict(entries)
 
     @contextmanager
     def hold_cross_process_lock(self) -> Iterator[None]:

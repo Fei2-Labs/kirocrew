@@ -96,10 +96,10 @@ downstream editions: overriding one variable rebrands every catalog string,
 instead of forking 13 locale files through every upstream sync (see
 [extension-seams](extension-seams.md)).
 
-> Transitional note: the mechanical conversion of pre-existing catalog values
-> is landing in follow-up PRs (the full-catalog diff exceeds the reviewable
-> size limit). The rules below bind new copy immediately; the catalog-wide
-> no-literal invariant test ships with the final conversion chunk.
+> The pre-existing catalog values were converted in batches (the full-catalog
+> diff exceeds the reviewable size limit). The conversion is complete; a
+> catalog-wide test in `productName.test.ts` pins that no value outside the
+> exceptions below carries the literal.
 
 Authoring rules that follow:
 
@@ -109,10 +109,17 @@ Authoring rules that follow:
 - **The `apps.<id>.manifest.*` keys are the deliberate exception.** They must
   stay byte-identical to the Python-side `app.json` prose (`[manifest-sync]`
   is a hard zero), so they keep the literal English name.
-- **Repo-attribution copy keeps the literal too.** A string naming this
-  project as the star/fork/issue target (`app.star_kirocrew_on_github`) wraps
-  a hardcoded upstream URL, so interpolating the product name would make an
-  edition render its own name linking to the upstream repository.
+- **Attribution and data-egress copy keeps the literal too.** A string whose
+  referent does not change with an edition must not interpolate the name:
+  `app.star_kirocrew_on_github` wraps a hardcoded upstream repo URL, and the
+  survey (`components.sessionPulseSurveyCard.email_disclosure`) and install
+  receipts (`privacyDisclosure.installReceipt*`) name the recipient of data
+  sent to hardcoded upstream endpoints. Interpolating those would make an
+  edition misattribute a link target or where user data goes.
+- **Wire-format identifiers keep their unspaced literal.** The generated
+  Slack app name (`KiroCrew-{{alias}}`) and the webhook signature headers
+  (`X-KiroCrew-Timestamp` / `X-KiroCrew-Signature`) are fixed by the backend,
+  so the UI must spell them exactly whatever the edition renders elsewhere.
 - **A call-time variable of the same name wins** over the default, per
   i18next's merge order — useful when a string names a *different* crew.
 - German compounds hyphenate through the placeholder

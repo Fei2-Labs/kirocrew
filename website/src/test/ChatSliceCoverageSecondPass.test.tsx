@@ -538,9 +538,10 @@ describe('chatSlice slot-detail refresh merges', () => {
     // Resolving that ambiguity from text identity was attempted and retired:
     // every variant carried a real over-drop hole (duplicate-text turns,
     // missed echoes, pages reaching past the bounded cache window). The
-    // contract is now: the bubble breaks the scan but NEVER authorizes a
-    // drop — over-keep, not over-drop. The new-turn residual (this chip can
-    // strand until reload) is tracked as issue #6075.
+    // contract: TEXT never resolves the bubble — only a persisted row carrying
+    // the bubble's own client-minted sendId does (#6075) — so an id-less
+    // bubble breaks the scan and NEVER authorizes a drop, whatever text the
+    // page holds. Over-keep, not over-drop.
     let s = chatReducer(initial, setActiveSlot('A'))
     s = chatReducer(s, replaceMessages([
       msg({ role: 'user', content: 'question', ts: '1' }),
@@ -596,6 +597,131 @@ describe('chatSlice slot-detail refresh merges', () => {
       msg({ role: 'user', content: 'check the logs', ts: '5' }),
     ], { running: true })))
     expect(s.messages.some(m => m.role === 'thinking' && m.content === 'pre-steer reasoning')).toBe(true)
+  })
+
+  it('resolves a raced steer bubble by send-id and drops the finished turn\'s chip (#6075)', () => {
+    // The steer POST landed after chat_done: the server persisted the text as
+    // a PLAIN user row on the new-turn path, carrying the client-minted
+    // sendId the bubble was stamped with. That id-proven boundary sits inside
+    // the covered page (the row itself vouches for the bubble via the shared
+    // send-id identity), so the pre-steer chip of the FINISHED turn drops —
+    // matching a reload — instead of stranding at the tail on every refresh.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'finished-turn reasoning' }),
+      msg({ role: 'user', content: 'do the next thing', ts: '2026-08-26T06:00:00.000Z', meta: { steer: true, optimistic: true, sendId: 'sid-raced' } }),
+    ]))
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'user', content: 'do the next thing', ts: '5', meta: { sendId: 'sid-raced', mid: 'm-raced' } }),
+      msg({ role: 'assistant', content: 'new turn answer', ts: '6' }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking')).toBe(false)
+  })
+
+  it('a page row with a DIFFERENT send-id never vouches for the bubble (#6075)', () => {
+    // Id identity is exact: a persisted row carrying some OTHER send's id —
+    // plus a plain-text copy of the bubble's content — is not evidence about
+    // THIS bubble. The unmatched bubble keeps the decline-to-guess default
+    // and the pre-steer reasoning survives.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'pre-steer reasoning' }),
+      msg({ role: 'user', content: 'do the next thing', ts: '2026-08-26T06:00:00.000Z', meta: { steer: true, optimistic: true, sendId: 'sid-mine' } }),
+    ]))
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'user', content: 'do the next thing', ts: '5', meta: { sendId: 'sid-someone-else', mid: 'm-x' } }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking' && m.content === 'pre-steer reasoning')).toBe(true)
+  })
+
+  it('an id-proven ACCEPTED steer lets the scan reach the real anchor below (#6075)', () => {
+    // The covered page holds a STEER row carrying the bubble's sendId:
+    // acceptance is proven, so the bubble does not end the block's turn and
+    // the forward scan continues to the post-steer answer — the block anchors
+    // above it instead of stranding at the tail.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'pre-steer reasoning' }),
+      msg({ role: 'user', content: 'also check X', ts: '2026-08-26T06:00:00.000Z', meta: { steer: true, optimistic: true, sendId: 'sid-accepted' } }),
+      msg({ role: 'assistant', content: 'steered answer', ts: '4' }),
+    ]))
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'user', content: 'also check X', ts: '3', meta: { steer: true, sendId: 'sid-accepted', mid: 'm-acc' } }),
+      msg({ role: 'assistant', content: 'steered answer', ts: '4' }),
+    ], { running: true })))
+    const roles = s.messages.map(m => m.role)
+    const thinkingIdx = roles.indexOf('thinking')
+    expect(thinkingIdx).toBeGreaterThanOrEqual(0)
+    expect(thinkingIdx).toBeLessThan(roles.indexOf('assistant'))
+  })
+
+  it('a PLAIN optimistic send is never id-resolved into a boundary (#6075)', () => {
+    // For a NON-steer send, "a persisted row with this id exists" does not
+    // prove "the turn above this bubble is over": crew mode persists the user
+    // row as a durable queue entry and starts no turn at all. Recording a
+    // boundary there would re-open the over-drop class the retired text
+    // heuristics were rejected for — id resolution is licensed for STEER
+    // bubbles only, where the row's own steer flag names the consuming path.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'live reasoning' }),
+      msg({ role: 'user', content: 'queued for later', ts: '2026-08-26T06:00:00.000Z', meta: { optimistic: true, sendId: 'sid-plain' } }),
+    ]))
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'user', content: 'queued for later', ts: '5', meta: { sendId: 'sid-plain', mid: 'm-plain' } }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking' && m.content === 'live reasoning')).toBe(true)
+  })
+
+  it('a send-id the page holds MORE THAN ONCE resolves nothing (#6075)', () => {
+    // Ids are minted unique, so a duplicate in one page is a client defect or
+    // an adversarial echo — either way the id names no single path and the
+    // tombstone keeps the decline-to-guess default instead of letting the
+    // first-seen row classify the bubble.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'pre-steer reasoning' }),
+      msg({ role: 'user', content: 'do the next thing', ts: '2026-08-26T06:00:00.000Z', meta: { steer: true, optimistic: true, sendId: 'sid-dupe' } }),
+    ]))
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'user', content: 'do the next thing', ts: '5', meta: { sendId: 'sid-dupe', mid: 'm-a' } }),
+      msg({ role: 'user', content: 'do the next thing again', ts: '6', meta: { sendId: 'sid-dupe', mid: 'm-b' } }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking' && m.content === 'pre-steer reasoning')).toBe(true)
+  })
+
+  it('a duplicated send-id never extends the coverage cut past a live anchor (#6075)', () => {
+    // The coverage-cut half of the same fail-safe: a client reusing one id on
+    // two different sends must not let a stale page's copy of the OLDER send
+    // match the NEWER bubble and advance coveredIdx past a post-snapshot tool
+    // anchor — that would drop the live turn's reasoning, the exact over-drop
+    // the never-stacked identity rule exists to prevent. With the id
+    // duplicated (one copy in the page, two claimants in the cache), send-id
+    // identity is withheld from coverage entirely and the block survives.
+    let s = chatReducer(initial, setActiveSlot('A'))
+    s = chatReducer(s, replaceMessages([
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'thinking', content: 'live reasoning' }),
+      // Post-snapshot anchor: landed after the page below was fetched.
+      msg({ role: 'tool', content: '🔧 grep', ts: '9', meta: { tool_call_id: 'tc-live' } }),
+      msg({ role: 'user', content: 'first send', ts: '2026-08-26T06:00:00.000Z', meta: { steer: true, optimistic: true, sendId: 'sid-reused' } }),
+      msg({ role: 'user', content: 'second send', ts: '2026-08-26T06:00:01.000Z', meta: { steer: true, optimistic: true, sendId: 'sid-reused' } }),
+    ]))
+    s = chatReducer(s, lifecycle('chat/refreshSlot/fulfilled', 'A', detail('A', [
+      msg({ role: 'user', content: 'question', ts: '1' }),
+      msg({ role: 'user', content: 'first send', ts: '5', meta: { sendId: 'sid-reused', mid: 'm-first' } }),
+    ], { running: true })))
+    expect(s.messages.some(m => m.role === 'thinking' && m.content === 'live reasoning')).toBe(true)
   })
 
   it('keeps a block anchored to unconfirmed text through a racing mid-turn refresh', () => {

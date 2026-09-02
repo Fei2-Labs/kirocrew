@@ -1042,37 +1042,34 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
     )
 
 
-def _agent_spec_candidates(agent: str, project: str | None = None) -> list[Path]:
-    """Project-first agent specs, matching kiro-cli's resolution order."""
-    candidates: list[Path] = []
-    if project:
-        try:
-            from kiro_crew.agent_discovery import project_agent_files
-
-            candidates.extend(project_agent_files(project))
-        except Exception:
-            logger.debug("Project agent scan failed for %r", agent, exc_info=True)
-    candidates.extend(kiro_agents_dir().glob("*.json"))
-    return candidates
-
-
-def _load_agent_file_resources(agent: str, project: str | None = None) -> str:
-    """Load markdown ``file://`` resources from one agent config.
+def _load_steering_resources() -> str:
+    """Load steering files from the agent config's resources array.
 
     kiro-cli injects these automatically for its sessions; the dashboard
-    must do it explicitly for spec adapters, which do not read Kiro agent
-    configs. This applies to custom agents as well as the default agent.
+    must do it explicitly so that dashboard chat sessions also benefit
+    from project-specific steering conventions.
     Only loads ``file://`` resources matching ``*.md``.
     """
     try:
-        cfg: dict | None = None
-        for candidate in _agent_spec_candidates(agent, project):
-            candidate_data = _read_agent_spec(candidate)
-            if candidate_data is None:
-                continue
-            if candidate_data.get("name") == agent or candidate.stem == agent:
-                cfg = candidate_data
-                break
+        cfg_path = kiro_agents_dir() / "kirocrew.json"
+        if not cfg_path.exists():
+            return ""
+        # The agents dir is user-writable and shared with other tools, so the
+        # spec goes through the hardened agent-spec reader. ``safe_read_file``
+        # screened the resolved target but read it with an unbounded
+        # ``fh.read()`` -- the size cap guards ``safe_read_file_bytes``, the
+        # other helper -- and emitted no SEL event, so an oversized spec was
+        # still read whole here and a refusal was never audited. Every outcome
+        # the blanket ``except`` below used to absorb (PermissionError on a
+        # sensitive target, AttributeError on non-object JSON) now arrives as
+        # ``None`` and returns the same empty string, without the read.
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        cfg = _read_agent_spec(
+            cfg_path,
+            operation="steering_resources",
+            source="unknown",
+        )
         if cfg is None:
             return ""
         resources = cfg.get("resources", [])
@@ -1104,11 +1101,6 @@ def _load_agent_file_resources(agent: str, project: str | None = None) -> str:
     except Exception as exc:
         logger.debug("steering load failed: %s", type(exc).__name__)
         return ""
-
-
-def _load_steering_resources() -> str:
-    """Compatibility wrapper for the default agent's file resources."""
-    return _load_agent_file_resources("kirocrew")
 
 
 # Critical rules reinforced every session (supplements the system prompt).
@@ -1827,13 +1819,8 @@ class ContextBuilder:
             from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
 
             cfg = KiroCrewConfig.load()
-            # Reads the ACP BACKEND, not agent.provider: the provider enum is
-            # single-valued ("acp"), so comparing it against "claude_code" could
-            # never be true and the branded name never applied. Branding stays
-            # claude-specific rather than spec-adapter-wide, because the persona
-            # rewrite substitutes Claude's own product wording.
-            # The persona NAME substituted into the prompt, carried over from main
-            # unchanged. Respelling it would rename the bot, not fix a typo.
+            # Reads the ACP backend, not agent.provider: provider stays "acp".
+            # This persona rewrite is Claude-specific, not spec-adapter-wide.
             _branded = "KiroCrew"  # brand-ok
             claude_active = cfg.agent.acp_backend == ACP_BACKEND_CLAUDE
             self._bot_name = _branded if claude_active else "Kiro"
@@ -1966,8 +1953,13 @@ class ContextBuilder:
                 "are about to do, what you just did, rationale, alternatives "
                 "you rejected, caveats, trade-offs, unprompted next steps, and "
                 "closing offers to help.\n"
-                "- A change, a command, or a value IS the answer. Show it and "
-                "stop; do not narrate it.\n"
+                "- Whatever the user needs in order to know or to act IS the "
+                "answer — a change, a command, a value, a verdict. Lead with "
+                "it and stop; do not narrate it. The work that produced it — "
+                "the evidence, the search, the options you weighed — is "
+                "explanation, so it is opt-in like the rest. Naming your "
+                "findings is not naming the answer: if the user has to derive "
+                "it from what you found, you have not answered.\n"
                 "- One exception to stopping: when that command or change "
                 "destroys, overwrites or rewrites something, the undo path "
                 "rides along with it in the same reply — how to get it back, "
@@ -1983,7 +1975,23 @@ class ContextBuilder:
                 "Take a position instead of listing options.\n"
                 "- Code, commands, paths, identifiers, error strings and file "
                 "contents stay verbatim and complete — this mode cuts prose, "
-                "never payload.\n"
+                "never payload. Payload is what the user asked for or has to "
+                "act on. Material you quote to prove a point is evidence, not "
+                "payload, and evidence is opt-in: leave it out and offer it.\n"
+                "- One sentence per thing you are telling them. The verdict is "
+                "a sentence; each recommendation is a sentence; each item in a "
+                "list is a sentence. This bounds each item, not the reply, so "
+                "a procedure that genuinely needs seven steps gets seven "
+                "one-sentence steps — but a reply that has grown sections, "
+                "numbered findings or bullets with sub-bullets is a report, "
+                "and the answer is buried inside it.\n"
+                "- Verify against the real thing, then answer without showing "
+                "the work. Reading the code, the log or the document is what "
+                "keeps you from being wrong; a file path, a line number, a "
+                "quoted function or a count of the steps you took only shows "
+                "that you read it. Say what the thing does, not where you "
+                "found it, and hand the reference over when the user asks to "
+                "check it.\n"
                 "- The moment the user asks why, asks you to explain, or asks "
                 "for a doc, review, walkthrough or deep dive, this mode is off "
                 "for that reply: give the full detail they asked for.\n\n"
@@ -2056,7 +2064,7 @@ class ContextBuilder:
     def _load_agent_prompt(agent: str, project: str | None = None) -> str:
         """Read the prompt from a custom agent's config file."""
         for f in _agent_spec_candidates(agent, project):
-            data = _read_agent_spec(f)
+            data = _read_agent_spec(f, operation="agent_prompt_load", source="unknown")
             if data is None:
                 continue
             if data.get("name") != agent and f.stem != agent:
@@ -2140,6 +2148,10 @@ class ContextBuilder:
         and hooks are injected for all agents.
         """
         is_custom = agent and agent != "kirocrew"
+        # Positive membership, not "== claude_code": EVERY public-spec adapter
+        # reads no Kiro agent config, so each needs the same explicit
+        # injection. Deriving it from one harness silently withholds the
+        # injection from the next one added (harness-parity H5).
         is_spec_adapter = is_spec_adapter_provider_label(provider_type)
         caps = _resolve_caps(model_window)
         parts: list[str] = []
@@ -2653,16 +2665,20 @@ class ContextBuilder:
         _user_bounds: tuple[int, int] | None = None
         _user_part_index: int | None = None
         is_cc = provider_type == "claude_code"
-        # Two DIFFERENT concerns, deliberately not one flag: the skills plan is a
-        # DIALECT question (a spec adapter loads no kiro agent config, so Kiro Crew
-        # injects what kiro-cli would have loaded), while the persona rewrite below
-        # is claude-specific BRANDING that substitutes Claude's own product wording.
+        # Positive membership, not "== claude_code": EVERY public-spec adapter
+        # reads no Kiro agent config, so each needs the same explicit
+        # injection. Deriving it from one harness silently withholds the
+        # injection from the next one added (harness-parity H5).
         is_spec_adapter = is_spec_adapter_provider_label(provider_type)
 
         # Session context on first message only
         if is_new_session:
             # Agent prompt goes BEFORE session context wrapper
             # so the LLM treats it as its identity, not background info.
+            # ORDER MATTERS: a custom agent is the user's explicit choice, so its
+            # own prompt outranks the branded default persona below. Testing
+            # ``is_cc`` first discards that prompt on every spec adapter and
+            # substitutes a persona the user did not pick.
             if is_custom:
                 agent_prompt = self._load_agent_prompt(agent or "", project)
             elif is_cc:
@@ -3183,17 +3199,19 @@ class ContextBuilder:
             # wants none of the Crew's dashboard-tool nudges (it drives its own
             # UI through its MCP tools), so honor that here too, not just for
             # _CRITICAL_RULES.
-            # ask_question is a MID-turn blocking decision; [OPTIONS:] remains
-            # the cheaper END-turn choice mechanism on every interactive surface.
+            # ask_question posts a NON-BLOCKING card and the agent ends its turn:
+            # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
+            # the cheaper choice mechanism on every interactive surface.
             if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
                 parts.append(
-                    "\n\n(If you need the user's answer to a blocking question BEFORE "
-                    "you can continue the current turn, use the ask_question tool — it "
-                    "pauses and returns the answer as the tool result. Use it SPARINGLY: "
-                    "only when you genuinely cannot proceed without the answer. When you "
-                    "are ENDING your turn, use the final [OPTIONS:] line instead. Never "
-                    "interrupt the user for a non-blocking choice, and never ask what you "
-                    "can reasonably decide or discover yourself.)"
+                    "\n\n(If a decision is genuinely needed before the work can "
+                    "continue, use the ask_question tool to put it to the user as a card, "
+                    "then END YOUR TURN: the tool does not block, and the answer arrives "
+                    "as the user's next message rather than as the tool's result. Use it "
+                    "SPARINGLY: only when you cannot proceed without the answer. When you "
+                    "are ending your turn anyway, use the final [OPTIONS:] line instead. "
+                    "Never interrupt the user for a non-blocking choice, and never ask "
+                    "what you can reasonably decide or discover yourself.)"
                 )
                 # A follow-up card is distinct from both: it offers concrete NEXT
                 # tasks after work is done, optionally handing one to a worktree.
@@ -3224,3 +3242,69 @@ class ContextBuilder:
             end = head + len(seg[: _user_bounds[1]].translate(_MULTIBYTE_TABLE))
             user_span_out.extend((start, end))
         return final, hook_result
+
+
+def _agent_spec_candidates(agent: str, project: str | None = None) -> list[Path]:
+    """Project-first agent specs, matching kiro-cli's resolution order."""
+    candidates: list[Path] = []
+    if project:
+        try:
+            from kiro_crew.agent_discovery import project_agent_files
+
+            candidates.extend(project_agent_files(project))
+        except Exception:
+            logger.debug("Project agent scan failed for %r", agent, exc_info=True)
+    candidates.extend(kiro_agents_dir().glob("*.json"))
+    return candidates
+
+
+def _load_agent_file_resources(agent: str, project: str | None = None) -> str:
+    """Load markdown ``file://`` resources from one agent config.
+
+    kiro-cli injects these automatically for its sessions; the dashboard
+    must do it explicitly for spec adapters, which do not read Kiro agent
+    configs. This applies to custom agents as well as the default agent.
+    Only loads ``file://`` resources matching ``*.md``.
+    """
+    try:
+        cfg: dict | None = None
+        for candidate in _agent_spec_candidates(agent, project):
+            candidate_data = _read_agent_spec(
+                candidate, operation="agent_file_resources", source="unknown"
+            )
+            if candidate_data is None:
+                continue
+            if candidate_data.get("name") == agent or candidate.stem == agent:
+                cfg = candidate_data
+                break
+        if cfg is None:
+            return ""
+        resources = cfg.get("resources", [])
+        parts: list[str] = []
+        home_resolved = str(Path.home().resolve()) + os.sep
+        for res in resources:
+            if not isinstance(res, str) or not res.startswith("file://"):
+                continue
+            raw_pattern = res.removeprefix("file://")
+            base = Path.home()
+            for p in sorted(base.glob(raw_pattern)):
+                resolved = p.resolve()
+                if not str(resolved).startswith(home_resolved):
+                    continue
+                if (
+                    resolved.is_file()
+                    and p.suffix == ".md"
+                    and not is_sensitive_path(str(resolved))
+                ):
+                    try:
+                        parts.append(safe_read_file(str(p)))
+                    except PermissionError:
+                        pass
+        if parts:
+            logger.debug(
+                "loaded %d steering bytes from %d files", sum(len(p) for p in parts), len(parts)
+            )
+        return "\n".join(parts) if parts else ""
+    except Exception as exc:
+        logger.debug("steering load failed: %s", type(exc).__name__)
+        return ""

@@ -24,6 +24,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 type Point = { x: number; y: number }
 
+/** Shared double-tap bounds across full-viewport magnification surfaces. */
+export const DOUBLE_TAP_MS = 300
+export const DOUBLE_TAP_SLOP = 32
+export const DOUBLE_TAP_ZOOM = 2.5
+
 /** Divisor turning a `wheel` deltaY into a multiplicative zoom step. 100 is the
  *  conventional "one notch" unit, so a trackpad's many small deltas accumulate
  *  smoothly while a mouse notch lands near the clamp below. */

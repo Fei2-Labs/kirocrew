@@ -77,6 +77,21 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      # Declared explicitly so callers pass this ONE secret instead of
+      # `secrets: inherit`, which would hand this lane every secret in the
+      # repository. The lane assumes a signing role and produces the installer
+      # users run, so the blast radius of a compromise here is worth bounding
+      # to the credential it actually uses. Mirrors publish-windows.yml.
+      #
+      # Not required: HAS_WINDOWS_SIGNING treats an empty value as "no signing
+      # secret" and skips every signing step, which is what keeps forks -- and
+      # the workflow_dispatch packaging probe, which deliberately runs with no
+      # credentials -- green. Making it required would turn that clean skip
+      # into a workflow-call failure.
+      AWS_WINDOWS_SIGNING_ROLE_ARN:
+        description: "Role assumed to sign the Windows installer and nupkg"
+        required: false
   # Manual build-only probe: builds the installer from any ref WITHOUT
   # publishing anything. Used to validate packaging changes before merge.
   workflow_dispatch:
@@ -169,19 +184,29 @@ jobs:
       HAS_WINDOWS_SIGNING: ${{ secrets.AWS_WINDOWS_SIGNING_ROLE_ARN != '' && inputs.use_prod_environment == true && 'true' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: website/package-lock.json
+          # cache disabled: this workflow is workflow_call-only from
+          # nightly.yml / release.yml, so every run builds published bytes.
+          # An Actions cache is writable from any branch and readable by a
+          # tag run (zizmor cache-poisoning).
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        # cache disabled explicitly: setup-uv's default (enable-cache: auto)
+        # turns the cache ON for hosted runners, and this workflow only ever
+        # runs on a publish path, so a restored entry would reach the signed
+        # installer (zizmor cache-poisoning).
+        with:
+          enable-cache: false
         # The build script provisions python-build-standalone interpreters
         # through uv; windows-latest does not ship it, and the script's
         # curl|sh fallback is POSIX-shaped.

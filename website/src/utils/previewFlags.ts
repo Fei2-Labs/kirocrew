@@ -50,8 +50,8 @@ export interface PreviewFlagChange {
 export const PREVIEW_WEBHOOKS = `${PREVIEW_FLAG_PREFIX}webhooks`
 
 /**
- * Experimental ACP backends (the dedicated Developer > ACP Adapters tab, and
- * the active-backend row on System > Services).
+ * Experimental ACP adapters — the ACP adapter controls (Developer > ACP
+ * Adapters, and the active-adapter row on System > Services).
  *
  * Gated for a different reason than the other flags: not roughness, but that no
  * successful session has been observed on a non-kiro backend. The refusal paths
@@ -64,6 +64,49 @@ export const PREVIEW_WEBHOOKS = `${PREVIEW_FLAG_PREFIX}webhooks`
  * shown the control.
  */
 export const PREVIEW_ACP_BACKENDS = `${PREVIEW_FLAG_PREFIX}acp-backends`
+
+/**
+ * Crew: the Crew Members page (`/members`) and the "New Crew Mode chat" entry in
+ * the sidebar's create menu.
+ *
+ * ONE flag over both, not one each: they are two doors into the same unfinished
+ * feature, and a user who reaches crew through the door that was left open hits
+ * the same rough edges either way — so a per-door flag would only let the
+ * feature half-ship. The two surfaces stay separate code; the flag is what says
+ * "crew is not released yet".
+ *
+ * Gating the INGRESS only. A session already created in crew mode keeps working,
+ * keeps its `Crew` row badge, and its route stays registered, so turning the
+ * flag off does not orphan existing work — it stops advertising the feature to
+ * someone who has not opted in.
+ */
+export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
+
+/**
+ * Creating a chat that RUNS ON a connected remote crew — the "New chat on crew"
+ * entry in the sidebar's create menu.
+ *
+ * Its own flag, deliberately NOT {@link PREVIEW_CREW}. The word "crew" carries
+ * two unrelated meanings here: `PREVIEW_CREW` holds Crew Mode (parallel
+ * sub-sessions) and the Crew Members page, while this holds sessions dispatched
+ * to another MACHINE over the instances tunnel. Sharing one key would release or
+ * hold both at once, which is the same half-ship failure `PREVIEW_CREW`'s own
+ * one-flag-two-doors reasoning exists to prevent — in the opposite direction.
+ *
+ * Held because the LANDING is unfinished, not the dispatch: the session really is
+ * created on the peer, but there is no native remote chat view yet, so it opens
+ * by switching to that crew's pane, and the local session list does not show
+ * live remote sessions — so the session is hard to return to afterwards.
+ *
+ * Its toggle lives in Settings > Remote crews, not Developer > Feature Previews:
+ * the flag is only meaningful to someone who already has a crew connected, and
+ * that is the page where crews are managed.
+ *
+ * Gating the INGRESS only. A session already created on a peer keeps running
+ * there and stays reachable through that crew's own dashboard; turning the flag
+ * off only stops offering the menu entry.
+ */
+export const PREVIEW_REMOTE_CREW_CHAT = `${PREVIEW_FLAG_PREFIX}remote-crew-chat`
 
 /**
  * Read a preview flag. Absent, unparseable, or storage-denied all mean OFF —

@@ -9,6 +9,13 @@ When an installed app has ``dev: true`` in its ``installed.json``:
   and broadcasts an ``app_reload`` WebSocket event whenever any file changes.
   The dashboard's AppHost reloads so edits appear without a manual refresh.
 
+Link the whole ``ui/`` DIRECTORY, never individual files inside it: since
+#6809 the UI route opens the final name with ``O_NOFOLLOW`` (the swap-resistant
+open that closed the check-then-reopen window), so a per-file symlink like
+``ln -s ~/src/app/dist/index.mjs ui/index.mjs`` answers 404 — indistinguishable
+from "not built yet". The directory link keeps working because the route
+resolves the ui root before validating against it.
+
 Toggling dev mode is a metadata-only change (``installed.json``), picked up by
 the watcher within one poll interval — no gateway restart needed.
 
@@ -29,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,6 +51,7 @@ from kiro_crew.apps.manager import (
     apps_dir,
 )
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.security import is_sensitive_path, path_contains_sensitive
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +67,26 @@ _DIGEST_MASK = (1 << 63) - 1
 #: Sentinel file (a JSON array of app names in dev mode) under ``apps_dir()``.
 #: ``list_apps()`` skips non-directory entries, so this file is invisible to it.
 _DEV_SENTINEL = ".dev-apps.json"
+
+#: Operator grant record (a JSON object mapping app name -> the RESOLVED ui
+#: root granted, as ``os.path.realpath`` of ``<install>/ui`` at toggle time)
+#: under ``apps_dir()``, written ONLY by :func:`set_dev_mode` /
+#: :func:`remove_dev_app` — never created by the startup reconcile. The
+#: sentinel above is a WATCH/no-store convenience that
+#: :func:`_reconcile_sentinel_from_installed` rebuilds from each app's own
+#: (app-writable) ``installed.json``, so a sentinel entry can be laundered by
+#: an app that writes ``dev: true`` to its own metadata and waits for a
+#: restart. This record is the AUTHORIZATION half the UI route requires
+#: (#6809). Binding the grant to the SPECIFIC resolved root (not a bare name)
+#: is load-bearing: it makes the grant self-invalidating — repointing ``ui``
+#: after the toggle (an app update, a swapped link, a reinstall under the same
+#: name) yields a root that no longer equals the granted one, so any grant
+#: left behind by a crash mid-revoke or an uninstall race authorizes at most
+#: the exact tree the operator approved, never a new target. The two files
+#: stay separate on purpose — merging them would either re-open the
+#: laundering path (reconcile adds) or break the documented out-of-band
+#: ``dev: true`` watch contract (reconcile stops adding).
+_DEV_GRANTS = ".dev-grants.json"
 
 _watch_task: asyncio.Task | None = None
 
@@ -134,6 +163,37 @@ def _write_dev_sentinel(names: set[str]) -> None:
     atomic_write(path, json.dumps(sorted(names), indent=2) + "\n")
 
 
+def _grants_path() -> Path:
+    return apps_dir() / _DEV_GRANTS
+
+
+def _read_dev_grants() -> dict[str, str]:
+    """Read the operator grant map (empty on any error — absent means no grants).
+
+    Maps app name -> the resolved ui root granted. A legacy/foreign shape
+    (anything but a str->str object) reads as empty: an unparseable grant
+    record must fail closed, never open.
+    """
+    try:
+        data = json.loads(_grants_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, dict):
+        return {
+            str(k): str(v)
+            for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
+    return {}
+
+
+def _write_dev_grants(grants: dict[str, str]) -> None:
+    """Atomically write the operator grant map to the grants file."""
+    path = _grants_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, json.dumps(grants, indent=2, sort_keys=True) + "\n")
+
+
 def _scan_installed_dev_apps() -> set[str]:
     """Return the dev-app set derived authoritatively from every ``installed.json``.
 
@@ -191,6 +251,31 @@ def _reconcile_sentinel_from_installed() -> set[str]:
                 sorted(installed),
             )
             _write_dev_sentinel(installed)
+        # The grant record is REMOVE-ONLY here: prune grants whose app no
+        # longer has VALID installed metadata (a crash between uninstall and
+        # :func:`remove_dev_app`'s revoke), so a later reinstall under the
+        # same name cannot inherit the authorization. Existence is tested via
+        # ``_read_installed`` rather than ``is_dir()`` because an uninstall
+        # with ``keep_data`` can leave (or recreate) the directory for the
+        # preserved data while the app itself — its ``installed.json`` — is
+        # gone. Never ADD a grant from ``installed.json`` — that is
+        # app-writable metadata, and deriving the grant from it is exactly
+        # the laundering path #6809 closes.
+        grants = _read_dev_grants()
+        live: dict[str, str] = {}
+        for gname, groot in grants.items():
+            try:
+                gmeta = _read_installed(gname)
+            except Exception:
+                gmeta = None
+            if gmeta is not None:
+                live[gname] = groot
+        if live != grants:
+            logger.info(
+                "app dev-mode: pruning grants for absent apps (%s)",
+                sorted(set(grants) - set(live)),
+            )
+            _write_dev_grants(live)
         _set_dev_cache(installed)
     return installed
 
@@ -237,6 +322,60 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
         meta = _read_installed(name)
         if meta is None:
             return {"error": f"app {name!r} is not installed"}
+        granted_root: str | None = None
+        if enabled:
+            # VALIDATE BEFORE ANY WRITE: a refusal must leave prior state
+            # exactly as it was — an already-enabled app whose `ui` was
+            # repointed to a sensitive root and then re-toggled must not have
+            # its existing dev mode silently torn down by the refusal (the
+            # old shape wrote metadata/sentinel first and "rolled back" by
+            # unconditionally disabling, destroying prior state). The grant
+            # binds the ui root's CURRENT resolved path, so it authorizes
+            # exactly the tree the operator saw when toggling — anything that
+            # later repoints ``ui`` invalidates it (re-toggle after
+            # re-pointing to re-bind). A root escaping the install dir into a
+            # SENSITIVE location (credential stores, key material) is refused
+            # outright — no dev workflow legitimately serves those, and the
+            # unauthenticated UI route must never be grantable onto them
+            # (#6809).
+            granted_root = os.path.realpath(apps_dir() / name / "ui")
+            try:
+                # Anchor = resolved apps ROOT + literal name (same rule as the
+                # route): re-resolving through the app's own entry would race
+                # a concurrent swap of that entry.
+                Path(granted_root).relative_to(
+                    Path(os.path.realpath(apps_dir())) / name
+                )
+            except ValueError:
+                # BOTH directions of the sensitivity test: a root that IS
+                # sensitive (inside `~/.ssh`) and a root that CONTAINS
+                # sensitive leaves (`~/.docker` is not itself on the list —
+                # only its `config.json` is — and `~` contains everything).
+                # Either shape would let the unauthenticated UI route serve
+                # credential material out of an allowlisted extension.
+                if is_sensitive_path(granted_root) or path_contains_sensitive(
+                    granted_root
+                ):
+                    return {
+                        "error": (
+                            f"app {name!r} has a ui root resolving to a "
+                            f"sensitive location ({granted_root}) — the "
+                            "dev-mode grant is refused"
+                        )
+                    }
+        else:
+            # Revoke the AUTHORIZATION first: every write below narrows state,
+            # so a crash after any prefix of them leaves the SAFER remainder
+            # (grant gone, metadata/sentinel possibly stale — watching without
+            # authorization). The old order (grant last) failed open: a crash
+            # after the metadata write left a live grant for a still-installed
+            # app, which the reconcile never expires because the app still
+            # exists — and the app could then write ``dev: true`` back into
+            # its own metadata and re-satisfy the grant check unaided.
+            grants = _read_dev_grants()
+            if name in grants:
+                grants.pop(name)
+                _write_dev_grants(grants)
         meta.dev = enabled
         _write_installed(name, meta)
         names = _read_dev_sentinel()
@@ -245,6 +384,13 @@ def set_dev_mode(name: str, enabled: bool) -> dict[str, Any]:
         else:
             names.discard(name)
         _write_dev_sentinel(names)
+        if enabled and granted_root is not None:
+            # The AUTHORIZATION record, written LAST on enable (mirror of the
+            # revoke-first rule above: a crash mid-toggle must always leave
+            # the un-granted state) and only here / in :func:`remove_dev_app`.
+            grants = _read_dev_grants()
+            grants[name] = granted_root
+            _write_dev_grants(grants)
         # Update the in-process cache immediately so a same-process POST toggle
         # takes effect on the very next UI request (no wait for a watcher tick).
         _set_dev_cache(names)
@@ -262,11 +408,22 @@ def remove_dev_app(name: str) -> None:
     try:
         with _sentinel_lock():
             names = _read_dev_sentinel()
-            if name not in names:
+            grants = _read_dev_grants()
+            if name not in names and name not in grants:
                 return
-            names.discard(name)
-            _write_dev_sentinel(names)
-            _set_dev_cache(names)
+            if name in grants:
+                # Revoke the operator grant with the uninstall: a DIFFERENT app
+                # later reinstalled under the same name must not inherit the
+                # authorization to serve an out-of-install ui root. (Even when
+                # this best-effort cleanup is skipped by a crash, the grant is
+                # bound to the OLD resolved root and pruned at the next
+                # reconcile once the app's metadata is gone.)
+                grants.pop(name)
+                _write_dev_grants(grants)
+            if name in names:
+                names.discard(name)
+                _write_dev_sentinel(names)
+                _set_dev_cache(names)
     except Exception:
         logger.debug("dev-mode sentinel cleanup for %r failed", name, exc_info=True)
 
@@ -276,11 +433,56 @@ def is_dev_mode(name: str) -> bool:
 
     Blocking IO — do NOT call on the event loop per-request; use
     :func:`is_dev_mode_cached` on hot paths.
+
+    Reads only the app's own ``installed.json`` — a file inside the install
+    directory the APP ITSELF can write — so this answers "does the metadata say
+    dev" and must never AUTHORIZE anything security-relevant. For an
+    authorization decision use :func:`dev_mode_granted_root`, which also requires
+    the gateway-owned sentinel.
     """
     if not _check_path_safety(name):
         return False
     meta = _read_installed(name)
     return bool(meta and meta.dev)
+
+
+def dev_mode_granted_root(name: str) -> str | None:
+    """The RESOLVED ui root the operator's dev-mode grant covers, or ``None``.
+
+    Requires BOTH the operator grant record (:data:`_DEV_GRANTS`, a file at
+    the apps ROOT written only by :func:`set_dev_mode` — never created by the
+    startup reconcile) AND the app's ``installed.json`` ``dev`` flag.
+    ``installed.json`` alone is the app's own writable metadata — an app that
+    edits it to ``dev: true`` must not thereby authorize itself (#6809: the UI
+    route relaxes root containment only under this grant, and a self-granted
+    app could point its ui root at a credential directory). The watch
+    sentinel is deliberately NOT consulted: the reconcile rebuilds it from
+    app-writable metadata at every startup, so it proves watching, not
+    authorization.
+
+    The returned path is the root that was RESOLVED AND BOUND at toggle time;
+    the caller must require its current resolved root to EQUAL this value,
+    which is what makes a stale or inherited grant harmless — it covers one
+    exact tree the operator approved, never whatever ``ui`` points at now.
+    (The toggle endpoint itself carries no app-vs-operator identity — a
+    same-origin caller reaches it too — which is why the binding, the
+    sensitive-path screen at grant time, and this equality check carry the
+    guarantee rather than the file's authorship alone.)
+
+    Blocking IO — do NOT call on the event loop; callers run it off-loop, and
+    it sits on an exceptional path (an out-of-install ui root), never on
+    normal serving.
+    """
+    if not _check_path_safety(name):
+        return None
+    try:
+        granted = _read_dev_grants().get(name)
+    except Exception:
+        # An unreadable grant record means the grant cannot be proven: fail closed.
+        return None
+    if granted is None or not is_dev_mode(name):
+        return None
+    return granted
 
 
 def is_dev_mode_cached(name: str) -> bool:

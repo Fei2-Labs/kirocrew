@@ -24,6 +24,20 @@ from kiro_crew.dashboard.handlers.mcp_discover import (
 )
 
 
+async def _api_acp_backends(request: web.Request) -> web.Response:
+    """Load the backend descriptor surface on first request.
+
+    Lazy on purpose: ``handlers.acp_backends`` imports ``kiro_crew.acp`` at
+    module scope, which pulls in the ACP client AND the runtime. This module is
+    imported on the boot path, so a module-scope import here would drag both
+    into gateway start.
+    """
+
+    from kiro_crew.dashboard.handlers.acp_backends import api_acp_backends
+
+    return await api_acp_backends(request)
+
+
 def register(app: web.Application) -> None:
     """Register the agent_config routes on *app*."""
     # Agent config
@@ -32,6 +46,16 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/config/default-agent", handlers.api_default_agent)
     app.router.add_put("/api/config/default-agent", handlers.api_default_agent)
     app.router.add_get("/api/config/schema", handlers.api_config_schema)
+    # Per-backend selectability, the capability table, and whether THIS machine
+    # has the harness installed. Beside the schema route because the dashboard's
+    # backend switch reads both: the schema says which options this build/policy
+    # allows, this says which of them would actually start and what each supports.
+    #
+    # THE ONLY registration of this path. aiohttp answers from the first match in
+    # registration order, so a second one elsewhere in the table does not merge
+    # with this -- it makes one of the two payloads unreachable, silently and
+    # with no failing test. ``test_dashboard_route_table.py`` pins uniqueness.
+    app.router.add_get("/api/acp-backends", _api_acp_backends)
     app.router.add_get("/api/config/kirocrew", handlers.api_kirocrew_config)
     app.router.add_put("/api/config/kirocrew", handlers.api_kirocrew_config)
     app.router.add_patch("/api/config/kirocrew", handlers.api_kirocrew_config_patch)

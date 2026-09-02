@@ -74,11 +74,46 @@ Out-of-band lanes that never gate a PR:
   button, not a CI comment), `pr-merge-conflict-label.yml` and `fork-pr-label.yml`
   (both mirror a fact GitHub does not surface in the `/pulls` list onto a label), and
   `add-contributor.yml` (a daily cron, plus manual dispatch, adds each merged
-  PR's author to the README Contributors block via
+  PR's author AND the reporters of the issues that PR closed to the README
+  Contributors block via
   `scripts/update_contributors.py`; because the default branch is protected it
   opens a rolling PR rather than committing directly, like `test-durations.yml`.
   A login in `.github/contributors-optout.txt` is never added, which keeps the
   README's removal promise enforceable against the full-rebuild collector).
+  One paginated GraphQL sweep over `pullRequests(states: MERGED)` drives it,
+  reading each node's `author` and its `closingIssuesReferences` authors. The
+  reporter side is deliberately keyed on that link rather than on listing
+  `/issues`: the connection is populated only when a PR declares it closes the
+  issue, and only merged PRs are scanned, so an entry is evidence the report
+  changed the product — which keeps duplicates, invalid reports and
+  credit-farming issues out. It undercounts by design (a fix that omitted the
+  closing keyword is invisible), and the remedy is the manual `--login` path, not
+  loosening the rule. Dedup is two-layered: `sort -u` over the union, because
+  someone can be both a PR author and a reporter, then the script's own README
+  scan. The same block also holds contributors whose contribution left neither
+  trace — a review, a translation, a private security report — added with
+  `scripts/update_contributors.py --login`. Those entries survive every later run
+  because the collector only ever inserts and never rewrites an existing line;
+  that preservation is what makes one shared list workable instead of a second
+  table.
+
+  Note that opening that rolling PR is best-effort. This repository leaves
+  "Allow GitHub Actions to create and approve pull requests" off — one switch
+  covers creating AND approving, and `main`'s merge gate is a required review — so
+  `gh pr create` with `GITHUB_TOKEN` is refused with `GitHub Actions is not
+  permitted to create or approve pull requests`. It only bites after the previous
+  rolling PR merged and its branch was deleted; while the PR is open, pushing to
+  the branch is enough. The push happens first either way, so a refusal is a
+  handoff, not a loss: the job stays green and files/updates one issue titled
+  "Add Contributor needs a human to open the contributors PR" carrying the compare
+  link. The same limitation applies to every workflow here that opens a PR
+  (`test-durations.yml`, `cleanup-temp-screenshots.yml`, `memory-benchmark.yml`),
+  which carry the same guard in a lighter form: they emit a `::notice::` with the
+  compare link and exit 0 rather than filing an issue, because their branches are
+  regenerated on the next scheduled run and so do not need a durable tracker. Any
+  create failure that is NOT that refusal still fails the job in all four.
+  `test/test_workflow_pr_create_handoff.py` holds them in step and fails a new
+  `gh pr create` step that skips the guard.
 
 ## `ci.yml`: correctness
 
@@ -88,7 +123,7 @@ Every job here is blocking.
 |---|---|
 | `scrub-lint` | `scripts/scrub-lint.sh --no-history`. Fails on any internal marker in this public tree, so a sync cannot reintroduce a coupling |
 | `vendor-manifest` | `scripts/verify_vendor_manifest.py`. Hashes every file under `src/kiro_crew/_vendor` against the committed `scripts/vendor_manifest.sha256` — the tree is excluded from semgrep and the AI reviewers' diff, so this checksum is its only content review. Always-on (not behind the `changes` path filter) |
-| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink |
+| `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.10 and 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink — and `scripts/check_sync_io_in_async.py` (self-test first) — no blocking db / subprocess / http / `time.sleep` call inside an `async def` under `src/`, outside `.github/sync-io-in-async-baseline.txt`, which can only shrink. A stall past `dashboard.loop_stall_exit_after_secs` (25s) makes the watchdog kill the gateway and drop every in-flight turn (#3057, #1572); the escape is an offload (`await asyncio.to_thread(...)`, or a named lane from `src/kiro_crew/executors.py`) or a `# on-loop-io-ok: <why it cannot block>` marker whose reason is mandatory. All four baselined gates in this job read their diff scope from the one shared resolver in `scripts/ratchet_scope.py`, so they cannot disagree about which lines a change added; the env-base gates (`check_brand_name.py`, `check_harness_parity.py`, `check_focus_cue.py`) share the same diff parsing through its explicit-base entry points while keeping their `*_BASE_REF` base semantics |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
 | `loop-bound-locks` | `scripts/check_loop_bound_locks.py`, self-test first. Fails on any module-global `asyncio.Lock()`/`Event()`/`Queue()` declaration — those bind to the import-time (or first-use) event loop and raise `RuntimeError` when acquired from another loop (Python 3.10+). #4800 converted the tree to `kiro_crew.loop_lock.LoopBoundLock`; whole-tree, since the backlog is zero |
 | `backend-test` | 2 Python versions x 4 duration-balanced pytest-split shards (8 jobs), `-n auto` within each. Coverage only on 3.12 (3.10 passes `--no-cov` for a trace-free run) |
@@ -362,7 +397,12 @@ thing: *does this block the merge*, **never confidence**. There is no
 workflows — the diff-is-not-evidence clause, the coverage/finding/fix bars, the
 output contract, and the falsification-pass mandate and verdict framing — live in
 shared `.github/review-prompts/gpt-*.md` files rather than as two inline copies,
-so the lanes cannot drift apart on them (#5852). The same-repo lane stages them
+so the lanes cannot drift apart on them (#5852). The same-repo lane's remaining
+inline chunks (its system rules, repo context, and round-convergence sections)
+moved into that directory too (#3697), so its whole prompt is now assembled by
+splicing staged prompt files in a fixed order — which is also what lets the
+prepare-pr skill's `local_review.py` mirror the contract by reading the same
+files instead of scraping shell heredocs. The same-repo lane stages them
 from the PR's **base** commit like the Opus lanes; unlike those lanes it falls
 back to the checked-out copy (with a warning) when a block is absent on the base,
 because a hard gate cannot afford a no-verdict pass and, on a same-repo PR, the
@@ -525,6 +565,40 @@ commit status plus one `readiness:` label**.
   passed for it.
 - **Labels:** `readiness: checking` (pending), `readiness: action required` (a
   blocker), `readiness: passed`. Exactly one is ever present.
+- **It also enforces the disposition rule.** Besides scoring lanes, readiness runs
+  `pr_status.py --disposition-gate` (checked out from the default branch, never
+  from the PR head — this workflow is `pull_request_target` and holds write
+  tokens) and folds each violation of the one-lane / one-rationale-per-finding
+  rule into its blocking list. That is the only enforcement point that binds a
+  writer who never runs the prepare-pr loop, which is what a blanket
+  single-rationale record used to escape through (#6658). The rule keeps ONE
+  implementation: the readiness step calls the same script the local gate does
+  rather than re-reading the marker grammar in shell. A record set it cannot read
+  is `pending`, never red — a transient comments-API failure must not fail the
+  required status — and a record whose author the collaborators permission API
+  does not confirm as a writer is ignored, exactly as `codex-review.yml`'s
+  adjudication ledger ignores it, so the gate never blocks on a record that holds
+  no downgrade power. One consequence to know: readiness has **no
+  `issue_comment` trigger**, so correcting the offending comment fires nothing by
+  itself. `pr-readiness-sweep.yml` mode 5 covers that — it treats a disposition
+  record whose `updated_at` is newer than the verdict as evidence the verdict is
+  stale, and re-fires the recompute within ~15 minutes. Deleting the record with
+  no replacement leaves nothing observable and waits for a push or a manual
+  dispatch. The comparison is not race-free and is not claimed to be: the gate
+  reads the comments early in the readiness job while the status is published at
+  the end, so a record created in between is missed by that run and also looks
+  older than the verdict to the sweep. What bounds that residual is the harm
+  model, not the detection -- a violating record's only power is letting the
+  adjudication ledger downgrade a REPEATED finding on a later review round, and a
+  later review round takes a push, which recomputes readiness and catches the
+  violation.
+- **Unapproved fork runs remain blocking but are attributed separately.** GitHub
+  reports a fork workflow held behind *Approve and run* as `action_required`
+  even though it has not executed. Readiness keeps the failure status and
+  `readiness: action required` label, but lists those lanes under **Awaiting
+  maintainer approval** instead of **Blocking**. It does not call them pending:
+  only a maintainer can clear the condition, while pending statuses are eligible
+  for automatic self-healing.
 
 Two subtleties:
 

@@ -91,26 +91,30 @@ def random_bucket_name() -> str:
 # neither Homebrew nor the official-pkg symlink dir — so a bare ``"aws"`` fails
 # ``execvp`` inside ``sandbox-exec`` with "No such file or directory", which is
 # exactly why the Artifact Deploy "Verify" step failed for Homebrew users until
-# the gateway was relaunched from a shell that carried the full PATH.
+# the gateway was relaunched from a shell that carried the full PATH. The SSM
+# session-manager-plugin installs into these same dirs, so it is resolved and
+# spawn-searched through them too (#5392).
 _AWS_BIN_DIRS = (
     "/opt/homebrew/bin",  # Apple Silicon Homebrew
     "/usr/local/bin",     # Intel Homebrew + official AWS CLI v2 pkg symlink
 )
 
 
-def resolve_aws_bin() -> str:
-    """Resolve ``aws`` to an absolute path, falling back to the bare name.
+def resolve_aws_tool_bin(name: str) -> str:
+    """Resolve an AWS-tooling binary to an absolute path, or the bare ``name``.
 
     Searches the inherited ``PATH`` first, then the well-known install dirs in
-    :data:`_AWS_BIN_DIRS`, so the desktop-app gateway resolves the CLI no matter
+    :data:`_AWS_BIN_DIRS`, so the desktop-app gateway resolves the tool no matter
     how it was launched (Finder/Dock give a minimal PATH; a terminal launch does
-    not). Falling back to the bare ``"aws"`` preserves the prior behaviour — and
-    its "not found" error — when the CLI genuinely is not installed anywhere.
+    not). Falling back to the bare ``name`` preserves the prior behaviour — and
+    its "not found" error — when the tool genuinely is not installed anywhere.
 
-    Public: this is the repo's single ``aws``-CLI resolution chokepoint, reused
-    by every sibling spawn site (``cloud.aws``, ``cloud.ssm``, ``voice_reply``,
-    ``dashboard.chat_voice``, the artifact-deploy skill scripts) so each one
-    survives a GUI-launched gateway's minimal PATH the same way (#4770).
+    Public and generic over ``name`` because ``aws`` is not the only AWS binary
+    the gateway has to find in those dirs: ``session-manager-plugin`` installs
+    into exactly the same ones (AWS's macOS ``.pkg`` symlinks it into
+    ``/usr/local/bin``, the Homebrew cask into the brew prefix), and its probe hit
+    the identical minimal-PATH gap (#5392). Both callers therefore share this one
+    body rather than each re-deriving the dirs and the provenance rule.
 
     A hit found only through the fallback dirs (i.e. NOT reachable via the
     inherited ``PATH``, which the pre-existing bare-argv behaviour already
@@ -123,21 +127,90 @@ def resolve_aws_bin() -> str:
     failure mode.
     """
     env_path = os.environ.get("PATH", "")
-    found = shutil.which("aws", path=env_path) if env_path else None
+    found = shutil.which(name, path=env_path) if env_path else None
     if found:
         # Same trust class as the pre-existing behaviour: execvp against the
         # inherited PATH already executed exactly this binary.
         return found
     fallback = os.pathsep.join(p for p in _AWS_BIN_DIRS if p)
-    found = shutil.which("aws", path=fallback) if fallback else None
+    found = shutil.which(name, path=fallback) if fallback else None
     if found:
         from kiro_crew.github_runner import validate_provider_executable
 
         try:
             return validate_provider_executable(found)
         except ValueError:
-            logger.warning("refusing aws CLI at %s: failed provenance validation", found)
-    return "aws"
+            logger.warning("refusing %s at %s: failed provenance validation", name, found)
+    return name
+
+
+def resolve_aws_bin() -> str:
+    """Resolve ``aws`` to an absolute path, falling back to the bare name.
+
+    Public: this is the repo's single ``aws``-CLI resolution chokepoint, reused
+    by every sibling spawn site (``cloud.aws``, ``cloud.ssm``, ``voice_reply``,
+    ``dashboard.chat_voice``, the artifact-deploy skill scripts) so each one
+    survives a GUI-launched gateway's minimal PATH the same way (#4770). See
+    :func:`resolve_aws_tool_bin` for the search order and the provenance rule.
+    """
+    return resolve_aws_tool_bin("aws")
+
+
+def aws_spawn_env(aws_bin: str) -> dict[str, str]:
+    """This process's env with :data:`_AWS_BIN_DIRS` APPENDED to ``PATH``.
+
+    ``aws_bin`` is the argv head the caller is about to spawn — the return value of
+    :func:`resolve_aws_bin` for that same spawn. It is required, not optional: see
+    the fail-closed rule below, which cannot be enforced without it.
+
+    Resolving our own argv head absolutely is not sufficient for ``aws ssm
+    start-session``: the CLI locates ``session-manager-plugin`` itself, by name,
+    against the CHILD's inherited ``PATH`` at exec time. A GUI-launched gateway
+    hands the child the minimal launchd ``PATH``, so the tunnel dies inside a
+    correctly-resolved ``aws`` — the resolver cannot reach that lookup, only the
+    child's environment can (#5392). Passing this as ``env=`` is therefore the
+    other half of the same fix, not a duplicate of it.
+
+    APPENDED, never prepended: the inherited ``PATH`` keeps first claim on every
+    name, so this can only make a previously-unresolvable lookup succeed and can
+    never re-point one the child already resolved. That is the whole trust
+    argument for widening a credential-bearing child's ``PATH`` at all, and it is
+    also why this is not :func:`kiro_crew.env.augmented_path`, which PREPENDS a
+    broader set (``~/.local/bin``, npm/mise/volta shims) — the right search space
+    for finding an MCP launcher, too wide and wrongly-ordered ahead of ``/usr/bin``
+    for a child holding AWS credentials and a live tunnel to the user's box.
+
+    **A non-absolute ``aws_bin`` returns the env UNWIDENED.** This is the one case
+    where "can only make an unresolvable lookup succeed" is not a safety argument
+    but the hazard itself: :func:`resolve_aws_tool_bin` falls back to the bare name
+    precisely when it found a candidate in these dirs and
+    ``validate_provider_executable`` REFUSED it, and that refusal is enforced only
+    by the bare name failing ``execvp`` against a ``PATH`` those dirs are absent
+    from. Widening the child's ``PATH`` would put the refused binary back on it and
+    hand it AWS credentials — converting a fail-closed rejection into an execution.
+    So the widening is offered only to a head that was already resolved
+    absolutely, where ``execvp`` performs no ``PATH`` search at all and the dirs
+    can affect nothing but the CLI's own onward lookups.
+
+    Dirs already on ``PATH`` are not repeated, so a terminal-launched gateway
+    (whose ``PATH`` carries them) gets a byte-identical env and the fix is inert
+    outside the minimal-PATH case it exists for.
+
+    Unlike the resolvers above this touches no filesystem — it is a dict copy and
+    a string join over ``os.environ`` — so it is safe to call directly on the
+    gateway event loop, where a PATH scan would not be.
+    """
+    env = dict(os.environ)
+    if not os.path.isabs(aws_bin):
+        # Unresolved head: the bare name IS the provenance refusal. Leave PATH
+        # alone so it keeps failing execvp, as it did before this env existed.
+        return env
+    current = env.get("PATH", "")
+    have = {p for p in current.split(os.pathsep) if p}
+    extra = [d for d in _AWS_BIN_DIRS if d and d not in have]
+    if extra:
+        env["PATH"] = os.pathsep.join(([current] if current else []) + extra)
+    return env
 
 
 def _aws(args: list[str], profile: str) -> list[str]:

@@ -13,6 +13,7 @@ import {
   Server,
   LayoutGrid,
   Compass,
+  Library,
 } from 'lucide-react'
 
 import { getAdvertisedSurfaces, surfaceLabel } from '../../../surfaces/registry'
@@ -101,6 +102,11 @@ const EXTRA_PAGES: readonly (Omit<PageEntry, 'title'> & { previewFlag?: string }
   // the route as the only thing telling them apart. The inbound arrow also says
   // which direction this one runs.
   { key: 'webhooks', route: '/webhooks', icon: inlineIcon(ArrowDownToLine), previewFlag: PREVIEW_WEBHOOKS },
+  // Knowledge has no rail surface (it is a tab inside Agent Capabilities), so
+  // the registry no longer offers it and the palette needs it from here. The
+  // route targets the tab directly rather than the legacy /knowledge redirect,
+  // so the subtitle teaches the page's new address instead of hiding it.
+  { key: 'knowledge', route: '/capabilities?tab=knowledge', icon: inlineIcon(Library) },
   { key: 'logs', route: '/logs', icon: inlineIcon(ScrollText) },
   { key: 'developer', route: '/developer', icon: inlineIcon(Code2) },
   { key: 'hooks', route: '/hooks', icon: inlineIcon(Webhook) },
@@ -128,6 +134,9 @@ const EXTRA_PAGE_TITLE_KEY: Record<string, string> = {
   // ones. Titled "Inbound webhooks", not "Webhooks", to stay distinguishable
   // from the `hooks` entry (the agent-hooks page) that sits beside it.
   webhooks: 'pages.settings.webhooksPanel.inbound_webhooks',
+  // Reuses the Capabilities tab's own label so the palette and the rail cannot
+  // disagree on what the page is called.
+  knowledge: 'pages.capabilitiesPage.knowledge_label',
   logs: 'components.commandPalette.providers.pagesProvider.logs',
   developer: 'components.commandPalette.providers.pagesProvider.developer',
   hooks: 'components.commandPalette.providers.pagesProvider.hooks',

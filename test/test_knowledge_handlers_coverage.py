@@ -734,8 +734,8 @@ class TestImportBundle:
     @pytest.mark.parametrize("payload", [[1, 2, 3], "just a string", 42])
     async def test_non_object_json_is_400_not_500(self, store, payload):
         # request.json() happily parses a bare array/string/number/null. The
-        # shared _json_object_body guard answers the non-object case for all
-        # nine request.json() sites in this module, so it fires before the
+        # shared read_bounded_json guard answers the non-object case for all
+        # nine JSON-body sites in this module, so it fires before the
         # bundle-shape validator and owns this code.
         async with _client(_make_app(store)) as client:
             resp = await client.post("/api/knowledge/import", json=payload)
@@ -1971,31 +1971,9 @@ class TestJsonObjectBodyGuard:
             assert resp.status == 400
             assert (await resp.json())["code"] == "invalid_json"
 
-    @pytest.mark.asyncio
-    async def test_recursion_error_is_400_not_500(self):
-        # A deeply nested document blows the JSON parser's recursion budget:
-        # request.json() raises RecursionError (not a ValueError), which must
-        # also read as a client mistake. The raise threshold varies by Python
-        # version and platform (~1k on 3.10, ~10k on 3.12, lower on
-        # small-stack Windows), so a real payload either misses the threshold
-        # or gambles with the worker's C stack -- pin the contract at the
-        # helper boundary like the transport-error test below.
-        request = MagicMock()
-        request.json = AsyncMock(side_effect=RecursionError())
-        body, err = await kh._json_object_body(request)
-        assert body is None
-        assert err is not None
-        assert err.status == 400
-        assert json.loads(err.text)["code"] == "invalid_json"
-
-    @pytest.mark.asyncio
-    async def test_transport_errors_propagate_not_400(self):
-        # A disconnect mid-body is not a client JSON mistake: the narrowed
-        # ValueError catch must let transport failures keep their 500 class.
-        request = MagicMock()
-        request.json = AsyncMock(side_effect=ConnectionResetError())
-        with pytest.raises(ConnectionResetError):
-            await kh._json_object_body(request)
+    # The RecursionError and transport-error boundaries moved with the guard:
+    # they are properties of ``_shared.read_bounded_json``, not of this module,
+    # and are pinned in ``test_read_bounded_json.py`` (TestDecodeContract).
 
     @pytest.mark.asyncio
     async def test_file_state_object_body_still_works(self, store):

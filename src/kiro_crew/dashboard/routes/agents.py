@@ -14,14 +14,6 @@ from aiohttp import web
 from kiro_crew.dashboard import handlers
 
 
-async def _api_acp_backends(request: web.Request) -> web.Response:
-    """Load the preview-only backend descriptor surface on first request."""
-
-    from kiro_crew.dashboard.handlers.acp_backends import api_acp_backends
-
-    return await api_acp_backends(request)
-
-
 def register(app: web.Application) -> None:
     """Register the agents routes on *app*."""
     # Workspaces
@@ -32,9 +24,9 @@ def register(app: web.Application) -> None:
     # Agents
     app.router.add_get("/api/agents/installed", handlers.api_agents_installed)
     app.router.add_get("/api/models", handlers.api_models)
-    # Backend registry: the ONE source for the capability table, so the Settings
-    # card and `kirocrew doctor` cannot disagree about what a backend supports.
-    app.router.add_get("/api/acp-backends", _api_acp_backends)
+    # ``GET /api/acp-backends`` is registered by the ``agent_config`` slice, which
+    # runs BEFORE this one and therefore wins every request. Do not add it back
+    # here: a second registration cannot extend the first, only shadow it.
     app.router.add_get("/api/effort-levels", handlers.api_effort_levels)
     app.router.add_get("/api/slash-commands", handlers.api_slash_commands)
     app.router.add_get("/api/agents/detail/{name}", handlers.api_agent_detail)
@@ -59,3 +51,4 @@ def register(app: web.Application) -> None:
     # Crew Members (roster + per-member pinned DM thread)
     app.router.add_get("/api/members", handlers.api_members)
     app.router.add_post("/api/members/{slug}/thread", handlers.api_member_thread)
+    app.router.add_get("/api/members/{slug}/activity", handlers.api_member_activity)

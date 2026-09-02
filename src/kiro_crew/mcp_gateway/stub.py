@@ -31,10 +31,10 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.executors import subprocess_executor
+from kiro_crew.executors import configure_default_executor, subprocess_executor
 from kiro_crew.jsonl_util import rotate_jsonl_at
 from kiro_crew.mcp_caller import CallerContext, _parent_pid
 from kiro_crew.mcp_gateway import transport
@@ -1697,6 +1697,13 @@ async def _recaller_loop(
 
 
 async def _amain(argv: Optional[list[str]] = None) -> int:
+    # ── Name the default executor ──
+    # asyncio.to_thread and run_in_executor(None, ...) route onto the loop's
+    # default executor, which Python names threads anonymously.  This names
+    # them ``mc-default`` so profilers like py-spy can attribute blocking work
+    # to this stub.  Must run BEFORE any to_thread offload.
+    configure_default_executor()
+
     # An invalid MC_MCP_LOG (e.g. "verbose") would make basicConfig raise
     # "Unknown level" and kill the stub BEFORE its fallback-to-per-session-exec
     # path can run. Fall back to WARNING on any unrecognised level.
@@ -2036,13 +2043,46 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
     return 0
 
 
+def _hard_exit(code: int) -> NoReturn:
+    """Terminate without interpreter finalization.
+
+    ``sys.exit()`` cannot be used here. The ``stub-stdin`` daemon thread parks
+    in ``sys.stdin.buffer.readline()`` for the life of the process, holding that
+    stream's lock, and interpreter finalization tries to flush and close the
+    same ``BufferedReader``. CPython cannot acquire the lock and aborts the
+    process with ``Fatal Python error: _enter_buffered_busy`` (SIGABRT, exit
+    134, core dumped) instead of returning ``code``.
+
+    Finalization is skipped, so do its two jobs that matter here explicitly:
+    ``logging.shutdown()`` drains handler buffers (the only handler is a
+    ``StreamHandler`` on stderr, configured in :func:`_amain`), then stderr is
+    flushed. stdout is deliberately NOT flushed here: every stdout frame is
+    written and flushed by the dedicated ``stub-stdout`` daemon writer thread,
+    which holds the buffer's lock while blocked on a stalled downstream pipe —
+    flushing from this thread would deadlock on that lock and the process
+    would never reach ``os._exit``. Nothing else is owed — the
+    atexit-registered thread-pool joins in ``kiro_crew.executors`` hold no
+    unflushed state, only threads the OS reclaims, and skipping them also
+    drops a teardown hang risk on a wedged filesystem read.
+    """
+    try:
+        logging.shutdown()
+    except Exception:  # pragma: no cover — never block exit on log teardown
+        pass
+    try:
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+    os._exit(code)
+
+
 def main() -> None:
     """Sync entry point for ``python -m kiro_crew.mcp_gateway.stub``."""
     try:
         rc = asyncio.run(_amain())
     except KeyboardInterrupt:
         rc = 0
-    sys.exit(rc)
+    _hard_exit(rc)
 
 
 if __name__ == "__main__":

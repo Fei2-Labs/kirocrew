@@ -316,9 +316,10 @@ export default function CommandBarOverlay({
   const slotStatusDetail = useAppSelector(s => s.chat.slotStatusDetail ?? {})
   const simplifiedToolNames = useSimplifiedToolNames()
   // `aria-modal` is a promise that Tab cannot reach the page behind the dialog, so
-  // the trap has to be real. Escape is left to the input's own handler, which needs
-  // it to pop a scope before it closes the bar.
-  useDialogFocusTrap(dialogRef, onClose, true, false)
+  // the trap has to be real. Escape is owned by the dialog panel's own keydown
+  // handler below, which needs it to pop a scope before it closes the bar (and
+  // claims it through the IME latch first).
+  useDialogFocusTrap(dialogRef, onClose, { handleEscape: false })
   // Constructing the sessions engine is just memoized closures — it issues no
   // request until `search()` is called, and only the sessions VIEW calls it. That
   // call site, not the construction, is what the root must never reach.
@@ -971,6 +972,12 @@ export default function CommandBarOverlay({
         // one owner rather than two.
         onKeyDown={e => {
           if (e.key !== 'Escape') return
+          // An Escape mid-composition belongs to the IME — it cancels the candidate
+          // list, not the search scope or the bar. The claim owns the whole decline
+          // contract (a declined key keeps its default for the IME and is stopped
+          // from leaking to outer layers), so it must run BEFORE the unconditional
+          // preventDefault below takes the key for the dialog.
+          if (!ime.claimKey(e)) return
           e.preventDefault()
           // Inside a scope, Escape steps OUT of it rather than discarding the whole
           // search: the query the user typed is the expensive part, and Backspace on

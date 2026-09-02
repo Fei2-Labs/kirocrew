@@ -14,12 +14,20 @@ import os
 import shutil
 import time
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
+from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
 from kiro_crew.effort import EFFORT_LEVELS, is_valid_effort
-from kiro_crew.providers.base import LLMProvider
-from kiro_crew.sandbox import cgroup_scope_argv, create_subprocess_limited, wrap_argv
+
+if TYPE_CHECKING:
+    from kiro_crew.providers.base import LLMProvider
+from kiro_crew.sandbox import (
+    cgroup_scope_argv,
+    create_subprocess_limited,
+    wrap_argv,
+    wrap_argv_async,
+)
 
 try:
     from kiro_crew.acp.client import (
@@ -138,15 +146,9 @@ def _get_provider_type(config: Optional[dict] = None) -> str:
 def _get_acp_backend(config: Optional[dict] = None) -> str:
     """Configured ``agent.acp_backend``; defaults to kiro-cli (``""``).
 
-    Read here rather than threaded in, because the pool builds its own workers
-    and never sees the provider factory. Without this the pool spawned kiro-cli
-    on a host whose operator selected another backend — which on a host with no
-    kiro-cli at all is an unresolvable binary rather than a wrong answer.
-
-    Only a value the operator may actually persist is honoured. A known-but-not-
-    selectable id degrades to the default, matching what
-    ``config.loader._normalize_acp_backend`` does for the chat path, so the pool
-    cannot end up on a backend the rest of the process refused.
+    Read from one config snapshot so pool workers cannot diverge from the chat
+    backend selected by the operator. Unselectable or malformed values fall back
+    to the Kiro default, matching config-loader normalization.
     """
     from kiro_crew.acp import backends as acp_backends
 
@@ -160,7 +162,7 @@ def _get_acp_backend(config: Optional[dict] = None) -> str:
 
 
 def _get_allow_ungated_tools(config: Optional[dict] = None) -> bool:
-    """Return the explicit adapter tool-gate opt-out from one config snapshot."""
+    """Return explicit adapter tool-gate opt-out from one config snapshot."""
     data = _read_config() if config is None else config
     value = _section(data, "agent").get("acp_backend_allow_ungated_tools", False)
     return value if isinstance(value, bool) else False
@@ -336,9 +338,8 @@ class AcpWorker(Worker):
                 logger.debug("AcpWorker: stale client shutdown failed", exc_info=True)
             self._client = None
             self._provider = None
-        # One read owns backend identity, the sandbox, and the named security
-        # opt-out. Reading each independently permits a concurrent Settings save
-        # to create a combination the operator never selected.
+        # One read owns backend identity, sandbox, and named security opt-out.
+        # Reading each independently could combine values from concurrent saves.
         config = self._config_snapshot
         if config is None:
             config = await asyncio.to_thread(_read_config)
@@ -356,8 +357,7 @@ class AcpWorker(Worker):
         from kiro_crew.acp.types import ACP_BACKEND_KAS
 
         if acp_backend == ACP_BACKEND_KAS:
-            # KAS is multiplexed by AcpRuntime and cannot be launched by the raw
-            # AcpClient spawn table. Use the same provider/runtime path as chat.
+            # KAS is multiplexed by AcpRuntime; use same provider/runtime path as chat.
             from kiro_crew.config.loader import DEFAULT_MODEL
             from kiro_crew.providers.acp import AcpProvider
 
@@ -373,9 +373,8 @@ class AcpWorker(Worker):
             await self._provider.start()
             self._effective_effort = self._effort
         else:
-            # Kiro remains on its first-class direct path. Public-spec and
-            # registry adapters use the admission client, which owns their
-            # fail-closed tool-routing decision.
+            # Kiro stays on first-class direct path. Public-spec adapters use
+            # admission client, which owns fail-closed tool-routing decisions.
             client_type = (
                 SpecAdapterAcpClient if requires_spec_adapter_admission(acp_backend) else AcpClient
             )
@@ -388,8 +387,8 @@ class AcpWorker(Worker):
             )
             await self._client.ensure_ready()
             await self._apply_effort()
-        # Shield the live worker PID from the periodic orphan sweep for as long
-        # as it runs. Paired with unregister in shutdown() and on respawn above.
+        # Shield live worker PID from periodic orphan sweep. Paired with
+        # unregister in shutdown() and respawn above.
         target = self._provider.client if self._provider is not None else self._client
         pid = getattr(target, "_pid", None)
         if isinstance(pid, int) and pid > 0:
@@ -398,9 +397,7 @@ class AcpWorker(Worker):
         else:
             self._protected_pid = None
         logger.info(
-            "AcpWorker: ready (agent=%s, pid=%s)",
-            AGENT_NAME,
-            getattr(target, "_pid", "unknown"),
+            "AcpWorker: ready (agent=%s, pid=%s)", AGENT_NAME, getattr(target, "_pid", "unknown")
         )
 
     async def _apply_effort(self) -> None:
@@ -464,8 +461,6 @@ class AcpWorker(Worker):
             return await asyncio.wait_for(_collect(), timeout=timeout)
         if self._client is None or not self._client.is_ready:
             await self.start()
-        if self._provider is not None:
-            return await self.send_message(prompt, timeout=timeout)
         assert self._client is not None
         return await self._client.send_message(prompt, timeout=timeout)
 
@@ -556,12 +551,29 @@ class CCWorker(Worker):
         fetch_tools = os.environ.get("KIROCREW_KNOWLEDGE_FETCH_TOOLS", "").strip()
         if fetch_tools:
             cmd += ["--allowedTools", fetch_tools]
-        wrapped = cgroup_scope_argv(wrap_argv(cmd)[0])  # cgroup DoS ceiling
+        wrapped = cgroup_scope_argv(
+            (await wrap_argv_async(cmd, _prepare=wrap_argv))[0]
+        )  # cgroup DoS ceiling
         self._proc = await create_subprocess_limited(
             *wrapped,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Own process group, so the worker's descendants are reachable as a tree.
+            # `claude -p` forks helpers (see spine/agent_runner.py's _terminate_group),
+            # and without this the child lands in the gateway's OWN group -- which is
+            # the one case platform_compat.kill_and_reap deliberately skips its group
+            # kill for, so the reap below would degrade to a pid-scoped kill and
+            # re-parent those helpers to init.
+            #
+            # BOTH args, spelled out explicitly, per the recipe in platform_compat:
+            # on POSIX start_new_session calls setsid (so killpg reaps the group) and
+            # creationflags=0 is a no-op; on Windows start_new_session is silently
+            # ignored and CREATE_NEW_PROCESS_GROUP is what makes the child tree
+            # `taskkill /T`-reapable. Not **unpacked from a dict -- that defeats
+            # mypy's Popen overload resolution on the build fleet.
+            start_new_session=platform_compat.IS_POSIX,
+            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
         )
         self._event_queue = asyncio.Queue()
         self._reader_task = asyncio.create_task(self._stdout_reader())
@@ -631,8 +643,7 @@ class CCWorker(Worker):
             self._reader_task = None
         if self._proc is not None:
             try:
-                self._proc.kill()
-                await self._proc.wait()
+                await platform_compat.kill_and_reap(self._proc)
             except Exception:
                 logger.debug("CCWorker shutdown error", exc_info=True)
             self._proc = None
@@ -651,8 +662,7 @@ class CCWorker(Worker):
         await self._spawn()
         if old is not None and old is not self._proc:
             try:
-                old.kill()
-                await old.wait()
+                await platform_compat.kill_and_reap(old)
             except Exception:
                 logger.debug("CCWorker: stale process reap failed", exc_info=True)
         self.calls_since_reset = 0

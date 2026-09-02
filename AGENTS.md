@@ -43,6 +43,7 @@ in the **same commit** when you change what it documents.
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |
+| `stt/`, `transcribe.py`, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/features/stt-streaming.md) + [voice-streaming](docs/system-specs/features/voice-streaming.md) |
 | cron, learn, dashboard handlers | [learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md) |
 | Slack, Discord, any channel, messaging, approvals | [messaging](docs/system-specs/modules/messaging.md) + [slack-gateway](docs/system-specs/modules/slack-gateway.md) |
 | subagents, spawn, orphan recovery | [subagent](docs/system-specs/modules/subagent.md) |
@@ -186,11 +187,15 @@ that harness pays for it.
   it makes `sandbox.wrap_argv` SKIP Kiro Crew's own seatbelt in favour of the
   harness's internal sandbox, so granting it to a harness without one leaves the
   agent process unconfined.
-- **Kiro is the floor.** `agent.acp_backend` defaults to `ACP_BACKEND_KIRO` and
-  it is in `ACP_BACKENDS_SELECTABLE` unconditionally; an unusable persisted value
-  degrades there with a logged reason (`_normalize_acp_backend`) instead of
-  raising. A harness is selected at `acp_backend` — `agent.provider` stays
-  `enum=["acp"]`.
+- **Kiro is the floor.** `agent.acp_backend` defaults to `ACP_BACKEND_KIRO` and it
+  is in `acp_backends.selectable_backends()` unconditionally (its baseline is
+  `BASELINE_SELECTABLE_BACKENDS`); an unusable persisted value degrades there with a
+  logged reason instead of raising. There is exactly one gate —
+  `resolve_selected_backend`, called from `_normalize_acp_backend` inside config
+  load — and it reads `selectable_backends()` per call, so registering a backend is
+  what makes a persisted value survive. The Kiro construction path gains no second
+  check (harness-parity H13). A harness is selected at `acp_backend` —
+  `agent.provider` stays `enum=["acp"]`.
 - **Registration is additive at the seam** — `platform/interfaces.py`'s
   `ProviderRegistry`, a v1 addition with no `CONTRACT_VERSION` bump. A new
   provider capability lands on the `LLMProvider` ABC with a safe default, never

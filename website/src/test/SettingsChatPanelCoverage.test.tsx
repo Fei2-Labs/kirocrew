@@ -249,11 +249,16 @@ describe('ChatPanel — Composer', () => {
     await waitFor(() => expect(storedChat().followUpLayout).toBe('multiline'))
   })
 
-  it('persists Quick Send through the dashboard config, keeping siblings', async () => {
+  it('persists Quick Send through the dashboard config, sending only that key', async () => {
     wrap()
     fireEvent.click(await settledSwitch('Quick Send'))
+    // ONLY the changed key. A full-object body rebuilt from this panel's cached
+    // config would write every other setting back at its cached value, clobbering
+    // one a second tab changed after we cached it. Siblings are preserved by the
+    // handler, which applies only the keys present in the body -- see
+    // test/test_session_card_source_links_knob.py::TestConfigEndpoint.
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, quick_send: true })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ quick_send: true })
     )
   })
 
@@ -262,7 +267,6 @@ describe('ChatPanel — Composer', () => {
     fireEvent.click(await settledSwitch('Merge Queued Messages'))
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({
-        ...BASE_DASH,
         merge_queued_messages: true,
       })
     )
@@ -351,7 +355,7 @@ describe('ChatPanel — Messages', () => {
     wrap()
     await pickOption('Widget Density', 1)
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, widget_density: 'less' })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ widget_density: 'less' })
     )
   })
 
@@ -359,7 +363,7 @@ describe('ChatPanel — Messages', () => {
     wrap()
     await pickOption('Response Verbosity', 1)
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, verbosity: 'concise' })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ verbosity: 'concise' })
     )
   })
 
@@ -367,7 +371,7 @@ describe('ChatPanel — Messages', () => {
     wrap()
     fireEvent.click(await settledSwitch('MCP Apps in Side Panel'))
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, mcp_app_panel: true })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ mcp_app_panel: true })
     )
   })
 
@@ -376,7 +380,6 @@ describe('ChatPanel — Messages', () => {
     fireEvent.click(await settledSwitch('Folder suggestions'))
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({
-        ...BASE_DASH,
         folder_suggestions_enabled: false,
       })
     )
@@ -402,7 +405,7 @@ describe('ChatPanel — Sessions', () => {
     wrap()
     fireEvent.click(await settledSwitch(label))
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, [key]: expected })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ [key]: expected })
     )
   })
 
@@ -441,8 +444,6 @@ describe('ChatPanel — Sessions', () => {
     fireEvent.click(opts[2])
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({
-        ...BASE_DASH,
-        restore_sessions: true,
         restore_window_minutes: 60,
       })
     )
@@ -676,5 +677,71 @@ describe('ChatPanel — About You and Power', () => {
     wrap()
     fireEvent.click(await settledSwitch('Prevent sleep while running'))
     expect(await screen.findByText(/Failed to save dashboard config/)).toBeInTheDocument()
+  })
+})
+
+describe('ChatPanel — optimistic model selection (#6848)', () => {
+  /** A patchConfig that stays pending until `release()` is called. */
+  function pendingPatch() {
+    let release!: () => void
+    patchConfigMock.mockImplementationOnce(
+      () => new Promise(res => { release = () => res({}) }) as never
+    )
+    return () => release()
+  }
+
+  it.each([
+    ['Default Model', 'claude-opus-4.8'],
+    ['Background Model', 'claude-opus-4.8'],
+    ['Subagent Model', 'claude-opus-4.8'],
+    ['Fallback model', 'claude-opus-4.8'],
+  ])('%s shows the picked value immediately, before the PATCH settles', async (label, model) => {
+    const release = pendingPatch()
+    wrap()
+    await waitFor(() => expect(modelsMock).toHaveBeenCalled())
+    await openSelect(label)
+    fireEvent.click(screen.getByRole('option', { name: model }))
+    // The PATCH is still in flight — the trigger must already show the choice.
+    const trigger = screen.getByRole('combobox', { name: label })
+    await waitFor(() => expect(trigger).toHaveTextContent(model))
+    expect(patchConfigMock).toHaveBeenCalledTimes(1)
+    release()
+  })
+
+  it('shows a picked reasoning effort immediately, before the PATCH settles', async () => {
+    seedMc({ agent: { model: 'claude-opus-4.8' } })
+    const release = pendingPatch()
+    wrap()
+    await waitFor(() => expect(modelsMock).toHaveBeenCalled())
+    await openSelect('Default Reasoning Effort')
+    fireEvent.click(screen.getByRole('option', { name: 'High' }))
+    const trigger = screen.getByRole('combobox', { name: 'Default Reasoning Effort' })
+    await waitFor(() => expect(trigger).toHaveTextContent('High'))
+    expect(patchConfigMock).toHaveBeenCalledTimes(1)
+    release()
+  })
+
+  it('rolls the selector back to the server value when the PATCH fails', async () => {
+    rejectOnce(patchConfigMock)
+    wrap()
+    await waitFor(() => expect(modelsMock).toHaveBeenCalled())
+    await openSelect('Default Model')
+    fireEvent.click(screen.getByRole('option', { name: 'claude-haiku-4.5' }))
+    expect(await screen.findByText(/Failed to save default model/)).toBeInTheDocument()
+    const trigger = screen.getByRole('combobox', { name: 'Default Model' })
+    await waitFor(() => expect(trigger).toHaveTextContent('Default (auto)'))
+    expect(trigger).not.toHaveTextContent('claude-haiku-4.5')
+  })
+
+  it('rolls a role model back when the PATCH fails', async () => {
+    seedMc({ agent: { role_models: { background: 'claude-opus-4.8' } } })
+    rejectOnce(patchConfigMock)
+    wrap()
+    await waitFor(() => expect(modelsMock).toHaveBeenCalled())
+    await openSelect('Background Model')
+    fireEvent.click(screen.getByRole('option', { name: 'claude-haiku-4.5' }))
+    expect(await screen.findByText(/Failed to save role model/)).toBeInTheDocument()
+    const trigger = screen.getByRole('combobox', { name: 'Background Model' })
+    await waitFor(() => expect(trigger).toHaveTextContent('claude-opus-4.8'))
   })
 })

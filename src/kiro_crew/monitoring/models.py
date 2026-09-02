@@ -23,6 +23,15 @@ DEFAULT_MONITOR_CADENCE_SECS = 300
 MONITOR_STOP_INVALID_RECORD = "invalid_monitor_record"
 
 
+def _is_finite_non_negative_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 class MonitorDecision(str, Enum):
     """Effect the monitor controller applies after a probe."""
 
@@ -155,12 +164,7 @@ class MonitorState:
             raise ValueError("version must be a positive integer")
         for name in ("created_ts", "last_observed_at", "next_probe_at", "stopped_at"):
             value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or value < 0
-            ):
+            if not _is_finite_non_negative_number(value):
                 raise ValueError(f"{name} must be a finite non-negative number")
         for name in (
             "agent_turns",
@@ -230,14 +234,7 @@ def monitor_state_from_dict(raw: object) -> MonitorState:
             value = raw.get(key)
             values[key] = value if isinstance(value, str) and value else f"unsupported_{key}"
         created_ts = raw.get("created_ts")
-        values["created_ts"] = (
-            created_ts
-            if not isinstance(created_ts, bool)
-            and isinstance(created_ts, (int, float))
-            and math.isfinite(created_ts)
-            and created_ts >= 0
-            else 0.0
-        )
+        values["created_ts"] = created_ts if _is_finite_non_negative_number(created_ts) else 0.0
         values["budgets"] = MonitorBudgets()
         values["_raw_payload"] = deepcopy(raw)
         return MonitorState(**values)
@@ -270,14 +267,11 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
         value = raw.get(name)
         return value if isinstance(value, str) and value else f"invalid_{name}"
 
-    created_ts = raw.get("created_ts")
-    if (
-        isinstance(created_ts, bool)
-        or not isinstance(created_ts, (int, float))
-        or not math.isfinite(created_ts)
-        or created_ts < 0
-    ):
-        created_ts = 0.0
+    raw_created_ts = raw.get("created_ts")
+    created_ts: int | float = 0.0
+    if _is_finite_non_negative_number(raw_created_ts):
+        assert isinstance(raw_created_ts, (int, float)) and not isinstance(raw_created_ts, bool)
+        created_ts = raw_created_ts
     return MonitorState(
         kind=_identity("kind"),
         target=_identity("target"),

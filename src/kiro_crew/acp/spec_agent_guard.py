@@ -95,7 +95,15 @@ def _candidate_paths(agent: str, work_dir: Path | str) -> list[Path]:
     # global spec that kiro-cli would not necessarily be able to activate.
     if project_dir is not None:
         project_path = project_dir / f"{agent}.json"
-        if project_path in exact and _read_agent_spec(project_path) is None:
+        if (
+            project_path in exact
+            and _read_agent_spec(
+                project_path,
+                operation="spec_agent_candidate_paths",
+                source="unknown",
+            )
+            is None
+        ):
             return [project_path]
     return [user_dir / resolved.filename]
 
@@ -125,7 +133,11 @@ def shell_restriction(agent: str, work_dir: Path | str) -> str:
         # can reuse the basename but Crew neither wrote nor controls that file.
         if path.parent == kiro_agents_dir() and path.name in OWNED_KIRO_AGENT_FILES:
             continue
-        spec = _read_agent_spec(path)
+        spec = _read_agent_spec(
+            path,
+            operation="spec_agent_shell_restriction",
+            source="unknown",
+        )
         if spec is None:
             return (
                 f"its spec at {path} could not be read, so whether it withholds "

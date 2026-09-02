@@ -70,6 +70,13 @@ class TestResolveSpawnEnv:
 class TestClientSpawnOffLoop:
     @pytest.mark.asyncio
     async def test_spawn_env_resolution_and_mkdir_run_off_loop(self, tmp_path) -> None:
+        # Pre-created: ``Path.mkdir`` is patched below to RECORD the thread
+        # rather than create anything, and the spawn path's macOS workspace
+        # guard stats this directory immediately after the mkdir it records —
+        # so without a real directory the guard fails closed on a workspace the
+        # client was about to create. This test is about which thread the mkdir
+        # runs on, which the recorder still observes.
+        (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
         loop_thread = threading.current_thread()
         ssh_threads: list[threading.Thread] = []
         krb_threads: list[threading.Thread] = []
@@ -255,6 +262,13 @@ class TestEnsureReadyWorkDir:
 class TestRuntimeSpawnOffLoop:
     @pytest.mark.asyncio
     async def test_spawn_mkdir_and_krb5_run_off_loop(self, tmp_path, monkeypatch) -> None:
+        # Pre-created: ``Path.mkdir`` is patched below to RECORD the thread
+        # rather than create anything, and the spawn path's macOS workspace
+        # guard stats this directory immediately after the mkdir it records —
+        # so without a real directory the guard fails closed on a workspace the
+        # client was about to create. This test is about which thread the mkdir
+        # runs on, which the recorder still observes.
+        (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
         loop_thread = threading.current_thread()
         krb_threads: list[threading.Thread] = []
         cgroup_threads: list[threading.Thread] = []

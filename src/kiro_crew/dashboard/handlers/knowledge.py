@@ -13,7 +13,6 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
 
 from aiohttp import web
 
@@ -21,6 +20,7 @@ from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
 from kiro_crew.dashboard import part_stream
+from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.handlers.files import (
     _ZIP_CONTAINER_EXTS,
     _content_matches_ext,
@@ -61,6 +61,7 @@ from kiro_crew.knowledge.sync import SyncScheduler
 from kiro_crew.knowledge.watcher import KnowledgeWatcher
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 logger = logging.getLogger(__name__)
 
@@ -154,52 +155,6 @@ def _store(request: web.Request):
 
 def _pipeline(request: web.Request):
     return request.app.get("knowledge_pipeline")
-
-
-async def _json_object_body(
-    request: web.Request, *, allow_absent: bool = False
-) -> tuple[dict[str, Any] | None, web.Response | None]:
-    """Parse the request body as a JSON **object**, or produce the 400 to return.
-
-    ``await request.json()`` happily returns a list, string, or number for a
-    body that is valid JSON but not an object, and every caller in this module
-    then calls ``.get()`` on the result -- which raises and turns a client
-    mistake into a 500. One owner for the parse-and-shape guard keeps the
-    module's ``request.json()`` call sites on a single contract instead of
-    bespoke per-handler guards.
-
-    Returns ``(body, None)`` on success, or ``(None, error_response)`` when
-    the caller should return early. *allow_absent* treats a request without a
-    readable body as an empty object, for endpoints whose fields all have
-    defaults.
-
-    Deliberately separate from ``_shared.read_bounded_json``, which shares the
-    ``invalid_json``/``body_not_object`` codes: switching these nine sites onto
-    it would mean choosing a byte cap per endpoint (its ``max_bytes`` must be
-    a number, and knowledge bundles have no principled ceiling today), would
-    change the ``"invalid JSON"`` message text existing tests and callers pin,
-    and it has no *allow_absent*. Consolidating the two helpers is deferred
-    scope, not a disagreement about the contract.
-    """
-    if allow_absent and not request.can_read_body:
-        return {}, None
-    try:
-        parsed = await request.json()
-    except (LookupError, RecursionError, ValueError):
-        # json.JSONDecodeError and UnicodeDecodeError are ValueError
-        # subclasses; LookupError is an unknown charset= codec in the
-        # client's Content-Type header; RecursionError is a deeply nested
-        # JSON document blowing the parser's stack. All are client mistakes.
-        # Transport failures (disconnect mid-body, read timeout) deliberately
-        # propagate: they are not a client JSON mistake and keep their 500
-        # status class.
-        return None, web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    if not isinstance(parsed, dict):
-        return None, web.json_response(
-            {"error": "body must be a JSON object", "code": "body_not_object"},
-            status=400)
-    return parsed, None
 
 
 def _create_embedder(app):
@@ -539,10 +494,10 @@ async def update_item(request: web.Request) -> web.Response:
     item_id = request.match_info["id"]
     if not store.get_item(item_id):
         return web.json_response({"error": "not found"}, status=404)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     allowed = {"tags", "item_type", "status", "title", "summary", "namespace"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if not fields:
@@ -872,10 +827,10 @@ async def pick_folder(request: web.Request) -> web.Response:
 async def add_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources -- add a remote source."""
     store = _store(request)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name", "")
     source_type = body.get("source_type", "")
     uri = body.get("uri", "")
@@ -1221,10 +1176,10 @@ async def rename_source(request: web.Request) -> web.Response:
     source_id = request.match_info["id"]
     if not store.db.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone():
         return web.json_response({"error": "not found"}, status=404)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name")
     if not isinstance(name, str):
         return web.json_response({"error": "name must be a string"}, status=400)
@@ -1349,10 +1304,10 @@ async def retry_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/retry -- reset file to pending."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1371,10 +1326,10 @@ async def skip_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/skip -- mark file as skipped."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1399,10 +1354,10 @@ async def ingest_text(request: web.Request) -> web.Response:
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     text = body.get("text", "")
     if not text:
         return web.json_response({"error": "no text provided"}, status=400)
@@ -1493,7 +1448,24 @@ def _inspect_zip_archive(path: str) -> str | None:
     synchronous zip I/O, so callers MUST run it off the event loop (via
     ``asyncio.to_thread``) — a large/hostile central directory would otherwise
     stall the gateway loop and heartbeat.
+
+    The member cap runs TWICE, deliberately. The shared vet (kiro_crew.zip_vet)
+    reads the archive tail first, so the declared central-directory size — the
+    field ZipFile's construction loop actually reads and allocates from — is
+    bounded BEFORE ZipFile exists. The infolist() pass below then bounds the
+    aggregate declared expansion, which only the parsed records can answer. The
+    rejection reasons are unchanged: an archive that the preflight refuses would
+    have been refused by the count check anyway, just after the allocation.
     """
+    try:
+        vet_zip_inventory(path, max_members=_MAX_INGEST_ARCHIVE_MEMBERS)
+    except ZipInventoryRejected as exc:
+        # Same reasons this function already returns, so the API error body and
+        # the SEL outcome do not change shape: a tail we cannot parse is a bad
+        # archive, an over-cap inventory is too many members.
+        if exc.reason in ("missing_eocd", "truncated_eocd", "unreadable"):
+            return "bad_archive"
+        return "too_many_members"
     try:
         with zipfile.ZipFile(path) as zf:
             infos = zf.infolist()
@@ -1640,10 +1612,10 @@ async def export_all(request: web.Request) -> web.Response:
 
 async def import_bundle(request: web.Request) -> web.Response:
     """POST /api/knowledge/import -- accept .knowledge JSON bundle."""
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     shape_error = _validate_knowledge_bundle(body)
     if shape_error is not None:
         _sel_log("import", outcome="rejected", reason=shape_error)
@@ -1786,10 +1758,10 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     if not await embedder.is_available_async():
         return web.json_response({"error": "Embedding model not available"}, status=503)
 
-    body, body_err = await _json_object_body(request, allow_absent=True)
+    body, body_err = await read_bounded_json(request, max_bytes=None, allow_absent=True)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     rebuild = body.get("rebuild", False)
     force = body.get("force", False)
 
@@ -1960,10 +1932,10 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "pipeline not configured",
              "code": "pipeline_unavailable"}, status=503)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     result = await add_agent_document(
         pipeline,
         title=str(body.get("title") or ""),

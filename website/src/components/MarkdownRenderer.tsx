@@ -2,7 +2,7 @@ import React, { createContext, useContext, memo, useEffect, useMemo, useRef, use
 import Clickable from './Clickable'
 import { HOVER_NONE_ACTION_BTN_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { Paperclip, X, Download, Plus, Minus, Search, Folder, Maximize2, Check } from 'lucide-react'
+import { Paperclip, X, Download, Plus, Minus, Search, Folder, Maximize2, Check, Image as ImageIcon, GitPullRequest } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
@@ -35,12 +35,14 @@ import { api } from '../api/client'
 import { useBlockAssembler, maskInlineCode } from '../hooks/useBlockAssembler'
 import { usePathKind, type PathKind } from '../hooks/usePathKind'
 import { useGatewayPlatform, type GatewayPlatform } from '../hooks/useGatewayPlatform'
+import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM } from '../hooks/usePinchZoom'
 import { fileIcon } from '../utils/fileIcons'
 import { urlTransform, ALLOWED_PROTOCOLS, WINDOWS_ABS_PATH_RE, decodeLocalPath } from '../utils/urlTransform'
 import { safeHttpUrl } from '../lib/safeUrl'
 import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
 import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
+import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import JiraLogo from './icons/JiraLogo'
 import GithubLogo from './icons/GithubLogo'
@@ -562,6 +564,8 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   }
   const forgeLabel = source ? forgeChipLabel(source) : null
   if (source && forgeLabel) {
+    const forgeMeta = sourceProviderMeta(source.provider)
+    const ForgeIcon = forgeMeta.icon
     return (
       <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
         <a
@@ -571,9 +575,16 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
           title={href}
           className="inline-flex min-w-0 items-center gap-1.5 text-text no-underline focus-ring"
         >
-          {source.provider === 'github'
+          {forgeMeta.logo === 'github'
             ? <GithubLogo size={12} className="shrink-0" />
-            : <GitlabLogo size={12} className="shrink-0" />}
+            : forgeMeta.logo === 'gitlab'
+              ? <GitlabLogo size={12} className="shrink-0" />
+              : ForgeIcon
+                // A registered provider's own mark, when its descriptor ships one.
+                ? <ForgeIcon size={12} className="shrink-0" />
+                // A registered provider with no bundled logo uses the neutral
+                // glyph rather than borrowing GitLab's mark.
+                : <GitPullRequest className="lucide-inline shrink-0" />}
           <span className="truncate max-w-[32ch]">{forgeLabel}</span>
         </a>
       </span>
@@ -1055,6 +1066,18 @@ export function reservedImageClass(compact: boolean): string {
   return compact ? 'mc-img-reserve mc-img-reserve-compact' : 'mc-img-reserve'
 }
 
+/** Fixed placeholder box for an image whose dimensions are not yet known
+ *  (first-ever load, nothing learned). An unloaded <img> has NO intrinsic
+ *  size — the max-w/max-h classes are only caps, so without a definite box it
+ *  collapses to a 0-wide border sliver. A fixed ~16:9 box (not full width —
+ *  full-width placeholders stack into a wall when a message carries several
+ *  images) reserves believable space; the compact box matches the sent-prompt
+ *  thumbnail caps exactly. Numbers are the DISPLAY size, so they sit under
+ *  each mode's max-w/max-h caps. */
+export function pendingImageBoxStyle(compact: boolean): React.CSSProperties {
+  return compact ? { width: '240px', height: '180px' } : { width: '420px', height: '236px' }
+}
+
 function ImgWithFallback({
   node,
   src,
@@ -1117,29 +1140,31 @@ function ImgWithFallback({
   // happen to declare width/height. Give SVGs a definite width basis; the
   // viewBox aspect ratio then derives the height, clamped by max-h.
   const isSvg = /\.svg([?#]|$)/i.test(src)
-  // Reserve vertical layout space BEFORE the bytes decode. A markdown image has
-  // no intrinsic dimensions in the source, so without this it lays out at ~0px
-  // until the network/decode completes, then snaps to its natural height —
-  // shoving every sibling below it (still-streaming text, the next block) down
-  // in one discrete jump. For a user reading a streaming message (or lazily
-  // loading an image below the fold) that reads as a "flash". Holding a
-  // min-height placeholder until `onLoad` reserves the space up front and
-  // bounds the on-load shift; the placeholder is released once loaded so the
-  // final layout is pixel-exact and history/completed images carry no floor.
-  // The floor is a heuristic (markdown gives us no aspect ratio): 120px sits
-  // below the common screenshot/diagram case (which then benefits) but above
-  // small icons/badges — for a sub-120px raster image the on-load change is a
-  // bounded (<=120px) collapse, an accepted residual since such images are
-  // uncommon in markdown. SVGs already get a definite width basis (their viewBox
-  // derives the height), so they need no placeholder. See
+  // Reserve layout space BEFORE the bytes decode. A markdown image has no
+  // intrinsic dimensions in the source, so without this it lays out at ~0px
+  // (zero WIDTH too — an unloaded <img> has no intrinsic size and max-width is
+  // only a cap, so the element collapses to a border-thin sliver) until the
+  // network/decode completes, then snaps to its natural size — shoving every
+  // sibling below it (still-streaming text, the next block) down in one
+  // discrete jump. For a user reading a streaming message (or lazily loading
+  // an image below the fold) that reads as a "flash". Holding a placeholder
+  // box until `onLoad` reserves the space up front and bounds the on-load
+  // shift; the placeholder is released once loaded so the final layout is
+  // pixel-exact and history/completed images carry no reserve.
+  // The box is a FIXED size, not full-width (a deliberate product decision:
+  // a full-width band reads as a much larger pending change than the image
+  // usually is, and several loading images stack into a wall). The size is a
+  // heuristic (markdown gives us no aspect ratio): a ~16:9 box near the
+  // common screenshot case, sized under each mode's max-w/max-h caps so the
+  // pending box never exceeds what the loaded image could occupy. See
   // MarkdownRenderer.streamingImageShift.test.tsx.
-  // Learned exact dimensions trump the heuristic floor: a transcript image
+  // Learned exact dimensions trump the heuristic box: a transcript image
   // remounts every time the virtualized window scrolls back over it, and a
-  // 120px floor under a 400-600px screenshot still realizes the difference as
-  // a visible jump on every (re)load. Recording naturalWidth/Height on first
-  // successful load (keyed by resolved URL, same mechanism as the artifact
-  // gallery's thumbnails) lets every later mount reserve the real aspect box
-  // via width/height attributes before any bytes arrive.
+  // heuristic box under a 400-600px screenshot still realizes the difference
+  // as a visible jump on every (re)load. Recording naturalWidth/Height on
+  // first successful load (keyed by resolved URL, same mechanism as the
+  // artifact gallery's thumbnails) lets every later mount reserve the real
+  // aspect box before any bytes arrive.
   const learned = !isSvg ? getImageDims(url) : undefined
   // The reserved box must resolve to EXACTLY the size the loaded image will
   // take, or the difference shows as a border wrapping empty space with the
@@ -1157,7 +1182,7 @@ function ImgWithFallback({
     ? { width: compact ? '240px' : '760px', height: 'auto' }
     : learned
       ? reservedImageStyle(learned)
-      : (loaded ? undefined : { minHeight: '120px' })
+      : (loaded ? undefined : pendingImageBoxStyle(compact))
   // Sent-prompt (user message) images render as a small preview so an attached
   // screenshot doesn't dominate the bubble; the lightbox still opens full size
   // on click. Response images keep the large inline size. See CompactImagesCtx.
@@ -1165,7 +1190,25 @@ function ImgWithFallback({
   // variable) so the i18n lint's className exemption still recognizes these as
   // class strings, not untranslated copy.
   return (
-    <span className="block my-2">
+    <span className="relative block my-2">
+      {/* Loading skeleton: a decorative overlay ON TOP of the (still
+          transparent) <img>, never a wrapper around it — the img's own layout
+          contract (ms-auto on the IMG, definite max-w caps, no shrink-to-fit
+          wrapper; see the className comment below) must not change shape
+          between loading and loaded. The overlay is a SIBLING that replicates
+          the img's box (same reserve class/style, same caps, same edge
+          alignment) and unmounts on load, so the img itself never remounts.
+          pointer-events-none keeps hover/click reaching the img. */}
+      {!loaded && !isSvg && (
+        <span
+          aria-hidden="true"
+          className={`pointer-events-none absolute top-0 ${compact ? 'end-0' : 'start-0'} flex items-center justify-center overflow-hidden rounded-md border border-border bg-bg-accent ${learned ? reservedImageClass(compact) + ' ' : ''}${compact ? 'max-w-[240px] max-h-[180px]' : 'max-w-[min(100%,760px)] max-h-[60vh]'}`}
+          style={learned ? reservedImageStyle(learned) : pendingImageBoxStyle(compact)}
+        >
+          <span className="absolute inset-0 animate-pulse bg-bg-hover" />
+          <ImageIcon size={28} className="relative animate-pulse text-muted" aria-hidden="true" />
+        </span>
+      )}
       {/* The <img> is the lightbox trigger; dispatchLightbox needs the image
           element itself as currentTarget and the [data-lightbox-image] query
           relies on it being an <img>, so it can't be a <button>. Keyboard users
@@ -3394,6 +3437,7 @@ export function Lightbox() {
       // pinch's vertical component as pull-to-close, and the <img> pan would fight
       // the scale over the same two contacts.
       abortSwipeRef.current?.()
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
       const d = dragRef.current
       if (d.active) { d.active = false; d.dragging = false; setDragging(false) }
     },
@@ -3445,6 +3489,34 @@ export function Lightbox() {
   }, [])
   // Publish it for the hook's `onPinchStart`, which is constructed above this.
   abortSwipeRef.current = abortSwipe
+
+  // ── double-tap to zoom (touch) ───────────────────────────────────────────
+  const lastTapRef = useRef({ t: 0, x: 0, y: 0 })
+  const onDoubleTap = useCallback((e: React.PointerEvent<HTMLElement>): boolean => {
+    if (e.pointerType === 'mouse') return false
+    if ((e.target as HTMLElement | null)?.closest('button')) return false
+    const now = Date.now()
+    const last = lastTapRef.current
+    const isDouble = now - last.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - last.x, e.clientY - last.y) < DOUBLE_TAP_SLOP
+    lastTapRef.current = { t: now, x: e.clientX, y: e.clientY }
+    if (!isDouble) return false
+    lastTapRef.current = { t: 0, x: 0, y: 0 }
+    suppressClickRef.current = true
+    abortSwipe()
+    const d = dragRef.current
+    if (d.active) { d.active = false; d.dragging = false; setDragging(false) }
+    if (zoomRef.current > LIGHTBOX_ZOOM_MIN) {
+      setZoom(LIGHTBOX_ZOOM_MIN)
+      setPan({ x: 0, y: 0 })
+      return true
+    }
+    const cx = window.innerWidth / 2
+    const cy = window.innerHeight / 2
+    const z = DOUBLE_TAP_ZOOM
+    setZoom(z)
+    setPan(clampPan((e.clientX - cx) * (1 - z), (e.clientY - cy) * (1 - z), z))
+    return true
+  }, [abortSwipe, clampPan, setPan, setZoom, zoomRef])
   // ── pinch-to-zoom (touch, two fingers) ───────────────────────────────────
   // Browser page zoom is off on touch across the shell (viewport meta in
   // index.html, root `touch-action` in index.css, `gesturestart` suppression in
@@ -3471,12 +3543,19 @@ export function Lightbox() {
     // cases (drag live, already zoomed) a pinch is most likely to start from.
     // The hook records the contact and, when a pinch seats, calls `onPinchStart`
     // (which drops the swipe and the <img> drag) and returns true.
-    if (trackPointerDown(e)) return
-    if (zoomRef.current > LIGHTBOX_ZOOM_MIN) return // the <img> pan owns this gesture
-    // Toolbar taps must stay taps — never start a drag from a control.
+    if (trackPointerDown(e)) {
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
+      return
+    }
+    // Toolbar taps must stay taps — never start a gesture from a control.
     if ((e.target as HTMLElement | null)?.closest('button')) return
+    // A consumed double-tap changes zoom synchronously through the live ref's
+    // owner but React publishes that new value on the next render. Return now
+    // instead of consulting the still-fit ref and re-arming swipe-to-dismiss.
+    if (onDoubleTap(e)) return
+    if (zoomRef.current > LIGHTBOX_ZOOM_MIN) return // the <img> pan owns this gesture
     swipeRef.current = { pointerId: e.pointerId, startX: e.clientX, startY: e.clientY, active: true, engaged: false }
-  }, [trackPointerDown, zoomRef])
+  }, [trackPointerDown, onDoubleTap, zoomRef])
   const onOverlayPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     // A live pinch consumes the move (scale + focal-anchored pan).
     if (trackPointerMove(e)) return
@@ -3491,6 +3570,7 @@ export function Lightbox() {
       if (Math.abs(dx) > Math.abs(dy)) { s.active = false; return }
       s.engaged = true
       setSwiping(true)
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
     }
     // Downward travel tracks the finger 1:1; upward is rubber-banded, since
     // pulling up is not a dismiss but should not feel dead either.
@@ -3546,6 +3626,7 @@ export function Lightbox() {
   useEffect(() => {
     setSwipeY(0)
     setSwiping(false)
+    lastTapRef.current = { t: 0, x: 0, y: 0 }
     swipeRef.current.active = false
     swipeRef.current.engaged = false
     swipeRef.current.pointerId = -1
@@ -3586,8 +3667,18 @@ export function Lightbox() {
         if (cur) void downloadLightboxImage(cur.images[cur.index])
       }
     }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    // CAPTURE phase, matching DiagramLightbox: dialog panels (Modal, the Radix
+    // ui/dialog family) stop bubble-phase keydown propagation so the page's
+    // global shortcuts don't fire under them, and this viewer opens ABOVE
+    // those dialogs (a README image inside SkillBrowserModal / McpBrowserModal
+    // etc). With focus still inside the dialog panel, a bubble-phase listener
+    // here never sees the key — arrows/zoom go dead while Escape still works.
+    // Capture runs before any panel handler. It also fixes Escape ordering
+    // over a Modal: this handler's preventDefault now lands BEFORE Modal's
+    // bubble-phase window listener, so its defaultPrevented skip keeps the
+    // modal open and Escape closes only the viewer.
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [isOpen, zoomIn, zoomOut])
   if (!state) return null
   const img = state.images[state.index]
@@ -3644,7 +3735,11 @@ export function Lightbox() {
             const dx = e.clientX - d.startX
             const dy = e.clientY - d.startY
             d.moved = Math.max(d.moved, Math.hypot(dx, dy))
-            if (d.moved > 4 && !d.dragging) { d.dragging = true; setDragging(true) }
+            if (d.moved > 4 && !d.dragging) {
+              d.dragging = true
+              setDragging(true)
+              lastTapRef.current = { t: 0, x: 0, y: 0 }
+            }
             setPan(clampPan(d.baseX + dx, d.baseY + dy))
           }}
           onPointerUp={endDrag}

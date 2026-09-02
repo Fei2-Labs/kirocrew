@@ -23,6 +23,7 @@ from kiro_crew.platform.interfaces import (
     PROVIDER_BACKEND_FACTORY_ATTR,
     CapabilityResult,
     InterceptDecision,
+    MobileConnectMethod,
     OtlpDestination,
 )
 
@@ -588,3 +589,20 @@ class DefaultJailProvider:
     def maybe_reexec_into_jail(self, argv: List[str], mode: str) -> Optional[int]:
         # None → no re-exec; the command runs in-process exactly as today.
         return None
+
+
+class DefaultMobileConnectProvider:
+    """The personal-install phone-connection pair.
+
+    ``tailnet_qr`` rides the existing tailnet publish + QR mint surface
+    (``/api/tailnet/mobile/*``); ``login_link`` rides the one-time mobile
+    sign-in link (``/api/auth/mobile-link``).  Descriptors only — each method's
+    own endpoint keeps its full guard stack.  An enterprise companion replaces
+    this list via ``dataclasses.replace(ctx, mobile_connect=...)``.
+    """
+
+    def connect_methods(self) -> List[MobileConnectMethod]:
+        return [
+            MobileConnectMethod(id="tailnet_qr", kind="tailnet_qr"),
+            MobileConnectMethod(id="login_link", kind="login_link"),
+        ]

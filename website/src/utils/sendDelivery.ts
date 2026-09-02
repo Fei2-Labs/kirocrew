@@ -6,6 +6,11 @@ export interface SendReceiptBody {
   queued?: boolean
   /** A steer-flagged send was injected into the running turn. */
   steered?: boolean
+  /** The server-minted stable id (`meta.mid`) of the user row this send
+   *  appended. Present only on a confirmed immediate dispatch; the client
+   *  stamps it onto the optimistic bubble so message-pinning works before the
+   *  chat_done refresh rebuilds the transcript from disk. */
+  mid?: string
   /** Server-authored refusal prose. Typed `unknown` because it arrives off the
    *  wire: a caller that renders it must narrow it to a string first. */
   error?: unknown

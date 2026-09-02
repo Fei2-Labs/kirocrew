@@ -1384,23 +1384,9 @@ class RepoIsolation:
         `_ok` checks both, and this drifted from it. Raised by the GPT review of this branch.
         """
 
-        def _neutral(args: list[str]) -> bool:
-            try:
-                proc = _run(
-                    ["git", "-C", str(self.clone_path), *args],
-                    cwd=self.clone_path if self.clone_path.exists() else Path.cwd(),
-                    timeout=30,
-                )
-            except (OSError, subprocess.SubprocessError):
-                return False
-            if proc.returncode != 0:
-                return False
-            url = (proc.stdout or "").strip()
-            return (not url) or ("DISABLED" in url.upper()) or ("NO_PUSH" in url.upper())
+        from ...backend.clone_setup import _repository_is_isolated
 
-        return _neutral(["remote", "get-url", "--push", "origin"]) and _neutral(
-            ["remote", "get-url", "origin"]
-        )
+        return _repository_is_isolated(self.clone_path)
 
     def do_not_pollute_paths(self) -> list[Path]:
         """Host paths the spine snapshots around the (no-op) measurement boot.

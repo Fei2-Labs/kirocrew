@@ -100,7 +100,9 @@ from kiro_crew.subagent_persistence import _agent_dir, read_state
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
     CHANNEL_ID_RE,
+    CHANNEL_MAX_LEN,
     CRON_SESSION_RE,
+    SLACK_THREAD_TS_RE,
     SPAWN_RUN_SCHEMA,
     ValidationError,
     validate_tool_args,
@@ -108,6 +110,28 @@ from kiro_crew.validation import (
 
 #: Seconds to wait for Slack when verifying a pasted token at save time.
 _TOKEN_VERIFY_TIMEOUT = 8
+
+#: A Slack message timestamp is `<10-digit epoch>.<6-digit sequence>` -- 17
+#: characters. The cap is what BOUNDS the value: these routes forward `ts` to
+#: Slack and write it into a SEL audit line, and the allowlist check that
+#: rejects an untracked channel runs AFTER that line is written.
+_SLACK_TS_MAX_LEN = 30
+
+
+def _is_slack_ts(value: object) -> bool:
+    """True for a Slack message timestamp that is safe to forward.
+
+    Uses the shared ``SLACK_THREAD_TS_RE`` rather than an inline
+    ``^\\d+\\.\\d+$``: ``\\d`` is Unicode-aware, so a string of Arabic-Indic
+    numerals satisfied the old check and was forwarded verbatim. The shared
+    pattern spells the class ``[0-9]`` to avoid precisely that.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) <= _SLACK_TS_MAX_LEN
+        and bool(SLACK_THREAD_TS_RE.match(value))
+    )
+
 
 #: Public field name -> .env credential key for the two Slack secrets.
 _SLACK_SECRET_FIELDS = {
@@ -381,7 +405,7 @@ async def api_spawn(request: web.Request) -> web.Response:
                 reasoning_effort,
                 verdict_agent,
                 verdict_backend,
-                model_pin_resolved=True,
+                model_pin_resolved=verdict_backend is not None,
             )
             if d:
                 return d, ""
@@ -390,7 +414,7 @@ async def api_spawn(request: web.Request) -> web.Response:
                 reasoning_effort,
                 verdict_agent,
                 verdict_backend,
-                model_pin_resolved=True,
+                model_pin_resolved=verdict_backend is not None,
             )
 
         # The resolvers read config and glob ~/.kiro/agents — file I/O that
@@ -2114,7 +2138,7 @@ async def api_send_message(request: web.Request) -> web.Response:
 
     thread_ts = body.get("thread_ts")
     if thread_ts is not None:
-        if not isinstance(thread_ts, str) or not re.match(r"^\d+\.\d+$", thread_ts):
+        if not _is_slack_ts(thread_ts):
             return web.json_response(
                 {"error": "thread_ts must be a Slack timestamp string like '1712793600.123456'"},
                 status=400,
@@ -2720,12 +2744,12 @@ async def api_slack_pins(request: web.Request) -> web.Response:
     if not isinstance(channel, str):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     channel = channel.strip()
-    if not channel or not CHANNEL_ID_RE.match(channel):
+    if not channel or len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
 
     ts = body.get("ts", "")
     if action in ("add", "remove"):
-        if not isinstance(ts, str) or not re.match(r"^\d+\.\d+$", ts):
+        if not _is_slack_ts(ts):
             return web.json_response(
                 {"error": "ts must be a Slack timestamp string like '1712793600.123456'"},
                 status=400,
@@ -2815,10 +2839,10 @@ async def api_slack_reactions(request: web.Request) -> web.Response:
     if not isinstance(channel, str):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     channel = channel.strip()
-    if not channel or not CHANNEL_ID_RE.match(channel):
+    if not channel or len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     ts = body.get("ts", "")
-    if not isinstance(ts, str) or not re.match(r"^\d+\.\d+$", ts):
+    if not _is_slack_ts(ts):
         return web.json_response(
             {"error": "ts must be a Slack timestamp string like '1712793600.123456'"},
             status=400,
@@ -3489,7 +3513,9 @@ async def api_browser_view_start(request: web.Request) -> web.Response:
 
     Idempotent, and off-loaded to a thread because starting the dashboard waits on
     a child process becoming healthy, which would otherwise stall the event loop
-    and with it every other dashboard request.
+    and with it every other dashboard request. Honors
+    ``dashboard.browser_view_port`` when set, so a remote-gateway operator can
+    keep the port inside their tunnel's forwarded set.
 
     App-token denied: this both LAUNCHES a browser process and returns the
     unauthenticated dashboard URL, so it is the stronger half of the same hole
@@ -3498,7 +3524,14 @@ async def api_browser_view_start(request: web.Request) -> web.Response:
     denied = _deny_non_owner_browser_request(request, "browser_view_start")
     if denied is not None:
         return denied
-    await asyncio.to_thread(browser_cli_view.ensure_running)
+
+    def _start_view() -> None:
+        # Config read stays in the worker thread with the child-process wait:
+        # both are blocking I/O that must not run on the event loop.
+        pinned = KiroCrewConfig.load().dashboard.browser_view_port
+        browser_cli_view.ensure_running(pinned or None)
+
+    await asyncio.to_thread(_start_view)
     return web.json_response(await asyncio.to_thread(browser_cli_view.status))
 
 
@@ -3916,8 +3949,8 @@ async def _slack_config_save_locked(request: web.Request) -> web.Response:
 
     # ── Phase 2: commit. All validation passed, so writes are safe. ──
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         await _write_env_off_loop(env_updates)
         # Keep the live process environment in sync with the new .env state.
         # load_credentials() lets os.environ win over .env, so without this a
@@ -4343,8 +4376,8 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
                 relabel="session_folder" in staged,
             )
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         await _write_env_off_loop(env_updates)
         # Keep the live process environment in sync with the new .env state
         # (load_credentials() lets os.environ win over .env — see the Slack
@@ -4726,8 +4759,8 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
                 relabel="session_folder" in staged,
             )
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         await _write_env_off_loop(env_updates)
         # Keep the live process environment in sync with the new .env state
         # (load_credentials() lets os.environ win over .env — see the Slack
@@ -4863,8 +4896,8 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     throttled_source = "" if is_proxied_request(request) else source
     if throttled_source and webhooks.auth_throttle_blocked(throttled_source):
         # Off the loop: the first ``sel()`` of a process CONSTRUCTS the log
-        # (trust-dir creation, key validation, an icacls subprocess on Windows),
-        # and this route can be the first request a fresh gateway ever serves.
+        # (trust-dir creation, key validation — blocking file IO), and this
+        # route can be the first request a fresh gateway ever serves.
         await asyncio.to_thread(
             lambda: _sel().log_api_access(
                 caller=source,
@@ -5368,8 +5401,9 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
                     relabel="session_folder" in changes,
                 )
         if env_updates:
-            # Off-loop: restrict_to_owner spawns whoami/icacls subprocesses on
-            # Windows, which would stall the gateway loop if run inline.
+            # Off-loop: the .env write is blocking file IO (lock, temp write,
+            # owner-only lockdown, replace) that would stall the gateway loop
+            # if run inline.
             #
             # Cancellation guard: _write_env_off_loop shields + drains its
             # worker, so a CancelledError from it means the .env write has
@@ -5705,8 +5739,8 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
                     relabel="session_folder" in changes,
                 )
         if env_updates:
-            # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-            # which must not block the event loop.
+            # Off-loop: the .env write is blocking file IO (lock, temp write,
+            # owner-only lockdown, replace) and must not block the event loop.
             #
             # Cancellation guard: see Teams save for the full rationale. Only
             # roll config back when the .env write actually failed, not when
@@ -6296,8 +6330,8 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
                 relabel="session_folder" in staged,
             )
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         #
         # Cancellation guard: see Teams save for the full rationale. Only
         # roll config back when the .env write actually failed, not when
@@ -6790,8 +6824,8 @@ async def _feishu_config_save_locked(request: web.Request) -> web.Response:
             return _corrupt_config()
 
     if env_updates:
-        # Off-loop: on Windows the owner-only lockdown shells out to icacls,
-        # which must not block the event loop.
+        # Off-loop: the .env write is blocking file IO (lock, temp write,
+        # owner-only lockdown, replace) and must not block the event loop.
         #
         # Cancellation guard: see the WeCom save for the full rationale. Only
         # roll config back when the .env write actually failed, not when

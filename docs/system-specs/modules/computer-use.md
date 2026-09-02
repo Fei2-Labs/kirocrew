@@ -190,7 +190,8 @@ control. `test_mcp_computer.py::test_the_shim_carries_no_identity_refusal_at_all
 guards the absence, because a behavioural test alone passes just as well with a
 refusal that happens to be unreachable.
 
-**An unresolved key becomes `unresolved:<shim pid>`, never the empty string** — and
+**An unresolved key becomes `unresolved:<shim pid>[#<connection nonce>]`, never the
+empty string** — and
 that is a correctness fix, not cosmetics. `SnapshotIndex` namespaces entries by
 `(session_key, window_key)`, so an empty key collapsed EVERY unresolved session onto
 one `("", window)` slot. Since unresolved is the normal case on macOS, two concurrent
@@ -201,13 +202,31 @@ per session, so the shim's own pid separates the namespaces exactly as far as th
 sessions are genuinely separate — in the 1:1 shim topology. On a POOLED backend one
 process serves many sessions, so the pid separates only what the injected caller
 block does not already name: co-tenants gatewayd CAN name get real per-session keys,
-and the residual — two or more co-tenants it cannot name sharing one
-`unresolved:<pid>` namespace — is tracked as #5322. Read at call time rather than
+and the ones it cannot are separated by the **per-connection nonce** gatewayd injects
+alongside the caller block (`_meta."kirocrew.tenant".nonce`, #5322). The nonce is
+gateway-minted and stripped on every inbound frame like the caller block, so a stub
+cannot choose to share a peer's namespace; it carries no session key, so
+`CallerContext.from_meta` still finds no identity and nothing is laundered into
+attribution. Both halves are read at call time rather than
 captured at import, so a forked child cannot inherit its parent's string and
 re-alias with it.
 
+Absent nonce is the normal 1:1 case (no gateway, or a backend that never advertised
+the caller extension), and the key stays `unresolved:<pid>` — correct there, because
+one process is one session. It is ALSO what a pre-nonce gatewayd produces: `manager.py`
+adopts whatever healthy daemon already holds the socket, so a daemon that outlived a
+package upgrade keeps serving and injects nothing, and the backend cannot tell that
+apart from the 1:1 case (absence of both blocks is ambiguous by construction). That
+window is why `kirocrew-computer` stays in `_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD`
+rather than being reclassified shareable here — the classification is a config WRITE
+via `seed.py`, so it must not promise a separation the serving daemon may not
+implement. A stub that reconnects gets a fresh nonce and therefore a
+fresh namespace: its earlier snapshots become unreachable, which surfaces as "call
+`computer_get_state` first" rather than as an action against a stale tree.
+
 The prefix is deliberate: this is a namespace separator, not attribution, and an audit
-reader must not mistake a pid for a resolved identity. And it is a namespacing fix
+reader must not mistake a pid — or a nonce — for a resolved identity. And it is a
+namespacing fix
 specifically **because** the alternative — refusing an empty key — is the line that
 made the feature unusable on macOS; the security posture is unchanged, only the cache
 key is.
@@ -1562,10 +1581,14 @@ a result.
 `computer_use/screencast.py` + `website/src/components/ComputerUseLiveView.tsx`.
 The machine being driven is often not the machine the operator is looking at (a
 cloud Mac, a session reached over the reverse SSH tunnel, or another Space), so a
-floating picture-in-picture panel mirrors what the agent sees. Same shape as the
-browse mirror (`browser/screencast.py` → `/api/browser/frame` → WS →
-`BrowserLiveView`), for the same reason: it rides an existing capture rather than
-opening a new one.
+floating picture-in-picture panel mirrors what the agent sees. It rides an
+existing capture rather than opening a new one: `emit_snapshot_frame` POSTs the
+already-encoded JPEG to the loopback `/api/computer-use/frame` ingress, which
+rebroadcasts it to OWNER websockets as a `computer_use_frame` event. The
+in-gateway browse mirror this shape was modelled on is gone — browsing now runs
+through the external `playwright-cli` binary (`kiro_crew/browser_cli/`), which
+serves its own dashboard (`playwright-cli show`, supervised by
+`browser_cli/view.py`) instead of relaying frames through the gateway.
 
 **It is a RELAY, not a capture.** `capture_snapshot_image` hands the JPEG it just
 encoded for the model to `emit_snapshot_frame`. There is no timer, no second
@@ -2294,8 +2317,9 @@ dead button that only reproduces in a packaged build.
 
 ## The CLI (`kirocrew computer`) — and what is deliberately not ported
 
-`computer_use/cli.py`. Three verbs, hand-rolled dispatch mirroring
-`browser/cli.py`. Full command reference in [cli.md](cli.md).
+`computer_use/cli.py`. Three verbs, hand-rolled dispatch rather than argparse
+subparsers (the parent CLI forwards `REMAINDER`). Full command reference in
+[cli.md](cli.md).
 
 | Verb | For | Gated on the primary enable? |
 |---|---|---|
@@ -2317,14 +2341,14 @@ window list.
 ### `call` is a harness, not an eleventh tool
 
 `call` runs the existing tools through `tools.dispatch_tool` — **the same ordered
-chokepoint an agent call traverses**. The primary enable, the fail-closed
-`gate.require_computer_use`, the app denylist, index freshness, the secure-target
-refusals and the observation ceiling all apply, so `call` cannot see or do anything
-the agent could not. That is precisely what makes it a faithful reproduction tool
-rather than a debug backdoor, and it is why the implementation goes through
-`tools` rather than reaching into `service` (a test asserts that over the AST — a
-future "skip the overhead" edit would otherwise stay green while dropping
-governance on the floor).
+chokepoint an agent call traverses**. The fail-closed primary enable, the
+audit-only `gate.require_computer_use`, the app denylist, index freshness, the
+secure-target refusals and the observation ceiling all apply, so `call` cannot see
+or do anything the agent could not. That is precisely what makes it a faithful
+reproduction tool rather than a debug backdoor, and it is why the implementation
+goes through `tools` rather than reaching into `service` (a test asserts that over
+the AST — a future "skip the overhead" edit would otherwise stay green while
+dropping governance on the floor).
 
 One consequence, stated rather than left to be discovered: the session key is
 always the attended `cli_chat` surface (`sel._infer_source` → `cli`), used for the

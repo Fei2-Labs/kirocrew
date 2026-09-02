@@ -13,11 +13,12 @@ import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectS
 import { createSlot, appendSlotMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
 import { queryComposer } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
-import { applyNavIntentInMain } from './utils/navIntent'
+import { applyNavIntentInMain, chatDeepLinkSlot } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
 import { agentSwitchFailureMessage } from './utils/agentSwitchFeedback'
 import { readSendReceipt } from './utils/sendDelivery'
 import { updateAffordance } from './utils/updateAffordance'
+import { isNewSection } from './utils/releaseVersion'
 import { metricColor } from './utils/metricColor'
 import { fetchNotifications, ackNotification, armBootNotificationsFallback } from './store/notificationsSlice'
 import { useWebSocket } from './hooks/useWebSocket'
@@ -27,10 +28,12 @@ import { useBranding } from './hooks/useBranding'
 import { useRumPageView } from './hooks/useRumPageView'
 import { useIsMobile } from './hooks/useIsMobile'
 import { useSidePanelDock } from './hooks/useSidePanelDock'
+import { useDndSensors } from './hooks/useDndSensors'
 import { usePreviewFlag, usePreviewFlagRevision } from './hooks/usePreviewFlag'
 import { PREVIEW_ACP_BACKENDS } from './utils/previewFlags'
 import { setRailWidth, railWidthFor } from './hooks/useRailWidth'
 import { useFocusMode, useFocusChromeVisible, setFocusChromeVisible, FOCUS_INSET } from './hooks/useFocusMode'
+import { APP_NAV_ORDER_KEY, buildReorderBaseline, mergeVisibleReorder, readAppNavOrder, useAppNavHidden } from './lib/appNavHidden'
 import { computeHeaderDragGaps, type DragGap } from './lib/dragGaps'
 import { isEmbeddedPane } from './lib/embedded'
 import { useHoverIntent } from './hooks/useHoverIntent'
@@ -43,7 +46,7 @@ import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
 import { isMetricNumber, metricNumber } from './utils/metrics'
-import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
+import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, SquareTerminal, Bot, Smartphone, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
@@ -51,10 +54,29 @@ import AgentImportFlow from './components/AgentImportFlow'
 import PrivacyChapter from './components/PrivacyChapter'
 import { OnboardingShellHost } from './components/OnboardingChapterShell'
 import { PREVIEW_EXPAND_EVENT } from './components/WebPreviewPanel'
-import { motion, AnimatePresence } from 'framer-motion'
+import { canRenderMobileConnectKind } from './components/mobileConnectRenderers'
+import { motion, AnimatePresence, useMotionValue, useTransform } from 'framer-motion'
+import { useDrawerSwipe, animateDrawer, registerDrawerTargets, takeOverDrawer, safeAreaLeft } from './hooks/useDrawerSwipe'
+
+/** Mobile nav drawer travel: its 220px width + the 8px mx-2 inset + border. */
+/** Mobile nav drawer width. Shared with its travel below so the two cannot drift
+ *  — a travel wider than the panel spends the settle's tail moving something
+ *  already off the screen. */
+const MOBILE_NAV_WIDTH = 220
+/** The `mx-2` inset the panel sits at, so its left edge starts here. */
+const MOBILE_NAV_INSET = 8
+/** What it takes for the nav drawer to clear the screen: its own width, the
+ *  `mx-2` inset it starts at, a hair for the 1px border and `shadow-sm`'s
+ *  spread, and the safe-area inset — the panel is pinned at `left-safe`, so on a
+ *  notched phone in landscape it starts that far in and has to cross it too.
+ *  Was a flat 240, which both overshot the width by 9px (parking the panel
+ *  offscreen at 96% of the slide, so the rest of the settle moved nothing) and
+ *  ignored the inset (parking it with a strip still visible in landscape). */
+const mobileNavTravel = () =>
+  MOBILE_NAV_WIDTH + MOBILE_NAV_INSET + 3 + safeAreaLeft()
 import { usePersistedBool } from './hooks/usePersistedBool'
 import { isMacElectron, isWinElectron, isLinuxFramelessElectron } from './lib/electron'
-import { DndContext, closestCenter, MouseSensor, TouchSensor, useSensor, useSensors, DragOverlay, type DragStartEvent, type DragEndEvent } from '@dnd-kit/core'
+import { DndContext, closestCenter, DragOverlay, type DragStartEvent, type DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import ChatPage from './pages/ChatPage'
@@ -74,7 +96,6 @@ import LogsPage from './pages/LogsPage'
 import HooksPage from './pages/HooksPage'
 import WebhooksPage from './pages/WebhooksPage'
 import CapabilitiesPage from './pages/CapabilitiesPage'
-import KnowledgePage from './pages/KnowledgePage'
 // Lazy: /members is a standalone surface not needed at startup, and the main
 // chunk sits at its size budget — the import() boundary keeps the page (and
 // its drawer/roster tree) out of the initial bundle.
@@ -142,6 +163,12 @@ import { countUpdatables, registryQueryFn, type UpdatableInstalledRow } from './
 // mount gate at the render site means the chunk is fetched exactly when it
 // can render.
 const UpdateFoundModal = lazy(() => import('./components/UpdateFoundModal'))
+// The dialog is lazy; the renderer registry it consults is NOT (imported at the
+// top of this file). The nav rail decides whether to show the "Connect your
+// phone" row before this chunk is ever fetched, so a predicate hiding inside it
+// would answer "cannot draw" for every method until the user had already opened
+// a dialog the row never offered.
+const MobileConnectModal = lazy(() => import('./components/MobileConnectModal'))
 // Same boundary, same reason: the pill renders nothing without an update,
 // so its code rides the on-demand chunk instead of the app core.
 const UpdatePill = lazy(() => import('./components/UpdatePill'))
@@ -544,11 +571,18 @@ function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride,
   pressed?: boolean
 }) {
   const navigate = useNavigate()
+  // On mobile this row lives inside the nav DRAWER, whose slide runs on the
+  // compositor (animateDrawer) — and a framer layout-projection node under a
+  // compositor-driven ancestor transform mis-attributes the panel's travel to
+  // itself, compounding a corrective offset (the ChatSidebar rows measured
+  // >4,000px of it). The desktop rail is framer-free motion-wise, so it keeps
+  // the row-reorder glide that `layout` buys there.
+  const isMobileRow = useIsMobile()
   const iconEl = <span className={`app-icon-nav w-4 h-4 flex items-center justify-center shrink-0 transition-opacity ${active ? 'opacity-100 text-accent is-lit' : 'opacity-70'}`}>{icon}</span>
   const { tip, tipOn, rowRef, showTip, hideTip } = useNavTip<HTMLDivElement>(collapsed)
   const activate = () => { onClick?.(); (onClickOverride || (() => navigate(path)))() }
   return (
-    <motion.div layout="position"
+    <motion.div layout={isMobileRow ? undefined : 'position'}
       ref={rowRef}
       data-onboarding-nav={navId}
       // role+tabIndex+key handler make this a real keyboard-operable control
@@ -559,7 +593,7 @@ function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride,
       whileHover={collapsed ? undefined : { scale: 1.02 }}
       whileTap={{ scale: 0.97 }}
       transition={{ duration: 0.15 }}
-      className={`nav-item group/nav relative flex items-center rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 ${collapsed ? '' : 'overflow-hidden'} ${active ? 'nav-active text-text-strong bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
+      className={`nav-item group/nav relative flex items-center min-w-0 rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 ${collapsed ? '' : 'overflow-hidden'} ${active ? 'nav-active text-text-strong bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover'}`}
       onClick={activate}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate() } }}
       onMouseEnter={showTip}
@@ -585,7 +619,7 @@ function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride,
       {!collapsed && (
         <span
           aria-label={typeof label === 'string' ? label : undefined}
-          className="whitespace-nowrap overflow-hidden"
+          className="flex-1 min-w-0 truncate"
         >
           {label}
         </span>
@@ -701,9 +735,33 @@ function TasksRedirect() { const { search } = useLocation(); return <Navigate to
 function ChatRedirect() { const { search } = useLocation(); return <Navigate to={'/chat' + search} replace /> }
 function OrchestratedRedirect() { const { slug } = useParams(); const { search } = useLocation(); return <Navigate to={`/chat${slug ? '/' + slug : ''}${search}`} replace /> }
 
-/** How long the notification sheet's exit animation runs before the portal is
- *  unmounted. MUST match the `nc-slide-out` duration in tailwind.config.js. */
-const NC_CLOSE_MS = 240
+/**
+ * Desktop width of the notification sheet, in px.
+ *
+ * Stated as a constant because the PARKED offset is derived from it, and a
+ * parked offset that disagrees with the rendered width is not a cosmetic
+ * mismatch: too small leaves a strip of the sheet on screen before the
+ * entrance starts, too large stretches the entrance over travel the sheet
+ * never occupies. Tailwind cannot take an interpolated class, so the `w-[400px]`
+ * literal below is the second spelling — `App.notificationSheetExit.test.tsx`
+ * pins the two together.
+ */
+const NC_SHEET_DESKTOP_W = 400
+/** Extra travel past the sheet's own width so its shadow clears the edge too —
+ *  what `translateX(calc(100% + 20px))` used to spell. */
+const NC_SHEET_CLEARANCE = 20
+/**
+ * Backstop for the exit phase ONLY.
+ *
+ * `animateDrawer` reports arrival on every path it has — finish, browser-cancel,
+ * and the main-thread fallback it takes when there is no element or no
+ * `Element.animate` — so the unmount is normally driven by that callback and
+ * this timer never fires. It exists because a stuck `closing` phase would leave
+ * the bell inert (a tap during the exit is deliberately a no-op, see the
+ * `onClick` below), and it is deliberately far longer than the 240ms exit
+ * settle: a tight value would race the animation it is meant to outlive.
+ */
+const NC_CLOSE_BACKSTOP_MS = 1000
 
 /**
  * Topbar Notifications bell. The Notifications surface is `hiddenFromNav`, so
@@ -718,16 +776,73 @@ function NotificationsBellButton() {
   const dispatch = useAppDispatch()
   const items = useAppSelector(s => s.notifications.items)
   const isMobile = useIsMobile()
-  const [open, setOpen] = useState(false)
-  // Exit animation: the sheet must stay mounted long enough to slide back out,
-  // so dismissal flips `closing` (portal still rendered, sheet plays
-  // nc-slide-out) and a timer does the real unmount. Must match the
-  // animation duration in tailwind.config.js (`nc-slide-out`).
-  const [closing, setClosing] = useState(false)
+  /**
+   * ONE phase value, not an `open` + `closing` pair (mirrors the mobile nav
+   * drawer above and ChatPage's sessions drawer).
+   *
+   * The pair was the defect: dismissal set `closing = true` AND `open = false`
+   * in the same commit, while the sheet stayed on screen for the whole exit
+   * animation. For those 240ms the logical state said closed and the pixels said
+   * open, so the bell's `if (open) close() else open()` toggle read a tap as
+   * "it's closed, open it" and re-entered the sheet — the reported "tapped to
+   * dismiss and it opened again". A phase cannot disagree with itself: anything
+   * other than `closed` means the sheet is on screen.
+   */
+  const [phase, setPhase] = useState<'closed' | 'open' | 'closing'>('closed')
+  // Read by the handlers, which must see the phase this tap produced rather than
+  // the one their closure was rendered with.
+  const phaseRef = useRef(phase)
+  phaseRef.current = phase
+  const open = phase === 'open'
+  const closing = phase === 'closing'
   const [selectedTs, setSelectedTs] = useState<string | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const bellRef = useRef<HTMLButtonElement>(null)
+  const sheetRef = useRef<HTMLDivElement | null>(null)
+  /** Sheet offset in px: 0 at rest, +parked offscreen to the right. */
+  const sheetX = useMotionValue(0)
+  /**
+   * Where the sheet sits when parked offscreen.
+   *
+   * Measured off the mounted sheet when there is one. Before the first mount
+   * there is nothing to measure, so it is derived from the same rule the layout
+   * uses. On mobile that overshoots by the safe-area insets (0 in portrait), and
+   * overshooting is invisible — the sheet is offscreen either way and the settle
+   * still lands exactly on 0. Deriving it from `innerWidth` on DESKTOP would
+   * not be: the sheet is 400px there, so it would enter from far beyond its own
+   * edge and the 420ms would be spent crossing empty space.
+   */
+  const parkedOffset = useCallback(() => {
+    const measured = sheetRef.current?.offsetWidth
+    if (measured && measured > 0) return measured + NC_SHEET_CLEARANCE
+    const w = isMobile ? (typeof window !== 'undefined' ? window.innerWidth : 0) : NC_SHEET_DESKTOP_W
+    return w + NC_SHEET_CLEARANCE
+  }, [isMobile])
+  /**
+   * Point the settle at the real sheet so it runs on the COMPOSITOR, and — the
+   * reason this replaced the CSS keyframe pair — so a REVERSAL is continuous.
+   *
+   * `animate-nc-slide-in` / `animate-nc-slide-out` each began at a hardcoded
+   * endpoint, so swapping the class mid-flight teleported the sheet to the new
+   * animation's `from` instead of continuing from where it was. Measured on a
+   * 390px sheet: dismissing 100ms into the entrance jumped it the remaining
+   * ~100px to fully-open before sliding out (~325px at 30ms), and re-opening
+   * 50ms into the exit flung it the full 410px offscreen and replayed the entire
+   * 420ms entrance. `animateDrawer` keyframes from the offset the outgoing
+   * animation is PRESENTING, which is exactly the discontinuity those two
+   * measurements are.
+   *
+   * `scrim: null` because the sheet's column scrim is its own CHILD and travels
+   * with it; there is no separate backdrop to fade in lockstep. Safe against
+   * registerDrawerTargets' projection precondition because nothing under
+   * `components/notifications/` imports framer-motion at all.
+   */
+  useEffect(() => registerDrawerTargets(sheetX, {
+    panel: () => sheetRef.current,
+    scrim: () => null,
+    travel: parkedOffset,
+  }), [sheetX, parkedOffset])
   // Badge counts attention-worthy rows only (RFC Phase 3): passive and
   // muted-channel (silenced) rows are excluded, mirroring the backend's
   // _unread_count semantics.
@@ -742,27 +857,45 @@ function NotificationsBellButton() {
 
   // Single dismissal path: every close (bell toggle, outside click, Escape,
   // navigation, error fallback) goes through here so the sheet always gets its
-  // slide-out instead of being torn down instantly.
+  // slide-out instead of being torn down instantly. Re-entrant by design — a
+  // second dismissal while one is already running must not restart the settle.
   const closePanel = useCallback(() => {
-    if (open) setClosing(true)
-    setOpen(false)
+    if (phaseRef.current !== 'open') return
+    phaseRef.current = 'closing'
+    setPhase('closing')
     setSelectedTs(null)
-  }, [open])
+    takeOverDrawer(sheetX)
+    animateDrawer(sheetX, parkedOffset(), () => {
+      phaseRef.current = 'closed'
+      setPhase('closed')
+    })
+  }, [sheetX, parkedOffset])
 
   const openPanel = useCallback(() => {
-    setClosing(false)
-    setOpen(true)
+    if (phaseRef.current === 'open') return
+    // Seat the parked offset BEFORE the phase flips: the render below serializes
+    // `sheetX.get()` into the sheet's inline transform, so writing the value
+    // first is what makes the FIRST painted frame offscreen instead of a flash
+    // at rest followed by an entrance from nowhere.
+    if (phaseRef.current === 'closed') sheetX.set(parkedOffset())
+    phaseRef.current = 'open'
+    setPhase('open')
     setSelectedTs(null)
+    takeOverDrawer(sheetX)
+    animateDrawer(sheetX, 0)
     recordEvent('notifications_open', { source: 'topbar' })
-  }, [])
+  }, [sheetX, parkedOffset])
 
-  // Unmount the portal once the exit animation has played. Reopening mid-flight
-  // clears `closing` first, which cancels this timer via the cleanup.
+  // See NC_CLOSE_BACKSTOP_MS: `animateDrawer`'s arrival callback owns the
+  // unmount, and this only rescues a phase that never heard back at all.
   useEffect(() => {
-    if (!closing) return
-    const t = window.setTimeout(() => setClosing(false), NC_CLOSE_MS)
+    if (phase !== 'closing') return
+    const t = window.setTimeout(() => {
+      phaseRef.current = 'closed'
+      setPhase('closed')
+    }, NC_CLOSE_BACKSTOP_MS)
     return () => window.clearTimeout(t)
-  }, [closing])
+  }, [phase])
 
   // While the sheet plays its exit animation it is STILL in the DOM, so it must
   // stop being interactive in every modality — not just the pointer. `inert`
@@ -773,11 +906,6 @@ function NotificationsBellButton() {
   const leavingProps = (closing
     ? { inert: '', 'aria-hidden': true }
     : {}) as HTMLAttributes<HTMLDivElement>
-  // Desktop slides a fixed 400px sheet by px; mobile is full-width, so it needs
-  // the percentage variant (see the keyframe comment in tailwind.config.js).
-  const sheetAnim = closing
-    ? (isMobile ? 'animate-nc-slide-out-full' : 'animate-nc-slide-out')
-    : (isMobile ? 'animate-nc-slide-in-full' : 'animate-nc-slide-in')
 
   // Close popover when navigating (e.g. detail panel's "Go to Chat" buttons)
   const lastPathRef = useRef(location.pathname)
@@ -824,7 +952,7 @@ function NotificationsBellButton() {
       <button
         ref={bellRef}
         className={`flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 relative ${open ? 'text-accent' : 'text-muted hover:text-text'}`}
-        onClick={() => { if (open) closePanel(); else openPanel() }}
+        onClick={() => { if (phaseRef.current === 'closed') openPanel(); else closePanel() }}
         title={unacked.length > 0 ? i18nT('app.notification_count', { count: unacked.length }) : i18nT('app.notifications')}
         aria-label={i18nT('app.notifications')}
         aria-haspopup="dialog"
@@ -866,8 +994,17 @@ function NotificationsBellButton() {
               (header, controls, notification rows) is its own floating
               material card instead. */}
           <div
+            ref={sheetRef}
             {...leavingProps}
-            className={`absolute top-0 bottom-0 right-0 ${closing ? 'pointer-events-none' : 'pointer-events-auto'} ${isMobile ? 'w-full' : 'w-[400px]'} flex flex-col isolate ${sheetAnim}`}
+            data-nc-phase={phase}
+            className={`absolute top-0 bottom-0 right-0 ${closing ? 'pointer-events-none' : 'pointer-events-auto'} ${isMobile ? 'w-full' : 'w-[400px]'} flex flex-col isolate`}
+            // Serialized from the MotionValue rather than bound through framer:
+            // this element is not framer-bound, and `animateDrawer` writes the
+            // arrival into the element's own inline style for exactly that
+            // reason. A re-render mid-settle re-serializes a stale offset here,
+            // which is harmless — a running animation on `transform` wins over
+            // the inline style, and the settle publishes the final value itself.
+            style={{ transform: `translate3d(${sheetX.get()}px, 0, 0)` }}
           >
             {/* Column scrim — macOS NC dims/blurs only the strip behind the
                 cards and it travels WITH the sheet. The layer extends 80px
@@ -1029,6 +1166,24 @@ export default function App() {
   // every mousemove during a grip-drag, and a primitive snapshot lets
   // useSyncExternalStore's Object.is check skip those re-renders of App.
   const bottomTerminalOpen = useBottomTerminalOpen()
+  // "Connect your phone" rail entry. The methods come from the CPP
+  // mobile_connect seam filtered by governance; an empty list (edition
+  // returned none, policy denied all, seam degraded) hides the row entirely —
+  // the endpoint is the authority, the frontend never guesses.
+  const [mobileConnectOpen, setMobileConnectOpen] = useState(false)
+  const mobileConnectQuery = useQuery({
+    queryKey: ['mobile-connect-methods'],
+    queryFn: api.mobileConnectMethods,
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+  // Only kinds this frontend can draw — a built-in section or an edition's
+  // registered renderer (`components/mobileConnectRenderers.tsx`). A kind
+  // nothing can draw would otherwise show the rail row and then open an empty
+  // dialog, so the predicate, not a literal list, is what gates the row.
+  const mobileConnectKinds = (mobileConnectQuery.data?.methods ?? [])
+    .map(m => m.kind)
+    .filter(canRenderMobileConnectKind)
   // Selected session's project directory: a terminal opened from the nav row
   // starts there (server default when no session is selected or it has none).
   const activeSlotProject = useAppSelector(selectActiveSlotProject)
@@ -1433,11 +1588,107 @@ export default function App() {
     const t = window.setTimeout(() => setShellEntered(true), 600)
     return () => window.clearTimeout(t)
   }, [])
-  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  /**
+   * Mobile nav drawer, as ONE phase value (mirrors ChatPage's sessions drawer):
+   * `closing` keeps the panel mounted while it slides out. The slide itself
+   * runs on the COMPOSITOR via animateDrawer — the shell shares its main
+   * thread with every streaming session, so a framer main-thread tween here
+   * dropped frames exactly when the app was busiest. The width used by the
+   * offset is the drawer's own 220px + its 8px inset, not the viewport.
+   */
+  const [mobileNavPhase, setMobileNavPhase] = useState<'closed' | 'open' | 'closing'>('closed')
+  const mobileNavMounted = mobileNavPhase !== 'closed'
+  const mobileNavPhaseRef = useRef(mobileNavPhase)
+  mobileNavPhaseRef.current = mobileNavPhase
+  /** Panel offset in px: -mobileNavTravel() offscreen, 0 at rest. */
+  const mobileNavX = useMotionValue(0)
+  const mobileNavPanelRef = useRef<HTMLElement | null>(null)
+  const mobileNavScrimRef = useRef<HTMLDivElement | null>(null)
+  /**
+   * The dashboard shell — the common ancestor of `<main>`, the nav drawer's
+   * panel and its scrim. Bound rather than `<main>` because the panel and scrim
+   * are `fixed` siblings OUTSIDE it, so a gesture rooted at `<main>` never sees
+   * the touches that should CLOSE the drawer: the finger lands on the scrim or
+   * the panel, and the listener is on an element neither is inside.
+   *
+   * Widening the root does not widen what arms: dialogs render through a portal
+   * to `document.body`, so they are outside this element entirely, and a page
+   * with its own drawer claims its sides with `data-owns-swipe`.
+   */
+  const shellRef = useRef<HTMLDivElement | null>(null)
+  // Safe against the projection bug only because the drawer's nav rows drop
+  // their `layout` prop on mobile — see registerDrawerTargets' precondition.
+  useEffect(() => registerDrawerTargets(mobileNavX, {
+    panel: () => mobileNavPanelRef.current,
+    scrim: () => mobileNavScrimRef.current,
+    travel: mobileNavTravel,
+  }), [mobileNavX])
+  const openMobileNav = useCallback(() => {
+    if (mobileNavPhaseRef.current === 'open') return
+    if (mobileNavPhaseRef.current === 'closed') mobileNavX.set(-mobileNavTravel())
+    mobileNavPhaseRef.current = 'open'
+    setMobileNavPhase('open')
+    animateDrawer(mobileNavX, 0)
+  }, [mobileNavX])
+  /** Scrim opacity derived from the panel's own offset: 1 at rest, 0 as it
+   *  clears the edge, so a half-open drag is half-dimmed and a cancelled drag
+   *  un-dims with the finger. Divided by the drawer's OWN travel, matching the
+   *  sessions drawer. A literal `opacity: 0` was correct only while the tap was
+   *  the sole mover — the compositor settle animates the scrim in lockstep and
+   *  never reads this, but a DRAG writes the MotionValue and nothing else would
+   *  paint the dim. */
+  const mobileNavScrim = useTransform(mobileNavX, x =>
+    Math.max(0, Math.min(1, 1 + x / Math.max(1, mobileNavTravel()))))
+  const closeMobileNavDrawer = useCallback(() => {
+    if (mobileNavPhaseRef.current !== 'open') return
+    mobileNavPhaseRef.current = 'closing'
+    setMobileNavPhase('closing')
+    takeOverDrawer(mobileNavX)
+    animateDrawer(mobileNavX, -mobileNavTravel(), () => {
+      mobileNavPhaseRef.current = 'closed'
+      setMobileNavPhase('closed')
+    })
+  }, [mobileNavX])
+  /**
+   * Mount the drawer for a gesture that has begun opening it, WITHOUT the slide
+   * `openMobileNav` would start: the finger owns the offset from here until it
+   * lifts, and a settle running against it would pull the panel out from under
+   * the drag. Same split as the chat page's own drawer.
+   */
+  const beginMobileNavDrag = useCallback(() => {
+    mobileNavPhaseRef.current = 'open'
+    setMobileNavPhase('open')
+  }, [])
+  /**
+   * The nav drawer is reachable by swipe on EVERY page, not just chat: the
+   * gesture is bound on the shell, so it covers both the page content that opens
+   * it and the scrim/panel that close it. A page owning the same side declares
+   * `data-owns-swipe` on the element it binds, which suppresses this instance
+   * there (the chat page keeps its sessions drawer on a rightward drag). The
+   * hamburger stays the discoverable path.
+   */
+  useDrawerSwipe(shellRef, {
+    enabled: isMobile,
+    travel: mobileNavTravel,
+    open: mobileNavPhase === 'open',
+    x: mobileNavX,
+    onGestureOpen: beginMobileNavDrag,
+    onSettle: open => {
+      if (open) return
+      mobileNavPhaseRef.current = 'closed'
+      setMobileNavPhase('closed')
+    },
+  })
 
   // Dynamic app nav items — all apps (builtin + installed) with UI pages
   const [appNavItems, setAppNavItems] = useState<Array<{ path: string; id: string; label: string; group: string; icon: React.ReactElement }>>([])
-  const [appNavOrder, setAppNavOrder] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem('mc-app-nav-order') || '[]') } catch { return [] } })
+  const [appNavOrder, setAppNavOrder] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem(APP_NAV_ORDER_KEY) || '[]') } catch { return [] } })
+  // Which app rows the user UNPINNED from the sidebar via the Library
+  // launchpad grid (`mc-app-nav-hidden`, owned by `lib/appNavHidden.ts`).
+  // The shared hook keeps this live under both propagation paths (same-tab
+  // change event + cross-tab `storage`), so a pin toggle in LibraryPage
+  // re-renders the rail immediately.
+  const appNavHidden = useAppNavHidden()
   // Preview-gated surfaces (see `utils/previewFlags.ts`) must not be advertised
   // anywhere. `surfacePreviewEnabled` is a synchronous storage read, so the rail
   // needs this subscription to re-render when Developer > Feature Previews flips a flag —
@@ -1463,30 +1714,77 @@ export default function App() {
   // open a gap as you drag, and a DragOverlay renders the floating ghost.
   // activeAppDragId tracks the app being dragged, for the overlay + source dim.
   const [activeAppDragId, setActiveAppDragId] = useState<string | null>(null)
-  // Split mouse/touch sensors so touch can both scroll AND drag:
-  //  - MouseSensor: 8px distance lets a plain click reach NavItem navigation;
-  //    only a deliberate drag past the threshold starts a reorder (desktop).
-  //  - TouchSensor: 250ms press-and-hold (5px tolerance) arms a drag, so a
-  //    quick finger-swipe still scrolls the nav rail natively and only a
-  //    deliberate hold starts a reorder. A single PointerSensor can't do this:
-  //    its `touch-action: none` requirement steals every swipe for dragging.
-  const appDndSensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
-  )
+  // Split mouse/touch sensors so touch can both scroll AND drag; the split and
+  // its WebKit reasoning live in the shared hook. 8px of mouse travel is this
+  // rail's own choice: a plain click has to reach NavItem navigation, so the
+  // threshold sits higher than a list whose rows only select.
+  const appDndSensors = useDndSensors({ distance: 8 })
   // Collapse a long Apps list behind a "N more" toggle so the nav can't grow
   // unbounded. Above APPS_NAV_LIMIT visible entries the overflow is hidden until
   // the user expands (persisted).
   const APPS_NAV_LIMIT = 6
   const [appsExpanded, setAppsExpanded] = useState(() => localStorage.getItem('mc-apps-expanded') === '1')
   const toggleAppsExpanded = useCallback(() => setAppsExpanded(v => { const next = !v; safeSetItem('mc-apps-expanded', next ? '1' : '0'); return next }), [])
-  const sortedAppGroup = useMemo(() => {
-    const items = [...advertisedNavItems.filter(n => n.group === 'Apps'), ...appNavItems]
-    if (appNavOrder.length === 0) return items
+  const { sortedAppGroup, sortedAppGroupAllIds } = useMemo(() => {
+    // Drop rows the user unpinned in the Library launchpad BEFORE the
+    // APPS_NAV_LIMIT slice downstream, so a hidden row never consumes a
+    // visible slot. The hidden set only ever contains ids written by the
+    // Library grid — `appNavTarget(app).id` values, byte-identical to the
+    // ids these rows carry — so set membership can only hide grid-managed
+    // app rows. The Discover/Library built-ins are not list rows here
+    // (`hiddenFromNav`, rendered as the section-header accent links) and
+    // can never be filtered out by this.
+    //
+    // `sortedAppGroupAllIds` is the same effective order WITHOUT the hidden
+    // filter — what the rail would show if everything were pinned. It seeds
+    // the drag-reorder merge so a hidden app's position survives even when
+    // `mc-app-nav-order` is empty or has never listed it (its slot is then
+    // implicit in this natural order, and persisting only the visible ids
+    // would erase it).
+    const all = [...advertisedNavItems.filter(n => n.group === 'Apps'), ...appNavItems]
     const orderMap = new Map(appNavOrder.map((id, i) => [id, i]))
-    return items.sort((a, b) => (orderMap.get(a.id) ?? 999) - (orderMap.get(b.id) ?? 999))
-  }, [advertisedNavItems, appNavItems, appNavOrder])
+    const sortedAll = appNavOrder.length === 0
+      ? all
+      : [...all].sort((a, b) => (orderMap.get(a.id) ?? 999) - (orderMap.get(b.id) ?? 999))
+    return {
+      sortedAppGroupAllIds: sortedAll.map(n => n.id),
+      sortedAppGroup: sortedAll.filter(n => !appNavHidden.has(n.id)),
+    }
+  }, [advertisedNavItems, appNavItems, appNavOrder, appNavHidden])
   const handleAppDragStart = useCallback((e: DragStartEvent) => setActiveAppDragId(e.active.id as string), [])
+  // Materialize implicit sidebar positions the moment an app is HIDDEN: once
+  // an id is in the hidden set, its position must live in the persisted
+  // order, because every later event that could erase the implicit source —
+  // disabling the app (drops its nav row), uninstall, a reorder — happens
+  // while the row is invisible. Persisting the full effective order at
+  // hide-time makes `mc-app-nav-order` authoritative for hidden ids, closing
+  // the whole class (hide→disable→drag→re-pin lands the app back in its
+  // original slot). Guarded to ids that currently HAVE an effective row:
+  // an id with none (already uninstalled) cannot be materialized and must
+  // not retrigger the write.
+  useEffect(() => {
+    if (appNavHidden.size === 0) return
+    // FRESH read, never the React copy: another tab may have reordered
+    // since this tab last wrote, and a baseline seeded with the stale copy
+    // would overwrite that tab's saved order (there is no cross-tab
+    // propagation for the order key).
+    const stored = readAppNavOrder()
+    const persisted = new Set(stored)
+    const materializable = [...appNavHidden].some(
+      id => !persisted.has(id) && sortedAppGroupAllIds.includes(id))
+    if (!materializable) return
+    const next = buildReorderBaseline(stored, sortedAppGroupAllIds)
+    // Persist FIRST and mirror into state only on success: a failed write
+    // (quota, storage denied) leaves the fresh-read guard permanently
+    // unsatisfied, so setting state anyway would re-trigger this effect with
+    // a new array reference every render — an infinite update loop. Skipping
+    // the state set on failure loses nothing visible (the baseline preserves
+    // the currently rendered order), and the write is retried on the next
+    // deps change.
+    if (safeSetItem(APP_NAV_ORDER_KEY, JSON.stringify(next))) {
+      setAppNavOrder(next)
+    }
+  }, [appNavHidden, sortedAppGroupAllIds])
   const handleAppDragEnd = useCallback((e: DragEndEvent) => {
     setActiveAppDragId(null)
     const { active, over } = e
@@ -1495,10 +1793,22 @@ export default function App() {
     const from = ids.indexOf(active.id as string)
     const to = ids.indexOf(over.id as string)
     if (from < 0 || to < 0) return
-    const next = arrayMove(ids, from, to)
-    setAppNavOrder(next)
-    safeSetItem('mc-app-nav-order', JSON.stringify(next))
-  }, [sortedAppGroup])
+    const moved = arrayMove(ids, from, to)
+    // `sortedAppGroup` excludes hidden (unpinned) rows, so persisting `moved`
+    // alone would ERASE a hidden app's slot — re-pinning would dump it at the
+    // end. The baseline is the FRESHLY-READ persisted order UNION the current
+    // effective order: reading storage (not the React copy) keeps a reorder
+    // made in another tab from being overwritten, the persisted array can
+    // remember ids with no current nav row at all (a hidden app that is
+    // temporarily DISABLED has no appNavItems entry), and the effective tail
+    // carries never-reordered apps whose slot is only implicit
+    // (see buildReorderBaseline / mergeVisibleReorder).
+    const next = mergeVisibleReorder(
+      buildReorderBaseline(readAppNavOrder(), sortedAppGroupAllIds), ids, moved)
+    if (safeSetItem(APP_NAV_ORDER_KEY, JSON.stringify(next))) {
+      setAppNavOrder(next)
+    }
+  }, [sortedAppGroup, sortedAppGroupAllIds])
   // Drag cancel (e.g. Escape) fires onDragCancel, NOT onDragEnd — clear the
   // active id here too, else the source row stays dimmed and the overlay ghost
   // lingers. Mirrors ChatSidebar's handleSidebarDragCancel.
@@ -2073,16 +2383,35 @@ export default function App() {
     const electronAPI = (window as Window & { electronAPI?: { setDevMode?: (v: boolean) => void } }).electronAPI
     electronAPI?.setDevMode?.(devMode)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
-  // Native app-menu navigation (Settings…, About): the Electron main process
-  // sends an in-app path; route to it. Accept only plain absolute app paths —
-  // rejects protocol-relative ("//host") and external URLs by construction.
+  // Native app-menu navigation (Settings…, About) and the Crew Companion's "Open
+  // session" CTA: the Electron main process sends an in-app path; route to it.
+  // Accept only plain absolute app paths — rejects protocol-relative ("//host")
+  // and external URLs by construction.
+  //
+  // A session deep link takes the same route a popout's nav intent does — select
+  // the session, then navigate — rather than a bare navigate. `?sid=` is read by
+  // ChatPage only while it MOUNTS, so from an already-open /chat a bare navigate
+  // would surface the dashboard with the previous session still on screen: the
+  // window comes forward and the notification appears to have opened nothing.
   useEffect(() => {
     const electronAPI = (window as Window & { electronAPI?: { onNavigate?: (cb: (path: string) => void) => () => void } }).electronAPI
     if (!electronAPI?.onNavigate) return
     return electronAPI.onNavigate(path => {
-      if (typeof path === 'string' && /^\/(?!\/)/.test(path)) navigate(path)
+      if (typeof path !== 'string' || !/^\/(?!\/)/.test(path)) return
+      const slotKey = chatDeepLinkSlot(path)
+      if (slotKey) {
+        applyNavIntentInMain(
+          // `path` is deliberately dropped in favour of the bare route: a
+          // NavIntent carries no query string, and ChatPage writes `?sid=` back
+          // into the URL itself once the session is active.
+          { path: '/chat', slotKey },
+          { navigate, switchSlot: (key) => { dispatch(switchSlot(key)) } },
+        )
+        return
+      }
+      navigate(path)
     })
-  }, [navigate])
+  }, [navigate, dispatch])
   // Dismiss the dev-page notification dot once the user visits /developer
   useEffect(() => {
     if (location.pathname === '/developer') setDevPageSeen(true)
@@ -2125,21 +2454,35 @@ export default function App() {
     if (lastSeen === version) return
     // First visit — no baseline to diff, just record current version
     if (!lastSeen) { safeSetItem('mc-last-version', version); return }
-    // Version changed — show only new entries since lastSeen
+    // Version changed — show the sections in `lastSeen < v <= version`, and
+    // nothing else. Both bounds are load-bearing, and the missing UPPER one is
+    // the reported bug: `main` is bumped a minor ahead of the released line and a
+    // release's notes are written when it ships, so the newest section in the
+    // file is routinely OLDER than the running build. A 0.6.0 build was opening a
+    // modal headed `[0.4.0]` — the last released line — offering to update to it.
+    //
+    // The lower bound is a version COMPARISON rather than the old equality test
+    // against the last-seen heading. Every build between two releases has no
+    // section of its own, so equality matched nothing and the slice ran to
+    // end-of-file, which is how the stale section got in.
     api.changelog().then(d => {
       if (!d.content) return
-      const lines = d.content.split('\n')
       const filtered: string[] = []
       let include = false
-      for (const line of lines) {
-        if (line.startsWith('## [')) {
-          const v = line.match(/## \[([^\]]+)\]/)?.[1]
-          if (v && lastSeen && v === lastSeen) break
-          include = true
+      for (const line of d.content.split('\n')) {
+        // ANY level-2 heading ends the preceding section, matching the renderer
+        // (`changelog.py:_H2_RE`). Keying only on `## [` left an unversioned
+        // heading and its body inside whichever section came before it.
+        if (/^##\s+\S/.test(line)) {
+          const v = line.match(/^##\s+\[([^\]]+)\]/)?.[1]
+          include = !!v && isNewSection(v, lastSeen, version)
         }
         if (include) filtered.push(line)
       }
       const text = filtered.join('\n').trim()
+      // No qualifying section means this build's release has no notes yet, which
+      // is the normal state on a dev build. Say nothing: the modal exists to
+      // deliver notes, and one carrying someone else's is worse than none.
       if (text) { setChanges(text); setShowChangelog(true) }
     }).catch(() => {}).finally(() => safeSetItem('mc-last-version', version))
   }, [version])  
@@ -2245,7 +2588,7 @@ export default function App() {
   }, [dispatch, navigate, colorTheme, appStore])
 
   const toggleNav = () => {
-    if (isMobile) { setMobileNavOpen(p => !p) }
+    if (isMobile) { if (mobileNavPhaseRef.current === 'open') closeMobileNavDrawer(); else openMobileNav() }
     else if (focusActive) {
       // The rail is a hover-held overlay in focus mode and always full width, so
       // there is no collapsed state to toggle into. The same control puts it away
@@ -2260,9 +2603,19 @@ export default function App() {
     }
   }
   // Close mobile nav on route change
-  useEffect(() => { if (isMobile) setMobileNavOpen(false) }, [location.pathname]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (isMobile) closeMobileNavDrawer() }, [location.pathname]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Escape closes the open drawer — the keyboard's dismissal path. The scrim's
+  // click-to-dismiss is pointer-only (it is aria-hidden and unfocusable, so a
+  // full-screen tab stop never appears in the tab order).
+  useEffect(() => {
+    if (!isMobile || mobileNavPhase !== 'open') return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeMobileNavDrawer() }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [isMobile, mobileNavPhase, closeMobileNavDrawer])
   // Reset mobile nav state when leaving mobile viewport
-  useEffect(() => { if (!isMobile) setMobileNavOpen(false) }, [isMobile])
+  // Leaving mobile: drop the panel with no slide (no drawer exists on desktop).
+  useEffect(() => { if (!isMobile) { setMobileNavPhase('closed'); takeOverDrawer(mobileNavX) } }, [isMobile, mobileNavX])
   // Focus mode forces the rail EXPANDED regardless of the user's collapse
   // preference. A collapsed rail is 74px, and as a hover-held overlay that is a
   // hard target to keep the pointer inside — it puts itself away the moment you
@@ -2282,7 +2635,7 @@ export default function App() {
   // query. Nothing measures a cluster any more — the drag-region reporter
   // addresses the header itself and the layout tests match the group classes, so
   // the two cluster refs this used to keep are gone with the measurement.
-  const closeMobileNav = isMobile ? () => setMobileNavOpen(false) : undefined
+  const closeMobileNav = isMobile ? closeMobileNavDrawer : undefined
   const activePath = location.pathname
   // App Store split (PR1): two sidebar entries share the /apps namespace.
   //  - Library owns /apps/library and everything under it.
@@ -2351,8 +2704,10 @@ export default function App() {
     ) : (
     /* h-dvh (100vh fallback) so the shell tracks the visible viewport on
        mobile: a 100vh shell extends under the browser's collapsible UI,
-       which hides the bottom row (the chat composer) on phones. */
-    <div className="h-screen supports-[height:100dvh]:h-dvh w-screen flex flex-col overflow-hidden bg-bg">
+       which hides the bottom row (the chat composer) on phones.
+       w-full, not w-screen: 100vw resolves independently of layout, so it can
+       disagree with the `(max-width: 767px)` query this shell branches on. */
+    <div className="h-screen supports-[height:100dvh]:h-dvh w-full flex flex-col overflow-hidden bg-bg">
       {/* Embedded remote panes receive their switcher model from the parent via
           this bridge (option B) — no-op in the top-level dashboard. */}
       <EmbeddedHostBridge />
@@ -2365,6 +2720,7 @@ export default function App() {
           instance tab is active, so local state/websocket survive the switch. */}
       <div className="absolute inset-0" style={{ display: activeInstanceId === null ? 'block' : 'none' }}>
     <div
+      ref={shellRef}
       data-testid="dashboard-shell"
       className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg p-safe ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
       // Retire the entrance animation once it has played, so re-showing this
@@ -2954,36 +3310,34 @@ export default function App() {
               <div className="text-sm font-bold text-text-strong"><Package className="lucide-inline" /> {i18nT('app.v')}{version}</div>
               <button aria-label={i18nT('app.close')} className="text-muted text-[13px] cursor-pointer hover:text-text" onClick={() => { setShowChangelog(false); setShowFull(false) }}><X className="lucide-inline" /></button>
             </div>
+            {/* The notes are this modal's PAYLOAD, not a garnish on an update
+                offer, so they are no longer gated on `updateAvailable`. The
+                modal opens on a version CHANGE — the reader already has the
+                build — and the common case right after an update is that no
+                further update is pending, which is exactly when the old gate
+                replaced the notes with "You're on the latest version" and
+                delivered nothing. Availability is a separate fact and now has
+                its own row below. */}
+            <div className="text-[13px] font-medium text-muted uppercase tracking-wider mb-2">{i18nT('app.what_s_new')}</div>
+            <div className="p-3 bg-bg rounded-lg border border-border max-h-56 overflow-y-auto mb-4">
+              <div className="text-[13px] text-text leading-relaxed"><MarkdownRenderer content={changes} /></div>
+            </div>
             {updateAvailable ? (
-              <>
-                {changes ? (
-                  <>
-                    <div className="text-[13px] font-medium text-muted uppercase tracking-wider mb-2">{i18nT('app.what_s_new')}</div>
-                    <div className="p-3 bg-bg rounded-lg border border-border max-h-56 overflow-y-auto mb-4">
-                      <div className="text-[13px] text-text leading-relaxed"><MarkdownRenderer content={changes} /></div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="p-3 bg-bg rounded-lg border border-border mb-4">
-                    <div className="text-[13px] text-muted leading-relaxed">{i18nT('app.a_newer_version_is_available_no_changelog_entry')}</div>
-                  </div>
-                )}
-                {affordance === 'apply' ? (
-                  <button className="w-full py-2 rounded-lg text-[13px] font-medium cursor-pointer bg-accent text-accent-fg border-none hover:opacity-90 transition-opacity" onClick={handleUpdate}>
-                    {i18nT('app.update_now')}
-                  </button>
-                ) : affordance === 'command' ? (
-                  // This install cannot replace its own code from here: `POST
-                  // /api/update` is git fetch + reset, so a wheel install answers
-                  // 400/409 and a desktop bundle is owned by its own updater.
-                  // Settings > About carries the same command with an explanation
-                  // and a copy button.
-                  <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
-                    data-testid="modal-update-command">
-                    {updateCommand}
-                  </div>
-                ) : null}
-              </>
+              affordance === 'apply' ? (
+                <button className="w-full py-2 rounded-lg text-[13px] font-medium cursor-pointer bg-accent text-accent-fg border-none hover:opacity-90 transition-opacity" onClick={handleUpdate}>
+                  {i18nT('app.update_now')}
+                </button>
+              ) : affordance === 'command' ? (
+                // This install cannot replace its own code from here: `POST
+                // /api/update` is git fetch + reset, so a wheel install answers
+                // 400/409 and a desktop bundle is owned by its own updater.
+                // Settings > About carries the same command with an explanation
+                // and a copy button.
+                <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
+                  data-testid="modal-update-command">
+                  {updateCommand}
+                </div>
+              ) : null
             ) : (
               <div className="text-sm text-muted py-4 text-center"><CheckCircle className="lucide-inline" /> {i18nT('app.you_re_on_the_latest_version')}</div>
             )}
@@ -3012,6 +3366,11 @@ export default function App() {
       {updateAvailable && (
         <Suspense fallback={null}>
           <UpdateFoundModal />
+        </Suspense>
+      )}
+      {mobileConnectOpen && (
+        <Suspense fallback={null}>
+          <MobileConnectModal kinds={mobileConnectKinds} onClose={() => setMobileConnectOpen(false)} />
         </Suspense>
       )}
 
@@ -3079,20 +3438,25 @@ export default function App() {
         />
       </OnboardingShellHost>
 
-      {/* Mobile backdrop */}
-      <AnimatePresence>
-        {isMobile && mobileNavOpen && (
-          <motion.div
-            key="nav-backdrop"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.25 }}
-            className="fixed inset-0 z-[46] bg-black/50 backdrop-blur-sm"
-            onClick={() => setMobileNavOpen(false)}
-          />
-        )}
-      </AnimatePresence>
+      {/* Mobile backdrop — opacity is animated by animateDrawer in lockstep
+          with the panel (compositor), so there is no framer fade here; it
+          mounts at 0 and the slide carries it. Mounted for the whole phase so
+          the slide-out fade is not cut short.
+          aria-hidden: the scrim is decorative — its click-to-dismiss is a
+          pointer convenience, and keyboard users dismiss via Escape (handled
+          where the drawer state lives). A focusable full-screen scrim would
+          add a giant tab stop over the whole page, which is why this is NOT
+          the Clickable component. */}
+      {isMobile && mobileNavMounted && (
+        <motion.div
+          ref={mobileNavScrimRef}
+          data-testid="nav-backdrop"
+          aria-hidden="true"
+          style={{ opacity: mobileNavScrim }}
+          className="fixed inset-0 z-[46] bg-black/50 backdrop-blur-sm"
+          onClick={closeMobileNavDrawer}
+        />
+      )}
 
       {/* Nav */}
       {/* Desktop rail and mobile drawer share one body but get DIFFERENT
@@ -3381,6 +3745,20 @@ export default function App() {
                   onClickOverride={() => { if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
                 />
               )}
+              {mobileConnectKinds.length > 0 && (
+                <NavItem
+                  path="#"
+                  label={i18nT('app.connect_your_phone')}
+                  icon={<Smartphone size={16} />}
+                  /* Toggles the connect dialog instead of navigating — same
+                     contract as the terminal row above. */
+                  active={mobileConnectOpen}
+                  pressed={mobileConnectOpen}
+                  collapsed={effectiveCollapsed}
+                  onClick={closeMobileNav}
+                  onClickOverride={() => setMobileConnectOpen(true)}
+                />
+              )}
               <div>{renderNavRow(cap)}</div>
               <NavItem
                 path={s.path}
@@ -3471,8 +3849,8 @@ export default function App() {
         })()}
         </>)
         return isMobile ? (
-          <AnimatePresence>
-            {mobileNavOpen && (
+          <>
+            {mobileNavMounted && (
               /* mt-2, unlike the desktop rail's mt-0: this form is `fixed` to the
                  VIEWPORT top rather than sitting in the grid row below the
                  topbar, so mt-0 pressed the card's rounded top edge flat against
@@ -3480,12 +3858,22 @@ export default function App() {
                  the 8px inset on all four keeps the drawer reading as one
                  floating card. `top-0 bottom-0` with both margins resolves the
                  height to viewport-16px, so nothing is clipped. */
+              /* motion.nav, like the sessions drawer and the right overlay: a
+                 drag writes `mobileNavX` directly and ONLY a live binding paints
+                 those frames. A plain <nav> reading `mobileNavX.get()` at render
+                 time was correct while the tap was this panel's only mover —
+                 a MotionValue deliberately does not re-render React, so once the
+                 drawer gained a gesture the panel froze after the single
+                 re-render the lock happens to cause, and moved only on release
+                 when the settle took over. The settle still runs on the
+                 COMPOSITOR through mobileNavPanelRef; framer and that animation
+                 coexist here exactly as they do for the other two panels,
+                 because `takeOverDrawer` adopts and cancels whatever is running
+                 before either one writes. */
               <motion.nav
                 key="mobile-nav-drawer"
-                initial={{ x: -240 }}
-                animate={{ width: 220, x: 0 }}
-                exit={{ x: -240 }}
-                transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
+                ref={mobileNavPanelRef}
+                style={{ width: MOBILE_NAV_WIDTH, x: mobileNavX }}
                 className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-2 mb-2 shadow-sm z-50 overflow-hidden fixed top-safe left-safe bottom-safe"
                 role="navigation"
                 aria-label={i18nT('app.main_navigation')}
@@ -3493,7 +3881,7 @@ export default function App() {
                 {navBody}
               </motion.nav>
             )}
-          </AnimatePresence>
+          </>
         ) : (
           <nav
             ref={railPeekSurface}
@@ -3555,7 +3943,8 @@ export default function App() {
             <Route path="/chat/:slug?" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />
             <Route path="/notifications" element={<ErrorBoundary><NotificationsPage /></ErrorBoundary>} />
-            <Route path="/knowledge" element={<ErrorBoundary><KnowledgePage /></ErrorBoundary>} />
+            {/* Knowledge moved into Agent Capabilities; old bookmarks land on its tab. */}
+            <Route path="/knowledge" element={<Navigate to="/capabilities?tab=knowledge" replace />} />
             <Route path="/members" element={<ErrorBoundary><Suspense fallback={null}><MembersPage /></Suspense></ErrorBoundary>} />
             <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
             <Route path="/schedule" element={<SchedulePage />} />

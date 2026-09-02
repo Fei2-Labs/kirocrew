@@ -12,35 +12,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# Shared with ``test_mcp_rebuild_reconsumption`` via a dedicated helpers module --
+# the repo's convention, since a test module is not importable from another one.
+# Re-exported under the original private names so the call sites below are unchanged.
+from mcp_merge_helpers import DEFAULT_MANAGED_MCPS as _DEFAULT_MANAGED_MCPS
+from mcp_merge_helpers import bundled_defaults as _bundled_defaults
+from mcp_merge_helpers import run_install_mcp_merge as _run_install_mcp_merge
 from windows_sim import replace_sharing_violation
 
 from conftest import requires_symlinks
 from kiro_crew import agent_state
 from kiro_crew import atomic_write as aw
 from kiro_crew.agent import install_agent, migrate_agent_specs
-
-
-def _bundled_defaults(tmp_path: Path) -> Path:
-    """Write a minimal bundled defaults.json and return its parent dir."""
-    cfg_dir = tmp_path / "config"
-    cfg_dir.mkdir()
-    defaults = {
-        "model": "claude-default",
-        "tools": ["ReadFile"],
-        "allowedTools": ["ReadFile"],
-        "mcpServers": {},
-        "toolsSettings": {"execute_bash": {"deniedCommands": ["rm -rf /"]}},
-        "hooks": {"preToolUse": "audit"},
-    }
-    (cfg_dir / "defaults.json").write_text(json.dumps(defaults))
-    (cfg_dir / "prompt.md").write_text("system prompt")
-    return cfg_dir
-
-
-_DEFAULT_MANAGED_MCPS = {
-    "kirocrew-cron": {"command": "/usr/bin/kirocrew", "args": ["mcp-cron"]},
-    "kirocrew-core": {"command": "/usr/bin/kirocrew", "args": ["mcp-core"]},
-}
 
 
 def _run_install(tmp_path: Path, cfg_dir: Path, managed_mcps: dict | None = None, **kwargs) -> Path:  # type: ignore[return]
@@ -4399,63 +4383,6 @@ def _make_exec(tmp_path: Path, name: str) -> str:
     p.write_text("#!/bin/sh\n")
     p.chmod(0o755)
     return str(p)
-
-
-def _run_install_mcp_merge(
-    tmp_path: Path,
-    cfg_dir: Path,
-    *,
-    cc_servers: dict,
-    kiro_servers: dict,
-    kirocrew_servers: dict | None = None,
-    which_side_effect=lambda c, **kw: c,
-) -> dict:
-    """Run install_agent with CC-global and Kiro-global mcp.json seeded and a
-    customizable shutil.which. Returns the parsed kirocrew.json config."""
-    kiro_dir = tmp_path / "kiro_agents"
-    kiro_dir.mkdir(exist_ok=True)
-    prompt = cfg_dir / "prompt.md"
-    mc_config = tmp_path / "empty_mc_config.json"
-    if not mc_config.exists():
-        mc_config.write_text(json.dumps({"agent": {"kiro_hooks_autoimport": False}}))
-    kiro_mcp = tmp_path / "fake_kiro_mcp.json"
-    cc_mcp = tmp_path / "fake_cc_mcp.json"
-    kiro_mcp.write_text(json.dumps({"mcpServers": kiro_servers}))
-    cc_mcp.write_text(json.dumps({"mcpServers": cc_servers}))
-    if kirocrew_servers is not None:
-        kc_home = tmp_path / "kirocrew_home"
-        kc_home.mkdir(parents=True, exist_ok=True)
-        (kc_home / "mcp.json").write_text(json.dumps({"mcpServers": kirocrew_servers}))
-
-    _user_home = tmp_path / "kirocrew_home"
-    patches = [
-        patch.multiple(
-            "kiro_crew.agent",
-            KIRO_AGENTS_DIR=kiro_dir,
-            _BUNDLED_CFG_DIR=cfg_dir,
-            _KIROCREW_BIN="/usr/bin/kirocrew",
-            _MANAGED_MCP_SERVERS=_DEFAULT_MANAGED_MCPS,
-            _KIRO_MCP_JSON=kiro_mcp,
-            _CC_MCP_JSON=cc_mcp,
-        ),
-        patch("kiro_crew.agent._user_dir", lambda: _user_home),
-        patch("kiro_crew.agent._prompt_path", return_value=prompt),
-        patch("kiro_crew.agent._shipped_defaults", return_value=cfg_dir / "defaults.json"),
-        patch("kiro_crew.agent._project_dir", return_value=None),
-        patch("kiro_crew.agent._aim_skill_paths", return_value=[]),
-        patch("kiro_crew.agent.shutil.which", side_effect=which_side_effect),
-        patch("kiro_crew.agent._mc_config_path", return_value=mc_config),
-        # A companion contributes the Claude Code scope via the CPP seam — the
-        # core no longer reads ~/.claude.json directly at rebuild time (OSS is
-        # Kiro-only). Point the seam at cc_mcp so these merge-priority tests
-        # exercise the seam-routed provider-global merge.
-        patch("kiro_crew.agent._extra_mcp_scope_globals", return_value=[cc_mcp]),
-    ]
-    with ExitStack() as stack:
-        for p in patches:
-            stack.enter_context(p)
-        path = install_agent()
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 class TestSpecEnvPathIsExpandedOnEmit:

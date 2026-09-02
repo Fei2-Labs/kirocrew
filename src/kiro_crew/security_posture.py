@@ -116,6 +116,29 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "credential + exfiltration-URL chain immediately before print.",
     ),
     (
+        "Central policy fetch failures",
+        "platform/policy_distribution.py",
+        "The failure text of a central governance-policy fetch, which reaches TWO "
+        "surfaces: `kirocrew policy fetch` on stdout and a `logger` line (durable, "
+        "and served to the dashboard by `GET /api/logs`). The bytes are not ours -- a "
+        "malformed document reaches the message through a parser error, and `json`'s "
+        "errors quote the offending text, so an endpoint that echoes back the "
+        "request's `Authorization` header (its own request reflected, a proxy error "
+        "page) would carry that credential to both surfaces. Every detail goes "
+        "through `_sanitize_detail`, which applies the shared credential + "
+        "exfiltration-URL chain and additionally elides the operator-configured "
+        "source URL and its bare hostname.",
+    ),
+    (
+        "AutoNudge monitor responses",
+        "dashboard/handlers/autonudge.py",
+        "Structured monitor state served by the AutoNudge dashboard endpoints. "
+        "Provider observations are arbitrary nested JSON and can quote credentials "
+        "or exfiltration URLs, so every string key and value in the monitor mapping "
+        "passes through the platform-aware redaction chain before the response leaves "
+        "the backend.",
+    ),
+    (
         "AWS identity-probe failures",
         "aws_consent.py",
         "The stderr of a failed `aws sts get-caller-identity`, run to show the "
@@ -507,6 +530,24 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "history.py",
         "Redacted before persistence, so a leaked credential is not written to disk "
         "and replayed into later context.",
+    ),
+    (
+        "Auto-skill update merge prompt",
+        "history_consolidation.py",
+        "The existing live skill body is redacted before it enters the model prompt "
+        "that merges a proposed update, and the model's merged output is scanned again.",
+    ),
+    (
+        "Auto-skill pending candidate staging",
+        "history_consolidation.py",
+        "LLM-authored descriptions, triggers, procedures, and generated scripts are "
+        "redacted before SkillsLoader writes a pending create or update candidate.",
+    ),
+    (
+        "Auto-skill direct publication",
+        "history_consolidation.py",
+        "LLM-authored descriptions, triggers, and procedures are redacted before "
+        "immediate live skill creation or direct refinement through SkillsLoader.",
     ),
     (
         "Side-panel stream",
@@ -1141,7 +1182,7 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "Auto Triage Pipeline dashboard strings",
-        "apps/builtins/auto_triage_pipeline/backend/pipeline_fold.py",
+        "apps/builtins/issue_radar/backend/pipeline_fold.py",
         "Every string this read-only fold hands to its routes -- issue titles, "
         "assignee and author logins, labels, event names, slot keys -- funnels "
         "through one `_printable` helper before serialization, and the routes render "
@@ -1208,10 +1249,35 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # hygiene so a response echoing a credential or exfiltration URL cannot
         # leak into the log ring / /api/logs stream; not an egress boundary.
         "task_planner.py",
+        # Audit-side log hygiene: log_decline scrubs the model-authored tool
+        # title before writing the shared auto_approve_declined SEL row. The
+        # audit log is a gate-side record, not an output bound for a human or
+        # a third party — the surfaces that SHOW a refusal (the dashboard's
+        # notice line) are the registered sinks.
+        "name_grant.py",
+        # Internal coordinator partitions behind the single registered
+        # ``subagent.py`` output boundary.  They redact lifecycle payloads before
+        # handing them to facade-owned event/completion callbacks, but the split
+        # adds no new transport or audience and therefore no additional posture
+        # row.
+        "subagent_manager/admission.py",
+        "subagent_manager/cancellation.py",
+        "subagent_manager/continuation.py",
+        "subagent_manager/monitoring.py",
+        "subagent_manager/run.py",
+        "subagent_manager/terminal.py",
         # The shared recursive redactor helper itself — a pure scrubber, not an
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
         "apps/builtins/mochi/redact.py",
+        # Shared model-fallback text builders (fallback_story_of /
+        # annotate_model_fallback): scrub the chain-exhaustion story and the
+        # fallback-served warning line ONCE, centrally, so every consumer gets
+        # the same safe text. They own no output — the scrubbed text reaches a
+        # human only through the delivering surfaces (the cron/heartbeat alert
+        # paths in slack/gateway.py and the sub-agent completion path in
+        # subagent.py), which are the registered sinks.
+        "llm_helpers.py",
         # Redacts artifact names/metadata at the point they are STAGED (the
         # pushable list and the S3 meta sidecar), before any response exists.
         # It owns no output of its own — every HTTP response carrying that data
@@ -1323,6 +1389,18 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/chat_title.py",
         "dashboard/chat_utils.py",
         "dashboard/chat_voice.py",
+        # Owner-driven components extracted from dashboard/state.py.  They
+        # redact while staging or dispatching through the facade, but they do
+        # not introduce new logical egress paths: the same DashboardState
+        # boundaries were already represented by the facade's registered sink
+        # rows.  Classifying the implementation files separately would make a
+        # behavior-preserving decomposition change the public posture items and
+        # count even though no new value crosses a process or persistence
+        # boundary.
+        "dashboard/interaction_coordinator.py",
+        "dashboard/notification_coordinator.py",
+        "dashboard/slot_projection.py",
+        "dashboard/websocket_hub.py",
         # Pre-redacts follow-up items before handing to state.py's WS egress
         # (the registered sink); its own return string is re-redacted by
         # chat_runner before broadcast. Not itself an egress boundary.
@@ -1331,6 +1409,10 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/ws.py",
         "dashboard/server.py",
         "dashboard/handlers/sessions.py",
+        # Roster last-message previews: same preview + redaction chain as
+        # handlers/sessions.py, feeding the same dashboard HTTP surface the
+        # registered sink already covers.
+        "dashboard/handlers/members.py",
         "dashboard/handlers/artifacts.py",
         "dashboard/handlers/core.py",
         "dashboard/handlers/cron.py",
@@ -1508,6 +1590,11 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "apps/builtins/dev_fleet/server.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",
+        # Live translation redacts the MODEL's answer before writing it to the
+        # meeting's translations.json. The source line was already redacted at
+        # dispatch, so this covers only what a model reintroduced, and the
+        # user-visible surface is the app's own translations route.
+        "apps/builtins/meetings/backend/domain/translate.py",
         "apps/builtins/meetings/backend/providers/calendar.py",
         "apps/builtins/meetings/backend/providers/tasks.py",
         "apps/builtins/meetings/backend/routes/agents.py",
@@ -1674,7 +1761,7 @@ def _write_protected_items() -> list[PostureItem]:
     return [
         PostureItem(
             label=f"~/{entry}",
-            detail="Reads allowed; writes blocked so the agent cannot raise its own limits",
+            detail="Reads allowed; the agent's file-edit tools cannot modify it",
         )
         for entry in security.write_protected_home_paths()
     ]

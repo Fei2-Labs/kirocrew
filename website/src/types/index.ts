@@ -37,6 +37,12 @@ export interface StatusData {
    */
   update_latest_version?: string
   /**
+   * DISPLAY-ONLY fold of `update_latest_version` (clean base on the stable
+   * channel). The popup's snooze/skip keys and every arm path keep reading
+   * the raw field. Optional: an older gateway does not send it.
+   */
+  update_latest_version_display?: string
+  /**
    * The release channel this INSTALL follows (the `channel` file `cli.sh` wrote).
    * "" when the layout has no channel at all — a git checkout tracks a remote, a
    * desktop bundle and a container are updated by something else — which is what
@@ -45,6 +51,20 @@ export interface StatusData {
    * diverge between a channel switch and the new lane's build landing.
    */
   update_channel?: string
+  /**
+   * Is the running build ahead of everything `update_channel` publishes? True
+   * means that lane has never shipped these bytes, so the install is not on it
+   * and only re-running the installer moves it — the state a channel switch
+   * leaves on an install whose bytes the gateway cannot replace.
+   *
+   * Backend-derived from the feed comparison, deliberately NOT from comparing
+   * `update_channel` against `release_channel`: promotion re-points the soaked
+   * candidate's bytes without re-stamping them, so a promoted stable build
+   * reports `release_channel: 'insider'` while being a stable install with
+   * nothing pending. False on every layout with no feed answer (git checkout,
+   * desktop bundle, container) and on older gateways (absent reads as false).
+   */
+  update_channel_move_pending?: boolean
   update_managed_by?: string
   update_can_arm?: boolean
   /**
@@ -70,6 +90,15 @@ export interface StatusData {
   update_progress?: { step: string; detail: string } | null
   version?: string
   /**
+   * The RUNNING build's version folded for display — the clean base on the
+   * stable channel (`0.4.0` for bytes stamped `0.4.0rc14`), the raw version
+   * on every other channel. DISPLAY-ONLY sibling of `version` above, which
+   * stays raw because the SPA compares it across pushes to force a reload
+   * over a gateway upgrade. Optional: an older gateway does not send it —
+   * fall back to `version`.
+   */
+  version_display?: string
+  /**
    * Which release lane these bytes came from. The gateway resolves it (see
    * `src/kiro_crew/release_channel.py`) rather than leaving the dashboard to
    * parse `version`: the same release is stamped as SemVer for the desktop app
@@ -83,17 +112,7 @@ export interface StatusData {
   release_channel?: 'nightly' | 'insider' | 'stable'
   branch?: string
   commit?: string
-  /**
-   * The agent harness NEW sessions run on, resolved by the gateway. `label` is
-   * the harness's display name ("Kiro CLI", "Claude Code", …) and `backend` its
-   * id (`""` is kiro-cli). `kiro_credits` says whether a turn on it draws down
-   * the signed-in Kiro account's credit plan — the gateway owns that membership
-   * rule, so never mirror it here.
-   *
-   * Absent or `null` means UNKNOWN: an older gateway, or one that could not read
-   * the config. Treat that as "behave as before" — leave a readout as it was
-   * rather than asserting a harness or hiding a real balance.
-   */
+  /** Default ACP harness for newly created sessions. Empty backend means Kiro CLI. */
   harness?: { backend: string; label: string; kiro_credits: boolean } | null
   platform?: string
   yolo?: boolean
@@ -148,6 +167,23 @@ export interface UpdateCheckResult {
   requires_restart?: boolean
   channel?: string
   latest_version?: string
+  /**
+   * DISPLAY-ONLY sibling of `latest_version`, folded to the clean release
+   * version on the stable channel (a promoted candidate keeps its insider/rc
+   * stamp in the bytes, e.g. "0.4.0rc14" for the "0.4.0" release). Never pass
+   * this to `InAppUpdateFlow`'s `version` prop, `/api/update/arm`, or a
+   * snooze/skip key — those must use the raw `latest_version`, which is
+   * compared byte-for-byte against the installed build's own never-folded
+   * `__version__` during apply.
+   */
+  latest_version_display?: string
+  /**
+   * Copyable upgrade command ("" when none). Carried by the channel-switch
+   * response (POST /api/update/channel, which answers with this same contract
+   * re-run against the new lane); the check endpoint itself carries the
+   * command inside `remediation` instead.
+   */
+  update_command?: string
   changes?: string
   check_status?: 'unchecked' | 'checking' | 'succeeded' | 'failed' | 'deferred'
   update_available?: boolean | null
@@ -720,7 +756,7 @@ export interface ChatSlot {
    *  and it reports "" rather than guessing whenever resolution is unsettled — so
    *  a consumer must treat absent as "no news", never as a mismatch. */
   effective_agent?: string
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; provider_label?: string; source_links?: { provider: 'github' | 'gitlab' | 'jira'; number: number; url: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; provider_label?: string; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
    * survey shows only on a "user" slot, so an imported Slack thread, a
@@ -728,8 +764,8 @@ export interface ChatSlot {
    * `chat-<n>-<ts>` key shape) never triggers it. */
   origin?: string
   /** Live ACP harness this slot's provider is driving (``''`` = kiro).
-   *  Omitted when no provider is bound yet. Distinct from `status.harness`,
-   *  which is the default for *new* sessions. */
+   * Omitted when no provider is bound yet. Distinct from `status.harness`,
+   * which is the default for *new* sessions. */
   acp_backend?: string
   /** Artifact companion binding: slug of the artifact this slot is a companion
    * chat for. Set at slot create and persisted in the history meta line, so the
@@ -825,10 +861,24 @@ export interface IssueComment {
   id: string; author: string; body: string; createdAt: string; url: string
 }
 
+/** Which source system an extracted link, issue, or pull request belongs to.
+ *
+ *  The three built-ins are spelled out so they still autocomplete and so a
+ *  `provider === 'github'` narrowing keeps working, but the type is OPEN: a
+ *  downstream edition registers its own provider through
+ *  `registerSourceProvider` (see `utils/pullRequestLinks`) and its id then flows
+ *  through these payloads unchanged. `(string & {})` is the standard way to widen
+ *  a literal union without collapsing it to `string` in editor completions.
+ *
+ *  Declared here rather than in `utils/pullRequestLinks` so the payload types
+ *  never have to import from a util (which imports `ChatMessage` from this
+ *  module); `PullRequestProvider` there is an alias of this. */
+export type SourceProviderId = 'github' | 'gitlab' | 'jira' | (string & {})
+
 /** A pull request / merge request the provider reports as linked to the issue. */
 /** A linked change: a pull request (GitHub/GitLab) or a linked issue (Jira). */
 export interface IssueLinkedChange {
-  provider: 'github' | 'gitlab' | 'jira'; url: string; number: number; title: string; state: string
+  provider: SourceProviderId; url: string; number: number; title: string; state: string
   /** Jira link relationship label (e.g. "blocks", "is blocked by"). */
   relation?: string
   /** Full Jira issue key (e.g. "PROJ-123"). */
@@ -842,7 +892,7 @@ export interface IssueReactions {
 }
 
 export interface IssueSource {
-  provider: 'github' | 'gitlab' | 'jira'
+  provider: SourceProviderId
   /** Always the validated request url, never the provider's echo of it. */
   url: string
   number: number
@@ -871,7 +921,7 @@ export interface IssueSource {
 }
 
 export interface PullRequestSource {
-  provider: 'github' | 'gitlab'; url: string; number: number; title: string
+  provider: SourceProviderId; url: string; number: number; title: string
   description: string; state: string; draft: boolean; mergedAt: string; updatedAt: string
   headBranch: string; baseBranch: string; headSha: string; author: string
   additions: number; deletions: number; changedFiles: number
@@ -889,6 +939,9 @@ export interface PullRequestSource {
 
 export interface ChatFolder {
   id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
+   *  this folder. Absent = no tags, mirroring the optional `color`. */
+  tags?: string[]
   /** Channel namespace when this folder was created by per-channel session filing (e.g. 'discord'). */
   channel?: string
 }
@@ -1025,15 +1078,6 @@ export interface NotificationChannel {
   default_priority: string | null
   protected: boolean
   settings: { muted?: boolean; priority?: string }
-}
-
-export interface SecretaryItem {
-  id: string; channel: string; channel_name: string
-  thread_ts: string | null; message: string
-  sender_id: string; sender_name: string
-  thread_context: { sender: string; text: string }[]
-  classification: string; draft: string; confidence: string
-  status: string; created_at: number; context_summary?: string
 }
 
 export interface PendingApproval {

@@ -41,8 +41,8 @@ interface FollowUpBarProps {
  * the tail of its text sat outside the visible box, so it read as a single
  * clipped pill with no other option in view. `followup-chip` (index.css) caps
  * the width at half the row minus half the gap — bounded to 18rem..26rem — so
- * two chips fit side by side at ANY composer width, and the label wraps onto
- * two clamped lines so the truncation is explicit (ellipsis) instead of an
+ * two chips fit side by side at ANY composer width, and the label clamps to one
+ * line so the truncation is explicit (ellipsis) instead of an
  * invisible overflow. The cap is deliberately relative: the original absolute
  * 26rem was sized against a 900px composer that no default user gets (compact
  * content width is 816px), so it silently forbade the two columns it existed to
@@ -162,31 +162,49 @@ function splitMainChipClassName(isPicked: boolean) {
 }
 
 /**
- * The two-line clamp lives on an unpadded inner element on purpose:
- * `-webkit-line-clamp` clips at the padding edge, so clamping the padded
- * button itself leaves a sliver of the third line visible inside its bottom
- * padding.
+ * The clamp lives on an unpadded inner element on purpose: `-webkit-line-clamp`
+ * clips at the padding edge, so clamping the padded button itself leaves a
+ * sliver of the next line visible inside its bottom padding.
+ *
+ * ONE line, not two. A chip is a teaser for the instruction, not the payload —
+ * clicking it puts the full text in the composer, and the untruncated string
+ * stays in the DOM (accessible name) and on `title` (hover), so the truncation
+ * is recoverable. Wrapping instead makes a long label's chip taller than its
+ * neighbours, which is the one thing a row of sibling controls cannot afford;
+ * one line makes every chip the same height by construction rather than by an
+ * alignment rule.
  */
 function ChipLabel({ option }: { option: string }) {
-  return <span className="line-clamp-2 break-words">{option}</span>
+  return <span className="line-clamp-1 break-words">{option}</span>
 }
 
 /**
- * Length above which a label is likely clamped. Past it the hover tooltip
- * carries the full option text instead of the click hint — an unreadable label
- * is the more pressing gap, and the gesture hint is still shown on every short
- * chip and on the send segment. The DOM keeps the whole string either way, so
- * the accessible name is never truncated.
+ * Hover text for a chip: the full option, then the gesture hint on its own line.
+ *
+ * The full label is unconditional. A character-count threshold was the obvious
+ * proxy for "is this clamped" and it is the wrong one — truncation depends on the
+ * rendered width, the font and the chip's own box, so any fixed number leaves a
+ * band of labels visibly cut with no way to read them (at one clamped line the
+ * cut starts around 44 characters, so a 60-char threshold missed everything
+ * between). `title` takes a `U+000A` per line break, so both fit with no
+ * measurement and no component.
+ *
+ * The DOM keeps the whole string either way, so a screen reader's accessible
+ * name is never truncated regardless of this.
+ *
+ * Joined rather than built as a template literal: with `should-validate-template`
+ * the i18n lint reports at the whole template node, so `` `${option}\n\n${hint}` ``
+ * counts as an untranslated literal even though both halves are already
+ * localized. A bare separator trims to empty and is skipped, which is the
+ * accurate outcome — a line break is not copy.
  */
-const LONG_LABEL_CHARS = 60
-
 function chipTooltip(option: string, hint: string) {
-  return option.length > LONG_LABEL_CHARS ? option : hint
+  return [option, hint].join('\n\n')
 }
 /** Right-hand "send now" segment class — same palette as the chip body, divided by a border. */
 function sendSegmentClassName(isPicked: boolean) {
-  // inline-flex + items-center keeps the arrow vertically centred when the
-  // chip body wraps onto a second line.
+  // inline-flex + items-center keeps the arrow centred against whatever height
+  // the chip body resolves to, so it does not need to know the clamp.
   return `inline-flex items-center shrink-0 px-1.5 py-1.5 rounded-r-lg cursor-pointer transition-all border border-l-0 ${
     isPicked
       ? 'border-solid border-accent/50 text-accent bg-accent-subtle hover:bg-accent/20'
@@ -428,11 +446,11 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
           <ChevronRight size={16} />
         </button>
       )}
-      {/* Chips are bottom-aligned, not centred: a long label clamps onto two
-          lines and makes its chip taller than the rest, and centring floats
-          every single-line chip into the middle of that taller row. The shared
-          edge is the BOTTOM one because the strip sits directly above the
-          composer, so that is the edge the row is read against. */}
+      {/* The one-line clamp already makes every chip the same height, so this
+          only decides where a chip would sit if one ever became taller (an
+          icon, a badge, a second line). Bottom, not centre: the strip sits
+          directly above the composer, so that is the edge the row is read
+          against. */}
       <div ref={setScroller} className={`flex ${CHIP_ROW_GAP} overflow-x-auto items-end`} style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
         {options.map((o, i) => {
           const isPicked = picked.has(o)
@@ -460,9 +478,10 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
 
 function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey }: LayoutProps) {
   return (
-    // Bottom-aligned for the same reason as the scroll layout: a two-line
-    // clamped chip must not float its single-line neighbours onto its own
-    // centre line, and the edge shared with the composer below is the bottom.
+    // Bottom-aligned for the same reason as the scroll layout: with the
+    // one-line clamp every chip is already the same height, so this only
+    // decides where a taller chip would sit, and the edge shared with the
+    // composer below is the bottom.
     <div className={`flex ${CHIP_ROW_GAP} flex-wrap pt-1 items-end`}>
       {options.map((o, i) => {
         const isPicked = picked.has(o)

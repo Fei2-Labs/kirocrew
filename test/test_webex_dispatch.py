@@ -11,6 +11,7 @@ import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
 from kiro_crew.messaging.link import ChannelLink
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.webex import cards
 from kiro_crew.webex import transport_dispatch as webex_dispatch
 from kiro_crew.webex.client import WebexInbound
@@ -97,12 +98,22 @@ class FakeSessions:
         self.mirror_links: dict = {}
         self.opt_out: dict = {}
         self.batched = 0
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
 
     async def get_or_create(self, key, *, agent, channel_id):
         self.last_agent = agent
         if self._raise is not None:
             raise self._raise
         return self._p, self._is_new, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, cid) -> None:
         self.channels.append((key, cid))

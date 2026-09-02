@@ -42,11 +42,14 @@ export const CHUNK_BUDGETS = {
   // little with every translated string, which is expected and fine; what this
   // ceiling catches is a NEW library or surface landing in the catalog chunk.
   // The built-in App Store guidance adds one use-case and one configuration
-  // string for each of 23 apps across all 12 shipped catalogs.
-  // Re-measured after merging upstream PR #6307 (staged ACP adapter
-  // admission): new surfaces (adapter picker, admission status, the
-  // workflow library UI) each add strings across all 12 catalogs.
-  all: 10050 * KB, // measured 9770 KB after PR #6307's adapter-admission UI
+  // string for each of 23 apps across all 12 shipped catalogs. The Dev Fleet
+  // closed-PR prune group and the expanded Disconnect guidance are the largest
+  // recent catalog increments included in this measurement; Dev Fleet's
+  // per-pod system readout then adds its own strings across the same 12
+  // catalogs on top of that baseline. The Drive gallery's keys across 13
+  // catalogs ride inside the headroom that measurement already left, so this
+  // branch does not move the ceiling.
+  all: 10490 * KB, // measured 9985 KB before the pod-system catalog keys (~5% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because

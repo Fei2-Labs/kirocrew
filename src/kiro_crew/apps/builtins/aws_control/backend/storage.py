@@ -342,6 +342,69 @@ def list_section(
     }
 
 
+def list_library_folders(profile: str, region: str, bucket: str, *, account: str) -> list[str]:
+    """Every immediate folder name directly under ``artifacts/`` — RAW, unredacted.
+
+    Singular rather than section-parameterized, unlike its object-I/O siblings.
+    The Library is the only section with a local ledger to reconcile, so a
+    ``section`` argument here would have exactly one reachable value; the prefix
+    is anchored from ``SECTION_PREFIXES`` inside, which keeps the rule that a raw
+    prefix never comes from a caller.
+
+    Deliberately NOT :func:`list_section`. That one is a DISPLAY read: it runs
+    every name through the egress redactors, which is right for a name rendered
+    in the dashboard and wrong for an IDENTITY read. The Library reconcile
+    compares these names against ledger KEYS, and a redacted name matches no
+    key — so a reconcile fed the display listing could read a cloud copy that
+    is present as absent, and drop a live ledger entry on that reading.
+
+    Also deliberately without a page token. Omitting ``--max-items`` lets the
+    CLI auto-paginate and applies ``--query`` to the MERGED result (the same
+    property :func:`usage` relies on), so the answer is either the COMPLETE
+    set of folders or a raised error — never a first page a caller could
+    mistake for the whole prefix. Callers here reason about ABSENCE, and
+    absence from a partial listing is not absence.
+
+    For the same reason an unreadable response RAISES instead of degrading to
+    an empty list, unlike :func:`usage`: empty means "nothing in the cloud",
+    and a caller acting on that would discard every record it holds.
+    """
+    prefix = SECTION_PREFIXES["library"]
+    out = _checked(
+        [
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            bucket,
+            "--prefix",
+            prefix,
+            "--delimiter",
+            "/",
+            "--expected-bucket-owner",
+            account,
+            "--output",
+            "json",
+            "--query",
+            "CommonPrefixes[].Prefix",
+        ],
+        profile,
+        action="s3:ListBucket",
+        timeout=60,
+    )
+    try:
+        rows = json.loads(out or "[]") or []
+    except json.JSONDecodeError:
+        raise AWSError(
+            "the folder listing returned a response that could not be read as JSON; "
+            "refusing to report the section as empty"
+        ) from None
+    return [
+        row[len(prefix) :].rstrip("/")
+        for row in rows
+        if isinstance(row, str) and row.startswith(prefix) and row[len(prefix) :].strip("/")
+    ]
+
+
 #: Ceiling for a single owner-pinned transfer. ``put-object`` is one request and
 #: S3 rejects a body over 5 GiB; ``s3 cp`` would have split it into a multipart
 #: upload, but no ``aws s3`` command accepts ``--expected-bucket-owner``, so a

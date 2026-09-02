@@ -380,11 +380,12 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
           // (native-event contract in useImeGuard.ts) runs before the
           // preventDefault() and focus move.
           if (!wrapsBackward && !wrapsForward) return
-          // `claimKey` consumes the native event (document/window listeners),
-          // but React 17+ checks the SYNTHETIC propagation flag when walking
-          // component ancestors — stop that half too so a declined Tab cannot
-          // trigger an ancestor's own keyboard handling.
-          if (!fsImeLatch.claimKey(e.nativeEvent)) { e.stopPropagation(); return }
+          // `claimSyntheticKey` owns BOTH halves of a decline: the native
+          // event (which document/window listeners see) and React's own
+          // propagation flag (which it walks when dispatching to component
+          // ancestors), so a declined Tab cannot trigger an ancestor's
+          // keyboard handling.
+          if (!fsImeLatch.claimSyntheticKey(e)) return
           e.preventDefault()
           ;(wrapsBackward ? last : first).focus()
         }}>

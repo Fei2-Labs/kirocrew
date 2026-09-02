@@ -18,8 +18,8 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
-    ACP_BACKENDS_SELECTABLE,
 )
+from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.config.loader import KiroCrewConfig, build_provider_factory
 from kiro_crew.knowledge.llm_pool import _get_acp_backend
 
@@ -168,7 +168,7 @@ class TestPoolBackendReader:
         assert _get_acp_backend({}) == ""
 
     def test_selectable_value_is_honoured(self) -> None:
-        for backend in ACP_BACKENDS_SELECTABLE:
+        for backend in selectable_backends():
             assert _get_acp_backend({"agent": {"acp_backend": backend}}) == backend
 
     def test_known_but_unselectable_degrades(self, monkeypatch) -> None:

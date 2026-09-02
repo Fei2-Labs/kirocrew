@@ -118,7 +118,12 @@ _SPAWN_BASES = {"subprocess", "asyncio"}
 # Spawn helpers called as a BARE NAME rather than ``module.attr`` -- they are
 # imported directly, so the receiver check above cannot see them. Without this
 # the audit goes blind the moment a call site moves to the wrapper.
-_SPAWN_NAMES = {"create_subprocess_limited", "run_limited", "popen_limited"}
+_SPAWN_NAMES = {
+    "_create_ffmpeg_subprocess",
+    "create_subprocess_limited",
+    "run_limited",
+    "popen_limited",
+}
 
 # Tokens whose presence anywhere in the enclosing function marks the spawn as
 # routed through the sandbox chokepoint. ``_prepare_sandboxed_spawn`` is the
@@ -341,8 +346,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # worktree of a push-disabled clone, which is where its blast radius is
         # contained; these calls are the harness around it, not the agent's hands.
         "apps/builtins/auto_improvement/backend/clone_setup.py::_disable_push",
+        "apps/builtins/auto_improvement/backend/clone_setup.py::_origin_urls",
+        "apps/builtins/auto_improvement/backend/clone_setup.py::_repository_is_safe",
         "apps/builtins/auto_improvement/backend/clone_setup.py::_gh_prefers_ssh",
-        "apps/builtins/auto_improvement/backend/clone_setup.py::_ok",
         "apps/builtins/auto_improvement/backend/clone_setup.py::_run",
         "apps/builtins/auto_improvement/backend/clone_setup.py::list_clone_branches",
         "apps/builtins/auto_improvement/backend/clone_setup.py::setup_safe_clone",
@@ -356,6 +362,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "::test_approval_is_logged_then_granted",
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
         "::test_audit_failure_denies_instead_of_approving",
+        # Offline clone-setup regressions use only fixed Git argv against pytest
+        # tmp_path repositories; no agent/model input reaches command or cwd.
+        "apps/builtins/auto_improvement/tests/test_clone_setup_idempotent.py::_seeded_bare",
+        "apps/builtins/auto_improvement/tests/test_clone_setup_idempotent.py"
+        "::test_extra_origin_value_refuses_reuse",
+        "apps/builtins/auto_improvement/tests/test_clone_setup_idempotent.py"
+        "::test_disable_push_replaces_every_url_value",
         # A FIXED argv of `[sys.executable, "-c", <literal>]` — the interpreter running the
         # test plus a constant source string with no interpolation, so neither the command
         # nor its args are agent-influenced. The child only imports a module and prints
@@ -448,6 +461,10 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "::test_a_recipe_holding_the_config_url_can_still_push",
         "apps/builtins/auto_improvement/tests/test_pr_recipe.py"
         "::test_without_the_config_url_the_neutralized_clone_degrades_to_the_queue",
+        # Same basis: fixed `git init/config` argv against a tmp_path repo, proving an
+        # agent-planted external diff helper is refused before any publisher Git call.
+        "apps/builtins/auto_improvement/tests/test_pr_recipe.py"
+        "::test_push_refuses_before_git_when_repository_safety_changed",
         # Same basis: a fixed `git init/add/commit` against a tmp_path, asserting a diff
         # that cannot apply is refused BEFORE the pipeline drafts.
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
@@ -715,6 +732,34 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "dep_sync.py::_probe_interpreter",
         "dep_sync.py::sync",
         "dep_sync.py::sync_or_reinstall",
+        # npm_preflight is the sync's pre-merge installability probe, and like
+        # dep_sync it runs AS one of the sync steps -- which server.py already
+        # wrapped through sandboxed_spawn_argv before handing it to the runner.
+        # So all three of its spawns are already inside that sandbox, and routing
+        # them again would nest one sandbox inside itself; the chokepoint is
+        # applied at the call site, exactly as for server.py::worker.
+        #
+        # No argv is agent-influenced. _extract spawns
+        # `<git> -C <repo> show <remote>/<base branch>:website/<fixed filename>`:
+        # the binary comes from _trusted_bin (never PATH), the repo from the
+        # operator-configured checkout, the branch from the BASE_BRANCH constant,
+        # and the three filenames from a module-level tuple.
+        # _install_already_proven spawns
+        # `<git> -C <repo> diff --name-only <ref> -- website` from the same three
+        # sources, with the pathspec a module-level constant; it only READS, and
+        # its answer decides whether the install below is skipped.
+        # probe spawns `<npm> ci --ignore-scripts --no-audit --no-fund` with cwd
+        # set to its own mkdtemp scratch directory -- not a repository, and not a
+        # path any caller supplies.
+        #
+        # The lockfile it installs IS repo-controlled, but that is input data to
+        # npm rather than steering of argv or cwd, it is the same content the real
+        # `npm ci` step installs, and --ignore-scripts is what keeps that content
+        # from getting code executed. A filesystem-scoped wrapper here would also
+        # block the scratch-directory writes that are the whole point of the probe.
+        "apps/builtins/dev_fleet/npm_preflight.py::_extract",
+        "apps/builtins/dev_fleet/npm_preflight.py::_install_already_proven",
+        "apps/builtins/dev_fleet/npm_preflight.py::probe",
         # Foreground last-resort restart (Make Live on hosts with no drivable
         # service manager): a detached `kirocrew restart --port <marker port>`,
         # fixed argv whose binary is validated (basenamed kirocrew, absolute,
@@ -756,7 +801,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cli.py::_node_ok",
         "cli.py::main",
         "cli_chat.py::_run_chat",
-        "cli_chat.py::_tui",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run``
         # (attr ``run`` on base ``asyncio``). The SQLite adapter invokes the
         # in-memory coordinator coroutine inside its dedicated worker thread;
@@ -916,9 +960,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # probe is to read the HOST's own macOS TCC grants, which a sandbox that
         # rewrites the process identity would answer wrongly.
         "dashboard/handlers/computer_use.py::_probe_permissions",
-        "dashboard/handlers/core.py::_is_apple_silicon",
-        "dashboard/handlers/core.py::_stt_prereq_commands",
-        "dashboard/handlers/core.py::api_stt_install",
         "dashboard/handlers/files.py::_run",
         "dashboard/handlers/files.py::api_screenshot",
         "dashboard/handlers/files.py::api_upload",
@@ -1152,14 +1193,10 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "slack/gateway.py::_warn_if_kiro_cli_outdated",
         "testing/harness.py::spawn_feature_gateway",
         # Apple on-device speech (macOS only). None of these takes an agent-authored
-        # command: the argv is a fixed toolchain path, the helper Kiro Crew itself
-        # compiled, or ffmpeg — and every variable part is a positional argument to
-        # execve (no shell), so a hostile value can only be a bad filename, not a
-        # second command. `_to_native_audio` mirrors the already-allowlisted
-        # `transcribe.py::_run_whisper_cli`: same ffmpeg invocation on the same
-        # user-supplied audio path. `_build_helper` runs swiftc over a file that ships
-        # inside the package, writing to the data home's `run/` dir (sensitive-path
-        # fenced, 0700). The three spawns that EXECUTE the compiled helper
+        # command: the argv is a fixed toolchain path or the helper Kiro Crew itself
+        # compiled. `_build_helper` runs swiftc over a file that ships inside the
+        # package, writing to the data home's `run/` dir (sensitive-path fenced,
+        # 0700). The three spawns that EXECUTE the compiled helper
         # (`transcribe`, `inventory`, `StreamingSession.start`) now route through
         # `sandbox.sandboxed_spawn_argv(mode="strict")` via `_sandboxed`, so they are
         # wrapped rather than merely declared; `strict` was verified to leave batch,
@@ -1178,14 +1215,38 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # (`transcribe.py::_python3_bin_dir` is absent: its scripts-dir probe
         # routes through `dep_sync.py::_probe_interpreter`, so an entry here
         # would be stale.)
-        "transcribe.py::_run_whisper_cli",
+        # Every runtime audio conversion now converges here so the authenticated
+        # bundled image stays bound until spawn. The executable is either that
+        # digest-verified image or a fixed-directory system candidate; the three
+        # current callers pass fixed ffmpeg flags and positional audio/temp paths,
+        # never a shell, custom cwd, or agent-controlled environment. A hostile path
+        # can only name a bad input, not a second command. `_SPAWN_NAMES` propagates
+        # this audit through the generic helper, so each caller remains independently
+        # reviewed and a future caller fails the gate until it is classified.
+        "transcribe.py::_create_ffmpeg_subprocess",
+        # The macOS authenticity oracle for the bundled ffmpeg: spawns the
+        # absolute /usr/bin/codesign (never PATH) with constant flags and a
+        # requirement string built from a module-level team-ID constant. The
+        # only variable argument is the path of the process-private snapshot
+        # (`/proc/self/fd/N`-style descriptor or the 0o500 snapshot dir this
+        # module itself just wrote and digest-verified) — no agent influence
+        # over command, args, cwd, or env. It cannot route through
+        # sandboxed_spawn_argv: codesign must read the system trust store and
+        # evaluate the Apple certificate chain, which the OS sandbox denies.
+        "transcribe.py::_macos_developer_id_authentic",
+        "transcribe.py::_pcm_via_ffmpeg",
         "transcribe.py::_transcribe_aws",
+        # The build probe executes the same authenticated image with the single
+        # fixed `-version` argument; it accepts no external input at all. Both
+        # streams are CAPTURED rather than discarded, so a refusal can name itself
+        # in the build log, and are decoded with errors="replace" because a loader
+        # complaint arrives in the host's console encoding.
+        "transcribe.py::_packaged_ffmpeg_version_probe",
         # JSON-Schema ``pattern`` validation for MCP app→gateway tool-call args
         # (validate_mcp_tool_arguments). The spawn's command surface is FULLY
         # fixed and NOT agent-selectable: binary is our own ``sys.executable``,
-        # argv is the constant ``-I -B -c <_PATTERN_CHILD_SRC>`` (``-I`` =
-        # isolated mode: no env, no user site, no PYTHON* vars; ``-B`` prevents
-        # writes beside a signed bundled interpreter), cwd is inherited (never
+        # argv is the constant ``-I -c <_PATTERN_CHILD_SRC>`` (``-I`` = isolated
+        # mode: no env, no user site, no PYTHON* vars), cwd is inherited (never
         # set from input). The only agent/server-influenced values — the regex
         # ``pattern`` (from the server's declared inputSchema) and the ``value``
         # (from the app) — are passed as a JSON **stdin** body, never as argv,

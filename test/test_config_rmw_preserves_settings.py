@@ -9,12 +9,44 @@ existing config raises, and a genuinely absent one still starts from ``{}``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
 
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import ConfigReadError, read_config_for_update
+
+
+def _inline_on_the_loop(fn, /, *args, **kwargs):
+    """Call *fn* from inside a running event loop, as an async handler does.
+
+    ``write_config_atomically`` is synchronous and several dashboard handlers
+    still reach it directly from a coroutine. That is the case its Windows volume
+    gate exists for, so a test about the gate has to actually be on a loop --
+    a plain test function is not, and would silently exercise the offloaded path
+    instead.
+    """
+
+    async def _main():
+        return fn(*args, **kwargs)
+
+    return asyncio.run(_main())
+
+
+def _offloaded(fn, /, *args, **kwargs):
+    """Call *fn* in a worker thread from a running loop.
+
+    The shape ``dashboard/chat_utils.run_config_write`` gives every config write
+    it owns: the loop stays free and the blocking work happens where a wait costs
+    nothing but the worker's own time.
+    """
+
+    async def _main():
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    return asyncio.run(_main())
+
 
 _REAL_SETTINGS = {
     "agent": {"approval_mode": "interactive", "max_subagents": 8},
@@ -325,8 +357,9 @@ class TestWriteConfigAtomically:
     def test_the_volume_is_classified_before_any_filesystem_work(self, tmp_path, monkeypatch):
         """Ordering IS the fix here, so it is asserted rather than the outcome alone.
 
-        This function runs inline on the event loop, and on Windows a DACL write to
-        a UNC or mapped-drive path is an unbounded SMB round-trip. A check placed
+        This case is a write running INLINE ON THE LOOP -- the one that cannot
+        afford the unbounded SMB round-trip a DACL write to a UNC or mapped-drive
+        path costs, and so the one the volume gate exists for. A check placed
         inside ``atomic_write`` -- where an earlier revision of this change put it
         -- is already too late: the ``stat`` and the ``parent.mkdir`` below, plus
         everything ``atomic_write`` does, each touch the target volume first, so the
@@ -336,6 +369,11 @@ class TestWriteConfigAtomically:
         config symlinked into a dotfiles repo can point at a different volume than
         the link, so classifying before resolving would classify the wrong volume.
         That is asserted too, rather than left implied.
+
+        The write is driven through :func:`_inline_on_the_loop` deliberately. A
+        plain test function has no running loop, which is now the OFFLOADED case
+        and skips the classification entirely -- so calling directly here would
+        assert nothing about the gate.
         """
         import kiro_crew.config.loader as loader
 
@@ -360,7 +398,9 @@ class TestWriteConfigAtomically:
         )
 
         path = tmp_path / "config.json"
-        loader.write_config_atomically(path, {"slack": {"bot_token": "xoxb-secret"}})
+        _inline_on_the_loop(
+            loader.write_config_atomically, path, {"slack": {"bot_token": "xoxb-secret"}}
+        )
 
         assert order[0] == "classify_volume", (
             "the volume must be classified before any filesystem work on it -- "
@@ -372,7 +412,7 @@ class TestWriteConfigAtomically:
 
     def test_a_local_volume_still_gets_the_lockdown(self, tmp_path, monkeypatch):
         # The other half: the gate must not become a blanket opt-out. On a local
-        # volume the write is protected exactly as it is without the gate.
+        # volume the on-loop write is protected exactly as it is without the gate.
         import kiro_crew.config.loader as loader
 
         locked: list[str] = []
@@ -381,7 +421,9 @@ class TestWriteConfigAtomically:
         monkeypatch.setattr(platform_compat, "restrict_to_owner", lambda p: locked.append(str(p)))
 
         path = tmp_path / "config.json"
-        loader.write_config_atomically(path, {"slack": {"bot_token": "xoxb-secret"}})
+        _inline_on_the_loop(
+            loader.write_config_atomically, path, {"slack": {"bot_token": "xoxb-secret"}}
+        )
 
         assert len(locked) == 1, f"the lockdown must run on a local volume: {locked}"
         assert locked[0].endswith(".tmp"), "the DACL must land on the TEMP, before the content"
@@ -399,8 +441,109 @@ class TestWriteConfigAtomically:
         monkeypatch.setattr(loader.windows_acl, "volume_is_local", _boom)
 
         path = tmp_path / "config.json"
-        loader.write_config_atomically(path, {"auto_update": True})
+        _inline_on_the_loop(loader.write_config_atomically, path, {"auto_update": True})
         assert json.loads(path.read_text())["auto_update"] is True
+
+    def test_an_offloaded_write_gets_the_dacl_on_a_non_local_volume(self, tmp_path, monkeypatch):
+        """The fix. A network-homed data home is protected once the caller offloads.
+
+        The volume was never the thing that made the DACL unaffordable -- the
+        event loop was. A write handed to a worker thread (what
+        ``dashboard/chat_utils.run_config_write`` does for every config write it
+        owns) blocks nothing but that worker, so an unbounded SMB round-trip is
+        affordable and ``config.json`` gets the owner-only DACL even on a UNC or
+        mapped-drive path.
+
+        The volume must not even be classified here: its answer could only take
+        protection away, so asking would be both pointless and a round-trip.
+        """
+        import kiro_crew.config.loader as loader
+
+        locked: list[str] = []
+        classified: list[str] = []
+        monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+        monkeypatch.setattr(
+            loader.windows_acl,
+            "volume_is_local",
+            lambda p: classified.append(str(p)) or False,  # a network-homed data home
+        )
+        monkeypatch.setattr(platform_compat, "restrict_to_owner", lambda p: locked.append(str(p)))
+
+        path = tmp_path / "config.json"
+        _offloaded(loader.write_config_atomically, path, {"slack": {"bot_token": "xoxb-secret"}})
+
+        assert len(locked) == 1, (
+            "an offloaded write blocks only its own worker, so the owner-only DACL "
+            f"must be applied regardless of the volume: {locked}"
+        )
+        assert locked[0].endswith(".tmp"), (
+            "the DACL must land on the TEMP file, before any content reaches it -- "
+            "otherwise the inline token exists in a readable file first"
+        )
+        assert not classified, (
+            "off the loop the volume must not be classified at all: its answer can "
+            f"only weaken the outcome, so asking is a wasted round-trip: {classified}"
+        )
+        assert json.loads(path.read_text())["slack"]["bot_token"] == "xoxb-secret"
+
+    def test_a_synchronous_caller_gets_the_dacl_on_a_non_local_volume(self, tmp_path, monkeypatch):
+        # The CLI and startup paths (cli_setup, cli_chat, KiroCrewConfig.save from
+        # boot) have no event loop at all, so they were skipping the DACL on a
+        # network-homed data home for a reason that never applied to them.
+        import kiro_crew.config.loader as loader
+
+        locked: list[str] = []
+        monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+        monkeypatch.setattr(loader.windows_acl, "volume_is_local", lambda _p: False)
+        monkeypatch.setattr(platform_compat, "restrict_to_owner", lambda p: locked.append(str(p)))
+
+        path = tmp_path / "config.json"
+        loader.write_config_atomically(path, {"slack": {"bot_token": "xoxb-secret"}})
+
+        assert len(locked) == 1, f"a caller with no loop has nothing to stall: {locked}"
+        assert locked[0].endswith(".tmp")
+
+    def test_an_offloaded_write_survives_a_lockdown_that_fails(self, tmp_path, monkeypatch):
+        # restrict_on_error="warn", not "raise": config.json must not become
+        # unwritable because a DACL could not be applied. Newly reachable on a
+        # non-local volume, so it is pinned there rather than assumed.
+        import kiro_crew.config.loader as loader
+
+        def _boom(_p):
+            raise OSError("the SMB share refused the descriptor write")
+
+        monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+        monkeypatch.setattr(loader.windows_acl, "volume_is_local", lambda _p: False)
+        monkeypatch.setattr(platform_compat, "restrict_to_owner", _boom)
+
+        path = tmp_path / "config.json"
+        _offloaded(loader.write_config_atomically, path, {"auto_update": True})
+
+        assert json.loads(path.read_text())["auto_update"] is True, (
+            "a DACL that cannot be applied must warn and continue -- losing the "
+            "settings write would be strictly worse than an inherited ACL"
+        )
+
+    def test_the_predicate_answers_for_the_thread_that_actually_writes(self):
+        """The link the fix hangs on, asserted directly rather than inferred.
+
+        ``on_event_loop`` is asked from deep inside a synchronous call stack, so
+        what matters is that it reports on the CALLING THREAD: True in a coroutine,
+        False in the worker ``asyncio.to_thread`` hands the write to. If that ever
+        inverted, every case above would still pass while the real behaviour
+        flipped -- an on-loop write would take the SMB stall and an offloaded one
+        would skip the DACL it can afford.
+        """
+        from kiro_crew.atomic_write import on_event_loop
+
+        async def _both():
+            return on_event_loop(), await asyncio.to_thread(on_event_loop)
+
+        inline, offloaded = asyncio.run(_both())
+
+        assert inline is True, "a coroutine runs on the loop it must not stall"
+        assert offloaded is False, "asyncio.to_thread's worker has no loop of its own"
+        assert on_event_loop() is False, "a plain synchronous caller has no loop either"
 
     @pytest.mark.skipif(
         not platform_compat.IS_POSIX,

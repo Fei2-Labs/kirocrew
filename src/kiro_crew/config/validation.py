@@ -306,11 +306,7 @@ _CONFIG_CACHE = ConfigCache()
 _CONFIG_CACHE_LOCK = _CONFIG_CACHE._lock
 
 
-def validate_config_data(
-    data: dict,
-    *,
-    selectable_acp_backends: frozenset[str] | None = None,
-) -> dict:
+def validate_config_data(data: dict) -> dict:
     """Validate *data* against the config JSON Schema.
 
     Logs warnings for any issues found and mutates *data* in-place to
@@ -323,24 +319,14 @@ def validate_config_data(
     # circular import: schema.py imports KiroCrewConfig from config.loader, which
     # re-exports this module — importing schema at module level here would close
     # a config.loader -> validation -> schema -> loader cycle at import time.
-    from kiro_crew.config.loader import CONFIG_RESERVED_TOP_KEYS
+    from kiro_crew.config.loader import (
+        CONFIG_RESERVED_TOP_KEYS,
+        _validated_stt_model,
+        _validated_stt_provider,
+    )
     from kiro_crew.config.schema import JSON_SCHEMA, SCHEMA_REGISTRY
 
-    # JSON_SCHEMA is a process-lifetime metadata snapshot, while the explicit
-    # adapter admission set can evolve independently. Refresh the enum from the
-    # current reviewed set so a newly admitted backend is not deleted merely
-    # because schema.py was imported before its registration.
     validation_schema = JSON_SCHEMA
-    try:
-        from kiro_crew.acp.backends import selectable_ids
-
-        selectable = sorted(
-            selectable_ids() if selectable_acp_backends is None else selectable_acp_backends
-        )
-        validation_schema = copy.deepcopy(JSON_SCHEMA)
-        validation_schema["properties"]["agent"]["properties"]["acp_backend"]["enum"] = selectable
-    except (ImportError, KeyError, TypeError):
-        logger.debug("Could not refresh the ACP backend validation enum", exc_info=True)
 
     # 1. Detect unrecognized top-level keys. The schema registry models only the
     # config's *sections*, so the keys save() stamps itself are not in it and
@@ -386,6 +372,22 @@ def validate_config_data(
             from kiro_crew.acp.backends import canonical_backend_id
 
             agent["acp_backend"] = canonical_backend_id(agent["acp_backend"])
+
+    # 3a. Resolve the STT provider and model through the loader's own degradation
+    # rules before the enum check can discard them. Both fields accept values that
+    # are deliberately absent from their enum (a retired provider, and a model name
+    # the catalog maps onto a current entry), and the loader answers each with a
+    # specific warning and a specific replacement. An enum violation instead
+    # deletes the key, so the parse site would fall back to the plain default and
+    # the operator would be told only that a value was rejected. Normalizing here
+    # makes the resolved value and the log identical whether or not ``jsonschema``
+    # is installed, which is the whole point: this function is a no-op without it.
+    stt = data.get("stt")
+    if isinstance(stt, dict):
+        if "provider" in stt:
+            stt["provider"] = _validated_stt_provider(stt["provider"])
+        if "model" in stt:
+            stt["model"] = _validated_stt_model(stt["model"])
 
     # 4. Preserve numeric values written by older config writers.
     _coerce_legacy_numeric_values(data, validation_schema)

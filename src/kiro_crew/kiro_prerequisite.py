@@ -51,7 +51,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import hooks, platform_compat
+from kiro_crew import hooks, identity_stores, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_files import AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
@@ -195,7 +195,7 @@ _AUTH_STORE_READ_ERROR = "Kiro identity file could not be read safely"
 # "no such table: history" on first use. Copying every table's DDL (and indexes)
 # while withholding non-identity ROWS keeps the CLI's queries valid and still
 # hands the sandboxed process no transcript content.
-_AUTH_SQLITE_DB = "data.sqlite3"
+_AUTH_SQLITE_DB = identity_stores.AUTH_SQLITE_DB
 _AUTH_IDENTITY_TABLES = ("auth_kv", "migrations")
 # `state` is a mixed key/value table: a few rows describe WHICH identity is signed
 # in (Identity Center region + start URL, CodeWhisperer profile) and the rest is
@@ -801,64 +801,6 @@ def _atomic_write_secret_bytes(path: Path, content: bytes) -> None:
     atomic_write(path, content, fsync=True, restrict_to_owner=True)
 
 
-def _store_write_time(db: Path) -> float:
-    """Newest write across a store's main file and its WAL sidecar.
-
-    The store runs in SQLite WAL mode: a commit lands in the ``-wal`` sidecar
-    and the main file's mtime does not advance until a checkpoint, so the main
-    file alone under-reports recency on exactly the side being written. The
-    ``-shm`` index file is not consulted -- it is mapped shared memory, not a
-    write record. Raises ``OSError`` if the main file vanished; a missing
-    sidecar is normal (checkpointed or non-WAL store).
-    """
-
-    newest = db.stat().st_mtime
-    wal = db.with_name(db.name + "-wal")
-    try:
-        newest = max(newest, wal.stat().st_mtime)
-    except OSError:
-        pass
-    return newest
-
-
-def _win32_identity_store_path(home: Path) -> Path:
-    """Pick between the Local anchor and the legacy Roaming store on Windows.
-
-    Current kiro-cli writes ``AppData/Local/kiro-cli``; older layouts used
-    ``AppData/Roaming/kiro-cli``. When only one store exists it is the store.
-    When BOTH exist, the most recently written one wins: an upgraded host
-    carries a stale Roaming leftover next to its live Local store (upgrades do
-    not clean up the old directory), while a downgraded host writes Roaming
-    next to a stale Local leftover -- and preferring either fixed side reads
-    the leftover on the other shape, yielding a confident fingerprint of an
-    account nobody is signed into. Reporting both-present as absent instead
-    would silently disable identity tracking on every upgraded host, the
-    common shape. The mtime signal is as trustworthy as the stores
-    themselves: both paths sit inside the ``_SENSITIVE_HOME_DIRS`` fence, so
-    anything that could move their timestamps could already author the rows
-    outright -- no new forgeable surface. Equal timestamps prefer Local, the
-    current layout.
-    """
-
-    local = home / "AppData" / "Local" / "kiro-cli" / _AUTH_SQLITE_DB
-    roaming = home / "AppData" / "Roaming" / "kiro-cli" / _AUTH_SQLITE_DB
-    if not roaming.exists():
-        return local
-    if not local.exists():
-        return roaming
-    try:
-        # Recency is per STORE, not per file: in WAL mode a commit advances
-        # the -wal sidecar while the main file's mtime stays frozen until a
-        # checkpoint, so each side reports the newest of the pair.
-        if _store_write_time(roaming) > _store_write_time(local):
-            return roaming
-    except OSError:
-        # A store vanished between the existence probe and the stat; the
-        # Local anchor is the current layout and the safe default.
-        pass
-    return local
-
-
 def kiro_identity_store_path(
     platform_name: str,
     home: Path,
@@ -886,8 +828,9 @@ def kiro_identity_store_path(
     directory (``AppData/Local/kiro-cli``); older layouts used the roaming one
     (``AppData/Roaming/kiro-cli``). When only one store exists it is chosen;
     when both exist the most recently written one wins, so a leftover from
-    the other layout never masks the live store's account (see
-    :func:`_win32_identity_store_path`). Both anchors sit inside the
+    the other layout never masks the live store's account (the WAL-aware
+    mtime tie-break lives in :func:`identity_stores.selected_store`). Both
+    anchors sit inside the
     ``_SENSITIVE_HOME_DIRS`` fence, so neither choice widens what an agent
     can forge. This branch stats the filesystem, so callers on the event loop
     should resolve the path inside the same worker thread as the read itself.
@@ -899,11 +842,7 @@ def kiro_identity_store_path(
     that genuinely requires it does not change every call site.
     """
 
-    if platform_name == "darwin":
-        return home / "Library" / "Application Support" / "kiro-cli" / _AUTH_SQLITE_DB
-    if platform_name == "win32":
-        return _win32_identity_store_path(home)
-    return home / ".local" / "share" / "kiro-cli" / _AUTH_SQLITE_DB
+    return identity_stores.selected_store(platform_name, home)
 
 
 def identity_store_is_relocated(
@@ -941,24 +880,33 @@ def identity_store_is_relocated(
     :meth:`KiroPrerequisiteService.current_identity_fingerprint` makes it
     diagnosable. A variable set to exactly the default location is not a
     relocation.
+
+    The (variable, default root) pairs are PROJECTED from
+    :data:`identity_stores.IDENTITY_STORE_ROOTS` -- each kiro-cli row's
+    ``env_var`` against the parent of its home-relative directory -- so this
+    check learns about a new or relocated store row the same way the fence,
+    staging, and state-db discovery do. macOS falls out naturally: its rows
+    carry no ``env_var`` (no standard variable relocates
+    ``~/Library/Application Support``), so no pair is checked there.
     """
 
-    if platform_name == "win32":
-        for variable, default in (
-            ("LOCALAPPDATA", home / "AppData" / "Local"),
-            ("APPDATA", home / "AppData" / "Roaming"),
+    plat = (
+        identity_stores.Platform(platform_name)
+        if platform_name in ("darwin", "win32")
+        else identity_stores.Platform.POSIX
+    )
+    for root in identity_stores.IDENTITY_STORE_ROOTS:
+        if (
+            root.platform is not plat
+            or root.product is not identity_stores.Product.KIRO_CLI
+            or root.env_var is None
         ):
-            configured = environ.get(variable, "").strip()
-            if configured and Path(configured) != default:
-                return True
-        return False
-    if platform_name == "darwin":
-        # No standard variable relocates ~/Library/Application Support.
-        return False
-    configured = environ.get("XDG_DATA_HOME", "").strip()
-    if not configured:
-        return False
-    return Path(configured) != home / ".local" / "share"
+            continue
+        default = home.joinpath(*root.home_relative_dir.split("/")).parent
+        configured = environ.get(root.env_var, "").strip()
+        if configured and Path(configured) != default:
+            return True
+    return False
 
 
 def identity_fingerprint(path: Path) -> str:
@@ -1095,7 +1043,17 @@ def _auth_store_mappings(
     home: Path,
     environ: MutableMapping[str, str],
 ) -> tuple[_AuthStoreMapping, ...]:
-    """Return only Kiro identity stores, never the surrounding credential dirs."""
+    """Return only Kiro identity stores, never the surrounding credential dirs.
+
+    Built over the canonical :func:`identity_stores.store_mappings` projection so
+    the source directories, the env-var source-side honouring
+    (``LOCALAPPDATA`` / ``APPDATA`` / ``XDG_DATA_HOME``), the fixed staged side,
+    and the Local-before-Roaming ordering all come from the single table. This
+    wrapper keeps staging's own concerns: the ``.aws/sso/cache`` token mapping
+    (not an identity store, so not in the table), the ``_AuthStoreMapping`` shape
+    with ``filenames=_AUTH_SQLITE_FILES``, and the ``win32:{app}`` group that
+    defers the abort across a product's two alternate AppData roots.
+    """
 
     mappings = [
         _AuthStoreMapping(
@@ -1104,57 +1062,25 @@ def _auth_store_mappings(
             filenames=("kiro-auth-token*.json",),
         )
     ]
-    app_names = ("kiro-cli", "amazon-q")
-    if platform_name == "darwin":
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=home / "Library" / "Application Support" / app_name,
-                    staged_relative=Path("Library") / "Application Support" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
+    for row in identity_stores.store_mappings(platform_name, home, environ):
+        # Both AppData roots of one Windows product are alternates: only one is
+        # this host's live store, so a stale leftover in the unused root must
+        # not abort staging from the used one. A shared group defers the abort
+        # across them; distinct ``staged_relative`` values (from the table) keep
+        # them from overwriting each other. macOS/Linux have a single location
+        # per product, so no group. (The env-var source-side honouring and the
+        # fixed staged side are already applied by ``store_mappings``.)
+        group = (
+            f"win32:{row.product.value}" if platform_name == "win32" else None
+        )
+        mappings.append(
+            _AuthStoreMapping(
+                source=row.source,
+                staged_relative=row.staged_relative,
+                filenames=_AUTH_SQLITE_FILES,
+                group=group,
             )
-    elif platform_name == "win32":
-        # Both AppData roots, because the installed CLI is observed using either
-        # one and every OTHER reader of this store already covers both: the fence
-        # (``_SENSITIVE_HOME_DIRS``), the trusted live-store list
-        # (``_CLI_SQLITE_DBS``), the logout fingerprint
-        # (``_win32_identity_store_path``) and ``kiro_cli_state_dbs``. Staging
-        # was the last reader still naming Local alone, so on a host whose CLI
-        # keeps its store under Roaming it staged NOTHING and the staged home
-        # looked signed-out. ``LOCALAPPDATA``/``APPDATA`` are honoured for the
-        # source side (that is where this host's real store lives), while the
-        # staged side is the fixed default layout the staged env re-points those
-        # variables at.
-        local_app_data = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-        roaming_app_data = Path(environ.get("APPDATA") or home / "AppData" / "Roaming")
-        for app_name in app_names:
-            for source_root, staged_root in (
-                (local_app_data, "Local"),
-                (roaming_app_data, "Roaming"),
-            ):
-                mappings.append(
-                    _AuthStoreMapping(
-                        source=source_root / app_name,
-                        staged_relative=Path("AppData") / staged_root / app_name,
-                        filenames=_AUTH_SQLITE_FILES,
-                        # The two roots of one product are alternates, so a stale
-                        # store in the unused root cannot abort staging from the
-                        # used one. Distinct ``staged_relative`` values keep them
-                        # from overwriting each other when a host has both.
-                        group=f"win32:{app_name}",
-                    )
-                )
-    else:
-        data_home = Path(environ.get("XDG_DATA_HOME") or home / ".local" / "share")
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=data_home / app_name,
-                    staged_relative=Path(".local") / "share" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
-            )
+        )
     return tuple(mappings)
 
 

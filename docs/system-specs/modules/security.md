@@ -15,6 +15,7 @@ KiroCrew implements defense-in-depth security across multiple layers: OS-level p
 | DNS rebinding | Attacker domain resolves to `127.0.0.1`; browser sends forged `Host` to the loopback-bound dashboard (incl. GET exfil) | `Host`-header allowlist validation on every method (`check_host` / `host_validation_middleware`), deny-by-default, 403 + SEL audit. Sole exemption: the three `PROBE_PATHS` liveness probes (orchestrators address containers by IP); their handlers strip identity fields via a second `check_host` gate, leaking nothing beyond TCP reachability |
 | Unauthenticated remote access | Dashboard bound to `0.0.0.0` | Loopback-only by default (`127.0.0.1`); when user opts in via `dashboard.url`, token auth middleware requires HMAC-SHA256 signed, IP-pinned, single-use tokens on every request |
 | Unauthenticated remote access (AEA tunnel) | `tunnel.enabled` exposes dashboard via public HTTPS URL | Double auth: Tunnels validates Midway OIDC at edge + KiroCrew token auth middleware. Security gate refuses tunnel start without token auth active. Owner-only access (Tunnels restricts by username). SEL audit on connect/disconnect/denial |
+| Published surface on a throwaway instance | A scratch instance (Dev Fleet pod) boots a gateway that can publish a tunnel, becoming reachable off the host and contending with a real gateway's registration. A seeded `tunnel.enabled=False` does not hold: it is written once at HOME creation and anything composing config later can flip it back | `--no-tunnel` boot flag pins "never publish" for the life of the process (`tunnel.set_publish_disabled`, read via `publish_disabled()`), consulted by BOTH doors out — `setup_tunnel` at boot, ahead of the token-auth gate and before any `TunnelManager` is constructed, and the on-demand provisioning in `slack.allowlist`, which bypasses `setup_tunnel` entirely. Config is deliberately not consulted: the flag is process state, so no file — including a `config.local.json` overlay — can turn it back on. A pod passes the flag on every exec whose target checkout declares it; the control plane builds the argv but the target worktree's gateway executes it, so `target_supports_flag` probes that checkout first and DROPS the flag when absent, because handing it to a gateway that predates it exits argparse 2 and `Restart=on-failure`/`RestartSec=5` (no `RestartPreventExitStatus`) makes that a 5s restart loop. SCOPE: such a checkout does NOT receive this guarantee — it keeps its pre-flag tunnel behaviour, which is a non-regression rather than a fix, and no config-side substitute is attempted. Re-pinning `tunnel.enabled=False` in the pod config was tried and withdrawn: `KiroCrewConfig.load()` deep-merges `config.local.json` OVER `config.json` with the overlay winning and `config set` writes the overlay by default, so pinning one file does not pin the setting; and the gateway's enable test is an OR (`cfg.tunnel.enabled or current_context().tunnel.enabled()`) whose provider half no config file reaches. Pinning `KIROCREW_PROFILE=standalone` to reach that half is also refused — the profile selects the whole `PlatformContext` including the Level-1 governance ceiling, so it would skip an administrator's policy. Every refusal is SEL-audited — `tunnel.start_denied` at boot and `tunnel.provision_denied` on the on-demand path, both with `resources=no_tunnel_boot_flag` — and `/api/tunnel/status` reports `reason: "boot_flag"` |
 | Unauthorized dashboard access | No auth on localhost | Token auth middleware on all requests (loopback bypass removed); file-based IPC secret for internal paths |
 | Non-owner channel interaction | Any workspace/server member clicks YOLO/approve buttons | 5-layer owner verification |
 | Fail-open owner lock | `KIROCREW_OWNER_ID` unset → no check | Deny-by-default: refuse connect + reject messages |
@@ -154,14 +155,15 @@ under `(allow default)`, never an edition-resolved or user-writable executable.
 - **Normalizer second pass (verb-independent)**: the regex first-pass matches raw shell text, so it sees only the path spellings it is authored for — two textually different strings naming the same file are not decidable by a regex over an unnormalized command line, and the set of equivalent spellings (dot segments, `..`, repeated slashes, `$HOME` vs the resolved home, quote splitting) is open-ended by construction. `_check_sensitive_via_normalizer()` therefore tokenizes via `normalize_shell_command()` and routes **every** path-like operand through `is_sensitive_path()` — the same normalizing checker the file gate uses — so one implementation is authoritative on both surfaces and a newly registered keystone leaf is protected on both by registration alone. The pass runs regardless of verb, mirroring the verb-independent backstop the sensitive-dir matcher applies: naming a sensitive path is itself the signal, and normalization is the only layer able to decide equivalence, so restricting it to a verb allowlist would leave a spelling such as `~/.kiro/crew/./live_target.json` unchecked for every verb outside that list. `_NORMALIZER_READ_VERBS` / `_LINK_CREATE_VERBS` are consulted only to skip the command name itself, never to decide whether operands are checked. `key=value` operands are split on the first `=` and the value checked as well: `of=/path` does not resolve as a path, and `--output=/path` is otherwise dropped by the flag skip. **Attached redirections** (`>~/path`, `>>~/path`, `2>~/path`) are kept as a single token by `shlex.split`; the leading operator prefix is stripped via `_REDIR_PREFIX_RE` before the path portion is checked, so `printf x >~/.kiro/crew/./live_target.json` is blocked just as `echo x > ~/.kiro/crew/./live_target.json` (with a space) is
   - **Not covered**: a bare relative operand (`live_target.json` run with the cwd inside the data home). `is_sensitive_path` is called without a `base_dir`, so such a token resolves against the gateway process cwd rather than the command's — a command line inspected before execution does not carry its cwd. Closing it requires a fail-closed decision for relative tokens whose basename matches a keystone leaf
 - `hooks.on_tool_call` runs **both** `is_sensitive_path` and `is_sensitive_bash_command` on the **normalized** tool title regardless of the kiro-cli `Reading: `/`Running: ` display prefix. The claude-agent-acp adapter sets a file-read tool's title to the bare path and a Bash tool's title to the bare command (no prefix), so gating either check on the prefix would let credential reads through on an alternate ACP backend. `is_sensitive_path` resolves the title as a path (a bare `~/.aws/credentials` matches; a `cat ~/.aws/credentials` command resolves to a non-sensitive path and is caught by `is_sensitive_bash_command` instead).
-- Sensitive paths: `~/.aws`, `~/.ssh`, `~/.gnupg`, `~/.gpg`, `~/.config/gcloud`, `~/.azure`, `~/.docker/config.json`, `~/.kube/config`, `~/.npmrc`, `~/.pypirc`, `~/.netrc`, `~/.git-credentials`, `~/.kiro/crew/.env`, `~/.kiro/crew/sel_hmac.key`, `~/.kiro/crew/trust`, `~/.kiro/crew/security_events.jsonl`, `~/.kiro/crew/app_admission.json`, `~/.kiro/crew/workflow_library`, `~/.kiro/crew/run`, `~/.kiro/crew/run-coordinator`, plus the legacy root-level PID authority leaves
-- **Crew data-home secret/trust-root leaves are covered under EVERY known home prefix.** Since the data home moved from top-level `~/.kirocrew` to `~/.kiro/crew`, each Kiro Crew secret / governance trust-root leaf (`.env`, `browser-cookies.txt`, `playwright-storage-state.json`, `sel_hmac.key`, `trust`, `security_events.jsonl`, `app_admission.json`, `security_policy.json`, `profiles`, `admission_policy.json`, `denied_commands.json`, `crons.json`, `cron-history`, `workflow_library`, `oauth_endpoints.json`, `live_target.json`, `token_signing.key`, `refresh_chains.json`, `.local_secret`, `routing`, `run`, `run-coordinator`) is expanded onto `_SENSITIVE_HOME_DIRS` under each entry of `_CREW_HOME_PREFIXES = (".kiro/crew", ".kirocrew")`. So the same leaf is read+write-blocked in (1) the current home `~/.kiro/crew` and (2) a not-yet-migrated pre-move legacy `~/.kirocrew`. The migration force-deletes `~/.kirocrew` once the move completes — there is no rollback copy to gate. A new secret is added to `_CREW_SECRET_LEAVES` once and is covered in both locations.
-- **Run coordinator ledger (`run-coordinator/`)** — the directory contains canonical run, command, lease, and delivery metadata plus SQLite WAL/SHM/journal sidecars. It is on `_CREW_SECRET_LEAVES` as a whole directory so an agent cannot read task payloads, forge terminal delivery, or rewrite its own desired/observed state and fencing metadata. Every Kiro Crew OS-sandbox mode resolves the active data home and denies reads, writes, and hardlinks to its ledger, including when `KIROCREW_HOME` places it outside `Path.home()`; the default and legacy lexical paths remain covered too. This closes raw subprocess access that bypasses tool-call path matching. The gateway opens the database directly rather than through the tool gate. The directory and known files are owner-only on creation and reopen.
+- Sensitive paths include host credential stores (`~/.aws`, `~/.ssh`, `~/.gnupg`, `~/.gpg`, `~/.config/gcloud`, `~/.azure`, Docker/Kubernetes/npm/PyPI/netrc/git credentials), vendor ACP credentials, and Kiro Crew's secret and governance roots. Legacy root-level PID authority leaves remain protected even though current process tracking lives under `run/`.
+- **Crew data-home secret/trust-root leaves are covered under EVERY known home prefix.** Every entry in `_CREW_SECRET_LEAVES` is expanded under both `_CREW_HOME_PREFIXES = (".kiro/crew", ".kirocrew")`, covering current and deprecated homes with one source of truth. This includes `.env`, BYOK and browser credentials, SEL and trust material, `security_policy.json`, `profiles/`, `policy_cache/`, `admission_policy.json`, `computer_use.json`, cron and workflow state, OAuth and signing keys, routing, `run/`, `run-coordinator/`, and app-owned credential/trust roots. New keystone state is added once and inherits both prefixes.
+- **Run coordinator ledger.** `run-coordinator/` contains canonical run, command, lease, and delivery metadata plus SQLite WAL/SHM/journal sidecars. Protecting the whole directory prevents an agent from reading task payloads, forging completion delivery, or rewriting desired/observed state and fencing metadata. Every OS-sandbox mode also masks the active relocated ledger when `KIROCREW_HOME` lies outside the default home; gateway coordinator code opens it directly. Files and directories are owner-only on creation and reopen.
+- **Meetings owner-edit root.** `apps/meetings/data/edits` is a directory leaf on the same read+write sensitive floor. The minutes editor returns owner-authored text verbatim, so its sidecars may contain private corrections or credential-shaped examples; meetings agents must neither inspect them with `fs_read` nor overwrite them with `fs_write`. Keeping the root outside `meetings/<id>/`, then registering the whole directory, makes the existing hook gate the enforcement boundary and also protects atomic-write temporary siblings. The Meetings backend opens these files directly, so save, overlay, revert, and meeting deletion are unaffected.
 - **SEL audit trust root (Talos finding cdf82704)** — `~/.kiro/crew/trust/sel_hmac.key` (the HMAC-SHA256 signing key for the tamper-evident audit chain, gated via the whole-dir `trust` entry; the legacy pre-migration `~/.kiro/crew/sel_hmac.key` leaf stays gated too) and `~/.kiro/crew/security_events.jsonl` (the audit log itself) are on the sensitive floor. The key lives in a dedicated owner-only `trust/` directory OUTSIDE the log's directory so write access to the log dir does not imply re-signing power. Without this floor an audited agent could `fs_read` the key and forge/rewrite the chain, or rewrite the log directly, erasing evidence of its own actions. The gateway's own SEL writer/reader (`sel.py`, `dashboard/session_health.py`) opens these files directly and does **not** route through `is_sensitive_path()`, so audit logging is unaffected. Residual: the key still lives in the agent's namespace; a deeper out-of-process signer (key never exposed to the agent) is documented future hardening.
 - **App admission trust root (keystone invariant)** — `~/.kiro/crew/app_admission.json` (the sole fleet-controlled App Kit admission ceiling loaded by `apps/admission.py`) is on the sensitive floor, read- and write-blocked through the shared file gate. Because an **absent** policy falls open (admit), a governed agent that could `fs_write`/`tee`/`rm` this file could delete or neuter its own admission ceiling and re-admit a banned/unsigned app. Adding it to `_SENSITIVE_HOME_DIRS` also arms the bash write/extract matcher (`tee`/`rm`/redirect). The gateway's own loader (`apps.admission.load_app_admission_policy`) opens it directly via `path.read_text()` and does **not** route through `is_sensitive_path()`, so legitimate policy loading is unaffected.
 - **Cron store (keystone leaf `crons.json`, #4812)** — the cron store holds access-control state, not just scheduling data: `session_key` decides which chat session may manage a job through the MCP cron tools and where its output is delivered, `approval_mode` is a per-job auto-approval decision, and `command`/`script` decide what gets executed on the host on a schedule. While the file sat outside the protected leaves, an auto-approved shell could reassign ownership, flip a job to auto-approve, or rewrite a scheduled job's command with an ordinary file edit — an open side door around the MCP tools' deliberate cannot-write-`session_key` rule and the `self-protection-cron-adopt` denied command, because those controls match command strings while the state lives in the file. The gap was a class, not a one-off: a command-string matcher cannot hold a file-backed invariant, so the structural control (the gate) is where the state lives now. Both `crons.json` and the `cron-history` sidecar directory (per-job records plus the index) are on `_CREW_SECRET_LEAVES`, read+write-blocked under every `_CREW_HOME_PREFIXES` entry on both the tool path and every shell form. The gateway's own writers (`CronService` via `atomic_write`, `CronHistoryStore`) open the paths directly and do **not** route through `is_sensitive_path()`, so scheduling and history are unaffected. Cost, accepted deliberately: a human hand-edit through an agent shell is now refused — the same trade-off every other keystone leaf makes; the store's malformed-entry tolerance still covers out-of-band edits made outside an agent session.
 - **Saved workflow library (keystone directory `workflow_library`)** — a valid definition is executable source and its presence means the user explicitly promoted it into a durable named capability. Owner-only modes do not isolate a same-UID agent process, so leaving the records under an ordinary workflows directory would let an auto-approved file edit plant a definition that the library would list and run without the confirmation flow. The dedicated `<KIROCREW_HOME>/workflow_library/` directory is therefore on `_CREW_SECRET_LEAVES`, read+write-blocked for agent file tools and every shell form. Classifying the whole directory also protects atomic-write temp files. Run snapshots remain under the configurable `workflows.dir`; only explicitly promoted definitions use this fixed trust root. Dashboard and workflow-service readers/writers open it directly, so human listing, saving, editing, and invocation are unaffected.
-- **Runtime exec and process-authority trust root** — the `run/` dir under the crew home is on the sensitive floor (under every `_CREW_HOME_PREFIXES` entry) because the gateway executes its contents **outside** the agent sandbox and trusts its process-tracking records when reaping orphan trees. It holds sandbox launcher scripts, remote-instance run markers, and `kiro_pids.txt` / `kiro_session_pids.txt` with their locks. Without this floor a prompt-injected agent could replace an unsandboxed launcher/marker or forge a PID plus a real start token and redirect the reaper at another same-user process. Legacy root-level PID filenames remain explicit sensitive leaves and are never migrated or read, so a stale file cannot restore the old authority surface. The gateway's own writers open these paths directly and do **not** route through `is_sensitive_path()`, so startup, spawn, and reaping are unaffected.
+- **Runtime exec dir trust root (run-marker sandbox-escape)** — the `run/` dir under the crew home is on the sensitive floor (under every `_CREW_HOME_PREFIXES` entry) because the gateway executes its contents **outside** the agent sandbox: the sandbox launcher scripts (`sandbox.py` execs `python <home>/run/kirocrew_sandbox_*.py`) and the remote-instance run-marker `gateway-<port>.bin` (`instances/run_marker.py`), whose recorded launcher path the SSH token-mint **and** the `restart_remote` action read and `exec` on the remote host. Without this floor entry a prompt-injected / sandboxed agent that could `fs_write` (or `tee`/redirect) a marker — or a launcher — into `run/` could point it at an attacker-controlled binary that the next routine token refresh or restart execs unsandboxed (owner + `-x` checks don't help; agent writes run as the same user) — a reachable sandbox escape. Classifying the whole dir also arms the bash write/extract matcher. The gateway's own writers (`instances/run_marker.write_marker` via `atomic_write`, and the sandbox launcher writer) open these paths directly and do **not** route through `is_sensitive_path()`, so gateway startup/spawn is unaffected.
 - **Live-target pointer (keystone leaf `live_target.json`)** — `~/.kiro/crew/live_target.json` decides which checkout the gateway `execve`s into at startup (Dev Fleet "Make live"), so a writable pointer is arbitrary code execution under the gateway's own identity, and a readable one tells an attacker which checkout to aim at. Added to `_CREW_SECRET_LEAVES`, so it is read+write-blocked under every `_CREW_HOME_PREFIXES` entry through the shared file gate. Only the human-driven dashboard cutover action (`_make_live` in `dev_fleet/server.py`) writes it, via `live_target.write_target()`. The gateway's own startup reader (`live_target.maybe_reexec` called from `cli.py`) opens it directly rather than through the gate, so live-target resolution is unaffected.
 
 - **Channel routing state (keystone leaf `routing`, holding Teams' `teams_service_urls.json`)** — the store is DELIVERY ADDRESSING, not a secret: it maps each allow-listed Teams identity to the conversation that identity was last seen in, and `teams/transport.py`'s `resolve_configured_target` resolves an explicit `user:<upn>` send target through exactly that map. While the file sat outside the protected leaves, a prompt-injected agent with file-write access could point one operator's UPN at a different person's conversation and have the next cron result, subagent-completion notice or `send_message` delivered there. The two attestations on the inbound path do not close it: the JWT's own `serviceurl` claim binds the address only for the activity carrying it, `connector_host_allowed` re-checks the host wherever the Connector token is attached, and neither can distinguish one legitimate conversation id from another on a shared Connector host. Reading is fenced with writing because the file enumerates the operator's UPNs and the conversations they use. **A DIRECTORY leaf, not the file, and that is load-bearing:** a file leaf matches only its exact name, while `atomic_write` publishes through a `tempfile.mkstemp` sibling (`tmpXXXXXXXX.tmp`) in the same parent — so with the store loose in the data-home root an agent watching that directory could overwrite the temp file in the window before `os.replace` and have the rename publish its own routing. A directory entry covers every child, random temp names included; the same residual is why `trust`, `profiles` and `cron-history` are directories. Note the general form is NOT closed by this entry: a keystone leaf named as a FILE (`crons.json`, `security_policy.json`, …) still has an uncovered `atomic_write` temp sibling, which is a matcher-level question rather than a per-store one. `ServiceUrlStore` opens its path directly (`atomic_write` / `read_text`) rather than through the gate, so proactive routing across a restart is unaffected. There is deliberately no migration from the pre-`routing/` location: reading the old, agent-writable path would reopen exactly the hole this closes, and the store is a warm start that degrades to in-memory by design.
@@ -171,11 +173,16 @@ under `(allow default)`, never an edition-resolved or user-writable executable.
 
 - **Operator OAuth consent-endpoint extension (keystone leaf `oauth_endpoints.json`)** — the security module's OAuth banner-safety contract (`security.oauth_url_contains_credential`, and `_exfil_url_warning` under `allow_oauth_entropy=True`) exempts standard front-channel params (`state`, PKCE, …) from the base64-blob/query-length heuristics only at an exact-match `(host, path)` in the code-owned `_OAUTH_AUTHORIZATION_ENDPOINTS`. `~/.kiro/crew/oauth_endpoints.json` (`{"additional_authorization_endpoints": [{"host", "path"}]}`) is the operator's escape hatch for identity providers outside that launch set (Okta orgs, Auth0, self-hosted OIDC, tenant-scoped Entra paths): `security._load_operator_oauth_endpoints()` unions strictly validated entries with the builtin set at check time (`_approved_oauth_authorization_endpoint`, memoized on the file's stat so a hand-edit takes effect on the next check without a restart). **Enforcement point:** the dashboard's live MCP OAuth banner validates URLs with this same gate — `_emit_mcp_oauth_request` in `chat_runner.py` calls `security.oauth_url_contains_credential` directly — so an operator endpoint entry governs the banner path as well as every other consumer wired to the contract gate. Each entry widens a trust boundary, so the file is on `_CREW_SECRET_LEAVES` (full read+write keystone block on both the tool path and every shell form) — an agent must not be able to author its own exemption — and there is deliberately no dashboard writer; the operator hand-edits it out-of-band. Every read fails soft to the EMPTY set (missing/unreadable/corrupt/non-object file, mirroring `computer_use.enable_state.load_state`), invalid entries are skipped individually with a warning (no wildcards, schemes, ports, userinfo, percent-escapes, IP literals, `..`, whitespace, or backslashes; hosts are lowercase-normalized DNS names with a letter TLD, paths exact and case-sensitive), and the entry list is truncated at 50 before validation so a mangled file cannot amplify. HTTPS-only / no-explicit-port / exact-match stay enforced by the gate logic and are NOT relaxable via the file, and the exemption grants exactly what the builtin set grants — fixed-credential patterns, heavy percent-encoding, userinfo, fragments, backslashes, and unknown-param heuristics remain unconditional. An approval that came from an operator entry (not the builtin set) emits a best-effort `oauth_endpoint_extension_used` SEL event, deduped per process per endpoint.
 
+**Windows UNC trusted-root gate** (`unc_probe_allowed` + `validate_file_path` in `hooks.py`) — a UNC path names a HOST, so resolving or stat-ing untrusted UNC-shaped text (`\\evil\share\x.png` or `//evil/share/x.png` echoed in any message or query) makes Windows open an outbound SMB connection to an attacker-named host. `validate_file_path` therefore consults `unc_probe_allowed` **before any resolution** on Windows — the ordering is the control, since `realpath` on UNC text is itself the probe — and the gate's comparison is purely lexical (`normcase`/`normpath`), never touching the network. Filesystem access is restricted to UNC paths under three trusted roots, all admitted on the same basis (directories this gateway itself writes to): (1) the crew **data home** — on a roaming profile the home directory is itself a UNC share, the one legitimate source of UNC attachment paths; (2) the **temp directory** — channel-side image staging; (3) the **kiro agents directory** (`<kiro home>/agents`) — `apps.bridges._register_agents` and `agent.rebuild_agent_config` write the managed specs there, and it is a *sibling* of the data home on the same share, so before #6721 its absence made `_read_agent_spec` silently read every user-level agent spec as absent on a UNC home. The prefix comparison is separator-boundary-anchored (a sibling share on the same host, or an `agents-evil` neighbour directory, is refused), a root that is not itself UNC-shaped admits nothing (the roots cannot become a bypass on an ordinary local home), and the agents root is **memoized per configuration** (keyed on the raw `KIRO_HOME` and the accessor identity): `kiro_agents_dir()` resolves `KIRO_HOME` with filesystem I/O — on a UNC-shaped override, an SMB touch — so it must not run per gate check on hot/async validation paths, and a computation failure memoizes the root as absent fail-safe (the gate stays total; recovery is an env change or restart, and the degraded state is the pre-#6721 status quo). The **project-level** agents dir (`project_agents_dir`) is deliberately NOT admitted: an arbitrary project directory is not gateway-written, so admitting it would be a genuine trust-boundary widening rather than a repair.
+
 **Write-only config protection** (`is_sensitive_write_path` in `security.py` + `hooks.py`) — runtime config files are protected against *modification* by agent tools while staying *readable*:
 - `~/.kiro/crew/config.json` and `~/.kiro/crew/config.local.json` are in a write-only tier (`_WRITE_PROTECTED_HOME_PATHS`, expanded under every `_CREW_HOME_PREFIXES` entry so the pre-move legacy copy is covered too), deliberately NOT in the read+write `_SENSITIVE_HOME_DIRS` list above — the dashboard file viewer, `cat`, and knowledge indexing legitimately read config.
 - `is_sensitive_write_path(path)` is a superset of `is_sensitive_path(path)`, sharing the same `_path_in_home_dirs` resolve/casefold core so the two gates can't drift. `hooks.on_tool_call` denies a file-EDIT tool call (ACP `edit` kind) whose `path`/`file_path` resolves to a config file.
 - Empty/unknown ACP tool kinds are intentionally left to the load-time clamp backstop rather than hard-denied, to avoid over-blocking config reads that arrive without a kind (governance's shape inference can apply both read+write scopes because it is a permissive policy intersection; this gate is a hard deny). Bash writes (`tee`, `>`, `sed -i`) likewise fall to the clamp.
 - The operator edits config out-of-band via the dashboard config API / CLI, which do not route through this gate.
+
+**Array-nested target paths bind on both planes (issue #6558).** A batch-shaped tool carries its real targets inside an array argument (`{"operations": [{"mode": "Line", "path": …}]}`). The sensitive-path keystone in `hooks.py` (`target_paths` / `TargetPaths`) was made nesting-aware first; the governance INTERSECTION plane (`platform/governance.py` `_tool_arg_paths` / `classify_tool_args`) previously read only the TOP level, so a nested path produced no `(scope, item)` pair, `gate_decision` hit its permit-by-default `if not pairs` branch, and an operator ceiling denying `filesystem.read`/`filesystem.write` outside the workspace never bound on the nested spelling. The bounded, depth-aware, iterative walk now lives in ONE shared lower-level module, `kiro_crew.platform.tool_paths` (stdlib-only, imports neither `hooks` nor `governance`, so there is no cycle — `hooks` imports `governance`), and BOTH planes delegate to it. The third extractor, `hooks._SEARCH_DENY_ARG_KEYS`, stays flat by design (documented residual below) and is out of scope.
+- **Truncated-scan policy on the permit-by-default plane.** The shared walk is bounded (`_TARGET_PATH_MAX_PATHS`=256, `_TARGET_PATH_MAX_NODES`=10_000) and reports a `truncated` flag. The `hooks` keystone fails SAFE by hard-denying any truncated scan. The governance plane is permit-by-default and must NOT blanket-deny an ungoverned standalone host, so on truncation it emits the filesystem scope(s) the tool kind implies (`edit`→`filesystem.write`; `read`→`filesystem.read`; unknown-kind-without-command→both) against a synthetic, never-permittable item (`_TRUNCATED_SCAN_ITEM`, containing a NUL byte so no allow-list pattern can match it). Effect: a prefix-bounded ALLOW-mode ceiling that confines the scope to a workspace DENIES the unverifiable call (closing the "bury the path past 10_000 nodes to escape the ceiling" fail-open), while an ungoverned scope still permits it (permit-by-default preserved). (A catch-all ALLOW pattern — `**`/`/**`/`*` — does match the marker via fnmatch and permits, but such a ceiling confines nothing and is unconstrained anyway, so this is consistent with its own posture rather than a bypass.) A DENY-mode ceiling that blocks only specific paths permits the marker — a targeted deny is not a general confinement and a partial scan cannot prove the buried path hit that one pattern; the always-on resolved keystone remains the authoritative guard for the sensitive tiers there. This resolves issue #6558 open-question-2 (option (c)); rejected: (a) permit-as-before keeps the fail-open, (b) unconditional deny over-blocks ungoverned hosts and every unrelated scope.
 
 **Data-home completion-marker protection** (`.data-home-ready`) — the marker whose presence makes `~/.kiro/crew` authoritative (migration is skipped once it exists, and a leftover legacy home is treated as debris). Because its mere *presence* is the trust signal — and, unlike config files, **no load-time clamp neutralizes a planted value** — a prompt-injected agent that could create it in a pre-migration home would make the next boot skip migration and ignore the legacy home's governance policy + secrets (deleting it forces a needless re-migration). It is therefore protected on *both* enforcement layers:
 - **File-edit tool gate**: the marker is in `_WRITE_PROTECTED_HOME_PATHS` (under every `_CREW_HOME_PREFIXES` entry), so `is_sensitive_write_path` denies an ACP `edit`-kind write to it while reads stay allowed.
@@ -337,6 +344,44 @@ The gateway's writers (`store.claim` / `update_fields`, and `ledger_sync`'s `git
 schedule) open these paths directly and do not route through the tool gate, so the app and team
 sync keep working.
 
+**Downloaded model weights** (`<data home>/models`) — write-protected on both layers, with the same read/write asymmetry, because the weights are an **input to a trust decision** rather than a setting. `stt.models` (and `embeddings`) verify a file against a pinned sha256 and then hand its **path** to a native loader that re-opens it by name, so a writable directory leaves a window between the digest and the open. Re-hashing cannot close it — the loader re-opens by name — and neither can a metadata memo, since `os.utime` is available to anything that can write the file. Removing the writability is what closes it.
+
+- **Tool path**: `models` is in `_WRITE_PROTECTED_HOME_PATHS` under every `_CREW_HOME_PREFIXES` entry. A directory rather than a leaf, so the trailing separator the pattern already accepts covers everything beneath it — the trust decision needs *any* file the loader might open, not one filename. Reads stay allowed (`is_sensitive_path` is `False`): the settings surface and `kirocrew doctor` both report what is installed, and weights hold no secret.
+- **Bash gate, anchored**: the same entry in `_WRITE_PROTECTED_BASH_LEAVES`, matched verb-independently.
+- **Bash gate, anchor-INDEPENDENT**: `_WHISPER_WEIGHT_NAME` (`ggml-*.bin`) is matched as a bare path **segment**, the same tier as `_BARE_TOKEN_PROTECTED_LEAVES`, because the anchored entry alone falls to a single `cd`: `cd ~/.kiro/crew/models; cp evil.bin ggml-base.bin` names no home, no crew prefix and no separator, and decides what a C++ GGML parser reads. Anchoring is therefore not part of this contract. A **pattern** rather than the four catalog filenames, so a row added to `stt.models.CATALOG` is fenced without a second edit in `security`. It is deliberately wider than the crew home (an unrelated GGML checkout cannot be copied from the agent's shell either); that is a denial, the safe direction, and the file tools are untouched. `models` itself must **never** join this tier — the SCOPE note there forbids generic names, and an unanchored `models` would refuse a large fraction of ordinary commands.
+- **Shared terminator boundary** (`path_end`): this tier's patterns accepted only `/`, whitespace, end-of-string or a quote after a fenced path, which made flush punctuation a bypass for **every** entry — `cd ~/.aws;`, `cd ~/.ssh;` and `cd ~/.kiro/crew/profiles;` were allowed while the same commands written with `&&` were blocked, purely because `&&` is preceded by a space. The class is now every character a shell treats as the end of a word (`; & | ( ) < > , :` and a backtick). Widening a deny boundary can only deny more; the rule it enforces is unchanged. This is what catches the archive form (`cd <models>; tar -xf evil.tar`), where the weight name is inside the tarball and so unavailable to a name match.
+
+`test_security.py::TestModelWeightsAreWriteProtected` pins all of it, including the false-positive cost of both widenings.
+
+**App-sources checkouts** (`app-sources/`) — the persistent tree every installed app *executes*
+from (`apps.registry.app_source_dir` → `<data-home>/app-sources/{name}`). The entry is a whole
+DIRECTORY rather than a leaf, which `_path_in_home_dirs` already supports: it matches the entry
+and its `entry + os.sep` prefix, so every file under every checkout is covered without
+enumerating them.
+
+This is the strongest instance of the write-only class, because the protected file *is* the
+executed code rather than an input to a decision about it — an agent with ordinary file-write
+tools could edit an installed app's source, which then runs with that app's privileges on the
+app's next launch. Nothing downstream neutralizes it: unlike `config.json`, whose inflated values
+the load-time clamp below rewrites, a modified checkout is simply run. Provenance does not catch
+it either — `install_from_registry` records `_resolved_clone_commit` (the tree's real `HEAD`), and
+an agent write dirties the worktree without moving `HEAD`, so a modified tree still reports the
+pinned SHA.
+
+- **File-edit tool gate only**, deliberately: `app-sources` is in `_WRITE_PROTECTED_HOME_PATHS`
+  but NOT in `_WRITE_PROTECTED_BASH_LEAVES`. That matcher blocks on a command *naming* the path,
+  which would deny bash reads too — and unlike the marker and the two Ops Mission Control files,
+  reading app source is a routine, high-volume operation (the dashboard file viewer lists
+  `app-sources` as a browsable root, knowledge indexing walks it, and reading an app's code is how
+  anyone debugs one). Reads stay allowed on both paths; `app-sources` is not in
+  `_SENSITIVE_HOME_DIRS`. This leaves shell writes on the same footing as `config.json`'s, where
+  the tool gate is likewise the enforcement point.
+- The gateway's own installer is unaffected: `_clone_build_app` clones, builds and prunes through
+  direct Python/subprocess calls, which are not agent tool calls and never reach
+  `hooks.on_tool_call`.
+- An installed app's *data* directory (`apps/{name}/data/`) is a different tree and stays
+  writable — apps persist state there through the agent's own tools.
+
 **Load-time resource-limit clamp** (`config/loader.py`) — defends against a config-loader bound bypass: the dashboard config API rejects out-of-range writes, but a direct edit of `config.json` (any process as the same OS user, or a prompt-injected agent with file-write access) bypassed that gate.
 - `KiroCrewConfig.load()` calls `_clamp_security_bounds(data)` on the disk-read path (before caching) so cache hits and the `GET /api/config/kirocrew` serialization both report clamped values.
 - Clamped knobs: `agent.subagent_auto_max` ≤ `SUBAGENT_AUTO_MAX_CEILING` (64), `agent.max_subagents` ≤ 64, `agent.subagent_max_turns` ≤ `SUBAGENT_MAX_TURNS_CEILING` (200), `session.pool_size` ≤ `POOL_SIZE_MAX` (10). Mins match existing runtime floors (0/1); `bool` and non-int values are left untouched for dataclass coercion.
@@ -359,10 +404,6 @@ sync keep working.
 - Base64 detection: finds 40+ char base64 chunks, decodes them, checks if decoded content matches any credential pattern
 - **Bare label-less secret-key detection** (`bf7b1baf`): a 40-char AWS *secret access key* (the value paired with an `AKIA`/`ASIA` ID) is a bare base64 run with NO prefix and NO `key=` label, so the fixed-format patterns above miss it when it appears standalone (echoed alone, in a log line, in a JSON array element). A third redaction pass adds an entropy + structural heuristic: `_BARE_SECRET_RUN_RE` isolates each `[A-Za-z0-9+/]{40,}` run (word-boundary look-arounds so surrounding prose is preserved), then `_looks_like_secret_key()` applies every gate below — a token must clear ALL of them (design bias is toward NOT redacting: a false negative reverts to prior behavior, a false positive corrupts benign output). Gates, ordered by measured cost per rejection (cheapest first): (1) length is EXACTLY 40 (AWS secret-key length); (2) contains lower + upper + digit (rejects all-lower prose, ALL-UPPER constants, base32, digit runs); (3) not an all-hex run (`_HEX_ONLY_RE` rejects 40-char git SHAs and 32/64-char md5/sha256 digests — verified even for mixed-case hex that would otherwise clear the entropy gate); (4) the longest run of consecutive lowercase letters ≤ `_SECRET_MAX_LOWER_RUN` (5), decided by `_lowercase_run_exceeds(token, cap)`, which stops as soon as a run reaches `cap + 1` instead of measuring the longest run in the whole token; (5) vowel ratio ≤ `_SECRET_MAX_VOWEL_RATIO` (0.30); (6) Shannon entropy ≥ `_SECRET_ENTROPY_MIN` (4.3 bits/char — real random keys average ~4.78 and rarely drop below ~4.4, while camelCase identifiers and file paths cluster at 4.0-4.3; the canonical AWS example scores 4.66); (7) does not base64-decode to ≥85% printable ASCII (`_decodes_to_printable_text` leaves encoded-text blobs to the decode-and-scan pass). **The order of gates 4-7 is a performance property, not a correctness one:** all four are pure predicates that return `False` on failure, so every permutation produces the same verdict on every input — which is exactly why a behavior test cannot pin it. Entropy used to run first and was therefore paid on every window that cleared gates 1-3, even though the two structural gates reject more per microsecond. Measured over the windows reaching this point: lowercase-run 1.65 µs at 66.5% rejection, vowel 2.89 µs at 62.3%, entropy 8.48 µs at 54.5%, decode 3.01 µs at 0%. Ordering by cost per rejection cut `redact_credentials()` on a 51 KB payload from 69.8 ms to 27.0 ms with byte-identical output. `TestSecretGateOrderIsCostOrdered` counts gate evaluations and fails if the order regresses to entropy-first; do not reorder these four back without re-measuring. Both structural gates apply to EVERY token: unlike a naive design, the presence of `/` or `+` is **not** a free pass to redact, so a 40-char mixed-case file path (e.g. `src/main/java/com/Example/FooBarBazClas1`) — which contains `/` yet is built from dictionary-word segments with long lowercase runs — stays intact. The pass scans the ORIGINAL text (stable offsets) and skips any run already redacted by pass 1/2. Tests (`test_security.py::TestBareSecretKeyRedaction`) prove true positives on real secret shapes and NO over-redaction of git SHAs, UUIDs, sha256/md5 hex, base32, prose, code identifiers, or slash-delimited file paths. **Glued-secret sliding window**: `_looks_like_secret_key()` only accepts an EXACTLY-40-char token (gate 1) — its documented boundary assumption — but `_BARE_SECRET_RUN_RE` captures the *longest* base64 run, so a real 40-char secret glued to an adjacent base64 char with no delimiter (`X`+secret, secret+`A`, `SECRET=`+secret+`ABC`, secret+`X`+secret) forms a 41+ char run that fails the exact-40 gate and would leak verbatim. Pass 3 therefore gates each captured run through `_contains_bare_secret()`, which slides a 40-char window across the run and redacts the whole run when ANY window clears every gate; this stays linear (the regex yields disjoint spans). The sliding window does not over-redact >40-char benign camelCase identifier runs (no window within them looks like a secret)
 - Applied on **every** output path — each boundary where agent output reaches a human or an external service. The authoritative list is the `redaction_paths` control in `security_posture.py` (see "Security Posture Detail Registry" below), which is what Settings → Security renders; do NOT restate the count as a literal here (this line read "ALL 5 output paths" long after the real number had multiplied, and the dashboard's hardcoded pill inherited that stale 5)
-- **Keyed subagent command responses** — executor and coordinator failures run
-  through both shared redactors before they are persisted as durable command
-  results, returned over HTTP/MCP, or reconstructed by command-status lookup;
-  this boundary is registered in the authoritative posture registry.
 - **Deny-surface tool titles** (`dashboard/chat_runner.py`): `event.title` prefers the model's own `description` field (`_select_tool_title`), so it is agent-controlled display text. Every permission-deny surface — the 🚫 blocked transcript row (broadcast AND persisted to the ConversationLog) and the SEL audit `tool_name` — renders it only through `_redact_display_text()` (both redactors, idempotent, byte-identical for clean titles). The two deny shapes are rendered in exactly one place each: `_reject_invalid_tool()` (name validation failed) and `_reject_hook_error()` (PreToolUse fire raised), beside `_reject_hook_blocked()` (hook exit-2 block), so a permission path added later cannot publish the raw title by omission. `test_dashboard_approval.py::TestDenyRowTitleRedaction` pins each path behaviorally plus a structural zero-raw-interpolation guard
 - **Cross-chunk streaming redaction** (`StreamRedactor`): per-chunk redaction misses a credential split across a token/streaming/Slack chunk boundary (a chunk ending `...AKIA` and the next starting `IOSFODNN7...` each individually escape `redact_credentials()`, so raw fragments reach WebSocket/SSE/Slack consumers). `StreamRedactor` is a rolling-buffer redactor: it withholds the trailing run of credential-class characters (`_CRED_CLASS` — letters/digits + URL/base64/connection-string punctuation, the possible start of a not-yet-complete credential) until a non-credential-class terminator arrives or the stream ends, then rejoins and redacts before emitting on the wire. Holdback is bounded by `_STREAM_HOLDBACK_MAX = 512` (larger than the longest fixed-format credential) so a split token is always rejoined; `flush()` redacts the buffered remainder at segment/stream end. Adds at most one chunk of latency. **Streaming JWT/JWE ceiling** (round-2 + round-3): JWTs (esp. RS256/ES256 with embedded claims) routinely exceed 512 chars, so a terminal token longer than the DoS floor would otherwise be bisected — the first `len-512` chars emitted raw before `flush()` redacts only the held tail. When the withheld tail matches `_PARTIAL_JWT_TAIL_RE` (`eyJ…` optionally followed by up to FOUR `.`-separated base64url segments — `{0,4}`, so a 5-segment compact JWE escalates too, matching the batch JWE ceiling — anchored to buffer end) the cap is raised to `_STREAM_HOLDBACK_JWT_MAX = 4096` so the whole token is rejoined before emission; the 512-char floor still applies to every non-credential run. **Split-Bearer holdback** (a8e5fe6a): an `Authorization: Bearer <token>` header spans whitespace (not in `_CRED_CLASS`), so the cred-class run alone would commit the `Authorization: Bearer ` prefix and leak the token on the next chunk. `_BEARER_ANCHOR_PARTIAL_RE` (case-insensitive, JSON-aware, `\Z`-anchored, matching any prefix of an in-progress `Authorization: Bearer <token>`) makes `feed` pull the commit index back to the anchor start (`i = min(i, anchor.start())`), holding header + token together, and escalates the cap so an opaque OAuth/refresh/SSO Bearer token >512 chars (no `eyJ`) is not bisected either. **Fail-closed ceiling** (round-3): when a credential-anchored tail (JWT/JWE/Bearer) exceeds the 4096 ceiling, `feed` FAILS CLOSED — it redacts+emits the confirmed-safe prefix, appends `_REDACTED_CREDENTIAL_TAG` (`[REDACTED: credential]`, shared with the batch redactor), and DROPS the oversized tail rather than bisecting it; a plain cred-class run with NO credential anchor is still committed verbatim (bisected — no data loss, DoS bound intact)
 - Defense against write-then-execute attacks: even if the LLM tricks kiro-cli into running a credential-extracting script, the output is scrubbed before the LLM can use it in follow-up messages
@@ -960,6 +1001,16 @@ re-parsed into GUI sub-effects; and the **web terminal PTY**
 `is_sensitive_bash_command` / governance call at all, so it is an operator-only,
 ungoverned plane today.
 
+### A variable LEAF under the keystone (`security.py`, `win_crew_var_leaf_path`)
+
+`~/.kiro/crew` is not fenced as a directory — only its leaves are — so a read whose *filename* is unresolvable (`cat "$HOME/.kiro/crew/$F"`) can only be refused by asking whether the DIRECTORY holds a protected leaf. The token-level rule does that, but it needs a token: POSIX `shlex` destroys an unquoted Windows-native path before any token rule runs, so a raw-text branch matches the same shape directly on the command text, anchored to the crew home and its leaf-bearing subdirectories.
+
+**The bracketing expansion forms match their OPENER and do not describe a body.** This gate only ever asks "does an unresolved expansion start here", and any answer that models the contents can be out-nested. Both failures were real: a body permitting one level of nesting (`(?:[^()]|\([^()]*\))*`) missed `$(a $(b $(c)))`, and `\$\{[^}\s]+\}` missed `${My Var}` because a PowerShell variable name may legally contain a space. `$(`, `@(` and `${` are therefore matched bare — that cannot be out-nested, and it can only deny more, which costs nothing here because a *resolvable* leaf under the keystone is already fenced by name.
+
+The delimited forms keep their closers on purpose: an unterminated `%`, `!` or backtick is a **literal** to cmd, PowerShell and `sh` respectively, so it names no expansion and matching it would refuse ordinary filenames. Anchoring is what bounds the false-positive cost of the opener-only forms — `echo $(date)` and `type %APPDATA%\$(x)\config.ini` are unaffected, because neither names the keystone directory.
+
+`test_security.py::TestKeystoneVariableLeafNativeSpellings` parametrises every anchor, both separators, both crew-home spellings and both variable and computed leaves; restoring either depth-limited body fails 48 of its cases.
+
 ### Suspicious Bash Patterns (`security.py`)
 
 55 patterns in `SUSPICIOUS_BASH_PATTERNS` checked by `audit_bash_command()` at tool invocation time. Patterns with `*` use `fnmatch` glob matching; others use substring matching.
@@ -1450,10 +1501,7 @@ their presence disables canonical non-shell grantability and matching, so a
 same-`toolCallId` re-prompt cannot turn an argument-bearing call into an inputless
 one. A missing server/tool identity or a pre-upgrade pending card without the
 internal key fails closed for durable trust while ordinary Allow once and Reject
-remain available. A spec-adapter MCP title with zero or multiple roster matches
-is explicitly marked ambiguous and hard-denied by every PreToolUse consumer, so
-an approval surface cannot substitute a display-derived identity. Existing broad
-`*` trust retains its established semantics;
+remain available. Existing broad `*` trust retains its established semantics;
 legacy ambiguous exact MCP display patterns do not match the new internal keys.
 
 The `pattern` submitted by the dashboard is a consent proof, not authority: it
@@ -1598,12 +1646,6 @@ without that disclosure. Likewise, the `suspicious_patterns` row states it is
 not enforced at the PreToolUse gate — the gate uses the narrower
 `audit_bash_exfiltration` plus the denied-command rules.
 
-Coordinator restart recovery is an output boundary too: both legacy imports and
-native lease takeovers redact task, agent, and error fields before constructing a
-durable completion event. The security-posture registry names those two modules
-separately so a recovery-only delivery path cannot disappear from the coverage
-inventory.
-
 **`/api/security/stats` is retained but no longer used by the dashboard**, which
 reads `/api/security/posture` (same counts plus the items). It re-sources via
 `posture_counts_async`, which resolves every `items_fn` — so the count is still
@@ -1644,160 +1686,6 @@ imported function-locally to avoid the `kiro_crew.dashboard` package cycle.
 - **React text children** instead of `esc()` + `sanitize()` HTML strings
 - **No regex URL linkification in HTML strings** — use React elements via `.split()`
 - **Shell injection prevention** — `/etc/hosts` update uses `sudo tee -a` (not `sh -c echo`)
-
-## ACP backend tool-gate routing
-
-Kiro Crew's PreToolUse gate — the bundled denied-command rules, the sensitive-path
-block, the governance ceiling — runs from exactly one place,
-`HookManager.on_tool_call`, reached only from the `EVENT_PERMISSION_REQUEST` branch
-of the dispatch parser. **A backend that does not send
-`session/request_permission` per tool call is a backend where none of those
-controls execute.** How each backend is made to ask is therefore a security
-property, recorded as `Routing` on its descriptor:
-
-| Routing | Backend | Established by |
-|---|---|---|
-| `AGENT_SPEC` | kiro-cli, KAS | the spawn names an agent — true by construction, nothing to probe |
-| `SEEDED_SETTINGS` | claude-agent-acp | Kiro Crew writes `permissions.defaultMode: "default"` and reads it back |
-| `SESSION_CONFIG` | codex-acp | the ACP v1 session advertises a config option (`mode`) whose enforced value (`read-only`) makes privileged tools ask; applied and verified per session |
-| `UNVERIFIED` | unknown registry adapters | no verified mechanism — fails closed |
-
-**Why codex-acp uses `SESSION_CONFIG` instead of adapter configuration.** Probing
-`approval_policy` in `$CODEX_HOME/config.toml` reads a file the ACP session does
-not honour: codex-acp starts these sessions in its own default **agent** mode,
-which permits commands and file writes *inside the workspace* without emitting
-`session/request_permission` at all. A host-side probe of that file therefore
-resolved `ROUTED` for a session that was ungated in practice — measured as 166
-execute/edit operations with zero permission frames, detected only by Layer 2
-after the writes had already landed. The enforceable boundary is the session's own
-advertised `mode` selector, so the descriptor carries
-`permission_config_id`/`permission_config_value` and the client applies it before
-the first prompt rather than trusting an out-of-band file. `read-only` still
-permits passive reads; commands and changes request approval. ACP v1 offers no way
-to make an adapter ask for passive reads, so the **Reads** approval mode's promise
-holds and **Normal** is honest about changes, which is the contract that matters.
-
-`acp/tool_gate.py` resolves one of three verdicts and enforces it in two layers.
-
-**Verdicts.** `ROUTED`, `BYPASSED`, or `INDETERMINATE`. INDETERMINATE is not a
-synonym for "probably fine": a guarantee that lapses whenever a file is unreadable
-is not a guarantee, so it is enforced exactly like BYPASSED. It is a distinct value
-only so the operator-facing message can say "could not determine" rather than
-asserting a policy the file never contained.
-
-**A `SESSION_CONFIG` verdict is a contract, not a probe.** `resolve_verdict`
-returns `ROUTED` with the reason "the client enforces `<id>=<value>` before the
-first prompt", because there is nothing on disk to read — the option lives on the
-session, which does not exist yet. The claim is discharged in
-`AcpClient._apply_session_permission_routing`, inside the `session/new` /
-`session/load` handshake and **before** `session/prompt` can run:
-`tool_gate.session_config_issue` requires this session to have advertised that
-exact option id carrying that exact value, and `set_config_option` must be
-accepted. A missing option, a missing value, a malformed `configOptions`, or a
-rejected write routes to `tool_gate.enforce_runtime_routing`, which raises
-`AcpToolGateUnroutable` under the same opt-out rule as Layer 1. Absence is not
-read as lazy advertising the way an optional model/effort option is: the
-difference is that the first prompt would otherwise run ungated. Because it runs
-inside the handshake, a **resumed** session re-verifies rather than inheriting a
-mode the previous process set.
-
-**Layer 1, pre-flight.** `AcpClient._spawn` enforces before the subprocess exists,
-so a session that cannot be governed never gets a process to run tools in. A
-non-`ROUTED` verdict raises `AcpToolGateUnroutable` (an `AcpError` subclass so
-branch-less callers degrade to generic handling), which the `ensure_ready` retry
-ladder treats as non-retryable. File-backed routing (`SEEDED_SETTINGS`) is a
-configuration fact on disk, so respawning re-reads the same file.
-`SESSION_CONFIG` has nothing on disk to read: Layer 1 is the contract that the
-handshake will apply the advertised option before the first prompt.
-
-**Layer 2, in band.** An execute-kind tool completing on any backend whose routing
-is not `AGENT_SPEC`, with no `session/request_permission` ever seen, records a
-`log_governance_degraded` SEL event and warns, once per process. This is
-**detection, not prevention**: by the time the frame arrives the adapter has
-already run the command. Its purpose is to catch a config that claimed the backend
-asks while it does not. `AGENT_SPEC` backends are exempt — they auto-approve
-read-only tools without a permission frame by design, so including them would emit
-a false positive every session.
-
-**The opt-out.** `agent.acp_backend_allow_ungated_tools`, default off, is the one
-named way to start a session anyway. When on: a warning naming the unenforced
-controls at every session start, a SEL event, and a `kirocrew doctor` issue — the
-doctor reports it even when the current verdict is ROUTED, because it disarms the
-refusal for future sessions too. Goose permission mode `auto` has no dashboard
-surface, payload field, or persisted slot marker, and the mode-change endpoint
-refuses it because a harness-owned grant cannot inherit the governance clamp or
-SafetyOverride expiry. Auto cannot become a second, non-expiring bypass.
-
-**The Claude/OpenCode seeds are conservative.** Kiro Crew writes `defaultMode` / `permission`
-only when
-nothing is configured, and never overwrites a configured mode — not even to
-strengthen it. An explicitly configured `auto` is somebody's decision; the session
-refuses instead, with the opt-out as the documented way through. The probe reads
-the file back after seeding, so a silently failed write surfaces as INDETERMINATE
-rather than passing.
-Malformed, unreadable, and non-object files are preserved rather than replaced.
-Reads reject a linked leaf and writes use the shared atomic writer with its
-cross-platform symlink/junction parent-chain refusal, so a project cannot redirect
-a routing seed into an external operator file.
-
-**Credential stores.** Each backend's credential leaf is on
-`_SENSITIVE_HOME_DIRS`; Claude contributes `.claude/.credentials.json` and Codex
-contributes `.codex/auth.json` — the leaves, not their directories, because
-blocking those would hide the settings and config files needed for routing
-diagnosis. When `CLAUDE_CONFIG_DIR`, `CLAUDE_HOME`, or `CODEX_HOME` is set, the
-sensitive-target builder re-anchors the corresponding credential leaf under
-each resolved root and includes the overrides in its cache key; filesystem and
-normalized shell checks therefore move with the credentials while ordinary
-settings remain readable. The list is written
-**literally**, not derived from the registry at runtime: importing `acp.backends`
-from `security.py` is an import cycle, and a `try/except` around it swallows the
-failure and silently protects nothing. `test_acp_backend_credentials_are_protected`
-is the contract that keeps the two in step.
-
-Leaf entries arm the `fs_read`/`fs_write` gate, absolute-path shell matching, and
-the home-entry-relative scan (`cd ~/.codex && cat auth.json`); directory entries
-use the same shared matcher.
-
-**Executable ACP registry cache.** `<data-home>/acp-registry.json` remains
-readable but is write-protected at both the file-tool and shell layers. Its
-package, argv, and admitted environment fields feed the next adapter spawn, so
-an agent-authored rewrite would otherwise persist code execution through Kiro
-Crew's trusted launcher. Kiro Crew's registry refresher writes the file directly,
-atomically, and owner-only. Parser-side environment filtering independently
-drops executable lookup and runtime/dynamic-loader/shell/npm control keys.
-Executable distribution fields are admitted only when the version is concrete
-semver, the package names that exact version in a supported npx/uvx spelling,
-and every bounded argv element is a string without NUL. Runtime revalidates the
-same contract even when a caller constructs a registry record without using the
-JSON parser. uvx distributions remain unselectable because `--offline` can
-execute an ephemeral cache entry and does not prove `uv tool install`. For npm
-distributions Kiro Crew enumerates the inherited shell toolchain first and every
-augmented manager-path toolchain after it. Ordinary toolchains query each global
-npm root, require an exact name/version manifest and an unambiguous Node bin that
-stays within the package tree, and launch it with that toolchain's absolute Node
-path. Executable manager shims run directly; Windows `.cmd` / `.bat` shims are
-unwrapped to their adjacent `npm-cli.js`. Volta global installs are verified in
-their persistent per-package image instead of the unrelated `npm root -g`.
-Package and bin registration metadata must agree before the package-pinned Node
-image launches the verified entry point directly; the workspace-sensitive
-generic Volta shim is never executed. Successful ordinary roots are cached but
-misses and Volta images are
-retried so a later operator install is visible without a restart. This consumes
-the documented global install without npx cache materialization, network
-resolution, or a shell.
-
-**Agent profiles.** A spec adapter sends no `session/set_mode`, so a custom agent
-whose spec withholds shell would silently gain the adapter's unrestricted shell —
-a privilege escalation for exactly the restricted app and subagent agents whose
-narrowed tool set IS their boundary. `acp/spec_agent_guard.py` refuses that
-combination. Discovery keys identity on the JSON `name` field, not the filename,
-and applies the same project-shadowing rules as dispatch. An unreadable exact-name
-spec is treated as unverifiable rather than permissive, since otherwise making a
-spec unreadable would convert a refusal into an approval. Agents Kiro Crew itself
-authors are exempt only when the owned filename is in Kiro Crew's global agents
-directory. The default `kirocrew` name has no independent exemption: a project
-shadow using that name is evaluated like any other project spec, so it cannot
-borrow global ownership to widen its tools.
 
 ## Security Rules for Development
 

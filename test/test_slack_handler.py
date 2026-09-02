@@ -626,7 +626,7 @@ class TestHandleMessage:
 
     @pytest.mark.asyncio
     async def test_trusted_bot_access_disabled(self):
-        """from_trusted_bot is always False — bot messages never bypass owner check."""
+        """from_trusted_bot=False (untrusted bot): error replies are NOT suppressed."""
         from kiro_crew.acp.client import AcpError
 
         class _RaisingProvider(FakeProvider):

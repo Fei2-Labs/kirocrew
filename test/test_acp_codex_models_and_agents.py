@@ -196,8 +196,10 @@ class TestSpecAdapterAgentGuard:
         refusal into an approval.
         """
         self._write(agents_dir, "opaque", {"tools": ["fs_read"]})
+        # The stub forwards **kw because the reader takes keyword-only SEL
+        # attribution labels this test does not care about.
         monkeypatch.setattr(
-            "kiro_crew.agent_discovery._read_agent_spec", lambda path: None, raising=True
+            "kiro_crew.agent_discovery._read_agent_spec", lambda path, **kw: None, raising=True
         )
         restriction = spec_agent_guard.shell_restriction("opaque", tmp_path)
         assert "could not be read" in restriction

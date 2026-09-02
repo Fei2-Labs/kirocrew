@@ -29,6 +29,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      # persist-credentials retained: sync / "Open sync PR" runs git fetch + git push -u origin
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0          # merge needs real history, not a shallow clone
@@ -123,9 +124,38 @@ jobs:
             echo "</details>"
           } > /tmp/body.md
 
-          gh pr create --base "$BASE" --head "$BR" \
+          # `gh pr create` with GITHUB_TOKEN is refused outright when the
+          # repository has "Allow GitHub Actions to create and approve pull
+          # requests" turned OFF -- GitHub answers
+          #   GraphQL: GitHub Actions is not permitted to create or approve
+          #   pull requests (createPullRequest)
+          # This repository leaves it off deliberately: the same single switch
+          # also grants APPROVING, and main's merge gate is a required human
+          # review.
+          #
+          # The push above already succeeded, so nothing is lost -- only the
+          # last, cosmetic step is unavailable. Hand the branch to a human with
+          # a one-click compare link and keep the run green. Any OTHER create
+          # failure is a real error and must still fail loud, so it is re-raised
+          # rather than swallowed. Same remedy as add-contributor.yml and
+          # test-durations.yml.
+          rc=0
+          out="$(gh pr create --base "$BASE" --head "$BR" \
             --title "merge: sync $UP" --body-file /tmp/body.md \
-            --label upstream-sync || echo "::warning::branch pushed, PR creation failed"
+            --label upstream-sync 2>&1)" || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ]; then
+            case "$out" in
+              *"not permitted to create or approve pull requests"*)
+                compare="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$BASE...$BR?expand=1"
+                echo "::notice::Branch $BR is pushed and ready, but GitHub Actions may not open pull requests in this repository. Open it here: $compare"
+                exit 0
+                ;;
+              *)
+                exit "$rc"
+                ;;
+            esac
+          fi
 
       # ── conflicted: issue only, pre-classified, no branch ─────────────────
       - name: File conflict issue

@@ -1943,10 +1943,20 @@ class TestPureHelpers:
         assert not own
 
     def test_should_auto_approve_spawn(self):
+        from types import SimpleNamespace
+
         builder = MagicMock()
         builder.is_auto_approved_spawn.return_value = True
-        assert h._should_auto_approve_spawn(builder, "spawn_run") is True
-        assert h._should_auto_approve_spawn(None, "spawn_run") is False
+        event = SimpleNamespace(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+            is_shell=False,
+            shell_classified=True,
+        )
+        assert h._should_auto_approve_spawn(builder, event) is True
+        assert h._should_auto_approve_spawn(None, event) is False
 
 
 # ──────────────────────────────────────────────────────────────────────

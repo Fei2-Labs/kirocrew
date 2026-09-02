@@ -265,7 +265,17 @@ export interface CostReport {
 }
 
 /** Artifact kinds the library can hold. `image` cannot be pushed. */
-export type ArtifactKind = 'widget' | 'markdown' | 'html' | 'json' | 'webapp' | 'image'
+/**
+ * Artifact kinds, mirroring ALLOWED_KINDS in the backend artifact store.
+ *
+ * ALL EIGHT, deliberately. `list_pushable` returns `artifact.kind`
+ * verbatim without filtering, and `_KIND_EXT` makes svg and text
+ * PUSHABLE -- so omitting them did not make them unreachable, it only
+ * stopped the compiler from noticing that their kind badge rendered
+ * blank. Keep this in step with the backend set.
+ */
+export type ArtifactKind =
+  | 'widget' | 'markdown' | 'html' | 'svg' | 'json' | 'text' | 'webapp' | 'image'
 
 /**
  * One artifact in the account's cloud library. `pushedVersion` is the version

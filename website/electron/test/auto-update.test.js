@@ -343,6 +343,100 @@ test("guard: a prerelease-stamped build ahead of stable is NOT nagged (byte-stam
   assert.strictEqual(states.at(-1).state, "not-available");
 });
 
+// The feed's answer is the ONLY honest input for "which lane are these bytes
+// from", because promotion re-points the soaked candidate's file at stable
+// without re-stamping it: the stable feed's release is literally
+// `0.4.1-insider.1`, so channelForVersion() reports `insider` for a stable
+// install. The display layer therefore reads `laneVersion` /
+// `runningAheadOfLane` instead, and the About panel's version chip and
+// "you are on a prerelease" note key on those. The auto-offer guard above is
+// deliberately NOT keyed on them -- suppressing an unsolicited downgrade is a
+// separate decision from labelling the running build honestly.
+test("records what the followed lane publishes, so an ahead build is not mislabelled", async () => {
+  const { deps, emit } = makeDeps({ appVersion: "0.5.0-insider.2" });
+  deps.getChannelPreference = () => "stable";
+  const u = initAutoUpdate(deps);
+  // Before any check the answer is UNKNOWN, never "ahead": a boot-time panel
+  // must not un-fold every promoted-stable version on a comparison never made.
+  assert.strictEqual(u.getInfo().laneVersion, "");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, null);
+
+  await u.check();
+  // The stable lane's current release, which the direction gate then (correctly)
+  // declines to auto-offer -- the version must survive that suppression.
+  emit("update-available", { version: "0.4.1-insider.1" });
+  assert.strictEqual(u.getInfo().laneVersion, "0.4.1-insider.1");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, true);
+});
+
+test("a lane that publishes exactly the running build reports not-ahead", async () => {
+  // The promoted-stable population: prerelease-STAMPED bytes that ARE the stable
+  // release. `update-not-available` fires because the feed matches the running
+  // version, which is what makes this a definite false rather than an unknown.
+  const { deps, emit } = makeDeps({ appVersion: "0.4.1-insider.1" });
+  deps.getChannelPreference = () => "stable";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-not-available", { version: "0.4.1-insider.1" });
+  assert.strictEqual(u.getInfo().laneVersion, "0.4.1-insider.1");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, false);
+});
+
+test("a build running BEHIND its lane is not ahead of it", async () => {
+  const { deps, emit } = makeDeps({ appVersion: "0.4.0-insider.14" });
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-available", { version: "0.4.1-insider.1" });
+  assert.strictEqual(u.getInfo().runningAheadOfLane, false);
+});
+
+test("lifecycle payloads carry the lane pair, so a push-driven renderer agrees with getInfo", async () => {
+  const { deps, emit, states } = makeDeps({ appVersion: "0.5.0-insider.2" });
+  deps.getChannelPreference = () => "stable";
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-available", { version: "0.4.1-insider.1" });
+  const last = states.at(-1);
+  assert.strictEqual(last.laneVersion, "0.4.1-insider.1");
+  assert.strictEqual(last.runningAheadOfLane, true);
+});
+
+test("a lane answer is dropped once the install follows a different channel", async () => {
+  // Design review caught this: `update:set-channel` stores the preference and
+  // returns getInfo() SYNCHRONOUSLY while its re-check is still in flight, so a
+  // retained answer from the old lane gets paired with the new channel. On an
+  // up-to-date insider build flipped to stable, a kept `runningAheadOfLane: false`
+  // says "these bytes ARE the stable release" -- folding the chip to a version
+  // that does not exist and suppressing the prerelease ask, i.e. the very bug the
+  // lane pair exists to fix, for as long as the next check keeps failing.
+  let preference = "insider";
+  const { deps, emit } = makeDeps({ appVersion: "0.5.0-insider.2" });
+  deps.getChannelPreference = () => preference;
+  const u = initAutoUpdate(deps);
+  await u.check();
+  emit("update-not-available", { version: "0.5.0-insider.2" });
+  assert.strictEqual(u.getInfo().runningAheadOfLane, false, "insider lane publishes these bytes");
+
+  // The switcher flips. No check has completed for stable yet.
+  preference = "stable";
+  assert.strictEqual(u.getInfo().laneVersion, "", "the insider answer does not describe stable");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, null, "unknown, never a stale false");
+});
+
+test("a lane answer is attributed to the lane whose feed was fetched, not to a later flip", async () => {
+  // Mirror of shouldAutoOffer's feedChannel rule: if the preference changes while
+  // a check is in flight, the answer that comes back describes the OLD lane.
+  let preference = "stable";
+  const { deps, emit } = makeDeps({ appVersion: "0.5.0-insider.2" });
+  deps.getChannelPreference = () => preference;
+  const u = initAutoUpdate(deps);
+  await u.check(); // feed configured for stable
+  preference = "insider"; // user flips mid-flight
+  emit("update-available", { version: "0.4.1-insider.1" }); // ...stable's answer arrives
+  assert.strictEqual(u.getInfo().laneVersion, "", "not reported as the insider lane's answer");
+  assert.strictEqual(u.getInfo().runningAheadOfLane, null);
+});
+
 test("guard: an EXPLICIT channel switch off the default lane is still offered", async () => {
   // Stable-stamped build whose user explicitly picked insider: the preference
   // moves it off its default (stable) lane, so a lower insider build is a

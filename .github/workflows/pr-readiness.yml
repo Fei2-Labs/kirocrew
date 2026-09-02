@@ -368,6 +368,103 @@ jobs:
             fi
           done
 
+      # The disposition gate below runs a repository script, so the bytes it
+      # executes must come from TRUSTED code -- this workflow is
+      # pull_request_target and holds write tokens, so checking out the PR head
+      # would hand a contributor arbitrary execution with them. Pin the DEFAULT
+      # BRANCH explicitly rather than relying on the per-event default ref
+      # (base branch for pull_request_target, default branch for workflow_run):
+      # one visible ref is what makes the trust boundary reviewable.
+      # github.event.repository is absent on some payloads, so fall back to
+      # github.ref_name, which is the default branch on those triggers.
+      # sparse-checkout keeps this to the one script directory, and
+      # persist-credentials: false leaves no token in the worktree -- nothing
+      # here runs git against the remote.
+      - name: Check out the disposition evaluator from the default branch
+        if: steps.context.outputs.stale != 'true' && steps.context.outputs.state == 'OPEN'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
+          sparse-checkout: src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts
+          persist-credentials: false
+
+      # Issue #6658: the one-lane / one-rationale-per-finding disposition rule
+      # was mechanical only for a writer running the prepare-pr loop, so a
+      # writer who skips that loop could post a blanket single-rationale
+      # `target=gpt` record that codex-review.yml's adjudication ledger admits
+      # with full downgrade power while nothing on the merge path objected.
+      # Evaluating it here binds every writer, because this job publishes the
+      # repository's only required status.
+      #
+      # The evaluation is NOT reimplemented in shell: `--disposition-gate` runs
+      # the same `disposition_violations` the local gate calls, over the same
+      # records the ledger admits, so the rule keeps ONE definition instead of
+      # gaining a workflow-side fourth copy of the grammar.
+      #
+      # This step must never fail the job. A failed step skips the publish step
+      # below, which leaves the required status pending with no further event to
+      # recompute it on an unchanged commit -- the permanent-pending failure
+      # mode this workflow is written around. So: no `set -e`, every outcome
+      # becomes an output, and an unreadable record set becomes `ok=false`,
+      # which the evaluation reads as WAITING, never as a red.
+      #
+      # Cost, stated plainly: this is the repository's highest-dispatch
+      # workflow, and the gate adds a shallow sparse checkout plus one comment
+      # read (and one permission call per distinct disposition author, which on
+      # a PR with no disposition comments is zero). It cannot be skipped on a
+      # cheap precondition, because deciding whether a disposition comment
+      # exists means reading the comment list and matching the marker prefix --
+      # a fourth reading of the grammar, which is the thing #6658 exists to
+      # avoid. The per-revision concurrency group already collapses the
+      # workflow_run burst, so the added work lands roughly once per head
+      # update per uncollapsed event, not once per monitored workflow.
+      - name: Evaluate disposition records
+        id: dispositions
+        if: steps.context.outputs.stale != 'true' && steps.context.outputs.state == 'OPEN'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.context.outputs.pr }}
+          SHA: ${{ steps.context.outputs.sha }}
+          GATE: ${{ github.workspace }}/src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/pr_status.py
+        run: |
+          set -uo pipefail
+
+          ok=false
+          violations=""
+          if [ ! -f "$GATE" ]; then
+            # The evaluator moved or the sparse checkout missed it. Report
+            # UNKNOWN so readiness waits and says why, rather than reporting a
+            # clean rule from a check that never ran.
+            echo "pr-readiness: disposition evaluator not found at $GATE" >&2
+          elif out="$(python3 "$GATE" --disposition-gate \
+                --repo "$REPO" --pr "$PR" --head "$SHA")"; then
+            echo "pr-readiness: disposition gate -- $out"
+            if [ "$(jq -r '.ok' <<<"$out" 2>/dev/null)" = "true" ]; then
+              ok=true
+              violations="$(jq -r '.violations[]' <<<"$out" 2>/dev/null || true)"
+            else
+              echo "pr-readiness: disposition gate could not evaluate: $(jq -r '.error' <<<"$out" 2>/dev/null)" >&2
+            fi
+          else
+            # stderr above is deliberately NOT suppressed: the gate turns every
+            # expected failure into ok=false JSON, so reaching here means the
+            # interpreter itself failed and the traceback is the only diagnosis.
+            echo "pr-readiness: disposition gate did not run (exit $?)" >&2
+          fi
+
+          # Random heredoc delimiter per GitHub's own guidance for multi-line
+          # outputs: the violation text is charset-limited (logins, span ids,
+          # lane names) and newline-flattened by the gate, so this is belt and
+          # braces rather than the only guard.
+          delim="EOF_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          {
+            echo "ok=$ok"
+            echo "violations<<$delim"
+            printf '%s\n' "$violations"
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Evaluate current revision
         id: verdict
         if: steps.context.outputs.stale != 'true' && steps.context.outputs.state == 'OPEN'
@@ -384,6 +481,12 @@ jobs:
           DEFAULT_BRANCH: ${{ steps.context.outputs.default_branch }}
           TRIGGER_EVENT: ${{ github.event_name }}
           TRIGGER_ACTION: ${{ github.event.action }}
+          # From the disposition step above. Empty DISPOSITION_OK means the step
+          # did not run at all, which contributes nothing -- the step's own `if`
+          # matches this one's, and test_pr_readiness_dispositions.py pins the
+          # wiring so a rename cannot silently disable the gate.
+          DISPOSITION_OK: ${{ steps.dispositions.outputs.ok }}
+          DISPOSITION_VIOLATIONS: ${{ steps.dispositions.outputs.violations }}
         run: |
           set -euo pipefail
           source "$RUNNER_TEMP/gh-retry.sh"
@@ -462,6 +565,11 @@ jobs:
           passed=()
           pending=()
           failed=()
+          # A fork run with conclusion `action_required` was created but never
+          # executed: only a maintainer can approve it. Keep that condition out
+          # of `failed[]` so the verdict attributes the block correctly, and
+          # out of `pending[]` because automation cannot clear it by itself.
+          awaiting_approval=()
 
           for spec in "${workflow_specs[@]}"; do
             file="${spec%%|*}"
@@ -619,7 +727,24 @@ jobs:
                 esac
               else
                 case "$conclusion" in
-                  success|neutral|skipped) passed+=("$label") ;;
+                  success|neutral) passed+=("$label") ;;
+                  # A workflow-level skip stays NON-BLOCKING -- the paths filters
+                  # skip lanes on purpose, so failing here would redden ordinary
+                  # PRs -- but it is reported as "Not eligible" rather than folded
+                  # into the passed count. Counting it as passed made an absent
+                  # matrix leg indistinguishable from a green one, which is exactly
+                  # how a platform nobody builds for reads as covered. `skipped[]`
+                  # feeds only the summary, never the verdict.
+                  skipped) skipped+=("$label (skipped)") ;;
+                  action_required)
+                    if [ "$FORK" = "true" ]; then
+                      awaiting_approval+=("$label")
+                    else
+                      # On an upstream branch this conclusion is anomalous,
+                      # so retain the failure-class diagnostic.
+                      failed+=("$label ($conclusion)")
+                    fi
+                    ;;
                   *) failed+=("$label ($conclusion)") ;;
                 esac
               fi
@@ -634,14 +759,17 @@ jobs:
           # leaves a red check for a network blip. This deliberately does NOT
           # weaken the gate: pending blocks merge exactly like failure does,
           # and only a transport error with NO already-observed blocker takes
-          # this branch -- a genuine failure recorded by an earlier lane
-          # dominates (the `failed` guard below), falling through to the normal
-          # action-required verdict, so a known red is never masked by a later
-          # lane's network trouble. Recovery is automatic -- the self-heal
+          # this branch -- a genuine failure or maintainer-approval wait
+          # recorded by an earlier lane dominates (the array guards below),
+          # falling through to the normal action-required verdict, so a known
+          # red is never masked by a later lane's network trouble. Recovery is
+          # automatic -- the self-heal
           # sweep re-fires any pending readiness status older than its
           # staleness window, and any later monitored-workflow event recomputes
           # sooner.
-          if [ "$transport_failed" = "true" ] && [ "${#failed[@]}" -eq 0 ]; then
+          if [ "$transport_failed" = "true" ] \
+            && [ "${#failed[@]}" -eq 0 ] \
+            && [ "${#awaiting_approval[@]}" -eq 0 ]; then
             # The tiebreaker for every ambiguous case is an asymmetry:
             # publishing "pending" can only ever BLOCK a merge, never allow
             # one, so pending is the fail-safe write whenever validation
@@ -727,6 +855,24 @@ jobs:
           # one-way-door / long-term-reversibility lens now lives in Design
           # Review. Readiness no longer waits on any API-owned external check.)
 
+          # Disposition-rule enforcement (issue #6658). A violation is a
+          # condition waiting cannot fix -- only the author editing or deleting
+          # the comment can -- so it belongs in `failed`, alongside a red lane.
+          # `ok=false` means the record set could not be established, which is
+          # UNKNOWN and therefore `pending`: a transient comments/permission API
+          # failure must never red the required status (issue #2753's class).
+          case "${DISPOSITION_OK:-}" in
+            true)
+              while IFS= read -r violation; do
+                [ -n "$violation" ] || continue
+                failed+=("disposition rule: $violation")
+              done <<<"${DISPOSITION_VIOLATIONS:-}"
+              ;;
+            false)
+              pending+=("disposition records could not be read")
+              ;;
+          esac
+
           blockers=()
           waiting=()
           if [ "${#failed[@]}" -gt 0 ]; then
@@ -739,11 +885,20 @@ jobs:
             waiting+=("pull request is a draft")
           fi
 
-          if [ "${#blockers[@]}" -gt 0 ]; then
+          if [ "${#blockers[@]}" -gt 0 ] || [ "${#awaiting_approval[@]}" -gt 0 ]; then
             state="action_required"
             label="readiness: action required"
             status_state="failure"
-            description="${#blockers[@]} blocking readiness item(s)"
+            if [ "${#blockers[@]}" -gt 0 ] && [ "${#awaiting_approval[@]}" -gt 0 ]; then
+              description="${#blockers[@]} blocking readiness item(s); ${#awaiting_approval[@]} awaiting maintainer approval"
+            elif [ "${#blockers[@]}" -gt 0 ]; then
+              description="${#blockers[@]} blocking readiness item(s)"
+            else
+              description="${#awaiting_approval[@]} workflow(s) awaiting maintainer approval"
+              if [ "${#passed[@]}" -eq 0 ] && [ "$transport_failed" = "false" ]; then
+                description="$description; none has run yet"
+              fi
+            fi
           elif [ "${#waiting[@]}" -gt 0 ]; then
             state="checking"
             label="readiness: checking"
@@ -769,7 +924,7 @@ jobs:
           # can only be diagnosed by opening the summary UI by hand (#3550).
           # Plain `echo` here lands in the job's own log instead, so
           # `gh run view --log | grep 'pr-readiness: lane state'` finds it.
-          echo "pr-readiness: lane state -- passed=[${passed[*]:-}] pending=[${pending[*]:-}] failed=[${failed[*]:-}] skipped=[${skipped[*]:-}]"
+          echo "pr-readiness: lane state -- passed=[${passed[*]:-}] pending=[${pending[*]:-}] failed=[${failed[*]:-}] skipped=[${skipped[*]:-}] awaiting_approval=[${awaiting_approval[*]:-}]"
 
           {
             echo "state=$state"
@@ -788,6 +943,15 @@ jobs:
               echo
               echo "**Not eligible**"
               printf -- "- %s\n" "${skipped[@]}"
+            fi
+            if [ "${#awaiting_approval[@]}" -gt 0 ]; then
+              echo
+              echo "**Awaiting maintainer approval**"
+              printf -- "- %s\n" "${awaiting_approval[@]}"
+              echo
+              echo "> GitHub created these fork runs but has not executed them."
+              echo "> A maintainer must approve them; the contributor cannot"
+              echo "> clear this condition."
             fi
             if [ "${#blockers[@]}" -gt 0 ]; then
               echo

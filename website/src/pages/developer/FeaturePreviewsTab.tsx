@@ -3,9 +3,8 @@ import { ArrowRight } from 'lucide-react'
 
 import { SettingsCard, SettingsToggle } from '../../components/settings'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_ACP_BACKENDS, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
+import { PREVIEW_CREW, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
 import { i18nT } from '../../i18n/t'
-import { ACP_BACKEND_ROUTE } from '../overview/AcpBackendCard'
 
 /**
  * Developer > Feature Previews — opt in to surfaces that ship in the bundle but
@@ -39,7 +38,7 @@ import { ACP_BACKEND_ROUTE } from '../overview/AcpBackendCard'
 export function FeaturePreviewsTab() {
   const navigate = useNavigate()
   const webhooks = usePreviewFlag(PREVIEW_WEBHOOKS)
-  const acpAdapters = usePreviewFlag(PREVIEW_ACP_BACKENDS)
+  const crew = usePreviewFlag(PREVIEW_CREW)
 
   return (
     <>
@@ -67,27 +66,25 @@ export function FeaturePreviewsTab() {
         </div>
       )}
     </SettingsCard>
-    {/* Its own card, per this page's one-card-per-feature rule. The flag adds a
-        dedicated Developer tab and the active-backend row on System > Services. */}
+    {/* One card, one flag, BOTH crew doors: the Crew Members rail item and the
+        sidebar's "New Crew Mode chat" entry. The toggle copy names both, because
+        a reader who only sees "Crew" cannot predict which of the two moves — and
+        the two appear in places far enough apart that discovering the second one
+        by flipping the switch is not reliable.
+
+        NO ingress button here, deliberately, unlike the webhooks card above. That
+        one needs its link because `/webhooks` is `hiddenFromNav` and the card is
+        its ONLY door. Crew is not: flipping this switch puts the Crew Members row
+        back on the rail in the same tick (`usePreviewFlagRevision`), so a link
+        here would be a second spelling of a door the user can already see — and
+        one that costs a catalog key in twelve languages permanently. */}
     <SettingsCard>
       <SettingsToggle
-        label={i18nT('pages.developer.featurePreviewsTab.acp_backends')}
-        description={i18nT('pages.developer.featurePreviewsTab.experimental_acp_backends_claude_code')}
-        checked={acpAdapters}
-        onChange={v => setPreviewFlag(PREVIEW_ACP_BACKENDS, v)}
+        label={i18nT('pages.developer.featurePreviewsTab.crew')}
+        description={i18nT('pages.developer.featurePreviewsTab.the_crew_members_page_and_crew_mode_chats_both_a')}
+        checked={crew}
+        onChange={v => setPreviewFlag(PREVIEW_CREW, v)}
       />
-      {acpAdapters && (
-        <div className="pt-1">
-          <button
-            type="button"
-            onClick={() => navigate(ACP_BACKEND_ROUTE)}
-            className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent bg-transparent border-none cursor-pointer px-0 py-1 hover:underline"
-          >
-            {i18nT('pages.developer.featurePreviewsTab.acp_backends')}
-            <ArrowRight size={13} className="lucide-inline" />
-          </button>
-        </div>
-      )}
     </SettingsCard>
     </>
   )

@@ -56,8 +56,13 @@ def _minted_claims(payload: dict) -> dict:
     return json.loads(_b64url_decode(token.split(".", 1)[0]))
 
 
-def _caller_token(**extra: str) -> str:
-    return generate_token("alice", ttl_seconds=MAX_SESSION_TTL_SECS, extra=extra or None)
+def _caller_token(*, peer_key: str = "", **extra: str) -> str:
+    return generate_token(
+        "alice",
+        ttl_seconds=MAX_SESSION_TTL_SECS,
+        peer_key=peer_key,
+        extra=extra or None,
+    )
 
 
 def test_mobile_link_uses_configured_external_origin():
@@ -139,6 +144,22 @@ def test_mobile_link_carries_the_callers_bounds_into_the_minted_token():
     claims = _minted_claims(json.loads(response.text))
     assert claims["boot"] == "boot-abc"
     assert claims["no_refresh"] == "1"
+
+
+def test_mobile_link_carries_the_callers_exact_device_binding():
+    """A delegated login link cannot widen a peer-bound session."""
+    peer_key = "ts:node:alice@example.com|phone.tail.ts.net"
+    response = _call(
+        _request(
+            dashboard_url="https://dashboard.example",
+            cookie_token=_caller_token(require_peer="1", peer_key=peer_key),
+        )
+    )
+
+    assert response.status == 200
+    claims = _minted_claims(json.loads(response.text))
+    assert claims["require_peer"] == "1"
+    assert claims["peer_key"] == peer_key
 
 
 def test_mobile_link_caps_ttl_at_the_callers_remaining_session():
@@ -301,4 +322,10 @@ def test_mobile_link_writes_its_audit_off_the_event_loop():
 
     assert response.status == 200
     assert spy.call_args_list, "the audit record was written on the event loop"
-    assert all(call.args[0] is auth_mobile._audit for call in spy.call_args_list)
+    # Two legitimate off-loop callees: the SEL audit and the mobile-connect
+    # governance re-check (profile resolution can touch the filesystem). The
+    # audit MUST be among them — that is the property this test pins.
+    callees = [call.args[0] for call in spy.call_args_list]
+    assert auth_mobile._audit in callees, "the audit record was written on the event loop"
+    allowed = {auth_mobile._audit, auth_mobile.mint_denied_reason}
+    assert all(fn in allowed for fn in callees)

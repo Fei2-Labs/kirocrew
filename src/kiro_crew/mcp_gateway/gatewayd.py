@@ -46,14 +46,19 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterator, Optional
+from typing import Any, Callable, Collection, Iterator, NoReturn, Optional
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.loader import config_dir as _config_dir
-from kiro_crew.executors import maintenance_executor, subprocess_executor
+from kiro_crew.executors import (
+    configure_default_executor,
+    maintenance_executor,
+    subprocess_executor,
+)
 from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
-from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, transport
+from kiro_crew.mcp_caller import new_tenant_nonce
+from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, tool_surface, transport
 from kiro_crew.mcp_gateway.apps import sweep_spool as apps_sweep_spool
 from kiro_crew.mcp_gateway.backend import Backend, BackendGone, spawn_backend
 from kiro_crew.mcp_gateway.backend_tmp import sweep_all_backend_tmp
@@ -319,9 +324,10 @@ async def run_gatewayd(
     """
     socket_path = Path(socket_path)
     # Off the event loop for the same reason as the manager's call: the
-    # owner-only step shells out to icacls on Windows. Startup is the least
-    # contended moment in this process, but the daemon's signal handlers and
-    # supervising ping are already live, so it is offloaded here too.
+    # owner-only step is blocking filesystem work (the Windows DACL is applied
+    # in-process). Startup is the least contended moment in this process, but
+    # the daemon's signal handlers and supervising ping are already live, so it
+    # is offloaded here too.
     await asyncio.to_thread(transport.prepare_dir, socket_path)
     # Singleton guard (race-free): acquire an exclusive advisory lock on a
     # lockfile beside the endpoint BEFORE probing/unlinking/binding. Without it,
@@ -401,7 +407,9 @@ async def run_gatewayd(
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
         try:
-            await _handle_connection(reader, writer, pool, resolver, socket_path, hot_keys)
+            await _handle_connection(
+                reader, writer, pool, resolver, socket_path, hot_keys, stop_event=stop_event
+            )
         except asyncio.CancelledError:
             # Normal on shutdown — propagate for the gather() below.
             raise
@@ -1570,7 +1578,14 @@ class _StubConn:
     unreadable /proc) and never counts as a mismatch.
     """
 
-    __slots__ = ("stub_uuid", "ancestor_pids", "pool_label", "caller", "pid_start_ids")
+    __slots__ = (
+        "stub_uuid",
+        "ancestor_pids",
+        "pool_label",
+        "caller",
+        "pid_start_ids",
+        "tenant_nonce",
+    )
 
     def __init__(
         self,
@@ -1579,12 +1594,20 @@ class _StubConn:
         pool_label: str,
         caller: Optional[CallerContext],
         pid_start_ids: Optional[dict[int, Optional[str]]] = None,
+        tenant_nonce: str = "",
     ) -> None:
         self.stub_uuid = stub_uuid
         self.ancestor_pids = ancestor_pids
         self.pool_label = pool_label
         self.caller = caller
         self.pid_start_ids = pid_start_ids if pid_start_ids is not None else {}
+        # Namespace separator for a connection whose session the gateway cannot
+        # name, forwarded to the backend on every request (#5322). GATEWAY-minted
+        # and never derived from the Register frame: ``stub_uuid`` arrives from
+        # the stub, so a nonce derived from it would let one stub choose to share
+        # an unnamed peer's per-tenant namespace. Independent of ``caller``,
+        # which may be retargeted by a later claim-push while this stays put.
+        self.tenant_nonce = tenant_nonce
 
 
 #: Live stub connections indexed by every ancestor PID of the kiro-cli
@@ -2053,6 +2076,36 @@ def _audit_pool_rejected(caller: str, pool_label: str, reason: str) -> None:
         logger.debug("SEL audit emit for gateway reject failed", exc_info=True)
 
 
+def _audit_replacement_validated(caller: str, pool_label: str, outcome: str, detail: str) -> None:
+    """Emit a SEL audit event for a backend replacement, adopted OR refused.
+
+    A transparent respawn is the one place the gateway swaps the process behind
+    a live session, so both outcomes are access decisions about which server may
+    answer that session — the same class as :func:`_audit_pool_rejected`, and the
+    same two-sided shape as the peer-identity and app-call trails, which record
+    allow as well as deny. Recording only the refusal would leave the event this
+    whole guard exists to make visible — a process gaining authority to serve a
+    session that did not ask for it — as a rotating log line and nothing more.
+
+    ``detail`` carries what the decision was made on: WHICH tools moved on a
+    refusal, and whether the tool set was verified or there was nothing to verify
+    on an adoption. That is what separates a server upgrade from a server that
+    answers differently per caller. Wrapped defensively — an audit-log failure
+    must never break the recovery path.
+    """
+    try:
+        SecurityEventLog().log_api_access(
+            caller=caller or "unknown",
+            operation="mcp-gateway.respawn-toolset",
+            outcome=outcome,
+            source="gateway",
+            resources=pool_label,
+            error=detail,
+        )
+    except Exception:  # pragma: no cover — audit must never break the handler
+        logger.debug("SEL audit emit for backend replacement failed", exc_info=True)
+
+
 def _audit_prewarm_spawn(pool_label: str) -> None:
     """Emit a SEL audit event for a backend spawned by the warm-pool prewarmer.
 
@@ -2077,6 +2130,88 @@ def _audit_prewarm_spawn(pool_label: str) -> None:
         logger.debug("SEL audit emit for prewarm spawn failed", exc_info=True)
 
 
+def _audit_stand_down(reason: str, outcome: str) -> None:
+    """Emit a SEL audit event for a stand-down request.
+
+    A stand-down ends the daemon, so it is the most consequential frame the
+    control surface accepts and belongs in the HMAC-chained SEL alongside the
+    claim/abort/peer decisions. Wrapped defensively -- an audit-log failure must
+    never break connection handling.
+    """
+    try:
+        SecurityEventLog().log_api_access(
+            caller="gateway-manager",
+            operation="mcp-gateway.stand_down",
+            outcome=outcome,
+            source="gateway",
+            resources=",".join(resolvable_target_stems()) or "(none)",
+            error=reason,
+        )
+    except Exception:  # pragma: no cover — audit must never break the handler
+        logger.debug("SEL audit emit for stand-down failed", exc_info=True)
+
+
+def _apply_stand_down(frame: dict[str, Any], stop_event: Optional[asyncio.Event]) -> dict[str, Any]:
+    """Yield the socket voluntarily so a daemon with a current target map can bind.
+
+    ``manager._report_adoption_drift`` can already SEE that an adopted survivor's
+    baked target map no longer covers the configured stub set; its own warning
+    ends "Replace the daemon to restore them", and this frame is how that
+    replacement happens without anyone unlinking a live socket.
+
+    Setting ``stop_event`` takes exactly the graceful path SIGTERM takes (the
+    signal handlers installed by ``_amain`` do only ``stop_event.set()``):
+    accepts stop, attached stubs drain, ``pool.shutdown_all()`` runs, the
+    endpoint is removed, the lock is released, the process exits. Doing it this
+    way round is the whole point. The alternative -- the starting gateway
+    unlinking the socket to take it -- is a connect-probe-then-unlink, which in
+    its documented false-stale window steals a LIVE incumbent's endpoint and
+    re-introduces the socket-theft class the flock guard exists to prevent. Here
+    the incumbent decides, and the request only ever arrives over a connection
+    that proves the incumbent is alive, so there is no stale-vs-live judgement to
+    get wrong.
+
+    ``need`` is the list of target stems the caller requires. A daemon that
+    already resolves ALL of them is REFUSED: there is nothing to gain by cycling
+    it, and honouring the request would turn this into a bare kill switch a
+    confused caller could aim at a daemon serving it correctly. A SUPERSET is
+    therefore fit -- extra stems a newer config no longer asks for are harmless,
+    and refusing on inequality would cycle a perfectly good daemon.
+
+    Trust basis for the rest is the same uid-gated owner-only socket that
+    authenticates Register/Claim/Abort.
+    """
+    need = frame.get("need")
+    if not isinstance(need, list) or not need or not all(isinstance(s, str) and s for s in need):
+        _audit_stand_down("missing or invalid need list", "denied")
+        return {"type": "stand-down-rejected", "reason": "missing or invalid 'need' stem list"}
+    served = set(resolvable_target_stems())
+    missing = sorted(set(need) - served)
+    if not missing:
+        _audit_stand_down("already covers every needed stem", "denied")
+        return {
+            "type": "stand-down-rejected",
+            "reason": "this daemon already resolves every requested target stem",
+        }
+    if stop_event is None:
+        # Reached only by a handler wired without a stop event (unit tests
+        # constructing _handle_connection directly). Refuse rather than claim a
+        # shutdown that cannot happen -- an accepted-but-inert control frame is
+        # worse than a rejected one, because the caller then waits for a lock
+        # that is never released.
+        _audit_stand_down("handler has no stop event", "denied")
+        return {"type": "stand-down-rejected", "reason": "shutdown not wired on this handler"}
+    logger.warning(
+        "gatewayd: standing down on request — this daemon cannot resolve %s, "
+        "which the caller's current config requires; draining so a daemon with "
+        "the current target map can bind",
+        ", ".join(missing),
+    )
+    _audit_stand_down(f"missing {','.join(missing)}", "allowed")
+    stop_event.set()
+    return {"type": "standing-down", "missing": missing}
+
+
 async def _handle_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -2084,6 +2219,8 @@ async def _handle_connection(
     resolver: TargetResolver,
     socket_path: Path,
     hot_keys: Optional[HotKeyStore] = None,
+    *,
+    stop_event: Optional[asyncio.Event] = None,
 ) -> None:
     """Process one stub connection end-to-end.
 
@@ -2211,6 +2348,17 @@ async def _handle_connection(
     # same uid-gated 0700 socket as Register/Claim.
     if register.get("type") == "abort":
         await _write_json_line(writer, await _apply_abort(register, pool))
+        return
+
+    # Stand-down short-circuit (one-shot control connection from a STARTING
+    # gateway): "your baked target map cannot resolve what my config needs --
+    # yield the socket". The only frame that ends the daemon, and the mechanism
+    # that turns _report_adoption_drift's warning into an actual repair. Trust
+    # basis: same uid-gated owner-only socket as Register/Claim/Abort.
+    # Validation, the already-covers refusal and auditing live in
+    # ``_apply_stand_down``.
+    if register.get("type") == "stand-down":
+        await _write_json_line(writer, _apply_stand_down(register, stop_event))
         return
 
     # App-call short-circuit (one-shot control connection from the dashboard):
@@ -2421,7 +2569,14 @@ async def _handle_connection(
         logger.exception("pid start-id snapshot failed for stub %s", stub_uuid)
         pid_start_ids = {}
 
-    conn = _StubConn(stub_uuid, indexed_pids, pool_key.human_readable(), caller, pid_start_ids)
+    conn = _StubConn(
+        stub_uuid,
+        indexed_pids,
+        pool_key.human_readable(),
+        caller,
+        pid_start_ids,
+        new_tenant_nonce(),
+    )
     _conn_index_add(conn)
 
     # Register this connection for the keepalive probe. Scoped to the handler's
@@ -2838,7 +2993,9 @@ async def _handle_connection(
                 captured_init = dict(msg)
 
             try:
-                await backend.forward_from_stub(stub_uuid, msg, caller=caller)
+                await backend.forward_from_stub(
+                    stub_uuid, msg, caller=caller, tenant_nonce=conn.tenant_nonce
+                )
             except BackendGone as exc:
                 # Transparent respawn: a shared backend dying must NOT brick
                 # this stub's transport (which would make kiro-cli mark the
@@ -2847,19 +3004,27 @@ async def _handle_connection(
                 # handshake from the captured initialize, re-attach this stub,
                 # and fail ONLY this one in-flight request with a retryable
                 # error. The transport stays open, so the next call self-heals.
-                recovered = await _respawn_backend_for_stub(
-                    pool,
-                    pool_key,
-                    resolver,
-                    stub_uuid,
-                    writer,
-                    captured_init,
-                    backend,
-                    inbox,
-                    writer_task,
-                    caller=caller,
-                    conn=conn,
-                )
+                try:
+                    recovered = await _respawn_backend_for_stub(
+                        pool,
+                        pool_key,
+                        resolver,
+                        stub_uuid,
+                        writer,
+                        captured_init,
+                        backend,
+                        inbox,
+                        writer_task,
+                        caller=caller,
+                        conn=conn,
+                    )
+                except _ReplacementRefused as refusal:
+                    # A replacement was available but validating it said no. The
+                    # session gets the REASON, not "backend gone": that is the
+                    # difference between a stated failure it can act on and one
+                    # indistinguishable from an unrecoverable spawn.
+                    await _write_json_line(writer, _jsonrpc_error(msg, str(refusal)))
+                    return
                 if recovered is None:
                     # Genuinely unrecoverable (no captured init, circuit
                     # breaker open / capacity, or prime failed): fall back to
@@ -3069,6 +3234,91 @@ async def _acquire_backend(
     return backend, was_spawned
 
 
+class _ReplacementRefused(Exception):
+    """A respawn was rejected for a reason the SESSION should be told.
+
+    Distinct from the plain ``None`` give-ups (no captured initialize, acquire
+    rejected, prime failed) because those say nothing a client could act on
+    beyond "the backend is gone", while this one names what changed underneath
+    it. The message is put into the terminal JSON-RPC error verbatim, so it must
+    stay bounded and free of line breaks — which is what
+    :func:`~kiro_crew.mcp_gateway.tool_surface.describe_surface_change` already
+    guarantees for the tool names it reports.
+    """
+
+
+def _rekey_refusal_reason(conn: Optional["_StubConn"], captured_key: str) -> str:
+    """Why a respawn must be refused because its stub changed owner, or ``""``.
+
+    A ``claim`` frame can retarget a connection's identity on any await, and both
+    sides of the tool-set comparison belong to the CAPTURED caller — the anchor
+    is the listing that principal was served, and the probe asks as that
+    principal. Across a rekey the comparison therefore describes somebody who no
+    longer owns this stub, and on a caller-scoped server it says nothing about
+    what the live owner would be served. Re-probing would race the same way, so
+    the answer is refusal on the same fail-closed terms the subscription replay
+    already uses.
+
+    A connection that cannot answer the question (``None``) is NOT read as a
+    rekey: it simply cannot be checked.
+    """
+    live_key = _live_session_key(conn)
+    if live_key is None or live_key == captured_key:
+        return ""
+    return (
+        "the stub's owner was retargeted mid-respawn, so the tool set it was "
+        "told about cannot speak for the live owner"
+    )
+
+
+def _refuse_replacement(
+    stub_uuid: str, pool_key: PoolKey, captured_key: str, reason: str
+) -> NoReturn:
+    """Log, audit, and raise for a replacement that validation rejected.
+
+    Fail loud rather than silently: the frozen tool set lives in the client and
+    no gateway-side write can refresh it, so the only honest options are to adopt
+    a process whose schema the session cannot see has moved, or to refuse and say
+    why. Refusing lands on the give-up path this function already has — the
+    caller answers the in-flight request with a terminal error and the stub
+    reconnects — which is a stated failure at a call boundary instead of a wrong
+    one.
+
+    RAISES rather than returning ``None`` so the reason reaches the SESSION: the
+    generic give-ups answer with "backend gone", indistinguishable from an
+    unrecoverable spawn, and the one party that could act on knowing the tool set
+    moved is the client, which sees neither the log nor the audit trail.
+
+    One function for every refusal site, because a second copy is how the log
+    line, the audit event and the client's message drift apart.
+    """
+    logger.warning(
+        "respawn give-up (replacement rejected) stub=%s pool=%s: %s",
+        stub_uuid,
+        pool_key.human_readable(),
+        reason,
+    )
+    _audit_replacement_validated(captured_key, pool_key.human_readable(), "denied", reason)
+    raise _ReplacementRefused(
+        f"the MCP server was replaced and its tool set changed ({reason}); "
+        f"this session's tools are stale — reconnect to pick up the new ones"
+    )
+
+
+def _live_session_key(conn: Optional["_StubConn"]) -> Optional[str]:
+    """The session key that owns ``conn`` RIGHT NOW, or ``None`` when unknowable.
+
+    A ``claim`` frame retargets a connection's identity, and it can land on any
+    await — so a decision a respawn made from the caller captured at request
+    time has to be re-checked against this before it takes effect. ``None`` (no
+    connection threaded through) means the question cannot be asked, which is
+    NOT the same as "unchanged": a caller must not read it as agreement.
+    """
+    if conn is None:
+        return None
+    return conn.caller.session_key if conn.caller is not None else ""
+
+
 async def _respawn_backend_for_stub(
     pool: BackendPool,
     pool_key: PoolKey,
@@ -3128,6 +3378,16 @@ async def _respawn_backend_for_stub(
     replay_uris: list[str] = []
     with contextlib.suppress(Exception):
         replay_uris = old_backend.resource_subscription_uris(stub_uuid)
+    # Captured BEFORE detach for the same reason as the URIs above: the tool set
+    # THIS stub was told about is per-stub state that detach prunes, and reading
+    # it afterwards would report "nothing was ever served" for a session that
+    # was told plenty — which reads as agreement and adopts blindly.
+    old_surface: Optional[tool_surface.ToolSurface] = None
+    with contextlib.suppress(Exception):
+        old_surface = old_backend.served_tool_surface(stub_uuid)
+    # The principal this respawn is FOR, as of when the failing request arrived.
+    # Both rekey gates below re-check the live owner against it.
+    captured_key = caller.session_key if caller is not None else ""
     with contextlib.suppress(Exception):
         await old_backend.detach_stub(stub_uuid)
 
@@ -3210,6 +3470,34 @@ async def _respawn_backend_for_stub(
                 exc,
             )
             return None
+        # Validate the replacement's tool set BEFORE adopting it. Priming the
+        # captured handshake proves the fresh process talks MCP; it says nothing
+        # about what it publishes, and ``initialize`` metadata does not describe
+        # a tool set — so up to here a server upgraded in place could keep its
+        # protocolVersion, capabilities and serverInfo while renaming a tool or
+        # tightening a required field, and this stub's session would go on
+        # issuing calls built against the schema the DEAD process published.
+        #
+        # Only asked when this stub was actually served a listing: with no
+        # claim on record there is nothing a replacement can contradict, and
+        # refusing then would turn a recovery this path already performs today
+        # into a failure on no evidence. ``old_surface`` was captured above,
+        # before the detach that prunes it.
+        if old_surface is not None:
+            drift = tool_surface.describe_surface_change(
+                old_surface,
+                await new_backend.probe_tool_surface(
+                    caller=caller,
+                    tenant_nonce=(conn.tenant_nonce if conn is not None else ""),
+                ),
+            ) or _rekey_refusal_reason(conn, captured_key)
+            if drift:
+                # The fresh backend is deliberately left in the pool. Its tool
+                # set is wrong only for a session holding the OLD declaration;
+                # a session that starts after this reads the new one correctly
+                # and legitimately, so tearing it down would punish every
+                # future session for this one's frozen view.
+                _refuse_replacement(stub_uuid, pool_key, captured_key, drift)
         new_inbox = await new_backend.attach_stub(stub_uuid)
         if replay_uris and conn is not None:
             # Rekey race: a ``claim`` frame can retarget this connection's
@@ -3221,9 +3509,7 @@ async def _respawn_backend_for_stub(
             # and skip the replay when it changed (fail closed: the new
             # owner subscribes on its own; the old owner's leases on the
             # dead backend died with it).
-            live_key = conn.caller.session_key if conn.caller is not None else ""
-            captured_key = caller.session_key if caller is not None else ""
-            if live_key != captured_key:
+            if _live_session_key(conn) != captured_key:
                 logger.info(
                     "respawn skipping subscription replay (owner rekeyed "
                     "mid-respawn) stub=%s pool=%s",
@@ -3261,6 +3547,35 @@ async def _respawn_backend_for_stub(
         # pooled, and the two must not disagree.
         if not respawn_exclusive_uuid:
             pool.unreserve(pool_key)
+    # LAST word on ownership, and the one that actually closes the window. The
+    # check beside the comparison above is an optimisation — it avoids the attach
+    # and the replay when the owner has already moved — but ``attach_stub`` and
+    # ``replay_resource_subscriptions`` both await, so a claim can still land
+    # between that check and here. Everything from this point to the return is
+    # synchronous, so a re-check here leaves no gap.
+    #
+    # Only when a surface was validated: with no anchor the comparison never
+    # happened, so a rekey invalidates nothing, and refusing would fail a
+    # recovery this path performs today on no evidence.
+    if old_surface is not None:
+        late_rekey = _rekey_refusal_reason(conn, captured_key)
+        if late_rekey:
+            # Detach what was just attached, or this backend's refcount keeps a
+            # stub that is about to be told the adoption failed.
+            with contextlib.suppress(Exception):
+                await new_backend.detach_stub(stub_uuid)
+            _refuse_replacement(stub_uuid, pool_key, captured_key, late_rekey)
+    if old_surface is not None:
+        # The claim follows the SESSION, not the process that answered it. The
+        # anchor was recorded on the backend that just died; leaving it there
+        # would make this replacement anchor-less, so the NEXT respawn of this
+        # stub would have nothing to compare and would adopt blindly — the guard
+        # would cover only the first process swap in a session's life, while the
+        # client's frozen tool set is still the one from its original listing.
+        #
+        # Set after the ownership re-check above, so a refused adoption never
+        # seeds a surface onto a backend the stub is not going to use.
+        new_backend.carry_served_tool_surface(stub_uuid, old_surface)
     new_writer_task = asyncio.create_task(
         _drain_inbox_to_stub(new_inbox, writer, stub_uuid),
         name=f"mcp-gateway-stub-writer-{stub_uuid[:8]}",
@@ -3270,6 +3585,24 @@ async def _respawn_backend_for_stub(
         stub_uuid,
         new_backend.pid,
         pool_key.human_readable(),
+    )
+    # Audited HERE, not at the comparison: this is the point the replacement
+    # actually gains authority to serve the session — stub attached,
+    # subscriptions replayed, writer task live. An event emitted earlier would
+    # record authority that a later give-up revokes.
+    #
+    # An adoption with no anchor is recorded too, and says so. The alternative —
+    # audit only when a comparison ran — would leave the swap this guard exists
+    # to make visible unrecorded in exactly the case where nothing checked it.
+    _audit_replacement_validated(
+        captured_key,
+        pool_key.human_readable(),
+        "allowed",
+        (
+            f"tool set verified: {len(old_surface)} tool(s) unchanged"
+            if old_surface is not None
+            else "tool set not verified: this stub was served no listing"
+        ),
     )
     return new_backend, new_inbox, new_writer_task
 
@@ -3713,6 +4046,13 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
     stop_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
+
+    # ── Name the default executor ──
+    # asyncio.to_thread and run_in_executor(None, ...) route onto the loop's
+    # default executor, which Python names threads anonymously.  This names
+    # them ``mc-default`` so profilers like py-spy can attribute blocking work
+    # to this gateway.  Must run BEFORE any to_thread offload.
+    configure_default_executor()
 
     # Catch exceptions that slip past per-task handlers — e.g. a
     # fire-and-forget coroutine that blows up without ``await``. Without

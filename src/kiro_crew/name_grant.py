@@ -72,12 +72,14 @@ is a superset with the version-manager directories PREPENDED, so resolving
 against ours would answer for a search order the command will not use.
 
 Cost is a ``which`` walk plus a handful of ``stat`` calls per decision, on the
-same order as ``trusted_system_bin``'s own lookup, and it runs on the event loop
-where the approval is decided. Building the search path is safe there because
-:func:`env.augmented_path` is string work over a glob that
-``env._node_all_bin_dirs`` caches for the process lifetime, and that cache is
-already warm: the same call builds the ``PATH`` handed to the agent process at
-session start, long before any tool approval.
+same order as ``trusted_system_bin``'s own lookup. The filesystem work runs on
+a worker thread via :func:`refusal_for_command_off_loop` — never on the event
+loop where the approval is decided; only the constant Windows decline is
+answered on-loop, because it needs no filesystem access at all. Building the
+search path is cheap wherever it runs because :func:`env.augmented_path` is
+string work over a glob that ``env._node_all_bin_dirs`` caches for the process
+lifetime, and that cache is already warm: the same call builds the ``PATH``
+handed to the agent process at session start, long before any tool approval.
 
 The verdict itself is deliberately uncached: a cached "trusted" answer is a
 substitution window, and this must reflect the filesystem as it is when the tier
@@ -86,6 +88,7 @@ decides.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -96,10 +99,12 @@ import stat
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Any, Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.env import augmented_path
 from kiro_crew.github_runner import agent_writable_roots
+from kiro_crew.platform.context import redact_log_via_context
 
 logger = logging.getLogger(__name__)
 
@@ -1246,3 +1251,160 @@ def name_grant_refusal(command: str) -> Refusal | None:
         if refusal is not None:
             return refusal
     return None
+
+
+def shell_command_for_event(event: object) -> str | None:
+    """The shell command a name-based grant for *event* would be vouching for.
+
+    ``None`` for a non-shell tool or a shell event with no recoverable command:
+    there is no program name to vouch for there, and those tiers are a
+    different question this module does not answer.
+
+    Duck-typed on ``is_shell`` / ``shell_command`` because every surface's
+    permission event carries those two fields, and this module must not import
+    a provider type from any of them.
+    """
+
+    if not getattr(event, "is_shell", False):
+        return None
+    command = getattr(event, "shell_command", None)
+    if not command:
+        return None
+    return command
+
+
+async def refusal_for_command_off_loop(command: str) -> Refusal | None:
+    """The ONE place the auto-approve tiers reach the name-grant check.
+
+    It resolves names against ``PATH`` and digests the file behind each one, so
+    it runs on a worker thread: the gateway's loop must not stat a stalled
+    network mount or read a large binary. Every tier on every surface — the
+    dashboard rungs, the task runner, subagents, and the channel turn driver —
+    goes through here rather than calling ``asyncio.to_thread`` itself, so
+    there is a single place to reason about (and, for the rung tests, a single
+    place to stub — three tiers each spawning their own thread is what crashed
+    the Windows xdist workers).
+
+    NEVER raises (cancellation excepted). The callers sit inside provider
+    event loops where an escaped exception would leave the ACP permission
+    request unanswered — a wedged turn, which is strictly worse than either
+    verdict. An unexpected failure inside the check is answered as an
+    ``UNINSPECTABLE`` refusal: the check could not vouch for the names, so the
+    grant is declined and the request takes the surface's normal path. The
+    guard lives HERE, at the chokepoint, so every tier inherits it — a guard
+    per caller is two copies that drift.
+
+    Windows is answered ON the loop, because there the verdict needs no
+    filesystem access at all: the check declines every name-based grant outright
+    (neither ``cmd.exe`` search order nor POSIX-mode tokenization is modelled),
+    so the thread would do nothing but hand back a constant. Paying a hop for it
+    is not merely waste — the worker can outlive a caller's event loop, which is
+    what crashes an xdist worker rather than merely failing its test.
+
+    An empty command answers ``None`` — the same deliberate contract as
+    :func:`name_grant_refusal`: there is no name to vouch for, and every tier
+    that calls this has already established it holds a command
+    (:func:`shell_command_for_event` is that pre-filter). A new caller must
+    route through :func:`refusal_for_event` rather than passing a value it has
+    not established is a command.
+    """
+
+    try:
+        if not command:
+            return None
+        if platform_compat.IS_WINDOWS:
+            return name_grant_refusal(command)
+        return await asyncio.to_thread(name_grant_refusal, command)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("name-grant check failed; declining the grant")
+        return Refusal(
+            UNINSPECTABLE,
+            "the name-grant check itself failed, so no program name can be vouched for",
+        )
+
+
+async def refusal_for_event(event: object) -> Refusal | None:
+    """Why a shell *event* may not be auto-approved by program NAME, or ``None``.
+
+    Every auto-approve tier is a statement about a PROGRAM, and the shell
+    resolves the name itself afterwards through a ``PATH`` that legitimately
+    leads with directories the agent can write. This is the surface-agnostic
+    entry point: a surface that honours a name-based grant awaits it at the
+    point of honour, and on a refusal DOWNGRADES to its own normal
+    non-auto-approve path (interactive card, deny-by-default) — a refusal
+    costs one prompt and never blocks the command. The decline-not-raise
+    guard lives in :func:`refusal_for_command_off_loop`, so this never raises
+    either (cancellation excepted).
+
+    ``None`` for a non-shell tool or an unrecoverable command: there is no
+    program name to vouch for, and those tiers are unchanged.
+    """
+
+    command = shell_command_for_event(event)
+    if command is None:
+        return None
+    return await refusal_for_command_off_loop(command)
+
+
+def log_decline(
+    *,
+    source: str,
+    session_key: str,
+    event: object,
+    refusal: Refusal,
+    tier: str,
+    sel_factory: Callable[[], Any],
+    agent: str = "kirocrew",
+    metadata: dict | None = None,
+) -> None:
+    """Record that a name-based auto-approve was DECLINED, and on which tier.
+
+    Declining is a security decision, so it belongs in the audit log beside the
+    approvals and denials. Without it the log shows a command arriving at the
+    interactive card (or, headless, at the deny-by-default reject) and never
+    says that a grant was withheld, or why. This is the ONE writer for every
+    surface, so the disclosure rule below is maintained in one place rather
+    than re-implemented per surface.
+
+    The CODE, never the ``detail``: the detail names the program and the
+    resolved paths, and an audit sink is exactly where that becomes a
+    disclosure. Both ``code`` and ``log_text`` are constants read out of a
+    module table. ``event.title`` is model-authored — often the command itself
+    for a shell tool — so it passes through the credential and
+    exfiltration-URL redactors before reaching the sink.
+
+    Not ``critical=True``. That flag is for audit-or-deny, where a caller must
+    refuse rather than run something unaudited. Nothing runs unaudited here:
+    declining sends the request to the surface's normal path, whose own answer
+    is audited in turn.
+
+    *sel_factory* is REQUIRED: each caller passes its own module-level ``sel``
+    binding so that module's audit test seam still observes the row — an
+    optional default would let a new surface compile while its decline-audit
+    test observes nothing.  *metadata* entries are merged in, with the
+    ``reason``/``code``/``tier`` convention keys authoritative.
+    """
+
+    md: dict = dict(metadata or {})
+    md.update({"reason": "name_grant", "code": refusal.code, "tier": tier})
+    title = str(getattr(event, "title", "") or "")
+    # Through the CONTEXT so a loaded companion's extra credential regexes apply.
+    # This one persists: the title is model-authored and lands in a shared SEL
+    # audit row, so a host-specific token shape the OSS baseline does not know
+    # would be durable rather than rotating out of a log window. The `_log_`
+    # spelling because an audit write must not raise, and because on a process
+    # with no composed context the baseline is still the right answer.
+    title = redact_log_via_context(title)
+    sel_factory().log_tool_invocation(
+        session_key=session_key,
+        agent=agent,
+        source=source,
+        tool_name=title,
+        tool_kind=str(getattr(event, "tool_kind", "") or ""),
+        outcome="auto_approve_declined",
+        request_id=getattr(event, "request_id", ""),
+        error=refusal.log_text,
+        metadata=md,
+    )

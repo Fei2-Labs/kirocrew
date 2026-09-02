@@ -42,7 +42,7 @@ const PROVIDER_ID = 'knowledge'
 const PROVIDER_LABEL_KEY = 'components.commandPalette.providers.knowledgeProvider.knowledge'
 
 /** Where Enter ("open entry") navigates — no per-entry deep link exists yet. */
-const KNOWLEDGE_ROUTE = '/knowledge'
+const KNOWLEDGE_ROUTE = '/capabilities?tab=knowledge'
 
 /** Cache server responses briefly so retyping the same query is free. */
 const KNOWLEDGE_STALE_MS = 30_000

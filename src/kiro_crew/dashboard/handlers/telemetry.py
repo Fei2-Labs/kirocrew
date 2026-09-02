@@ -53,12 +53,15 @@ from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.hooks import validate_file_path
 from kiro_crew.metrics.provider import TELEMETRY_ENV_VAR, env_pin, otlp_egress_active
 from kiro_crew.metrics.schema import RESOURCE_ATTR_PROCESS_START_TIME
+from kiro_crew.metrics.turns import TURN_METRIC
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
 
 _STARTUP_METRIC = "kirocrew.session.startup.duration"
-_TURN_METRIC = "kirocrew.turn.duration"
+# Read from the emitter's own constant rather than re-spelled: a reader and an
+# emitter naming the instrument differently is a silently empty panel.
+_TURN_METRIC = TURN_METRIC
 # The end-to-end startup point. The claude path emits no ``phase`` attribute at
 # all, so an absent phase is treated as the total (see _aggregate).
 _PHASE_TOTAL = "total"
@@ -96,11 +99,17 @@ _OTHER_SPLIT_ATTRS = frozenset({"warm"})
 # budget already spent dies with "start a new chat" — the emit site labels
 # it distinctly so the recovered-stall exclusion cannot hide dead sessions,
 # and fault_rate stays a single-series computation.
-# Every entry here must have a producer: either a _turn_outcome return label
+# Every entry here must have a producer: either a turn_outcome return label
 # or "unknown" (minted by this aggregator for attribute-less points) — the
 # cross-module test enforces that, so a dead entry (e.g. a "cancelled" label
 # nothing ever emitted — user cancels map to "error") cannot linger and
 # mislead readers about what fault_rate counts.
+# "unclassified" is deliberately ABSENT: it marks a turn whose surface had no
+# stop reason to give (a bare TurnUsage at a helper call site), so counting it
+# would invent a fault for every clean background turn the moment this metric
+# started sampling them. It is not folded into "ok" either — it stays its own
+# slice in the outcome breakdown so the blind spot is visible rather than
+# resolved by a guess in either direction.
 _TERMINAL_FAULT_OUTCOMES = frozenset({"error", "timeout", "unknown", "stall_exhausted"})
 
 # (shard-fingerprint, TTL) cache — shards are append-only, so a change to any
@@ -961,13 +970,24 @@ def _aggregate(shard_paths: list[Path]) -> dict[str, Any]:
     turn_outcome = turn.outcomes
     turn_total = sum(turn_outcome.values())
     turn_faults = sum(v for k, v in turn_outcome.items() if k in _TERMINAL_FAULT_OUTCOMES)
+    # fault_rate is computed over the turns whose outcome is KNOWN, not over every
+    # turn. ``unclassified`` marks a turn whose surface had no stop reason to give
+    # (a helper call site passing a bare TurnUsage), and it cannot go in either
+    # position honestly: in the numerator it invents a fault for every clean
+    # background turn, and in the denominator alone it silently dilutes the rate
+    # towards zero as background traffic grows — an optimistic dashboard, which is
+    # the failure mode this metric's widening was supposed to end. Excluded from
+    # both. The count needs no field of its own: it already ships in this same
+    # response as ``outcome["unclassified"]``, so a reader can see exactly how
+    # much of the window fault_rate does not cover.
+    turn_classified = turn_total - turn_outcome.get("unclassified", 0)
     turn_block = {
         # ``other_generations`` arrives via stats(): >0 means the window
         # straddles a bucket-boundary change and only the dominant generation
         # is reported (see _Hist).
         **turn.stats(),
         "outcome": turn_outcome,
-        "fault_rate": round(turn_faults / turn_total, 4) if turn_total else 0.0,
+        "fault_rate": round(turn_faults / turn_classified, 4) if turn_classified else 0.0,
     }
 
     return {

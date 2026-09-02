@@ -1311,6 +1311,31 @@ class TestRmtreeForce:
         monkeypatch.setattr(pc.shutil, "rmtree", lambda *_a, **_k: None)
         assert pc.rmtree_force(root) is False
 
+    def test_missing_tree_is_already_removed(self, tmp_path):
+        assert pc.rmtree_force(tmp_path / "missing") is True
+
+    def test_nested_missing_race_does_not_hide_a_surviving_root(self, monkeypatch, tmp_path):
+        root = tmp_path / "tree"
+        root.mkdir()
+
+        def _nested_missing(*_args: Any, **_kwargs: Any) -> None:
+            raise FileNotFoundError("nested entry disappeared")
+
+        monkeypatch.setattr(pc.shutil, "rmtree", _nested_missing)
+        assert pc.rmtree_force(root) is False
+        assert root.exists()
+
+    def test_delete_error_is_reported_without_raising(self, monkeypatch, tmp_path):
+        root = tmp_path / "tree"
+        root.mkdir()
+
+        def _boom(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("denied")
+
+        monkeypatch.setattr(pc.shutil, "rmtree", _boom)
+        assert pc.rmtree_force(root) is False
+        assert root.exists()
+
     def test_readonly_hook_retries_the_operation(self, tmp_path):
         victim = tmp_path / "ro.txt"
         victim.write_text("x")

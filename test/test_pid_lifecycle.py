@@ -395,6 +395,11 @@ class TestResetStateUntracksParentPid:
         client._stderr_lines = deque(["some error"], maxlen=20)
         client._pending_oauth_requests = []
         client._oauth_emitted_servers = set()
+        # _reset_state restarts the per-process cost baseline on this object
+        # (always present in production: __init__ assigns it unconditionally).
+        from kiro_crew.acp.types import AcpPromptStats
+
+        client.last_prompt_stats = AcpPromptStats()
         mock_task = Mock()
         mock_task.done.return_value = False
         client._stderr_task = mock_task

@@ -2,9 +2,11 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
+  Building2,
   Check,
   Copy,
   Globe,
+  IdCard,
   Link2,
   Loader2,
   RefreshCw,
@@ -35,6 +37,10 @@ const DEVICE_POLL_INTERVAL_MS = 5_000
  * not a protocol token.
  */
 export type KasLoginProvider = 'google' | 'github' | 'builder_id' | 'idc'
+
+// Extra begin-device fields the `idc` provider needs (the company's IAM Identity
+// Center access-portal URL, plus an optional region); other providers send none.
+export type KasLoginExtra = { start_url?: string; region?: string }
 
 // Display name for the provider a sign-in is running under (the device view's
 // eyebrow interpolates it). Routed through the catalog like every other label
@@ -153,8 +159,15 @@ function Chooser({
 }: {
   busy: boolean
   beginError: string
-  onPick: (provider: KasLoginProvider) => void
+  onPick: (provider: KasLoginProvider, extra?: KasLoginExtra) => void
 }) {
+  // The company-SSO choice expands an inline form (start URL + region) instead of
+  // beginning immediately: the portal URL is per-company, so there is nothing to
+  // start until the user supplies it.
+  const [ssoOpen, setSsoOpen] = useState(false)
+  const [startUrl, setStartUrl] = useState('')
+  const [region, setRegion] = useState('')
+  const startUrlReady = startUrl.trim().length > 0
   return (
     <GateShell
       aside={{
@@ -184,9 +197,76 @@ function Chooser({
           disabled={busy}
           onClick={() => onPick('github')}
         />
-        {/* Builder ID / company-SSO buttons return when begin_device accepts those
-            providers — a visible button whose click can only 400 is worse than
-            absence (the wire only supports google/github today). */}
+        <ProviderButton
+          icon={<IdCard className="lucide-inline" />}
+          label={i18nT('components.kasLogin.continue_with_builder_id')}
+          disabled={busy}
+          onClick={() => onPick('builder_id')}
+        />
+        {ssoOpen ? (
+          <form
+            className="rounded-lg border border-border bg-bg-elevated p-3"
+            data-testid="kas-login-sso-form"
+            onSubmit={(e) => {
+              e.preventDefault()
+              if (!startUrlReady || busy) return
+              onPick('idc', {
+                start_url: startUrl.trim(),
+                ...(region.trim() ? { region: region.trim() } : {}),
+              })
+            }}
+          >
+            <label
+              className="block text-[12px] font-medium text-text-strong"
+              htmlFor="kas-sso-start-url"
+            >
+              {i18nT('components.kasLogin.sso_start_url_label')}
+              <input
+                id="kas-sso-start-url"
+                type="url"
+                aria-label={i18nT('components.kasLogin.sso_start_url_label')}
+                autoFocus
+                value={startUrl}
+                onChange={(e) => setStartUrl(e.target.value)}
+                placeholder={i18nT('components.kasLogin.sso_start_url_placeholder')}
+                className="focus-ring mt-1 w-full rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[13px] font-normal text-text-strong placeholder:text-muted"
+              />
+            </label>
+            <p className="mt-1 text-[12px] leading-relaxed text-muted">
+              {i18nT('components.kasLogin.sso_helper')}
+            </p>
+            <label
+              className="mt-3 block text-[12px] font-medium text-text-strong"
+              htmlFor="kas-sso-region"
+            >
+              {i18nT('components.kasLogin.sso_region_label')}
+              <input
+                id="kas-sso-region"
+                type="text"
+                aria-label={i18nT('components.kasLogin.sso_region_label')}
+                value={region}
+                onChange={(e) => setRegion(e.target.value)}
+                placeholder="us-east-1"
+                className="focus-ring mt-1 w-full rounded-lg border border-border bg-bg px-3 py-2 font-mono text-[13px] font-normal text-text-strong placeholder:text-muted"
+              />
+            </label>
+            <div className="mt-3 flex items-center gap-2">
+              <Btn type="submit" primary disabled={!startUrlReady || busy}>
+                {i18nT('components.kasLogin.sso_continue')}
+              </Btn>
+              <Btn type="button" disabled={busy} onClick={() => setSsoOpen(false)}>
+                {i18nT('components.kasLogin.sso_cancel')}
+              </Btn>
+            </div>
+          </form>
+        ) : (
+          <ProviderButton
+            icon={<Building2 className="lucide-inline" />}
+            label={i18nT('components.kasLogin.continue_with_company_sso')}
+            disabled={busy}
+            onClick={() => setSsoOpen(true)}
+          />
+        )}
       </div>
       {/* role="alert": the failure appears in place after the click, with no
           route change a screen reader would announce. */}
@@ -359,8 +439,9 @@ export default function KasLoginGate({ children }: { children?: ReactNode }) {
   })
 
   const beginMutation = useMutation({
-    mutationFn: (provider: KasLoginProvider) => api.kasLoginBeginDevice(provider),
-    onSuccess: (session, provider) => setDevice({ ...session, provider }),
+    mutationFn: ({ provider, extra }: { provider: KasLoginProvider; extra?: KasLoginExtra }) =>
+      api.kasLoginBeginDevice(provider, extra),
+    onSuccess: (session, { provider }) => setDevice({ ...session, provider }),
   })
 
   const pollQuery = useQuery({
@@ -468,13 +549,13 @@ export default function KasLoginGate({ children }: { children?: ReactNode }) {
     <Chooser
       busy={beginMutation.isPending}
       beginError={beginMutation.error?.message ?? ''}
-      onPick={(provider) => {
+      onPick={(provider, extra) => {
         beginMutation.reset()
         // The device-code flow is the one begin path the backend exposes, and it
         // works identically from a browser on both install shapes — the old
         // transport branch parked desktop users on a loopback screen no backend
         // endpoint could ever complete.
-        beginMutation.mutate(provider)
+        beginMutation.mutate({ provider, extra })
       }}
     />
   )

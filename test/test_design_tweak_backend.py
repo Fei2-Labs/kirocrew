@@ -3110,6 +3110,59 @@ class TestDevProxyBodyCaps:
         assert server._OVERLAY_PATH.encode() in out
 
 
+class TestDevProxyContentTypeIsAllowlisted:
+    """A proxied reply carries one of OUR literals, never the upstream's value.
+
+    `_PROXY_CTYPES` and `_safe_upstream_ctype` exist because the dev server is the
+    project's own process but still an unaudited one whose headers land in our
+    response. The selector was written, tested in isolation, and never called:
+    `_relay_http` forwarded every upstream header through `_header_value` alone, so
+    the media type and its charset reached the browser as sent. `_header_value`
+    still stopped response splitting, which is why this survived -- what was lost
+    is the mapping to a closed set.
+    """
+
+    def _relay(self, monkeypatch, upstream_ctype, path="/"):
+        class _Conn:
+            def __init__(self, *a, **k):
+                pass
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                return _FakeUpstreamResponse(b"body", upstream_ctype)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(server.http.client, "HTTPConnection", _Conn)
+        probe = _RelayProbe.__new__(_RelayProbe)
+        _RelayProbe.__init__(probe, path=path)
+        probe._relay_http()
+        assert not probe.errors
+        return {k.lower(): v for k, v in probe.sent_headers}
+
+    def test_upstream_charset_is_normalised(self, monkeypatch):
+        """The one case a verbatim forward actually changed browser behaviour."""
+        sent = self._relay(monkeypatch, "text/html; charset=iso-8859-1")
+        assert sent["content-type"] == "text/html; charset=utf-8"
+
+    def test_unrecognised_media_type_falls_back_to_the_request_path(self, monkeypatch):
+        sent = self._relay(monkeypatch, "bogus/thing", path="/app.css")
+        assert sent["content-type"] == _safe_ctype_for_css()
+
+    def test_a_header_smuggled_into_the_media_type_cannot_survive(self, monkeypatch):
+        sent = self._relay(monkeypatch, "evil/x\r\nSet-Cookie: a=b", path="/x.css")
+        assert sent["content-type"] == _safe_ctype_for_css()
+        assert "set-cookie" not in sent
+
+
+def _safe_ctype_for_css() -> str:
+    """The literal the selector maps an unknown media type on a `.css` path to."""
+    return server._safe_upstream_ctype("bogus/thing", "/x.css")
+
+
 class TestDevProcCrossPlatform:
     """Starting and stopping a project's dev server must not use POSIX-only calls.
 

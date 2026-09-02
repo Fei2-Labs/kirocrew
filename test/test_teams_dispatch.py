@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.transport_dispatch import TeamsDispatcher
 
@@ -61,6 +62,10 @@ class FakeSessions:
         self.channels: list = []
         self.last_agent = None
         self._busy = False
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         # Mid-turn queue + dashboard-mirror surface the dispatcher now uses.
         self.queues: dict[str, list] = {}
         self.cleared: list = []
@@ -110,6 +115,12 @@ class FakeSessions:
         if self._raise is not None:
             raise self._raise
         return self._p, self._is_new, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, cid) -> None:
         self.channels.append((key, cid))

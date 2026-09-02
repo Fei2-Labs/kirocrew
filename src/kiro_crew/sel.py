@@ -17,9 +17,12 @@ Rotation: the live log is closed at ``_SEGMENT_MAX_BYTES`` and renamed into
 ``<config_dir>/security_events.d/``, keeping ``_SEGMENT_KEEP`` closed segments.
 Each segment is an INDEPENDENT HMAC chain (it starts from genesis), and the
 first record of every new live log is a ``sel_rotation`` event naming the
-segment just closed and its final ``entry_hash`` — so the boundary is auditable
-evidence rather than a chain break, and retention deleting an old segment leaves
-every surviving segment verifiable on its own.
+segment just closed and its size — deliberately NOT that segment's final
+``entry_hash``, which a sibling process still holding a writable fd to the
+renamed inode could invalidate, making verification report an untampered log as
+compromised. The segment NAME is what lets an investigator walk the sequence, so
+the boundary is auditable evidence rather than a chain break, and retention
+deleting an old segment leaves every surviving segment verifiable on its own.
 Retention: configurable, default 365 days per Amazon Security Event Logging Standard.
 """
 
@@ -725,9 +728,15 @@ class SecurityEventLog:
             raise OSError(
                 f"SEL chain-lock sidecar {lock_path} is a link; refusing to lock it"
             )
+        # Windows' CRT text mode strips a trailing 0x1A while opening a file
+        # for update. The fallback lock path can be the raw HMAC key, so this
+        # descriptor must be binary even though the lock code never writes it.
         fd = os.open(
             lock_path,
-            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0),
             0o600,
         )
         joined: _ChainHold | None = None
@@ -1141,14 +1150,19 @@ class SecurityEventLog:
             written = os.fstat(f.fileno())
         # Ensure permissions are correct even if file pre-existed with
         # wrong mode (e.g. created by an older version). POSIX repair only,
-        # deliberately NOT ``platform_compat.restrict_to_owner``: that helper
-        # spawns ``icacls`` on Windows (a blocking subprocess), and this
-        # append path can run inline on a caller's thread that may be the
-        # asyncio event loop — the ``critical=True`` audit-or-deny write, and
-        # the fallback taken when the writer thread cannot start (see
-        # ``_may_rotate``) — where a blocking call freezes every gateway task.
+        # deliberately still NOT ``platform_compat.restrict_to_owner``: on POSIX
+        # that helper IS this exact call, so a swap would add only the Windows
+        # owner-only DACL — and this append path can run inline on a caller's
+        # thread that may be the asyncio event loop (the ``critical=True``
+        # audit-or-deny write, and the fallback taken when the writer thread
+        # cannot start, see ``_may_rotate``), where a DACL write to a UNC or
+        # mapped-drive path costs an unbounded SMB round-trip. Adopting the
+        # helper here therefore means first deciding what a non-local volume
+        # gets, the way ``write_config_atomically`` gates its own lockdown on
+        # ``windows_acl.volume_is_local``; until that is settled the log keeps
+        # whatever DACL it inherits on Windows. Tracked in #6359.
         try:
-            os.chmod(self._path, 0o600)  # lockdown-ok: #5228 -- icacls would block the event loop
+            os.chmod(self._path, 0o600)  # lockdown-ok: #5228 -- unbounded SMB round-trip on the loop
         except OSError:
             logger.warning("Failed to enforce 0o600 permissions on SEL audit log %s", self._path, exc_info=True)
         self._live_seen = (written.st_dev, written.st_ino, written.st_size)
@@ -1681,11 +1695,14 @@ class SecurityEventLog:
         new live log starts from genesis, so BOTH verify independently and
         retention deleting an old segment can never break a surviving one. The
         boundary is not lost — it is recorded as the new log's first entry, a
-        ``sel_rotation`` event naming the closed segment and its final
-        ``entry_hash``. An investigator can therefore still walk segment to
-        segment, and a segment that was deleted or swapped is visible as a
-        rotation record whose named predecessor is absent or ends on a different
-        hash.
+        ``sel_rotation`` event naming the closed segment and its size. It
+        deliberately does NOT claim that segment's final ``entry_hash``: a hash
+        captured here can be stale by the time the record is written (see
+        :meth:`_rotation_event`), which would make verification report an
+        untampered log as compromised. An investigator can therefore still walk
+        segment to segment, and a segment that was deleted or swapped is visible
+        as a rotation record whose named predecessor is absent or whose entries
+        fail their own per-record HMACs.
         """
         size = self._live_size()
         if size < _SEGMENT_MAX_BYTES:
@@ -3300,6 +3317,23 @@ def sel() -> SecurityEventLog:
     return SecurityEventLog()
 
 
+def _trust_root_key_loads(path: Path) -> bool:
+    """True when *path* is a regular file currently holding a usable key.
+
+    ``stat`` only — the caller reads the bytes just after, and the point here is
+    to answer "does the resolved path still resolve?" without paying a read on
+    the healthy path. ``S_ISREG`` is load-bearing rather than tidiness: a
+    candidate location an actor can create is a place they can put a FIFO, and
+    opening one blocks in-kernel forever, which an ``asyncio`` timeout cannot
+    reclaim because the thread is stuck in a syscall.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_size >= _HMAC_KEY_MIN_BYTES
+
+
 def sel_hmac_key_path() -> Path:
     """Canonical on-disk location of the SEL trust-root key (``sel_hmac.key``).
 
@@ -3314,11 +3348,63 @@ def sel_hmac_key_path() -> Path:
     (e.g. via ``config_dir()``; ``_default_dir()`` honors ``KIROCREW_HOME`` the
     same way, so resolving through the shared accessor keeps the trust root
     single under isolated-home deployments).
+
+    RE-RESOLVES per call. ``_hmac_key_file`` is decided once inside
+    ``_load_or_create_hmac_key`` and a legacy install can leave it on the legacy
+    location after a failed migration; a sibling process that later completes
+    that migration deletes the file this process is still naming. Without
+    re-resolution every dependent protocol inherits that dead path and has to
+    grow its own recovery, which is one fallback per caller instead of the class
+    being closed (the shape ``session_pid_sig`` was left in by #2574).
+
+    What re-resolution does NOT touch is the audit chain. The chain is signed
+    and verified with ``self._hmac_key``, the BYTES read once at init, and no
+    record carries a key id or generation marker — so re-reading the key file
+    into the signing key mid-process would orphan every record already chained
+    (which is why ``_load_or_create_hmac_key`` raises rather than regenerating,
+    and why migration moves bytes with ``os.replace``). This accessor returns a
+    PATH that the signing and verification code never reads. The anchor stays
+    pinned to the bytes cached at init; only the path handed to dependent
+    protocols follows the file.
+
+    A relocated candidate is adopted ONLY when its bytes equal the key this
+    process already validated at init. Adopting an unverified file would be a
+    downgrade rather than a fix: the resolved path vanishing is exactly the
+    moment an actor who can write the trust directory would plant a key of their
+    own, and handing dependents a path is handing them signing material. When
+    nothing verifies, the resolved path is returned unchanged so the operator
+    report keeps naming the file that actually broke, and
+    ``session_pid_sig._load_hmac_key`` still recovers from the in-memory copy.
     """
     inst = SecurityEventLog._instance
-    if inst is not None and getattr(inst, "_initialized", False):
-        return inst._hmac_key_file
-    return _default_dir() / _TRUST_SUBDIR / _HMAC_KEY_FILE
+    if inst is None or not getattr(inst, "_initialized", False):
+        # No singleton in this process (the verifying MCP process, typically):
+        # this branch already recomputes on every call, so it was never frozen.
+        return _default_dir() / _TRUST_SUBDIR / _HMAC_KEY_FILE
+    resolved: Path = inst._hmac_key_file
+    if _trust_root_key_loads(resolved):
+        return resolved
+    anchor: bytes | None = getattr(inst, "_hmac_key", None)
+    if not anchor:
+        return resolved
+    base: Path = inst._dir
+    # Same precedence as _load_or_create_hmac_key: the trust/ location first,
+    # the legacy sibling-of-the-log location second.
+    for cand in (base / _TRUST_SUBDIR / _HMAC_KEY_FILE, base / _HMAC_KEY_FILE):
+        if cand == resolved or not _trust_root_key_loads(cand):
+            continue
+        try:
+            found = cand.read_bytes()
+        except OSError:
+            continue
+        if hmac.compare_digest(found, anchor):
+            logger.debug(
+                "SEL trust root re-resolved %s -> %s (same key bytes)",
+                resolved,
+                cand,
+            )
+            return cand
+    return resolved
 
 
 def _sel_hmac_key_bytes() -> bytes | None:
@@ -3336,10 +3422,13 @@ def _sel_hmac_key_bytes() -> bytes | None:
     record from that in-memory copy, so the audit chain is immune to the key
     file moving, being deleted, losing read permission, or being truncated
     afterwards. The dependent protocol that re-reads the file on every use is
-    not, and its resolved path is never re-resolved — which is how a gateway
-    ends up publishing unsigned identities forever while its audit chain still
-    looks healthy. These are the same bytes, already validated at init
-    (``>= _HMAC_KEY_MIN_BYTES``, see ``_load_or_create_hmac_key``).
+    not. ``sel_hmac_key_path`` re-resolves a relocation whose bytes match this
+    anchor (#2588), so what reaches here is the residue it cannot resolve — a
+    key deleted, unreadable, truncated, or replaced by bytes that are not the
+    anchor — which is how a gateway would otherwise end up publishing unsigned
+    identities forever while its audit chain still looks healthy. These are the
+    same bytes, already validated at init (``>= _HMAC_KEY_MIN_BYTES``, see
+    ``_load_or_create_hmac_key``).
 
     Returns ``None`` when no initialized singleton exists in this process (the
     verifying MCP process, typically) or the cached key is unusable.

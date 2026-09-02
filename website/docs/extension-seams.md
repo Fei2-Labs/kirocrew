@@ -9,11 +9,12 @@ The backend has the sibling mechanism, Composed Platform Providers: see
 [`docs/system-specs/modules/platform-context.md`](../../docs/system-specs/modules/platform-context.md).
 The two are independent. Nothing here reads `CONTRACT_VERSION`.
 
-## The eleven registry seams
+## The thirteen registry seams
 
 Each entry is one registrar the edition may call, paired with the reader the core
-already calls. `src/extensions.ts` names exactly these eleven in its header, and
-`src/test/extensionSeams.test.tsx` exercises each one.
+already calls. `src/extensions.ts` names exactly these thirteen in its header.
+`src/test/extensionSeams.test.tsx` exercises each one except the source-provider
+seam, which has its own suite in `src/test/sourceProviderSeam.test.ts`.
 
 | Seam | Module | Registrar to reader |
 |------|--------|---------------------|
@@ -28,17 +29,19 @@ already calls. `src/extensions.ts` names exactly these eleven in its header, and
 | Overview built-in suppression (subtractive) | `pages/overviewBuiltins.ts` | `suppressOverviewBuiltin()` to `isOverviewBuiltinSuppressed()` |
 | Panel-navigation chords | `hooks/useKeyboardShortcuts.ts` | `registerPanelShortcut()`, read by the shortcut handler and `DEFAULT_SHORTCUTS` |
 | Non-app route prefixes | `components/MigrationCheck.tsx` | `registerNonAppPrefix()`, read by `MigrationCheck` |
+| Source providers (Changes panel + sidebar chips) | `utils/pullRequestLinks.ts` | `registerSourceProvider()` to `sourceProviderDescriptor()` |
+| Phone-connection method renderers | `components/mobileConnectRenderers.tsx` | `registerMobileConnectRenderer()` to `getMobileConnectRenderers()` / `canRenderMobileConnectKind()` |
 
 Plus one **exported-transport** seam for edition-owned API methods. It is not a
 registry; see "API methods" below.
 
 Other `register*()` functions in `src/` (built-in surfaces, command-palette
 providers, tool pills, terminal sockets, highlight.js languages) are core-internal
-wiring, not edition seams. Only the eleven above are called from the composition
+wiring, not edition seams. Only the thirteen above are called from the composition
 root.
 
-Ten of the eleven are **additive** — the edition contributes a surface. The
-eleventh is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
+Twelve of the thirteen are **additive** — the edition contributes a surface. The
+remaining one is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
 Overview surface for a distribution whose environment makes it permanently
 inapplicable, which no additive seam can express. It is named `suppress*` rather
 than `register*` precisely so a call site cannot be misread as a contribution.
@@ -429,6 +432,60 @@ suppressed build emits no element at all rather than an empty, still-spaced one.
 **Non-app route prefixes.** `registerNonAppPrefix(prefix)` tells `MigrationCheck`
 that a route can never host a migratable app, so the migration banner does not
 probe it. A duplicate prefix is a no-op.
+
+**Source providers.** `registerSourceProvider(descriptor)` adds a code-review
+forge to link extraction, sidebar chips, and the Changes panel. It is the one
+seam whose registration is HALF a provider: the descriptor covers parsing and
+rendering (`parse`, `chipLabel`, `refLabel`, an optional `icon` glyph, and the
+`capabilities` flags gating each write affordance), while fetching and every
+mutation are served by a backend plugin the edition registers with
+`register_source_provider()` in
+`src/kiro_crew/dashboard/handlers/source_providers.py`, under the same id. The
+two registries validate the same id grammar (`/^[a-z][a-z0-9_-]{0,31}$/`) and
+both refuse the built-in ids (`github`, `gitlab`, `jira`), so a descriptor can
+never restyle a core provider and a payload provider id round-trips through both
+layers. A descriptor missing `parse`/`chipLabel`/`refLabel`/`capabilities`
+routes through `reportSeamCollision`.
+
+Every capability flag names the backend hooks it commits the plugin to (see
+`SourceProviderCapabilities` in `utils/pullRequestLinks.ts`): a flag set without
+its hooks renders a button whose call can only fail, which is exactly what the
+flags exist to prevent. Descriptor-returned links are re-validated
+(`validRegisteredLink`): the link must carry the descriptor's own id, an
+`https://` canonical URL that survives persist-and-reparse, and `kind: 'change'`
+— issue refs are refused at admission because the issue pipeline is
+built-in-only. A provider id the frontend has no descriptor for renders through
+fail-closed fallback meta (`utils/sourceProviderMeta.ts`): neutral labels, no
+logo, no write affordances. The backend plugin contract — payload schema
+(`SourceChangePayload`), shared caches, redaction, byte caps, and the optional
+mutation hooks — is documented on `SourceProviderPlugin` in
+`source_providers.py`; this seam's suite is `src/test/sourceProviderSeam.test.ts`
+plus `test/test_source_provider_plugin.py` on the backend.
+
+**Phone-connection method renderers.**
+`registerMobileConnectRenderer({ kind, component })` supplies the "Connect your
+phone" dialog section that draws one `MobileConnectMethod.kind` contributed by the
+backend `mobile_connect` CPP seam. It keys on `kind`, not `id`, because that is
+the descriptor's own split: `id` is the governed identifier the
+`capabilities.mobile_connect` `methods` ruleset narrows on, while `kind` exists to
+name the renderer — so two methods may share one kind and a component that needs
+the ids reads `/api/mobile-connect/methods` itself. A blank kind, a duplicate, or
+a **built-in** kind (`tailnet_qr`, `login_link`) routes through
+`reportSeamCollision`: those two are drawn by core sections whose mint endpoints
+the core audits, so registering over one would be an override that silently
+redirects a credential mint, not a contribution.
+
+The registry is also the **single** definition of the renderable set, read by two
+consumers that used to carry it as matching literals: `canRenderMobileConnectKind()`
+gates the nav rail's row and `getMobileConnectRenderers()` supplies the dialog's
+sections. A kind neither drawn nor registered is still filtered out at the rail, so
+the row stays hidden rather than opening a dialog with an empty body — the seam adds
+a way to draw a method, it does not remove that guard. Registered sections render
+above the built-ins, each in its own `ErrorBoundary`, so a throwing renderer
+disables only itself. It **cannot widen governance**: the endpoint filters every id
+through `capabilities.mobile_connect` before the dialog sees a kind, and each mint
+endpoint re-runs that decision (`mint_denied_reason`), so a renderer for a denied or
+unoffered method draws nothing.
 
 ## Reactivity
 

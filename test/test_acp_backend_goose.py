@@ -27,12 +27,12 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_GOOSE,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KNOWN,
-    ACP_BACKENDS_SELECTABLE,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
     METHOD_SESSION_LOAD,
     METHOD_SESSION_NEW,
 )
+from kiro_crew.acp_backends import selectable_backends
 
 _SYNTHETIC_UNVERIFIED = "example-acp"
 
@@ -40,7 +40,7 @@ _SYNTHETIC_UNVERIFIED = "example-acp"
 class TestGooseDescriptor:
     def test_goose_is_known_but_withheld_from_the_initial_preview(self) -> None:
         assert ACP_BACKEND_GOOSE in ACP_BACKENDS_KNOWN
-        assert ACP_BACKEND_GOOSE not in ACP_BACKENDS_SELECTABLE
+        assert ACP_BACKEND_GOOSE not in selectable_backends()
 
     def test_goose_routing_is_permission_request(self) -> None:
         descriptor = backends.descriptor_for(ACP_BACKEND_GOOSE)

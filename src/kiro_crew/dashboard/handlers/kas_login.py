@@ -9,8 +9,14 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from kiro_crew.auth.login.builder_id import BuilderIdAuthError
 from kiro_crew.auth.login.device import DeviceAuthError
-from kiro_crew.auth.service import KasLoginService, UnknownLoginError
+from kiro_crew.auth.service import (
+    InvalidRegionError,
+    KasLoginService,
+    MissingStartUrlError,
+    UnknownLoginError,
+)
 from kiro_crew.auth.store import TokenStore, TokenStoreError
 from kiro_crew.config.paths import data_home
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
@@ -114,7 +120,11 @@ async def api_kas_login_status(request: web.Request) -> web.Response:
 
 
 async def api_kas_login_begin_device(request: web.Request) -> web.Response:
-    """POST /api/kas-login/device {provider} — start a device-code login."""
+    """POST /api/kas-login/device {provider, start_url?, region?} — start a device login.
+
+    ``start_url`` and ``region`` apply to the ``idc`` provider only (the company's
+    IAM Identity Center portal); other providers ignore them.
+    """
     denied = await _require_owner(request, "kas_login_begin_device")
     if denied is not None:
         return denied
@@ -123,18 +133,30 @@ async def api_kas_login_begin_device(request: web.Request) -> web.Response:
         return _unavailable()
     body = await _read_json(request)
     provider = str((body or {}).get("provider") or "")
+    start_url = str((body or {}).get("start_url") or "")
+    region = str((body or {}).get("region") or "")
     if not provider:
         return web.json_response(
             {"error": "Missing 'provider'.", "code": "invalid_provider"}, status=400
         )
     try:
-        result = await service.begin_device(provider)
+        result = await service.begin_device(provider, start_url=start_url, region=region)
     except ValueError:
         return web.json_response(
             {"error": f"Unknown provider: {provider}", "code": "invalid_provider"},
             status=400,
         )
-    except DeviceAuthError as err:
+    except MissingStartUrlError:
+        return web.json_response(
+            {"error": "Company SSO requires a start URL.", "code": "missing_start_url"},
+            status=400,
+        )
+    except InvalidRegionError:
+        return web.json_response(
+            {"error": "Not a valid AWS region name.", "code": "invalid_region"},
+            status=400,
+        )
+    except (DeviceAuthError, BuilderIdAuthError) as err:
         await _audit(request, "kas_login_begin_device", "failed", error=str(err))
         return web.json_response(
             {"error": str(err), "code": "device_authorization_failed"}, status=502

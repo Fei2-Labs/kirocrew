@@ -133,13 +133,19 @@ function pending<T>(): Promise<T> {
   return new Promise<T>(() => undefined)
 }
 
-/** A promise whose resolution this test controls, for ordering two reads. */
-function deferred<T>(): { promise: Promise<T>; settle: (value: T) => void } {
+/** A promise whose outcome this test controls, for ordering async operations. */
+function deferred<T>(): {
+  promise: Promise<T>
+  settle: (value: T) => void
+  reject: (reason?: unknown) => void
+} {
   let settle!: (value: T) => void
-  const promise = new Promise<T>(resolve => {
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolve, rejectPromise) => {
     settle = resolve
+    reject = rejectPromise
   })
-  return { promise, settle }
+  return { promise, settle, reject }
 }
 
 /** An ESTALE rejection, the shape the save guard recognises. */
@@ -791,17 +797,34 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     expect(api.moveNote).not.toHaveBeenCalled()
   })
 
-  it('refuses to move a note whose pending save was rejected', async () => {
-    await mountDirty()
-    api.saveNote.mockRejectedValueOnce(staleRejection())
-    // Back to the rendered pane so the row action bar is reachable.
-    await userEvent.click(screen.getByRole('button', { name: 'Rendered' }))
-    rowAction('One', 'Rename note')
-    const field = await screen.findByRole('textbox', { name: 'Note name' })
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Renamed{Enter}')
+  it('joins an active debounced save and refuses to move when that save fails', async () => {
+    const save = deferred<{ ok: boolean; mtime: number }>()
+    api.saveNote.mockImplementationOnce(() => save.promise)
+    await mountWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    vi.useFakeTimers()
+    fireEvent.change(rawEditor(), { target: { value: '# Hello\n\nunsaved rename' } })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
 
-    await waitFor(() => expect(api.saveNote).toHaveBeenCalled())
+    // Rename while the debounce save is still unresolved. This second save
+    // barrier must JOIN the active request instead of issuing a competing save
+    // whose success could hide the first request's failure.
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    rowAction('One', 'Rename note')
+    const field = screen.getByRole('textbox', { name: 'Note name' })
+    fireEvent.change(field, { target: { value: 'Renamed' } })
+    fireEvent.keyDown(field, { key: 'Enter', code: 'Enter' })
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      save.reject(staleRejection())
+      await save.promise.catch(() => undefined)
+    })
+    vi.useRealTimers()
+    expect(await screen.findByText('This note changed on disk since you opened it.')).toBeTruthy()
     // Renaming would retarget the editor without ever reconciling its content.
     expect(api.moveNote).not.toHaveBeenCalled()
   })

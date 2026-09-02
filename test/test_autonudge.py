@@ -26,17 +26,6 @@ def svc(tmp_path):
     return AutoNudgeService(base_dir=tmp_path)
 
 
-def _structured_monitor(**changes: object) -> MonitorState:
-    values: dict[str, object] = {
-        "kind": "github_pull_request",
-        "target": "owner/repo#123",
-        "objective": "review_ready",
-        "created_ts": 1_000.0,
-    }
-    values.update(changes)
-    return MonitorState(**values)
-
-
 _FROZEN_NOW = 1_000_000.0
 
 
@@ -53,6 +42,17 @@ def _freeze_clock(monkeypatch) -> None:
     the wall-clock dependency.
     """
     monkeypatch.setattr(_an.time, "time", lambda: _FROZEN_NOW)
+
+
+def _structured_monitor(**changes: object) -> MonitorState:
+    values: dict[str, object] = {
+        "kind": "github_pull_request",
+        "target": "owner/repo#123",
+        "objective": "review_ready",
+        "created_ts": 1_000.0,
+    }
+    values.update(changes)
+    return MonitorState(**values)
 
 
 @pytest.mark.asyncio

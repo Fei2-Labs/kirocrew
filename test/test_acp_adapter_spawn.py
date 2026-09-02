@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from kiro_crew.acp import backends, goose, opencode, pi
-from kiro_crew.acp._dispatch import parse_usage_cost
 from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
     ACP_BACKEND_GOOSE,
@@ -255,42 +254,12 @@ class TestSpecAdaptersAreNotToldWeSupportElicitation:
         client._send_request.assert_not_awaited()
 
 
-class TestUsageCostIsReadNotDiscarded:
-    """claude-agent-acp ships a real USD figure; Crew was dropping it."""
-
-    def test_a_cost_block_is_parsed(self) -> None:
-        amount, currency = parse_usage_cost(
-            {"used": 10, "size": 100, "cost": {"amount": 0.42, "currency": "USD"}}
-        )
-        assert amount == 0.42
-        assert currency == "USD"
-
-    def test_an_absent_cost_block_is_the_norm_not_an_error(self) -> None:
-        """codex-acp sends no cost at all; that must not read as a failure."""
-        assert parse_usage_cost({"used": 10, "size": 100}) == (None, "")
-
-    def test_a_fractional_amount_survives(self) -> None:
-        """The token validator clamps to int, which would silently zero a cent."""
-        amount, _ = parse_usage_cost({"cost": {"amount": 0.004, "currency": "USD"}})
-        assert amount == 0.004
-
-    @pytest.mark.parametrize(
-        "bad",
-        ["1.0", None, True, float("nan"), float("inf"), -1.0, [], {}],
-    )
-    def test_a_malformed_amount_degrades_to_absent(self, bad: object) -> None:
-        """A cost that is not a real non-negative number must not enter a total.
-
-        ``True`` is in this list deliberately: bool is a subclass of int, so a
-        naive isinstance check would record a cost of 1.
-        """
-        assert parse_usage_cost({"cost": {"amount": bad}}) == (None, "")
-
-    def test_currency_is_never_inferred(self) -> None:
-        """A bare number with an assumed currency is a wrong number."""
-        amount, currency = parse_usage_cost({"cost": {"amount": 1.5}})
-        assert amount == 1.5
-        assert currency == ""
+# The fork's (amount, currency) cost model is superseded by upstream's USD-only
+# ``AcpPromptStats.apply_cost_cumulative``, which refuses a non-USD figure outright
+# rather than storing a currency alongside it. Its coverage is a strict superset of
+# what this class asserted -- malformed degradation, zero, non-USD, currency case
+# sensitivity, null/non-string currency, nested shapes, cumulative deltas and the
+# negative-delta guard -- and lives in test_acp_usage_cost.py.
 
 
 class TestCorrectedCapabilityLevels:

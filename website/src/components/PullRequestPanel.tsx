@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { withUnifiedPatchHeaders } from './unifiedPatchHeaders'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -32,6 +33,7 @@ import {
   MAX_PULL_REQUEST_SOURCES,
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
+import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import CopyBranchButton from './CopyBranchButton'
 import { PierrePatch } from '../pierre'
 import GithubLogo from './icons/GithubLogo'
@@ -43,6 +45,7 @@ import { Btn } from './ui'
 
 
 import { i18nT } from '../i18n/t'
+import { OWNER_SETTINGS_PATH, pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import ErrorNotice from './ErrorNotice'
 const CHECK_POLL_BASE_MS = 10_000
 const CHECK_POLL_MAX_MS = 60_000
@@ -109,43 +112,6 @@ function age(value: string): string {
   return timeAgo(Number.isFinite(ms) ? ms / 1000 : 0)
 }
 
-export function pullRequestErrorDetails(error: unknown): {
-  message: string
-  loginCommand: 'gh auth login' | 'glab auth login' | ''
-  /** The server refused pending an acknowledgement the client may now offer. */
-  confirmationRequired: boolean
-  /** The gateway was at its concurrent-fetch ceiling; the same request may succeed later. */
-  sourceBusy: boolean
-} {
-  let message = error instanceof Error ? error.message : String(error || '')
-  let confirmationRequired = false
-  let sourceBusy = false
-  // ApiError already unwraps the human message, which discards every other
-  // field, so the structured marker is read from the raw body it preserves.
-  const raw = typeof (error as { body?: unknown })?.body === 'string'
-    ? (error as { body: string }).body
-    : message
-  try {
-    const payload = JSON.parse(raw) as {
-      error?: unknown
-      confirmationRequired?: unknown
-      code?: unknown
-    }
-    if (typeof payload.error === 'string') message = payload.error
-    confirmationRequired = payload.confirmationRequired === true
-    sourceBusy = payload.code === 'source_busy'
-  } catch {
-    // Provider and network errors may already be plain text.
-  }
-  const authenticationFailure = /\b(?:not logged in(?:to)?|unauthenticated|authentication (?:failed|required)|requires authentication)\b/i.test(message)
-  const loginCommand = authenticationFailure && /(?:`|\b)gh auth login(?:`|\b)/i.test(message)
-    ? 'gh auth login'
-    : authenticationFailure && /(?:`|\b)glab auth login(?:`|\b)/i.test(message)
-      ? 'glab auth login'
-      : ''
-  return { message, loginCommand, confirmationRequired, sourceBusy }
-}
-
 /** Whether a failed source read is worth another attempt.
  *
  * Only admission pressure retries. A provider error (not authenticated, PR gone,
@@ -187,12 +153,15 @@ export interface PullRequestMergeBlocker {
  * avoids history rewriting (merge base into head); rebase + force-push is
  * reserved for genuine conflicts. */
 export function pullRequestMergeBlocker(source: PullRequestSource): PullRequestMergeBlocker | null {
+  // A provider that does not report merge state has nothing to block on, and a
+  // banner derived from absent fields would read as "clean" or invent a blocker.
+  if (!sourceProviderMeta(source.provider).capabilities.mergeState) return null
   // GitLab reports open MRs as 'opened'; the full payload carries the raw
   // provider state (matching stateTone below), so accept both spellings.
   const state = source.state.toLowerCase()
   if ((state !== 'open' && state !== 'opened') || source.mergedAt || source.draft) return null
   const base = source.baseBranch || 'the base branch'
-  const label = source.provider === 'github' ? `PR #${source.number}` : `MR !${source.number}`
+  const label = sourceProviderMeta(source.provider).refLabel(source.number)
   const sourceUrl = safeExternalUrl(source.url)
   const handoffHeader = (problem: string) => [
     `${problem} on ${label} (${source.title}):`,
@@ -293,6 +262,65 @@ export function pullRequestCiSignal(
   if (checks.some(check => check.bucket === 'failed')) return 'failed'
   if (checks.some(check => check.bucket === 'pending')) return 'running'
   return 'passed'
+}
+
+/** A merge field the provider actually answered, or undefined.
+ *
+ * Both `''` and `'unknown'` are non-answers rather than values (see
+ * `PullRequestSource.mergeable`): `''` is the provider omitting the field, and
+ * `'unknown'` is GitHub reporting that it has not finished computing the merge
+ * commit yet -- a transient state every push re-enters. Neither may overwrite a
+ * value that WAS settled, or the pair would flicker off and back on through the
+ * recompute window. */
+const settledMergeField = (value: string | undefined): string | undefined =>
+  (value && value !== 'unknown' ? value : undefined)
+
+/** The status entry for the SELECTED pull request: its cached chip status with
+ * the fields the full payload can speak to layered on top.
+ *
+ * A per-FIELD preference, not a whole-record replacement. Both sides describe
+ * the same pull request, but neither is a superset of the other -- the payload
+ * is fresher and user-refreshable, while the cache is the only source for
+ * anything this panel does not recompute. Rebuilding the record from the
+ * payload alone silently dropped every field it does not mention (the settled
+ * `mergeable` / `mergeStateStatus` pair), and dropped it for the selected
+ * source ONLY, so the one tab with the most authoritative data behind it was
+ * the one carrying the least.
+ *
+ * Two rules keep the fallback from being worse than the drop it replaces:
+ *
+ *  - an UNSETTLED payload field keeps the cached one rather than erasing it,
+ *    the same keep-known rule `keptCi` applies to CI below and the backend's
+ *    `record_full_payload_status` applies on the other side of the wire;
+ *  - a TERMINAL pull request carries no merge pair at all. Mergeability is a
+ *    question about a merge that can still happen, so once merged or closed a
+ *    retained `conflicting` is not stale data, it is an answer to a question
+ *    nobody asked. `SourceTabState` suppresses CI on the same predicate and for
+ *    the same reason -- the lifecycle glyph is the terminal signal.
+ */
+export function selectedSourceStatus(
+  source: PullRequestSource,
+  cached: PullRequestStatus | undefined,
+): PullRequestStatus {
+  // A degraded payload (the provider's checks read failed or truncated, so
+  // `checks` is flagged in `partialSections`) carries nothing to recompute CI
+  // from, so fall back to the chip status the backend deliberately kept alive
+  // instead of erasing the glyph. A genuinely empty checks section (no CI
+  // configured, not flagged partial) still clears a stale glyph.
+  const keptCi = source.partialSections?.includes('checks') ? cached?.ci : undefined
+  const state = pullRequestLifecycleState(source)
+  const terminal = state === 'merged' || state === 'closed'
+  return {
+    ...cached,
+    state,
+    ci: pullRequestCiSignal(source.checks) ?? keptCi,
+    mergeable: terminal
+      ? undefined
+      : (settledMergeField(source.mergeable) ?? settledMergeField(cached?.mergeable)),
+    mergeStateStatus: terminal
+      ? undefined
+      : (settledMergeField(source.mergeStateStatus) ?? settledMergeField(cached?.mergeStateStatus)),
+  }
 }
 
 /**
@@ -457,7 +485,7 @@ function CheckRow({ check, source, onAddToChat }: { check: PullRequestCheck; sou
   const checkUrl = safeExternalUrl(check.url)
   const sourceUrl = safeExternalUrl(source.url)
   const handoff = () => {
-    const label = source.provider === 'github' ? `PR #${source.number}` : `MR !${source.number}`
+    const label = sourceProviderMeta(source.provider).refLabel(source.number)
     const lines = [
       `Failing CI check on ${label} (${source.title}):`,
       '',
@@ -556,7 +584,11 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
   const queryClient = useQueryClient()
   const [confirmAutoMerge, setConfirmAutoMerge] = useState(false)
   const [immediateMergeWarning, setImmediateMergeWarning] = useState('')
-  const isGitHub = source.provider === 'github'
+  const meta = sourceProviderMeta(source.provider)
+  // Selects between the existing GitHub/GitLab catalog key pairs — "pull
+  // request" vs "merge request" wording — rather than asserting the provider IS
+  // GitHub. A registered provider takes the pull-request wording.
+  const isGitHub = meta.pullRequestWording
 
   const invalidate = () => {
     void queryClient.invalidateQueries({ queryKey: ['pull-request-source'] })
@@ -589,6 +621,10 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
   }
 
   if (!pullRequestIsLive(source)) return null
+  // Ready-for-review and auto-merge are merge-state writes. A provider whose
+  // gateway plugin does not implement them must not get buttons that can only
+  // return "unsupported by this provider".
+  if (!meta.capabilities.mergeState) return null
   const showReady = source.draft
   const showAutoMerge = !source.draft && !source.autoMerge
   const errorDetails = pullRequestErrorDetails(readyMutation.error || autoMergeMutation.error)
@@ -600,6 +636,7 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
   if (!showReady && !showAutoMerge && !source.autoMerge && !error) return null
 
   return (
+    <>
     <div className="mt-2 flex flex-wrap items-center gap-2">
       {showReady && (
         <Btn
@@ -660,6 +697,20 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
       )}
       <ErrorNotice message={error} variant="inline" askAgent />
     </div>
+    {/* The remedy link lives OUTSIDE the action row, on its own line — never
+        as a row peer, which would push the row past the two-button cap in the
+        confirm state (Cancel + Confirm are already there). */}
+    {error && errorDetails.ownerNotConfigured && (
+      <div className="mt-1.5">
+        <Link
+          to={OWNER_SETTINGS_PATH}
+          className="inline-flex items-center gap-1 text-[11px] text-accent hover:underline"
+        >
+          {i18nT('components.pullRequestPanel.open_slack_settings')} <ArrowRight className="lucide-inline" />
+        </Link>
+      </div>
+    )}
+    </>
   )
 }
 
@@ -814,6 +865,11 @@ export default function PullRequestPanel({
   const source = query.data
   const queryError = pullRequestErrorDetails(query.error)
   const sourceUrl = safeExternalUrl(source?.url || '')
+  // One meta lookup for every provider-shaped decision in this component: the
+  // Checks tab and its poll, the merge affordances, and the labels.
+  const providerChecks = Boolean(
+    source && sourceProviderMeta(source.provider).capabilities.checks,
+  )
   const sourceHasPendingChecks = Boolean(
     source?.checks.some(check => check.bucket === 'pending'),
   )
@@ -844,7 +900,7 @@ export default function PullRequestPanel({
         throw error
       }
     },
-    enabled: Boolean(selected && sourceHasPendingChecks && !query.isFetching),
+    enabled: Boolean(selected && providerChecks && sourceHasPendingChecks && !query.isFetching),
     retry: false,
     staleTime: 0,
     refetchOnWindowFocus: false,
@@ -953,27 +1009,14 @@ export default function PullRequestPanel({
     const merged: Record<string, PullRequestStatus> = { ...cached }
     // The selected pull request already has a full, user-refreshable payload —
     // prefer it over the cached chip status so its own chip never lags the
-    // header badge it sits above.
+    // header badge it sits above. Field by field: see `selectedSourceStatus`.
     if (source) {
-      // A degraded payload (the provider's checks read failed or truncated, so
-      // `checks` is flagged in `partialSections`) carries nothing to recompute
-      // CI from. Mirror the backend's keep-known rule
-      // (`record_full_payload_status` in `source_providers.py`): fall back to
-      // the chip status the backend deliberately kept alive instead of erasing
-      // the glyph. A genuinely empty checks section (no CI configured, not
-      // flagged partial) still clears a stale glyph.
-      const keptCi = source.partialSections?.includes('checks')
-        ? cached[source.url]?.ci
-        : undefined
-      merged[source.url] = {
-        state: pullRequestLifecycleState(source),
-        ci: pullRequestCiSignal(source.checks) ?? keptCi,
-      }
+      merged[source.url] = selectedSourceStatus(source, cached[source.url])
     }
     return merged
   }, [statusQuery.data, source])
 
-  const tabs: Array<{ id: SourceTab; label: string; count?: number; tone?: string }> = source ? [
+  const allTabs: Array<{ id: SourceTab; label: string; count?: number; tone?: string }> = source ? [
     { id: 'changes', label: i18nT('components.pullRequestPanel.changes'), count: source.files.length },
     { id: 'description', label: i18nT('components.pullRequestPanel.description') },
     { id: 'commits', label: i18nT('components.pullRequestPanel.commits'), count: source.commits.length },
@@ -997,6 +1040,15 @@ export default function PullRequestPanel({
     },
     { id: 'reviews', label: i18nT('components.pullRequestPanel.reviews'), count: source.comments.length },
   ] : []
+  // The Checks tab is dropped for a provider that cannot report CI, rather than
+  // rendered as a permanently empty section.
+  const tabs = allTabs.filter(item => item.id !== 'checks' || providerChecks)
+  // A provider without a Checks tab must not leave the panel on a tab that no
+  // longer has a button: `tab` is component state and survives switching between
+  // source tabs, so it can name a section this provider does not have. Falling
+  // back to the first tab is derived rather than an effect, so the very first
+  // render is already correct instead of flashing an empty section.
+  const activeTab: SourceTab = tabs.some(item => item.id === tab) ? tab : 'changes'
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -1006,7 +1058,9 @@ export default function PullRequestPanel({
           exactly one tab that does nothing. */}
       {cappedSources.length > 1 && (
       <div role="tablist" aria-label={i18nT('components.pullRequestPanel.pull_requests')} className="shrink-0 border-b border-border px-2 py-2 flex items-center gap-1 overflow-x-auto">
-        {cappedSources.map(item => (
+        {cappedSources.map(item => {
+          const itemMeta = sourceProviderMeta(item.provider)
+          return (
           <Btn
             key={item.url}
             type="button"
@@ -1016,11 +1070,21 @@ export default function PullRequestPanel({
             className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border-none cursor-pointer text-[12px] transition-colors ${item.url === selected?.url ? 'bg-bg-hover text-text' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover/60'}`}
             title={item.url}
           >
-            {item.provider === 'github' ? <GithubLogo size={13} className="shrink-0" /> : <GitlabLogo size={13} className="shrink-0" />}
-            <span>{item.provider === 'github' ? 'PR' : 'MR'} {item.provider === 'github' ? '#' : '!'}{item.number}</span>
+            {itemMeta.logo === 'github'
+              ? <GithubLogo size={13} className="shrink-0" />
+              : itemMeta.logo === 'gitlab'
+                ? <GitlabLogo size={13} className="shrink-0" />
+                : itemMeta.icon
+                  ? <itemMeta.icon size={13} className="shrink-0" />
+                  // Explicit 13 to match its siblings: `lucide-inline` sizes at
+                  // `1em`, which is 12px in this tab strip, so the neutral glyph
+                  // rendered a pixel smaller than every branded one beside it.
+                  : <GitPullRequest size={13} className="lucide-inline shrink-0" />}
+            <span>{itemMeta.refLabel(item.number)}</span>
             <SourceTabState status={statusByUrl[item.url]} />
           </Btn>
-        ))}
+          )
+        })}
       </div>
       )}
 
@@ -1054,7 +1118,7 @@ export default function PullRequestPanel({
           <div className="shrink-0 px-4 py-3 border-b border-border">
             <div className="flex items-center gap-2 text-[11px] text-muted">
               <span className={`px-1.5 py-0.5 rounded font-medium ${stateTone(source)}`}>{stateLabel(source)}</span>
-              <span>{source.provider === 'github' ? 'GitHub' : 'GitLab'}</span>
+              <span>{sourceProviderMeta(source.provider).displayName}</span>
               {source.headBranch && source.baseBranch && (
                 <span className="min-w-0 flex items-center gap-1 truncate"><CopyBranchButton branch={source.headBranch} /><ArrowRight className="lucide-inline shrink-0" /><span className="truncate">{source.baseBranch}</span></span>
               )}
@@ -1070,7 +1134,7 @@ export default function PullRequestPanel({
               </Btn>
               {sourceUrl && <a href={sourceUrl} target="_blank" rel="noopener noreferrer" className="p-1 rounded text-muted hover:text-text hover:bg-bg-hover" aria-label={i18nT('components.pullRequestPanel.open_pull_request')} title={i18nT('components.pullRequestPanel.open_pull_request')}><ExternalLink className="lucide-inline" /></a>}
             </div>
-            <div className="mt-2 text-[15px] font-semibold text-text-strong leading-snug">{source.title} <span className="font-normal text-muted">{source.provider === 'github' ? '#' : '!'}{source.number}</span></div>
+            <div className="mt-2 text-[15px] font-semibold text-text-strong leading-snug">{source.title} <span className="font-normal text-muted">{sourceProviderMeta(source.provider).numberLabel(source.number)}</span></div>
             <div className="mt-1 flex items-center gap-2 text-[11px] text-muted">
               {source.author && <span>{source.author}</span>}
               <span><span className="text-ok">+{source.additions}</span> <span className="text-danger">-{source.deletions}</span></span>
@@ -1101,7 +1165,7 @@ export default function PullRequestPanel({
             <div role="status" className="shrink-0 flex items-start gap-2 px-4 py-2 border-b border-border bg-warn/10 text-[11px] text-muted">
               <AlertCircle className="lucide-inline shrink-0 mt-0.5 text-warn" />
               <span>
-                {source.provider === 'github'
+                {sourceProviderMeta(source.provider).pullRequestWording
                   ? i18nT('components.pullRequestPanel.provider_results_may_be_partial_pull_request', { sections: source.partialSections.join(', ') })
                   : i18nT('components.pullRequestPanel.provider_results_may_be_partial_merge_request', { sections: source.partialSections.join(', ') })}
               </span>
@@ -1115,10 +1179,10 @@ export default function PullRequestPanel({
                 type="button"
                 role="tab"
                 id={`pr-tab-${item.id}`}
-                aria-selected={tab === item.id}
+                aria-selected={activeTab === item.id}
                 aria-controls="pr-tabpanel"
                 onClick={() => setTab(item.id)}
-                className={`shrink-0 flex items-center gap-1.5 px-2 py-1.5 rounded-md border-none cursor-pointer text-[11px] transition-colors ${tab === item.id ? 'bg-bg-hover text-text' : `bg-transparent text-muted hover:text-text ${item.tone || ''}`}`}
+                className={`shrink-0 flex items-center gap-1.5 px-2 py-1.5 rounded-md border-none cursor-pointer text-[11px] transition-colors ${activeTab === item.id ? 'bg-bg-hover text-text' : `bg-transparent text-muted hover:text-text ${item.tone || ''}`}`}
               >
                 {item.id === 'checks' && checksUnavailable ? (
                   <AlertCircle className="lucide-inline text-warn" />
@@ -1133,8 +1197,8 @@ export default function PullRequestPanel({
             ))}
           </div>
 
-          <div id="pr-tabpanel" role="tabpanel" aria-labelledby={`pr-tab-${tab}`} className="flex-1 min-h-0 overflow-y-auto">
-            <PullRequestBody source={source} tab={tab} onAddToChat={onAddToChat} />
+          <div id="pr-tabpanel" role="tabpanel" aria-labelledby={`pr-tab-${activeTab}`} className="flex-1 min-h-0 overflow-y-auto">
+            <PullRequestBody source={source} tab={activeTab} onAddToChat={onAddToChat} />
           </div>
         </>
       )}

@@ -23,6 +23,7 @@ from kiro_crew.context_blocks import USER_LABEL
 from kiro_crew.hooks import validate_file_path
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.metrics.turns import OUTCOME_UNCLASSIFIED, emit_turn_duration, turn_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +294,14 @@ _BACKGROUND_CHANNELS = frozenset(
         "heartbeat",
         "taskrunner",
         "workflow_pool",
+        # A workflow STAGE's own session, which gained the ``workflow`` label
+        # when the turn histogram needed one (it read ``other`` before, pooled
+        # with unrecognised key shapes). Listed deliberately rather than left to
+        # this set's fail-open behaviour: ``workflow_pool`` — the pool those
+        # stages run on — is already background, and a stage is the same kind of
+        # thing, so surfacing it as its own new panel category would split one
+        # concept across two rows.
+        "workflow",
         "background",
         "secretary",
     }
@@ -1367,6 +1376,13 @@ def persist_token_record(
     """Append a token usage record to today's shard under
     ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` (synchronous).
 
+    Has NO caller today, and unlike :func:`persist_token_record_async` it does
+    not emit ``kirocrew.turn.duration``. A future direct caller of this variant
+    would therefore write a usage row for a turn that appears in no latency or
+    fault-rate reading — silently reopening the gap the async variant's emit
+    closed. If you reach for this for a real per-turn path, emit there too (or
+    call the async variant).
+
     The ``provider`` field tags the source LLM backend (acp,
     claude_code, bedrock) so the dashboard chart can filter by provider.
     ``surface`` / ``agent`` tag the dispatch origin and resolved agent, and
@@ -1425,6 +1441,7 @@ async def persist_token_record_async(
     phase: str = "",
     app: str = "",
     model_source: object = None,
+    emit_metric: bool = True,
 ) -> None:
     """Async variant: builds the record on-loop, offloads the file write.
 
@@ -1435,6 +1452,28 @@ async def persist_token_record_async(
     See :func:`persist_token_record` for the ``surface`` / ``agent`` /
     ``context_used`` / ``context_window`` / ``elapsed_ms`` / ``model_source``
     fields.
+
+    ALSO emits ``kirocrew.turn.duration``, and this is the only place that does.
+    Being the one call every dispatch surface already makes once per turn is
+    exactly why: the emit used to live in ``chat_runner`` beside the dashboard
+    turn loop, so cron, heartbeat, memory consolidation, subagents, task-runner
+    steps, workflow stages and every messaging channel were absent from turn
+    latency and fault rate entirely — and absent does not read as absent, it
+    reads as healthy. See :mod:`kiro_crew.metrics.turns`.
+
+    The sample reuses the BUILT record's own ``duration_ms``, so the row store
+    and the histogram cannot disagree about one turn — the property the record
+    builder's docstring already claims and now enforces by construction rather
+    than by two call sites being handed the same variable.
+
+    ``emit_metric=False`` says the CALLER owns this turn's histogram sample. The
+    dashboard passes it because its persist call sits behind a
+    ``usage_has_billing`` gate: a turn that timed out having billed nothing
+    writes no row, and letting the row's absence swallow the sample would drop
+    exactly the faults ``fault_rate`` exists to count. It emits unconditionally
+    itself instead, which is also how its ``stall_exhausted`` refinement reaches
+    the histogram. Do NOT set this without emitting — the turn then goes
+    unrecorded, which reads as a healthy gap rather than a missing one.
     """
     try:
         model = _resolve_model(model, model_source)
@@ -1454,9 +1493,49 @@ async def persist_token_record_async(
             phase=phase,
             app=app,
         )
+        # Before the offloaded write: a file-write failure must not cost the
+        # latency sample, which needs nothing from disk.
+        if emit_metric:
+            _emit_turn_histogram(record, slot_key, event)
         await asyncio.to_thread(_write_token_record, record, now)
     except Exception:
         logger.debug("Failed to persist token record for slot %s", slot_key, exc_info=True)
+
+
+def _emit_turn_histogram(
+    record: dict,
+    slot_key: str,
+    event: object,
+) -> None:
+    """Emit this turn's ``kirocrew.turn.duration`` sample from a built record.
+
+    Split out so the emit is one statement in the persist path and can be
+    asserted directly by a test without writing a row.
+
+    Reads the duration off the RECORD rather than recomputing it from
+    ``event``/``elapsed_ms``: the builder already applies the
+    provider-reported-wins-else-wall-clock rule, and duplicating that logic here
+    is how the two would drift.
+
+    An ABSENT ``stop_reason`` attribute and a ``None``/empty one mean different
+    things and must not collapse. A bare ``TurnUsage`` has no such attribute and
+    cannot say how its turn ended (``unclassified``); an ``LLMEvent`` whose
+    ``stop_reason`` is ``None`` is reporting a CLEAN turn, which is what the acp
+    path leaves on a normal completion. The distinction lives here rather than in
+    ``turn_outcome`` because only this layer can see whether the attribute exists
+    at all — and it must not be resolved by a default: labelling the bare-usage
+    case ``ok`` claims successes nobody observed, while labelling it ``unknown``
+    puts it in ``telemetry._TERMINAL_FAULT_OUTCOMES`` and invents a fault for
+    every clean background turn.
+    """
+    _MISSING = object()
+    stop = getattr(event, "stop_reason", _MISSING)
+    outcome = OUTCOME_UNCLASSIFIED if stop is _MISSING else turn_outcome(stop)  # type: ignore[arg-type]  # noqa: E501
+    emit_turn_duration(
+        record.get("duration_ms"),
+        session_key=slot_key,
+        outcome=outcome,
+    )
 
 
 def _parse_token_history() -> dict[str, Any]:

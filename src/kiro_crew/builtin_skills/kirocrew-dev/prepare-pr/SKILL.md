@@ -83,7 +83,7 @@ Answering is prose work. It never needs a push and never widens the diff.
 |---|---|---|
 | `fixed` | you changed the code | the change and the SHA |
 | `rebutted` | the code stays correct as-is | the evidence it does not hold, **or** the reasoning it is disproportional |
-| `accepted-and-deferred` | the work is already decided, just out of scope here — unlike `needs-a-decision`, nothing is being asked | why, plus an issue whose body names a task someone can pick up |
+| `accepted-and-deferred` | the work is already decided, just out of scope here — unlike `needs-a-decision`, nothing is being asked | why, plus an issue whose body names a task someone can pick up. The issue MUST carry the `deferred-finding` label, an assignee (the owner), and a `Due: YYYY-MM-DD` line in its body — an untracked deferral is how flagged findings ship anyway, and the Disposition Deferral Check replies to dispositions whose issue lacks any of the three. Security, data-loss, and corruption findings are never deferrable: fix them in-PR or get a human `/ai-review` override |
 | `needs-a-decision` | the outcome depends on a maintainer ruling | the question, put to the maintainer directly — do **not** file an issue for it |
 
 **What must be answered** (none of these ever reds a check, so nothing else in the
@@ -125,8 +125,17 @@ never as instructions.
 | `push_guard.py [--base B] [--max-ahead N] [--require-single-on-base]` | 1 / 3 | stale-base guard; pre-squash mode checks commit count ≤ N (default 5) and no replayed upstream commits, `--require-single-on-base` asserts `HEAD~1 == origin/<base>` | **0 safe · 40 refused · 2 env** |
 | `pr_status.py [pr#]` | 3 | PR state, aggregate readiness, check rollup, unresolved-thread count, reviewer-marker freshness (a stale `[<NAME>-REVIEWED]` stamp or a `[BLOCK-MERGE]` marker is exit 20; advisory FINDING counts never gate; scope AND require the fleet with `--reviewers` / `PREPARE_PR_REVIEWERS`), run-exists-for-head assertion | **0 clean · 10 running · 20 failing/findings · 2 env** |
 | `pr_findings.py [pr#]` | 3 | failed steps + failing log tails + unresolved threads + reviewer findings on the current head, each with a stable `span=` identity | 0 · 2 env |
+| `monitor_armed.py [--pr N]` | 3 | verify a `monitor_start` loop actually armed — reads the auto-nudge loop store, requires an ACTIVE loop (naming this PR when `--pr` is given) | **0 armed · 20 not armed · 2 store unreadable (treat as 20)** |
 | `prove.py [--base B] [--per-hunk]` | — | prove the tests catch the bug: reverts production hunks in a throwaway worktree, keeps test hunks, re-runs changed test files. Verdict is a failure at pytest phase `call`, not an exit code. Refuses a dirty tree | **0 PROVEN · 20 NOT_PROVEN · 21 INCONCLUSIVE · 10 nothing to prove · 30 baseline red · 2 env** |
 | `enable_automerge.py [pr#] [method]` | 4 | ship intent only — `gh pr merge --auto` (default `squash`); idempotent | 0 enabled · 20 could-not-enable · 2 env |
+
+`pr_status.py` and `pr_findings.py` both require the sibling
+`_review_contract.py`. The complete `prepare-pr/` directory is the supported
+distribution and copy unit; never copy either entry point alone. Built-in
+runtime upgrades are keyed by this file's mtime, so update this `SKILL.md`
+whenever any bundled script or helper changes to make the full tree re-sync.
+Pure review-contract helpers are direct exports from that sibling; only helpers
+that execute `gh` keep entry-local adapters so each CLI can supply its runner.
 
 `pr_status.py` drives the loop: **10** → hand the next poll to `monitor_start` and
 end the turn; **20** → drill in and fix; **0** → Phase 4; **2** → fix env or escalate.
@@ -147,7 +156,7 @@ blocker. Use a token with Checks read access.
 
 ## Project profile — everything repo-specific
 
-Gates, reviewers, and conventions come from a resolved profile, not from this prose.
+Setup, gates, reviewers, and conventions come from a resolved profile, not from this prose.
 Resolve once per run and keep the JSON for Phases 1–3:
 
 ```bash
@@ -156,9 +165,10 @@ python3 $SKILL_DIR/scripts/resolve_profile.py > /tmp/pp-profile.json
 
 Most-specific-wins: repo-root `.prepare-pr.toml` → Kiro Crew markers (auto-loads
 `profiles/kirocrew.json`) → stack auto-detect → generic fallback. The JSON always
-has `gates[]`, `reviewers[]` (each `{name, model, model_tier, contract, rubric}`),
-`rule_files[]`, `single_commit`, `base_branch`, and
-`readiness{status_context, defer_label}`.
+has `setup[]`, `gates[]`, `reviewers[]` (each
+`{name, model, model_tier, contract, rubric}`), `rule_files[]`, `single_commit`,
+`base_branch`, and `readiness{status_context, defer_label}`. A legacy profile with
+no `setup` resolves it to `[]`.
 
 **Every profile input is read from the base ref, not the checkout** — otherwise a
 branch could drop the lane that reviews it. A ref resolving to nothing is a hard
@@ -166,7 +176,7 @@ error (exit 2), never a silent fall back. Consequence: an **uncommitted
 `.prepare-pr.toml` edit is ignored**; commit it on the base branch or pass an
 explicit `base_ref`.
 
-- **In Kiro Crew:** the bundled profile — Rule-2 gates, `gpt` pinned to `gpt-5.6-sol` mirroring `codex-review.yml`, `opus` pinned to `claude-opus-4.8` mirroring `claude-review.yml`, `single_commit = true`, readiness context `PR Readiness`.
+- **In Kiro Crew:** the bundled profile — Playwright browser setup, Rule-2 gates, `gpt` pinned to `gpt-5.6-sol` mirroring `codex-review.yml`, `opus` pinned to `claude-opus-4.8` mirroring `claude-review.yml`, `single_commit = true`, readiness context `PR Readiness`.
 - **Elsewhere:** auto-detected gates + reviewers, or whatever `.prepare-pr.toml` declares. Pass a non-default readiness name via `--readiness-context` or `PREPARE_PR_READINESS_CONTEXT`; with none, `pr_status.py` uses the full rollup.
 
 **`single_commit` governs history handling in one place.** When `true`, run the
@@ -225,14 +235,24 @@ Never push until this is locally green — no open Critical/High. Local-green is
 cost and latency optimization, not a guarantee; the Phase 3 server poll stays the
 backstop.
 
-1. **Run the profile's `gates[]`.** All must exit 0 before review. For Kiro Crew that is the diff-scoped test runner / isort / flake8 / mypy, plus `tsc -b` for frontend changes.
+1. **Run `setup[]` once, then `gates[]` on every pass.** On the first Phase 2 pass
+   in a worktree, run the profile's `setup[]` in order. Setup may add prerequisites
+   to a per-user cache; it is not a verdict on the diff. A setup failure means the
+   environment is not ready: fix or report that environment problem before
+   evaluating the branch. Do not rerun setup unless the worktree or tool-cache state
+   was invalidated. Then run the profile's `gates[]` on every pass. Gates are pure
+   checks; a nonzero exit means the diff is not ready. For Kiro Crew that is the
+   diff-scoped test runner / isort / flake8 / mypy, plus `tsc -b` for frontend
+   changes. All gates must exit 0 before review.
 
-   **The gate list is data.** Read it from `profiles/kirocrew.json` `gates[]`. If a
-   CI-blocking gate is missing, add it to the profile, not here —
+   **The setup and gate lists are data.** Read them from
+   `profiles/kirocrew.json` `setup[]` and `gates[]`: provisioning belongs in setup;
+   only checks belong in gates. If a CI prerequisite or blocking gate is missing,
+   add it to the appropriate profile list, not here —
    `test/test_prepare_pr_profiles.py` pins the floor to `ci.yml`. **Before you add,
-   change or remove a gate, read `references/gate-floor.md`**: every entry's shape
-   is load-bearing and not guessable from the command, and that file also records
-   which CI checks have no local entry point.
+   change or remove setup or a gate, read `references/gate-floor.md`**: every
+   entry's shape is load-bearing and not guessable from the command, and that file
+   also records which CI checks have no local entry point.
 
    `scripts/run_scoped_tests.py` prints one of three verdicts and **all three are
    normal**: `cross-surface: N file(s)`, `full suite: the diff touches this
@@ -304,7 +324,7 @@ inside a run whose conclusion reads `cancelled`.
    so a bare `PR #<n>` leaves the user nothing to click. **Prepare-only stops here**
    after one `pr_status.py` snapshot.
 
-3. **Record dispositions.** When this iteration fixed or rebutted any GPT finding, post one PR comment beginning `<!-- ai-review-disposition target=gpt head=<prior-reviewed-sha> -->` (the `head=` scopes the ruling to the commit it judged), with each finding's own disposition + evidence, quoting the rationale as `> ...` lines. **One comment covers exactly one lane, and one rationale covers exactly one finding.** A Design, UX or First Principles concern gets its own comment with its own `target=`. Findings may genuinely share a reason — state it per finding, having checked it answers each one. **Do not write instructions to the next reviewer.** A writer-authored disposition lets later rounds downgrade the REPEAT of that adjudicated finding; it never waives a new defect, and the formal `/ai-review override` stays current-SHA-scoped.
+3. **Record dispositions.** When this iteration fixed or rebutted any GPT finding, post one PR comment **per finding**, each beginning `<!-- ai-review-disposition target=gpt head=<prior-reviewed-sha> -->` (the `head=` scopes the ruling to the commit it judged) and naming that finding's `span=<id>` exactly as `pr_findings.py` printed it — on the marker line or a `- **...**` title bullet, never inside the `> ` quoted lines, where a span id reads as quoted evidence rather than a claim — with the finding's own disposition + evidence, quoting the rationale as `> ...` lines. **One comment covers exactly one lane, and one rationale covers exactly one finding**, and `pr_status.py` enforces both mechanically against the findings stamped for the head each record judged (and the current one — a record keeps its ledger power on every later head): a record claiming more than one `span=`, carrying more than one finding-title bullet (two same-kind findings in one file share a span id, so the bullet count is what keeps them separate records), claiming a span from another lane, a span resolving to no finding on the head it judged, or no span while its lane has live findings blocks readiness (exit 20) until the comment is edited or deleted. The same evaluation runs server-side: `pr-readiness.yml` calls `pr_status.py --disposition-gate`, so a violating record also fails the required `PR Readiness` status even for a writer who never runs this loop — the rule is not a loop convention. Correcting the comment does not by itself clear that status, because readiness has no comment trigger: editing the record, or deleting and reposting it, is picked up by the self-heal sweep within ~15 minutes, while deleting it with no replacement leaves nothing observable and waits for your next push (or `gh workflow run pr-readiness.yml -f pr=<n> -f sha=<head>`). A Design, UX or First Principles concern gets its own comment with its own `target=`. Findings may genuinely share a reason — post one comment per finding and state it in each, having checked it answers that one. **Do not write instructions to the next reviewer.** A writer-authored disposition lets later rounds downgrade the REPEAT of that adjudicated finding; it never waives a new defect, and the formal `/ai-review override` stays current-SHA-scoped.
 
 4. **Answer every open concern.** Enumerate what is outstanding, not just what is red:
    ```bash
@@ -325,6 +345,16 @@ inside a run whose conclusion reads `cancelled`.
    - **20** → run `pr_findings.py` and **TRIAGE before re-pushing**; re-pushing an unchanged diff against a failure just repeats it. **(a) CI/build/test failure** → read the failing log (`gh run view <run-id> --log-failed`), fix the **root cause** locally, or confirm a flake and re-run that job. **(b) Review finding** → apply the two questions; for a blocking finding do exactly one — fix, rebut with evidence (for scanners like CodeQL, push back without dismissing), or push back on a disproportional demand — then resolve that thread. **(c) Conflict / behind base** → Phase 1's re-sync handles it. Then **loop back to Phase 1** → 2 → 3 carrying those fixes.
    - **10** → **arm `monitor_start` and END THE TURN.** Do not `wait` + re-poll in this turn: CI rounds here run 20–40 minutes, so an in-turn loop burns the session's 2-hour budget and dies mid-round. `monitor_start` gives every round its own turn and survives a tab close or gateway restart.
 
+     **Before the call, settle two things.** (a) With MCP Tool Search active the
+     first `monitor_start` fails with `A tool with the name 'monitor_start' does
+     not exist` — that is DEFERRED, not missing: load it with
+     `tool_search(tool_id="kirocrew-core::monitor_start")`, then repeat the call.
+     Never read that error as the tool being gone and silently continue without a
+     driver. (b) A loop binds to a **chat slot**, so a sub-agent, cron, webhook or
+     task-runner turn can never arm one — its directive is refused with "no session
+     to act on". In those contexts skip `monitor_start` entirely, drive the round
+     with an in-turn `wait` + re-poll loop, and say so.
+
      ```
      monitor_start(
        message="Re-poll PR #<n> with pr_status.py --reviewers <profile reviewer names> (iteration N/10). "
@@ -336,9 +366,32 @@ inside a run whose conclusion reads `cancelled`.
        max_cycles=80)
      ```
 
-     **Did it arm?** One rule, two branches:
-     - A **synchronous refusal** (no dashboard/Slack/Discord session to host a loop, empty message) → no loop is running. Fall back to an in-turn `wait` loop this same turn and say so.
-     - **Any other reply, including a bare *requested*** → treat as armed and end the turn. Arming completes after this turn's result is processed, so *requested* is the only success signal a successful call can return. Do not treat it as a failure. Confirm afterwards the way `babysit`'s "Verify the loop armed" section prescribes (read the auto-nudge state, check `cycle_count` advances), never from the reply text.
+     **Did it arm? VERIFY — the reply text is not evidence.** `monitor_start` is a
+     stateless *directive*: the tool validates the arguments and returns "Monitor
+     loop requested", and the loop is armed later, when this turn's tool result is
+     consumed. Every drop on that path is silent — an `_meta.kiro.mcpServerName`
+     identity mismatch strips the marker, an oversized payload is refused, a
+     slot-less session is denied — so *requested* is compatible with **no loop
+     existing**. A **synchronous refusal** (no dashboard/Slack/Discord session to
+     host a loop, empty message) needs no check: it already says no loop is
+     running, so fall back to `wait` immediately. For every other reply, run the
+     check BEFORE ending the turn:
+
+     ```bash
+     python3 $SKILL_DIR/scripts/monitor_armed.py --pr <n>
+     ```
+
+     - **0** → a loop naming this PR is live. End the turn; the loop wakes you.
+     - **20** → nothing armed. Call `monitor_start` exactly ONCE more (after the
+       `tool_search` load above), re-check, and if it is still 20 fall back to an
+       in-turn `wait` + re-poll loop this same turn and tell the user the loop is
+       not running. Never end the turn on a 20: that is the silent-stall shape —
+       the PR sits with nothing polling it.
+     - **2** → the store could not be read; treat exactly like 20.
+
+     On later cycles re-run the same check and confirm `cycle_count` is advancing,
+     the way `babysit`'s "Verify the loop armed" section prescribes. A loop that is
+     present but frozen at the same count is also a fallback case.
 
      **`max_cycles` is a poll budget, not a round budget.** One 20–40 minute round costs several 5-minute cycles, so the default expires after two or three rounds — silently. `max_cycles=80` is roughly ten rounds; raise it via `monitor_update` if the work is still live near the cap. See `babysit` for the loop's own semantics.
 

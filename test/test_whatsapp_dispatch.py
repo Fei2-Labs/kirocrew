@@ -15,6 +15,7 @@ from typing import Any
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.messaging.driver import APPROVAL_AUTO
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.whatsapp.commands import (
     COMPACT_AUTO_TEXT,
     COMPACT_BUSY_TEXT,
@@ -92,6 +93,10 @@ class FakeSessions:
         persisted_generations: dict[str, int] | None = None,
     ) -> None:
         self.provider = provider or FakeProvider()
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         #: What ``max_generation`` reports per durable bucket, standing in for the
         #: session map on disk. Empty means a machine that has never run this
         #: channel, which is the only case an unseeded counter gets right.
@@ -131,6 +136,12 @@ class FakeSessions:
 
     async def get_or_create(self, key, agent=None, channel_id=None):
         return self.provider, True, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, channel_id):
         self.channels[key] = channel_id

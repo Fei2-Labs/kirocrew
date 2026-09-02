@@ -10,10 +10,12 @@ layer. No state is held; each function reads what it needs from a
 from __future__ import annotations
 
 import contextlib
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -31,7 +33,14 @@ except ImportError:  # pragma: no cover - Windows
 
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.loopback_http import loopback_urlopen
-from kiro_crew.platform_compat import IS_LINUX, IS_MACOS
+from kiro_crew.platform_compat import (
+    IS_LINUX,
+    IS_MACOS,
+    IS_POSIX,
+    find_port_listeners,
+    listening_pid_tool_available,
+    loopback_owner_pids,
+)
 from kiro_crew.pod import launchd
 from kiro_crew.pod import provision as prov
 from kiro_crew.pod import unit as unit_mod
@@ -83,19 +92,10 @@ APPROVAL_MODES: tuple[str, ...] = ("reads", "yolo", "interactive")
 CRONS_TRUE: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 
-def read_env_file(cfg: PodConfig, name: str) -> dict[str, str]:
-    """Parsed ``KEY='value'`` pairs for pod *name*, ``{}`` on any ``OSError``.
-
-    Fail-OPEN by design, which bounds who may use it: a missing pod, an
-    unreadable pods dir and a comments-only file all yield the same empty
-    mapping, so a caller that must tell "absent" from "exists but cannot be
-    positively read" MUST NOT read the pin through here — see
-    ``dev_fleet._read_pin_strict``, which propagates the failure instead.
-    """
-    try:
-        text = cfg.env_file(name).read_text()
-    except OSError:
-        return {}
+def _parse_env_text(text: str) -> dict[str, str]:
+    """Parse ``KEY='value'`` lines. Split out so a caller that must open the file
+    itself -- see :func:`_peer_claimed_port`, which needs no-follow semantics -- can
+    reuse this exact grammar instead of carrying a second copy that would drift."""
     out: dict[str, str] = {}
     for ln in text.splitlines():
         ln = ln.strip()
@@ -110,6 +110,28 @@ def read_env_file(cfg: PodConfig, name: str) -> dict[str, str]:
             raw = raw[1:-1]
         out[key.strip()] = raw
     return out
+
+
+def read_env_file(cfg: PodConfig, name: str) -> dict[str, str]:
+    """Parsed ``KEY='value'`` pairs for pod *name*, ``{}`` on any ``OSError``.
+
+    Fail-OPEN by design, which bounds who may use it: a missing pod, an
+    unreadable pods dir and a comments-only file all yield the same empty
+    mapping, so a caller that must tell "absent" from "exists but cannot be
+    positively read" MUST NOT read the pin through here -- see
+    ``dev_fleet._read_pin_strict``, which propagates the failure instead.
+
+    Takes the pod NAME, so the path read is one an operator named. A caller that
+    instead reads whatever files happen to be in the pods directory is choosing its
+    paths from directory contents rather than from an operator, which is a different
+    trust posture -- :func:`_peer_claimed_port` is that caller and does not come
+    through here.
+    """
+    try:
+        text = cfg.env_file(name).read_text()
+    except OSError:
+        return {}
+    return _parse_env_text(text)
 
 
 def write_env_file(cfg: PodConfig, name: str, updates: dict[str, str]) -> None:
@@ -235,12 +257,56 @@ def resolve_checkout(
 # Implementing that standard algorithm here keeps existing pod ports stable while
 # making a fresh Windows install independent of an external POSIX executable.
 # --------------------------------------------------------------------------- #
+#: Digit cap on an env-file port value. ``int()`` refuses a conversion over 4300
+#: digits, and nothing anyone meant as a port is longer than this; ten rather than
+#: the five a port needs so an out-of-range TYPO still parses and can be refused by
+#: name (see :func:`allocate_port`) instead of silently reading as "no value".
+_MAX_PORT_DIGITS = 10
+
+
+def _port_from_env(value: str | None) -> int | None:
+    """Parse an env-file value as a port number, or ``None`` when it is not one.
+
+    THE one place an env-file string becomes a port. Three call sites used to guard
+    this themselves and each got it wrong differently -- one on length, one on a
+    sibling it forgot to audit, one on character class -- so the guard is now a
+    single function they all share and the class is closed at the parse rather than
+    per symptom.
+
+    ``isdecimal``, NOT ``isdigit``, because ``isdigit`` is not the predicate that
+    matches ``int()``: U+00B2 SUPERSCRIPT TWO satisfies ``isdigit`` while ``int()``
+    raises ``ValueError`` on it. ``isdecimal`` admits exactly what ``int()`` accepts,
+    so such a value reads as "not a port" instead of tracebacking out of ``pod url``.
+    Note this deliberately still accepts a non-ASCII DECIMAL run such as U+0662
+    ARABIC-INDIC DIGIT TWO, which ``int()`` parses as 2 -- rejecting on ``isascii``
+    would refuse a value that is genuinely a number. Codepoints are NAMED rather
+    than written literally so this file stays ASCII and the reader is not relying on
+    their font to tell the cases apart.
+
+    RANGE IS THE CALLER'S POLICY, not this function's, because the two callers
+    legitimately differ: :func:`allocate_port` needs an out-of-range pin like
+    ``70000`` to arrive intact so it can refuse it by name, while
+    :func:`_peer_claimed_port` wants only real ports, since a value that cannot be a
+    port is not a claim on one. This function's job is to be crash-proof, and the
+    length cap is what makes it so.
+    """
+    if not value or not value.isdecimal() or len(value) > _MAX_PORT_DIGITS:
+        return None
+    try:
+        return int(value)
+    except ValueError:  # pragma: no cover - unreachable behind isdecimal + the cap
+        return None
+
+
 def _pinned_port(cfg: PodConfig, name: str) -> int | None:
-    """A ``PORT=`` pinned in the pod's env file wins over derivation."""
-    val = read_env_file(cfg, name).get("PORT")
-    if val and val.isdigit():
-        return int(val)
-    return None
+    """A ``PORT=`` pinned in the pod's env file wins over derivation.
+
+    Parsing (and every crash guard) lives in :func:`_port_from_env`. An unusable
+    value reads as "no pin" and falls back to derivation, which beats a traceback out
+    of the read-only callers -- ``pod url``, ``pod ls``, Dev Fleet -- that reach this
+    through :func:`derive_port`.
+    """
+    return _port_from_env(read_env_file(cfg, name).get("PORT"))
 
 
 def _posix_cksum(data: bytes) -> int:
@@ -271,12 +337,395 @@ def _posix_cksum(data: bytes) -> int:
 
 
 def derive_port(cfg: PodConfig, name: str) -> int:
-    """Resolve pod *name*'s port: pinned ``PORT=`` else ``base + (cksum % 199) + 1``."""
+    """Resolve pod *name*'s port: pinned ``PORT=`` else ``base + (cksum % 199) + 1``.
+
+    DERIVATION, not allocation: this answers "which port does this name map to",
+    and every reader (``pod url``, ``pod ls``, Dev Fleet, ``pod exec``) calls it to
+    agree on one answer without coordinating. It deliberately does NOT check
+    whether that port is free -- a reader must not renegotiate a running pod's
+    port, and a bind probe here would make the answer depend on when it was asked.
+
+    Whether the port can actually be had is an allocation question, asked once per
+    ``pod up`` by :func:`allocate_port`, which records its answer as a ``PORT=``
+    pin so every later derivation returns it.
+    """
     pinned = _pinned_port(cfg, name)
     if pinned is not None:
         return pinned
     cks = _posix_cksum(name.encode("utf-8"))
     return cfg.base_port + (cks % 199) + 1
+
+
+def _port_is_free(port: int) -> bool:
+    """Whether *port* can be bound on loopback right now.
+
+    PRIVATE, and it must stay private. ``instances/run_marker`` states the rule:
+    no "is something listening" helper may be offered, because a caller will
+    mistake reachability for identity -- and ``pod``'s own health probe was held
+    to that rule for exactly this reason. This function is not exempt by being
+    inverted: "nobody is listening" is equally useless as an identity signal, and
+    a free port says nothing about who WOULD answer on a busy one.
+
+    So the only caller is :func:`allocate_port`, whose question genuinely is
+    binding and nothing else: it is choosing a port to hand a process that has not
+    started yet.
+
+    ``SO_REUSEADDR`` is set to MIRROR THE ACTUAL BINDER. A pod's gateway serves
+    through ``aiohttp``'s ``TCPSite``, which leaves ``reuse_address`` at its
+    asyncio default -- set on POSIX -- so the gateway can bind a port whose only
+    occupant is a ``TIME_WAIT`` remnant. A probe without the option is therefore
+    STRICTER than the process it is probing for, and the difference is not
+    academic: ``pod down`` followed by ``pod up`` leaves the previous gateway's
+    accepted connections in ``TIME_WAIT`` on exactly that port, so every quick
+    restart would read as a collision and relocate the pod off its derived port
+    for nothing. ``instances/port_allocator.py`` documents the same reasoning for
+    the SSH forward. ``SO_REUSEADDR`` exempts ``TIME_WAIT`` only, never a live
+    ``LISTEN``, so a real collision is still caught.
+
+    That last sentence is POSIX, and deliberately not hedged: on Windows the option
+    means something closer to ``SO_REUSEPORT`` and would let this bind succeed
+    against a LIVE listener, inverting the answer. It is unguarded because it is
+    unreachable -- ``require_backend`` refuses pods on any host without
+    ``systemd --user`` or ``launchd``, so nothing calls this there. Anyone reusing
+    this probe outside the pod plane has to revisit that.
+
+    Raises :class:`PodError` when the probe cannot be RUN at all -- socket creation
+    or option-setting failing, e.g. on file-descriptor exhaustion. That is not the
+    same as a port being busy and must not be coerced into ``False``: answering
+    "not free" for a probe that never happened would silently relocate a pod on no
+    evidence. ``instances/port_allocator.py`` states the same rule for its own probe
+    -- "neither answer is true, so it propagates to the caller instead of being
+    coerced into one". ``allocate_port`` lets it through and ``pod up`` turns it into
+    a refusal, so the operator sees why rather than a traceback.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise PodError(
+            f"cannot check whether port {port} is free: creating a probe socket "
+            f"failed ({exc}). This is not a busy port -- the check could not run, so "
+            f"no port can be chosen safely"
+        ) from exc
+    with sock:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except OSError as exc:
+            raise PodError(
+                f"cannot check whether port {port} is free: configuring the probe "
+                f"socket failed ({exc}). This is not a busy port -- the check could "
+                f"not run, so no port can be chosen safely"
+            ) from exc
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            # THIS one is a real answer: the address cannot be taken, so it is busy.
+            return False
+        except OverflowError:
+            # bind() rejects a port outside 0-65535 with OverflowError, which is
+            # NOT an OSError and would escape as a traceback. Callers are expected
+            # to have validated the range (see :func:`allocate_port`); this is
+            # defence in depth so a future caller cannot reintroduce the crash, and
+            # "not bindable" is the honest answer for an impossible port.
+            return False
+    return True
+
+
+#: Env key recording the port :func:`allocate_port` chose ITSELF, so a later call
+#: can tell its own fallback from an operator's deliberate ``PORT=``. The VALUE is
+#: stored (not a bare flag) so the marker self-invalidates: an operator who
+#: hand-edits ``PORT=`` to something else no longer matches it and gets operator
+#: treatment, with no way for a stale marker to reclassify their choice as ours.
+AUTO_PORT_KEY = "PORT_AUTO"
+
+
+def operator_pinned(cfg: PodConfig, name: str) -> bool:
+    """Whether *name*'s ``PORT=`` was set by a PERSON rather than recorded by us.
+
+    One definition, two consumers, because the two must never disagree:
+    :func:`allocate_port` uses it to decide whether a busy pin may be relocated,
+    and ``pod up`` uses it to decide whether to stamp :data:`AUTO_PORT_KEY` on the
+    port it records. Answered from the same bytes in both cases -- if the caller
+    re-derived this rule for itself, a deliberate pin could be relocated on one
+    path while being honoured on the other.
+
+    A pin counts as ours only when the marker matches the pin's VALUE, so an
+    operator who hand-edits ``PORT=`` to something else stops matching and is
+    treated as deliberate again.
+
+    Compared as STRINGS, never through ``int()``. Both keys are written from the same
+    ``str(port)``, so byte equality is exactly the intended test. Whether each side is
+    port-SHAPED at all is asked of :func:`_port_from_env`, so this agrees with every
+    other reader about what counts as a value -- a value that is not decimal is not a
+    pin here for
+    the same reason it is not one there.
+    """
+    env = read_env_file(cfg, name)
+    raw = env.get("PORT", "")
+    if _port_from_env(raw) is None:
+        return False
+    auto = env.get(AUTO_PORT_KEY, "")
+    return not (_port_from_env(auto) is not None and auto == raw)
+
+
+#: Cap on a peer env file read during the claim scan. These files hold a handful of
+#: short ``KEY='value'`` lines; anything larger is not one, and the scan must not be
+#: a way to pull an arbitrary amount of some other file into memory.
+_MAX_PEER_ENV_BYTES = 64 * 1024
+
+
+def _read_peer_env(path: Path) -> dict[str, str] | None:
+    """Safely parse a PEER pod's env file, or ``None`` if it cannot be read.
+
+    Returns the MAPPING rather than a port so the caller can resolve the port the
+    same way :func:`derive_port` does; ``None`` means "could not positively read
+    this", which is different from "read it and it names no port".
+
+    Separate from :func:`read_env_file` because the trust posture differs. That
+    function takes a pod NAME, so the operator chose the path. This one is handed a
+    path the CLAIM SCAN found by globbing the pods directory, so the set of files
+    read is decided by directory contents rather than by a person -- and this runs in
+    the trusted CLI, outside the hooks gate that governs an agent's own reads. A
+    symlink planted there would therefore make a privileged process read its target.
+
+    So the open carries ``O_NOFOLLOW`` (a symlink raises ``ELOOP`` and is skipped)
+    rather than an ``is_symlink()`` pre-check, which would leave a window between the
+    check and the open -- AND ``O_NONBLOCK``, because ``O_NOFOLLOW`` does nothing
+    about a FIFO: a named pipe is not a symlink, and a plain ``O_RDONLY`` open of one
+    BLOCKS until a writer appears, which would hang every ``pod up`` on the plane
+    indefinitely rather than merely reading the wrong bytes. Measured: the blocking
+    form never returns, the non-blocking form returns at once.
+    ``O_NONBLOCK`` has no effect on reading a regular file, so it costs the normal
+    path nothing.
+
+    Nonblocking alone only stops the hang, so the descriptor is then ``fstat``-ed and
+    anything that is not a REGULAR file is refused -- a FIFO, a device, a directory.
+    That is the check that makes "this is a pod's env file" true rather than assumed.
+
+    The read is bounded, and every failure -- missing, unreadable, symlink, FIFO,
+    undecodable -- answers ``None``, because "this peer has no claim I can read" is
+    the safe answer and matches :func:`read_env_file`'s fail-open contract.
+
+    The value goes through :func:`_port_from_env`, so every crash guard lives in one
+    place. The RANGE check is this function's own policy: a value that cannot be a
+    port is not a claim on one, whereas :func:`allocate_port` needs an out-of-range
+    pin to arrive intact so it can name it.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace", closefd=False) as fh:
+            text = fh.read(_MAX_PEER_ENV_BYTES)
+    except OSError:
+        return None
+    finally:
+        # Closed HERE in every path, including the non-regular refusal above.
+        # ``closefd=False`` keeps ownership with this function rather than handing it
+        # to the wrapper, so no branch can leak a descriptor -- which would be a
+        # particularly poor failure in a scan whose whole job is running before a
+        # process needs file descriptors of its own.
+        try:
+            os.close(fd)
+        except OSError:  # pragma: no cover - already closed or invalid
+            pass
+    return _parse_env_text(text)
+
+
+def _peer_effective_port(cfg: PodConfig, name: str, path: Path) -> int | None:
+    """The port peer *name* would actually resolve, or ``None`` if unreadable.
+
+    Mirrors :func:`derive_port` -- pinned value if there is a usable one, else the
+    cksum derivation -- but from the ONE safe read above rather than by calling that
+    function, which uses plain ``read_text`` and would reintroduce both the symlink
+    follow and the FIFO hang the safe reader exists to prevent.
+
+    The derivation fallback is not a nicety. A pod that came up BEFORE claims were
+    recorded has no ``PORT=`` at all, yet it is running on its derived port right now.
+    Reading "no PORT key" as "claims nothing" would leave every pre-upgrade pod
+    unprotected: during a restart gap it is listening on nothing, so the probe also
+    reports its port free, and a colliding name would take it and leave the legacy pod
+    crash-looping on EADDRINUSE. Resolving what that peer WOULD use closes the upgrade
+    window without needing every pod restarted first.
+
+    A value that cannot be bound (out of range) is returned as-is rather than
+    filtered, because the point is to agree with :func:`derive_port` about what that
+    peer resolves. Such a port simply never matches a candidate in the band walk.
+    """
+    data = _read_peer_env(path)
+    if data is None:
+        return None
+    pinned = _port_from_env(data.get("PORT"))
+    if pinned is not None:
+        return pinned
+    return cfg.base_port + (_posix_cksum(name.encode("utf-8")) % 199) + 1
+
+
+def _ports_claimed_by_other_pods(cfg: PodConfig, name: str) -> dict[int, str]:
+    """``{port: pod name}`` for every ``PORT=`` recorded by a pod other than *name*.
+
+    A bind probe answers "is anyone LISTENING there right now", which is not the
+    same as "is that port somebody's". Two cases turn on the difference:
+
+    * A pod that is stopped is listening on nothing, so its operator-pinned port
+      probes free. A displaced pod landing there boots fine -- and then the pinned
+      pod's next ``up`` hits :func:`allocate_port`'s "a pin you set is never moved"
+      refusal for a squat THIS code created, with a message blaming the operator's
+      own environment.
+    * A pod whose gateway has been started but has not bound yet -- units are
+      ``Type=simple``, so ``start_pod`` returns before the bind -- also probes free.
+      Its port is written to disk BEFORE it is started, though, so consulting the
+      recorded claims sees a concurrent claim that the probe cannot.
+
+    One directory scan, inside the plane lock, so the answer cannot change under
+    the walk. Each entry is resolved through :func:`_peer_effective_port`, which reads
+    it safely and works out what that peer would use -- including a PRE-UPGRADE pod
+    with no ``PORT=`` at all, whose port is its derivation and which is running there
+    now. An entry that cannot be positively read claims nothing, so one hostile or
+    malformed file does not stop the plane from allocating.
+    """
+    claimed: dict[int, str] = {}
+    try:
+        entries = sorted(cfg.pods_dir.glob("*.env"))
+    except OSError:
+        return claimed
+    for entry in entries:
+        other = entry.name[: -len(".env")]
+        if other == name:
+            continue
+        # Validate the peer's NAME before doing anything with it. A pod name is
+        # `_NAME_RE`, the same rule `validate_name` enforces on operator input, so a
+        # stem that fails it is not a pod and has no port to claim -- there is nothing
+        # to protect and nothing to read.
+        #
+        # It is also load-bearing rather than tidy. Filenames are BYTES on POSIX, so a
+        # name containing invalid UTF-8 arrives as a surrogate (measured: `bad-\xff.env`
+        # is handed over as `'bad-\udcff.env'`), and the derivation fallback below has
+        # to encode the name to hash it -- which raises `UnicodeEncodeError` on a
+        # surrogate and would traceback out of every `pod up` on the plane. Matching
+        # the regex answers False for such a stem without raising, so the check both
+        # closes that and states the real precondition: peers are pods.
+        if not _NAME_RE.match(other):
+            continue
+        port = _peer_effective_port(cfg, other, entry)
+        if port is not None:
+            claimed.setdefault(port, other)
+    return claimed
+
+
+def _walk_band_for_free(cfg: PodConfig, name: str, occupied: int, claimed: dict[int, str]) -> int:
+    """First free in-band port at or after *occupied*, excluding the live plane.
+
+    Walks from just above *occupied* and wraps, so the result is deterministic (one
+    collision resolves the same way on every host and every retry) and stays near
+    the derived slot rather than clustering every displaced pod at the bottom of
+    the band.
+
+    Skips three things: the live plane, any port another pod has RECORDED (passed in
+    by the caller, which checks the derived port against the same set), and finally
+    anything actually listening.
+
+    Every allocation records its claim, so a concurrent allocation sees it even
+    though units are ``Type=simple`` and the gateway has not bound yet. That is what
+    lets this close the cross-name race without holding a lock across the boot.
+    """
+    span = 199
+    lo = cfg.base_port + 1
+    start = occupied - lo
+    for step in range(1, span):
+        candidate = lo + (start + step) % span
+        if candidate == cfg.live_port:
+            # The live plane is never a pod's port. `_up` refuses the DERIVED port
+            # for this reason already; the fallback must not reintroduce it.
+            continue
+        if candidate in claimed:
+            continue
+        if _port_is_free(candidate):
+            return candidate
+    raise PodError(
+        f"no free port for pod {name!r}: :{occupied} is busy and every port in "
+        f":{lo}-:{lo + span - 1} is either occupied or claimed by another pod. Free "
+        f"a port, or pin an explicit one with PORT= in {cfg.env_file(name)}"
+    )
+
+
+def allocate_port(cfg: PodConfig, name: str) -> tuple[int, int | None]:
+    """Choose the port to boot pod *name* on. Returns ``(port, displaced_from)``.
+
+    ``displaced_from`` is the port this call moved OFF when it was busy, else
+    ``None`` -- so a caller can say so out loud rather than the move being silent,
+    and knows when to record the new choice.
+
+    Why this exists: the derivation maps every name into 199 slots
+    (``base + (cksum(name) % 199) + 1``), so two worktree names colliding mod 199
+    is an ordinary event, not a pathological one, and the derived port can equally
+    be held by something that is not a pod at all. Without this, the loser's
+    gateway exits "address already in use" and its unit crash-loops -- while
+    ``pod url`` keeps printing the shared port, so the operator is pointed at a
+    pod that is not the one they just built.
+
+    The answer is recorded by the caller as a ``PORT=`` pin, which
+    :func:`derive_port` already prefers over derivation. That is what keeps every
+    later reader agreeing without being changed: the pin mechanism predates this
+    function and is the reason the fallback needs no new plumbing.
+
+    **An automatic pin is not an operator pin.** A fallback this function chose is
+    recorded alongside :data:`AUTO_PORT_KEY`, and a later call will relocate it
+    like any other busy port. Without that distinction one transient occupant of
+    the derived port -- a ``TIME_WAIT`` remnant, another process for a minute --
+    would pin the pod off its derived slot permanently, and every later collision
+    on the fallback would hit the "never moved automatically" refusal for a
+    decision the operator never made. An operator's OWN ``PORT=`` is still never
+    relocated: that would defeat the reason it was pinned.
+
+    THIS FUNCTION ONLY CHOOSES. It writes nothing, so the caller can record the
+    choice in the same env write it already performs, inside the lock it already
+    holds. Note the probe cannot RESERVE: the port is released before the pod's
+    gateway binds it, so see :func:`pod_plane_mutex` for what closes that window
+    and what remains open.
+
+    Raises :class:`PodError` when an operator's pinned port is busy, or when the
+    whole band is occupied -- a pod that cannot get a port must not appear to
+    start.
+    """
+    claimed = _ports_claimed_by_other_pods(cfg, name)
+    pinned = _pinned_port(cfg, name)
+    if pinned is not None:
+        # Validate the RANGE before probing. `_pinned_port` only checks that the
+        # value is digits, so `PORT='70000'` reaches here intact, and bind() answers
+        # an impossible port with OverflowError rather than a refusal. Port 0 is
+        # equally unusable despite binding successfully: it means "any free port",
+        # so the pod would come up somewhere nobody can predict -- the opposite of
+        # what a pin is for. Both are operator typos, so they earn the loud path
+        # rather than a silent relocation.
+        if not 1 <= pinned <= 65535:
+            raise PodError(
+                f"pod {name!r} pins PORT={pinned} in {cfg.env_file(name)}, which is "
+                f"not a usable port. Pin a port between 1 and 65535"
+            )
+        if pinned not in claimed and _port_is_free(pinned):
+            return pinned, None
+        if operator_pinned(cfg, name):
+            raise PodError(
+                f"pod {name!r} pins PORT={pinned} in {cfg.env_file(name)}, but that "
+                f"port is already in use. A pin you set is never moved "
+                f"automatically -- free it, or change the pin"
+            )
+        # Our own earlier fallback. Relocating it is the whole point of marking it.
+        return _walk_band_for_free(cfg, name, pinned, claimed), pinned
+
+    derived = derive_port(cfg, name)
+    # The claim check matters MOST here, not only in the walk. A pod that takes its
+    # derived port records that claim, and units are ``Type=simple`` so its gateway
+    # has not bound by the time a concurrent allocation probes -- meaning the probe
+    # alone would hand the same port to a colliding name. Consulting the recorded
+    # claims is what makes the concurrent case behave like the sequential one.
+    if derived not in claimed and _port_is_free(derived):
+        return derived, None
+    return _walk_band_for_free(cfg, name, derived, claimed), derived
 
 
 def pod_unit(cfg: PodConfig, name: str) -> str:
@@ -425,6 +874,38 @@ def is_active(cfg: PodConfig, name: str) -> bool:
     return cp.returncode == 0
 
 
+def main_pid(cfg: PodConfig, name: str) -> int | None:
+    """PID of the pod's OWN gateway process, or ``None`` when it is not running.
+
+    This is the pod's identity, and it is exact rather than approximate because
+    of how a pod boots: the unit is ``Type=simple`` running ``kirocrew pod _run
+    %i``, and :func:`_run` finishes with ``os.execve`` of the worktree's
+    ``kirocrew gateway``. The gateway therefore REPLACES the unit's main process
+    instead of being spawned beneath it, so ``MainPID`` names the very process
+    that binds the pod's port — no descendant walk, no cgroup scan.
+
+    Raises :class:`PodError` when the service manager could not be asked at all.
+    That is deliberately a different answer from ``None``: "asked, and this pod
+    has no process" is a fact a caller can act on (see :func:`port_owner`, where
+    it is what lets a listener be attributed to somebody else), while "could not
+    ask" must leave the question open. ``systemctl show`` prints ``MainPID=0``
+    for a dead or unknown unit and still exits 0, so an output with no
+    ``MainPID`` line at all is the honest signal that the query itself failed.
+    """
+    if IS_MACOS:
+        return launchd.main_pid(cfg, name)
+    cp = systemctl("show", pod_unit(cfg, name), "-p", "MainPID")
+    for ln in cp.stdout.splitlines():
+        if ln.startswith("MainPID="):
+            raw = ln.split("=", 1)[1].strip()
+            pid = int(raw) if raw.isdigit() else 0
+            return pid if pid > 0 else None
+    raise PodError(
+        f"could not read MainPID for pod {name!r} from systemctl "
+        f"(rc={cp.returncode}): {(cp.stderr or cp.stdout or '').strip()}"
+    )
+
+
 def unit_state(cfg: PodConfig, name: str) -> tuple[str, int]:
     """(ActiveState, NRestarts) for the pod's unit — ("unknown", 0) on error.
 
@@ -555,6 +1036,51 @@ def pod_name_mutex(cfg: PodConfig, name: str):
         finally:
             held[key] = 0
             fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+#: Reserved "name" the plane-wide lock borrows from :func:`pod_name_mutex`. Safe
+#: because ``_NAME_RE`` forbids ``@``, so no real pod can ever produce this key.
+_PLANE_LOCK_NAME = "@plane"
+
+
+@contextlib.contextmanager
+def pod_plane_mutex(cfg: PodConfig):
+    """Serialize port CLAIMING across the whole pod plane, not just one name.
+
+    :func:`pod_name_mutex` is per name, which is the right grain for the pin +
+    definition + start transaction it guards -- two different pods have no reason
+    to serialize their lifecycles. Port allocation is the exception: it is the one
+    step where two DIFFERENT names contend, because they contend for the band
+    rather than for each other's state.
+
+    Without this, two colliding names ``up``'d concurrently (Dev Fleet's normal
+    shape) hold disjoint name locks, both probe the same port free, and both boot
+    onto it -- exactly the crash-loop :func:`allocate_port` exists to prevent.
+    ``apps/backend.py``'s ``_reserve_free_port`` carries the same lesson one
+    subsystem over: "Probing without reserving ... lets two apps be handed the same
+    port -- both children then bind it and the loser dies with EADDRINUSE."
+
+    Implemented by BORROWING :func:`pod_name_mutex` under a reserved name rather
+    than copying its body: the two differ only in the key, and a second
+    hand-maintained copy would drift the moment either grew a feature. The key,
+    lock file, reentrancy and lock ordering are therefore identical by
+    construction rather than by review.
+
+    **What this does NOT close, stated rather than implied.** The probe releases
+    the port before the pod's gateway binds it, and the gateway is a separate
+    process, so no lock held here can span the choose->bind gap; a unit is
+    ``Type=simple``, so ``start_pod`` returns before the bind. Holding this until a
+    health check confirmed the bind WOULD close it, at the cost of serializing
+    every pod boot on the plane behind up to 45 health polls of the previous one.
+    What closes most of the gap instead is :func:`_walk_band_for_free` consulting
+    the pins already recorded on disk, so a concurrent claim is visible before its
+    gateway is listening. See that function for the residue that remains.
+
+    Held INSIDE :func:`pod_name_mutex` wherever both are taken, so the acquisition
+    order is always name -> plane and cannot deadlock against a second holder.
+    """
+    with pod_name_mutex(cfg, _PLANE_LOCK_NAME):
+        yield
 
 
 def _write_and_load_unit(cfg: PodConfig) -> subprocess.CompletedProcess | None:
@@ -926,10 +1452,122 @@ def install_backend(cfg: PodConfig) -> tuple[str, subprocess.CompletedProcess | 
     )
 
 
-def health(port: int, timeout: int = 3) -> int:
-    """HTTP status of the pod's /api/health, or 0 if unreachable.
+# --------------------------------------------------------------------------- #
+# Port ownership — WHO answers the pod's port, not merely whether anyone does.
+#
+# A pod's port is derived, not allocated: `base + (cksum(name) % 199) + 1` maps
+# every pod name into 199 slots, and `PORT=` in the per-pod env file can pin any
+# port by hand. So two pods colliding on one port is an ordinary event, and the
+# live gateway is reachable on the same loopback interface. Whoever binds first
+# wins; the loser's gateway exits "address already in use" and the unit
+# crash-loops behind it.
+#
+# A bare `GET /api/health` cannot tell those apart. `{"ok": true}` is the same
+# answer from any Kiro Crew gateway on the host, and its identity fields say
+# `app=kirocrew` plus a version — true of the squatter as well. Reading a 200 as
+# "this pod is up" therefore reports a crash-looping pod as healthy and points
+# the operator's browser at somebody else's instance.
+#
+# `instances/run_marker` states the rule this module was breaking: it
+# "deliberately does not offer a bare 'is something listening' helper, so no
+# caller can mistake reachability for identity". The pod probe is now held to it
+# — the reachability probe is private and every caller goes through `health`.
+# --------------------------------------------------------------------------- #
+#: Proven: the pod's own gateway process holds the port.
+OWNER_POD = "pod"
+#: Proven: something OTHER than this pod holds the port (another pod, the live
+#: gateway, an unrelated process).
+OWNER_FOREIGN = "foreign"
+#: Not decidable on this host — no listener-lookup tool, or the service manager
+#: could not be asked. Callers keep their pre-identity behaviour.
+OWNER_UNPROVEN = "unproven"
 
-    200 = open; 401/403 = serving but gated — all three mean "up".
+#: :func:`health` verdict for a port that answers but is NOT served by this pod.
+#: Negative like ``_wait_healthy``'s crash sentinel, so it can never collide with
+#: an HTTP status or with ``0`` (unreachable).
+HEALTH_FOREIGN = -2
+
+
+class PodOwnershipUnproven(PodError):
+    """Ownership could not be PROVEN either way, so a credential was withheld.
+
+    A distinct type because the two refusals want different handling. A
+    :data:`OWNER_FOREIGN` verdict is positive knowledge that the port belongs to
+    somebody else, and every caller should stop. "Could not prove it" is not that
+    — the pod may well be serving — so a caller whose main job is something other
+    than the credential (``pod up``, which has already booted the pod) can go on
+    and report what it does know, while still never putting the secret on the
+    wire. ``pod token`` has nothing else to do and still fails.
+    """
+
+
+def port_owner(cfg: PodConfig, name: str, port: int) -> str:
+    """Who holds *port*: :data:`OWNER_POD`, :data:`OWNER_FOREIGN`, or
+    :data:`OWNER_UNPROVEN`.
+
+    The proof is pid identity, the same shape ``port_resolution._gateway_owns_port``
+    uses for the live gateway: the process listening on the port must be the pod's
+    own (:func:`main_pid`). Three branches are worth naming.
+
+    **Ownership is scoped to the address the probe talked to.** A port NUMBER can
+    carry several LISTEN sockets on different local addresses, so "some process of
+    ours holds this port" is not the question -- the question is who a
+    ``127.0.0.1`` connect reaches. ``loopback_owner_pids`` answers exactly that,
+    mirroring the kernel's most-specific-bind dispatch. Taking every pid on the
+    port instead would let a pod bound to one specific local address vouch for a
+    foreign listener holding ``127.0.0.1`` on the same port -- the squatter would
+    be trusted BECAUSE the real pod exists elsewhere on that number. This scope
+    must stay in step with the address :func:`_probe_health` dials.
+
+    **A pod with no process, on a port somebody holds, is FOREIGN -- not
+    unproven.** This is the whole bug. A pod whose gateway lost the bind race has
+    no process at all, so there is no pid to match; if the answer were "cannot
+    tell" the squatter's 200 would still be reported as this pod's health, which
+    is exactly the state this function exists to name. A non-empty listener list
+    plus a pod that authoritatively has no pid IS proof the responder is someone
+    else.
+
+    **Undecidable stays undecidable.** No ``lsof``/``netstat``, a throwing
+    lookup, or a service manager that cannot be asked all return
+    :data:`OWNER_UNPROVEN`. Each caller then decides for itself: :func:`health`
+    keeps its pre-identity behaviour, because refusing would turn every pod on
+    such a host into a permanently unhealthy one -- a self-inflicted outage in
+    place of a misreport -- while :func:`mint_token`, which hands over a
+    credential, requires positive proof. That mirrors
+    ``cli_server._replacement_is_serving`` applying its listener check "only where
+    it can pass", and ``port_resolution._gateway_owns_port`` failing closed on the
+    path that sends the secret.
+    """
+    if not IS_POSIX or not listening_pid_tool_available():
+        return OWNER_UNPROVEN
+    try:
+        pids = set(loopback_owner_pids(find_port_listeners(port)))
+    except Exception:
+        return OWNER_UNPROVEN
+    if not pids:
+        # Something answered HTTP but no LISTEN socket covering loopback is
+        # visible. The two observations disagree, so claim nothing.
+        return OWNER_UNPROVEN
+    try:
+        ours = main_pid(cfg, name)
+    except Exception:
+        # Could not ask the service manager — see the docstring.
+        return OWNER_UNPROVEN
+    return OWNER_POD if ours is not None and ours in pids else OWNER_FOREIGN
+
+
+def _probe_health(port: int, timeout: int = 3) -> int:
+    """Raw HTTP status of ``/api/health`` on *port*, or 0 if unreachable.
+
+    Reachability ONLY — it says nothing about who answered, which is why it is
+    private. Callers want :func:`health`.
+
+    Every failure collapses to 0, ``http.client.HTTPException`` included: a
+    process holding the port that answers the TCP handshake without speaking
+    HTTP raises ``BadStatusLine``, which is neither ``OSError`` nor ``URLError``.
+    That case is not hypothetical here — a foreign listener on a derived port is
+    the reason this probe is being hardened — and it must read as "not serving"
+    rather than escaping as a traceback out of ``pod status``.
     """
     url = f"http://127.0.0.1:{port}/api/health"
     try:
@@ -940,8 +1578,28 @@ def health(port: int, timeout: int = 3) -> int:
             return resp.status
     except urllib.error.HTTPError as e:
         return e.code
-    except (urllib.error.URLError, OSError):
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
         return 0
+
+
+def health(cfg: PodConfig, name: str, port: int, timeout: int = 3) -> int:
+    """HTTP status of **this pod's** ``/api/health``, or a non-positive verdict.
+
+    * 200 = open; 401/403 = serving but gated — all three mean this pod is up.
+    * 0 = nothing reachable on the port.
+    * :data:`HEALTH_FOREIGN` = the port answers, but the responder is provably
+      not this pod, so this pod is NOT up.
+
+    The ownership check runs only once something has answered, which keeps the
+    common case free: a stopped pod costs one refused connection and no process
+    lookup, exactly as before.
+    """
+    code = _probe_health(port, timeout)
+    if code == 0:
+        return 0
+    if port_owner(cfg, name, port) == OWNER_FOREIGN:
+        return HEALTH_FOREIGN
+    return code
 
 
 # --------------------------------------------------------------------------- #
@@ -958,6 +1616,30 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
             f"no .local_secret for pod {name!r} — is it running? ({secret_file})"
         ) from exc
     port = derive_port(cfg, name)
+    owner = port_owner(cfg, name, port)
+    if owner != OWNER_POD:
+        # Positive proof REQUIRED here, unlike `health`. This call sends the pod's
+        # own ``.local_secret`` and returns a dashboard credential for whatever
+        # answered, so the two ways of being wrong are not symmetrical: refusing a
+        # live pod costs an error message, while proceeding on an unproven port
+        # hands a different local user -- who can bind 127.0.0.1 but cannot read
+        # this 0600 secret -- a credential for this pod. That is the same reason
+        # ``port_resolution._gateway_owns_port`` fails closed on the path that
+        # sends the secret, including when the listener lookup is simply missing.
+        if owner == OWNER_FOREIGN:
+            raise PodError(
+                f"refusing to mint a credential for pod {name!r}: :{port} is held "
+                f"by another process, not this pod's gateway. `kirocrew pod status "
+                f"{name}` shows the same verdict; a credential minted here would "
+                f"belong to whatever owns that port."
+            )
+        raise PodOwnershipUnproven(
+            f"withholding a credential for pod {name!r}: could not prove which "
+            f"process holds :{port} (no lsof/netstat on this host, or the service "
+            f"manager could not be asked), and this call would put the pod's own "
+            f"secret on the wire to whatever answered. Install lsof so ownership "
+            f"can be proven, or pin a free PORT= in {cfg.env_file(name)}."
+        )
     url = f"http://127.0.0.1:{port}/api/token/local?ttl={urllib.parse.quote(str(ttl))}"
     req = urllib.request.Request(url, headers={"X-Local-Secret": secret})
     try:
@@ -1132,6 +1814,14 @@ def write_pod_config(home_dir: Path, seed: str) -> None:
     the absence of ``SLACK_*`` in the inherited env. The HOME dir is ``0o700`` and
     ``config.json`` is ``0o600`` — the seeded config can carry provider tokens /
     API keys, which must not be world-readable on a shared host.
+
+    The seeded ``tunnel.enabled=False`` is NOT by itself what keeps a pod from
+    publishing. This function is create-only (it returns early when ``config.json``
+    already exists), and the value stays rewritable afterwards by anything that
+    composes config — a provider, a migration, a hand edit. The enforcement is
+    ``--no-tunnel`` on the boot argv, re-asserted at every exec. A target checkout
+    whose gateway cannot parse that flag does not get the guarantee: it keeps this
+    seeded value and behaves exactly as it did before the flag existed. See ``boot``.
     """
     home_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(home_dir, stat.S_IRWXU)  # 0o700 owner-only (mkdir mode is umask-masked)
@@ -1438,6 +2128,51 @@ def exec_in_pod(cfg: PodConfig, name: str, argv: list[str]) -> int:
 # systemd unit. Reads the PINNED checkout (never shells git), then exec()s the
 # worktree's own gateway with an isolated HOME; never returns on success.
 # --------------------------------------------------------------------------- #
+def target_supports_flag(checkout: Path, flag: str) -> bool:
+    """Whether the gateway in *checkout* will accept *flag* on its argv.
+
+    A pod's argv is built by the CONTROL PLANE (the template unit's ``ExecStart``
+    resolves ONE kirocrew at ``pod install`` time and every instance re-enters it
+    via ``%i``), but the gateway that argv reaches is the TARGET WORKTREE's own
+    binary. The two are independent checkouts, so an updated control plane can
+    hand a flag to a gateway too old to declare it -- argparse exits 2, and
+    ``Restart=on-failure`` + ``RestartSec=5`` (the unit carries no
+    ``RestartPreventExitStatus``) turns that into a restart loop every 5s rather
+    than a visible failure. Dev Fleet's whole point is worktrees at different
+    commits, so this is the ordinary case and not an exotic one.
+
+    Read from the checkout's own ``cli.py`` rather than by running
+    ``gateway --help``: the source IS what will execute (provisioning installs the
+    checkout editable), and a subprocess on every pod boot costs an interpreter
+    start for a question a string search answers.
+
+    Unreadable source answers False -- the flag is DROPPED, not forced. Refusing
+    to boot would be the fail-closed instinct, but here it is strictly worse: with
+    no ``RestartPreventExitStatus`` a refusal is itself the 5s restart loop this
+    exists to prevent, while dropping the flag leaves that pod at exactly the
+    guarantee it had before this flag existed (the seeded ``tunnel.enabled=False``)
+    -- no regression, just no improvement. The caller says so out loud.
+    """
+    try:
+        src = (checkout / "src" / "kiro_crew" / "cli.py").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    # Comment lines do not declare anything, and a checkout that only MENTIONS the
+    # flag in prose would otherwise pass the probe and then argparse-exit on it --
+    # the exact restart loop this exists to prevent. The real declaration is a bare
+    # quoted literal on its own line inside ``add_argument(...)``, so matching the
+    # quoted form (rather than ``add_argument("--flag"``) is what keeps this working
+    # against the repo's actual formatting; ``test_the_probe_accepts_this_very_repo``
+    # is the ratchet that catches a refactor moving the declaration elsewhere.
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if f'"{flag}"' in stripped or f"'{flag}'" in stripped:
+            return True
+    return False
+
+
 def boot(cfg: PodConfig, name: str) -> int:
     """Boot the isolated gateway for pod *name*. Returns an exit code on failure;
     on success it ``exec``s and does not return."""
@@ -1504,6 +2239,48 @@ def boot(cfg: PodConfig, name: str) -> int:
     argv = ["gateway"]
     if not crons:
         argv.append("--no-crons")
+    # Unconditional for any checkout that understands it, and deliberately not an
+    # env key like CRONS above: a pod is a throwaway instance and must have no
+    # published surface, so there is nothing for the operator to opt into.
+    # ``write_pod_config`` seeds ``tunnel.enabled=False`` too, but that is a value
+    # in a file it only writes ONCE (it returns early when config.json exists) and
+    # anything composing config later can turn it back on — after which the pod
+    # published on every boot and nothing re-asserted the guarantee. This flag is
+    # re-asserted at every exec, so the seeded value is now defense in depth rather
+    # than the enforcement. Reach a pod on the 127.0.0.1 port ``pod url`` prints,
+    # over ``ssh -L`` from another host.
+    #
+    # Probed rather than assumed because this argv is built by the control plane
+    # while the gateway it reaches belongs to the target worktree — see
+    # ``target_supports_flag`` for why a miss must drop the flag instead of
+    # refusing the boot.
+    if target_supports_flag(checkout, "--no-tunnel"):
+        argv.append("--no-tunnel")
+    else:
+        # This gateway predates the flag, so it does not RECEIVE the new guarantee:
+        # it keeps the pod's seeded ``tunnel.enabled=False`` and behaves exactly as
+        # it did before the flag existed. No regression, no improvement -- and
+        # deliberately nothing more.
+        #
+        # Config is NOT re-pinned here to hand it the guarantee anyway. That was
+        # tried and the premise does not hold: ``KiroCrewConfig.load()`` deep-merges
+        # ``config.local.json`` OVER ``config.json`` with the overlay winning, and
+        # ``kirocrew config set`` writes that overlay by default -- so pinning
+        # ``config.json`` is not pinning the setting. Nor would it be sufficient if
+        # it were: the gateway's enable test is an OR
+        # (``cfg.tunnel.enabled or current_context().tunnel.enabled()``) and no
+        # config file reaches the provider half at all.
+        #
+        # Refusing the boot is likewise unavailable: the refusal exit is non-zero
+        # and ``Restart=on-failure`` + ``RestartSec=5`` (the unit carries no
+        # ``RestartPreventExitStatus``) turns a refusal into a 5s restart loop.
+        print(
+            "kirocrew-pod: --no-tunnel not found in this checkout's cli.py, so the "
+            "flag was not passed -- this pod keeps the tunnel behaviour it had "
+            "before the flag existed. Update the checkout to get the guarantee. "
+            f"Checkout: {checkout}. If that checkout DOES declare the flag, the "
+            "probe has drifted -- see target_supports_flag."
+        )
     if approval:
         argv += ["--approval", approval]
     os.execve(str(bin_path), [str(bin_path), *argv], pod_env)

@@ -405,9 +405,13 @@ surfaces that have room to navigate. The scroll lives in `AcpBackendCard`, not i
   stale local state behind. Services disables the query entirely while the
   preview flag hides the row, so ordinary dashboard loads do not walk the
   adapter resolvers for an invisible label. The gateway registers a lightweight
-  lazy route for `GET /api/acp-backends`; its descriptor handler module is first
+  lazy route for `GET /api/acp-backends` — ONE registration, on the
+  `agent_config` slice; its descriptor handler module is first
   imported when that endpoint is requested, so a preview-disabled gateway does
-  not execute adapter discovery code before binding its socket.
+  not execute adapter discovery code before binding its socket. The install
+  snapshot behind `missing_components` / `restart_required` is part of the same
+  `?probe=1` opt-in, so an unprobed caller pays for no PATH or filesystem scan
+  and its rows carry the "we did not look" values rather than omitting the keys.
 
 Dashboard slash-command classification follows the live slot backend when one
 exists and otherwise reads `SessionManager.acp_backend`, the refreshed config

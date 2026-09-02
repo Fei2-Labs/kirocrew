@@ -215,4 +215,26 @@ describe('TelemetryPanel startup faults', () => {
     // tile being reinstated from a stale key.
     expect(screen.queryByText('Ready rate')).not.toBeInTheDocument()
   })
+
+  it('does not count "unclassified" turns as faults', async () => {
+    // A turn whose surface had no stop reason to give (a helper call site passing
+    // a bare TurnUsage) is not an outcome, and the API excludes it from BOTH
+    // sides of fault_rate. The tile's complement rule ("everything not ok")
+    // counted it, so once background surfaces started reporting, every clean
+    // cron / heartbeat / workflow turn landed in this count while the percentage
+    // beside it excluded them -- a count over one population next to a rate over
+    // another, which is the exact bug the complement rule exists to prevent.
+    await mount(
+      resp({
+        ...stat({ count: 100 }),
+        outcome: { ok: 40, unclassified: 59, error: 1 },
+        // 1 fault / 41 classifiable turns.
+        fault_rate: 0.0244,
+      }),
+    )
+    await waitFor(() => expect(screen.getByText('Fault rate')).toBeInTheDocument())
+
+    expect(faultTile().textContent).toContain('1 fault')
+    expect(faultTile().textContent).not.toContain('60 fault')
+  })
 })

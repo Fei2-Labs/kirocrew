@@ -65,6 +65,7 @@ P0_ROUTES: tuple[tuple[str, str], ...] = (
     ("POST", "/drive/{account}/share"),
     ("POST", "/shares/{id}/forget"),
     ("POST", "/library/{account}/push"),
+    ("POST", "/library/{account}/remove"),
     ("POST", "/backup/{account}/run"),
     ("POST", "/backup/{account}/nightly"),
     ("POST", "/backup/{account}/restore"),

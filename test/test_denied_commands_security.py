@@ -3927,3 +3927,618 @@ class TestStdinProgramTextScoping:
             f"echo {rule.pattern!r} >> notes.txt",
         ):
             assert security.is_denied(cmd) is None, f"rule fires on its own text: {cmd!r}"
+
+
+class TestSelfModuleIndexIsLinear:
+    """The self-protection floor's module-flag scan must stay LINEAR in token count.
+
+    ``_self_module_name_index`` walked forward from an interpreter token to the first
+    module flag, normalizing every token it passed.  ``_self_program_index`` called it
+    for every python-looking token and ``_matches_self_subcommand`` looped that over all
+    tokens, so a command of interpreter words with no module flag among them re-walked
+    and re-normalized the whole tail once per word: quadratic, on a floor that runs for
+    every command.
+
+    Reaching it needs only one product word anywhere in the text, which is what opens
+    the floor's cheap keyword gate (``_self_floor_can_fire``).  Padding alone does NOT
+    reproduce it -- ``python ... restart`` leaves that gate shut and the path is linear,
+    which is why the shape below carries ``kirocrew``.  Measured on base:
+    0.035 s / 0.125 s / 0.490 s / 1.937 s / 7.704 s at 250/500/1000/2000/4000 tokens,
+    4x per doubling, against 0.0027 s -> 0.0414 s after -- 186x at 4 000 tokens, and
+    the negative-verdict spelling pays the same cost to decide nothing.
+
+    The scan and the normalized forms are now computed once per token list.  Both the
+    verdicts and the complexity are pinned, since a rewrite that changed which token the
+    scan stops at would silently change what the floor denies.
+    """
+
+    # Every branch of the scan, with the index it must return for the interpreter at 0.
+    SHAPES: "list[tuple[list[str], object]]" = [
+        (["python", "-m", "kiro_crew", "restart"], 2),
+        (["python", "-mkiro_crew", "restart"], 1),
+        # A -m<something-else> is an ordinary interpreter flag: the scan must CONTINUE
+        # past it rather than stop, or the real module flag after it is never seen.
+        (["python", "-mjson", "-m", "kiro_crew"], 3),
+        (["python", "-msomething", "-mkiro_crew"], 2),
+        (["python", "-u", "-O", "-m", "kiro_crew"], 4),
+        # -m present but the module is not ours, and -m as the final token.
+        (["python", "-m", "json"], None),
+        (["python", "-m"], None),
+        (["python"], None),
+        (["python", "-mjson"], None),
+        # Quoting and dotted submodules the normalizer resolves.
+        (["python", "-m", "'kiro_crew'"], 2),
+        (["python", "-m", "kiro_crew.cli"], 2),
+    ]
+
+    def test_the_returned_index_is_unchanged(self):
+        from kiro_crew import security
+
+        for tokens, expected in self.SHAPES:
+            scan = security._self_module_flag_scan(list(tokens))
+            assert security._self_module_name_index(list(tokens), 0, scan) == expected, tokens
+
+    def test_a_shared_scan_answers_as_a_fresh_one_does(self):
+        """The scan is built once per frame and reused for every token in it, so a
+        stale or mismatched table would answer differently from one built for the call.
+        Pinned at every interpreter position, since that reuse is the whole optimization.
+        """
+        from kiro_crew import security
+
+        for tokens, expected in self.SHAPES:
+            shared = security._self_module_flag_scan(list(tokens))
+            for i in range(len(tokens)):
+                fresh = security._self_module_flag_scan(list(tokens))
+                assert security._self_module_name_index(
+                    list(tokens), i, shared
+                ) == security._self_module_name_index(list(tokens), i, fresh), (tokens, i)
+            assert security._self_module_name_index(list(tokens), 0, shared) == expected
+
+    def test_the_scan_is_a_required_argument(self):
+        """Not optional-with-a-fallback: this is called once per token by a loop over
+        those tokens, so a caller able to omit the scan could silently reintroduce the
+        quadratic. A type error is the point."""
+        import inspect
+
+        from kiro_crew import security
+
+        for fn in (security._self_module_name_index, security._self_program_index):
+            param = inspect.signature(fn).parameters["scan"]
+            assert param.default is inspect.Parameter.empty, fn.__name__
+
+    def test_the_floor_verdicts_are_unchanged(self):
+        from kiro_crew import security
+
+        for text in (
+            "kirocrew restart",
+            "python -m kiro_crew restart",
+            "python -mkiro_crew restart",
+            "python -mjson -m kiro_crew restart",
+            "python -msomething -m kiro_crew restart",
+            "python -u -O -m kiro_crew restart",
+            "python -m 'kiro_crew' restart",
+            "python -m kiro_crew -v restart",
+            "python python -m kiro_crew restart",
+        ):
+            assert security._is_self_restart(text), text
+
+        for text in (
+            "kirocrew doctor",
+            "python -m kiro_crew",
+            "python restart",
+            "python -m pytest test/test_restart.py",
+            "echo kirocrew restart",
+        ):
+            assert not security._is_self_restart(text), text
+
+    def test_the_stop_predicate_matches_the_handling(self):
+        from kiro_crew import security
+
+        for token in ("-m", "-mkiro_crew", "-mkiro_crew.cli"):
+            assert security._is_self_module_flag(token), token
+        # Not a stop: the scan has to keep going past these.
+        for token in ("-mjson", "-msomething", "python", "-u", "", "kiro_crew"):
+            assert not security._is_self_module_flag(token), token
+
+    def test_the_scan_is_linear_not_quadratic(self, monkeypatch):
+        """What makes the scan linear is asserted DETERMINISTICALLY, not by timing.
+
+        A timed doubling ratio cannot separate this property from the runner: on a
+        starved shared CI host, scheduler noise, GC pauses, and frequency scaling
+        inflate the ratio past any bound tight enough to catch the quadratic (a run
+        was observed failing the 3x ratio while the absolute budget below passed
+        with 2.1x headroom -- the red measured the runner, not the code), so the
+        ratio form false-reds PRs whose diff never touches this scan. The linearity
+        is structural, so it is asserted structurally, the same two-layer strategy
+        as ``test_mid_dotstar_chain_spam_stays_linear``. A regression has to break
+        one of these to reintroduce the quadratic:
+
+          1. PRECOMPUTE ONCE PER FRAME -- ``_self_module_flag_scan`` (the single
+             pair of linear passes that replaced the per-interpreter-token re-walk)
+             runs exactly once for the frame, however many interpreter tokens the
+             frame holds;
+          2. WORK PER TOKEN IS CONSTANT -- the ``_normalize_operand`` AND
+             ``_is_self_module_flag`` call counts each grow as an exact arithmetic
+             progression in the token count (equal size steps produce equal call
+             increments). The quadratic this test pins against re-normalized the
+             remaining tail once per interpreter token, which makes the increments
+             themselves grow with the size and breaks the progression. The flag
+             predicate is counted SEPARATELY because a cheaper regression shape
+             exists that never re-normalizes: a per-token forward walk over the
+             already-precomputed ``scan.norm`` (losing the ``stops`` O(1) jump)
+             keeps the normalize count linear, but it must consult the stop
+             predicate once per walked token, so that count goes quadratic and
+             breaks its progression.
+
+        The absolute budget stays as the machine-independent catastrophic-blowup
+        backstop: the pre-fix quadratic spent 1.94s where the bound is 0.5s, and it
+        also catches cost added outside the instrumented calls, where the counts
+        cannot see it.
+        """
+        import time
+
+        from kiro_crew import security
+
+        def build(n: int) -> str:
+            return " ".join(["python"] * n + ["kirocrew", "restart"])
+
+        # Backstop budget, measured BEFORE instrumenting (the counting wrappers
+        # below would bill their own overhead against it). The input is built
+        # OUTSIDE the timed window, and one untimed small-size call warms the
+        # path first, so first-call cost is not billed against the budget when
+        # this test runs alone.
+        security._is_self_restart(build(250))
+        text = build(2000)
+        start = time.perf_counter()
+        assert security._is_self_restart(text) is True
+        large = time.perf_counter() - start
+        # Base spent 1.94 s here; a quadratic scan cannot come near this ceiling.
+        assert large < 0.5, f"2k tokens took {large:.3f}s"
+
+        real_scan = security._self_module_flag_scan
+        real_norm = security._normalize_operand
+        real_flag = security._is_self_module_flag
+        counts = {"scan": 0, "norm": 0, "flag": 0}
+
+        def counting_scan(tokens: "list[str]") -> "security._SelfModuleScan":
+            counts["scan"] += 1
+            return real_scan(tokens)
+
+        def counting_norm(token: str) -> str:
+            counts["norm"] += 1
+            return real_norm(token)
+
+        def counting_flag(tok: str) -> bool:
+            counts["flag"] += 1
+            return real_flag(tok)
+
+        monkeypatch.setattr(security, "_self_module_flag_scan", counting_scan)
+        monkeypatch.setattr(security, "_normalize_operand", counting_norm)
+        monkeypatch.setattr(security, "_is_self_module_flag", counting_flag)
+
+        def measured(n: int) -> "tuple[int, int, int]":
+            counts["scan"] = counts["norm"] = counts["flag"] = 0
+            # The verdict must still be reached THROUGH the instrumented path, or
+            # the counts below are counting nothing.
+            assert security._is_self_restart(build(n)) is True
+            return counts["scan"], counts["norm"], counts["flag"]
+
+        results = [measured(n) for n in (500, 1000, 1500)]
+
+        # (1) The precompute runs once per frame, independent of the token count.
+        for scans, _, _ in results:
+            assert scans == 1, (
+                f"_self_module_flag_scan ran {scans} times for one frame -- a "
+                "per-token caller is the quadratic re-walk the precompute removed"
+            )
+
+        # (2) Per-token work is constant: equal size steps, equal call increments,
+        # for BOTH instrumented costs (see the docstring for why each has teeth).
+        for name, series in (
+            ("normalize", [norm for _, norm, _ in results]),
+            ("module-flag-predicate", [flag for _, _, flag in results]),
+        ):
+            assert series[0] > 500, (
+                f"the instrument is not observing the path under test -- fewer "
+                f"{name} calls than tokens means the scan never saw the frame"
+            )
+            assert series[1] - series[0] == series[2] - series[1], (
+                f"{name} counts {series} are not an arithmetic progression -- the "
+                "per-token cost grows with the input, which is the super-linear "
+                "re-walk this precompute exists to prevent"
+            )
+
+    def test_the_padded_shape_that_does_not_open_the_gate_stays_cheap(self):
+        """Pins the reason the reported reproduction did not reproduce: without a
+        product word the floor's keyword gate stays shut and nothing is scanned."""
+        from kiro_crew import security
+
+        assert not security._self_floor_can_fire("python restart")
+        assert security._self_floor_can_fire("python kirocrew")
+
+
+class TestPythonStdinDetectorStepsOverOutputRedirects:
+    """An OUTPUT redirect must not be mistaken for the interpreter's script path.
+
+    ``_python_reads_stdin`` decides whether a ``python`` invocation takes its PROGRAM
+    from stdin, and the credential-mint floor uses that to know whether to scan the
+    stdin carriers (here-string, heredoc, redirect, pipe producer) for a payload that
+    imports our CLI.  It read the raw token for ``<`` and for heredocs but had no branch
+    for the ``>`` family at all, so those tokens fell through to "a positional that is
+    not ``-`` is a script path" and the answer became False.
+
+    The unnumbered glued form survived by accident: ``_normalize_operand`` reduces
+    ``>out.txt`` to the empty string and the loop skips empties.  ``2>&1`` reduces to
+    ``2`` -- a perfectly good file name -- so the interpreter looked like it was running
+    a script called ``2``, and the program on its stdin went unscanned.  Eight spellings
+    reached the floor that way, verified against bash to actually run the here-string:
+
+        python 2>&1 <<< '<program>'          python 2>> log <<< '<program>'
+        python 1>&2 <<< '<program>'          python >& out <<< '<program>'
+        python 2> /dev/null <<< '<program>'  python 3>&1 <<< '<program>'
+        python > out.txt <<< '<program>'     python <<< '<program>' 2>&1
+
+    The last one is worth its own note: the here-string is consumed correctly there, and
+    a redirect AFTER it still flipped the verdict, because the walk continues past the
+    carrier and met the leftover ``2``.  So this was not only about redirects preceding
+    the payload.
+    """
+
+    # Program-on-stdin shapes: True. Bash was measured for each -- every one runs the
+    # here-string program.
+    READS_STDIN: "list[list[str]]" = [
+        ["2>&1", "<<<", "prog"],
+        ["1>&2", "<<<", "prog"],
+        ["2>", "/dev/null", "<<<", "prog"],
+        [">", "out.txt", "<<<", "prog"],
+        [">out.txt", "<<<", "prog"],
+        ["2>>", "log", "<<<", "prog"],
+        [">&", "out", "<<<", "prog"],
+        ["3>&1", "<<<", "prog"],
+        ["&>/dev/null", "<<<", "prog"],
+        ["&>>", "log", "<<<", "prog"],
+        ["12>&1", "<<<", "prog"],
+        ["2>&-", "<<<", "prog"],
+        ["2>&1-", "<<<", "prog"],
+        # The noclobber override and the {name} automatic descriptor (bash 4.1+), both
+        # raised in review. Measured in bash 5.2: every one runs the here-string.
+        ["2>|", "/dev/null", "<<<", "prog"],
+        ["2>|/dev/null", "<<<", "prog"],
+        [">|", "f", "<<<", "prog"],
+        ["{fd}>", "f", "<<<", "prog"],
+        ["{fd}>f", "<<<", "prog"],
+        ["{fd}>&1", "<<<", "prog"],
+        ["{fd}>>", "f", "<<<", "prog"],
+        ["{fd}>|", "f", "<<<", "prog"],
+        # A following operator glued into the SAME word starts a new redirect, so the
+        # target must stop there. Taking all of `/dev/null<<EOF` as the target swallows
+        # the heredoc marker and loses the program on stdin. Measured in bash: both run.
+        ["2>/dev/null<<EOF", "prog", "EOF"],
+        [">out<<EOF", "prog", "EOF"],
+        ["2>&1<<<prog"],
+        ["2>/dev/null<<<prog"],
+        ["2>>log<<<prog"],
+        ["&>/dev/null<<<prog"],
+        ["{fd}>f<<<prog"],
+        ["2>a>b<<<prog"],
+        # A redirect INSIDE a substitution belongs to that inner command and is not a
+        # boundary of this word: after the shell runs it, `2>$(printf /dev/null)` is just
+        # `2>/dev/null`. Measured in bash: all of these run the here-string.
+        ["2>$(echo>/dev/null;printf", "/dev/null)", "<<<", "prog"],
+        ["2>`echo>/dev/null;printf", "/dev/null`", "<<<", "prog"],
+        [">$(echo>x;printf", "out)", "<<<", "prog"],
+        ["2>${x:-/dev/null}", "<<<", "prog"],
+        ["2>$(printf", "/dev/null)", "<<<", "prog"],
+        # A subshell or brace group NESTED in the substitution closes with its own `)`
+        # or `}`. Depth must count those too, and the word must reach the scan with its
+        # delimiters intact -- the tokenizer splits on the space, so this arrives as the
+        # word `2>$(`, and `_SHELL_WRAPPER_CHARS` would otherwise strip the opener off.
+        ["2>$(", "(true);", "printf", "/dev/null)", "<<<", "prog"],
+        ["2>$(", "(true)", ";", "printf", "/dev/null", ")", "<<<", "prog"],
+        ["2>$(", "{", "true;", "printf", "/dev/null;", "}", ")", "<<<", "prog"],
+        # PowerShell's all-streams redirect. Included on the floor's fail-closed rule:
+        # under PowerShell `*>` is the operator and the program arrives on stdin, while
+        # under bash `*` is a glob whose first match becomes the script. Answering True
+        # over-triggers under bash and under-triggers under neither.
+        ["*>", "token.txt", "<<<", "prog"],
+        ["*>>", "token.txt", "<<<", "prog"],
+        ["*>token.txt", "<<<", "prog"],
+        # zsh's `!` noclobber override, the third modifier in the set. Measured with real
+        # zsh: `python >! out <<< '<program>'` runs the here-string.
+        [">!", "out", "<<<", "prog"],
+        [">>!", "out", "<<<", "prog"],
+        ["2>!", "out", "<<<", "prog"],
+        ["&>!", "out", "<<<", "prog"],
+        ["2>>!", "out", "<<<", "prog"],
+        [">!out", "<<<", "prog"],
+        # A redirect needs no whitespace in front of it, so it can ride on the back of a
+        # FLAG. Measured in bash: `python -u> out <<< '<program>'` runs the here-string.
+        ["-u>", "/dev/null", "<<<", "prog"],
+        ["-u>/dev/null", "<<<", "prog"],
+        ["-B>", "out", "<<<", "prog"],
+        ["-u2>", "err", "<<<", "prog"],
+        ["-u>>", "out", "<<<", "prog"],
+        ["-u>!", "out", "<<<", "prog"],
+        ["2>&1", "1>&2", "<<<", "prog"],
+        ["<<<", "prog", "2>&1"],
+        ["-u", "2>&1", "<<<", "prog"],
+        ["2>&1", "-u", "<<<", "prog"],
+        # No carrier at all: a bare interpreter still reads its program from stdin.
+        ["2>&1"],
+        ["2>&1", "-"],
+        # The redirect TARGET must be consumed, not run: `python 2> script.py`
+        # redirects into that file and still reads its program from stdin.
+        ["2>", "script.py"],
+        [">", "script.py"],
+        ["2>script.py"],
+    ]
+
+    # The program comes from somewhere else: False, redirect or no redirect.
+    SUPPLIES_PROGRAM_ELSEWHERE: "list[list[str]]" = [
+        ["2>&1", "script.py"],
+        ["script.py", "2>&1"],
+        ["2>", "/dev/null", "script.py"],
+        [">", "out.txt", "script.py"],
+        ["2>&1", "-c", "code"],
+        ["-c", "code", "2>&1"],
+        ["2>&1", "-m", "mod"],
+        ["-m", "mod", "2>&1"],
+        # Measured in bash: after these redirects a real script still supplies the
+        # program, so stepping over the redirect must not mean ignoring what follows.
+        ["2>|", "f", "script.py"],
+        ["{fd}>&1", "script.py"],
+        ["{fd}>", "f", "script.py"],
+        # A redirect glued to a POSITIONAL: the script still supplies the program, so the
+        # word must be split and its prefix classified rather than skipped. Measured in
+        # bash: `python script.py> out <<< '<program>'` runs the script.
+        ["script.py>", "out"],
+        ["script.py>out"],
+        ["-c>", "out", "code"],
+    ]
+
+    def test_the_glue_point_is_only_a_trailing_redirect(self):
+        """None when the word has no `>`, or already starts with one -- a leading file
+        descriptor belongs to the redirect, and the shell reads digits as an fd only when
+        they are the whole prefix (`2>err` is fd 2; `x2>err` is the word `x2`)."""
+        from kiro_crew import security
+
+        assert security._redirect_glue_point("-u>") == 2
+        assert security._redirect_glue_point("-u>/dev/null") == 2
+        assert security._redirect_glue_point("-u2>err") == 3
+        assert security._redirect_glue_point("script.py>out") == 9
+        for token in (">out", "2>err", "&>f", "*>f", "{fd}>f", "-u", "script.py", ""):
+            assert security._redirect_glue_point(token) is None, token
+
+    def test_a_brace_expansion_is_not_read_as_a_descriptor(self):
+        """``{fd}>`` is an automatic descriptor; ``{a,b}`` is a brace EXPANSION the shell
+        resolves before redirect parsing. Only an identifier may sit in the braces, or an
+        ordinary argument could be swallowed as a redirect."""
+        from kiro_crew import security
+
+        assert security._output_redirect_scan("{fd}>&1") == ("1", 7)
+        assert security._output_redirect_scan("{fd}>") == ("", 5)
+        for token in ("{a,b}>x", "{1..3}>x", "{}>x", "{a b}>x"):
+            assert security._output_redirect_scan(token) is None, token
+
+    def test_a_program_on_stdin_is_detected_through_an_output_redirect(self):
+        from kiro_crew import security
+
+        for tokens in self.READS_STDIN:
+            assert security._python_reads_stdin(list(tokens)) is True, tokens
+
+    def test_a_script_or_inline_program_still_wins(self):
+        from kiro_crew import security
+
+        for tokens in self.SUPPLIES_PROGRAM_ELSEWHERE:
+            assert security._python_reads_stdin(list(tokens)) is False, tokens
+
+    def test_the_redirect_helper_reports_target_and_end_position(self):
+        """Three distinct answers. A glued target ends at the word's end; an empty target
+        at the word's end means the target is the NEXT token; an end short of the word
+        means another operator followed and must be re-examined, not eaten."""
+        from kiro_crew import security
+
+        assert security._output_redirect_scan("2>&1") == ("1", 4)
+        assert security._output_redirect_scan(">out.txt") == ("out.txt", 8)
+        assert security._output_redirect_scan("&>/dev/null") == ("/dev/null", 11)
+        assert security._output_redirect_scan("2>") == ("", 2)
+        assert security._output_redirect_scan(">&") == ("", 2)
+        assert security._output_redirect_scan("2>>") == ("", 3)
+        # An end short of len() is where the glued-heredoc bypass lived.
+        assert security._output_redirect_scan("2>/dev/null<<EOF") == ("/dev/null", 11)
+        assert security._output_redirect_scan("2>&1<f") == ("1", 4)
+        assert security._output_redirect_scan(">a>b") == ("a", 2)
+        assert security._output_redirect_scan("2></dev/null") == ("", 2)
+        # Scanning from an offset is how a chain is walked in one pass.
+        assert security._output_redirect_scan(">a>b", 2) == ("b", 4)
+        # A redirect is a boundary only at substitution depth ZERO. Inside `$(...)`,
+        # `${...}` or backticks it belongs to the inner command, and cutting there left
+        # the tail of the substitution to be read as a script path.
+        assert security._output_redirect_scan("2>$(echo>/dev/null;printf") == (
+            "$(echo>/dev/null;printf",
+            25,
+        )
+        assert security._output_redirect_scan("2>`echo>x`") == ("`echo>x`", 10)
+        assert security._output_redirect_scan("2>${x:->}") == ("${x:->}", 9)
+        # Depth counts EVERY opener, not just a `$`-prefixed one: a nested subshell
+        # closes with its own `)`, and ignoring it drops the depth to zero early.
+        assert security._output_redirect_scan("2>$( (x)>y )") == ("$( (x)>y )", 12)
+        assert security._output_redirect_scan("2>$(") == ("$(", 4)
+        # PowerShell's all-streams descriptor, and the glob spellings it must NOT eat.
+        assert security._output_redirect_scan("*>") == ("", 2)
+        assert security._output_redirect_scan("*>>") == ("", 3)
+        assert security._output_redirect_scan("*>token.txt") == ("token.txt", 11)
+        for token in ("*", "*.py", "*.txt"):
+            assert security._output_redirect_scan(token) is None, token
+
+    def test_the_descriptor_and_modifier_sets_are_the_enumerated_ones(self):
+        """The two sets are enumerated from the shells' grammars, not grown one spelling
+        per review round. Asserted here so the boundary is a test rather than a comment:
+        descriptors are digits, ``&``, ``{name}`` and ``*``; modifiers are ``&``, ``|``
+        and ``!``."""
+        from kiro_crew import security
+
+        for descriptor in ("", "2", "12", "&", "*", "{fd}"):
+            for operator in (">", ">>"):
+                for modifier in ("", "&", "|", "!"):
+                    token = f"{descriptor}{operator}{modifier}"
+                    assert security._output_redirect_scan(token) is not None, token
+        # A modifier outside the set is part of the TARGET, not the operator.
+        assert security._output_redirect_scan(">?x") == ("?x", 3)
+        assert security._output_redirect_scan(">^x") == ("^x", 3)
+        # ...and the boundary still applies once the substitution has closed.
+        assert security._output_redirect_scan("2>$(printf x)>b") == ("$(printf x)", 13)
+        # Not output redirects, and must not be swallowed as such.
+        for token in ("script.py", "-u", "-", "<<<", "<<PY", "<f", "2", "", "-c"):
+            assert security._output_redirect_scan(token) is None, token
+
+    def test_a_chain_of_glued_redirects_is_linear(self, monkeypatch):
+        """One word may hold many operators (``>a>a>a...``). Re-slicing the word per
+        operator was quadratic in its length -- on a floor that runs for every command,
+        and in a module that pins linearity elsewhere, so it is pinned here too.
+
+        Asserted DETERMINISTICALLY, not by timing: a doubling ratio false-reds on a
+        starved shared runner whose scheduler noise exceeds the ratio's slack (see
+        ``test_the_scan_is_linear_not_quadratic`` for the observed case), so what
+        makes the walk linear is asserted structurally instead. The fix's contract is
+        that a chain word is walked ONCE, IN PLACE: ``_output_redirect_scan`` returns
+        an index precisely so the caller can advance through the same string rather
+        than re-slice it. A regression has to break one of these:
+
+          1. ONE SCAN PER OPERATOR -- the ``_output_redirect_scan`` invocation
+             count grows as an exact arithmetic progression in the chain length
+             (equal size steps produce equal call increments; per-operator
+             re-injection or retry work makes the increments themselves grow);
+          2. THE FULL WORD EVERY TIME -- every invocation receives a string of the
+             chain word's full length. Re-slicing the remainder per operator (the
+             quadratic) hands the scan progressively shorter COPIES, each of which
+             costs the slice that made it;
+          3. THE START INDEX ADVANCES -- strictly increasing within the word, never
+             reset to 0, so each character is visited once.
+
+        The absolute budget stays as the machine-independent catastrophic-blowup
+        backstop for cost added outside the scan, where the trace cannot see it.
+        """
+        import time
+
+        from kiro_crew import security
+
+        # Backstop budget, measured BEFORE instrumenting (the tracing wrapper below
+        # would bill its own overhead against it). The input is built OUTSIDE the
+        # timed window, and one untimed small-size call warms the path first, so
+        # first-call cost is not billed against the budget when this test runs
+        # alone.
+        security._python_reads_stdin([">a" * 200, "<<<", "prog"])
+        tokens = [">a" * 1600, "<<<", "prog"]
+        start = time.perf_counter()
+        assert security._python_reads_stdin(tokens) is True
+        large = time.perf_counter() - start
+        assert large < 0.2, f"1600 glued redirects took {large:.4f}s"
+
+        real_scan = security._output_redirect_scan
+        trace: "list[tuple[int, int]]" = []  # (len(raw), start)
+
+        def tracing_scan(raw: str, start: int = 0) -> "tuple[str, int] | None":
+            trace.append((len(raw), start))
+            return real_scan(raw, start)
+
+        monkeypatch.setattr(security, "_output_redirect_scan", tracing_scan)
+
+        def walked(k: int) -> "list[tuple[int, int]]":
+            trace.clear()
+            word = ">a" * k
+            assert security._python_reads_stdin([word, "<<<", "prog"]) is True
+            return list(trace)
+
+        sizes = (400, 800, 1200)
+        walks = [walked(k) for k in sizes]
+
+        # (1) One scan per operator: equal size steps, equal call increments.
+        # The progression form (rather than exact doubling) is deliberately
+        # immune to a constant per-word offset, so a benign refactor that adds
+        # one trailing probe call does not false-red this test.
+        calls = [len(w) for w in walks]
+        assert calls[0] >= sizes[0], (
+            "the instrument is not observing the path under test -- fewer scans "
+            "than operators means the chain was never walked"
+        )
+        assert calls[1] - calls[0] == calls[2] - calls[1], (
+            f"scan counts {calls} for chain sizes {sizes} are not an arithmetic "
+            "progression -- per-operator work that scales with the chain is the "
+            "re-slicing quadratic the in-place walk exists to prevent"
+        )
+
+        # (2) + (3) The walk is in place: every scan sees the FULL word and the
+        # start index only ever advances.
+        for walk, k in zip(walks, sizes):
+            word_len = len(">a" * k)
+            assert {length for length, _ in walk} == {word_len}, (
+                "a scan received a string shorter than the chain word -- the "
+                "remainder is being re-sliced per operator, which is quadratic "
+                "in the word's length"
+            )
+            starts = [position for _, position in walk]
+            assert all(a < b for a, b in zip(starts, starts[1:])), (
+                "the scan's start index went backwards or repeated -- the walk "
+                "restarted inside the word instead of advancing through it once"
+            )
+
+    def test_the_floor_denies_the_stdin_program_behind_a_redirect(self):
+        """The end-to-end property: these are credential-mint attempts whose program
+        rides in on stdin, and each was ALLOWED before this change."""
+        from kiro_crew import security
+
+        payload = "from kiro_crew.cli import main; main()"
+        for cmd in (
+            f"python 2>&1 <<< '{payload}'",
+            f"python 1>&2 <<< '{payload}'",
+            f"python 2> /dev/null <<< '{payload}'",
+            f"python > out.txt <<< '{payload}'",
+            f"python 2>> log <<< '{payload}'",
+            f"python >& out <<< '{payload}'",
+            f"python 3>&1 <<< '{payload}'",
+            f"python 2>&1 1>&2 <<< '{payload}'",
+            f"python <<< '{payload}' 2>&1",
+            f"echo '{payload}' | python 2>&1",
+            f"python 2>&1 << 'PY'\n{payload}\nPY",
+            # Raised in review, measured in bash 5.2.
+            f"python 2>| /dev/null <<< '{payload}'",
+            f"python >| out <<< '{payload}'",
+            f"python {{fd}}>&1 <<< '{payload}'",
+            f"python {{fd}}> out <<< '{payload}'",
+            # Glued mixed operators, measured in bash.
+            f"python 2>/dev/null<<EOF\n{payload}\nEOF",
+            f"python >out<<EOF\n{payload}\nEOF",
+            f"python 2>&1<<<'{payload}'",
+            # A redirect nested in a substitution, measured in bash.
+            f"python 2>$(echo>/dev/null;printf /dev/null) <<< '{payload}'",
+            f"python 2>`echo>/dev/null;printf /dev/null` <<< '{payload}'",
+            f"python 2>$( (true); printf /dev/null) <<< '{payload}'",
+            f"python 2>$( {{ true; printf /dev/null; }} ) <<< '{payload}'",
+            # PowerShell's all-streams redirect with the program on a pipe.
+            f"echo '{payload}' | python *> token.txt",
+            f"echo '{payload}' | python *>> token.txt",
+            # A redirect glued to a flag, measured in bash.
+            f"python -u> /dev/null <<< '{payload}'",
+            f"python -B> out <<< '{payload}'",
+        ):
+            assert security._is_credential_mint(cmd.lower()), cmd
+
+    def test_the_floor_still_allows_the_ordinary_shapes(self):
+        from kiro_crew import security
+
+        payload = "from kiro_crew.cli import main; main()"
+        for cmd in (
+            "python script.py",
+            f"python script.py <<< '{payload}'",
+            "python -m json.tool",
+            "python 2>&1 script.py",
+            "ls -la 2>&1",
+            "pytest test/test_x.py 2>&1 | tail -5",
+            # Reading `*>` as a redirect must not start denying ordinary commands: with
+            # no payload-bearing carrier there is nothing for the floor to fire on.
+            "python *> out",
+            "python *.py > out",
+            "pytest tests/ *> out",
+        ):
+            assert not security._is_credential_mint(cmd.lower()), cmd

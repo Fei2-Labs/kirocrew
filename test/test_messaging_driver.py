@@ -248,18 +248,33 @@ class TestApprovalLadder:
 
 class TestAutoApproveTool:
     """The injected auto_approve_tool predicate (e.g. auto_approve_subagent_spawn
-    for spawn_run) takes precedence over the interactive ladder."""
+    for spawn_run) takes precedence over the interactive ladder.
 
-    def _perm_script(self, title):
+    The predicate receives the PERMISSION EVENT (not the title): the title is
+    model-authored, so the production predicate keys on canonical identity
+    (``tool_name``/``is_shell``). Both directions are pinned below through the
+    real ``build_auto_approve`` builder; flipping any consumer back to a
+    title-only check must fail the forged-shell direction.
+    """
+
+    def _perm_script(self, title, **event_fields):
         return [
             AcpEvent(
                 kind=EVENT_PERMISSION_REQUEST,
                 request_id="rq1",
                 title=title,
                 options=[{"id": "approve"}],
+                **event_fields,
             ),
             AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
         ]
+
+    @staticmethod
+    def _spawn_hook_builder(enabled=True):
+        """A ctx_builder double with only the spawn hook flag set."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(hooks=SimpleNamespace(auto_approve_subagent_spawn=enabled))
 
     def test_predicate_auto_approves_matching_tool(self):
         r = _RecordingRenderer()
@@ -275,7 +290,7 @@ class TestAutoApproveTool:
             r,
             approval_mode=APPROVAL_INTERACTIVE,
             decider=decider,
-            auto_approve_tool=lambda title: title == "spawn_run",
+            auto_approve_tool=lambda event: (getattr(event, "title", "") or "") == "spawn_run",
         )
         assert p.approved == ["rq1"]
         assert p.rejected == []
@@ -289,10 +304,73 @@ class TestAutoApproveTool:
             p,
             r,
             approval_mode=APPROVAL_INTERACTIVE,
-            auto_approve_tool=lambda title: title == "spawn_run",
+            auto_approve_tool=lambda event: (getattr(event, "title", "") or "") == "spawn_run",
         )
         assert p.rejected == ["rq1"]
         assert p.approved == []
+
+    def test_genuine_spawn_run_mcp_event_still_auto_approves(self):
+        # Direction 1: a genuine spawn_run MCP call (canonical identity from
+        # ``_meta.kiro``, provenance-flagged, served by the crew's own MCP
+        # server) keeps unattended fan-out unblocked.
+        from kiro_crew.messaging.dispatch import build_auto_approve
+
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            self._perm_script(
+                "spawn_run",
+                tool_name="spawn_run",
+                mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
+            )
+        )
+        _run(
+            p,
+            r,
+            approval_mode=APPROVAL_INTERACTIVE,
+            auto_approve_tool=build_auto_approve(self._spawn_hook_builder()),
+        )
+        assert p.approved == ["rq1"]
+        assert p.rejected == []
+
+    def test_shell_event_with_forged_spawn_title_is_not_auto_approved(self):
+        # Direction 2 (the issue's attack): a SHELL event whose model-authored
+        # title says spawn_run must fall to the ladder, not ride the rung.
+        from kiro_crew.messaging.dispatch import build_auto_approve
+
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(self._perm_script("spawn_run", is_shell=True, shell_classified=True))
+        _run(
+            p,
+            r,
+            approval_mode=APPROVAL_INTERACTIVE,
+            auto_approve_tool=build_auto_approve(self._spawn_hook_builder()),
+        )
+        assert p.approved == []
+        assert p.rejected == ["rq1"]
+
+    def test_canonical_name_mismatch_with_forged_title_is_not_auto_approved(self):
+        # A non-shell tool whose canonical _meta.kiro name is NOT spawn_run
+        # cannot borrow the rung by re-titling itself.
+        from kiro_crew.messaging.dispatch import build_auto_approve
+
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            self._perm_script(
+                "spawn_run",
+                tool_name="artifact_delete",
+                mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
+            )
+        )
+        _run(
+            p,
+            r,
+            approval_mode=APPROVAL_INTERACTIVE,
+            auto_approve_tool=build_auto_approve(self._spawn_hook_builder()),
+        )
+        assert p.approved == []
+        assert p.rejected == ["rq1"]
 
     def test_session_trust_auto_approves_without_buttons(self):
         r = _RecordingRenderer()
@@ -458,7 +536,7 @@ class TestToolGateEnforcement:
             p,
             r,
             approval_mode=APPROVAL_INTERACTIVE,
-            auto_approve_tool=lambda title: True,
+            auto_approve_tool=lambda event: True,
             tool_gate=lambda ev: "deny",
         )
         assert p.rejected == ["rq1"]
@@ -528,7 +606,7 @@ class TestDenyAllTools:
             p,
             r,
             approval_mode=APPROVAL_INTERACTIVE,
-            auto_approve_tool=lambda title: True,
+            auto_approve_tool=lambda event: True,
             deny_all_tools=True,
         )
         assert p.rejected == ["rq1"] and p.approved == []

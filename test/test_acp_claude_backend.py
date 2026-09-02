@@ -120,7 +120,7 @@ class TestPermissionModeProbe:
 
 
 class TestRoutingRestsOnTheAdapterReadPath:
-    """Why claude is in ACP_BACKENDS_SELECTABLE at all.
+    """Why claude is in selectable_backends() at all.
 
     The ROUTED verdict is MANUFACTURED: Kiro Crew writes a permission mode and
     then reports the session governed. That is only honest while two things hold,
@@ -163,9 +163,9 @@ class TestRoutingRestsOnTheAdapterReadPath:
         routing seed may merge into a file the operator already owned, Claude
         cannot be selectable until cleanup removes only Crew-owned state.
         """
-        from kiro_crew.acp.types import ACP_BACKENDS_SELECTABLE
+        from kiro_crew.acp_backends import selectable_backends
 
-        assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_SELECTABLE
+        assert ACP_BACKEND_CLAUDE not in selectable_backends()
 
 
 class TestSeeding:

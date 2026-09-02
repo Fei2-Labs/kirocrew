@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 # admitted by the user-surface provenance gate below, then separately requires
 # the current turn to own the slot it would mutate.
 _DASHBOARD_ONLY_DIRECTIVES = frozenset({"suggest_followup", "ask_question"})
-_USER_SURFACE_DIRECTIVES = frozenset({"set_project"})
+_USER_SURFACE_DIRECTIVES = frozenset({"set_project", "reset_conversation"})
 
 
 def _has_user_surface(session_key: str) -> bool:
@@ -164,6 +164,8 @@ async def apply_session_directive(
             result = await _autonudge_stop(slot, session_key, args)
         elif kind == "set_project":
             result = await _set_project(state, slot, args)
+        elif kind == "reset_conversation":
+            result = await _reset_conversation(slot, session_key, args)
         elif kind == "suggest_followup":
             result = await _suggest_followup(state, slot, args)
         elif kind == "ask_question":
@@ -355,13 +357,42 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
     )
 
 
+def _no_loop_message(svc: Any, binding: str) -> str:
+    """The result for ``autonudge_stop`` when this session resolves no loop.
+
+    ``get_by_slot`` resolves only the loop bound to the CALLING session's
+    binding key, so its miss covers two states that a caller cannot otherwise
+    tell apart: no loop exists anywhere (an idempotent success — the goal
+    already holds), or a loop is running under a different slot key and is
+    simply unreachable from here (nothing was stopped). Counting the service's
+    active loops separates them.
+
+    Reports a COUNT and never a loop id or slot key. The stop tool exposes no
+    loop-id parameter precisely so a session cannot target another session's
+    loop; naming other sessions' loops here would hand the model the
+    identifiers that schema withholds. Cross-session enumeration stays on the
+    token-authed dashboard API. A count is all this branch needs, because the
+    caller's question is whether ITS OWN stop took effect.
+    """
+    active = [lp for lp in svc.list_all() if getattr(lp, "active", True)]
+    if not active:
+        return "No active auto-nudge loop on this session — nothing to stop."
+    return (
+        "NOTHING WAS STOPPED. No auto-nudge loop is bound to this session "
+        f"(binding: {binding}), but {len(active)} auto-nudge loop(s) are running on "
+        "other sessions. A loop can only be stopped from the session it is bound "
+        "to, so this call could not reach them."
+    )
+
+
 async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> str:
     from kiro_crew.autonudge import get_instance
 
     svc = get_instance()
     # "Nothing to stop" is an IDEMPOTENT success — the goal (no loop running on
     # this session) already holds — so the disabled-service and no-loop paths
-    # keep returning. The unsupported-session path is a refusal like its
+    # keep returning; a binding miss that is NOT that state is separated in
+    # ``_no_loop_message``. The unsupported-session path is a refusal like its
     # siblings: the caller asked for an effect this session can never carry.
     if svc is None:
         return "No auto-nudge loop to stop (auto-nudge is disabled on this host)."
@@ -370,7 +401,7 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
         raise _DirectiveDenied("autonudge_stop is not supported from this session type.")
     loop = svc.get_by_slot(binding)
     if not loop:
-        return "No active auto-nudge loop on this session — nothing to stop."
+        return _no_loop_message(svc, binding)
     loop_id = loop.id
     reason = str(args.get("reason") or "").strip()
     # Research Lab consumes a persisted stop record to distinguish deliberate
@@ -447,6 +478,38 @@ async def _set_project(state: Any, slot: Any, args: dict[str, Any]) -> str:
     return (
         f"Project set to {rp}. The session cold-starts with the new CWD and "
         "project-level .kiro/steering on the next message."
+    )
+
+
+async def _reset_conversation(slot: Any, session_key: str, args: dict[str, Any]) -> str:
+    """Queue a conversation discard for this slot's next turn boundary.
+
+    Deferred rather than applied here because the caller is mid-turn: a discard
+    is a full provider teardown, and the immediate route
+    (``POST /api/chat/slots/{slot}/reset-conversation``) refuses a busy slot for
+    exactly that reason. Queuing is what makes the effect reachable from inside
+    the turn that wants it — the flag is consumed at a later turn boundary.
+
+    Queues the *session_key* THIS TURN runs on, captured by the caller, rather
+    than re-resolving it from the slot. A slot's ``linked_session_key`` is
+    mutable: a cron or workflow injection can rebind the live slot between the
+    turn that asked for the reset and the consume that applies it, so a
+    slot-resolved key would discard whatever conversation the slot points at by
+    then and leave the one the caller meant untouched. The key is the caller's,
+    not the slot's.
+
+    Only the model's memory is dropped. The slot stays open, the session-map
+    entry keeps its channel linkage, and the transcript is untouched on disk and
+    in the tab: the record is the user's, the context was the conversation's.
+    """
+    slot._pending_discard_conversation_key = session_key
+    return (
+        "Conversation reset queued. It lands at a turn boundary — normally the "
+        "end of this turn, later if a turn is still in flight on the session or "
+        "sub-agents are running, queued, or delivering a result. The next "
+        "message after it lands starts with no memory of this conversation. The "
+        "transcript is untouched — earlier messages stay visible in the tab and "
+        "on disk."
     )
 
 

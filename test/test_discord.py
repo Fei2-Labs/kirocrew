@@ -70,6 +70,7 @@ from kiro_crew.messaging.queue_receipt import receipt_text as _receipt_text
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import _opt_out_key
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -98,6 +99,24 @@ class MultipartFake:
         return await self.send_message(  # type: ignore[attr-defined]
             channel_id, text, components=components, reply_to_message_id=reply_to_message_id
         )
+
+    async def send_document(
+        self,
+        channel_id: str,
+        document: Any,
+        *,
+        caption: Any = None,
+        reply_to_message_id: Any = None,
+    ) -> str | None:
+        """Record the destination alongside the file: the document verb routes a
+        thread to its own channel id, which is the part a caller can get wrong."""
+        getattr(self, "uploads", []).append(("document", [document]))
+        getattr(self, "documents", []).append((channel_id, document, caption))
+        if getattr(self, "raise_uploads", False):
+            raise RuntimeError("document send exploded")
+        if getattr(self, "fail_uploads", False):
+            return None
+        return await self.send_message(channel_id, caption or "")  # type: ignore[attr-defined]
 
     async def edit_message_with_files(
         self,
@@ -135,6 +154,8 @@ class FakeClient(MultipartFake):
         self.attachment_bodies: dict[str, bytes] = {}
         self.attachment_downloads: list[str] = []
         self.uploads: list[tuple[str, list[Any]]] = []
+        #: (channel_id, document, caption) per name-preserving document send.
+        self.documents: list[tuple[str, Any, Any]] = []
         self.edit_ok = True
         #: When set, every send returns None, which is what the real client does
         #: for a revoked token or a dead network.
@@ -312,6 +333,10 @@ class FakeSessions:
         self.last_model: Any = None
         self.last_provider: Any = None
         self.raise_on_get = raise_on_get
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self._busy = False
         self._has = True
         self.queued: list = []
@@ -347,6 +372,12 @@ class FakeSessions:
         # rather than merely handing on something.
         self.last_provider = FakeProvider()
         return self.last_provider, True, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel: str) -> None:
         return None
@@ -2158,6 +2189,42 @@ class TestDispatcher:
         await d.handle_message(self._msg("hello world"))
         assert "Answer: hello world" in (cli.final_text() or "")
         assert sess.successes and sess.released
+        # Pins that the pre-dispatch closing gate is consulted on the normal
+        # path, so it cannot be dropped or renamed into a no-op unnoticed.
+        assert sess.begin_turns == 1
+
+    @pytest.mark.asyncio
+    async def test_a_shutdown_between_the_claim_and_the_dispatch_never_opens_the_turn(
+        self,
+    ) -> None:
+        """The lease-dispatch race gate.
+
+        ``get_or_create`` guards the CLAIM, but the turn only opens at
+        ``driver.run``, and the context build between them is wide enough for a
+        gateway restart to land in. Opening a turn then registers it behind the
+        drain snapshot ``close_all`` has already taken, so it is killed
+        mid-flight holding its native lock and reaches the user as an empty
+        response instead of this channel's notice.
+        """
+        d, cli, sess = _dispatcher({"u1"})
+        # get_or_create deliberately ignores `closing`, so the CLAIM still
+        # succeeds here. That is the race being pinned: a refused claim was
+        # always handled, an accepted claim whose DISPATCH loses was not.
+        sess.closing = True
+
+        await d.handle_message(self._msg("hello world"))
+
+        assert "Answer: hello world" not in (
+            cli.final_text() or ""
+        ), "the turn must not open behind close_all's drain snapshot"
+        assert sess.begin_turns == 1
+        # A restart is neither a success nor a session fault: charging it to the
+        # circuit breaker would count toward resetting a session that never
+        # misbehaved.
+        assert not sess.successes
+        assert not sess.failures
+        # Refused is not leaked -- the session-keyed semaphore still comes back.
+        assert sess.released
 
     @pytest.mark.asyncio
     async def test_cold_start_failure_releases_nothing_but_closes_renderer(

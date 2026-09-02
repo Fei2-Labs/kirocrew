@@ -8,9 +8,13 @@ accessibility / capture work and all SEL auditing happen in the GATEWAY.
 That split exists because ``hooks._governance_denial`` — the PreToolUse gate — is
 fail-**OPEN** by deliberate repo policy (a governance glitch must not wedge every
 tool call on every surface), so it cannot be the sole authorization point for a
-surface that can read a password field's ``AXValue``. The authoritative gate
-(``computer_use/gate.py::require_computer_use``) fails CLOSED and needs the
-OS-resolved app identity and the addressed element's role, which only the
+surface that can read a password field's ``AXValue``. The fail-CLOSED gate is the
+keystone primary enable, read at the top of ``computer_use/tools.py``'s ordered
+chokepoint: a keystone that is missing, unreadable or disabled refuses the call
+outright. ``computer_use/gate.py::require_computer_use`` is audit-only — it
+unconditionally permits and records the call — and the refusals downstream of the
+enable (the operator's target policy, the element and pointer shape checks) need
+the OS-resolved app identity and the addressed element's role, which only the
 gateway-side tool body has.
 
 Two halves are tested here:
@@ -73,6 +77,11 @@ from kiro_crew.computer_use.types import (
     TOOL_SET_VALUE,
     TOOL_TYPE_TEXT,
     AppRef,
+)
+from kiro_crew.mcp_caller import (
+    CallerContext,
+    set_current_caller,
+    set_current_tenant_nonce,
 )
 from kiro_crew.testing.fake_computer_use import (
     FAKE_CREDENTIAL_FIXTURE,
@@ -2028,7 +2037,26 @@ class TestUnresolvedSessionsAreNamespaced:
     spawns one shim process per session, so the shim's own pid separates the
     namespaces precisely as far as the sessions are genuinely separate, and nothing is
     refused. The security posture is unchanged; only the cache key is.
+
+    #5322 is the POOLED half of the same aliasing. "One shim process per session" is
+    the 1:1 topology's premise, and a pooled backend breaks it: one process serves N
+    connections, so the pid separates nothing and every unnamed co-tenant collapsed
+    back onto a single ``unresolved:<pid>`` key. The pid is now joined by the
+    gateway-minted per-CONNECTION nonce, which separates them again — still a
+    separator, still not attribution, and still nothing refused.
     """
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_nonce(self):
+        """No injected nonce unless a test installs one.
+
+        The nonce lives in a ``ContextVar`` the dispatch loop sets and clears, so a
+        test leaving one installed would silently rewrite every later test's
+        expected key.
+        """
+        set_current_tenant_nonce("")
+        yield
+        set_current_tenant_nonce("")
 
     def test_two_unresolved_sessions_do_not_share_a_snapshot_slot(self):
         """The bug, at the layer it actually lived in."""
@@ -2061,6 +2089,99 @@ class TestUnresolvedSessionsAreNamespaced:
     def test_the_placeholder_is_per_process(self):
         key = mcp_computer._unresolved_session_key()
         assert key == f"{mcp_computer.UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+
+    def test_two_unnamed_co_tenants_of_ONE_process_do_not_share_a_slot(self, monkeypatch):
+        """#5322, at the layer it lives in — one pid, two connections.
+
+        Both co-tenants run in the SAME shim process, so ``os.getpid()`` is pinned to
+        one value here deliberately: that is the whole premise the pooled topology
+        breaks. Without the nonce half both keys are the same string and the second
+        snapshot answers the first session's lookup — the wrong-target action the
+        fingerprint check cannot catch, because both trees describe the same window.
+        """
+        from kiro_crew.computer_use.index import SnapshotIndex
+        from kiro_crew.computer_use.types import ElementRec, Snapshot
+
+        monkeypatch.setattr(os, "getpid", lambda: 5150)
+        app = AppRef(name="Notes", pid=1, window_id=7)
+
+        def snap(title: str) -> Snapshot:
+            return Snapshot(
+                app=app,
+                elements=(ElementRec(index=0, role="AXButton", title=title),),
+                captured_at=100.0,
+            )
+
+        keys: list[str] = []
+        for nonce in ("aaaa1111", "bbbb2222"):
+            set_current_tenant_nonce(nonce)
+            keys.append(mcp_computer._unresolved_session_key())
+
+        assert keys[0] != keys[1], "one pid, two connections: the keys must differ"
+
+        index = SnapshotIndex()
+        index.put(snap("A"), session_key=keys[0])
+        index.put(snap("B"), session_key=keys[1])
+        for key, expected in zip(keys, ("A", "B")):
+            got = index.get(app.window_key, session_key=key, now=100.0)
+            assert got is not None and got.elements[0].title == expected, key
+
+    def test_the_nonce_half_is_read_at_CALL_time_too(self, monkeypatch):
+        """One process serves many connections in sequence as well as concurrently.
+
+        A nonce captured once per process would namespace by process again, which is
+        the bug. Each call reads the connection the call arrived on.
+        """
+        monkeypatch.setattr(os, "getpid", lambda: 5150)
+        set_current_tenant_nonce("first")
+        assert mcp_computer._unresolved_session_key() == "unresolved:5150#first"
+        set_current_tenant_nonce("second")
+        assert mcp_computer._unresolved_session_key() == "unresolved:5150#second"
+
+    def test_the_nonce_never_becomes_an_IDENTITY(self, monkeypatch):
+        """A separator must not be promoted to attribution.
+
+        The nonce names a connection, not a principal. If the strict resolver ever
+        read it, an unnamed caller would arrive at every consumer of a session key —
+        cron ownership, callback routing, audit — carrying a key that names nobody
+        while LOOKING resolved. So with a nonce installed and no identity source,
+        strict resolution must still come back empty, and the shim must still take
+        the unresolved path.
+        """
+        monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
+        monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+        set_current_caller(None)
+        set_current_tenant_nonce("cafebabe")
+
+        assert mcp_computer._resolve_session_key_strict() == ""
+        assert mcp_computer._unresolved_session_key().startswith(
+            mcp_computer.UNRESOLVED_SESSION_PREFIX
+        )
+
+    def test_a_named_co_tenant_is_unaffected_by_the_nonce(self, monkeypatch):
+        """The nonce is the fallback's business only.
+
+        A caller the gateway CAN name already has a per-session key; appending a
+        connection nonce to it would split one session's own namespace across a
+        reconnect for no reason.
+        """
+        set_current_caller(CallerContext(session_key="dashboard:main"))
+        set_current_tenant_nonce("cafebabe")
+        try:
+            assert mcp_computer._resolve_session_key_strict() == "dashboard:main"
+        finally:
+            set_current_caller(None)
+
+    def test_the_key_survives_an_HTTP_header(self):
+        """The key is sent as ``X-Session-Key``, so the separator must be encodable.
+
+        ``_session_key_header_error`` is the shim's own pre-flight; a key it rejects
+        never reaches the gateway at all.
+        """
+        set_current_tenant_nonce("cafebabe")
+        assert (
+            mcp_computer._session_key_header_error(mcp_computer._unresolved_session_key()) is None
+        )
 
     def test_it_is_read_at_CALL_time_not_captured_at_import(self, monkeypatch):
         """A ``fork``ed child must not inherit the parent's string.

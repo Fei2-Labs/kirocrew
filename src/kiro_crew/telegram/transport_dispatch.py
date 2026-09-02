@@ -51,7 +51,11 @@ from kiro_crew.messaging.commands import (
     stop_running_turn,
     task_arg_reply,
 )
-from kiro_crew.messaging.dispatch import build_directive_consumer, delivery_is_muted
+from kiro_crew.messaging.dispatch import (
+    build_auto_approve,
+    build_directive_consumer,
+    delivery_is_muted,
+)
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -73,6 +77,7 @@ from kiro_crew.providers.acp import provider_label
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.stats import Stats
 from kiro_crew.telegram.attachments import process_telegram_attachments
 from kiro_crew.telegram.commands import (
@@ -784,14 +789,10 @@ class TelegramDispatcher:
                 out_renderer,
                 approval_mode=self.approval_mode,
                 decider=decider,
-                # Preserve the auto_approve_subagent_spawn hook for spawn_run
-                # (replicated inline to avoid a telegram -> slack import).
-                auto_approve_tool=lambda title: bool(
-                    self.ctx_builder
-                    and self.ctx_builder.hooks
-                    and self.ctx_builder.hooks.auto_approve_subagent_spawn
-                    and title == "spawn_run"
-                ),
+                # Preserve the auto_approve_subagent_spawn hook for spawn_run.
+                # The shared builder keys on canonical event identity
+                # (tool_name/is_shell), never the model-authored title.
+                auto_approve_tool=build_auto_approve(self.ctx_builder),
                 # /yolo: read the grant per request, not once at boot, so turning
                 # it on (or letting it expire) takes effect on the very next tool
                 # instead of after a gateway restart. TurnDriver runs the
@@ -811,6 +812,9 @@ class TelegramDispatcher:
                 directive_consumer=build_directive_consumer(
                     session_key=session_key, sessions=self.sessions, dispatcher=self
                 ),
+                audit_session_key=session_key,
+                audit_agent=agent or "kirocrew",
+                closing_gate=lambda: self.sessions.begin_turn(session_key),
             )
             accumulated = await driver.run(full_message)
 
@@ -902,6 +906,18 @@ class TelegramDispatcher:
                 )
             except Exception:
                 logger.debug("Telegram: success audit failed", exc_info=True)
+        except SessionClosingError:
+            # Shutdown began between the claim and the dispatch, so no turn ever
+            # opened. Caught ahead of the generic handler so a restart is not
+            # charged to the circuit breaker via `record_failure` nor counted as
+            # a failed message — neither is true of a session that never
+            # misbehaved. `failure_reason` is left as it was, so the `finally`
+            # finalizes the placeholder with this channel's usual notice instead
+            # of leaving a perma-"🤔 …".
+            logger.info(
+                "Telegram: aborting dispatch for %s — gateway is shutting down",
+                session_key,
+            )
         except Exception as exc:
             logger.exception("Telegram transport_dispatch: error handling message")
             # Permanent, user-actionable failures (e.g. model entitlement)

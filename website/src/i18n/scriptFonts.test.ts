@@ -39,8 +39,9 @@
  * leading unicode-ranged alias is deterministic regardless of what follows it.
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { readFile, readdir } from 'node:fs/promises'
+import { basename, join, relative } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
 
@@ -196,23 +197,32 @@ function scriptToken(block: string, mono = false): string {
 }
 
 /** Every file that DECLARES --font-body or --mono, found by walking the tree. */
-function declarationSites(): Array<{ file: string; line: number; text: string }> {
+async function declarationSites(): Promise<Array<{ file: string; line: number; text: string }>> {
   const out: Array<{ file: string; line: number; text: string }> = []
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir)) {
-      if (entry === 'node_modules' || entry.startsWith('.')) continue
-      const full = join(dir, entry)
-      if (statSync(full).isDirectory()) {
-        walk(full)
-        continue
-      }
-      if (!/\.(css|ts|tsx)$/.test(entry)) continue
+  const sourceFiles = async (dir: string): Promise<string[]> => {
+    const entries = await readdir(dir, { withFileTypes: true })
+    const nested = await Promise.all(entries.map(async (entry) => {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) return []
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) return sourceFiles(full)
+      return /\.(css|ts|tsx)$/.test(entry.name) ? [full] : []
+    }))
+    return nested.flat()
+  }
+
+  const files = await sourceFiles(SRC)
+  let next = 0
+  const scan = async () => {
+    while (next < files.length) {
+      const full = files[next++]
+      const entry = basename(full)
       // Tests never declare a font stack, and this file necessarily contains the
       // detection pattern as a literal — without the exclusion it matches itself.
       // The only false-negative this creates is a stack declared inside a test,
       // which would not reach the app.
       if (/\.test\.(ts|tsx)$/.test(entry)) continue
-      readFileSync(full, 'utf8')
+      const content = await readFile(full, 'utf8')
+      content
         .split('\n')
         .forEach((text, i) => {
           // A declaration, not a read: `--font-body:` / `--mono:` / a role token
@@ -226,9 +236,17 @@ function declarationSites(): Array<{ file: string; line: number; text: string }>
         })
     }
   }
-  walk(SRC)
-  return out
+  // Files are independent. A bounded worker set avoids both the serial OneDrive
+  // walk that exceeded Vitest's test budget under full-suite load and an
+  // unbounded Promise.all that could exhaust file descriptors on a larger tree.
+  await Promise.all(Array.from({ length: Math.min(16, files.length) }, scan))
+  return out.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line)
 }
+
+// The three assertions inspect the same immutable source snapshot. Scan once so
+// later assertions cannot pay another full-tree I/O pass or observe a different
+// tree halfway through the file.
+const allDeclarationSites = declarationSites()
 
 describe('script fallback faces', () => {
   it.each(ALIASES)('defines %s with a unicode-range and local()-only sources', (family) => {
@@ -338,14 +356,14 @@ describe('script fallback faces', () => {
 })
 
 describe('font stack declarations', () => {
-  it('finds every declaration site the tree actually contains', () => {
+  it('finds every declaration site the tree actually contains', async () => {
     // Guards the walker itself: if this drops to a handful, the glob broke and the
     // next assertion would pass vacuously.
-    expect(declarationSites().length).toBeGreaterThanOrEqual(12)
+    expect((await allDeclarationSites).length).toBeGreaterThanOrEqual(12)
   })
 
-  it('references the alias token at every declaration site', () => {
-    const offenders = declarationSites()
+  it('references the alias token at every declaration site', async () => {
+    const offenders = (await allDeclarationSites)
       .filter((s) => !/var\(--script-fallbacks(-mono)?\)/.test(s.text))
       .map((s) => `${s.file}:${s.line}: ${s.text.trim().slice(0, 96)}`)
     expect(
@@ -354,9 +372,9 @@ describe('font stack declarations', () => {
     ).toEqual([])
   })
 
-  it('puts the aliases ahead of every Latin base family', () => {
+  it('puts the aliases ahead of every Latin base family', async () => {
     const offenders: string[] = []
-    for (const site of declarationSites()) {
+    for (const site of await allDeclarationSites) {
       const aliasAt = site.text.search(/var\(--script-fallbacks(-mono)?\)/)
       if (aliasAt < 0) continue
       for (const base of BASE_FAMILIES) {

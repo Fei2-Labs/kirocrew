@@ -30,6 +30,7 @@ import logging
 from aiohttp import web
 
 from kiro_crew.dashboard.handlers._shared import _caller_bounds, _is_restricted_session
+from kiro_crew.dashboard.handlers.mobile_connect import mint_denied_reason
 from kiro_crew.dashboard.origin import check_origin
 from kiro_crew.dashboard.token_auth import (
     LINK_WINDOW_SECS,
@@ -84,6 +85,15 @@ async def api_auth_mobile_link(request: web.Request) -> web.Response:
             {"error": "app_token_forbidden", "code": "app_token_forbidden"}, status=403
         )
 
+    # Governance chokepoint: minting a mobile sign-in link is the "login_link"
+    # method of the capabilities.mobile_connect scope. The methods listing may
+    # already hide this method, but omission is presentation only — the mint
+    # itself re-runs the decision (fail-closed inside mint_denied_reason).
+    denied = await asyncio.to_thread(mint_denied_reason, "login_link")
+    if denied:
+        await _audit_async(user_id, "governance_denied", denied)
+        return web.json_response({"error": denied, "code": "governance_denied"}, status=403)
+
     # A restricted (incognito/temporary/channel-guest) session must not trade
     # itself for a durable any-device credential — same predicate as the
     # sibling tailnet-mobile surface's guard.
@@ -111,7 +121,13 @@ async def api_auth_mobile_link(request: web.Request) -> web.Response:
             {"error": "caller_session_expired", "code": "caller_session_expired"}, status=403
         )
 
-    token = generate_token(user_id, ttl_seconds=ttl_ceiling, extra=carried or None)
+    caller_peer_key = carried.pop("peer_key", "")
+    token = generate_token(
+        user_id,
+        ttl_seconds=ttl_ceiling,
+        peer_key=caller_peer_key,
+        extra=carried or None,
+    )
     await _audit_async(user_id, "issued")
     return web.json_response(
         {

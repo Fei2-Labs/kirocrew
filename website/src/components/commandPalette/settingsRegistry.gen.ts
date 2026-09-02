@@ -795,15 +795,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
-    "id": "chat.agent-backend",
-    "label": "Agent Backend",
-    "labelKey": "pages.settings.chatPanel.agent_backend",
-    "description": "Which command-line agent actually drives your sessions. Kiro CLI is the default; GitHub Copilot CLI, KAS, and OpenCode are alternate backends — switching requires that CLI to already be installed and signed in on this machine. OpenCode serves any OpenAI-compatible endpoint you configure in it (BYOK).",
-    "tab": "chat",
-    "type": "select",
-    "occurrence": 1
-  },
-  {
     "id": "chat.auto-compact-threshold",
     "label": "Auto-Compact Threshold",
     "labelKey": "pages.settings.chatPanel.auto_compact_threshold",
@@ -994,6 +985,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Pin the latest turn",
     "labelKey": "pages.settings.chatPanel.pin_last_prompt",
     "description": "Keep the most recent turn visible as a sticky banner once it scrolls above the fold.",
+    "tab": "chat",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
+    "id": "chat.pr-and-issue-chips-on-session-cards",
+    "label": "PR and Issue Chips on Session Cards",
+    "labelKey": "pages.settings.chatPanel.session_card_source_links",
+    "description": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date.",
     "tab": "chat",
     "type": "toggle",
     "occurrence": 1
@@ -1372,13 +1372,22 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "instances.chat-on-a-crew",
+    "label": "Chat on a crew",
+    "labelKey": "pages.settings.remoteCrewPanel.chat_on_a_crew",
+    "description": "Adds “New chat on crew” to the create menu, which starts a session that runs on a connected crew. Unfinished: it opens in that crew’s own pane, and sessions running on a crew are not listed here yet.",
+    "tab": "instances",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "instances.enable-remote-crew-management",
     "labelKey": "pages.settings.instancesPanel.enable_remote_crew_management",
     "tab": "instances",
     "type": "toggle",
     "occurrence": 1,
     "configKey": "instances.enabled",
-    "label": "Enable remote crew management"
+    "label": "Enable remote instance management"
   },
   {
     "id": "notifications.sound-category-turn",
@@ -1432,6 +1441,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "tab": "notifications",
     "type": "toggle",
     "occurrence": 1
+  },
+  {
+    "id": "notifications.sound-category-agent",
+    "labelKey": "pages.settings.notificationsPanel.category_agent",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Proactive agent messages",
+    "description": "When the agent proactively messages you outside a chat"
+  },
+  {
+    "id": "notifications.sound-category-skills",
+    "labelKey": "pages.settings.notificationsPanel.category_skills",
+    "tab": "notifications",
+    "type": "select",
+    "occurrence": 1,
+    "label": "Skills",
+    "description": "New skill candidates awaiting your approval"
   },
   {
     "id": "notifications.sources",
@@ -1574,7 +1601,7 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
       "section": "rules"
     },
     "label": "Your custom denies",
-    "description": "Add your own deny patterns (Python-compatible regex). These are enforced at Kiro Crew's PreToolUse gate alongside the built-in rules."
+    "description": "Add your own deny patterns (Python-compatible regex). These are enforced at {{productName}}'s PreToolUse gate alongside the built-in rules."
   },
   {
     "id": "shortcuts.enable-shortcuts",
@@ -1637,7 +1664,8 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
     "tab": "voice",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.endpointing"
   },
   {
     "id": "voice.aws-profile-amazon-polly",
@@ -1719,6 +1747,16 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "voice.live-transcript-refresh-ms",
+    "label": "Live transcript refresh (ms)",
+    "labelKey": "pages.settings.sttSettings.partial_interval_ms",
+    "description": "How often the transcript is redrawn while you speak. Lower feels more immediate and costs more processing.",
+    "tab": "voice",
+    "type": "stepper",
+    "occurrence": 1,
+    "configKey": "stt.partial_interval_ms"
+  },
+  {
     "id": "voice.microphone",
     "label": "Microphone",
     "labelKey": "pages.settings.sttSettings.microphone",
@@ -1728,21 +1766,24 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
-    "id": "voice.mlx-model",
-    "label": "MLX Model",
-    "labelKey": "pages.settings.sttSettings.mlx_model",
-    "tab": "voice",
-    "type": "select",
-    "occurrence": 1
-  },
-  {
     "id": "voice.model",
     "label": "Model",
     "labelKey": "pages.settings.sttSettings.model",
-    "description": "Larger models are more accurate but slower to run. A model downloads on first use, so the first dictation after switching models may appear to hang or time out while the download completes.",
+    "description": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
     "tab": "voice",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.model"
+  },
+  {
+    "id": "voice.pause-that-ends-a-phrase-ms",
+    "label": "Pause that ends a phrase (ms)",
+    "labelKey": "pages.settings.sttSettings.silence_ms",
+    "description": "How much silence commits what you just said. Lower reacts sooner; higher tolerates thinking pauses.",
+    "tab": "voice",
+    "type": "stepper",
+    "occurrence": 1,
+    "configKey": "stt.silence_ms"
   },
   {
     "id": "voice.piper-binary",
@@ -1766,10 +1807,11 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.provider",
     "label": "Provider",
     "labelKey": "pages.settings.sttSettings.provider",
-    "description": "Whisper, MLX and Apple Speech run locally; Transcribe calls AWS",
+    "description": "Local speech recognition runs on this machine and sends nothing anywhere. Transcribe uploads your audio to AWS.",
     "tab": "voice",
     "type": "select",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.provider"
   },
   {
     "id": "voice.provider-2",
@@ -1810,10 +1852,11 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "id": "voice.streaming",
     "label": "Streaming",
     "labelKey": "pages.settings.sttSettings.streaming",
-    "description": "Stream live partial transcripts into the input box as you speak. Supported by Transcribe (AWS) and Apple Speech (on-device).",
+    "description": "Show the transcript in the input box as you speak, instead of only when you stop.",
     "tab": "voice",
     "type": "toggle",
-    "occurrence": 1
+    "occurrence": 1,
+    "configKey": "stt.streaming"
   },
   {
     "id": "voice.tap-vs-hold-cutoff",

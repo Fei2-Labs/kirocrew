@@ -118,7 +118,7 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/fleet` | Lightweight worktree + pod list (polled every 12s), including `main_repo` and `main_repo_inferred`. `?fresh=1` forces cache bypass. Answers `{worktrees: [], needs_setup: true}` when no main checkout was found (see Main Checkout Discovery) and `{worktrees: [], error}` when a named checkout is unreadable. |
 | `/apps/dev-fleet/api/worktree?name=` | Lazy per-branch detail: PR, commits, disk usage |
 | `/apps/dev-fleet/api/pod/logs?name=&n=` | Pod journal tail (recent N lines, default 120) |
-| `/apps/dev-fleet/api/run?id=` | Async run status + streamed output (last 60 lines) |
+| `/apps/dev-fleet/api/run?id=` | Async run status + streamed output (last 60 lines), plus `cause` on a sync failure the gateway can name |
 | `/apps/dev-fleet/api/prune-candidates` | List worktrees eligible for pruning |
 | `/apps/dev-fleet/api/prune-status` | Live prune progress: per-item state machine (`items`) + backward-compatible top-level counters |
 | `/apps/dev-fleet/api/disk` | Aggregate disk usage per worktree (async computation) |
@@ -135,6 +135,7 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/pod/restart` | `{name}` | Stop then start pod |
 | `/apps/dev-fleet/api/pod/token` | `{name}` | Mint a dashboard token for the pod |
 | `/apps/dev-fleet/api/pod/provision` | `{name}` | Start async venv+dist build (returns `{run_id}`) |
+| `/apps/dev-fleet/api/pod/provision/dismiss` | `{name, run_id}` | Forget a terminal provision failure when the run id still matches |
 | `/apps/dev-fleet/api/rebase` | `{name}` | Rebase worktree onto origin/main |
 | `/apps/dev-fleet/api/restart-gateway` | — | Restart the live gateway through its service-manager backend; returns the pre-restart `start_id` for the restart handshake |
 | `/apps/dev-fleet/api/make-live` | `{path, dry_run?}` | Repoint the live gateway at another worktree (see Make Live); a real cutover returns `start_id` for the restart handshake |
@@ -223,8 +224,20 @@ Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if
 
 - `runtime.active_names(cfg)` — systemctl list (blocking, offloaded via `run_in_executor`)
 - `runtime.derive_port(cfg, name)` — cksum-based port derivation (blocking, offloaded)
-- `runtime.health(port, timeout)` — HTTP probe (blocking, offloaded)
-- `runtime.mint_token(cfg, name, ttl)` — token minting (blocking, offloaded)
+- `runtime.health(cfg, name, port, timeout)` — identity-gated HTTP probe (blocking,
+  offloaded). Takes the pod's NAME, not just its port, because a derived port is
+  routinely held by another pod or by the live gateway: `port_owner` requires the
+  process a `127.0.0.1` connect reaches to be this pod's own `MainPID`, and a
+  responder that is provably somebody else's returns `HEALTH_FOREIGN` (`-2`)
+  instead of its HTTP status. The fleet row treats that as unhealthy, since the
+  frontend's `health >= 200` test already excludes a negative value. There is
+  deliberately no bare-port variant to call — see `instances/run_marker`, which
+  states the rule ("no caller can mistake reachability for identity")
+- `runtime.mint_token(cfg, name, ttl)` — credential minting (blocking, offloaded).
+  Requires POSITIVE ownership proof and refuses when ownership is merely
+  unprovable, unlike `health`, which keeps its reading: this call sends the pod's
+  own `.local_secret`, so failing open would hand a credential to whatever
+  answered
 - `runtime.recent_journal(cfg, name, n)` — journalctl tail (blocking, offloaded)
 - `provision.has_venv(path)` / `provision.has_dist(path)` — filesystem checks (offloaded)
 
@@ -471,10 +484,10 @@ running run resumes polling into the stepper (accumulating the log window as
 usual), and a failed run restores the persisted red failure state with its log
 auto-expanded. Reattached and locally-started runs are deduped by run id, so a
 fleet refetch never starts a second poll loop for a run already being tracked.
-The dismiss `×` is client-side only: a failed run's id keeps being exposed
-until a newer provision for that checkout replaces it, the run is evicted from
-the bounded registry, or the gateway restarts — so a reload after dismissing
-re-shows the failure. Server-side dismissal is deliberately out of scope here.
+The dismiss `×` posts the worktree name and run id to the server before clearing
+the local strip. The server removes the persisted id only when it still matches
+that terminal run; a stale dismiss cannot clear a newer provision, and a running
+provision cannot be dismissed. A successful response therefore survives reload.
 
 ## Action narration (restart + sync feedback)
 
@@ -617,6 +630,95 @@ publishes the same bundle the build just wrote into `website/dist`, which keeps
 the pinned `/assets` route and the staged `index.html` on the same hashed
 chunks. The run script stops at the first non-zero step, so a build or staging
 failure fails the sync rather than silently leaving the symlink in place.
+
+### Dependency preflight and the `node_modules` transaction
+
+`npm ci` deletes `node_modules` before it installs, so a registry refusal used to
+leave the checkout with an emptied tree, a stale bundle against new backend code,
+and no way back that did not need the registry that was unavailable. Two
+independent triggers recur: a private-registry token that expires on a clock, and
+a curated mirror that blocks a version the lockfile pins.
+
+**The symptom is handled as a transaction.** The `npm ci` step carries `stash`
+metadata; the generated runner moves the tree aside before the step, restores it
+on any non-zero outcome, and drops the backup on success. This lives in the runner
+because the runner is fail-fast — anything scheduled *after* a failed step never
+runs, which is precisely the case that needs the restore. When a tree **and** a
+leftover backup are both present the state is genuinely ambiguous (killed during
+the install leaves a partial tree plus the good backup; killed during the success
+cleanup leaves the good tree plus a half-deleted one, and nothing on disk tells
+them apart), so the runner stops and touches neither, naming both paths.
+
+**The cause is handled by a `Verify dependencies` step between `fetch` and
+`merge`.** It runs a real script-free `npm ci` in a scratch directory against the
+incoming lockfile, read from the fetched ref rather than the working tree. The
+position is the mechanism: the lockfile is knowable as soon as fetch lands, fetch
+moves only refs, so refusing there costs nothing and needs no rollback. It is not
+an auth check — retrieval is integrity-addressed, so an auth probe fails while the
+install it guards would have succeeded.
+
+Fetch, probe and merge consume ONE commit. `<remote>/<base branch>` cannot serve
+for that: it is mutable, and the status refresher re-fetches it every
+`_NET_REFRESH_S` seconds in the same process, so with a real install between them
+the probe could certify a revision the merge does not install. The fetch step also
+writes the tip it brought to a per-process ref (`refs/kirocrew/sync-base-<pid>`),
+which the refresher never touches; `_prune_dead_sync_base_refs` collects refs left
+by gateway processes that are gone, and leaves alone any whose PID is still alive.
+
+The probe executes a **snapshot** of `npm_preflight.py` copied into an unguessable
+`mkdtemp`, run with `-I`, never imported from the checkout. The module is
+stdlib-only, so the copy needs no package context. Both halves matter: `-I` drops
+the cwd from `sys.path`, and the snapshot means an editable install cannot make
+the tree being synced supply the code doing the verifying.
+
+**The install is skipped when the answer is already on disk.** Most syncs are
+backend-only and change nothing under `website/`, so paying a full scratch install
+to re-derive "is this lockfile installable" on every Pull + Build is cost without
+information. `_install_already_proven` skips it, and only when BOTH hold: `git
+diff --name-only <ref> -- website` is empty, meaning the incoming ref changes no
+path under the frontend half at all, AND `website/node_modules` is populated (not
+merely present — an interrupted `npm ci` leaves an empty directory, which proves
+nothing). Without a tree there is no evidence, so a fresh checkout's first sync
+still probes. Anything the comparison cannot answer — a failing or missing `git`,
+a timeout — probes as well: the unknown case costs an install rather than a
+guarantee.
+
+A populated tree is evidence, not a verified install, and the bound is worth
+stating: a prior frontend sync whose post-merge `npm ci` died partway can leave a
+partial tree beside the merged lockfile, and later backend-only syncs will skip on
+it, since from there on the subtree is unchanged and nothing re-examines it. The
+consequence is the same class as the dead-registry residual — the skip decides only
+whether this sync pays for a rehearsal, so a refusal lands one step later rather
+than never, and the transaction keeps the checkout consistent either way. Issue
+[#7132](https://github.com/kirodotdev/KiroCrew/issues/7132) tracks the stronger
+evidence check that would close it.
+
+The condition is the whole subtree rather than just `package-lock.json` /
+`package.json` / `.npmrc`, and the difference is load-bearing. With those three
+identical but frontend SOURCE changed, a skipped probe lets the merge land, and a
+failing `npm ci` afterwards leaves the checkout with new source and the
+previously-built bundle — the stale-bundle half of the very defect this section
+exists to prevent. Requiring the entire subtree to be unchanged makes that
+unreachable: with no frontend change there is no new bundle owed, so a failed sync
+leaves the frontend byte-for-byte as it was.
+
+What makes the skip safe rather than merely cheap is where a failure lands. Under
+this condition the transaction above restores the tree on any non-zero step, the
+lockfile it matches did not change, and neither did the source the bundle was
+built from. A skipped probe can only leave a state a later `npm ci` fixes, never
+one no revision produced. A skip is reported on the run's `preflight:` detail line
+rather than the generic pass line, so it is visible in the log instead of
+inferable from a missing pause.
+
+**Failure causes reach the dashboard as an exit code, not as text.** The probe
+exits with a reserved code (41-45) and the runner owns two more (46 ambiguous
+tree, 47 restore failed); `npm_preflight.explain_exit` maps each to one
+registry-neutral sentence at run completion, surfaced as `cause` on `/run` and
+preferred by the UI over the last output line. Two properties keep it honest: a
+reserved code arriving from any step OTHER than the probe is demoted to a plain
+failure, because every other step runs worktree-controlled code that can exit any
+number it likes; and only the sync run kind is stamped at all, since `_start_run`
+is shared with `provision`, whose script enforces no such reservation.
 
 The build and the copy are ONE step because they share ONE holder of the staging
 lock (`.dist.staging.lock`, next to `static/dist`). `npm run build` empties

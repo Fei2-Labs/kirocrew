@@ -205,7 +205,7 @@ def revoke_local_grant(mcp_url: str, *, cache_dir: Path | None = None) -> list[s
 
     The CALLER decides whether the grant is ours to delete, and must still hold
     the lock that decided it -- see
-    :func:`kiro_crew.dashboard.handlers.connections._remove_provider_entry`.
+    :func:`kiro_crew.connections.ownership.remove_provider_entry`.
     Nothing here re-checks ownership.
 
     Returns the labels actually removed, for the audit record.

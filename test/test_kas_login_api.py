@@ -70,7 +70,7 @@ class _StubService(KasLoginService):
         self.calls.append("status")
         return {"authenticated": False, "provider": "", "identity": "", "transport": "device"}
 
-    async def begin_device(self, provider_str):
+    async def begin_device(self, provider_str, *, start_url="", region=""):
         self.calls.append(("begin", provider_str))
         if provider_str == "facebook":
             raise ValueError(provider_str)
@@ -215,7 +215,7 @@ async def test_begin_and_poll_return_502_on_transport_error():
     import aiohttp
 
     class _OfflineService(_StubService):
-        async def begin_device(self, provider_str):
+        async def begin_device(self, provider_str, *, start_url="", region=""):
             raise aiohttp.ClientError("connection refused")
 
         async def poll_device(self, login_id):

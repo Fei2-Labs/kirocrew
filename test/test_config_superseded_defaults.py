@@ -40,6 +40,10 @@ AUTOCOMPACT_ENTRY = next(
     e for e in SD.SUPERSEDED_DEFAULTS if e.dotted_key == "session.autocompact_pct"
 )
 
+LOOP_STALL_ENTRY = next(
+    e for e in SD.SUPERSEDED_DEFAULTS if e.dotted_key == "dashboard.loop_stall_exit_after_secs"
+)
+
 
 @pytest.fixture(autouse=True)
 def _forget_process_warnings():
@@ -304,3 +308,18 @@ def test_the_autocompact_summary_names_both_values_and_the_release():
     assert "session.autocompact_pct" in text
     assert "90.0" in text and "70.0" in text
     assert "#4388" in text
+
+
+def test_loop_stall_old_default_is_reported_without_rewriting():
+    base = {"dashboard": {"loop_stall_exit_after_secs": 25}}
+    assert LOOP_STALL_ENTRY in superseded_default_drift(base)
+    assert base == {"dashboard": {"loop_stall_exit_after_secs": 25}}
+
+
+def test_loop_stall_summary_explains_automatic_default():
+    text = drift_summary(LOOP_STALL_ENTRY)
+    assert "dashboard.loop_stall_exit_after_secs" in text
+    assert "25s desktop / 90s managed service" in text
+    assert "JSON null" in text
+    assert "None" not in text
+    assert "#6651" in text

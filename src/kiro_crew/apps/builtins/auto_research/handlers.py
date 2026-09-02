@@ -3183,7 +3183,7 @@ async def _handle_knowledge_status(request: web.Request) -> web.Response:
     # (it has not, until the user adds it), so no filesystem side effects here.
     uri = str((d / "findings_for_knowledge.md").resolve())
     try:
-        existing = store.get_source_by_uri(uri)
+        existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     except Exception:
         logger.exception("knowledge-status lookup failed for %s", cid)
         return web.json_response({"in_library": False})
@@ -3222,7 +3222,7 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
     sanitized_path.write_text(redacted)
     uri = str(sanitized_path.resolve())
     # Dedup check
-    existing = store.get_source_by_uri(uri)
+    existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     if existing:
         return web.json_response(
             {"error": "Already in Knowledge Library", "id": existing["id"]}, status=409
@@ -3245,19 +3245,35 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
         if row
         else f"Research: {cid}"
     )
-    sid = store.add_source(name=name, source_type="local_file", uri=uri, properties={})
-    store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (sid,))
-    store.db.commit()
+
+    # The store hands out one connection per thread, so all statement work for
+    # this request runs off-loop in a single worker: a lock wait on the store's
+    # busy timeout must stall a thread, never the event loop (issue #7020's
+    # loop-stall class). ``add_source`` rides in the same closure because the
+    # status UPDATE needs its ``sid`` on the same per-thread connection.
+    def _add_source_marked_syncing() -> str:
+        new_sid = store.add_source(name=name, source_type="local_file", uri=uri, properties={})
+        store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (new_sid,))
+        store.db.commit()
+        return new_sid
+
+    sid = await asyncio.to_thread(_add_source_marked_syncing)
 
     async def _bg_ingest() -> None:
-        try:
-            await pipeline.ingest_file(uri, source_id=sid)
+        def _mark_synced() -> None:
             store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (sid,))
             store.db.commit()
-        except Exception:
-            logger.exception("Research findings ingestion failed for %s", cid)
+
+        def _mark_error() -> None:
             store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (sid,))
             store.db.commit()
+
+        try:
+            await pipeline.ingest_file(uri, source_id=sid)
+            await asyncio.to_thread(_mark_synced)
+        except Exception:
+            logger.exception("Research findings ingestion failed for %s", cid)
+            await asyncio.to_thread(_mark_error)
 
     task = asyncio.create_task(_bg_ingest())
     app_tasks = request.app.setdefault("_bg_tasks", set())

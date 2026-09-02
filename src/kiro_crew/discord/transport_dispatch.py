@@ -59,7 +59,11 @@ from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.messaging.attachments import IngestLimits
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import stop_running_turn
-from kiro_crew.messaging.dispatch import build_directive_consumer, delivery_is_muted
+from kiro_crew.messaging.dispatch import (
+    build_auto_approve,
+    build_directive_consumer,
+    delivery_is_muted,
+)
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -77,6 +81,7 @@ from kiro_crew.providers.acp import provider_label
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 from kiro_crew.stats import Stats
 
@@ -603,12 +608,10 @@ class DiscordDispatcher:
                 out_renderer,
                 approval_mode=self.approval_mode,
                 decider=decider,
-                auto_approve_tool=lambda title: bool(
-                    self.ctx_builder
-                    and self.ctx_builder.hooks
-                    and self.ctx_builder.hooks.auto_approve_subagent_spawn
-                    and title == "spawn_run"
-                ),
+                # Preserve the auto_approve_subagent_spawn hook for spawn_run.
+                # The shared builder keys on canonical event identity
+                # (tool_name/is_shell), never the model-authored title.
+                auto_approve_tool=build_auto_approve(self.ctx_builder),
                 # The operator's process-wide grant, read per permission request --
                 # the same predicate every other shipped channel passes. Without it
                 # Discord is the one surface where arming YOLO from the dashboard is
@@ -624,6 +627,9 @@ class DiscordDispatcher:
                 directive_consumer=build_directive_consumer(
                     session_key=session_key, sessions=self.sessions, dispatcher=self
                 ),
+                audit_session_key=session_key,
+                audit_agent=agent or "kirocrew",
+                closing_gate=lambda: self.sessions.begin_turn(session_key),
             )
             accumulated = await driver.run(full_message)
 
@@ -694,6 +700,16 @@ class DiscordDispatcher:
                 )
             except Exception:
                 logger.debug("Discord: success audit failed", exc_info=True)
+        except SessionClosingError:
+            # Shutdown began between the claim and the dispatch, so no turn ever
+            # opened. Caught ahead of the generic handler so a restart is not
+            # charged to the circuit breaker via `record_failure`, which is not
+            # true of a session that never misbehaved. The `finally` still
+            # finalizes the renderer and releases the lease.
+            logger.info(
+                "Discord: aborting dispatch for %s — gateway is shutting down",
+                session_key,
+            )
         except Exception:
             logger.exception("Discord transport_dispatch: error handling message")
             if _acquired:
@@ -882,12 +898,6 @@ class DiscordDispatcher:
         await self._queue.flip_answering_locked(
             session_key, self._receipt_surface(channel_id), answered, deferred
         )
-
-    async def _receipt_finish_cancelled_locked(self, session_key: str, channel_id: str) -> None:
-        """Finalize the receipt to a "🛑 Cancelled" record, if present. Caller
-        MUST hold ``self._queue.lock``."""
-        assert self.client is not None
-        await self._queue.finish_cancelled_locked(session_key, self._receipt_surface(channel_id))
 
     def _receipt_surface(self, channel_id: str) -> ReceiptSurface:
         """A receipt surface with this channel's address already bound."""

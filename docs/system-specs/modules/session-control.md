@@ -3,13 +3,14 @@
 ## Overview
 
 Session control lets one of the user's chat sessions observe and interrupt
-another: open a new session, stop an in-flight turn, and read a transcript tail.
+another: open a new session, stop an in-flight turn, close (archive) a session,
+and read a transcript tail.
 It exists because a session cannot see what its peers are doing. A session that
 has spent an hour on a PR cannot tell whether the session watching the build has
 finished, and today the only way to find out is for the human to switch tabs and
 look. Session control lets the session ask directly.
 
-Three MCP tools on `kirocrew-dashboard`, three strict-internal routes, one config
+Five MCP tools on `kirocrew-dashboard`, five strict-internal routes, one config
 switch. Every route is on `_STRICT_INTERNAL_API_PATHS`; an unlisted one is
 unreachable in production because the caller's `X-Internal-Secret` is ignored.
 
@@ -17,6 +18,8 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 |------|-------|--------------|
 | `session_create` | `POST /api/session-control/create` | Open a new, empty session in the caller's workspace |
 | `session_stop` | `POST /api/session-control/stop` | Stop another session's in-flight turn |
+| `session_close` | `POST /api/session-control/close` | Close (archive) another session, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
+| `session_send` | `POST /api/session-control/send` | Deliver a message that another session runs as its next turn |
 | `session_read_message` | `GET /api/session-control/read` | Read another session's transcript tail + liveness |
 
 **One verb here writes into another session's conversation: `session_send`.**
@@ -58,10 +61,10 @@ and its keys are what `target` accepts.
 
 ## Authorization
 
-Deny-by-default, and checked in **one** place — `authorize_target` — for the two
-verbs that take a target, so a guard cannot be present on `stop` and missing on
-`read`. (`session_create` has no target to authorize; it checks the caller's own
-eligibility with the same refusals.) Every refusal is recorded in the SEL as
+Deny-by-default, and checked in **one** place — `authorize_target` — for every
+verb that takes a target (`stop`, `send`, `close`, `read`), so a guard cannot be
+present on one and missing on another. (`session_create` has no target to
+authorize; it checks the caller's own eligibility with the same refusals.) Every refusal is recorded in the SEL as
 `session_control.<op>` with `outcome=denied`, so an attempt to reach a session
 that is out of bounds is visible after the fact even though nothing happened.
 
@@ -91,17 +94,17 @@ Two notes on scope:
 - **Only sessions the dashboard currently holds are addressable.** A closed tab
   is out of reach on purpose — waking one would resurrect a conversation the
   user put away. This is narrower than `list_sessions`, which also lists history.
-- **All three tools are on `CHANNEL_AGENT_BLOCKED_TOOLS`, including the read.** A
-  channel agent is contained to channel posts, and session control crosses that
-  boundary in both directions: a stop reaches the user through one of their
-  dashboard transcripts, and `session_read_message` pulls a private dashboard
-  conversation into a channel other humans can see. Containment is about what
-  crosses the boundary, not about who writes, so the read is blocked alongside
-  the rest. `session_create` earns its place for a different reason: it writes
-  nothing into an existing conversation, but it puts a persistent,
-  sidebar-visible session outside that containment.
+- **Every target-taking tool is on `CHANNEL_AGENT_BLOCKED_TOOLS`, including the
+  read.** A channel agent is contained to channel posts, and session control
+  crosses that boundary in both directions: a stop or close reaches the user
+  through one of their dashboard transcripts, and `session_read_message` pulls a
+  private dashboard conversation into a channel other humans can see. Containment
+  is about what crosses the boundary, not about who writes, so the read is
+  blocked alongside the rest. `session_create` earns its place for a different
+  reason: it writes nothing into an existing conversation, but it puts a
+  persistent, sidebar-visible session outside that containment.
 
-All three tools additionally require a **signed** caller identity
+All these tools additionally require a **signed** caller identity
 (`_resolve_session_key_strict`), not the lenient `/proc` ancestor walk. A
 subagent spawned by `spawn_run` lives under its parent slot's process tree, so
 the walk resolves it to the parent — and since authorization here is entirely
@@ -177,13 +180,98 @@ backwards, so they would be skipped permanently while the response read as
 "nothing new". A cursor exactly AT the end is not stale and still returns an empty
 window.
 
+## Stopping is safe to re-send
+
+The Stop button escalates: a second press while the first cancel is still pending
+hard-kills the turn, and the hard-kill path clears the slot's queue and its pending
+steers. That is right for a button, where the second press means a person watched
+the cooperative stop fail to take. It is wrong for an RPC, where a client that got
+no response inside its 30s request timeout re-sends the same request — so on the
+button's semantics a timeout retry would silently get the destructive variant of a
+verb the caller asked for once, and the queued work would be gone with nothing
+saying a retry rather than a decision caused it (issue #5074).
+
+`session_stop` therefore withholds the escalation for a call it cannot tell apart
+from a retry. `stop_retry.allow_escalation` records the first stop a caller makes
+against a target and answers `False` for any repeat inside `WINDOW_SECS` (120s);
+`stop_slot_turn` takes that as `escalate=False` and lets the repeat fall through to
+its existing "stop already in progress" no-op.
+
+Three properties are worth stating because each one is a way this could have gone
+wrong:
+
+- **Only the escalation is withheld, never the stop.** A repeat that finds the
+  target running again soft-stops it exactly as a first call would. The window
+  suppresses a kill, not a cancel.
+- **The window is anchored at the first stop and is not extended by the repeats it
+  absorbs.** So escalation is suppressed for at most one window: a client that
+  retries forever is absorbed, and after 120s a stop that STILL finds the target
+  winding down escalates — which is the case where escalating is the right answer.
+  A sliding window would put a hard kill out of reach of any caller polling faster
+  than the window.
+- **The key is (caller, target), not the target alone.** A retry comes from the
+  caller that made the original request; two different callers stopping one target
+  are two independent decisions, and keying on the target would suppress the second
+  caller's FIRST call — removing escalation from the RPC rather than making a retry
+  safe.
+
+The window is sized against what it has to outlast rather than picked: below the
+30s request timeout it would expire before the retry it exists to absorb. Nothing
+durable backs it, for `create_rate_limit`'s reason — a restart buys a caller one
+window, not a capability.
+
+The caller is told which of the two no-op facts it hit. `already_stopping`
+separates "was never running" from "its cancel is still in flight", because a
+de-duplicated retry reaches that reply routinely and rendering both as "nothing to
+stop" would tell the second caller the opposite of what happened.
+
+## Closing archives, and re-checks at the point of no return
+
+`session_close` is the tool-side equivalent of the tab ✕. It is **non-destructive**:
+the conversation is saved to history (`closed=True`) and can be reopened later, so
+closing dismisses the LIVE tab, it does not delete the transcript. It is a
+strictly heavier act than `session_stop` — an in-flight turn is cancelled first
+and its work discarded — so the tool description tells the caller to read the
+session before closing it. It reuses the dashboard's own close path
+(`close_slot`), the same sequence the ✕ button runs: a synchronous tombstone,
+auto-nudge-loop retirement BEFORE the awaits so no nudge resurrects the tab, the
+owning app's close hook with rollback, persist-as-closed, and per-tab session
+teardown. Its three failure modes surface as their own codes at HTTP 500
+(`nudge_retire_failed`, `app_close_hook_failed`, `history_save_failed`), which is
+why the routes now forward a 500 rather than degrading it to 400.
+
+**Authorization is re-asserted at the point of no return.** `authorize_target`
+runs before `close_slot`, but `close_slot` then awaits — auto-nudge retirement
+takes the AutoNudge lock, and the app hook awaits external work — and a target
+that was unmirrored and unlinked at admission can gain a channel mirror or link
+in that window. Archiving a now-channel-backed session it was never allowed to
+reach is exactly the boundary the `mirrored_target` / `linked_session_target`
+guards hold, so `close_target` passes a SYNCHRONOUS `pre_pop_check` that runs
+immediately before the slot is popped, after every await (the nudge retirements
+and the app hook). It re-runs `authorize_target` with `skip_enabled_check=True` —
+omitting the one part of that gate that can read config on the loop, since the
+feature was already confirmed enabled at admission and disabling it mid-close is
+not a containment boundary — and compares the re-resolved slot to the one being
+closed **by identity**: a concurrent close-and-reopen can re-mint the same key
+onto a different session, and popping that would tear down the replacement while
+saving the stale slot (409 `target_replaced`). Being synchronous is the whole
+point — there is no suspension between the last retirement, this re-check, and
+the pop, so nothing (a channel mirror/link landing, a re-mint, or a racing
+`monitor_start` arming a loop) can change between the final authorization and the
+archival; an awaited re-check, by contrast, reopens exactly those windows. Any
+refusal aborts the close, rolls back the retired nudge loop, and surfaces as the
+guard's own status. This is the same "re-gate adjacent to the mutation, comparing
+identity not presence" discipline `create_session` uses for its slot allocation,
+and the same theme as the queued-drain re-check (#5911). The human ✕ path passes
+no check — the person owns the tab and closes it unconditionally.
+
 ## Configuration
 
-`agent.session_control` (bool, default **false**). Off makes all three tools
-refuse with a message naming the switch, so an agent that has not been granted it
+`agent.session_control` (bool, default **false**). Off makes every tool refuse
+with a message naming the switch, so an agent that has not been granted it
 reports why rather than failing silently.
 
-Default-off is the deliberate part. The three tools ride on the existing
+Default-off is the deliberate part. The tools ride on the existing
 assignable `kirocrew-dashboard` server rather than a new one, so an operator who
 had already assigned that server to an agent for folder organization would
 otherwise find that agent able to read peer transcripts and stop peer turns purely

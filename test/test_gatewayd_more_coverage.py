@@ -764,6 +764,44 @@ class TestBackendGoneHandling:
         assert reader.remaining == 1, "a terminal error must close the connection"
 
     @pytest.mark.asyncio
+    async def test_a_refused_replacement_tells_the_session_why(
+        self, peer_ok, monkeypatch
+    ):
+        """A validated-and-rejected replacement is not the same event as an
+        unrecoverable spawn, and the client is the only party that could act on
+        knowing the tool set moved — the log and the audit trail are not visible
+        to it."""
+        backend = _fake_backend()
+        backend.forward_from_stub = AsyncMock(  # type: ignore[method-assign]
+            side_effect=BackendGone("stdin closed")
+        )
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(backend, True)))
+        monkeypatch.setattr(
+            gw,
+            "_respawn_backend_for_stub",
+            AsyncMock(
+                side_effect=gw._ReplacementRefused(
+                    "the MCP server was replaced and its tool set changed "
+                    "(gone=read_file); this session's tools are stale"
+                )
+            ),
+        )
+        reader = _ScriptedReader(
+            _register_frame(),
+            {"jsonrpc": "2.0", "id": 9, "method": "tools/list"},
+            {"type": "ping"},
+        )
+        writer = _FakeWriter()
+
+        await _handle(reader, writer, _fake_pool())
+
+        last = writer.frames()[-1]
+        assert last["id"] == 9
+        assert "tool set changed" in last["error"]["message"]
+        assert "gone=read_file" in last["error"]["message"]
+        assert reader.remaining == 1, "a terminal error must close the connection"
+
+    @pytest.mark.asyncio
     async def test_successful_respawn_replays_the_captured_initialize_and_retries(
         self, peer_ok, monkeypatch
     ):

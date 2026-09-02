@@ -24,10 +24,10 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_KIRO_CREDITS,
     ACP_BACKENDS_KNOWN,
-    ACP_BACKENDS_SELECTABLE,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
 )
+from kiro_crew.acp_backends import selectable_backends
 
 
 @pytest.mark.parametrize("backend", [ACP_BACKEND_OPENCODE, ACP_BACKEND_PI])
@@ -45,7 +45,7 @@ class TestOpenCodeAndPiAreAdaptedOnly:
 
 def test_pi_is_known_but_withheld_from_the_initial_preview() -> None:
     assert ACP_BACKEND_PI in ACP_BACKENDS_KNOWN
-    assert ACP_BACKEND_PI not in ACP_BACKENDS_SELECTABLE
+    assert ACP_BACKEND_PI not in selectable_backends()
 
 
 def test_opencode_is_known_and_admitted() -> None:
@@ -56,7 +56,7 @@ def test_opencode_is_known_and_admitted() -> None:
     driven end to end (see ``acp/types.py``'s own comment above
     ``ACP_BACKENDS_SELECTABLE`` for the verification notes)."""
     assert ACP_BACKEND_OPENCODE in ACP_BACKENDS_KNOWN
-    assert ACP_BACKEND_OPENCODE in ACP_BACKENDS_SELECTABLE
+    assert ACP_BACKEND_OPENCODE in selectable_backends()
 
 
 class TestPiStaysPermissionRequest:

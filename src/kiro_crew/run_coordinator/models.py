@@ -337,6 +337,13 @@ class RunCoordinator(Protocol):
         process_owned: bool,
     ) -> CoordinatorResult[RunRecord]: ...
 
+    async def clear_recovered_process(
+        self,
+        run_id: str,
+        fence: RunFence,
+        expected_version: int,
+    ) -> CoordinatorResult[RunRecord]: ...
+
     async def complete(
         self, completion: RunCompletion, fence: RunFence, expected_version: int
     ) -> CoordinatorResult[OutboxEvent]: ...

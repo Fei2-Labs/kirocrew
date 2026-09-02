@@ -46,6 +46,10 @@ vi.mock('../api/client', () => ({
 
 vi.mock('../hooks/useTheme', () => ({ useTheme: () => ({ theme: 'dark' }) }))
 
+// happy-dom cannot drive real Radix menus — swap in the repo's stateful mock
+// so the launchpad tile's overflow menu (where Enable now lives) opens.
+vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
+
 // Render catalog KEYS, not English. The trust-modal strings are authored in the
 // locale catalogs; asserting on their English would make this suite a copy of
 // the copywriting and break on any reword. Interpolated values are appended so
@@ -165,11 +169,16 @@ function renderDetailFromGet(name = THIRD_PARTY.name) {
  *
  * The Library page (/apps/library) is the surface that offers it:
  * FeaturedSpotlight/AppListRow only render Enable for a hidden BUILT-IN, so an
- * installed-but-disabled third-party app is enabled from its installed card
- * (or the detail page).
+ * installed-but-disabled third-party app is enabled from its launchpad tile's
+ * overflow menu (the tile caps its action row at two peers — Open plus the
+ * menu — so Enable lives behind the MoreHorizontal trigger).
  */
 async function clickEnable() {
-  const btn = await screen.findByRole('button', { name: /installedAppCard\.enable$/ })
+  const trigger = await screen.findByRole('button', {
+    name: `pages.libraryPage.tile_more_actions ${THIRD_PARTY.displayName}`,
+  })
+  fireEvent.click(trigger)
+  const btn = await screen.findByRole('menuitem', { name: /installedAppCard\.enable$/ })
   fireEvent.click(btn)
   return btn
 }

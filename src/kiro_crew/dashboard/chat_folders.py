@@ -13,6 +13,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_ids
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.create_rate_limit import FOLDER_CREATE, allow_create
 from kiro_crew.dashboard.state import DashboardState
@@ -119,6 +120,38 @@ _FOLDER_COLOR_PALETTE = frozenset(
 def _is_valid_folder_color(s: str) -> bool:
     """True for a palette color value (lowercase hex, allowlisted)."""
     return s in _FOLDER_COLOR_PALETTE
+
+
+def _validate_folder_tags(state: DashboardState, raw: Any) -> tuple[list[str] | None, str | None]:
+    """Validate a folder ``tags`` payload against the tag vocabulary.
+
+    Returns ``(clean_ids, None)`` on success or ``(None, error)`` on rejection.
+    Only the payload SHAPE is rejected (``tags`` must be an array) — matching
+    ``api_chat_slot_tags``, the sibling this endpoint mirrors, unknown ids and
+    non-string entries are silently FILTERED, not 400ed. That leniency is
+    load-bearing: a dangling id can legitimately exist on a folder (the
+    acknowledged best-effort strip failure in ``api_chat_tag_delete``), and a
+    strict endpoint would make every subsequent save of that folder fail —
+    the "permanently uneditable folder" class. Filtering at the write means a
+    stale reference is shed on the next save instead of bricking it.
+    ``clean_ids`` is deduped preserving first-seen order, with no count cap
+    (vocabulary membership plus dedupe already bounds the list). An empty list
+    is valid — it means "no tags", the same way an absent ``color`` means
+    "default color".
+
+    Only the payload SHAPE is owned here (``tags`` must be an array → 400,
+    matching the sibling ``api_chat_slot_tags``); everything after the shape
+    check DELEGATES to ``validate_folder_tag_ids`` — the single definition of
+    a usable folder tag id — so the filter-not-400 leniency, dedupe, string
+    guard, and the authority-gated fail-open vocabulary intersection cannot
+    drift from the inheritance paths that read these same ids back. See that
+    helper's docstring for why filtering (not 400) and failing open (not
+    intersecting an unknown vocabulary) are both load-bearing.
+    """
+    if not isinstance(raw, list):
+        return None, "tags must be an array"
+
+    return validate_folder_tag_ids(raw, state), None
 
 
 async def generate_emoji_for_name(state: DashboardState, name: str) -> str:
@@ -482,6 +515,19 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
             {"error": "color must be one of the folder palette values", "code": "color_invalid"},
             status=400,
         )
+    # Organizational tags copied onto every new chat filed into this folder.
+    # Validated exactly like the slot-tags endpoint (ids from the live
+    # vocabulary), and included in the folder dict only when non-empty — the
+    # same optional-key shape as `color`, so a tagless folder keeps the record
+    # it has on disk today.
+    folder_tags: list[str] = []
+    if "tags" in body:
+        clean_tags, tags_err = _validate_folder_tags(state, body.get("tags"))
+        if tags_err or clean_tags is None:
+            return web.json_response(
+                {"error": tags_err or "tags invalid", "code": "tags_invalid"}, status=400
+            )
+        folder_tags = clean_tags
     folder = {
         "id": uuid.uuid4().hex[:12],
         "name": name,
@@ -494,6 +540,8 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
     }
     if color:
         folder["color"] = color
+    if folder_tags:
+        folder["tags"] = folder_tags
     # Never from the body: a caller that could name its own owner could name
     # someone else's. Written only when an app is calling, so the person's rows
     # keep the shape they have on disk today and "absent means the person"
@@ -527,7 +575,23 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
         folders.append(folder)
         return True, ""
 
-    create_err = await state.mutate_folders(_append)
+    if folder_tags:
+        # The AUTHORITATIVE intersection runs here, at the point of application,
+        # under ``tags_write_lock`` — the invariant every tag consumer follows
+        # (see api_chat_slot_tags / the channel filing): a tag deletion
+        # committing between the early shape check and this write must not be
+        # persisted onto the new folder, and the strip pass a deletion runs
+        # cannot see a folder that is not yet in the store.
+
+        async with tags_write_lock(state):
+            refreshed, _ = _validate_folder_tags(state, folder_tags)
+            if refreshed:
+                folder["tags"] = refreshed
+            else:
+                folder.pop("tags", None)
+            create_err = await state.mutate_folders(_append)
+    else:
+        create_err = await state.mutate_folders(_append)
     if create_err == "folder_cap_reached":
         return web.json_response(
             {
@@ -660,6 +724,13 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
                 status=400,
             )
         changes["color"] = color_val
+    if "tags" in body:
+        # Vocabulary-constrained tag list. An empty list clears the folder's
+        # tags; anything else must be ids that exist in the tag vocabulary.
+        clean_tags, tags_err = _validate_folder_tags(state, body["tags"])
+        if tags_err:
+            return web.json_response({"error": tags_err, "code": "tags_invalid"}, status=400)
+        changes["tags"] = clean_tags
     # All fields validated — apply atomically under the store lock, re-finding
     # the folder there so a concurrent delete cannot resurrect it, and
     # re-deciding the tree-shape rules there so two concurrent reparents cannot
@@ -696,9 +767,24 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
         target.update(changes)
         if not target.get("color"):
             target.pop("color", None)
+        if not target.get("tags"):
+            # Empty list clears the key entirely, so "absent means no tags"
+            # stays the single on-disk representation (mirrors color above).
+            target.pop("tags", None)
         return True, ""
 
-    err = await state.mutate_folders(_apply)
+    if "tags" in changes:
+        # Same point-of-application rule as create: the authoritative
+        # intersection and the store write are one critical section under
+        # ``tags_write_lock``, so a concurrent tag deletion cannot slip a
+        # just-deleted id past the strip pass and back onto this folder.
+
+        async with tags_write_lock(state):
+            refreshed, _ = _validate_folder_tags(state, changes["tags"])
+            changes["tags"] = refreshed if refreshed is not None else []
+            err = await state.mutate_folders(_apply)
+    else:
+        err = await state.mutate_folders(_apply)
     if err == "not_found":
         # Deleted between the validation above and acquiring the store lock.
         return web.json_response({"error": "not found", "code": "folder_not_found"}, status=404)

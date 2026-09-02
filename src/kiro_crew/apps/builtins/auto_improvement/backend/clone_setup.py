@@ -17,13 +17,20 @@ import ipaddress
 import logging
 import os
 import re
+import secrets
 import shutil
 import socket
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from kiro_crew.platform_compat import (
+    first_linked_ancestor,
+    is_link_or_junction,
+    rmtree_force,
+)
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from ..spine.git_safety import GIT_SAFE_CONFIG, require_pinned
@@ -46,6 +53,262 @@ _MAX_URL_LEN = 400
 
 #: The cross-cutting push-disable sentinel — matches the spine's isolation check.
 DISABLED_NO_PUSH = "DISABLED_NO_PUSH"
+
+_GIT_REPOSITORY_ENV_KEYS = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NAMESPACE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_TEMPLATE_DIR",
+        "GIT_WORK_TREE",
+    }
+)
+
+
+def _git_env(*, network_protocol: str = "") -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _GIT_REPOSITORY_ENV_KEYS
+        and not key.startswith("GIT_CONFIG_KEY_")
+        and not key.startswith("GIT_CONFIG_VALUE_")
+    }
+    env.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_ALLOW_PROTOCOL": network_protocol,
+        }
+    )
+    if not network_protocol:
+        env.update(
+            {
+                "GIT_PROTOCOL_FROM_USER": "0",
+                "GIT_NO_LAZY_FETCH": "1",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+            }
+        )
+    return env
+
+
+def _origin_urls(repo: Path, *, push: bool) -> list[str] | None:
+    key = "remote.origin.pushurl" if push else "remote.origin.url"
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                *_GIT_SAFE_CONFIG,
+                "config",
+                "--local",
+                "--no-includes",
+                "--get-all",
+                key,
+            ],
+            capture_output=True,
+            timeout=30,
+            shell=False,
+            env=_git_env(),
+            **UTF8_TEXT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode == 1:
+        return []
+    if proc.returncode != 0:
+        return None
+    return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+
+
+def _repository_is_safe(repo: Path) -> bool:
+    git_dir = repo / ".git"
+    if first_linked_ancestor(git_dir) or is_link_or_junction(git_dir):
+        return False
+    if not git_dir.is_dir():
+        return False
+    for directory in (
+        git_dir / "objects",
+        git_dir / "objects" / "info",
+        git_dir / "info",
+    ):
+        if first_linked_ancestor(directory) or is_link_or_junction(directory):
+            return False
+    for forbidden in (
+        git_dir / "commondir",
+        git_dir / "config.worktree",
+        git_dir / "objects" / "info" / "alternates",
+        git_dir / "objects" / "info" / "http-alternates",
+        git_dir / "info" / "grafts",
+    ):
+        if os.path.lexists(forbidden):
+            return False
+    object_dir = git_dir / "objects"
+    errors: list[OSError] = []
+    for current, directories, files in os.walk(
+        git_dir, topdown=True, followlinks=False, onerror=errors.append
+    ):
+        current_path = Path(current)
+        for name in directories:
+            if is_link_or_junction(current_path / name):
+                return False
+        for name in files:
+            path = current_path / name
+            if is_link_or_junction(path):
+                return False
+            try:
+                metadata = path.lstat()
+            except OSError:
+                return False
+            if not stat.S_ISREG(metadata.st_mode):
+                return False
+            if not path.is_relative_to(object_dir) and metadata.st_nlink != 1:
+                return False
+    if errors:
+        return False
+
+    unsafe_keys = (
+        r"^(include\.path|includeif\..*\.path|"
+        r"url\..*\.(insteadof|pushinsteadof)|"
+        r"credential\..*|"
+        r"core\.(alternaterefscommand|askpass|attributesfile|editor|excludesfile|fsmonitor|"
+        r"gitproxy|hookspath|pager|sshcommand|worktree)|"
+        r"diff\..*|difftool\..*|"
+        r"filter\..*\.(clean|process|smudge)|gpg\..*|"
+        r"merge\..*\.driver|mergetool\..*|sequence\.editor|ssh\..*|"
+        r"https?\..*|protocol\..*|"
+        r"remote\..*\.(proxy|receivepack|uploadpack)|"
+        r"extensions\.worktreeconfig)$"
+    )
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                *_GIT_SAFE_CONFIG,
+                "config",
+                "--local",
+                "--no-includes",
+                "--name-only",
+                "--get-regexp",
+                unsafe_keys,
+            ],
+            capture_output=True,
+            timeout=30,
+            shell=False,
+            env=_git_env(),
+            **UTF8_TEXT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 1
+
+
+_UNSAFE_CLONE_RETENTION = 3
+
+
+def _prune_unsafe_clone_retirements(parent: Path, repo_name: str, current: Path) -> None:
+    """Keep the current incident plus the two newest prior retired clones."""
+    prefix = f".{repo_name}.unsafe-"
+    try:
+        candidates = [
+            path
+            for path in parent.iterdir()
+            if path.name.startswith(prefix)
+            and path != current
+            and not is_link_or_junction(path)
+            and path.is_dir()
+        ]
+        candidates.sort(key=lambda path: path.lstat().st_mtime_ns, reverse=True)
+    except OSError:
+        logger.warning("could not inventory retired clones under %s", parent)
+        return
+    for stale in candidates[_UNSAFE_CLONE_RETENTION - 1 :]:
+        if not rmtree_force(stale):
+            logger.warning("could not prune retired clone %s", stale)
+
+
+def _retire_unsafe_clone(repo: Path) -> Path | None:
+    """Atomically remove an unsafe clone from its canonical name without Git.
+
+    This is an incident boundary, not setup recovery: it runs only when a clone that
+    was safe before an agent/build step fails validation afterwards. Renaming the root
+    directory does not dereference the now-hostile Git metadata, prevents a later run
+    from adopting a rejected provisional commit, and preserves bytes for diagnosis.
+    """
+    repo = Path(repo)
+    parent = repo.parent
+    if (
+        first_linked_ancestor(parent)
+        or is_link_or_junction(parent)
+        or is_link_or_junction(repo)
+        or not repo.is_dir()
+    ):
+        return None
+    container = parent / f".{repo.name}.unsafe-{secrets.token_hex(8)}"
+    retired = container / repo.name
+    try:
+        if os.name == "nt":
+            # mkdir is the no-replace reservation. Windows rename cannot replace a
+            # non-empty destination and never follows a destination symlink.
+            container.mkdir(mode=0o700)
+            os.rename(repo, retired)
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            parent_fd = os.open(parent, flags)
+            container_fd = -1
+            try:
+                os.mkdir(container.name, mode=0o700, dir_fd=parent_fd)
+                container_fd = os.open(container.name, flags, dir_fd=parent_fd)
+                # Both names are descriptor-relative. If a same-UID racer creates
+                # `retired` first, rename either replaces only that directory entry
+                # (never its target) or fails on a non-empty directory.
+                os.rename(
+                    repo.name,
+                    repo.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=container_fd,
+                )
+            finally:
+                if container_fd >= 0:
+                    os.close(container_fd)
+                os.close(parent_fd)
+    except OSError:
+        logger.exception("could not retire unsafe clone %s", repo)
+        try:
+            container.rmdir()
+        except OSError:
+            pass
+        return None
+    _prune_unsafe_clone_retirements(parent, repo.name, container)
+    return retired
+
+
+def _push_disabled(repo: Path) -> bool:
+    return _origin_urls(repo, push=True) == [DISABLED_NO_PUSH] and _origin_urls(
+        repo, push=False
+    ) == [DISABLED_NO_PUSH]
+
+
+def _repository_is_isolated(repo: Path) -> bool:
+    """True only when metadata/config is safe and every origin URL is disabled."""
+    return _repository_is_safe(repo) and _push_disabled(repo)
 
 
 @dataclass
@@ -152,60 +415,93 @@ def validate_target_url(url: str) -> tuple[CloneSpec | None, str]:
 
 
 def setup_safe_clone(url: str, scratch_root: Path, *, timeout_s: int = 300) -> tuple[dict, str]:
-    """Validate ``url`` and clone it into ``scratch_root`` with push disabled.
+    """Validate and install/reuse the canonical push-disabled clone.
 
-    Returns ``(result_dict, "")`` on success or ``({}, reason)`` on a user-input
-    problem. Idempotent: an existing clone of the same origin is reused after
-    re-asserting push-disabled. Never follows a symlinked destination — a
-    symlinked scratch dir must not let ``_disable_push`` rewrite a foreign repo.
+    Reuse attests only enforceable properties: canonical location, safe Git
+    metadata/config, and exactly one disabled fetch/push URL. Clone contents stay
+    agent-writable by design and are never represented as cryptographically trusted.
     """
     spec, err = validate_target_url(url)
     if not spec:
         return {}, err
+    if is_link_or_junction(scratch_root) or first_linked_ancestor(scratch_root):
+        return {}, "Clone scratch directory is under a link or junction (refused for safety)."
 
     scratch_root.mkdir(parents=True, exist_ok=True)
+    if is_link_or_junction(scratch_root) or first_linked_ancestor(scratch_root):
+        return {}, "Clone scratch directory failed safety verification."
     dest = scratch_root / spec.dir_name
 
-    if os.path.islink(dest):
-        return {}, f"Destination is a symlink (refused for safety): {dest}"
+    if is_link_or_junction(dest):
+        return {}, f"Destination is a link or junction (refused for safety): {dest}"
 
     git_dir = dest / ".git"
-    if not os.path.islink(git_dir) and git_dir.is_dir():
-        actual_origin = subprocess.run(
-            ["git", "-C", str(dest), "remote", "get-url", "origin"],
-            capture_output=True,
-            timeout=30,
-            shell=False,
-            **UTF8_TEXT,
-        ).stdout.strip()
-        if actual_origin and actual_origin != spec.clone_url:
+    if is_link_or_junction(git_dir):
+        return {}, f"Existing clone at {dest} has a linked Git directory — refusing reuse."
+    if git_dir.is_dir():
+        if not _repository_is_safe(dest):
+            return {}, f"Existing clone at {dest} failed Git metadata safety verification."
+        origins = _origin_urls(dest, push=False)
+        if origins is None or len(origins) != 1:
+            return {}, f"Existing clone at {dest} has ambiguous origin URLs — refusing reuse."
+        actual_origin = origins[0]
+        if actual_origin not in {DISABLED_NO_PUSH, spec.clone_url}:
             return {}, (
                 f"Existing clone at {dest} has origin {actual_origin!r}, which does not "
                 f"match the requested {spec.clone_url!r} — refusing to reuse it."
             )
         _disable_push(dest)
-        return _ok(spec, dest, reused=True), ""
+        result = _ok(spec, dest, reused=True)
+        if not result.get("push_disabled"):
+            return {}, "clone push could not be disabled — refusing reuse"
+        return result, ""
 
     if dest.exists():
         return {}, f"Destination already exists and is not a git repo: {dest}"
 
-    # argv list, shell=False, clone_url rebuilt from validated components.
+    protocol = "ssh" if spec.clone_url.startswith("git@") else urlparse(spec.clone_url).scheme
+    if protocol not in {"file", "https", "ssh"}:
+        return {}, "validated clone URL has no supported transport"
     try:
         proc = subprocess.run(
-            ["git", "clone", "--origin", "origin", spec.clone_url, str(dest)],
+            [
+                "git",
+                *_GIT_SAFE_CONFIG,
+                "-c",
+                "credential.helper=!gh auth git-credential",
+                "clone",
+                "--origin",
+                "origin",
+                spec.clone_url,
+                str(dest),
+            ],
             capture_output=True,
             timeout=timeout_s,
             shell=False,
+            env=_git_env(network_protocol=protocol),
             **UTF8_TEXT,
         )
     except subprocess.TimeoutExpired:
+        rmtree_force(dest)
         return {}, f"git clone timed out after {timeout_s}s."
+    except OSError as exc:
+        # No child started, so this setup attempt cannot own anything at `dest`.
+        # Do not race-delete a path another same-UID process may have created.
+        return {}, f"git clone could not start: {exc}"
     if proc.returncode != 0:
         tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
+        rmtree_force(dest)
         return {}, f"git clone failed: {tail[0][:200]}"
+    if not _repository_is_safe(dest):
+        rmtree_force(dest)
+        return {}, "cloned repository failed Git metadata safety verification"
 
     _disable_push(dest)
-    return _ok(spec, dest, reused=False), ""
+    result = _ok(spec, dest, reused=False)
+    if not result.get("push_disabled"):
+        rmtree_force(dest)
+        return {}, "clone push could not be disabled — refusing"
+    return result, ""
 
 
 #: Shape check for a user-selected branch: allowlisted charset, no leading dash
@@ -232,8 +528,12 @@ def list_clone_branches(clone: Path, *, timeout_s: int = 30) -> tuple[list[str],
     """Enumerate an existing clone's branches, default/HEAD first. Read-only, no
     network fetch, operates only on the server-controlled clone dir."""
     clone = Path(clone)
-    if not (clone / ".git").is_dir() and not (clone / ".git").is_file():
+    if not (clone / ".git").is_dir():
         return [], f"Not a git clone: {clone}"
+    if not _repository_is_safe(clone):
+        return [], "clone Git metadata failed safety verification"
+    if not _push_disabled(clone):
+        return [], "clone is not push-disabled"
     proc = subprocess.run(
         [
             "git",
@@ -247,6 +547,7 @@ def list_clone_branches(clone: Path, *, timeout_s: int = 30) -> tuple[list[str],
         capture_output=True,
         timeout=timeout_s,
         shell=False,
+        env=_git_env(),
         **UTF8_TEXT,
     )
     if proc.returncode != 0:
@@ -272,6 +573,7 @@ def list_clone_branches(clone: Path, *, timeout_s: int = 30) -> tuple[list[str],
         capture_output=True,
         timeout=timeout_s,
         shell=False,
+        env=_git_env(),
         **UTF8_TEXT,
     )
     default = (head.stdout or "").strip()
@@ -436,12 +738,43 @@ def _disable_push(repo: Path) -> None:
     Idempotent and best-effort across git versions: the caller re-verifies via
     :func:`_ok` / ``assert_push_disabled`` and fails closed if either url survives.
     """
-    for extra in (["--push"], []):
+    env = _git_env()
+    for key in ("remote.origin.pushurl", "remote.origin.url"):
         subprocess.run(
-            ["git", "-C", str(repo), "remote", "set-url", *extra, "origin", DISABLED_NO_PUSH],
+            [
+                "git",
+                "-C",
+                str(repo),
+                *_GIT_SAFE_CONFIG,
+                "config",
+                "--local",
+                "--no-includes",
+                "--unset-all",
+                key,
+            ],
             capture_output=True,
             timeout=30,
             shell=False,
+            env=env,
+            **UTF8_TEXT,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                *_GIT_SAFE_CONFIG,
+                "config",
+                "--local",
+                "--no-includes",
+                "--add",
+                key,
+                DISABLED_NO_PUSH,
+            ],
+            capture_output=True,
+            timeout=30,
+            shell=False,
+            env=env,
             **UTF8_TEXT,
         )
 
@@ -468,6 +801,10 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
     bare = branch.split("/", 1)[1] if branch.startswith("origin/") else branch
     if not bare or not is_valid_branch_name(bare):
         return False, f"invalid branch name: {branch!r}"
+    if not _repository_is_safe(clone):
+        return False, "clone Git metadata failed safety verification"
+    if not _push_disabled(clone):
+        return False, "clone is not push-disabled"
 
     def _run(*args: str, tmo: int = timeout_s) -> subprocess.CompletedProcess:
         # Harden every host-side git over this clone: `checkout -B` below runs `post-checkout`
@@ -482,10 +819,18 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
         # Raised by the Opus 5 review.
         require_pinned(clone)
         return subprocess.run(
-            ["git", "-C", str(clone), *_GIT_SAFE_CONFIG, *args],
+            [
+                "git",
+                "-C",
+                str(clone),
+                f"--work-tree={clone}",
+                *_GIT_SAFE_CONFIG,
+                *args,
+            ],
             capture_output=True,
             timeout=tmo,
             shell=False,
+            env=_git_env(),
             **UTF8_TEXT,
         )
 
@@ -533,32 +878,8 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
 
 
 def _ok(spec: CloneSpec, dest: Path, *, reused: bool) -> dict:
-    """Report success only after confirming push is actually disabled (fail closed)."""
-    push = subprocess.run(
-        ["git", "-C", str(dest), "remote", "get-url", "--push", "origin"],
-        capture_output=True,
-        timeout=30,
-        shell=False,
-        **UTF8_TEXT,
-    )
-    fetch = subprocess.run(
-        ["git", "-C", str(dest), "remote", "get-url", "origin"],
-        capture_output=True,
-        timeout=30,
-        shell=False,
-        **UTF8_TEXT,
-    )
-
-    def _neutral(proc: subprocess.CompletedProcess) -> bool:
-        url = (proc.stdout or "").strip()
-        return proc.returncode == 0 and (
-            (not url) or ("DISABLED" in url.upper()) or ("NO_PUSH" in url.upper())
-        )
-
-    # BOTH urls must be neutral. A live fetch url is a live push target
-    # (`git push "$(git remote get-url origin)"`), so checking only the push url
-    # reported "disabled" for a clone that could still write to the remote.
-    push_disabled = _neutral(push) and _neutral(fetch)
+    """Report success only after every origin URL is exactly the sentinel."""
+    push_disabled = _push_disabled(dest)
     return {
         "ok": True,
         "display": spec.display,

@@ -237,10 +237,41 @@ describe("first-download installer design contract", () => {
       /!macro customFinishPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage[\s\S]*?!insertmacro MUI_PAGE_FINISH/
     );
     const startAppContract = /Function StartApp[\s\S]*?!define MUI_FINISHPAGE_RUN_FUNCTION "StartApp"/;
+    // StartApp may diverge from electron-builder's locked template in EXACTLY
+    // ONE expression: the launch target. Upstream launches $launchLink, which
+    // installSection.nsh resolves to the Start Menu shortcut when one exists --
+    // and an update does not necessarily repoint that shortcut, because
+    // registryAddInstallInfo records KeepShortcuts="true". A shortcut left
+    // naming a previous install root makes the post-update relaunch start the
+    // OLD executable, which is the update loop this diverges to prevent. So the
+    // assertion rewrites our launch line back to upstream's and demands
+    // equality: the one intended difference is pinned, and any OTHER drift from
+    // the template still fails here.
+    const oursStartApp = normalizedNsisBlock(installer, startAppContract);
+    const upstreamStartApp = normalizedNsisBlock(assistedInstallerTemplate, startAppContract);
+    const oursLaunch =
+      '${StdUtils.ExecShellAsUser} $0 "$INSTDIR\\${APP_EXECUTABLE_FILENAME}" "open" "$1"';
+    const upstreamLaunch = '${StdUtils.ExecShellAsUser} $0 "$launchLink" "open" "$1"';
+    assert.ok(
+      oursStartApp.includes(oursLaunch),
+      "StartApp must relaunch the executable this installer just wrote"
+    );
     assert.equal(
-      normalizedNsisBlock(installer, startAppContract),
-      normalizedNsisBlock(assistedInstallerTemplate, startAppContract),
-      "customFinishPage must retain electron-builder's locked StartApp contract"
+      oursStartApp.includes(upstreamLaunch),
+      false,
+      "StartApp must not relaunch through a shortcut an update may leave stale"
+    );
+    // Fails when a dependency upgrade changes upstream's launch line, so the
+    // divergence gets re-derived against the new template instead of silently
+    // continuing to pass against a line that no longer exists.
+    assert.ok(
+      upstreamStartApp.includes(upstreamLaunch),
+      "upstream StartApp no longer launches $launchLink -- re-derive this divergence"
+    );
+    assert.equal(
+      oursStartApp.replace(oursLaunch, upstreamLaunch),
+      upstreamStartApp,
+      "customFinishPage may diverge from the locked StartApp contract ONLY in its launch target"
     );
     assert.match(buildWorkflow, /test-windows-installer\.ps1/);
     assert.match(runtimeScript, /^\$MaxInstallSeconds = 120$/m);
@@ -289,6 +320,61 @@ describe("first-download installer design contract", () => {
     );
   });
 
+  it("bundles the voice runtime, downloads models on demand, and gates supported targets", () => {
+    const buildScript = fs.readFileSync(
+      path.join(REPO_ROOT, "packaging", "build-desktop.sh"),
+      "utf8"
+    );
+    const windowsStart = buildScript.indexOf("build_backend_windows() {");
+    const windowsEnd = buildScript.indexOf("\n# Stdlib-probe agreement gate", windowsStart);
+    assert.ok(windowsStart >= 0 && windowsEnd > windowsStart);
+    const windowsBuilder = buildScript.slice(windowsStart, windowsEnd);
+    // A model remains a deliberate one-click download, not installer payload.
+    assert.doesNotMatch(buildScript, /bundled-models|bundle_default_stt_model/);
+    // The recogniser, compressed-audio decoder, and every Python/runtime
+    // dependency are installer payload. The gate executes a hash-authenticated,
+    // immutable view of the decoder, so pip metadata alone cannot make a release pass.
+    assert.match(buildScript, /imageio-ffmpeg==0\.6\.0/);
+    assert.match(buildScript, /ERROR: no prebuilt speech recogniser for supported target/);
+    assert.match(buildScript, /macOS Intel[^\n]+legacy backend unsupported/);
+    assert.doesNotMatch(buildScript, /bundling without it/);
+    assert.match(buildScript, /from kiro_crew\.stt\.engine import probe/);
+    assert.match(buildScript, /from kiro_crew\.transcribe import _packaged_ffmpeg_version_probe/);
+    assert.match(buildScript, /decoder = _packaged_ffmpeg_version_probe\(\)/);
+    // Both halves of the decoder verdict are pinned, because collapsing them back
+    // into one boolean is the regression this shape exists to prevent.
+    // AUTHENTICITY gates the release everywhere (exit 1 -> the build stops), so
+    // pip metadata or a swapped payload still cannot publish. EXECUTABILITY does
+    // not, because it is a property of the build host rather than the artifact:
+    // an image lacking an OS library the executable load-time imports refuses it
+    // before its entry point runs, while the same bytes run for a user, so that
+    // case warns and ships (exit 2).
+    assert.match(buildScript, /raise SystemExit\(1 if not decoder\.authentic else 2\)/);
+    assert.match(buildScript, /ERROR: bundled local voice runtime cannot load/);
+    assert.match(buildScript, /authenticated but does not run on THIS host/);
+    // The Apple-Silicon decoder must ship as a PLAIN Mach-O so the app signer
+    // signs it. Sealing it as a compressed payload (#6746) made Apple's notary
+    // service decompress the member, find an unsigned executable inside, and
+    // fail the whole macOS release.
+    assert.doesNotMatch(buildScript, /seal_macos_ffmpeg_payload/);
+    assert.doesNotMatch(buildScript, /source\.with_name\(source\.name \+ "\.gz"\)/);
+    assert.match(buildScript, /do NOT re-introduce a compressed payload/);
+    assert.match(buildScript, /local_voice_runtime_gate "\$out\/bin\/python3\.12"/);
+    assert.match(windowsBuilder, /local_voice_runtime_gate "\$out\/python\.exe"/);
+
+    // Git Bash does not convert /d/a/... once an extras suffix is appended. The
+    // Windows build must pass pip a PEP 508 file URI and must not tolerate a
+    // failed recogniser install.
+    assert.match(
+      windowsBuilder,
+      /root_uri="\$\(cd "\$ROOT" && "\$out\/python\.exe" -c[\s\S]*?sys\.stdout\.write\(Path\.cwd\(\)\.as_uri\(\)\)/
+    );
+    assert.match(windowsBuilder, /"kirocrew\[voice-aws\] @ \$root_uri"/);
+    assert.match(windowsBuilder, /"kirocrew\[voice\] @ \$root_uri"/);
+    assert.doesNotMatch(windowsBuilder, /"\$ROOT\[voice(?:-aws)?\]"/);
+    assert.doesNotMatch(windowsBuilder, /if\s+!\s+[\s\S]*?kirocrew\[voice\]/);
+  });
+
   it("shows native progress for updates without adding setup decisions", () => {
     assert.deepEqual(
       [...installer.matchAll(/^LangString KiroUpdateProgress (\d+) /gm)].map((match) => Number(match[1])),
@@ -327,6 +413,237 @@ describe("first-download installer design contract", () => {
       /Function KiroAbortPre[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?Abort[\s\S]*?FunctionEnd[\s\S]*?!define MUI_PAGE_FUNCTION_ABORTWARNING KiroAbortPre/
     );
     assert.doesNotMatch(installer, /NSD_(?:Create|Kill)Timer|Sleep\s+\d+/);
+  });
+
+  it("never relocates the install root on an update", () => {
+    // electron-updater re-runs this installer with --updated against an install
+    // that by definition already exists, so KiroEnsureAppInstallDir's
+    // collision-nesting would resolve $INSTDIR to a FRESH subdirectory and put
+    // the new version beside the running one instead of over it. That leaves two
+    // parallel installs, and the post-install relaunch plus every shortcut kept
+    // by KeepShortcuts="true" go on naming the old one -- so the app comes back
+    // on the version it just updated away from and re-offers the same update
+    // forever.
+    //
+    // The guard has to be the FIRST thing the function does. The two guards
+    // after it are both downstream of one registry value: upstream reads
+    // InstallLocation into $perUserInstallationFolder /
+    // $perMachineInstallationFolder, and customInit turns those into
+    // $KiroHasPer*Installation. When that value is absent both read 0 and the
+    // update nests, which is why the update path must not depend on them.
+    const ensureInstallDir = normalizedNsisBlock(
+      installer,
+      /Function KiroEnsureAppInstallDir[\s\S]*?FunctionEnd/
+    );
+    assert.match(
+      ensureInstallDir,
+      /^Function KiroEnsureAppInstallDir\n\$\{If\} \$KiroVisibleUpdate == 1\n\$\{AndIf\} \$KiroAppExeName != ""\n\$\{AndIf\} \$\{FileExists\} "\$KiroInstallDir\\\$KiroAppExeName"\nReturn\n\$\{EndIf\}\n/,
+      "an update must return before any install-dir nesting can run, and only for a root it can prove is ours"
+    );
+    // The update bypass must stay conditional on that ownership proof. `--updated`
+    // is a command-line flag on a user-runnable installer, so it can arrive with
+    // `/D=<any existing directory>`; an unconditional bypass would adopt a
+    // directory this installer never created and the generated uninstaller, which
+    // removes $INSTDIR recursively, would delete the user's contents there.
+    assert.equal(
+      /\$\{If\} \$KiroVisibleUpdate == 1\nReturn/.test(ensureInstallDir),
+      false,
+      "the update bypass must require proof the install root is ours, not return unconditionally"
+    );
+    // The name must be proven non-empty BEFORE it is appended. IfFileExists
+    // matches a directory as readily as a file, so an empty $KiroAppExeName
+    // collapses the ownership proof into a bare directory test -- the same
+    // failure the ${APP_EXECUTABLE_FILENAME} assertion below exists to prevent,
+    // reached by a different route: the variable never having been assigned at
+    // all. Only customInit assigns it, so without this the whole guard rests on
+    // customInit having run first, and a future page callback inserted ahead of
+    // it would silently turn the ownership proof back into "does this directory
+    // exist".
+    assert.match(
+      ensureInstallDir,
+      /\$\{AndIf\} \$KiroAppExeName != ""/,
+      "the ownership test must reject an empty executable name before appending it"
+    );
+    // The ownership test must read the executable name from a VARIABLE, never the
+    // ${APP_EXECUTABLE_FILENAME} define. That define lives in the template's
+    // common.nsh, which is included after installer.nsh, so a Function body --
+    // compiled at !include time -- cannot see it. NSIS does not fail loudly on
+    // that: it emits `warning 6000: unknown variable/constant` and DROPS the
+    // token, silently reducing the test to a bare directory path so the bypass
+    // fires for a directory we do not own. customInit assigns $KiroAppExeName
+    // instead, because a !macro body expands late enough to see the define.
+    assert.equal(
+      /\$\{APP_EXECUTABLE_FILENAME\}/.test(ensureInstallDir),
+      false,
+      "KiroEnsureAppInstallDir must not reference the ${APP_EXECUTABLE_FILENAME} define at include time"
+    );
+    assert.match(
+      installer,
+      /!macro customInit[\s\S]*?StrCpy \$KiroAppExeName "\$\{APP_EXECUTABLE_FILENAME\}"/,
+      "customInit must resolve $KiroAppExeName, since only a macro body sees that define"
+    );
+    // The guard must NOT be written as ${isUpdated}. That expands to a
+    // StdUtils::TestParameter plugin call, and a Function body is compiled when
+    // installer.nsh is !included -- before the generated script runs
+    // !addplugindir -- so it breaks the build with "Plugin not found, cannot
+    // call StdUtils::TestParameter". Only a !macro body (customInit) may test it,
+    // because that expands at its !insertmacro site. Asserted here because the
+    // two forms look interchangeable and the failure is invisible until an actual
+    // NSIS compile runs in CI.
+    assert.equal(
+      /\$\{isUpdated\}/.test(ensureInstallDir),
+      false,
+      "KiroEnsureAppInstallDir must not call the plugin-backed ${isUpdated} at include time"
+    );
+    // The fresh-install protection the guard sits in front of must stay: a first
+    // install still may not adopt a directory it did not create, because the
+    // generated uninstaller removes $INSTDIR recursively.
+    assert.match(
+      ensureInstallDir,
+      /KiroFreshInstallDirExists:\nStrCpy \$KiroInstallDir "\$KiroInstallDir\\\$\{APP_FILENAME\}"/,
+      "a fresh install must still nest past a directory it does not own"
+    );
+  });
+
+  it("repoints kept shortcuts once an update has proven install-root ownership", () => {
+    // KeepShortcuts="true" makes addStartMenuLink / addDesktopLink preserve
+    // whatever .lnk a previous install left behind, so a machine carrying two
+    // sibling install roots keeps launching the stale one from its shortcuts
+    // even though updates land on the live root. The customInstall hook
+    // rewrites this channel's own links at the root the update just wrote.
+    const heal = normalizedNsisBlock(installer, /!macro customInstall\r?\n[\s\S]*?!macroend/);
+    // The gate must stay exactly (visible update) AND (kept shortcuts) AND
+    // (physical bifurcation evidence). The $keepShortcuts assignment carries
+    // the pre-extraction ${FileExists} "$appExe" ownership proof -- a
+    // FileExists probe inside this macro would be vacuously true, because
+    // customInstall expands after installApplicationFiles wrote the
+    // executable. $KiroStaleSibling keeps the rewrite off healthy machines:
+    // CreateShortCut resets a link's arguments/icon/working directory, so a
+    // machine with a single install root must never have its customized
+    // shortcuts rewritten. Pinning all three conditions means deleting any
+    // one, or widening the gate to unproven installs or healthy machines,
+    // fails here.
+    assert.match(
+      heal,
+      /\$\{If\} \$KiroVisibleUpdate == 1\n\$\{AndIf\} \$keepShortcuts == "true"\n\$\{AndIf\} \$KiroStaleSibling == 1\n/,
+      "shortcut healing must be gated on visible-update + kept-shortcuts ownership proof + bifurcation evidence"
+    );
+    // The bifurcation flag is default-deny: it starts 0, and only the two
+    // sibling existence probes (stale parent root / stale nested child) may
+    // arm it -- both use the same executable-presence evidence standard as
+    // the update bypass.
+    assert.match(
+      heal,
+      /^!macro customInstall\n(?:;[^\n]*\n)*StrCpy \$KiroStaleSibling 0\n/,
+      "the bifurcation flag must default to 0 before any probe runs"
+    );
+    assert.match(
+      heal,
+      /\$\{AndIf\} \$\{FileExists\} "\$KiroStaleSiblingProbe\\\$\{APP_EXECUTABLE_FILENAME\}"\nStrCpy \$KiroStaleSibling 1/,
+      "the stale-parent probe must require this app's executable at the parent root"
+    );
+    assert.match(
+      heal,
+      /\$\{If\} \$\{FileExists\} "\$INSTDIR\\\$\{APP_FILENAME\}\\\$\{APP_EXECUTABLE_FILENAME\}"\nStrCpy \$KiroStaleSibling 1/,
+      "the stale-child probe must require this app's executable in the nested ${APP_FILENAME} child"
+    );
+    assert.equal(
+      heal.match(/StrCpy \$KiroStaleSibling 1/g).length,
+      2,
+      "only the two sibling probes may arm the bifurcation flag"
+    );
+    // The rewrite target must name the install root THIS run wrote. Any
+    // registry-derived path could itself be the stale sibling. Each rewrite is
+    // existence-gated so a shortcut the user deleted stays deleted, and the
+    // CreateShortCut arguments mirror the template's own calls.
+    assert.match(
+      heal,
+      /\$\{If\} \$\{FileExists\} "\$newStartMenuLink"\nClearErrors\nCreateShortCut "\$newStartMenuLink" "\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}" "" "\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}" 0 "" "" "\$\{APP_DESCRIPTION\}"/,
+      "the Start Menu link must be re-created at $INSTDIR with the template's own arguments"
+    );
+    assert.match(
+      heal,
+      /\$\{If\} \$\{FileExists\} "\$newDesktopLink"\nClearErrors\nCreateShortCut "\$newDesktopLink" "\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}" "" "\$INSTDIR\\\$\{APP_EXECUTABLE_FILENAME\}" 0 "" "" "\$\{APP_DESCRIPTION\}"/,
+      "the Desktop link must be re-created at $INSTDIR with the template's own arguments"
+    );
+    // A failed rewrite must leave a breadcrumb: the details pane is muted on
+    // this path, and a silent failure means the update reports success while
+    // the shortcut still names the stale root.
+    assert.match(
+      heal,
+      /\$\{If\} \$\{Errors\}\nSetDetailsPrint both\nDetailPrint "Could not rewrite the Start Menu shortcut[\s\S]*?SetDetailsPrint lastused\nClearErrors/,
+      "a failed Start Menu rewrite must print a breadcrumb before clearing the error flag"
+    );
+    // CreateShortCut drops the AppUserModelID stamp; the template re-stamps
+    // after every creation and the heal must too, or the rewritten shortcut
+    // loses its taskbar/notification identity registration.
+    assert.match(heal, /WinShell::SetLnkAUMI "\$newStartMenuLink" "\$\{APP_ID\}"/);
+    assert.match(heal, /WinShell::SetLnkAUMI "\$newDesktopLink" "\$\{APP_ID\}"/);
+    // Each branch reproduces the template's own compile-time opt-outs, so a
+    // future createStartMenuShortcut/createDesktopShortcut=false config change
+    // cannot leave this macro as the only code still writing that link.
+    assert.match(
+      heal,
+      /!ifndef DO_NOT_CREATE_START_MENU_SHORTCUT\n\$\{If\} \$\{FileExists\} "\$newStartMenuLink"/
+    );
+    assert.match(
+      heal,
+      /!ifndef DO_NOT_CREATE_DESKTOP_SHORTCUT\n\$\{If\} \$\{FileExists\} "\$newDesktopLink"/
+    );
+    // Only the template's own resolved link variables (setLinkVars) may be
+    // rewritten -- an invented .lnk literal would orphan the heal on a template
+    // upgrade and could reach another channel's or application's shortcut.
+    assert.doesNotMatch(
+      heal,
+      /\.lnk/,
+      "the heal must use $newStartMenuLink / $newDesktopLink, never a literal shortcut path"
+    );
+    // The stale sibling install directory is left in place: no ownership proof
+    // exists for a recursive delete under %LOCALAPPDATA%\Programs.
+    assert.doesNotMatch(heal, /RMDir|\bDelete\b/);
+    // The gate's ownership argument rests on two facts in the vendored
+    // template, and this platform's NSIS code cannot run in CI, so pin them
+    // the way the StartApp test pins assistedInstaller.nsh: an
+    // electron-builder bump that breaks either must fail here, not ship a
+    // silently dead (or silently widened) heal.
+    const installSection = fs.readFileSync(
+      path.join(
+        ROOT,
+        "node_modules",
+        "app-builder-lib",
+        "templates",
+        "nsis",
+        "installSection.nsh"
+      ),
+      "utf8"
+    );
+    // (a) $keepShortcuts can only become "true" behind the pre-extraction
+    // ${FileExists} "$appExe" ownership proof -- the fact the macro's gate
+    // borrows.
+    assert.match(
+      installSection,
+      /\$\{andIf\} \$\{FileExists\} "\$appExe"\r?\n\s*StrCpy \$keepShortcuts "true"/,
+      "the template must still assign keepShortcuts only behind the pre-extraction $appExe existence proof"
+    );
+    assert.equal(
+      installSection.match(/StrCpy \$keepShortcuts "true"/g).length,
+      1,
+      "a second keepShortcuts assignment would bypass the ownership proof the heal's gate borrows"
+    );
+    // (b) customInstall must still expand after extraction and after both link
+    // macros, or the heal reads pre-install state / gets overwritten.
+    const extractionAt = installSection.indexOf("!insertmacro installApplicationFiles");
+    const startMenuAt = installSection.indexOf("!insertmacro addStartMenuLink");
+    const desktopAt = installSection.indexOf("!insertmacro addDesktopLink");
+    const healAt = installSection.indexOf("!insertmacro customInstall");
+    assert.ok(
+      extractionAt !== -1 && startMenuAt !== -1 && desktopAt !== -1 && healAt !== -1,
+      "the template must still contain the extraction, link, and customInstall insertion points"
+    );
+    assert.ok(
+      extractionAt < startMenuAt && startMenuAt < desktopAt && desktopAt < healAt,
+      "customInstall must expand after extraction and after both link macros"
+    );
   });
 
   it("keeps install-root ownership and legacy startup cleanup without custom pages", () => {

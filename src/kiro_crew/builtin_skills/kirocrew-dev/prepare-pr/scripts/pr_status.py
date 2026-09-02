@@ -8,6 +8,8 @@ Stdlib only; portable.
 
 Usage:  python3 pr_status.py [pr-number] [--readiness-context NAME]
                              [--reviewers NAME1,NAME2] [--json]
+        python3 pr_status.py --disposition-gate --repo OWNER/NAME --pr N
+                             --head SHA
         (no number -> auto-detect the PR for the current branch;
          --readiness-context / PREPARE_PR_READINESS_CONTEXT override the
          aggregate status-context name, default "PR Readiness";
@@ -18,7 +20,11 @@ Usage:  python3 pr_status.py [pr-number] [--readiness-context NAME]
          --json appends one machine-readable object as the LAST line of stdout
          and changes nothing else -- same exit codes, same prose. Its
          ``progress_key`` sub-object is the only part safe to compare between
-         runs; a monitoring loop uses it to tell a stalled PR from a moving one)
+         runs; a monitoring loop uses it to tell a stalled PR from a moving one;
+         --disposition-gate evaluates ONLY the disposition rule for an
+         explicitly given repo/PR/head, prints one JSON object and exits 0 --
+         this is what pr-readiness.yml calls to enforce the rule server-side,
+         so the rule keeps a single definition)
 
 Exit codes:
    0  CLEAN     - open, non-draft, MERGEABLE, no CHANGES_REQUESTED, aggregate
@@ -31,15 +37,63 @@ Exit codes:
   20  BLOCKED   - failing readiness, merge conflict, draft, CHANGES_REQUESTED,
                   a terminal PR state (MERGED/CLOSED), a stale reviewer stamp,
                   a blocking review marker on the current head, no
-                  pull_request-event run for the current head, or anything
-                  that cannot be confirmed
+                  pull_request-event run for the current head, a disposition
+                  comment violating the one-lane / one-rationale-per-finding
+                  rule, or anything that cannot be confirmed
    2  ENV ERROR - gh missing or not authenticated, or PR not found
 """
+
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+
+
+class _NoBytecodeSourceLoader(importlib.machinery.SourceFileLoader):
+    """Load shipped source normally while suppressing cache writes."""
+
+    def get_code(self, fullname):
+        path = self.get_filename(fullname)
+        source = self.get_data(path)
+        return self.source_to_code(source, path)
+
+    def set_data(self, path, data, *, _mode=0o666):
+        return None
+
+
+def _load_review_contract():
+    """Load the sibling contract without cwd, sys.path, or bytecode side effects."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_review_contract.py")
+    name = "_prepare_pr_review_contract"
+    loader = _NoBytecodeSourceLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None:  # pragma: no cover - defensive
+        raise RuntimeError("cannot import prepare-pr review contract: " + path)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+_review_contract = _load_review_contract()
+REVIEWED_STAMP_RE = _review_contract.REVIEWED_STAMP_RE
+BLOCK_MERGE_RE = _review_contract.BLOCK_MERGE_RE
+DEFAULT_MARKER_AUTHORS = _review_contract.DEFAULT_MARKER_AUTHORS
+DEFAULT_MARKER_BINDINGS = _review_contract.DEFAULT_MARKER_BINDINGS
+_COMMENT_KEY_RE = _review_contract._COMMENT_KEY_RE
+FINDING_RE = _review_contract.FINDING_RE
+DISPOSITION_PREFIX = _review_contract.DISPOSITION_PREFIX
+DISPOSITION_MARKER_RE = _review_contract.DISPOSITION_MARKER_RE
+SPAN_CLAIM_RE = _review_contract.SPAN_CLAIM_RE
+DISPOSITION_BULLET_RE = _review_contract.DISPOSITION_BULLET_RE
+span_hash = _review_contract.span_hash
+sha_matches = _review_contract.sha_matches
+comment_key = _review_contract.comment_key
+extract_findings = _review_contract.extract_findings
+parse_disposition_record = _review_contract.parse_disposition_record
+
 
 # Strip ANSI escape sequences and C0/C1 control chars from untrusted printed
 # text (PR titles / check names are attacker-controllable) to prevent
@@ -68,8 +122,7 @@ _CLOSING_VERB = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
 _REPO_SLUG = r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*"
 # The three reference targets the host actually resolves.
 _ISSUE_TARGET = (
-    r"(?:(?:" + _REPO_SLUG + r")?#\d+"
-    r"|https?://[A-Za-z0-9.-]+/" + _REPO_SLUG + r"/issues/\d+)"
+    r"(?:(?:" + _REPO_SLUG + r")?#\d+" r"|https?://[A-Za-z0-9.-]+/" + _REPO_SLUG + r"/issues/\d+)"
 )
 _CLOSING_REF = _CLOSING_VERB + r"[ \t]*:?[ \t]+" + _ISSUE_TARGET
 # THE ACCEPTED EXPLICIT-TRAILER GRAMMAR, in full:
@@ -454,9 +507,7 @@ def _declared_closing_numbers(visible_body, base_repo=None):
     well_formed = True
     for line in _CLOSING_KW_RE.finditer(visible_body):
         for ref in _CLOSING_REF_RE.finditer(line.group(0)):
-            number = _normalize_issue_number(
-                ref.group("number") or ref.group("url_number")
-            )
+            number = _normalize_issue_number(ref.group("number") or ref.group("url_number"))
             if number is None:
                 well_formed = False
                 continue
@@ -490,9 +541,7 @@ def closing_link_reason(body, closing_refs, repo=None):
     body = body or ""
     visible_body = _visible_markdown_prose(body)
     if closing_refs:
-        declared, trailers_well_formed = _declared_closing_numbers(
-            visible_body, repo
-        )
+        declared, trailers_well_formed = _declared_closing_numbers(visible_body, repo)
         _resolved, missing_numbers, refs_well_formed = _undeclared_closing_numbers(
             declared, closing_refs
         )
@@ -550,56 +599,26 @@ def closing_link_reason(body, closing_refs, repo=None):
 _MAX_THREAD_PAGES = 50
 _MAX_COMMENT_PAGES = 50
 
-# Reviewer-marker contract (mirrored in pr_findings.py; a parity test pins the
-# two copies together -- each script stays standalone-copyable by design).
-# The review workflows stamp their verdict comment with a per-SHA proof line
-# and, only for a blocking verdict, a second per-SHA block marker:
-#   [<NAME>-REVIEWED] <full-sha>     e.g. [GPT-REVIEWED] / [OPUS-REVIEWED] /
-#                                         [DESIGN-REVIEWED] / [UX-REVIEWED]
-#   [BLOCK-MERGE] <full-sha>
-# Advisory findings appear as lines beginning with the literal token FINDING.
-# The conclusion of the review workflow run is deliberately NOT a signal here:
-# on this repo it is unreliable in both directions (red on healthy reviews,
-# green while the body carries findings) -- the stamp and the body are the
-# signal. Bots update their comment in place, so an old [BLOCK-MERGE] for a
-# superseded head disappears or keeps naming the old SHA; matching against the
-# current head filters both.
-REVIEWED_STAMP_RE = re.compile(r"\[([A-Z][A-Z0-9_-]*)-REVIEWED\]\s+([0-9a-f]{7,40})\b")
-BLOCK_MERGE_RE = re.compile(r"\[BLOCK-MERGE\]\s+([0-9a-f]{7,40})\b")
 FINDING_LINE_RE = re.compile(r"^\s*FINDING\b", re.MULTILINE)
 
-# Only comments authored by the repo's own workflow actor count as marker
-# sources. `user.type == "Bot"` alone is spoofable: a third-party app that
-# echoes PR-controlled text (a coverage bot quoting a diff, a triage bot
-# quoting the body) would post an attacker-chosen `[<NAME>-REVIEWED] <head>`
-# and forge freshness. The review workflows all post through the Actions
-# actor; same-repo workflows share the emitters' trust level, third-party
-# apps do not. Override with --marker-authors / PREPARE_PR_MARKER_AUTHORS for
-# a repo whose reviewers post under app-specific logins.
-DEFAULT_MARKER_AUTHORS = ("github-actions[bot]",)
 
-# Reviewer identity must come from WORKFLOW-AUTHORED bytes, never from model
-# output: each review workflow upserts its comment with its own HTML key as
-# the comment's LEADING bytes, written by the workflow template before any
-# model text is interpolated. Binding each key to its reviewer name means a
-# stamp counts only inside its own lane's comment -- injected model output in
-# one lane can never stamp another reviewer's freshness, whatever names it
-# emits. Override with --marker-bindings / PREPARE_PR_MARKER_BINDINGS
-# ("key=NAME,key=NAME") for a repo with different comment keys.
-DEFAULT_MARKER_BINDINGS = (
-    ("codex-ai-review", "GPT"),
-    ("claude-ai-review", "OPUS"),
-    ("design-review", "DESIGN"),
-    ("ux-review", "UX"),
-)
-# The key is authoritative only at the very start of the body (template-
-# controlled position); anywhere later it could be model output.
-_COMMENT_KEY_RE = re.compile(r"\A\s*<!--\s*([a-z0-9-]+)\s*-->")
+def fetch_disposition_comments(repo, number):
+    return _review_contract.fetch_disposition_comments(repo, number, run)
 
 
-def comment_key(body):
-    m = _COMMENT_KEY_RE.match(body or "")
-    return m.group(1) if m else ""
+def author_write_verdict(repo, login):
+    return _review_contract.author_write_verdict(repo, login, run)
+
+
+def author_is_repo_writer(repo, login):
+    return _review_contract.author_is_repo_writer(repo, login, run)
+
+
+def writer_disposition_records(repo, comments):
+    return _review_contract.writer_disposition_records(repo, comments, run, author_write_verdict)
+
+
+disposition_violations = _review_contract.disposition_violations
 
 
 def resolve_marker_bindings(argv, environ):
@@ -643,11 +662,6 @@ def resolve_marker_authors(argv, environ):
     return {n.strip().lower() for n in raw.split(",") if n.strip()} or {
         a.lower() for a in DEFAULT_MARKER_AUTHORS
     }
-
-
-def sha_matches(stamp_sha, head_sha):
-    """True when a stamped SHA identifies the current head (>=7-hex prefix)."""
-    return bool(stamp_sha) and len(stamp_sha) >= 7 and head_sha.startswith(stamp_sha)
 
 
 def resolve_readiness_context(argv, environ):
@@ -746,9 +760,7 @@ def positional_args(argv):
 
 def run(args):
     try:
-        p = subprocess.run(
-            args, capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
+        p = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
         return p.returncode, p.stdout.strip(), p.stderr.strip()
     except OSError as exc:
         return 127, "", "{}: {}".format(args[0], exc)
@@ -766,9 +778,8 @@ def err(msg):
 # and reports CI as unknown instead of aborting. The second read re-fetches
 # headRefOid and is discarded on a mismatch with the core read's head, so a
 # push landing between the two reads can never pair one head's metadata with
-# another head's checks. Byte-identical copy in pr_findings.py (parity-pinned
-# by test_prepare_pr_findings.py; the scripts are standalone-copyable, so
-# neither imports the other).
+# another head's checks. The parity-pinned copy in pr_findings.py keeps each
+# command's check-rollup path explicit.
 ROLLUP_UNAVAILABLE_NOTICE = (
     "CI check status UNAVAILABLE - the statusCheckRollup fetch failed (a token "
     "without Checks read access, e.g. any fine-grained PAT, cannot fetch it); "
@@ -1000,10 +1011,16 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
     posted is not required, its CI gate covers absence).
     """
     if comments is None or not head_sha:
-        return {"ok": False, "stale": [], "blocking": [], "findings": {}}
+        return {"ok": False, "stale": [], "blocking": [], "findings": {}, "elided": []}
     fresh_by_name: dict = {name: False for name in (only or ())}
     findings: dict = {}
     blocking = set()
+    # Reviewers whose freshness rests on an ELIDED stamp (see sha_matches). The
+    # gate accepts those, but silently swallowing them would hide the emitter
+    # defect for good: nobody would learn a lane is mangling the SHA it was
+    # handed. Reported as an advisory note, never as a blocking reason -- and
+    # deliberately absent from progress_key, which a polling loop diffs.
+    elided = set()
     for c in comments:
         body = c.get("body") or ""
         name = bindings.get(comment_key(body))
@@ -1022,11 +1039,19 @@ def evaluate_reviewer_markers(comments, head_sha, bindings, only=None):
                 fresh_by_name[name] = fresh_by_name.get(name, False) or fresh
                 if fresh:
                     findings[name] = len(FINDING_LINE_RE.findall(body))
+                    if not any(head_sha.startswith(sha) for sha in own_stamps):
+                        elided.add(name)
         for sha in BLOCK_MERGE_RE.findall(body):
             if sha_matches(sha, head_sha):
                 blocking.add(name or "(unattributed)")
     stale = sorted(n for n, fresh in fresh_by_name.items() if not fresh)
-    return {"ok": True, "stale": stale, "blocking": sorted(blocking), "findings": findings}
+    return {
+        "ok": True,
+        "stale": stale,
+        "blocking": sorted(blocking),
+        "findings": findings,
+        "elided": sorted(elided),
+    }
 
 
 def head_run_exists(repo, head_sha):
@@ -1131,6 +1156,7 @@ def build_report(
         "advisory": {
             "blocking_reviewers": sorted(marker_eval.get("blocking") or []),
             "bot_comments_readable": bool(marker_eval.get("ok")),
+            "elided_stamp_reviewers": sorted(marker_eval.get("elided") or []),
             "findings": dict(marker_eval.get("findings") or {}),
             "stale_reviewers": sorted(marker_eval.get("stale") or []),
             "unresolved_threads": n_unresolved,
@@ -1152,6 +1178,7 @@ def decide(
     marker_eval=None,
     head_run="skip",
     rollup_notice="",
+    disposition_eval=None,
 ):
     """Resolve PR state to (exit_code, status line). Fail-closed.
 
@@ -1169,7 +1196,17 @@ def decide(
        belongs to the old head. Ranking in-flight checks first reports "running"
        forever while nothing can complete -- a stall only a human notices.
        BEHIND, draft and CHANGES_REQUESTED behave the same way: each survives
-       any amount of waiting and needs the author to act.
+       any amount of waiting and needs the author to act. The disposition
+       evaluation (``disposition_eval``, built from disposition_violations)
+       belongs here too, in BOTH its states: a violation is cleared only by
+       the author editing or deleting the offending comment, and an
+       UNREADABLE evaluation is not "no violations" -- while either waits
+       behind an in-flight round, the reviewer bots rewrite their stamped
+       comments in place, so the judged-head span mapping the verdict needs
+       disappears with the old stamps. It gates because a record that claims
+       several findings, another lane's finding, or no finding at all is
+       exactly the blanket ruling the one-lane / one-rationale rule forbids
+       -- and the adjudication ledger would consume it as written.
     3. Only then is "still running" a wait, and an uncomputed mergeability too.
     4. Everything left is a check-result verdict -- including the reviewer-side
        conditions: ``marker_eval`` (from evaluate_reviewer_markers; None skips
@@ -1177,9 +1214,10 @@ def decide(
        string "skip" skips the gate). Both are evaluated ONLY here, after the
        running gate: while a round is in flight the reviewer bots may simply
        not have posted yet, and a stale stamp mid-round is expected, not a
-       defect. Both fail closed on "could not read". Advisory FINDING counts
-       never gate -- whether a non-blocking finding should hold the loop open
-       is a judgment call the exit code deliberately does not make.
+       defect. Both fail closed on "could not read".
+       Advisory FINDING counts never gate -- whether a non-blocking finding
+       should hold the loop open is a judgment call the exit code deliberately
+       does not make.
        ``rollup_notice`` -- the non-empty NOTICE string when the rollup read
        degraded (fetch failure, or a concurrent push between the two reads) --
        never changes the exit code either, only which reason an empty rollup
@@ -1199,6 +1237,24 @@ def decide(
         blocked_now.append("PR is a draft")
     if decision == "CHANGES_REQUESTED":
         blocked_now.append("review decision is CHANGES_REQUESTED")
+    if disposition_eval is not None:
+        # A disposition violation is a condition waiting cannot fix -- only the
+        # AUTHOR editing or deleting the comment clears it -- so it belongs
+        # with the other author-action conditions ABOVE the running gate.
+        # Deferring it behind an in-flight round loses the evidence: the
+        # reviewer bots rewrite their stamped comments in place when the round
+        # completes, and the judged-head span mapping the violation was
+        # computed from disappears with the old stamps. An UNREADABLE
+        # evaluation (records or the finding map could not be fetched) gates
+        # here for the same reason: "could not read" is not "no violations",
+        # and waiting through the round destroys the very evidence a re-read
+        # would need. Sorted by construction (disposition_violations returns a
+        # sorted list), so the joined reason -- which travels in
+        # ``progress_key.status`` -- is deterministic.
+        if not disposition_eval.get("ok"):
+            blocked_now.append("disposition records could not be established (fail-closed)")
+        for v in disposition_eval.get("violations") or []:
+            blocked_now.append("disposition rule: " + v)
     if blocked_now:
         return 20, "STATUS: BLOCKED - " + "; ".join(blocked_now)
 
@@ -1287,7 +1343,89 @@ def decide(
     return 0, "STATUS: CLEAN (readiness passed, mergeable, no blocking review decision)"
 
 
+def _flag_value(argv, name):
+    """Value of ``--name VALUE`` or ``--name=VALUE`` in argv, else ""."""
+    for i, a in enumerate(argv):
+        if a == name and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return ""
+
+
+def disposition_gate(argv, environ):
+    """Evaluate ONLY the disposition rule and print one JSON object; exit 0.
+
+    This is the server-side entry point (issue #6658): pr-readiness.yml calls
+    it so a disposition record violating the one-lane / one-rationale-per-
+    finding rule fails the repository's required status for EVERY writer, not
+    only for a writer running the prepare-pr loop. It exists as a mode of this
+    script rather than as a workflow-side reimplementation so the rule keeps a
+    single definition -- the same ``disposition_violations`` the local gate
+    calls, over the same records the adjudication ledger admits.
+
+    Usage: --disposition-gate --repo OWNER/NAME --pr N --head SHA
+    (--marker-bindings / --marker-authors and their env forms apply as usual.)
+
+    Prints ``{"ok", "violations", "comments", "records", "unverified",
+    "error"}``. ``ok`` is False when the record set could not be established,
+    which the caller must treat as UNKNOWN (pending) rather than as a red: a
+    transient API failure red-lighting the required status is the #2753 class
+    of bug. Exit status is 0 for both outcomes -- the JSON carries the verdict,
+    so a non-zero exit means only that this script itself failed to run, and
+    the caller can tell the two apart. Enforcement scope is deliberately
+    identical to the ledger's admission scope: an author the collaborators
+    permission API does not confirm as a writer is DROPPED here exactly as
+    codex-review.yml drops them, so this gate never blocks on a record that
+    holds no downgrade power (``unverified`` counts those, for observability).
+    """
+    repo = _flag_value(argv, "--repo").strip()
+    number = _flag_value(argv, "--pr").strip()
+    head_sha = _flag_value(argv, "--head").strip()
+    result = {
+        "ok": False,
+        "violations": [],
+        "comments": 0,
+        "records": 0,
+        "unverified": 0,
+        "error": "",
+    }
+    try:
+        if not repo or not number or not head_sha:
+            result["error"] = "--repo, --pr and --head are all required"
+        else:
+            bindings = resolve_marker_bindings(argv, environ)
+            comments = fetch_disposition_comments(repo, number)
+            bot_comments = fetch_bot_comments(repo, number, resolve_marker_authors(argv, environ))
+            records = writer_disposition_records(repo, comments)
+            if comments is None or bot_comments is None or records is None:
+                result["error"] = "disposition or marker comments could not be read"
+            else:
+                result["comments"] = len(comments)
+                result["records"] = len(records)
+                result["unverified"] = len(comments) - len(records)
+                # One violation per line downstream, so a newline inside one
+                # would forge an extra blocker line. Nothing in the strings can
+                # carry one today (logins, span ids and target= are all charset-
+                # limited), which is exactly why flattening here is free.
+                result["violations"] = [
+                    " ".join(sanitize(v).split())
+                    for v in disposition_violations(records, bot_comments, head_sha, bindings)
+                ]
+                result["ok"] = True
+    except Exception as exc:  # noqa: BLE001 - any failure is "unknown", never red
+        result["error"] = "{}: {}".format(type(exc).__name__, exc)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def main(argv):
+    # Before the auth probe and PR detection below: this mode is given its
+    # repo/PR/head explicitly and must stay usable from a workflow runner,
+    # where `gh auth status` prose is noise and the JSON is the whole output.
+    if "--disposition-gate" in argv[1:]:
+        return disposition_gate(argv, os.environ)
+
     if run(["gh", "auth", "status"])[0] != 0:
         err("ERROR: gh not found or not authenticated. Run: gh auth login")
         return 2
@@ -1385,8 +1523,9 @@ def main(argv):
     # unreliable in both directions on this repo.
     marker_authors = resolve_marker_authors(argv, os.environ)
     marker_bindings = resolve_marker_bindings(argv, os.environ)
+    bot_comments = fetch_bot_comments(repo, d.get("number"), marker_authors)
     marker_eval = evaluate_reviewer_markers(
-        fetch_bot_comments(repo, d.get("number"), marker_authors),
+        bot_comments,
         head_sha,
         marker_bindings,
         only=reviewers_filter,
@@ -1406,16 +1545,88 @@ def main(argv):
     else:
         for name in sorted(marker_eval["findings"]):
             print(
-                "  - {}: fresh{}{}".format(
+                "  - {}: fresh{}{}{}".format(
                     sanitize(name),
                     "  [BLOCK-MERGE]" if name in marker_eval["blocking"] else "",
-                    "  ({} advisory FINDING line(s))".format(marker_eval["findings"][name])
-                    if marker_eval["findings"][name]
-                    else "",
+                    (
+                        "  ({} advisory FINDING line(s))".format(marker_eval["findings"][name])
+                        if marker_eval["findings"][name]
+                        else ""
+                    ),
+                    (
+                        "  [stamp elided the head's middle - emitter transcription "
+                        "artifact, verified against this head]"
+                        if name in (marker_eval.get("elided") or ())
+                        else ""
+                    ),
                 )
             )
         for name in marker_eval["stale"]:
             print("  - {}: STALE (stamp names an older head)".format(sanitize(name)))
+
+    # Disposition-rule gate (issue #4187): a repository writer's disposition
+    # comment must claim exactly one span= finding identity from its own
+    # target= lane. Each record is validated against the findings stamped for
+    # the head its head= says it judged (in the ordinary fix-then-push round
+    # that is the PRIOR head) and the current one, so the rule "one comment
+    # covers one lane, one rationale covers one finding" is mechanical rather
+    # than prose.
+    disposition_comments = fetch_disposition_comments(repo, d.get("number"))
+    disposition_records = writer_disposition_records(repo, disposition_comments)
+    disposition_violation_list: list = []
+    # BOTH inputs must be readable: the records (the rulings) and the trusted
+    # reviewer comments (the finding map the rulings are validated against).
+    # An unreadable finding map is not "no findings" -- computing with an
+    # empty map would silently drop every evidence-bearing class while the
+    # round runs, and the judged-head evidence is rewritten in place when it
+    # completes.
+    disposition_ok = disposition_records is not None and bot_comments is not None
+    if disposition_ok:
+        disposition_violation_list = disposition_violations(
+            disposition_records, bot_comments, head_sha, marker_bindings
+        )
+    disposition_eval = {"ok": disposition_ok, "violations": disposition_violation_list}
+    print("-- Disposition records (one lane, one rationale per finding) " + "-" * 6)
+    if not disposition_ok:
+        print("  ERROR: disposition records could not be established (fail-closed)")
+    elif not disposition_comments:
+        print("  (no disposition comments)")
+    else:
+        # Both counts, so a degraded state is visible instead of reading like
+        # an empty PR: zero verified records above a non-zero comment count
+        # means the check is INERT for those comments -- non-writer authors,
+        # or a token that cannot read collaborator permissions (the endpoint
+        # needs push access).
+        print(
+            "  disposition-marked comment(s): {}  from verified writers: {}".format(
+                len(disposition_comments), len(disposition_records)
+            )
+        )
+        if not disposition_records:
+            print(
+                "  NOTICE: none verified as a repository writer's - the "
+                "disposition check is inert for these comments"
+            )
+        unknown_targets = sorted(
+            {
+                r["target"]
+                for r in disposition_records
+                if not r["malformed"]
+                and r["target"] not in {n.lower() for n in marker_bindings.values()}
+            }
+        )
+        if unknown_targets:
+            # Advisory only: an unbound lane (e.g. first-principles) has no
+            # extractable finding identity, but a typo'd target= looks the
+            # same and silently escapes the claim requirement -- say so.
+            print(
+                "  NOTICE: target lane(s) outside the marker bindings "
+                "(claim checks do not apply): " + ", ".join(sanitize(t) for t in unknown_targets)
+            )
+        for v in disposition_violation_list:
+            print("  VIOLATION: " + sanitize(v))
+        if not disposition_violation_list:
+            print("  (no disposition-rule violations)")
 
     # Assert a pull_request-event run exists for the current head, but only on
     # a PR that demonstrably uses Actions (a rollup entry with a workflowName);
@@ -1453,6 +1664,7 @@ def main(argv):
         marker_eval=marker_eval,
         head_run=head_run,
         rollup_notice=rollup_notice,
+        disposition_eval=disposition_eval,
     )
     print(status)
     if "--json" in argv[1:]:

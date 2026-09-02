@@ -113,9 +113,8 @@ describe('switchSlot initial load bound', () => {
     expect(st.slotOldestIndex).toBe(0)
   })
 
-  // Same guard as warmSlotCache and ChatPane's hydrate: the server's limit
-  // slices RAW rows, and a streaming response is many chunk rows that only
-  // collapse afterwards — bounding it would keep just the tail.
+  // Same guard as warmSlotCache and ChatPane's hydrate -- deliberate, not a raw-row
+  // guard: the handler collapses chunk runs BEFORE it slices, even mid-stream.
   it('switches to a streaming slot unbounded', async () => {
     mockDetail({ running: true })
     const store = makeStore({ slotRun: { 'slot-a': { state: 'streaming' } } })

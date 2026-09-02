@@ -696,7 +696,7 @@ class TestAcpClientSessionKey:
         with (
             patch(
                 "kiro_crew.acp.client._resolve_claude_acp_bin",
-                return_value=["/usr/bin/node", "/x/acp.js"],
+                return_value=(["/usr/bin/node", "/x/acp.js"], ""),
             ),
             patch(
                 "kiro_crew.acp.client.wrap_argv",
@@ -961,6 +961,87 @@ class TestSpawnStderrDrainCleanup:
         assert task.cancelled() or task.exception() is not None
 
 
+@pytest.mark.asyncio
+async def test_unbound_client_session_cwd_is_the_spawn_pathname(tmp_path):
+    """Off macOS nothing binds, so there is no descriptor to re-verify."""
+    client = AcpClient(work_dir=tmp_path)
+
+    assert client._bound_workspace_fd is None
+    assert await client._session_work_dir() == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bound_client_session_cwd_is_read_off_the_descriptor(tmp_path, monkeypatch):
+    """The sibling of AcpRuntime._session_work_dir: same rule, same reason.
+
+    session/new and session/load carry a cwd STRING the peer re-resolves, so the
+    bind-time spelling -- the one a symlink swap controls -- is re-verified and
+    replaced with the descriptor's own name before it is handed over.
+    """
+    client = AcpClient(work_dir=tmp_path)
+    client._bound_workspace_fd = 81
+    client._spawn_work_dir = str(tmp_path)
+    target = AsyncMock(return_value="/canonical/workspace")
+    monkeypatch.setattr(acp_client, "resolve_bound_session_workspace", target)
+
+    assert await client._session_work_dir() == "/canonical/workspace"
+    target.assert_awaited_once_with(81, str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_bound_client_session_cwd_fails_rather_than_handing_over_the_spelling(
+    tmp_path, monkeypatch
+):
+    """A workspace that no longer names the bound identity is not a fallback."""
+    client = AcpClient(work_dir=tmp_path)
+    client._bound_workspace_fd = 82
+    client._spawn_work_dir = str(tmp_path)
+    monkeypatch.setattr(
+        acp_client,
+        "resolve_bound_session_workspace",
+        AsyncMock(side_effect=acp_client.BoundWorkspaceMismatch("not-bound")),
+    )
+
+    with pytest.raises(AcpError, match="exact workspace"):
+        await client._session_work_dir()
+
+
+@pytest.mark.asyncio
+async def test_bound_client_session_cwd_fails_when_the_name_cannot_be_read(tmp_path, monkeypatch):
+    """Fail closed, for the same reason bound_agent_workspace_target raises."""
+    client = AcpClient(work_dir=tmp_path)
+    client._bound_workspace_fd = 83
+    client._spawn_work_dir = str(tmp_path)
+    monkeypatch.setattr(
+        acp_client,
+        "resolve_bound_session_workspace",
+        AsyncMock(side_effect=OSError("no F_GETPATH here")),
+    )
+
+    with pytest.raises(AcpError, match="Cannot verify"):
+        await client._session_work_dir()
+
+
+@pytest.mark.asyncio
+async def test_failed_live_spawn_cleanup_releases_workspace_when_kill_is_cancelled(tmp_path):
+    client = AcpClient(work_dir=tmp_path)
+    client._bound_workspace_fd = 74
+    client._spawn_work_dir = "/dev/fd/74"
+    client._kill_process = AsyncMock(side_effect=asyncio.CancelledError())
+    released: list[int] = []
+
+    async def record_release(descriptor):
+        released.append(descriptor)
+
+    with patch("kiro_crew.acp.client.release_bound_agent_workspace", side_effect=record_release):
+        with pytest.raises(asyncio.CancelledError):
+            await client._cleanup_failed_live_spawn()
+
+    assert released == [74]
+    assert client._bound_workspace_fd is None
+    assert client._spawn_work_dir == str(tmp_path)
+
+
 class TestAcpClientBackendSelection:
     """Verify the right backend binary is launched for kiro vs claude."""
 
@@ -1018,7 +1099,10 @@ class TestAcpClientBackendSelection:
         with (
             patch(
                 "kiro_crew.acp.client._resolve_claude_acp_bin",
-                return_value=["/usr/local/bin/node", "/usr/local/lib/claude-agent-acp/index.js"],
+                return_value=(
+                    ["/usr/local/bin/node", "/usr/local/lib/claude-agent-acp/index.js"],
+                    "",
+                ),
             ),
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
@@ -1048,11 +1132,122 @@ class TestAcpClientBackendSelection:
     async def test_spawn_claude_backend_missing_bin_raises(self, tmp_path):
         client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         with (
-            patch("kiro_crew.acp.client._resolve_claude_acp_bin", return_value=None),
+            patch("kiro_crew.acp.client._resolve_claude_acp_bin", return_value=(None, "")),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock),
         ):
             with pytest.raises(AcpError, match="claude-agent-acp not found"):
                 await client._spawn()
+
+    @pytest.mark.asyncio
+    async def test_spawn_claude_missing_bin_reports_the_cached_search_path(
+        self, tmp_path, monkeypatch
+    ):
+        searched = os.pathsep.join((str(tmp_path / "node-bin"), str(tmp_path / "npm-bin")))
+        later = str(tmp_path / "later-path")
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        with patch(
+            "kiro_crew.acp.client._resolve_claude_acp_bin",
+            return_value=(None, searched),
+        ) as resolve:
+            with pytest.raises(AcpError) as first:
+                await client._spawn()
+
+            monkeypatch.setenv("PATH", later)
+            with pytest.raises(AcpError) as second:
+                await client._spawn()
+
+        resolve.assert_called_once_with()
+        for error in (str(first.value), str(second.value)):
+            assert str(tmp_path / "node-bin") in error
+            assert str(tmp_path / "npm-bin") in error
+            assert later not in error
+
+    @pytest.mark.asyncio
+    async def test_spawn_kiro_missing_bin_reports_only_resolver_search_dirs(self, tmp_path):
+        searched = [str(tmp_path / "managed-bin"), str(tmp_path / "path-bin")]
+        unsearched = str(tmp_path / "never-checked")
+        client = AcpClient(work_dir=tmp_path)
+        with (
+            patch("kiro_crew.acp.client._resolve_kiro_bin", return_value=None),
+            patch("kiro_crew.acp.client.known_kiro_cli_dirs", return_value=searched),
+        ):
+            with pytest.raises(AcpError) as raised:
+                await client._spawn()
+
+        error = str(raised.value)
+        assert "searched 2 directories" in error
+        assert searched[0] in error
+        assert searched[1] in error
+        assert unsearched not in error
+
+    @pytest.mark.asyncio
+    async def test_spawn_kiro_missing_bin_reports_the_environment_it_searched(
+        self, tmp_path, monkeypatch
+    ):
+        """The reported directories must come from the search's own environment.
+
+        The diagnostic used to recompute ``known_kiro_cli_dirs`` from a FRESH
+        read of ``os.environ`` after resolution had already failed. A PATH change
+        landing in that window -- a concurrent installer, a self-update, anything
+        editing the gateway's environment -- makes the message name directories
+        that were never searched and omit ones that were, which is the opposite
+        of what a "not found (searched ...)" line is for.
+
+        #5048 gave the Claude adapter this guarantee by caching the search path
+        with the resolution result (see
+        ``test_spawn_claude_missing_bin_reports_the_cached_search_path``); this
+        pins the same property for the Kiro sibling it left recomputing.
+        """
+        from kiro_crew.acp import client as client_mod
+
+        injected = str(tmp_path / "appeared-after-the-search")
+        resolver_env: dict[str, object] = {}
+        diagnostic_env: dict[str, object] = {}
+        real_dirs = client_mod.known_kiro_cli_dirs
+
+        def _resolve_then_change_path(*, environ=None, home=None):
+            resolver_env["mapping"] = environ
+            # A PATH mutation arriving while the resolve is in flight.
+            monkeypatch.setenv("PATH", injected + os.pathsep + os.environ.get("PATH", ""))
+            return None
+
+        def _spy_dirs(platform_name, home, environ, **kwargs):
+            diagnostic_env["mapping"] = environ
+            return real_dirs(platform_name, home, environ, **kwargs)
+
+        client = AcpClient(work_dir=tmp_path)
+        with (
+            patch(
+                "kiro_crew.acp.client._resolve_kiro_bin",
+                side_effect=_resolve_then_change_path,
+            ),
+            patch("kiro_crew.acp.client.known_kiro_cli_dirs", side_effect=_spy_dirs),
+        ):
+            with pytest.raises(AcpError, match="not found"):
+                await client._spawn()
+
+        assert injected in os.environ["PATH"], "the test never actually changed PATH"
+        # THE DEFECT: the directory set reported to the user must not be derived
+        # from an environment the search never saw. Red-before, where the
+        # diagnostic re-read the live os.environ, this is the late PATH entry.
+        assert injected not in diagnostic_env["mapping"].get("PATH", "")
+        # And the guarantee stated positively: one mapping drove both.
+        assert resolver_env.get("mapping") is not None, "resolver got no environment"
+        assert diagnostic_env["mapping"] is resolver_env["mapping"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_kiro_bin_defaults_keep_every_other_caller_unchanged(self, tmp_path):
+        """The new parameters are optional, so the four other call sites are intact.
+
+        ``_resolve_kiro_bin_for_spawn`` is also called from ``acp/runtime.py``,
+        ``handlers/agents.py`` and ``handlers/sessions.py``, none of which needs
+        the search set. Omitting the arguments must resolve exactly as before.
+        """
+        from kiro_crew.acp import client as client_mod
+
+        with patch("kiro_crew.acp.client.resolve_kiro_cli", return_value=None) as resolve:
+            assert await client_mod._resolve_kiro_bin_for_spawn() is None
+        resolve.assert_called_once_with(environ=None, home=None)
 
     @pytest.mark.asyncio
     async def test_spawn_kiro_backend_unchanged(self, tmp_path):
@@ -1254,9 +1449,9 @@ class TestResolveClaudeAcpBin:
         bin_path.chmod(0o755)
         monkeypatch.setenv("CLAUDE_AGENT_ACP_BIN", str(bin_path))
         monkeypatch.setattr(client_mod, "_mise_which", lambda tool: None)
-        result = _resolve_claude_acp_bin()
-        assert result is not None
-        assert str(bin_path) in result
+        argv, _search_path = _resolve_claude_acp_bin()
+        assert argv is not None
+        assert str(bin_path) in argv
 
     @_POSIX_EXEC_PATHS_ONLY
     def test_path_lookup(self, tmp_path, monkeypatch):
@@ -1276,9 +1471,9 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: str(bin_path) if name == "claude-agent-acp" else None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result is not None
-        assert str(bin_path) in result
+        argv, _search_path = client_mod._resolve_claude_acp_bin()
+        assert argv is not None
+        assert str(bin_path) in argv
 
     @_POSIX_EXEC_PATHS_ONLY
     def test_mise_which_preferred(self, tmp_path, monkeypatch):
@@ -1299,8 +1494,8 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result == [str(script)]
+        argv, _search_path = client_mod._resolve_claude_acp_bin()
+        assert argv == [str(script)]
 
     @_POSIX_EXEC_PATHS_ONLY
     def test_mise_installed_script_resolves_node(self, tmp_path, monkeypatch):
@@ -1327,8 +1522,8 @@ class TestResolveClaudeAcpBin:
         monkeypatch.setenv("CLAUDE_AGENT_ACP_BIN", str(script))
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
         monkeypatch.setattr(client_mod, "_mise_which", lambda tool: None)
-        result = _resolve_claude_acp_bin()
-        assert result == [str(node_bin), str(script.resolve())]
+        argv, _search_path = _resolve_claude_acp_bin()
+        assert argv == [str(node_bin), str(script.resolve())]
 
     def test_non_executable_script_falls_back_to_path_node(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
@@ -1355,8 +1550,8 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: str(node_bin) if name == "node" else None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result == [str(node_bin), str(script.resolve())]
+        argv, _search_path = client_mod._resolve_claude_acp_bin()
+        assert argv == [str(node_bin), str(script.resolve())]
 
     @_POSIX_EXEC_PATHS_ONLY
     def test_mise_glob_fallback(self, tmp_path, monkeypatch):
@@ -1381,8 +1576,8 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result == [str(node_bin), str(acp_script.resolve())]
+        argv, _search_path = client_mod._resolve_claude_acp_bin()
+        assert argv == [str(node_bin), str(acp_script.resolve())]
 
     def test_returns_none_when_not_found(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
@@ -1398,8 +1593,9 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result is None
+        argv, search_path = client_mod._resolve_claude_acp_bin()
+        assert argv is None
+        assert search_path == client_mod.augmented_path(os.environ.get("PATH", ""))
 
 
 class TestResolveClaudeCodeExecutable:
@@ -3600,6 +3796,42 @@ class TestEnsureReadyRetryOnAcpError:
         assert call_count == 2
         assert client._session_id == "sess-ok"
         client._kill_process.assert_called_once_with(force=True)
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_retry_kill_releases_bound_workspace(self, tmp_path, monkeypatch):
+        client = AcpClient(work_dir=tmp_path)
+        kill_entered = asyncio.Event()
+        released: list[int] = []
+
+        async def fake_spawn():
+            client._process = MagicMock(returncode=None, pid=123)
+            client._bound_workspace_fd = 77
+            client._spawn_work_dir = "/dev/fd/77"
+
+        async def fake_init():
+            raise AcpError("init failed")
+
+        async def stalled_kill(*, force=False):
+            kill_entered.set()
+            await asyncio.Event().wait()
+
+        async def record_release(descriptor):
+            released.append(descriptor)
+
+        client._spawn = fake_spawn
+        client._initialize_session = fake_init
+        client._kill_process = stalled_kill
+        monkeypatch.setattr(acp_client, "release_bound_agent_workspace", record_release)
+
+        task = asyncio.create_task(client.ensure_ready())
+        await kill_entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert released == [77]
+        assert client._bound_workspace_fd is None
+        assert client._spawn_work_dir == str(tmp_path)
 
 
 class TestEnsureReadyRecreatesWorkDir:
@@ -7540,6 +7772,74 @@ class TestCaptureAvailableModels:
         )
         assert c.available_models()[0]["modelId"] == "m1"
 
+    def test_capture_matches_canonical_parser(self):
+        """Drift-pin (#6382): the client-side capture normalizes exactly like
+        ``parse_advertised_models`` — hard-coded expectation so a regression
+        inside the canonical parser (name fallback, description default,
+        value-as-id, non-dict skip) fails this pin too."""
+        resp = {
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [
+                    {"modelId": "m1", "name": "M1", "description": "d"},
+                    {"value": "m2"},
+                    {"name": "no id — skipped"},
+                    "not-a-dict",
+                ],
+            }
+        }
+        c = self._client()
+        c._capture_available_models(resp)
+        assert c.available_models() == [
+            {"modelId": "m1", "name": "M1", "description": "d"},
+            {"modelId": "m2", "name": "m2", "description": ""},
+        ]
+
+    def test_capture_delegates_to_canonical_parser(self, monkeypatch):
+        """Anti-re-fork pin (#6382): the list must be SOURCED from
+        ``parse_advertised_models`` AND called with the gated envelope
+        ``{"models": models}`` — a restored inline walk, a whole-response
+        re-resolution, or a wrong envelope all fail this pin.
+
+        Depends on the function-local import in ``_capture_available_models``;
+        if that import is ever hoisted to module scope, patch
+        ``kiro_crew.acp.client.parse_advertised_models`` instead.
+        """
+        from kiro_crew.acp import session_handle as sh
+
+        sentinel = [
+            {"modelId": "sentinel-a", "name": "A", "description": ""},
+            {"modelId": "sentinel-b", "name": "B", "description": ""},
+        ]
+        calls: list = []
+
+        def _fake(resp):
+            calls.append(resp)
+            return list(sentinel)
+
+        monkeypatch.setattr(sh, "parse_advertised_models", _fake)
+        c = self._client()
+        c._capture_available_models({"models": {"availableModels": [{"modelId": "real"}]}})
+        assert c.available_models() == sentinel
+        assert calls == [{"models": {"availableModels": [{"modelId": "real"}]}}]
+
+    def test_malformed_later_response_keeps_prior_snapshot(self):
+        """The non-empty assignment guard survives the consolidation: a later
+        malformed response must not clear an already-captured list."""
+        c = self._client()
+        c._capture_available_models({"models": {"availableModels": [{"modelId": "m1"}]}})
+        assert [m["modelId"] for m in c.available_models()] == ["m1"]
+        c._capture_available_models({"models": {"availableModels": "nope"}})
+        assert [m["modelId"] for m in c.available_models()] == ["m1"]
+
+    def test_empty_models_object_ignores_top_level_available_models(self):
+        """An EMPTY (falsy) ``models`` object must not let the parser's
+        dict-or-list fallback source the list from a top-level
+        ``availableModels`` key the dict gate never saw (#6382)."""
+        c = self._client()
+        c._capture_available_models({"models": {}, "availableModels": [{"modelId": "x"}]})
+        assert c.available_models() == []
+
 
 def _scripted_process(lines, *, returncode=None):
     """Build a mock subprocess whose stdout.readline yields *lines* in order.
@@ -8810,6 +9110,9 @@ class TestResolveKiroBinEnvOverride:
             ),
             patch.object(client_module, "wrap_argv", side_effect=capture_wrap),
             patch.object(
+                client_module, "assert_voice_runtime_outside_agent_workspace"
+            ) as voice_guard,
+            patch.object(
                 client_module,
                 "cgroup_scope_argv",
                 side_effect=lambda argv: ["/usr/bin/cgroup-wrapper", *argv],
@@ -8832,6 +9135,7 @@ class TestResolveKiroBinEnvOverride:
             "strip_python_env": True,
             "is_kiro_cli": True,
         }
+        voice_guard.assert_called_once_with(client._work_dir)
         spawn_call = mock_exec.await_args
         assert strip_spawn_shim(spawn_call.args) == (
             "/usr/bin/cgroup-wrapper",
@@ -8841,9 +9145,14 @@ class TestResolveKiroBinEnvOverride:
             "--agent",
             client._agent,
         )
-        # No inherited snapshot descriptor: the installed binary is exec'd in
-        # place, so there is nothing to hand down to the wrapper chain.
-        assert "pass_fds" not in spawn_call.kwargs
+        # No inherited SNAPSHOT descriptor: the installed binary is exec'd in
+        # place, so there is nothing to hand down to the wrapper chain. The
+        # spawn shim does inherit the cwd descriptor it ``fchdir``s to — that
+        # is what pins the working directory by fd instead of by a pathname a
+        # concurrent rename could swap — so the property here is that NOTHING
+        # ELSE rides along, not that ``pass_fds`` is empty.
+        passed = spawn_call.kwargs.get("pass_fds", ())
+        assert len(passed) <= 1, f"unexpected descriptors handed to the child: {passed}"
 
     def test_env_override_ignored_when_missing_file(self, tmp_path):
         # A configured-but-nonexistent path must not be returned; resolution
@@ -10302,11 +10611,13 @@ class TestSpawnEnvScrub:
             captured["env"] = kwargs.get("env")
             raise _StopSpawn()
 
-        monkeypatch.setattr(acp_client, "_resolve_kiro_bin", lambda: "/fake/kiro")
+        # **_ absorbs the environ/home the spawn path now pins, so the search and
+        # the "not found" diagnostic cannot read different environments.
+        monkeypatch.setattr(acp_client, "_resolve_kiro_bin", lambda **_: "/fake/kiro")
         monkeypatch.setattr(
             acp_client,
             "wrap_argv",
-            lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
+            lambda argv, mode=None, strip_python_env=False, is_kiro_cli=None, **_kw: (argv, None),
         )
         monkeypatch.setattr(acp_client, "cgroup_scope_argv", lambda argv: argv)
         monkeypatch.setattr(acp_client, "augmented_path", lambda p: p)
@@ -10348,11 +10659,11 @@ class TestSpawnEnvScrub:
             captured["env"] = kwargs.get("env")
             raise _StopSpawn()
 
-        monkeypatch.setattr(acp_client, "_resolve_kiro_bin", lambda: "/fake/kiro")
+        monkeypatch.setattr(acp_client, "_resolve_kiro_bin", lambda *_a, **_kw: "/fake/kiro")
         monkeypatch.setattr(
             acp_client,
             "wrap_argv",
-            lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
+            lambda argv, mode=None, strip_python_env=False, is_kiro_cli=None, **_kw: (argv, None),
         )
         monkeypatch.setattr(acp_client, "cgroup_scope_argv", lambda argv: argv)
         monkeypatch.setattr(acp_client, "augmented_path", lambda p: p)

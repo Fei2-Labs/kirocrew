@@ -16,7 +16,9 @@ import contextlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -260,6 +262,216 @@ class TestMoveTakesBothHalves:
         assert str(crew_home / "sessions" / "dashboard_chat-1.jsonl") in origins
 
 
+class TestASessionResumedWhileStagingIsLeftAlone:
+    """The authority checks run before the move loop, so they describe one instant.
+
+    A batch is not instant, and a session can be resumed between being certified
+    retired and being reached by the loop. The loop catches that from the stat it
+    already takes for the manifest: a source modified since the batch was
+    validated cannot be the idle file that qualified.
+    """
+
+    def _touch_when(self, target: Path, *, on: Path) -> Callable[[Path, Path], None]:
+        """Move normally, but write to *target* the first time *on* is moved.
+
+        Stands in for the real event: something resumes the session and appends to
+        its replay log while the batch is part-way through being staged.
+        """
+        real = session_storage._move_file
+        state = {"done": False}
+
+        def _move(src: Path, dst: Path) -> None:
+            real(src, dst)
+            if not state["done"] and src == on:
+                state["done"] = True
+                with target.open("ab") as fh:
+                    fh.write(b"resumed")
+                future = time.time() + 5
+                os.utime(target, (future, future))
+
+        return _move
+
+    def test_the_revived_session_stays_in_place_and_is_named(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-2", size=16, age_days=400)
+
+        # The first session's cli half moves, and that is when the SECOND session's
+        # transcript is written to — the ordering a real resume would produce.
+        victim = crew_home / "sessions" / "dashboard_chat-2.jsonl"
+        trigger = kiro_home / "sessions" / "cli" / "aaaa1111.jsonl"
+        monkeypatch.setattr(session_storage, "_move_file", self._touch_when(victim, on=trigger))
+
+        batch = session_storage.move_to_trash(
+            ["aaaa1111", "bbbb2222"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1", "bbbb2222": "dashboard_chat-2"}),
+            now=_NOW,
+        )
+
+        assert batch.sessions == 1
+        assert batch.revived == ("bbbb2222",)
+        # Still resumable, both halves, exactly where they were.
+        assert victim.is_file()
+        assert (kiro_home / "sessions" / "cli" / "bbbb2222.jsonl").is_file()
+        # And nothing of it is in the batch.
+        staged = session_storage.trash_root() / batch.batch_id
+        assert not (staged / "crew" / "dashboard_chat-2.jsonl").exists()
+        assert not (staged / "cli" / "bbbb2222.jsonl").exists()
+        # The session that was genuinely idle still moved.
+        assert (staged / "cli" / "aaaa1111.jsonl").is_file()
+
+    def test_a_half_that_already_moved_is_put_back(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Revival found on a LATER file must not leave the session split."""
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+        transcript = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+
+        cli_log = kiro_home / "sessions" / "cli" / "aaaa1111.jsonl"
+        monkeypatch.setattr(session_storage, "_move_file", self._touch_when(transcript, on=cli_log))
+
+        with pytest.raises(SessionStorageError, match="resumed while being staged"):
+            session_storage.move_to_trash(
+                ["aaaa1111"],
+                reason="manual",
+                index=_index({"aaaa1111": "dashboard_chat-1"}),
+                now=_NOW,
+            )
+
+        # The half that had already moved is back where it belongs.
+        assert cli_log.is_file()
+        assert transcript.is_file()
+
+    def test_a_resume_between_the_refresh_and_the_loop_is_caught(
+        self, stores: tuple[Path, Path]
+    ) -> None:
+        """The anchor is taken before the scan, so this window is covered too.
+
+        An anchor stamped after the authority checks would miss this: the write
+        lands while ``refresh`` runs, so its mtime is older than any later stamp
+        and the session would be staged while live. Driving it through *refresh*
+        puts the write exactly where a resume during the scan would land.
+        """
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+        victim = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+        mapping = {"aaaa1111": "dashboard_chat-1"}
+
+        def _refresh_and_resume() -> SessionIndex:
+            # A real resume writes at the current instant, NOT in the future, and
+            # that is the whole point of this test: an mtime of "now" is newer than
+            # an anchor taken at entry and OLDER than one taken after these checks,
+            # so only the early anchor catches it. The sleep makes the ordering
+            # measurable rather than trusting sub-microsecond clock resolution.
+            time.sleep(0.01)
+            with victim.open("ab") as fh:
+                fh.write(b"resumed")
+            written = time.time()
+            os.utime(victim, (written, written))
+            # Deliberately reports the session as retired: this pins the mtime
+            # guard, not the index re-read that already covers a MAPPED session.
+            return _index(mapping)
+
+        with pytest.raises(SessionStorageError, match="resumed while being staged"):
+            session_storage.move_to_trash(
+                ["aaaa1111"],
+                reason="manual",
+                index=_index(mapping),
+                now=_NOW,
+                refresh=_refresh_and_resume,
+            )
+
+        assert victim.is_file()
+        assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").is_file()
+
+    def test_a_revival_whose_rollback_cannot_finish_is_not_claimed_as_left_alone(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reporting revival is a claim, so it must not outlive a failed rollback.
+
+        Putting a file back is deliberately non-overwriting, so a resume that
+        recreates an origin makes the rollback incomplete: the staged copy stays in
+        the batch, unlisted by its manifest. Saying the session was "left in place"
+        would then be false, and restore could not see the orphan either.
+        """
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+        cli_log = kiro_home / "sessions" / "cli" / "aaaa1111.jsonl"
+        transcript = crew_home / "sessions" / "dashboard_chat-1.jsonl"
+
+        real = session_storage._move_file
+        state = {"done": False}
+
+        def _resume_recreating_the_origin(src: Path, dst: Path) -> None:
+            real(src, dst)
+            if not state["done"] and src == cli_log:
+                state["done"] = True
+                # The resume recreates the half that just moved AND writes the
+                # other one — the ordering that makes the rollback decline.
+                cli_log.write_bytes(b"live again")
+                with transcript.open("ab") as fh:
+                    fh.write(b"resumed")
+                future = time.time() + 5
+                for path in (cli_log, transcript):
+                    os.utime(path, (future, future))
+
+        monkeypatch.setattr(session_storage, "_move_file", _resume_recreating_the_origin)
+
+        with pytest.raises(SessionStorageError, match="could not be fully put back"):
+            session_storage.move_to_trash(
+                ["aaaa1111"],
+                reason="manual",
+                index=_index({"aaaa1111": "dashboard_chat-1"}),
+                now=_NOW,
+            )
+
+        # The live session keeps what the resume wrote — the rollback must never
+        # overwrite it with the staged copy.
+        assert cli_log.read_bytes() == b"live again"
+        assert transcript.is_file()
+
+        # And whatever could not be put back is IN the manifest, because an
+        # unlisted file in a batch is reachable by neither restore nor empty.
+        batches = list(session_storage.trash_root().iterdir())
+        assert len(batches) == 1
+        entries = [
+            json.loads(line)
+            for line in (batches[0] / session_storage.MANIFEST_NAME).read_text().splitlines()
+            if line.strip()
+        ]
+        staged_records = [e for e in entries if e.get("uid") == "aaaa1111"]
+        assert staged_records, "the stranded half was left out of the manifest"
+        rels = {record["rel"] for record in staged_records[0]["files"]}
+        assert rels, "an entry with no files cannot be restored"
+        for rel in rels:
+            assert (batches[0] / rel).is_file()
+
+    def test_an_untouched_batch_reports_nothing_revived(self, stores: tuple[Path, Path]) -> None:
+        """The guard must not fire on the ordinary case, or every reclaim breaks."""
+        crew_home, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=16, age_days=400)
+        _transcript(crew_home, "dashboard_chat-1", size=16, age_days=400)
+
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"],
+            reason="manual",
+            index=_index({"aaaa1111": "dashboard_chat-1"}),
+            now=_NOW,
+        )
+
+        assert batch.sessions == 1
+        assert batch.revived == ()
+
+
 class TestRestoreIsAllOrNothing:
     def test_restores_every_half(self, stores: tuple[Path, Path]) -> None:
         crew_home, kiro_home = stores
@@ -458,14 +670,14 @@ class TestRestoreIsAllOrNothing:
         _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
         _transcript(crew_home, "dashboard_chat-1", size=8, age_days=40)
         target = crew_home / "sessions" / "dashboard_chat-1.jsonl"
-        real_size = session_storage._file_size
+        real_stamp = session_storage._file_stamp
 
-        def flaky_size(path: Path) -> int:
+        def flaky_stamp(path: Path) -> tuple[int, float]:
             if path == target:
                 raise OSError("simulated transient stat failure")
-            return real_size(path)
+            return real_stamp(path)
 
-        monkeypatch.setattr(session_storage, "_file_size", flaky_size)
+        monkeypatch.setattr(session_storage, "_file_stamp", flaky_stamp)
 
         with pytest.raises(SessionStorageError, match="none of the selected"):
             session_storage.move_to_trash(
@@ -764,6 +976,40 @@ class TestManifestPersistenceFailure:
         assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").is_file()
         assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
         assert session_storage.list_trash() == []
+
+    def test_rewrite_fsyncs_before_publishing_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A crash after publish must not expose manifest bytes still only in cache."""
+        from kiro_crew import atomic_write as atomic_write_module
+
+        batch = tmp_path / "batch"
+        batch.mkdir()
+        events: list[str] = []
+        real_fsync = atomic_write_module.os.fsync
+        real_replace = atomic_write_module.replace_with_retry
+
+        def tracking_fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def tracking_replace(src: str | Path, dst: str | Path) -> None:
+            events.append("replace")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(atomic_write_module.os, "fsync", tracking_fsync)
+        monkeypatch.setattr(atomic_write_module, "replace_with_retry", tracking_replace)
+        header = {"schema": session_storage.MANIFEST_SCHEMA, "batch_id": "batch"}
+        entries = [{"uid": "aaaa1111", "files": []}]
+
+        session_storage._rewrite_manifest(batch, header, entries)
+
+        assert events.index("fsync") < events.index("replace")
+        manifest = batch / session_storage.MANIFEST_NAME
+        assert [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()] == [
+            header,
+            *entries,
+        ]
 
 
 class TestBatchIdentityIsTheDirectory:
@@ -1671,6 +1917,44 @@ class TestCotenantCache:
         session_storage.reclaim_block_reason()
 
         assert calls["n"] == 2, "the reclaim gate must re-enumerate the pod root on every call"
+
+    def test_reclaim_block_reason_reuses_cache_when_cached_true(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Display callers passing cached=True reuse the primed co-tenant pass."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+
+        session_storage.cotenant_sids(cached=True)  # prime
+        calls = self._count_pod_scans(monkeypatch)
+        session_storage.reclaim_block_reason(cached=True)
+        session_storage.reclaim_block_reason(cached=True)
+
+        assert calls["n"] == 0, "cached=True must reuse the primed co-tenant cache"
+
+    def test_measure_reuses_primed_cotenant_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """measure() opts into cached=True to avoid an extra co-tenant scan."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+
+        session_storage.cotenant_sids(cached=True)  # prime
+        calls = self._count_pod_scans(monkeypatch)
+        report = session_storage.measure(
+            session_storage.SessionIndex(),
+            units=[],
+            batches=[],
+        )
+
+        assert calls["n"] == 0, "measure() must reuse the primed co-tenant cache"
+        assert isinstance(report.reclaim_blocked_reason, str)
 
 
 class TestSharedStoreRefusal:

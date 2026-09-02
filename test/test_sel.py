@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 
 import kiro_crew.sel as sel_mod
+from conftest import requires_symlinks
 from kiro_crew import platform_compat
 from kiro_crew import sel as kiro_crew_sel
 from kiro_crew.sel import SecurityEvent, SecurityEventLog, _infer_source, sel, sel_hmac_key_path
@@ -563,7 +564,10 @@ log.flush()
         signing fine.
         """
         legacy = tmp_path / kiro_crew_sel._HMAC_KEY_FILE
-        legacy.write_bytes(os.urandom(64))
+        # Windows' CRT text mode treats a trailing 0x1A as DOS EOF. Keep this
+        # input deterministic so opening the binary key as a lock can never
+        # regress to text mode and silently truncate its final byte.
+        legacy.write_bytes(b"k" * 63 + b"\x1a")
         trust = tmp_path / kiro_crew_sel._TRUST_SUBDIR
 
         real_mkdir = Path.mkdir
@@ -902,6 +906,7 @@ log.flush()
         log.log(_make_event(event_id="after-release-1"))
         assert "after-release-1" in log._path.read_text(encoding="utf-8")
 
+    @requires_symlinks
     def test_symlinked_sidecar_is_refused(self, tmp_path):
         """A planted link is not a lock — following it defeats serialization.
 
@@ -1026,12 +1031,14 @@ log.flush()
     async def test_on_loop_contention_makes_exactly_one_nonblocking_attempt(
         self, tmp_path, monkeypatch
     ):
-        """The loop-side acquire must try ONCE and refuse — never poll.
+        """The loop-side acquire must try ONCE and refuse — never block or poll.
 
         A retry spin, however short each nap, sleeps the gateway event loop, so
         the stall is paid by every session it serves. This pins the contract:
         one ``try_acquire_lock`` call, an immediate fail-closed raise, and no
-        sleep anywhere on the path.
+        call to either blocking lock primitive. Wall time cannot prove that
+        contract: runner scheduling and the surrounding file work are outside
+        the lock algorithm but inside any elapsed-time measurement.
         """
         log = SecurityEventLog(base_dir=tmp_path, sync=True)
         log.log(_make_event(event_id="single-shot-preheat"))
@@ -1041,27 +1048,30 @@ log.flush()
         holder = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         assert platform_compat.try_acquire_lock(holder, exclusive=True)
 
-        attempts = []
+        attempts: list[tuple[int, bool]] = []
         real_try = platform_compat.try_acquire_lock
 
         def _counting_try(fd: int, *, exclusive: bool = False) -> bool:
-            attempts.append(fd)
+            attempts.append((fd, exclusive))
             return real_try(fd, exclusive=exclusive)
 
+        def _blocking_acquire_is_a_bug(*_args, **_kwargs):
+            pytest.fail("on-loop chain-lock acquire used a blocking primitive")
+
+        monkeypatch.setattr(kiro_crew_sel.platform_compat, "try_acquire_lock", _counting_try)
         monkeypatch.setattr(
-            kiro_crew_sel.platform_compat, "try_acquire_lock", _counting_try
+            kiro_crew_sel.platform_compat, "acquire_lock", _blocking_acquire_is_a_bug
         )
+        monkeypatch.setattr(kiro_crew_sel.platform_compat, "file_lock", _blocking_acquire_is_a_bug)
         try:
-            started = time.monotonic()
             with pytest.raises(OSError):
                 log.log(_make_event(event_id="single-shot-critical"), critical=True)
-            elapsed = time.monotonic() - started
         finally:
             platform_compat.release_lock(holder)
             os.close(holder)
 
         assert len(attempts) == 1, f"on-loop acquire polled {len(attempts)} times"
-        assert elapsed < 0.05, f"on-loop acquire took {elapsed:.3f}s"
+        assert attempts[0][1] is True, "the single lock attempt was not exclusive"
         assert "single-shot-critical" not in log._path.read_text(encoding="utf-8")
 
     def test_on_loop_acquire_helper_never_sleeps(self):
@@ -2405,6 +2415,106 @@ class TestHmacKeyTrustDirMigration:
         assert inst is not None and inst._initialized
         assert inst._hmac_key == (tmp_path / "trust" / "sel_hmac.key").read_bytes()
         self._reset()
+
+
+class TestTrustRootPathReResolution:
+    """``sel_hmac_key_path()`` re-resolves per call (#2588).
+
+    ``_hmac_key_file`` is decided once at init, and a failed legacy migration
+    leaves it on the legacy location; a sibling process that later completes the
+    migration deletes the file this process still names. The accessor follows the
+    key instead of every dependent protocol growing its own recovery — but only
+    to a file whose bytes are the anchor this process already validated, and
+    never by moving what the audit chain signs with.
+    """
+
+    def _reset(self) -> None:
+        SecurityEventLog._instance = None
+        SecurityEventLog._initialized = False
+
+    def test_resolved_path_is_returned_while_it_loads(self, tmp_path: Path) -> None:
+        SecurityEventLog(base_dir=tmp_path, sync=True)
+        assert sel_mod.sel_hmac_key_path() == tmp_path / "trust" / "sel_hmac.key"
+
+    def test_relocation_to_the_trust_dir_is_followed(self, tmp_path: Path) -> None:
+        """The #2539 shape: this process kept the legacy path after a failed
+        migration, then a sibling process completed it."""
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        canonical = tmp_path / "trust" / "sel_hmac.key"
+        # Pin the instance to the legacy location the way a failed migration does.
+        log._hmac_key_file = tmp_path / "sel_hmac.key"
+        assert not (tmp_path / "sel_hmac.key").exists()
+
+        assert sel_mod.sel_hmac_key_path() == canonical
+
+    def test_relocation_to_the_legacy_location_is_followed(self, tmp_path: Path) -> None:
+        SecurityEventLog(base_dir=tmp_path, sync=True)
+        legacy = tmp_path / "sel_hmac.key"
+        os.replace(tmp_path / "trust" / "sel_hmac.key", legacy)
+
+        assert sel_mod.sel_hmac_key_path() == legacy
+
+    def test_a_candidate_with_other_bytes_is_not_adopted(self, tmp_path: Path) -> None:
+        """The no-downgrade property. The resolved path vanishing is exactly when
+        an actor who can write the trust dir would plant a key of their own;
+        handing a dependent protocol that path hands it signing material."""
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        canonical = tmp_path / "trust" / "sel_hmac.key"
+        planted = b"p" * 32
+        assert log._hmac_key != planted
+        canonical.write_bytes(planted)
+        log._hmac_key_file = tmp_path / "sel_hmac.key"
+
+        # Unchanged, so the operator report still names the file that broke and
+        # session_pid_sig recovers from the validated in-memory copy instead.
+        assert sel_mod.sel_hmac_key_path() == tmp_path / "sel_hmac.key"
+
+    def test_a_short_candidate_is_not_adopted(self, tmp_path: Path) -> None:
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        (tmp_path / "trust" / "sel_hmac.key").write_bytes(b"short")
+        log._hmac_key_file = tmp_path / "sel_hmac.key"
+
+        assert sel_mod.sel_hmac_key_path() == tmp_path / "sel_hmac.key"
+
+    def test_re_resolution_never_moves_what_the_chain_signs_with(self, tmp_path: Path) -> None:
+        """The reason item 1 of #2588 was deferred does not apply: the accessor
+        returns a PATH the signing and verification code never reads, so a
+        relocation cannot orphan records already chained."""
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log.log_tool_invocation(
+            session_key="s1", tool_name="t1", tool_kind="tool", outcome="ok"
+        )
+        anchor = log._hmac_key
+        legacy = tmp_path / "sel_hmac.key"
+        os.replace(tmp_path / "trust" / "sel_hmac.key", legacy)
+
+        assert sel_mod.sel_hmac_key_path() == legacy
+        assert log._hmac_key == anchor
+        log.log_tool_invocation(
+            session_key="s2", tool_name="t2", tool_kind="tool", outcome="ok"
+        )
+        total, valid = log.verify_integrity()
+        assert (total, valid) == (2, 2)
+
+    def test_no_singleton_resolves_the_trust_default(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(sel_mod, "_default_dir", lambda: tmp_path)
+        assert SecurityEventLog._instance is None
+
+        assert sel_mod.sel_hmac_key_path() == tmp_path / "trust" / "sel_hmac.key"
+
+    def test_key_loads_predicate_rejects_a_directory(self, tmp_path: Path) -> None:
+        d = tmp_path / "sel_hmac.key"
+        d.mkdir()
+        assert sel_mod._trust_root_key_loads(d) is False
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO semantics")
+    def test_key_loads_predicate_rejects_a_fifo(self, tmp_path: Path) -> None:
+        """Asserted on the predicate rather than through the accessor on purpose:
+        without the ``S_ISREG`` guard the failure mode is an unbounded in-kernel
+        block on open, which would hang CI instead of failing it."""
+        fifo = tmp_path / "sel_hmac.key"
+        os.mkfifo(fifo)
+        assert sel_mod._trust_root_key_loads(fifo) is False
 
 
 class TestSizeRotation:

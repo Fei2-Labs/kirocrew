@@ -17,10 +17,15 @@ auditing happen IN THE GATEWAY (``computer_use/tools.py`` →
   ``hooks._governance_denial`` — the PreToolUse gate — is fail-**OPEN** by
   deliberate repo policy (a governance glitch must not wedge every tool call on
   every surface), so it cannot be the sole authorization point for a surface that
-  can read a password field's ``AXValue``. The authoritative gate
-  (``gate.require_computer_use``) fails CLOSED and needs the OS-resolved app
-  identity and the addressed element's role — which only the gateway-side tool
-  body has.
+  can read a password field's ``AXValue``. The fail-CLOSED gate is the keystone
+  primary enable, read at the top of ``computer_use/tools.py``'s ordered
+  chokepoint: a keystone that is missing, unreadable or disabled refuses the call
+  outright. ``gate.require_computer_use`` is audit-only — it unconditionally
+  permits and records the call, retained as the one place a future edition can
+  reintroduce a decision without touching every call site — and the refusals
+  downstream of the enable (the operator's target policy, the element and pointer
+  shape checks) need the OS-resolved app identity and the addressed element's
+  role, which only the gateway-side tool body has.
 * **Governance and the audit trail live where the platform context is composed.**
   The ceiling, the profile store and the SEL trust root are all gateway state.
 * **No native code in this process.** This module imports no ctypes, loads no
@@ -106,6 +111,7 @@ from kiro_crew.computer_use.types import (
     TOOL_TYPE_TEXT,
 )
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.mcp_caller import current_tenant_nonce
 from kiro_crew.mcp_core import (
     _http_error_body,
     _internal_secret,
@@ -161,33 +167,56 @@ ERR_GATEWAY_UNREACHABLE = (
 # per session, so in the 1:1 shim topology the pid separates the namespaces exactly
 # as far as the sessions are actually separate — and it does so without reinstating
 # the unattended-surface refusal that was removed by product decision. On a POOLED
-# backend one process serves many sessions, so the pid separates only what the
+# backend one process serves many sessions, so the pid alone separates only what the
 # injected caller block does not already name: co-tenants gatewayd can name get real
-# per-session keys, and the residual — unnamed co-tenants sharing one
-# ``unresolved:<pid>`` namespace — is tracked as #5322. It is
+# per-session keys, and the unnamed ones USED to collapse onto one
+# ``unresolved:<pid>`` namespace (#5322). They no longer do — gatewayd injects a
+# per-CONNECTION nonce on every forwarded call, which is appended here, so two
+# unnamed co-tenants of one pooled process hold separate namespaces. It is
 # deliberately NOT presented as trustworthy attribution: the prefix names it as
-# unresolved so an audit reader cannot mistake a pid for a session identity.
+# unresolved so an audit reader cannot mistake a pid (or a nonce) for a session
+# identity.
 UNRESOLVED_SESSION_PREFIX = "unresolved:"
+
+#: Separates the process half from the connection half of an unresolved key.
+#: Not ``:``, which already separates the prefix from the pid — a distinct
+#: character keeps the two halves legible in an audit line.
+UNRESOLVED_TENANT_SEPARATOR = "#"
 
 
 def _unresolved_session_key() -> str:
-    """A per-PROCESS session identity for a session we could not name.
+    """A per-CONNECTION session identity for a session we could not name.
 
-    ``unresolved:<pid>`` of THIS shim process. kiro-cli spawns one shim per session,
-    so the pid separates two unresolved sessions exactly as far as they really are
-    separate — which is what keeps ``SnapshotIndex``'s ``(session_key, window_key)``
-    namespace from aliasing them onto one entry and letting one session's action
-    resolve against another's element indices.
+    ``unresolved:<pid>`` of THIS shim process, plus ``#<nonce>`` of the calling
+    CONNECTION when the gateway supplied one. Together they separate two
+    unresolved sessions exactly as far as they really are separate, in both
+    topologies:
 
-    Read at CALL time rather than captured at import: a ``fork``ed child would
-    otherwise inherit the parent's string and re-alias with it, which is the exact
-    failure this is here to prevent.
+    * 1:1 shim (no gateway, no nonce) — kiro-cli spawns one shim per session, so
+      the pid is already the separator and the key is unchanged.
+    * Pooled backend — one process serves N connections, so the pid separates
+      nothing; the gateway-minted per-connection nonce does (#5322).
+
+    Without the nonce half, two unnamed co-tenants of a pooled backend shared one
+    key, which is what let ``SnapshotIndex``'s ``(session_key, window_key)``
+    namespace alias them onto one entry and let one session's action resolve
+    against another's element indices — while each session's own fingerprint
+    check still passed, because both trees describe the same window.
+
+    Both halves are read at CALL time rather than captured at import: a ``fork``ed
+    child would otherwise inherit the parent's pid string and re-alias with it,
+    and the nonce belongs to the call in flight, not to the process.
 
     Never presented as trustworthy attribution — the prefix says so. This is a
     namespace separator, not an authenticated identity; a genuine identity still
-    comes only from the two sources ``_resolve_session_key_strict`` accepts.
+    comes only from the two sources ``_resolve_session_key_strict`` accepts, and
+    the nonce is not one of them (it names a connection, not a principal).
     """
-    return f"{UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+    key = f"{UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+    nonce = current_tenant_nonce()
+    if nonce:
+        return f"{key}{UNRESOLVED_TENANT_SEPARATOR}{nonce}"
+    return key
 
 
 def _list_tools() -> list[dict[str, Any]]:

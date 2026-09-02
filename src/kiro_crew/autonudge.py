@@ -36,7 +36,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
@@ -74,9 +74,6 @@ _REARM_BACKOFF_MAX_SHIFT = 16  # clamp the 2**shift exponent
 # race their follow-up message; a short beat leaves room for notify_user_input
 # to cancel the pending fire again if they are still actively conversing.
 _OVERDUE_REARM_SECS = 10
-
-# Sentinel file per loop: creating it halts the loop on next cycle.
-STOP_SENTINEL = "STOP"
 
 # Persisted source category for a deliberate ``autonudge_stop`` directive.
 # The caller's free-form explanation is intentionally not stored: it is
@@ -531,9 +528,8 @@ class AutoNudgeService:
         # the durable row until the dependent worker has been archived.
         self._maintenance_quiescing: set[str] = set()
         self._maintenance_quiesce_events: dict[str, asyncio.Event] = {}
-        # Set by _load() when a persisted loop was repaired in memory (currently
-        # a re-homed/dropped stop_sentinel_path) so start() can flush the
-        # correction back to disk ONCE instead of re-deriving it every boot.
+        # Set by _load() when persisted state is repaired in memory so start()
+        # flushes the correction before any loop can re-arm.
         self._store_dirty = False
         # Consecutive non-delivery count per loop (drives escalating re-arm
         # backoff + once-per-streak failure logging). Not persisted; resets on
@@ -752,27 +748,16 @@ class AutoNudgeService:
         # arrives later sees this live service rather than a stale private copy.
         async with _maintenance_lock(self._base_dir):
             # Load + repair OFF the event loop: the locked read is file I/O and
-            # repair_sentinel_path's sensitivity check resolves realpaths, which can
-            # stall on an unavailable network-mounted sentinel. Freezing the loop
-            # here would take chat, heartbeat and liveness down until the watchdog
-            # restarts the gateway (no-blocking-call-on-event-loop).
+            # repair_sentinel_path's sensitivity check resolves realpaths.
             await asyncio.get_running_loop().run_in_executor(None, self._load)
-            # Persist any repair _load() made (re-homed sentinel paths) before the
-            # timers go live, so the corrected value survives even if this process
-            # never mutates a loop again. Routed through _persist_locked so it obeys
-            # the one write protocol (snapshot under `_lock`, fsync off the loop)
-            # rather than snapshotting unlocked.
             if self._store_dirty:
                 try:
                     await self._persist_locked()
                     self._store_dirty = False
-                except Exception:  # noqa: BLE001 - the in-memory repair still applies
-                    logger.warning("AutoNudge: could not persist loaded-state repair", exc_info=True)
-            # Re-arm timers for active loops on startup — toward each loop's
-            # persisted deadline, so a restart never resets the countdown: a loop
-            # that was 25 minutes into a 30-minute interval resumes with ~5 left,
-            # and one whose deadline passed while the gateway was down fires after
-            # the overdue beat. Legacy entries (no next_due_ts) start fresh.
+                except Exception:  # noqa: BLE001 - in-memory repair still applies
+                    logger.warning(
+                        "AutoNudge: could not persist loaded-state repair", exc_info=True
+                    )
             for loop in self._loops.values():
                 if loop.active:
                     self._arm_from_deadline(loop)
@@ -1112,7 +1097,9 @@ class AutoNudgeService:
             loop = self._loops.get(loop_id)
             if not loop:
                 return None
-            previous = asdict(loop)
+            # Keep typed nested values intact. ``asdict`` recursively converts
+            # MonitorState to a plain dict, which is not a valid rollback value.
+            previous = {item.name: getattr(loop, item.name) for item in fields(loop)}
             was_active = loop.active
             if message is not None:
                 loop.message = message

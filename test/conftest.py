@@ -403,6 +403,22 @@ def pytest_internalerror(excrepr, excinfo) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _release_stt_engine():
+    """Never let a loaded speech model outlive the test that loaded it.
+
+    ``kiro_crew.stt.engine`` keeps ONE recogniser per process on purpose: the
+    whole point of the module is that an utterance does not pay for a model load.
+    Under xdist that same property makes it cross-test state, and the instance
+    carries the idle-eviction window the first caller passed, so a later test
+    reading a different setting would silently get the earlier one.
+    """
+    yield
+    from kiro_crew.stt import engine as stt_engine
+
+    stt_engine._engine = None
+
+
+@pytest.fixture(autouse=True)
 def _reset_safety_override_between_tests():
     """Reset the SafetyOverride singleton between tests to prevent state leaking."""
     _reset_safety_override()
@@ -584,16 +600,25 @@ def _isolate_message_entry_cache():
 
     The byte counter is part of the same state, so resetting only the dict would
     leave the memory ceiling mis-accounted and evict a healthy cache.
+
+    The memoised config bounds are reset for the same reason: they are resolved
+    once per process from whatever KIROCREW_HOME the first caller saw, so a test
+    that resolved them under its own home would otherwise leak its bounds into
+    every later test's cache behaviour.
     """
     from kiro_crew.dashboard import chat_persistence as _cp
 
     _cp._entry_cache.clear()
     _cp._entry_cache_bytes = 0
+    _cp._entry_cache_bounds_cached = None
+    _cp._entry_cache_bounds_read_warned = False
     try:
         yield
     finally:
         _cp._entry_cache.clear()
         _cp._entry_cache_bytes = 0
+        _cp._entry_cache_bounds_cached = None
+        _cp._entry_cache_bounds_read_warned = False
 
 
 @pytest.fixture(autouse=True)

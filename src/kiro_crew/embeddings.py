@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import ctypes
 import functools
 import hashlib
 import importlib.util
@@ -96,9 +97,15 @@ _POOLING_TYPE_LAST = 3
 # small: KV-cache size scales linearly with n_ctx (~115KB/token for this
 # model) and the embedder may load in more than one process (gateway +
 # kirocrew-core MCP server — the GGUF weights themselves are mmap'd and
-# physically shared, the KV buffers are not). n_ubatch must cover the whole
-# input for pooled embedding models — keep all three in lockstep.
+# physically shared, the KV buffers are not). The logical batch still covers
+# the complete input for last-token pooling; llama.cpp may split that work into
+# smaller physical micro-batches without changing the resulting vector.
 _N_CTX = 2048
+# Physical decode micro-batch. Keeping this below the logical batch bounds the
+# compute scratch arena without reducing the accepted context. Qwen3's
+# 6,000-char maximum input produces byte-identical vectors at 512 and 2048,
+# while 512 avoids roughly 419 MiB of peak RSS on the shipped Linux runtime.
+_N_UBATCH = 512
 # Safety truncation (chars) before inference, sized under _N_CTX at a
 # conservative ~4 chars/token so a clipped input always fits the context
 # window. Only pathological un-chunked blobs exceed this; mirrors the
@@ -163,9 +170,7 @@ _MODEL_URL_ENV = "KIROCREW_EMBED_MODEL_URL"
 # _EDITABLE_CONFIG allowlist, so no API caller and no agent can point the
 # embedder at an arbitrary file.
 _MODEL_PATH_ENV = "KIROCREW_EMBED_MODEL_PATH"
-_DEFAULT_MODEL_URL = (
-    "https://d3j0sthz5doyui.cloudfront.net/models/qwen3-embedding-0.6b.gguf"
-)
+_DEFAULT_MODEL_URL = "https://d3j0sthz5doyui.cloudfront.net/models/qwen3-embedding-0.6b.gguf"
 _HTTP_TIMEOUT_SECS = 1800  # 610MB at >=340KB/s; slower links retry with backoff
 _HTTP_CHUNK_BYTES = 1 << 20
 # Written by the HTTP downloader every ~16MB so the status endpoint can report
@@ -189,6 +194,25 @@ _LINUX_X86_64_REQUIRED_CPU_FLAGS = frozenset(
     {"avx", "avx2", "bmi2", "f16c", "fma", "sse3", "ssse3"}
 )
 _LINUX_CPUINFO_PATH = Path("/proc/cpuinfo")
+
+#: MSVC runtime DLLs the vendored Windows libs IMPORT but which are not shipped
+#: beside them. All four ship with the Microsoft Visual C++ 2015-2022
+#: Redistributable, and a clean Windows install may carry none of them.
+#:
+#: Read off the PE import tables of the four DLLs in ``win_amd64`` rather than
+#: guessed: ``llama.dll`` and ``ggml.dll`` need the first three, and
+#: ``ggml-base.dll``/``ggml-cpu.dll`` additionally pull ``VCOMP140.DLL``, the MSVC
+#: OpenMP runtime. Both Linux payloads DO vendor their equivalent
+#: (``libgomp-*.so.1.0.0``), which is what makes this an omission on the Windows
+#: lane rather than a deliberate asymmetry. They are not vendored here because
+#: redistributing Microsoft's runtime is a licensing decision, not a packaging one
+#: — so the gap is reported precisely instead of being papered over.
+_WINDOWS_MSVC_RUNTIME_DLLS = (
+    "MSVCP140.dll",
+    "VCRUNTIME140.dll",
+    "VCRUNTIME140_1.dll",
+    "VCOMP140.DLL",
+)
 
 # The native-library closure every supported platform MUST ship, keyed by the
 # `llama_cpp_libs/<dir>` name. `libllama` is the entry point ctypes opens by
@@ -268,6 +292,27 @@ def _platform_libs_dirname() -> str | None:
         if machine in ("amd64", "x86_64"):
             return "win_amd64"
     return None
+
+
+def _missing_windows_msvc_runtime() -> list[str]:
+    """Which MSVC runtime DLLs the vendored Windows libs need but cannot be found.
+
+    Probed BY NAME through the OS loader rather than by listing a directory, so the
+    answer reflects the same search the vendored DLLs' own imports will perform
+    (System32, the app directory, the DLL search path) instead of a guess about where
+    the redistributable installed itself.
+
+    Always empty off Windows: ``ctypes.WinDLL`` does not exist elsewhere.
+    """
+    if sys.platform != "win32":
+        return []
+    absent: list[str] = []
+    for name in _WINDOWS_MSVC_RUNTIME_DLLS:
+        try:
+            ctypes.WinDLL(name)
+        except OSError:
+            absent.append(name)
+    return absent
 
 
 def _linux_x86_64_cpu_flags(
@@ -416,6 +461,25 @@ def _load_llama_class():
                 _LIB_PATH_ENV,
             )
             return None
+        if libs_dirname == "win_amd64":
+            # Named rather than left to surface as the loader's own
+            # "[WinError 126] The specified module could not be found", which points
+            # at the library being opened rather than at the runtime it imports and
+            # so reads as a broken platform. Same reasoning as the missing-files
+            # branch above: the fix here is one download, and an operator cannot
+            # guess it from a WinError.
+            missing_runtime = _missing_windows_msvc_runtime()
+            if missing_runtime:
+                logger.warning(
+                    "The bundled Windows llama.cpp runtime needs the Microsoft Visual "
+                    "C++ 2015-2022 Redistributable (x64); this host is missing %s. "
+                    "Install it from https://aka.ms/vs/17/release/vc_redist.x64.exe "
+                    "and restart Kiro Crew. Memory falls back to keyword search until "
+                    "then. Set %s to use an operator-provided runtime instead.",
+                    ", ".join(missing_runtime),
+                    _LIB_PATH_ENV,
+                )
+                return None
         if libs_dirname == "linux_x86_64":
             cpu_flags = _linux_x86_64_cpu_flags()
             if cpu_flags is None:
@@ -1264,8 +1328,15 @@ class LlamaCppEmbedder(EmbeddingBackend):
                 embedding=True,
                 pooling_type=_POOLING_TYPE_LAST,
                 n_ctx=_N_CTX,
+                # n_batch == n_ctx so the logical batch always covers the whole
+                # input in one go, which last-token pooling needs. This used to
+                # also size a ~1.24 GB per-token logits buffer in the vendored
+                # constructor; that buffer is now skipped entirely in embedding
+                # mode (see the `n_score_rows` divergence comment in
+                # src/kiro_crew/_vendor/llama_cpp/llama.py, issue #6827), so
+                # n_batch no longer trades memory against input length.
                 n_batch=_N_CTX,
-                n_ubatch=_N_CTX,
+                n_ubatch=_N_UBATCH,
                 # Both pools are pinned. Embedding is prompt processing, so the
                 # BATCH pool is the one that actually runs, but leaving the
                 # generation pool at llama.cpp's cpu//2 default would still size

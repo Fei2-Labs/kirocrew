@@ -4,6 +4,20 @@ The frontend must not carry its own copy of the capability table. If it did, the
 Settings card's disclosure and `kirocrew doctor` could disagree about what a
 backend supports, and the operator would have no way to tell which was right. One
 source, served here.
+
+Each row is the UNION of two owners, and it must stay one row from one handler on
+ONE registered route. Registering the path twice is not a duplicate that logs
+something: aiohttp resolves in registration order and the first match answers, so
+a second registration silently DELETES the other payload — every field one side
+owns simply stops arriving, and no test that calls a handler directly can see it.
+
+* The REGISTRY half — `label`, `experimental`, `dialect`, `routing`,
+  `capabilities`, `degraded_count`, `signin_command`, `selectable` — is derived
+  here from `acp.backends.descriptor_for`.
+* The MACHINE half — `policy_id`, `installed`, `missing_components`,
+  `install_command`, `restart_required` — comes from
+  :func:`kiro_crew.dashboard.handlers.acp_backend_status.install_snapshot`, which
+  asks through the spawn's own resolvers.
 """
 
 from __future__ import annotations
@@ -24,9 +38,40 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
 )
+from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
 from kiro_crew.dashboard.handlers.kiro_prerequisite import _is_dashboard_owner
+from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
+
+_AUDIT_OPERATION = "acp_backend_status_access"
+
+
+async def _audit_denial(request: web.Request, reason: str) -> None:
+    """Record a refused read on the security event log; never raise.
+
+    The payload names which backends are selectable and the active one's
+    tool-gate verdict, so a refused attempt to read it is host-security-relevant
+    and belongs on the audit log. An unwritable log must not turn the denial into
+    a 500 -- the refusal is the security-relevant half and still has to land.
+    """
+    caller = str(request.get("user") or "")
+    audit_caller = str(request.get("app") or caller or "unknown")
+
+    def _log() -> None:
+        sel().log_api_access(
+            caller=audit_caller,
+            operation=_AUDIT_OPERATION,
+            outcome="denied",
+            source="dashboard",
+            resources=request.path,
+            error=reason,
+        )
+
+    try:
+        await asyncio.to_thread(_log)
+    except Exception:
+        logger.debug("Could not audit denied ACP backend read", exc_info=True)
 
 
 def _probe_installed(
@@ -104,13 +149,21 @@ def _descriptor_payload(
     registry_adapters: Mapping[str, Any] | None = None,
     selectable: frozenset[str] | None = None,
     npm_resolution: Any = None,
+    install_row: Mapping[str, Any] | None = None,
 ) -> dict:
-    """One backend as JSON.
+    """One backend as JSON — the registry descriptor merged with *install_row*.
 
     Capability levels are sent as their string values rather than booleans so the
     UI can distinguish supported, degraded, unavailable and unverified. Collapsing
     them would make "works differently", "missing" and "not measured" render
     identically.
+
+    Every machine-half key is present on every row, probed or not, because the
+    client types them as required; unprobed they carry the "we did not look"
+    value rather than being omitted, so a consumer never has to distinguish an
+    absent key from a negative answer. ``policy_id`` is the exception that costs
+    nothing to answer — it is a static translation, not a probe, so it is always
+    the real one.
     """
     descriptor = acp_backends.descriptor_for(backend, registry_adapters=registry_adapters)
     capabilities = {
@@ -120,28 +173,48 @@ def _descriptor_payload(
     differences = sum(1 for value in capabilities.values() if value != "supported")
     if selectable is None:
         selectable = acp_backends.selectable_ids()
+    # "" when not probed, so the UI can tell "we did not look" apart from
+    # "we looked and could not tell" (`unknown`).
+    installed = ""
+    if probe:
+        installed = _probe_installed(
+            backend,
+            registry_adapters=registry_adapters,
+            npm_resolution=npm_resolution,
+        )
+    install_command = descriptor.install_command
+    missing_components: list[str] = []
+    restart_required = False
+    if install_row is not None:
+        # The install snapshot is the only side that can NAME the absent
+        # components, so its DEFINITE verdict wins where it has one. It has no
+        # probe for most ids and answers `unknown` for them, which is exactly
+        # where the adapter resolvers above are the better answer — taking
+        # `unknown` here would erase a verdict the spawn's own resolver gave.
+        snapshot_installed = str(install_row.get("installed") or "")
+        if snapshot_installed in ("installed", "missing"):
+            installed = snapshot_installed
+            missing_components = list(install_row.get("missing_components") or [])
+            restart_required = bool(install_row.get("restart_required"))
+        install_command = str(install_row.get("install_command") or "") or install_command
     return {
         "id": descriptor.id,
+        # The kiro backend's id is "" in code, so it cannot be its own wire
+        # name. An unregistered id falls back to itself rather than to "", so a
+        # registry adapter still sorts and renders under a name.
+        "policy_id": str(POLICY_ID_BY_BACKEND.get(descriptor.id, descriptor.id)),
         "label": descriptor.label,
         "experimental": descriptor.experimental,
         "selectable": descriptor.id in selectable,
         "signin_command": descriptor.signin_command,
-        "install_command": descriptor.install_command,
+        "install_command": install_command,
         "dialect": descriptor.dialect.value,
         "routing": descriptor.routing.value,
         "capabilities": capabilities,
         "degraded_count": differences,
-        # "" when not probed, so the UI can tell "we did not look" apart from
-        # "we looked and could not tell" (`unknown`).
-        "installed": (
-            _probe_installed(
-                backend,
-                registry_adapters=registry_adapters,
-                npm_resolution=npm_resolution,
-            )
-            if probe
-            else ""
-        ),
+        "installed": installed,
+        "missing_components": missing_components,
+        "restart_required": restart_required,
     }
 
 
@@ -160,11 +233,7 @@ def _active_state(
     from kiro_crew.config.loader import KiroCrewConfig
 
     try:
-        cfg = (
-            KiroCrewConfig.load()
-            if selectable is None
-            else KiroCrewConfig.load(selectable_acp_backends=selectable)
-        )
+        cfg = KiroCrewConfig.load()
         active = cfg.agent.acp_backend or ""
         allow_ungated = bool(cfg.agent.acp_backend_allow_ungated_tools)
     except Exception:
@@ -209,11 +278,13 @@ async def api_acp_backends(request: web.Request) -> web.Response:
     the host; a non-owner viewer has no reason to read either.
     """
     if request.get("app") != "":
+        await _audit_denial(request, "app scope not permitted")
         return web.json_response(
             {"error": "app scope not permitted", "code": "app_scope_forbidden"},
             status=403,
         )
     if not _is_dashboard_owner(request):
+        await _audit_denial(request, "owner only")
         return web.json_response(
             {"error": "owner only", "code": "owner_only"},
             status=403,
@@ -241,6 +312,19 @@ async def api_acp_backends(request: web.Request) -> web.Response:
     npm_resolution = None
     if probe and any(adapter.is_launchable for adapter in registry_adapters.values()):
         npm_resolution = await asyncio.to_thread(registry.npm_resolution_snapshot)
+    # Part of the same opt-in: the snapshot shells out to mise and walks the
+    # filesystem, so an unprobed caller must not pay for it.
+    install_rows: Mapping[str, Mapping[str, Any]] = {}
+    if probe:
+        from kiro_crew.dashboard.handlers.acp_backend_status import install_snapshot
+
+        try:
+            install_rows = await asyncio.to_thread(install_snapshot)
+        except Exception:
+            # Same defensive posture as ``_active_state``: a failed probe
+            # degrades the machine half of the rows, it must never cost the
+            # card its whole payload.
+            logger.debug("Could not read the backend install snapshot", exc_info=True)
     backends_payload = await asyncio.to_thread(
         lambda: [
             _descriptor_payload(
@@ -249,6 +333,7 @@ async def api_acp_backends(request: web.Request) -> web.Response:
                 registry_adapters=registry_adapters,
                 selectable=backend_ids,
                 npm_resolution=npm_resolution,
+                install_row=install_rows.get(backend),
             )
             for backend in sorted(described_ids)
         ]

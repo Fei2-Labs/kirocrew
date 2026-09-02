@@ -467,6 +467,15 @@ class TestFetchUsageDeadline:
 
         api_dict = {"credits_used": 12.0, "credits_plan": 100.0, "source": "api"}
         arn = "arn:aws:codewhisperer:us-east-1:1:profile/A"
+        # The short deadline exists to bound the phase-1 hang, and its job is
+        # done once that pass timed out. A loaded runner can legitimately spend
+        # more than 0.2s just reaching the subprocess executor on this pass,
+        # and a timeout here lands in the same transient-failure handler as a
+        # real hang (leaving credits_plan unset), so give the success pass a
+        # window only real work can fill.
+        monkeypatch.setattr(
+            sessions_mod, "_USAGE_FETCH_DEADLINE_SECS", 5.0, raising=False
+        )
         with patch.object(sessions_mod, "_resolve_kiro_bin_for_spawn", return_value="/bin/kiro"), \
              patch.object(sessions_mod, "_fetch_whoami",
                           AsyncMock(return_value={"email": "me@corp.com", "_profile_arn": arn})), \

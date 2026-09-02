@@ -209,6 +209,22 @@ export const SETTINGS_MANUAL: ManualSettingEntry[] = [
     occurrence: 1,
   },
   {
+    id: 'notifications.sound-category-agent',
+    labelKey: 'pages.settings.notificationsPanel.category_agent',
+    descriptionKey: 'pages.settings.notificationsPanel.category_agent_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
+    id: 'notifications.sound-category-skills',
+    labelKey: 'pages.settings.notificationsPanel.category_skills',
+    descriptionKey: 'pages.settings.notificationsPanel.category_skills_description',
+    tab: 'notifications',
+    type: 'select',
+    occurrence: 1,
+  },
+  {
     // Playwright attach token: a credential field with Save/Clear semantics the
     // SettingsInput primitive has no shape for.
     id: 'browser.attach-token',

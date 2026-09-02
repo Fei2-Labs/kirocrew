@@ -538,6 +538,7 @@ jobs:
           PR: ${{ steps.pr.outputs.pr }}
           HEAD: ${{ steps.pr.outputs.head_sha }}
           VERDICT: ${{ steps.verdict.outputs.verdict }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
         run: |
           set -uo pipefail
           [ -z "${PR:-}" ] && { echo "no PR resolved; skipping comment"; exit 0; }
@@ -560,13 +561,24 @@ jobs:
               cat "$f"
             } > "$RUNNER_TEMP/design-comment.md"
           else
-            # No parseable verdict → the review errored or emitted no header. Do
-            # NOT post raw model/error text; post a generic, leak-safe notice.
+            # No parseable verdict → post a generic, leak-safe notice (raw
+            # model/error text can carry internal detail). Name the cause from the
+            # model step's OWN outcome instead of asserting one: this branch is
+            # reached both when the model ran and returned nothing usable and when
+            # the model was never called at all, and "the model call errored" sent
+            # contributors to debug a call that had not happened.
+            case "${REVIEW_OUTCOME:-}" in
+              skipped) why="the review step never ran, because an earlier step in this job failed — no model call was made" ;;
+              failure) why="the review step failed" ;;
+              cancelled) why="the review step was cancelled" ;;
+              success) why="the review step completed but returned no verdict header" ;;
+              *)       why="the review step reported no outcome" ;;
+            esac
             {
               echo "$MARKER"
               echo "## Design Review (Fable 5, fork) — ⚠️ could not complete"
               echo
-              echo "_The design review did not produce a verdict for \`$HEAD\` (the model call errored or returned no verdict header). See the Fork Design Review job logs. Advisory — does not block merge._"
+              echo "_The design review did not produce a verdict for \`$HEAD\` ($why). See the Fork Design Review job logs. Advisory — does not block merge._"
             } > "$RUNNER_TEMP/design-comment.md"
           fi
           # Author-filtered per-page jq lookup so a PR commenter can't plant the

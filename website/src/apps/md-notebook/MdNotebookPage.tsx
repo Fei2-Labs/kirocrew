@@ -6,6 +6,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useIsMobile } from '../../hooks/useIsMobile'
+import { useImeGuard } from '../../hooks/useImeGuard'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import type { CSSProperties } from 'react'
@@ -193,6 +194,9 @@ export default function MdNotebookPage() {
   )
   const [panelOpen, setPanelOpen] = useState(() => loadPref<boolean>(LS.panelOpen, true))
   const isMobile = useIsMobile()
+  // Composition state for the raw-markdown textarea, whose Tab re-indents a list
+  // item by rewriting the whole value — see the keydown handler below.
+  const ime = useImeGuard()
   // The panel is a fixed 260px `flexShrink: 0` column, so at 390px it left the
   // editor 130px. `panelOpen` already exists but is a stored DESKTOP preference,
   // so it arrives open on a phone. While narrow the panel is a drawer that starts
@@ -465,6 +469,15 @@ export default function MdNotebookPage() {
    * not the response -- that makes the wait sufficient.
    */
   const writesInFlightRef = useRef(new Set<Promise<void>>())
+  /**
+   * The active disk save, shared by every caller that reaches the save barrier.
+   *
+   * A debounce and a rename/move can ask to flush the same dirty buffer at the
+   * same time. Sending both requests lets one success clear `dirtyRef` after the
+   * other request failed, so the mutation can move a note whose save was never
+   * reconciled. Joining the active request makes its one outcome authoritative.
+   */
+  const saveInFlightRef = useRef<Promise<void> | null>(null)
   const contentRef = useRef('')
   const pathRef = useRef<string | null>(null)
   const vaultRef = useRef(activeVaultId)
@@ -732,6 +745,13 @@ export default function MdNotebookPage() {
       window.clearTimeout(saveTimer.current)
       saveTimer.current = null
     }
+    // A mutation arriving while the debounce save is active must observe that
+    // request's outcome. Starting a second save here could clear `dirtyRef`
+    // after the first one failed and let the mutation cross a failed barrier.
+    if (saveInFlightRef.current) {
+      await saveInFlightRef.current
+      return
+    }
     if (!pathRef.current || !dirtyRef.current) return
     // The note this flush is persisting, as a VAULT + PATH pair. A save can still
     // be in flight when the user deletes that note from the row action bar, and
@@ -742,54 +762,62 @@ export default function MdNotebookPage() {
     // and the banner offers "Use the file on disk" against the NEW vault's buffer.
     const savingPath = pathRef.current
     const saving = { vault: vaultRef.current, path: savingPath }
-    const doneSave = trackWrite()
-    try {
-      // Save until what landed matches what the editor holds. `contentRef` can
-      // move while the request is in flight, and the debounce timer was
-      // cancelled above — clearing `dirty` against a stale snapshot would leave
-      // that newer text with nothing scheduled to persist it. Bounded so a fast
-      // typist cannot spin here; whatever is left stays dirty for the next
-      // debounce to pick up.
-      for (let attempt = 0; attempt < 3; attempt++) {
-        // The CONTENT is re-read live each attempt — that is the point of the
-        // loop. The TARGET is the captured pair, never the live refs: a vault
-        // switch or a rename during the round trip would otherwise redirect
-        // attempt 2 at whatever is open by then, writing this note's text
-        // somewhere the user never asked for.
-        const sent = contentRef.current
-        const res = await notesApi.saveNote(
-          saving.vault,
-          saving.path,
-          sent,
-          mtimeRef.current ?? undefined,
-        )
-        mtimeRef.current = res.mtime
-        if (contentRef.current === sent) {
-          setDirty(false)
-          dirtyRef.current = false
-          break
+    const run = (async () => {
+      const doneSave = trackWrite()
+      try {
+        // Save until what landed matches what the editor holds. `contentRef` can
+        // move while the request is in flight, and the debounce timer was
+        // cancelled above — clearing `dirty` against a stale snapshot would leave
+        // that newer text with nothing scheduled to persist it. Bounded so a fast
+        // typist cannot spin here; whatever is left stays dirty for the next
+        // debounce to pick up.
+        for (let attempt = 0; attempt < 3; attempt++) {
+          // The CONTENT is re-read live each attempt — that is the point of the
+          // loop. The TARGET is the captured pair, never the live refs: a vault
+          // switch or a rename during the round trip would otherwise redirect
+          // attempt 2 at whatever is open by then, writing this note's text
+          // somewhere the user never asked for.
+          const sent = contentRef.current
+          const res = await notesApi.saveNote(
+            saving.vault,
+            saving.path,
+            sent,
+            mtimeRef.current ?? undefined,
+          )
+          mtimeRef.current = res.mtime
+          if (contentRef.current === sent) {
+            setDirty(false)
+            dirtyRef.current = false
+            break
+          }
+          // The buffer moved on. Only keep retrying while it is still THIS note in
+          // THIS vault; otherwise the dirty flag being cleared below would belong to
+          // a different buffer entirely.
+          if (!targetsSameNote(saving, vaultRef.current, pathRef.current)) return
         }
-        // The buffer moved on. Only keep retrying while it is still THIS note in
-        // THIS vault; otherwise the dirty flag being cleared below would belong to
-        // a different buffer entirely.
-        if (!targetsSameNote(saving, vaultRef.current, pathRef.current)) return
+      } catch (e) {
+        const body = (e as { body?: { code?: string; mtime?: number; disk?: string } }).body
+        if (body?.code === 'ESTALE') {
+          // The note changed on disk since it was opened. Surface both versions
+          // rather than clobbering either — but ONLY while that note is still
+          // open. Deleting a note mid-flush also lands here (the backend refuses
+          // to resurrect it and returns the recreate sentinel), and showing the
+          // banner then would offer "Keep my version" for a note the user just
+          // deleted — accepting it would put the file back.
+          if (!targetsSameNote(saving, vaultRef.current, pathRef.current)) return
+          setFileConflict({ mtime: body.mtime ?? 0, disk: body.disk ?? '' })
+        } else {
+          setError(e instanceof Error ? e.message : String(e))
+        }
+      } finally {
+        doneSave()
       }
-    } catch (e) {
-      const body = (e as { body?: { code?: string; mtime?: number; disk?: string } }).body
-      if (body?.code === 'ESTALE') {
-        // The note changed on disk since it was opened. Surface both versions
-        // rather than clobbering either — but ONLY while that note is still
-        // open. Deleting a note mid-flush also lands here (the backend refuses
-        // to resurrect it and returns the recreate sentinel), and showing the
-        // banner then would offer "Keep my version" for a note the user just
-        // deleted — accepting it would put the file back.
-        if (!targetsSameNote(saving, vaultRef.current, pathRef.current)) return
-        setFileConflict({ mtime: body.mtime ?? 0, disk: body.disk ?? '' })
-      } else {
-        setError(e instanceof Error ? e.message : String(e))
-      }
+    })()
+    saveInFlightRef.current = run
+    try {
+      await run
     } finally {
-      doneSave()
+      if (saveInFlightRef.current === run) saveInFlightRef.current = null
     }
   }, [trackWrite])
 
@@ -2438,11 +2466,18 @@ export default function MdNotebookPage() {
               spellCheck={false}
               aria-label={i18nT('apps.mdNotebook.header.view_raw')}
               onChange={e => edit(e.target.value)}
+              {...ime.bindComposition<HTMLTextAreaElement>()}
               onKeyDown={e => {
                 if (e.key !== 'Tab') return
                 const ta = e.currentTarget
                 const next = shiftListItem(content, ta.selectionStart, e.shiftKey)
                 if (!next) return
+                // Claim BEFORE the rewrite: IMEs use Tab to cycle the candidate
+                // list, and on WebKit the keydown that commits a candidate
+                // arrives after `compositionend` with `isComposing` already
+                // false — so an unclaimed Tab would re-indent the list item and
+                // overwrite the text still being composed.
+                if (!ime.claimKey(e)) return
                 e.preventDefault()
                 ta.value = next.text
                 ta.setSelectionRange(next.pos, next.pos)

@@ -132,12 +132,14 @@ def _load_hmac_key() -> bytes | None:
     else while a verifier can still read it. When the file does NOT load, fall
     back to the identical bytes the live ``SecurityEventLog`` validated at init
     (:func:`kiro_crew.sel.sel_hmac_key_bytes`). Without that fallback this
-    protocol dies permanently the moment the resolved path stops resolving —
-    the path is frozen at SEL init and never re-resolved, while SEL itself
-    keeps signing from its cached copy, so a key file relocated by a concurrent
-    process (legacy -> ``trust/`` migration), deleted, chmod'd, or truncated
-    takes down every identity-dependent MCP tool with no failing audit chain to
-    point at it.
+    protocol dies permanently the moment the resolved path stops resolving.
+    :func:`kiro_crew.sel.sel_hmac_key_path` now re-resolves per call (#2588), so
+    a key relocated by a concurrent process (legacy -> ``trust/`` migration) is
+    followed rather than mourned; this fallback still carries the cases no path
+    can resolve away — deleted, chmod'd, truncated, or a relocation whose bytes
+    do not match the anchor and so are deliberately not adopted — where SEL
+    itself keeps signing from its cached copy and would otherwise leave every
+    identity-dependent MCP tool dead with no failing audit chain to point at it.
     """
     try:
         raw = sel_hmac_key_path().read_bytes()

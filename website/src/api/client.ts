@@ -19,6 +19,7 @@ import type {
   UpdateCheckResult,
   WorkflowRunSummary,
 } from '../types'
+import { ApiError, friendlyErrText } from './apiError'
 import { refreshOnce, __resetRefreshOnceForTests } from './refreshOnce'
 import {
   STALE_OWNER_SESSION_CODE,
@@ -837,6 +838,49 @@ export interface GovernanceScope {
   detail: GovernanceScopeDetail
 }
 
+/** Central-policy-distribution posture, from the `distribution` key of
+ *  GET /api/governance/policy.
+ *
+ *  POSTURE ONLY, and one field more strictly than the rest of that payload: the
+ *  producer reports the source's SCHEME and never its URL, because the endpoint is
+ *  the fleet's control plane and the dashboard is reachable by the agent's own
+ *  browser tooling. Every value is a number, a boolean, or a machine-readable enum,
+ *  so the dashboard renders translated text and no English arrives in the JSON body.
+ *
+ *  Only `configured` is guaranteed: the producer's fail-safe path answers
+ *  `{configured: false}` alone when the posture itself could not be resolved, so
+ *  every other field is optional and a reader must treat absence as unknown rather
+ *  than as a zero. */
+export interface GovernanceDistributionData {
+  /** Whether this host fetches its ceiling from a central source at all. False
+   *  also covers "could not tell" — pair it with `error_code`. */
+  configured: boolean
+  /** URL scheme of the source (`https`, `file`, `http`), never the URL. '' when
+   *  unconfigured. */
+  source_scheme?: string
+  /** Seconds between background re-fetches, already clamped to the polling floor.
+   *  0 = fetched at boot only. */
+  refresh_interval_seconds?: number
+  /** The fleet's staleness bound on the cached copy. 0 = no bound. */
+  max_cache_age_seconds?: number
+  /** What the host does when no ceiling can be established: refuse to start, or
+   *  fall through to the next policy tier and report a governance incident. */
+  on_unavailable?: 'fail_closed' | 'degrade' | ''
+  /** Whether the background poll loop is alive in this process. */
+  refresher_running?: boolean
+  /** Whether a last-known-good copy recorded against THIS source is on disk. */
+  cache_present?: boolean
+  /** Age of that copy in seconds; null when there is none. */
+  cache_age_seconds?: number | null
+  /** Outcome of the most recent background refresh. '' before the first one. */
+  last_refresh_status?: 'not_configured' | 'unchanged' | 'applied' | 'rejected' | 'unreachable' | ''
+  /** Seconds since that refresh; null when none has run. */
+  last_refresh_age_seconds?: number | null
+  /** Why the posture could not be resolved, as an enum the dashboard maps to
+   *  translated copy. '' when nothing went wrong. */
+  error_code?: 'misconfigured' | ''
+}
+
 /** GET /api/governance/policy — the read-only effective ceiling across scopes. */
 export interface GovernancePolicyData {
   /** Policy schema version, or null when no enterprise ceiling is present. */
@@ -864,6 +908,11 @@ export interface GovernancePolicyData {
    *  the governance security payload (PR #5544). Tolerated at load time and
    *  inert in this build. */
   unknown_profile_scopes?: Record<string, string[]>
+  /** Where the ceiling itself comes from, when a central source publishes it.
+   *  Present on BOTH the normal and the fail-safe snapshot, so a host whose first
+   *  fetch has not landed — `has_policy: false`, `profile: null` — can still be told
+   *  apart from a host that has no enterprise ceiling at all. */
+  distribution?: GovernanceDistributionData
   /** True when governance resolution failed — the viewer shows a soft notice. */
   unavailable: boolean
   scopes: GovernanceScope[]
@@ -975,6 +1024,8 @@ export type TailnetMobileStep =
  * this machine do next", where the other answers "what does the running server
  * already trust". Both are needed and they are not interchangeable. */
 export interface TailnetMobileData {
+  /** Per-process marker used only to prove a requested restart completed. */
+  boot_id: string
   step: TailnetMobileStep
   /** MagicDNS name as resolved right now; `''` when unresolvable. */
   host: string
@@ -1011,6 +1062,19 @@ export interface TailnetMobileMutation {
   ok: boolean
   code: string
   detail: string
+}
+
+/** Phone-connection methods surviving the governance filter. `kind` names the
+ *  renderer; the dashboard skips a kind it does not recognise, so an edition's
+ *  new method degrades to absent on an older frontend, never to a broken panel. */
+export interface MobileConnectMethodsData {
+  methods: { id: string; kind: string }[]
+}
+
+/** Durable config established by the explicit mobile setup action. */
+export interface TailnetMobileConfigure {
+  /** Trust/origin settings are snapshotted by middleware at gateway boot. */
+  restart_required: boolean
 }
 
 /** A minted mobile-access QR. Carries a LIVE session token in both fields, so
@@ -1058,6 +1122,61 @@ export interface TrustedAppsData {
  */
 export interface TrustedAppsRevokeResult extends TrustedAppsData {
   disabled: boolean
+}
+
+/**
+ * Whether THIS MACHINE has an ACP backend's components installed.
+ *
+ * `'unknown'` means the check itself failed, and it is NOT a synonym for
+ * `'missing'`: telling someone to install what they may already have costs them a
+ * global package install for nothing. Consumers must keep the three apart.
+ */
+export type AcpBackendInstalled = 'installed' | 'missing' | 'unknown'
+
+/**
+ * One row of `GET /api/acp-backends` — a backend the code knows about, paired
+ * with what this build can serve and what this machine actually has.
+ *
+ * `selectable` is a BUILD/edition-and-policy fact (the same set
+ * `PATCH /api/config/kirocrew` validates against); `installed` is a machine fact.
+ * They are independent: a build can serve a backend whose binary is absent, and a
+ * machine can hold a backend this build refuses to run.
+ *
+ * `missing_components` is non-empty only when `installed === 'missing'`;
+ * `install_command` is `''` when there is nothing to suggest.
+ */
+export interface AcpBackendProbe {
+  id: string
+  policy_id: string
+  selectable: boolean
+  installed: AcpBackendInstalled
+  missing_components: string[]
+  install_command: string
+  /** Rich descriptor fields returned when the endpoint is probed. */
+  label?: string
+  experimental?: boolean
+  signin_command?: string
+  dialect?: string
+  routing?: string
+  capabilities?: Record<string, string>
+  degraded_count?: number
+  /**
+   * Installed on disk, but the RUNNING gateway already resolved its absence and
+   * cached that for the process's life — so a session started now would still
+   * fail. Disables the option and says restart, rather than offering a control
+   * that is guaranteed to error.
+   */
+  restart_required: boolean
+}
+
+/** Combined response shape: unprobed requests expose registry/probe rows, while
+ * probed requests add active routing metadata and richer row descriptors. */
+export interface AcpBackendsResponse {
+  backends: AcpBackendProbe[]
+  active?: string
+  allow_ungated_tools?: boolean
+  routing_verdict?: string
+  routing_reason?: string
 }
 
 let _sessionExpiredShown = false
@@ -1271,30 +1390,14 @@ installStaleOwnerHandler(handleStaleOwnerSession)
 export { STALE_OWNER_SESSION_CODE }
 
 /**
- * HTTP error from an API call. Carries the response status so call sites can
- * branch on specific codes (e.g. 404 = not found, 409 = conflict) without
- * regex-matching the error message text.
- *
- * Extends Error so existing `e instanceof Error ? e.message : String(e)`
- * fallbacks keep working.
+ * `ApiError` and `friendlyErrText` now live in the side-effect-free
+ * `api/apiError` module so app API clients can import them without pulling this
+ * file's graph (queryClient, transport install, the error journal) into their
+ * bundles. Re-exported here because this has always been their import path —
+ * every existing consumer, and every test that mocks `../api/client`, is
+ * unchanged by the move.
  */
-export class ApiError extends Error {
-  readonly status: number
-  /** The raw response body, kept so a caller can read structured fields that
-   * `friendlyErrText` collapses away when it unwraps the human message. */
-  readonly body: string
-  /** The gateway rejected this call because the dashboard session no longer
-   * authenticates (403 + `X-Auth-Required`). Call sites branch on this to drop
-   * retry affordances that cannot succeed until the user re-authenticates. */
-  readonly authRequired: boolean
-  constructor(status: number, message: string, body = '', authRequired = false) {
-    super(message)
-    this.name = 'ApiError'
-    this.status = status
-    this.body = body
-    this.authRequired = authRequired
-  }
-}
+export { ApiError, friendlyErrText }
 
 /**
  * Whether *e* is a failure the user can only clear by signing back in.
@@ -1307,32 +1410,6 @@ export class ApiError extends Error {
  */
 export const isAuthExpiredError = (e: unknown): boolean =>
   e instanceof ApiError && e.authRequired
-
-/**
- * Map raw edge/proxy error bodies to a human-readable message. A dashboard
- * served through Builder Tunnels sits behind API Gateway, whose throttle
- * response is the opaque `{"message":"Rate exceeded","throttlingReasons":null}`
- * — rendering that verbatim in an error card is a terrible UX. The mapped
- * message only ever shows after the QueryClient's 429 retry ladder
- * (api/queryClient.ts) is exhausted.
- */
-export const friendlyErrText = (status: number, body: string): string => {
-  if (status === 429) {
-    return i18nT('api.client.rate_limited_by_the_tunnel_edge_http_429_too_man')
-  }
-  // Backends return errors as {"error": "…"} (or detail/message). Unwrap the
-  // field so the UI shows the human message with its real newlines, not the
-  // raw JSON envelope with escaped \n and \".
-  const trimmed = body.trim()
-  if (trimmed.startsWith('{')) {
-    try {
-      const parsed = JSON.parse(trimmed)
-      const msg = parsed?.error ?? parsed?.detail ?? parsed?.message
-      if (typeof msg === 'string' && msg.trim()) return msg
-    } catch { /* not JSON — fall through to raw body */ }
-  }
-  return body
-}
 
 /**
  * Build the ApiError AND journal it.
@@ -1626,6 +1703,14 @@ export interface TunnelStatus {
   error: string
   uptime: number
   reconnect_attempt: number
+  /**
+   * Why a `disabled` tunnel is off. `boot_flag` means the gateway was started
+   * with `--no-tunnel` and will never publish, whatever `tunnel.enabled` says in
+   * its config (a Dev Fleet pod always boots that way). Empty for every other
+   * state and for an ordinary unconfigured tunnel. Optional because a gateway
+   * older than this field does not send it.
+   */
+  reason?: string
 }
 
 export interface KiroPrerequisiteStatus {
@@ -1962,11 +2047,25 @@ export interface MemberRosterRow {
   slot_key: string
   /** O(1) liveness: the bound slot is mid-turn right now. */
   running: boolean
+  /** Epoch seconds of the DM transcript's last write; 0 = never talked. */
+  last_active_ts?: number
+  last_message?: string
   kiro_agent?: string
   workspace?: string
   memory_store?: string
   model?: string
   [extra: string]: unknown
+}
+
+/** One entry of GET /api/members/{slug}/activity — a recorded engagement.
+ *  `via` distinguishes a session the user opened with the member ('chat')
+ *  from an orchestrator routing decision ('select_crew'); the latter records
+ *  intent, not a run. */
+export interface MemberActivityEntry {
+  /** Epoch seconds (UTC) the engagement was recorded. */
+  ts: number
+  via: 'chat' | 'select_crew' | string
+  project?: string
 }
 
 export const api = {
@@ -2059,8 +2158,10 @@ export const api = {
   // CSRF/audit reasons as the spec repair above. Error responses carry a
   // machine-readable `code` field alongside the human message.
   kasLoginStatus: () => get('/api/kas-login').then(j) as Promise<KasLoginStatus>,
-  kasLoginBeginDevice: (provider: string) =>
-    post('/api/kas-login/device', { provider }).then(j) as Promise<KasLoginDeviceSession>,
+  kasLoginBeginDevice: (provider: string, extra?: { start_url?: string; region?: string }) =>
+    post('/api/kas-login/device', { provider, ...(extra ?? {}) }).then(
+      j,
+    ) as Promise<KasLoginDeviceSession>,
   kasLoginPoll: (login_id: string) =>
     post('/api/kas-login/poll', { login_id }).then(j) as Promise<KasLoginPollResult>,
   kasLoginLogout: (identity: string) =>
@@ -2085,22 +2186,32 @@ export const api = {
     url: string
     expires_in: number
   }>,
+  // Phone-connection methods available on this deployment under the current
+  // governance ceiling (CPP mobile_connect seam). Descriptor-only: minting the
+  // credential stays on each method's own endpoint above/below. An empty list
+  // hides the sidebar "Connect your phone" entry entirely.
+  mobileConnectMethods: () =>
+    get('/api/mobile-connect/methods').then(j) as Promise<MobileConnectMethodsData>,
   // Tailnet origin (Settings → Security). READ ONLY here: the toggle writes
   // `dashboard.tailscale.enabled` through the generic config PATCH, because the
   // setting IS a config value and the status endpoint reports what the running
   // server resolved from it at startup.
   tailnetStatus: () => get('/api/tailnet/status').then(j) as Promise<TailnetStatusData>,
   // Mobile access. `tailnetMobile` is a LIVE probe (two daemon round trips
-  // server-side), so poll it gently; the three mutations below are user-driven.
+  // server-side), so poll it gently; the mutations below are user-driven.
   tailnetMobile: () => get('/api/tailnet/mobile').then(j) as Promise<TailnetMobileData>,
+  tailnetMobileConfigure: () =>
+    post('/api/tailnet/mobile/configure', {}).then(j) as Promise<TailnetMobileConfigure>,
   tailnetMobilePublish: () =>
     post('/api/tailnet/mobile/publish', {}).then(j) as Promise<TailnetMobileMutation>,
   tailnetMobileUnpublish: () =>
     post('/api/tailnet/mobile/unpublish', {}).then(j) as Promise<TailnetMobileMutation>,
   // Mints a session token. Called ONLY from an explicit user action — never on
-  // render — because the response is a live credential.
-  tailnetMobileQr: (ttl?: string) =>
-    post('/api/tailnet/mobile/qr', ttl ? { ttl } : {}).then(j) as Promise<TailnetMobileQr>,
+  // render — because the response is a live credential. `sessionKey` carries
+  // the caller's REAL slot key so the server's restricted-session guard sees
+  // it instead of the shared `dashboard:ui` placeholder.
+  tailnetMobileQr: (ttl?: string, sessionKey?: string) =>
+    post('/api/tailnet/mobile/qr', ttl ? { ttl } : {}, sessionKey).then(j) as Promise<TailnetMobileQr>,
   // Denied commands (Settings → Security). Every endpoint returns the full
   // refreshed snapshot so callers can seed their query cache from the response.
   deniedCommands: () => get('/api/security/denied-commands').then(j) as Promise<DeniedCommandsData>,
@@ -2306,17 +2417,26 @@ export const api = {
   // mode="member"), so this is also the only place a member slot key comes from.
   memberThread: (slug: string) =>
     post('/api/members/' + encodeURIComponent(slug) + '/thread').then(j) as Promise<{ slot_key: string; slug: string; member: string }>,
+  // A member's recent activity pointers (real recorded signal only: session
+  // participations and routing decisions). `member` is the exact crew name —
+  // slugs are lossy, so the backend filters the shared log by exact name.
+  // Fetched on drawer open, never polled.
+  memberActivity: (slug: string, member: string) =>
+    fetch(
+      '/api/members/' + encodeURIComponent(slug) + '/activity?member=' + encodeURIComponent(member),
+    ).then(j) as Promise<{
+      slug: string
+      member: string
+      /** True when the display window is saturated — derived counters are floors. */
+      capped: boolean
+      entries: MemberActivityEntry[]
+    }>,
   updateKirocrewAgent: (name: string, body: object) =>
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
     del('/api/agents/' + encodeURIComponent(name)).then(j),
   models: (opts?: { slot?: string }) =>
     fetch('/api/models' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
-  // `probe=1` walks each adapter's resolution ladder. Default is off; the
-  // preview-gated Settings selector and Services label opt into the same probed
-  // query so they can share one cache and stay synchronized.
-  acpBackends: ({ probe }: { probe?: boolean } = {}) =>
-    fetch('/api/acp-backends' + (probe ? '?probe=1' : '')).then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
   slashCommands: (opts?: { slot?: string }) =>
@@ -2591,9 +2711,13 @@ export const api = {
   // artifacts are a pair and either half can fail alone; `entryRemoved` is false
   // when the entry configured under this slug points at a different endpoint (so it
   // is not ours to delete); `grantSharedWith` names the other entries using the same
-  // endpoint, which is why the grant was deliberately kept.
+  // endpoint, which is why the grant was deliberately kept. `grantCensusUnreadable`
+  // names the sources the census could not read, so the card can say WHICH file to
+  // repair -- optional because the other half of `grantCensusIncomplete` (an entry
+  // whose URL could not be compared) names no file, and a gateway predating the
+  // field sends none.
   connectionsDisconnect: (slug: string) =>
-    post('/api/connections/disconnect', { slug }).then(j) as Promise<{ ok: boolean; disconnected: string; grantRemoved: boolean; grantSurviving: string[]; entryRemoved: boolean; grantSharedWith: string[] }>,
+    post('/api/connections/disconnect', { slug }).then(j) as Promise<{ ok: boolean; grantRemoved: boolean; grantSurviving: string[]; entryRemoved: boolean; grantSharedWith: string[]; grantCensusIncomplete: boolean; grantCensusUnreadable?: string[] }>,
   // MCP Gateway (shared pool)
   mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; stub: string[]; stub_count: number; running: boolean; ping_ok: boolean; supported: boolean }>,
   mcpGatewayEnable: (enabled: boolean) => post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean; running: boolean; ping_ok: boolean }>,
@@ -2622,6 +2746,12 @@ export const api = {
   kirocrewConfig: () => fetch('/api/config/kirocrew').then(j),
   saveKirocrewConfig: (agent: object) => put('/api/config/kirocrew', { agent }).then(j) as Promise<{ ok?: boolean; restart_required?: boolean; error?: string }>,
   patchConfig: (path: string, value: unknown) => fetch('/api/config/kirocrew', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, value }) }).then(j),
+  // Owner-only, and absent (404) on an older gateway. Both of those reach the
+  // caller as a rejection, which is the intended signal: "no probe information",
+  // to be treated as fail-open rather than as a verdict.
+  acpBackends: ({ probe }: { probe?: boolean } = {}) =>
+    fetch('/api/acp-backends' + (probe ? '?probe=1' : '')).then(j) as Promise<AcpBackendsResponse>,
+
   // Optional integrations — backend endpoints are graceful no-ops on a public
   // install (AIM / kiro usage are stubbed). Kept so the UI compiles and
   // degrades gracefully (panels render empty when the feature is absent).
@@ -2647,13 +2777,28 @@ export const api = {
     enabled?: boolean
     provider?: string
     model?: string
-    mlx_model?: string
     streaming?: boolean
+    silence_ms?: number
+    partial_interval_ms?: number
+    endpointing?: boolean
+    dictation_panel?: boolean
     transcribe_region?: string
     transcribe_profile?: string
     language_code?: string
   }) => put('/api/config/stt', body).then(j),
-  sttInstall: () => post('/api/stt/install').then(j),
+  // Recogniser availability plus the model catalog and the progress of any
+  // download in flight. Separate from `sttConfig` because it is POLLED while a
+  // model is being fetched, and polling the config endpoint would re-read and
+  // re-probe configuration several times a second.
+  sttStatus: () => fetch('/api/stt/status').then(j),
+  // Fetch a model now, so the cost is paid at a moment the user chose rather
+  // than in the middle of their first dictation. Returns as soon as the transfer
+  // is under way; progress is read from `sttStatus`.
+  sttPrepare: (model: string) => post('/api/stt/prepare', { model }).then(j),
+  // Load the model and run one throwaway decode so the first real utterance does
+  // not pay for the graph allocation. Fire-and-forget at every call site: a
+  // failure only costs the latency it was meant to hide.
+  sttPrewarm: () => post('/api/stt/prewarm', {}).then(j),
   sttTranscribe: (blob: Blob, ext = 'webm') => {
     const fd = new FormData()
     fd.append('audio', blob, `recording.${ext}`)
@@ -2753,7 +2898,7 @@ export const api = {
   chatFolders: () => fetch('/api/chat/folders', { headers: { ..._sk } }).then(j),
   /** `config` carries the folder settings the create modal collects. Each is
    *  omitted when empty so the backend applies its own default. */
-  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string }) =>
+  createChatFolder: (name: string, parentId?: string, config?: { project_dir?: string; default_agent?: string; color?: string; tags?: string[] }) =>
     post('/api/chat/folders', { name, parent_id: parentId || '', ...(config ?? {}) }).then(j),
   updateChatFolder: (id: string, body: object) => patch('/api/chat/folders/' + encodeURIComponent(id), body).then(j),
   deleteChatFolder: (id: string) => del('/api/chat/folders/' + encodeURIComponent(id)).then(j),
@@ -2803,8 +2948,13 @@ export const api = {
   // Mid-turn steer: inject into the RUNNING turn instead of queueing. Fire-and-forget
   // JSON response ({ok, steered}); the backend falls back to queue if steer is
   // unavailable so the text is never dropped.
-  steerChat: (message: string, slot?: string) =>
-    fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, steer: true }) }).then(j),
+  // `sendId` is the client-minted correlation id stamped on the optimistic steer
+  // bubble (same convention as the plain send path). It rides in `meta`, which
+  // BOTH backend paths persist — the accepted-steer row and the new-turn row a
+  // steer that races chat_done falls onto — so the bubble is reconcilable, and
+  // its accepted-vs-new-turn ambiguity resolvable, by id identity (#6075).
+  steerChat: (message: string, slot?: string, sendId?: string) =>
+    fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, steer: true, ...(sendId ? { meta: { sendId } } : {}) }) }).then(j),
   sessionsHealth: () => fetch('/api/sessions/health').then(j),
   // Knowledge
   knowledgeSearch: (q: string) => get(`/api/knowledge/search-for-context?q=${encodeURIComponent(q)}`).then(j),
@@ -2831,6 +2981,17 @@ export const api = {
   // instance (backend rank-interleaves; remote rows carry instance_id/_name).
   // 403 = instances feature disabled — callers fall back to sessionsSearch.
   instancesSearchSessions: (q: string, limit = 50) => fetch('/api/instances/search-sessions?q=' + encodeURIComponent(q) + '&limit=' + limit).then(j),
+  /** Create a chat slot ON A CONNECTED PEER, through the instances chat proxy.
+   *  The peer owns the session end to end — its context, memory, skills and
+   *  kiro-cli run the turn, and nothing is written to local history. `api/chat`
+   *  is inside the proxy's path allowlist, so this needs no new backend route;
+   *  the returned `key` is the slot key in the PEER's namespace and is only
+   *  meaningful in a request routed back through the same instance.
+   *  No `agent` is sent: the peer picks its own default, which is the whole
+   *  point of the session running there rather than here. */
+  instancesCreateRemoteSlot: (instanceId: string) =>
+    post('/api/instances/' + encodeURIComponent(instanceId) + '/proxy/api/chat/slots',
+      {}).then(j) as Promise<{ key?: string }>,
   sessionDetail: (key: string) => fetch('/api/sessions/' + encodeURIComponent(key)).then(j),
   deleteSession: (key: string) => del('/api/sessions/' + encodeURIComponent(key)).then(j),
   clearSessions: () => del('/api/sessions').then(j),
@@ -2844,14 +3005,17 @@ export const api = {
   spawnRetry: (id: string) => post('/api/spawn/' + encodeURIComponent(id) + '/retry', {}).then(j),
   spawnClear: () => del('/api/spawn').then(j),
   approvals: (): Promise<{ id: string; source?: string; tool?: string; tool_input?: string; tool_call_id?: string; slot?: string; ts?: number }[]> => fetch('/api/approvals').then(j),
-  resolveApproval: (id: string, action: 'approve' | 'reject') => post('/api/approvals/' + encodeURIComponent(id) + '/' + action, {}).then(j),
+  resolveApproval: (id: string, action: 'approve' | 'reject' | 'reject_once') => post('/api/approvals/' + encodeURIComponent(id) + '/' + action, {}).then(j),
   /** Question cards still awaiting an answer, for rehydration after a reload or
    *  websocket reconnect (`question_card` is a one-shot broadcast). A blocking
    *  ask carries `ask_id`; a stateless card carries `card_id` instead. */
   pendingQuestions: (): Promise<{ ask_id?: string; card_id?: string; slot: string; questions: { question: string; header?: string; multiSelect?: boolean; options: { label: string; description?: string }[] }[]; ts?: number }[]> =>
     fetch('/api/ask-question/pending').then(j),
-  /** Resolve a pending agent question (ask_question MCP tool). Pass no answers
-   *  to dismiss, which unblocks the agent with a timeout-equivalent result. */
+  /** Resolve a pending agent question that carries an `ask_id` — a server-side
+   *  wait opened by `POST /api/ask-question`, not the MCP ask_question tool,
+   *  which posts a stateless `card_id` card instead. Pass no answers to
+   *  dismiss, which unblocks the waiting caller with a timeout-equivalent
+   *  result. */
   answerQuestion: (askId: string, answers?: Record<string, string>) =>
     post('/api/ask-question/' + encodeURIComponent(askId) + '/answer',
       answers ? { answers } : { dismissed: true }).then(j),
@@ -2980,7 +3144,7 @@ export const api = {
    * check compares against; it never installs anything, so the response is the
    * re-run check against the NEW channel.
    */
-  setUpdateChannel: (channel: string) => post('/api/update/channel', { channel }).then(j),
+  setUpdateChannel: (channel: string) => post('/api/update/channel', { channel }).then(j) as Promise<UpdateCheckResult>,
   /**
    * Restart the gateway without updating. The connection drops as the process
    * image is replaced, so callers must treat a network failure after a 200 as
@@ -2994,7 +3158,7 @@ export const api = {
   cancelUpdate: () => post('/api/update/cancel').then(j),
   simulateUpdate: (opts?: { delay?: number; fail_at?: string }) => post('/api/update/simulate', opts || {}).then(j),
   pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,
-  fileDiff: (path: string) => fetch('/api/file-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' }>,
+  fileDiff: (path: string) => fetch('/api/file-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' | 'error' }>,
   /** Fuzzy file search for @-mention picker. `kind` distinguishes folder hits from files.
    *  `kinds` narrows the result set server-side — 'files' or 'dirs'; omitted returns both.
    *  Filtering server-side rather than dropping unwanted hits here matters because the
@@ -3130,6 +3294,14 @@ export const api = {
   listRegistry: () => fetch('/api/apps/registry').then(j) as Promise<{ apps: any[]; serverPlatform: { os: string; arch: string }; categoryOrder?: string[]; editorialSections?: unknown[] }>,
   listRegistries: () => fetch('/api/apps/registries').then(j) as Promise<{ registries: { name: string; repo: string; branch: string; trust?: string }[]; pinned?: { name: string; repo: string; branch: string; trust?: string }[] }>,
   updateRegistries: (registries: { name: string; repo: string; branch: string; trust?: string }[]) => put('/api/apps/registries', { registries }).then(j) as Promise<{ ok: boolean; registries: { name: string; repo: string; branch: string; trust?: string }[]; newlyTrustedHosts: string[] }>,
+  // Drops the server's on-disk caches of the published documents (catalog /
+  // category order / editorial) so the NEXT listRegistry() is rebuilt from
+  // fresh fetches instead of waiting out TTLs. A POST because it is a state
+  // change (cache deletion + outbound fetches) and must sit behind the CSRF
+  // boundary a GET query param would bypass. Deliberately NOT under
+  // /api/apps/: that namespace grants an app named `registry` implicit
+  // path ownership (token_auth._app_owns_path).
+  refreshAppStore: () => post('/api/app-store/refresh').then(j) as Promise<{ ok: boolean }>,
   refreshRegistries: (repo?: string) => post('/api/apps/registries/refresh', repo ? { repo } : {}).then(j) as Promise<{ ok: boolean; refreshed: string[]; failed: string[]; results: { name: string; ok: boolean }[]; apps: number; lastSyncedAt: string }>,
   installFromRegistry: (name: string) => post('/api/apps/registry/install', { name }).then(j),
   /**

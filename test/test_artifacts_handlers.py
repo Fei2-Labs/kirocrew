@@ -457,6 +457,47 @@ class TestCreate:
         assert resp.status == 409
 
     @pytest.mark.asyncio
+    async def test_suffixed_slug_is_reported_in_the_response(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        # The CLI and the MCP tool are both HTTP clients, so the collision only
+        # reaches them if the create response carries it.
+        body = {"name": "Run Summary", "content": "first"}
+        first = _json_body(await api_artifacts_create(_request(body=body)))
+        assert first["slug"] == "run-summary"
+        assert first["slug_collided_with"] == ""
+
+        second = _json_body(await api_artifacts_create(_request(body=body)))
+        assert second["slug"] == "run-summary-2"
+        assert second["slug_collided_with"] == "run-summary"
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_slug_reports_no_collision(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        # An explicit slug differs from the name-derived one by intent; the store
+        # refuses a taken one outright, so comparing the two here would invent a
+        # collision that never happened.
+        body = {"name": "Run Summary", "content": "a", "slug": "chosen-by-hand"}
+        created = _json_body(await api_artifacts_create(_request(body=body)))
+        assert created["slug"] == "chosen-by-hand"
+        assert created["slug_collided_with"] == ""
+
+    @pytest.mark.asyncio
+    async def test_the_collision_report_is_create_only(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        # It describes one create call, so a later read must not carry it —
+        # otherwise every GET and LIST ships a permanently empty field.
+        body = {"name": "Run Summary", "content": "a"}
+        await api_artifacts_create(_request(body=body))
+        fetched = _json_body(await api_artifact_detail(_request(match={"slug": "run-summary"})))
+        # Positive control: this is a real artifact payload, so the absence below
+        # is a fact about the field and not about a failed read.
+        assert fetched["slug"] == "run-summary"
+        assert "slug_collided_with" not in fetched
+
+    @pytest.mark.asyncio
     async def test_restricted_session_denied(self, isolated_store, patch_restricted) -> None:
         body = {"name": "x", "content": "a"}
         resp = await api_artifacts_create(_request(body=body, restricted=True))

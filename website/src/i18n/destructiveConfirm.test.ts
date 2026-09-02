@@ -214,7 +214,6 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
  */
 export const EXEMPT_CONFIRM_PLACEHOLDER_NAMES = new Set([
   'count',
-  'total',
   'lines',
   'verb',
   'number',
@@ -227,7 +226,15 @@ export const EXEMPT_CONFIRM_PLACEHOLDER_NAMES = new Set([
   'resources',
   'bucket',
   'distribution',
+  // A denominator rendered beside `count`, so it is a bare numeral like the
+  // other count-shaped operands above.
+  'total',
+  // The ACP adapter's display label, taken from the adapter registry row the
+  // gateway advertised (`AcpBackendProbe.label`) rather than from anything the
+  // user typed, so it cannot smuggle prose into the confirm sentence.
   'backend',
+  // Set once by the edition's composition root (i18next defaultVariables),
+  // never user-supplied, so it cannot smuggle prose into a confirm sentence.
   'productName',
 ])
 

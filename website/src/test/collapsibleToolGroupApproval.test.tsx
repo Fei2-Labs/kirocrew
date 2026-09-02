@@ -182,6 +182,10 @@ describe('CollapsibleToolGroup batch multi-select (Req 4.1-4.4)', () => {
     fireEvent.click(screen.getByText(T('reject_all', { count: 2 })))
     await waitFor(() => expect(onApproveBatch).toHaveBeenCalledWith('rejected'))
     // Failure restores the buttons so the user can retry the decision.
-    await waitFor(() => expect(screen.getByText(T('reject_all', { count: 2 }))).toBeInTheDocument())
+    const rejectAll = await screen.findByText(T('reject_all', { count: 2 }))
+    expect(rejectAll).toHaveFocus()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.decision_failed'),
+    )
   })
 })

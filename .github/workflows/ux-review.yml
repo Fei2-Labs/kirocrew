@@ -199,6 +199,23 @@ jobs:
             only to surface findings. If a lens raises no finding, it produces
             NO output. Lenses 11–12 apply only when their surface is present.)
 
+            0. PRODUCT COHERENCE (run FIRST, before every other lens): put the
+               change next to the product it is joining. Open the sibling
+               surfaces that already do the closest job (Grep/Read
+               website/src; committed screenshots of existing pages when
+               present) and compare:
+               - LOOK — the new surface matches the product's established
+                 look: spacing, container shapes, elevation, typography,
+                 tokens.
+               - INFORMATION ARCHITECTURE — the same jobs use the same
+                 patterns: panel/sidebar toggles, close affordances, header
+                 layout, list rows, iconography. A user who has learned the
+                 rest of the product must not find this page strange.
+               - EARN EVERY ELEMENT — every button, label, and line of copy
+                 has a job a user needs done. Anything present without one is
+                 a finding.
+               Divergence from the product's established look or patterns is
+               a finding unless the PR states why this surface must differ.
             1. FIRST-TIME COMPREHENSION (the cold-read test): would a user
                seeing this for the first time understand what each label says
                and what each feature does?
@@ -482,6 +499,7 @@ jobs:
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           ACTOR: ${{ github.actor }}
           UI_SCOPE: ${{ steps.scope.outputs.ui }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
         run: |
           if [ "$HUMAN_OVERRIDE" = "true" ]; then
             OV_MARKER="<!-- ux-review -->"
@@ -584,11 +602,23 @@ jobs:
             # detail (AWS account ids, ARNs, endpoints, stack traces) into a
             # public comment. Post a generic, leak-safe notice; humans read
             # the job logs.
+            # Name the cause from the model step's OWN outcome instead of
+            # asserting one: this branch is reached both when the model ran and
+            # returned nothing usable and when the model was never called at all,
+            # and "the model call errored" sent contributors to debug a call that
+            # had not happened.
+            case "${REVIEW_OUTCOME:-}" in
+              skipped) why="the review step never ran, because an earlier step in this job failed — no model call was made" ;;
+              failure) why="the review step failed" ;;
+              cancelled) why="the review step was cancelled" ;;
+              success) why="the review step completed but returned no verdict header" ;;
+              *)       why="the review step reported no outcome" ;;
+            esac
             {
               echo "$MARKER"
               echo "## UX Review (Fable 5) — ⚠️ could not complete"
               echo
-              echo "_The UX review did not produce a verdict for \`$HEAD\` (the model call errored or returned no verdict header). See the UX Review job logs. Advisory — does not block merge._"
+              echo "_The UX review did not produce a verdict for \`$HEAD\` ($why). See the UX Review job logs. Advisory — does not block merge._"
             } > /tmp/ux-comment.md
           fi
           # Defense-in-depth: scrub credential shapes AND AWS account ids /
