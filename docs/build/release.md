@@ -499,6 +499,91 @@ bare declaration sets the source-of-truth and the fold's base; `_display_version
 is what actually shows a stable user `0.4.0`. The two are complementary, not
 alternatives.
 
+### Fork version identity
+
+This repository is a long-lived FORK, and `__version__` is deliberately
+**upstream's own literal**. Everything above depends on that: the promotion
+sequence manipulates it, `build-wheel.yml` rewrites it from the tag, the
+changelog gate folds prerelease spellings onto it, and the desktop updater's
+compare gate requires the app version to equal the feed version. A fork-private
+number in that slot would decouple all of them from the artifacts they describe.
+
+The cost was that a fork build reported exactly what upstream's did — and an
+upstream install stamped one minor ahead read as strictly NEWER. So the fork half
+rides a PEP 440 **local version segment**, owned by
+[`src/kiro_crew/fork_version.py`](../../src/kiro_crew/fork_version.py):
+
+```
+0.4.0-rc.9+fork.g645d7289          a clean fork build
+0.4.0-rc.9+fork.g645d7289.dirty    built from an uncommitted working tree
+0.4.0-rc.9                         no revision derivable — the plain base
+```
+
+`full_version()` composes it and is used for DISPLAY AND IDENTITY only:
+`kirocrew --version`, the gateway banner, the Slack version reply, the
+diagnostics bundle and its prefilled bug form, and the About hero (through the
+status payload's `upstream_base_version` / `fork_revision` / `fork_dirty`).
+`base_version()` — `__version__` with any local segment stripped — is what every
+comparison, every packaging manifest, and the changelog gate keep using.
+
+**Where the revision comes from**, in priority order:
+
+1. `_build_info.FORK_REVISION` / `FORK_DIRTY`, baked by
+   `scripts/stamp-distribution.sh` alongside the distribution stamp. A wheel or
+   packaged app has no `.git`, so packaging time is the only moment git can
+   answer — and per "Stable promotion" above, anything a stable user will see
+   must be in the RC bytes *before the RC is cut*, because promotion never
+   rebuilds. `FORK_STAMPED` makes an empty stamped value terminal, so a packaged
+   install never spawns git looking for a repository it does not have.
+2. A live `git rev-parse` + `git status --porcelain`, for a source checkout.
+   Lazy, memoized per process, and never at import time. `git describe` is not
+   used: this fork does not tag, so it has no reachable tag to describe from.
+   Two spawns with a five-second timeout each cannot run on the event loop, so
+   the derivation is split: `_do_update_check` calls `warm()` inside the same
+   off-loop step that already derives the install capability, and the status
+   payload calls `peek_revision()`, which never derives and reports "no fork
+   revision" until the memo is filled.
+3. `""` — an installed package with neither. The version renders as the plain
+   base. Deliberately not a `+fork.unknown` placeholder: that would *assert* a
+   fork build on an install that may well be upstream's own wheel.
+
+**The three version manifests are NOT touched.** `src/kiro_crew/__init__.py`,
+`pyproject.toml`, and `website/electron/package.json` keep the bare
+dual-valid `X.Y.Z[-rc.N]` spelling the policy above requires. A local segment in
+`pyproject.toml` would land in the wheel FILENAME, and one in the desktop
+manifest would reach electron-builder and Squirrel's filename-derived version
+sort — the same class of hazard the nightly stamp's `t` separator exists to
+avoid. The fork half reaches a packaged artifact through the baked
+`_build_info.py` instead, which nothing parses as a version.
+
+**Every classifier and comparator strips the local segment first**, through
+`fork_version.strip_local()`. This is not defensive tidiness — two parsers get it
+wrong without it, both silently and both hash-dependently:
+
+- `release_channel._PEP440_PRERELEASE` is an unanchored `(?:a|b|rc)\d+`, and a
+  sha is hex — the pattern occurs in ~46% of eight-character shas.
+  `0.5.0+fork.gb1234ab` read as prerelease `b1234`, so a fork build
+  of a STABLE base classified as `insider` **depending on the commit hash** —
+  feeding the bug-report channel label, `is_prerelease()`, and the dashboard.
+- `dashboard/handlers/updates._version_key`'s PEP 440 regex is anchored, so the
+  same string fell through to the semver branch, which read the first integer out
+  of the sha and ranked the build as prerelease `1234` of `0.5.0` — *below* the
+  bare release. Upstream's identical `0.5.0` then compared as newer.
+
+`changelog.py`'s two parsers already tolerate a local segment by construction and
+are left alone: their total-match design is what stops a malformed heading from
+overwriting a shipped section, and stripping first would widen it.
+
+**A fork build is never offered an upstream artifact from the release feed.** The
+feed publishes upstream's bytes; applying one to a fork install does not update
+it, it *replaces* it — the fork's divergence uninstalled from a button labelled
+"Update". `_check_release_feed` therefore reports `update_available: false` while
+still carrying `latest_version`, sets `fork_suppressed`, and drops the feed's
+`min_version` floor (whose only power is to make the prompt non-dismissible)
+before the signature is even consulted. The About hero renders the reason rather
+than an unexplained "up to date". The **git-checkout lane is untouched**: it
+fetches the install's own remote, which for a fork clone is the fork.
+
 ## CLI channel and the signed manifest
 
 The wheel is a first-class channel target, not a byproduct: a Linux or EC2 host

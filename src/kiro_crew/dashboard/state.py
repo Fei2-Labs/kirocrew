@@ -5488,6 +5488,10 @@ class DashboardState:
         update_min_version: str = "",
         update_can_arm: bool = False,
         version_display: str = "",
+        upstream_base_version: str = "",
+        fork_revision: str = "",
+        fork_dirty: bool = False,
+        update_fork_suppressed: bool = False,
     ) -> dict[str, Any]:
         """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
         uptime = int(time.time() - self.start_time)
@@ -5580,6 +5584,22 @@ class DashboardState:
             # upgrade, so it must never be folded. Empty string on emitters
             # that don't pass it (they render the raw version, as before).
             "version_display": version_display,
+            # FORK IDENTITY, the other half of `version`. This build's
+            # `version` is UPSTREAM's base (every comparison and packaging
+            # manifest keys on it), so on its own it cannot tell a fork build
+            # apart from the upstream build it forked. `fork_revision` is the
+            # git-derived short sha of the fork commit, `fork_dirty` says the
+            # working tree had uncommitted changes when it was built, and
+            # `upstream_base_version` names the base explicitly so the SPA
+            # never has to re-derive it by string surgery. All empty/False on
+            # an upstream build. Owned by `kiro_crew.fork_version`.
+            "upstream_base_version": upstream_base_version,
+            "fork_revision": fork_revision,
+            "fork_dirty": fork_dirty,
+            # An upstream update was found but withheld: applying it would
+            # REPLACE the fork rather than update it. See
+            # `handlers/updates.py::_check_release_feed`.
+            "update_fork_suppressed": update_fork_suppressed,
             "no_crons": self.no_crons,
             "branch": branch,
             "commit": commit,

@@ -106,6 +106,34 @@ export interface StatusData {
    */
   version_display?: string
   /**
+   * FORK IDENTITY — the other half of `version`.
+   *
+   * This is a long-lived FORK, and its `version` is UPSTREAM's base literal,
+   * because every comparison and every packaging manifest keys on that value.
+   * The consequence is that `version` alone cannot tell a fork build apart from
+   * the upstream build it was forked from, and an upstream install one minor
+   * ahead reads as strictly newer. `upstream_base_version` names the base
+   * explicitly (so the SPA never re-derives it by string surgery),
+   * `fork_revision` is the git-derived short sha of the fork commit, and
+   * `fork_dirty` says the working tree carried uncommitted changes when the
+   * build was made.
+   *
+   * `fork_revision` is EMPTY on an upstream build and on any install where no
+   * revision could be derived — those two are indistinguishable on purpose, so
+   * the UI must render fork attribution only when it is non-empty rather than
+   * assert a fork it has no evidence of. See `src/kiro_crew/fork_version.py`.
+   */
+  upstream_base_version?: string
+  fork_revision?: string
+  fork_dirty?: boolean
+  /**
+   * An upstream release was found on the feed and deliberately NOT offered:
+   * installing it would REPLACE this fork rather than update it. Lets the panel
+   * explain the withheld update instead of rendering an unexplained "up to
+   * date" beside a newer upstream version.
+   */
+  update_fork_suppressed?: boolean
+  /**
    * Which release lane these bytes came from. The gateway resolves it (see
    * `src/kiro_crew/release_channel.py`) rather than leaving the dashboard to
    * parse `version`: the same release is stamped as SemVer for the desktop app

@@ -1096,6 +1096,19 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Must NOT be sandboxed: the answer is about the real checkout's own
         # metadata.
         "platform/update_capability.py::_git_toplevel",
+        # Read-only `git rev-parse --short=8 HEAD` + `git status --porcelain`,
+        # deriving the FORK REVISION that the version string's PEP 440 local
+        # segment carries. Two fixed list-argvs (no shell=True) with NOTHING
+        # variable in them: the `-C` path is `fork_version._repo_root()`, derived
+        # from `__file__` — this package's own location, not an environment value
+        # and never agent input. The binary comes from
+        # platform_compat.trusted_git_bin (a vetted absolute path, never PATH)
+        # and `None` is treated as a refusal rather than a bare "git". The
+        # environment is stripped of the GIT_DIR family so no inherited value can
+        # redirect the answer to another repository. Must NOT be sandboxed: the
+        # answer is about the real checkout's own metadata, and every failure
+        # degrades to "no revision" rather than raising.
+        "fork_version.py::_run",
         # Feed-manifest signature verification gating the forced-update floor.
         # One fixed argv (`openssl dgst -sha256 -verify …`) whose binary comes
         # from platform_compat.trusted_system_bin (a vetted absolute path,

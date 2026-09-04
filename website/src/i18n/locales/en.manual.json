@@ -4580,7 +4580,10 @@
         "channel_explainer_gateway_switch_note_version": "Switching only changes which channel is checked for updates. The {{channel}} channel currently publishes v{{version}}, which is OLDER than the build you are running — run the command below to actually move this install onto it.",
         "channel_publishes_older_version": "The {{channel}} channel currently publishes v{{version}}, which is older than the build you are running, so it has no update to offer. <link>Download v{{version}}</link> to move onto that channel.",
         "switch_to_version": "Switch to v{{version}}",
-        "in_app_channel_move_intro": "The chosen channel's release installs beside the current one and switches over atomically. Applying takes one approval command on the gateway host."
+        "in_app_channel_move_intro": "The chosen channel's release installs beside the current one and switches over atomically. Applying takes one approval command on the gateway host.",
+        "based_on_upstream": "based on upstream {{version}} · fork {{revision}}",
+        "fork_uncommitted_changes": "uncommitted changes",
+        "fork_update_withheld": "Upstream {{version}} is available. It is not offered here, because installing it would replace this fork."
       },
       "computerUsePanel": {
         "computer_use_lets_the_agent_read_any_app_window": "Computer use lets the agent read any app window and send clicks and keystrokes into it. Most clicks are delivered straight to the app and leave your pointer alone, but the agent can ask to move the real pointer when a target needs it. Password fields are never read; nothing else limits which apps it may drive.",

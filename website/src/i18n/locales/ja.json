@@ -11743,7 +11743,10 @@
         "channel_explainer_gateway_switch_note_version": "切り替えても変わるのは更新を確認するチャンネルだけです。{{channel}} チャンネルが現在公開しているのは v{{version}} で、実行中のビルドより古いバージョンです。このインストールを実際に移すには下のコマンドを実行してください。",
         "channel_publishes_older_version": "{{channel}} チャンネルが現在公開しているのは v{{version}} で、実行中のビルドより古いため、更新は提示されません。<link>v{{version}} をダウンロード</link>してこのチャンネルに移れます。",
         "switch_to_version": "v{{version}} に切り替える",
-        "in_app_channel_move_intro": "選択したチャンネルのリリースは現在のものと並べてインストールされ、原子的に切り替わります。適用にはゲートウェイホストでの承認コマンドが 1 回必要です。"
+        "in_app_channel_move_intro": "選択したチャンネルのリリースは現在のものと並べてインストールされ、原子的に切り替わります。適用にはゲートウェイホストでの承認コマンドが 1 回必要です。",
+        "based_on_upstream": "アップストリーム {{version}} ベース · フォーク {{revision}}",
+        "fork_uncommitted_changes": "未コミットの変更あり",
+        "fork_update_withheld": "アップストリーム {{version}} が公開されています。インストールするとこのフォークが置き換えられるため、ここでは提供されません。"
       },
       "botChannelPanel": {
         "allowed_user_ids": "許可されたユーザー ID",

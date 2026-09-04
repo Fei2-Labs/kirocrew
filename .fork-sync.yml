@@ -139,6 +139,22 @@ conflict_policy:
     policy: fork_wins
     note: "Fork keeps its own version cadence (matches CHANGELOG.md)."
 
+  - glob: "src/kiro_crew/fork_version.py"
+    policy: fork_wins
+    note: |
+      Fork-only module; upstream has no counterpart, so a sync should never
+      touch it. See divergences/fork-version-identity for why `__version__`
+      itself stays UPSTREAM's literal instead of moving here.
+
+  - glob: "src/kiro_crew/release_channel.py"
+    policy: union
+    note: |
+      Take upstream's channel rules, but KEEP the `strip_local()` call in
+      `channel()`. Without it the unanchored `(?:a|b|rc)\d+` matcher reads a
+      fork build's `+fork.g<sha>` as a prerelease segment for most commit
+      hashes — hash-dependent, so it goes red intermittently or not at all.
+      Pinned by test/test_fork_version.py.
+
   # ── the desktop shell: upstream is extracting main.js into siblings ──
   - glob: "website/electron/main.js"
     policy: upstream_wins
@@ -183,6 +199,23 @@ conflict_policy:
       take upstream, then port any capture the fork has and upstream lacks.
 
 divergences:
+  - id: fork-version-identity
+    what: |
+      `__version__` stays UPSTREAM's bare literal. The fork half rides a PEP 440
+      LOCAL segment (`+fork.g<sha>[.dirty]`), derived from git and composed by
+      `kiro_crew.fork_version.full_version()` for display surfaces only.
+    why: |
+      A fork build was indistinguishable from the upstream build it forked, and
+      an upstream install one minor ahead read as NEWER. Rewriting `__version__`
+      would have decoupled the changelog gate, the promotion contract, the
+      release feed comparison and the desktop updater's compare gate from the
+      artifacts they describe — so the fork identity goes somewhere those
+      parsers ignore. Every classifier and comparator strips the local segment
+      first (`fork_version.strip_local`), and the release feed does not offer a
+      fork build an upstream artifact, because applying one REPLACES the fork.
+    pinned_by: "test/test_fork_version.py, test/test_fork_update_suppression.py"
+    decided: 2026-09-04
+
   - id: auth-grant-sources
     what: "Only explicit slot trust or global YOLO auto-approves a tool call."
     why: |

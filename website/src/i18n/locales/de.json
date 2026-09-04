@@ -11912,7 +11912,10 @@
         "channel_explainer_gateway_switch_note_version": "Ein Wechsel ändert nur, welcher Kanal auf Updates geprüft wird. Der Kanal {{channel}} veröffentlicht derzeit v{{version}} – ÄLTER als der laufende Build. Führe den Befehl unten aus, um diese Installation wirklich umzustellen.",
         "channel_publishes_older_version": "Der Kanal {{channel}} veröffentlicht derzeit v{{version}} – älter als der laufende Build, daher gibt es kein Update. <link>Lade v{{version}} herunter</link>, um auf diesen Kanal zu wechseln.",
         "switch_to_version": "Zu v{{version}} wechseln",
-        "in_app_channel_move_intro": "Das Release des gewählten Kanals wird neben dem aktuellen installiert und atomar umgeschaltet. Das Anwenden erfordert einen Bestätigungsbefehl auf dem Gateway-Host."
+        "in_app_channel_move_intro": "Das Release des gewählten Kanals wird neben dem aktuellen installiert und atomar umgeschaltet. Das Anwenden erfordert einen Bestätigungsbefehl auf dem Gateway-Host.",
+        "based_on_upstream": "basiert auf Upstream {{version}} · Fork {{revision}}",
+        "fork_uncommitted_changes": "nicht committete Änderungen",
+        "fork_update_withheld": "Upstream {{version}} ist verfügbar. Sie wird hier nicht angeboten, da die Installation diesen Fork ersetzen würde."
       },
       "botChannelPanel": {
         "allowed_user_ids": "Erlaubte Benutzer-IDs",

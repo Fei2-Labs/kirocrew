@@ -37,6 +37,7 @@ from urllib.parse import quote, urlencode
 
 from kiro_crew import __version__, platform_compat, release_channel
 from kiro_crew.config.loader import config_dir
+from kiro_crew.fork_version import full_version
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -345,7 +346,10 @@ _CHANNEL_OPTIONS = release_channel.CHANNEL_FORM_OPTIONS
 
 def _versions_text(note: str) -> str:
     lines = [
-        f"kirocrew_version: {__version__}",
+        # `full_version()`, not `__version__`: on a fork build this is the only
+        # line in the bundle that distinguishes it from the upstream build it
+        # forked. Identical to `__version__` on an upstream build.
+        f"kirocrew_version: {full_version(__version__)}",
         f"channel: {_channel()}",
         f"kiro_cli_version: {_kiro_cli_version()}",
         f"python: {platform.python_version()}",
@@ -392,7 +396,10 @@ def _issue_url(result: BundleResult, note: str, *, prefill: bool = True) -> str:
         "template": "bug_report.yml",
         "labels": ",".join(["bug", _CHANNEL_LABELS[channel]]),
         "title": "[bug] ",
-        "version": __version__,
+        # Prefills the bug form's version field. Carries the fork local segment
+        # so a fork-build report is not filed as an upstream one; a no-op on an
+        # upstream build.
+        "version": full_version(__version__),
         "channel": _CHANNEL_OPTIONS[channel],
         "what-happened": note.strip() or "",
         "context": "\n".join(
@@ -573,7 +580,7 @@ def collect_bundle(
         # Manifest last so it reflects the final included/skipped/redaction state.
         manifest = {
             "tool": "kirocrew-diagnostics",
-            "kirocrew_version": __version__,
+            "kirocrew_version": full_version(__version__),
             "channel": _channel(),
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "include_logs": include_logs,

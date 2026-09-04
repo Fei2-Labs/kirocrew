@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from kiro_crew import __version__, dep_sync, platform_compat
+from kiro_crew import __version__, dep_sync, fork_version, platform_compat
 from kiro_crew.beacon import distribution, is_default_home
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
@@ -1725,7 +1725,7 @@ def _status(args: argparse.Namespace) -> None:
         print("Kiro Crew gateway is running but returned an unexpected response.")
         return
 
-    print(f"Kiro Crew v{__version__} 👻\n")
+    print(f"Kiro Crew v{fork_version.full_version(__version__)} 👻\n")
     print(f"  Uptime:      {data.get('uptime', '—')}")
     print(f"  Sessions:    {data.get('sessions', 0)}")
     print(f"  Messages:    {data.get('messages', 0)}")

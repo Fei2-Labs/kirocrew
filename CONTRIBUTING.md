@@ -299,6 +299,14 @@ straight into electron-builder's `extraMetadata.version`, which rejects
 non-SemVer and kills a local `make desktop`. The tag still overrides all three
 at build time (see `docs/build/release.md` → "Version numbering policy").
 
+**The fork identifier is not one of these three.** This repository is a fork, and
+all three manifests keep UPSTREAM's version — otherwise the changelog gate, the
+promotion sequence, and the updater's compare gate stop describing the artifacts
+they govern. The fork half is a git-derived PEP 440 local segment
+(`0.4.0-rc.9+fork.g645d7289`) composed at display time by
+`kiro_crew.fork_version`; never hand-bump it, and never add it to a manifest.
+See `docs/build/release.md` → "Fork version identity".
+
 ### One trap worth knowing
 
 Any two prerelease tags sharing a base and a trailing number collapse onto the

@@ -29,6 +29,9 @@ from kiro_crew.config.loader import (
 from kiro_crew.dashboard.handlers._shared import read_capped_response
 from kiro_crew.dashboard.state import DashboardState, chat_message_frame
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.fork_version import base_version as fork_base_version
+from kiro_crew.fork_version import is_fork_build, peek_revision, strip_local
+from kiro_crew.fork_version import warm as warm_fork_revision
 from kiro_crew.git_divergence import (
     UNREADABLE_TIMEOUT,
     DivergenceUnreadable,
@@ -215,7 +218,10 @@ def _display_version(version: str, channel: str) -> str:
     :func:`_display_local_version`, which additionally refuses to fold bytes the
     stable lane has never shipped -- see ``channel_move_pending``.
     """
-    return base_version(version) if channel == "stable" else version
+    # ``strip_local`` on the non-stable branch too: a fork build's local segment
+    # is identity, not release, and the raw string is what the chip renders.
+    # The fork half is surfaced separately (``fork_revision`` on the payload).
+    return base_version(version) if channel == "stable" else strip_local(version)
 
 
 def _channel_move_pending() -> bool:
@@ -324,6 +330,17 @@ def status_update_fields() -> dict[str, object]:
     available = _update_info.get("update_available")
     ahead = _update_info.get("commits_ahead")
     behind = _update_info.get("commits_behind")
+    # Bare sha, not the ``g``-prefixed display identifier: the payload carries
+    # DATA and the SPA composes the label, so the prefix and the dirty marker
+    # stay presentation and live in one place on that side.
+    #
+    # PEEK, never derive. This reader runs on the event loop (``/api/status``
+    # and the 5-second WebSocket push), and deriving spawns two git processes
+    # with a five-second timeout each. Until the update check's off-loop step
+    # has warmed it, the payload honestly reports "no fork revision" — which the
+    # SPA renders as no attribution — instead of stalling every session to find
+    # out.
+    fork_sha, fork_is_dirty = peek_revision() or ("", False)
     return {
         "update_available": available if isinstance(available, bool) else None,
         "update_can_apply": bool(_update_info.get("can_apply")),
@@ -395,6 +412,20 @@ def status_update_fields() -> dict[str, object]:
         # catch. Falls back to the raw version until a check has resolved the
         # channel (`_display_local_version` keys on it; only stable folds).
         "version_display": _display_local_version(),
+        # FORK IDENTITY. ``version``/``version_display`` carry UPSTREAM's base
+        # version, because that is what every comparison and every packaging
+        # manifest keys on — which leaves a fork build indistinguishable from
+        # the upstream build it forked, and an upstream install one minor ahead
+        # even reads as newer. These three fields are the other half, so a user
+        # asking "what am I running" gets both. Empty / False on an upstream
+        # build or an install with no derivable revision.
+        "upstream_base_version": fork_base_version(),
+        "fork_revision": fork_sha,
+        "fork_dirty": fork_is_dirty,
+        # Was an available upstream update withheld because this is a fork
+        # build? Lets the panel say so rather than render an unexplained
+        # "up to date" beside a newer upstream version. See _check_release_feed.
+        "update_fork_suppressed": bool(_update_info.get("fork_suppressed")),
     }
 
 
@@ -481,7 +512,13 @@ def _version_key(value: str) -> tuple[tuple[int, ...], int, int, int, int] | Non
     Release tuples are NOT padded here — comparing keys of different arity is the
     caller's job (:func:`_is_newer`), because padding depends on both sides.
     """
-    text = str(value or "").strip()
+    # A PEP 440 local segment carries no ordering information and MUST NOT
+    # reach the parser: ``_PEP440_RE`` is anchored, so ``0.5.0+fork.gb1234ab``
+    # falls through to the semver branch below, which reads the first integer
+    # out of the sha and ranks the build as prerelease 1234 of ``0.5.0`` —
+    # BELOW the bare release. A fork build would then be offered upstream's
+    # identical release as an update. See `fork_version.strip_local`.
+    text = strip_local(value)
     if not text:
         return None
     match = _PEP440_RE.match(text)
@@ -686,6 +723,13 @@ async def _do_update_check() -> None:
             # would skip the finally — a leaked single-flight flag stops every future
             # check for the process's lifetime, which is a silently dead updater.
             capability = await asyncio.get_running_loop().run_in_executor(None, derive_capability)
+            # Warm the fork revision in the same off-loop window, for BOTH
+            # lanes. It is a git spawn, so it cannot run on the loop — and the
+            # status payload only PEEKS the memo (see ``status_update_fields``),
+            # so this is what makes the About surface able to name the fork at
+            # all. Failure is already swallowed inside the derivation, which
+            # returns "no revision" rather than raising.
+            await asyncio.get_running_loop().run_in_executor(None, warm_fork_revision)
             if capability.defers:
                 reason = capability.unavailable_reason or ""
                 _set_update_info(
@@ -1109,7 +1153,27 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
         )
         return
 
-    extra: dict[str, object] = {}
+    # A FORK BUILD IS NEVER OFFERED AN UPSTREAM ARTIFACT ON THIS LANE.
+    #
+    # The release feed publishes UPSTREAM's bytes. Applying one to a fork
+    # install does not update it, it REPLACES it — the fork's divergence is
+    # uninstalled, silently, from a button labelled "Update". The verdict is
+    # therefore reported as "nothing to apply" while ``latest_version`` is still
+    # carried, so the panel can say what upstream has moved to without offering
+    # to install it. ``fork_suppressed`` rides the payload so the UI can explain
+    # the difference instead of showing a bare "up to date".
+    #
+    # Scoped to the FEED lane on purpose. ``_check_git_checkout`` fetches the
+    # install's OWN remote, which for a fork clone is the fork — that lane is
+    # already correct and is left alone.
+    # Offloaded: the first call may spawn git, and this coroutine runs on the
+    # event loop. Memoized after ``_do_update_check`` warmed it, so in practice
+    # this is a tuple read that pays one executor hop.
+    fork_suppressed = await asyncio.to_thread(is_fork_build)
+    if fork_suppressed:
+        available = False
+
+    extra: dict[str, object] = {"fork_suppressed": fork_suppressed}
     pub_date = manifest.get("pub_date")
     if isinstance(pub_date, str) and _PUB_DATE_RE.match(pub_date):
         extra["latest_pub_date"] = pub_date
@@ -1122,7 +1186,13 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
     # every failure degrades to the ordinary dismissible prompt. Offloaded —
     # verification shells out to openssl.
     floor = manifest.get("min_version")
-    if isinstance(floor, str) and _MIN_VERSION_RE.match(floor):
+    if fork_suppressed and floor is not None:
+        # The floor's whole power is to make the prompt non-dismissible, and the
+        # only thing it can prompt toward here is the upstream artifact this
+        # lane refuses to offer a fork build. Honoring it would hold the
+        # dashboard hostage to an update that cannot legitimately be applied.
+        logger.debug("Fork build: ignoring the release feed's min_version floor")
+    elif isinstance(floor, str) and _MIN_VERSION_RE.match(floor):
         if _is_newer(floor, _display_version(remote_version, channel)) is True:
             # A floor above the very version the feed offers demands an update
             # the feed cannot satisfy — inconsistent, so ignore it. The offered

@@ -44,6 +44,7 @@ from __future__ import annotations
 import re
 
 from kiro_crew import __version__
+from kiro_crew.fork_version import strip_local
 
 #: The lanes a build can be on. Ordered loudest-first for docs; not an enum
 #: because these strings cross a JSON boundary into the dashboard and a label
@@ -54,6 +55,13 @@ CHANNELS = ("nightly", "insider", "stable")
 #: only digits and dots, so an ``a`` / ``b`` / ``rc`` followed by digits
 #: anywhere in the string can only have come from a prerelease segment. This
 #: also matches ``1.2.3rc4.post1``, which is the point of not anchoring it.
+#:
+#: THE PREMISE ABOVE HOLDS ONLY AFTER THE LOCAL SEGMENT IS STRIPPED. A fork
+#: build carries ``+fork.g<sha>``, a sha is hex, and ``a``/``b`` followed by a
+#: decimal digit occurs in ~46% of eight-character shas — so matched against
+#: the full string this reports ``insider`` for a STABLE base depending on the
+#: commit hash. Every caller goes through
+#: :func:`~kiro_crew.fork_version.strip_local` first; see its docstring.
 _PEP440_PRERELEASE = re.compile(r"(?:a|b|rc)\d+")
 
 #: Release channel -> the repository label that carries it. Prerelease reports
@@ -86,7 +94,11 @@ def channel(version: str | None = None) -> str:
     Takes an argument so tests and callers holding some *other* version string
     can use the same rule instead of reimplementing it.
     """
-    v = version if version is not None else __version__
+    # The PEP 440 local segment is DROPPED before any classification. It is not
+    # part of the release identity, and its content is arbitrary — a fork
+    # build's ``+fork.gb1234ab`` would otherwise be read as prerelease ``b1234``
+    # by the unanchored matcher below. See `fork_version.strip_local`.
+    v = strip_local(version if version is not None else __version__)
     # `.dev` is checked first: a nightly wheel is `<base>.dev<stamp>` and
     # carries no rc segment, while an rc wheel never carries `.dev`.
     if "-nightly." in v or ".dev" in v:

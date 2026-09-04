@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Trans } from 'react-i18next'
-import { RefreshCw, Scale, CheckCircle2, AlertCircle, Bug, GitBranch, GitCommitHorizontal, ExternalLink, ArrowUp, History, Package, X, Download, Copy } from 'lucide-react'
+import { RefreshCw, Scale, CheckCircle2, AlertCircle, Bug, GitBranch, GitCommitHorizontal, GitFork, ExternalLink, ArrowUp, History, Package, X, Download, Copy } from 'lucide-react'
 import { SettingsLink } from '../../components/SettingsLink'
 import { Progress } from '@/components/ui/progress'
 import { Card, CardTitle, Btn, Toggle } from '../../components/ui'
@@ -628,6 +628,18 @@ export function AboutPanel() {
   // reader (`versionLooksPrerelease`, the updater compare gate, the SPA's
   // reload-on-upgrade comparison) keeps its raw source.
   const gatewayVersionDisplay = useAppSelector(s => s.dashboard.status?.version_display) || ''
+  // FORK IDENTITY. `version` / `version_display` carry UPSTREAM's base version,
+  // because every comparison and every packaging manifest keys on it — so on
+  // their own they cannot tell this build apart from the upstream build it was
+  // forked from, and an upstream install one minor ahead even reads as NEWER.
+  // That was the reported confusion. These three render the other half.
+  const forkRevision = useAppSelector(s => s.dashboard.status?.fork_revision) || ''
+  const forkDirty = useAppSelector(s => s.dashboard.status?.fork_dirty) === true
+  const upstreamBaseVersion = useAppSelector(s => s.dashboard.status?.upstream_base_version) || ''
+  // An upstream release was found and deliberately NOT offered: installing it
+  // would replace the fork rather than update it. Without this the panel would
+  // render an unexplained "up to date" beside a newer upstream version.
+  const forkUpdateSuppressed = useAppSelector(s => s.dashboard.status?.update_fork_suppressed) === true
   // The desktop lane pair, live-first. `info` is a one-shot `getInfo()` read from
   // mount, while every later check pushes its own answer on the lifecycle payload,
   // so preferring the push is what keeps the chip and the prerelease ask correct
@@ -1190,6 +1202,37 @@ export function AboutPanel() {
               )}
             </div>
             <div className="text-[12.5px] text-muted mt-1">{i18nT('pages.settings.aboutPanel.autonomous_agent_management_runs_locally_open_so')}</div>
+            {/* Fork attribution. Rendered only when a revision could actually be
+                derived: an install with no baked stamp and no repository is
+                indistinguishable from upstream's own build, and asserting a fork
+                there would be a guess. The revision wears git's own `g` prefix so
+                it reads as an object name rather than as part of the version. */}
+            {forkRevision && (
+              <div className="text-[12px] text-muted mt-1 flex items-center gap-1.5 flex-wrap" data-testid="about-fork-build">
+                <GitFork size={12} className="lucide-inline shrink-0" aria-hidden />
+                <span className="font-mono">
+                  {i18nT('pages.settings.aboutPanel.based_on_upstream', {
+                    version: upstreamBaseVersion || gatewayVersion,
+                    revision: `g${forkRevision}`,
+                  })}
+                </span>
+                {/* Uncommitted changes mean the running bytes are not any commit,
+                    so a bug report naming the sha alone would name contents that
+                    never ran. */}
+                {forkDirty && (
+                  <span className="font-semibold" style={{ color: 'var(--warn)' }} data-testid="about-fork-dirty">
+                    {i18nT('pages.settings.aboutPanel.fork_uncommitted_changes')}
+                  </span>
+                )}
+              </div>
+            )}
+            {forkUpdateSuppressed && gwStatusLatest && (
+              <div className="text-[12px] mt-1" style={{ color: 'var(--warn)' }} data-testid="about-fork-update-withheld">
+                {i18nT('pages.settings.aboutPanel.fork_update_withheld', {
+                  version: gwStatusLatestDisplay || gwStatusLatest,
+                })}
+              </div>
+            )}
           </div>
         </div>
 

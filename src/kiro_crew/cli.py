@@ -41,7 +41,7 @@ from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import NoReturn
 
-from kiro_crew import __version__, cli_help, platform_compat
+from kiro_crew import __version__, cli_help, fork_version, platform_compat
 from kiro_crew.apps import builtins as _builtins_pkg
 from kiro_crew.apps.builtins import BUILTIN_NAMES as _BUILTIN_NAMES
 from kiro_crew.config import KiroCrewConfig, config_dir, ensure_data_home
@@ -1104,7 +1104,13 @@ def main() -> None:
         epilog=cli_help.render_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"kirocrew {__version__}")
+    # `full_version()` so `--version` on a fork build is not upstream's string.
+    # Reads the memoized derivation; no subprocess runs unless this line is hit.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"kirocrew {fork_version.full_version(__version__)}",
+    )
     parser.add_argument(
         "--verbose",
         "-v",

@@ -45,6 +45,7 @@ from kiro_crew.dashboard.chat_utils import run_config_write
 from kiro_crew.dashboard.handlers import get_update_info
 from kiro_crew.dashboard.token_auth import LINK_WINDOW_SECS, MAX_SESSION_TTL_SECS, parse_duration
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.fork_version import full_version
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.mcp_discovery import list_servers
 from kiro_crew.messaging.identity import channel_inbound_permitted
@@ -1362,7 +1363,7 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         blocks.append(command_hint_block(f"{_sc} #channel", "track/untrack channel"))
 
         # ── Version ──
-        version_text = f"📦 Kiro Crew v{__version__}"
+        version_text = f"📦 Kiro Crew v{full_version(__version__)}"
         update_info = get_update_info()
         remote_ver = update_info.get("latest_version")
         if update_info.get("update_available") and remote_ver:

@@ -181,6 +181,14 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "update_required",
             "update_min_version",
             "version_display",
+            # Fork identity, the other half of `version`: this build's version
+            # is UPSTREAM's base, so on its own it cannot tell a fork build
+            # apart from the upstream build it forked. See
+            # `kiro_crew.fork_version`.
+            "upstream_base_version",
+            "fork_revision",
+            "fork_dirty",
+            "update_fork_suppressed",
         }
 
     def test_the_shared_reader_never_flattens_a_missing_verdict(self) -> None:

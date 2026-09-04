@@ -517,6 +517,37 @@ def _pin_kill_and_reap_group_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _pin_fork_revision(monkeypatch):
+    """Stop the fork revision from being derived off the developer's checkout.
+
+    ``kiro_crew.fork_version`` answers "which commit are these bytes" by asking
+    git, memoized per process. Left live, the answer is HOST STATE: the sha of
+    whatever the runner has checked out, and a ``dirty`` flag that flips the
+    moment the author edits a file. That is exactly the class of leak this
+    rootdir conftest exists to close, and it is not hypothetical -- it reaches
+    real product decisions. ``_check_release_feed`` refuses to offer a fork build
+    an upstream artifact, so with a live derivation twelve pre-existing feed
+    tests asserted ``update_available: True`` and got ``False``, purely because
+    the suite happened to be running inside a git checkout.
+
+    The pin is the UPSTREAM-shaped answer -- no revision, clean -- because that
+    is the shape every pre-existing contract in the suite was written against,
+    and it is the one a packaged install with no stamp also reports.
+
+    A test that wants a fork build sets ``fork_version._cached`` itself, or
+    installs a ``kiro_crew._build_info`` stub after calling
+    ``reset_cache_for_tests()``; a later patch wins and reverts independently
+    (see ``test/test_fork_version.py``). Tolerant of a partial checkout, and
+    STRICT on the attribute so a rename cannot silently restore the leak.
+    """
+    try:
+        fork_version = importlib.import_module("kiro_crew.fork_version")
+    except Exception:  # pragma: no cover - a partial checkout must not break collection
+        return
+    monkeypatch.setattr(fork_version, "_cached", ("", False))
+
+
+@pytest.fixture(autouse=True)
 def _no_credential_env_residue():
     """Restore the credential env vars a test may have had INJECTED into it.
 
