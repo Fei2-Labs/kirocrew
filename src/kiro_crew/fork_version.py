@@ -89,6 +89,12 @@ REVISION_WIDTH = 8
 #: enough that a stale network mount cannot hang ``kirocrew --version``.
 _GIT_TIMEOUT_SECONDS = 5
 
+#: Where an UNTRACKED file could still change what this build runs: the Python
+#: package, and the frontend sources that are built into ``static/dist`` and
+#: served from it. Untracked entries anywhere else are operator scratch and do
+#: not make a build dirty -- see the reasoning in ``_git_revision``.
+SHIPPED_SOURCE_PATHS = ("src/kiro_crew", "website/src")
+
 #: A short or full lowercase-hex object name. Applied to git's own output as
 #: well as to a baked value: the baked module is generated, but it is generated
 #: from a shell variable, and an unvalidated value would put arbitrary text in
@@ -239,10 +245,20 @@ def _git_revision() -> tuple[str, bool]:
     # Dirtiness is a SEPARATE call rather than `describe --dirty`, because this
     # fork does not tag: `describe` without a reachable tag fails outright, and
     # `describe --always --dirty` answers with the sha but is the same two walks
-    # underneath. `status --porcelain` also counts untracked files, which is the
-    # honest reading for "were these the bytes that ran".
-    status = _run(["status", "--porcelain"])
+    # underneath.
+    #
+    # Untracked files are counted only under the paths that actually SHIP. A
+    # bare `status --porcelain` reads every untracked entry as dirtiness, and
+    # this repo permanently carries operator scratch (`.kiro/`, `.trellis/`,
+    # `.playwright-mcp/`) that is untracked without being ignored — so the flag
+    # stuck on for every build on a working checkout, and a marker that never
+    # clears carries no signal. An untracked file under `src/kiro_crew/` or
+    # `website/src/` can change what runs; one beside them cannot.
+    status = _run(["status", "--porcelain", "--untracked-files=no"])
     dirty = bool(status is not None and status.strip())
+    if not dirty:
+        shipped = _run(["status", "--porcelain", "--", *SHIPPED_SOURCE_PATHS])
+        dirty = bool(shipped is not None and shipped.strip())
     return revision[:REVISION_WIDTH], dirty
 
 
