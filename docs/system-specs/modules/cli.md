@@ -236,7 +236,9 @@ path gives up is ancestor-swap resistance, not link resistance.
 | `kirocrew memory show [preferences\|projects\|history]` | Read the markdown memory layer (all three when no target given); `--format md\|json`, `--since YYYY-MM-DD` for history |
 | `kirocrew memory export/import/migrate` | Export memory to JSON (`--include-markdown` adds the markdown layer), import it back, or migrate legacy markdown memory into the vector store |
 | `kirocrew policy show/validate/explain/profile` | Inspect the effective enterprise security policy, load-check it and all profiles, explain one tool/scope decision for a surface, or print a profile. `show` also summarizes the built-in denied-command catalog as grouped counts (`--ids` lists each category's rule ids), on every install regardless of whether an enterprise policy is active — the one place an agent can learn a class of work is hard-denied before planning around it. |
-| `kirocrew pod up/down/ls/status/token/url/logs/exec/install/provision` | Isolated worktree test gateways (**Linux `systemd --user` only** — every systemd-touching verb refuses with a one-line message on macOS/Windows). See `src/kiro_crew/pod/README.md`. |
+| `kirocrew pod up/down/ls/status/token/url/scenarios/logs/exec/install/provision` | Isolated worktree test gateways (**Linux `systemd --user` only** — every systemd-touching verb refuses with a one-line message on macOS/Windows). See `src/kiro_crew/pod/README.md`. |
+| `kirocrew pod scenarios [--json]` | List packaged seed scenarios in deterministic name order. Human output is a name/description table; `--json` emits an array of `{name, description}` rows. Descriptions come from the first line of each fixture manifest's narrow `description:` scalar without a PyYAML runtime dependency. An empty registry returns success with `[]` in JSON mode or an explicit human diagnostic. |
+| `kirocrew pod up --seed <scenario\|dir>` | Pre-populate the isolated home. A bare name is a packaged fixture and populates the whole home; a path contributes only its sanitized `config.json`. Unknown names are refused with the available list. Named fixtures copy directly into the final home through pinned source/destination directory descriptors; config/workspace setup uses the same held home, and the manifest lands last as the completion marker. Populated homes are never overwritten: a named-seed request against one refuses before start even when its marker matches; use plain `pod up` to restart it unchanged. Seeded config disables channel enablement and restores the sandbox floor. A per-instance systemd drop-in runs the checkout's own venv binary, post-health marker readback detects a seed that did not land, and `pod down` removes the drop-in with the home. Pod homes provide operational/state isolation, not protection from arbitrary same-UID host processes; Controller v1 invokes seeding from the host control plane and does not support nested pod control. |
 | `kirocrew knowledge dedup [--apply]` | Collapse cross-source duplicate knowledge documents (dry-run unless `--apply`) |
 | `kirocrew cron preview <script>` | Run a script cron locally with real MCP tools; notifications are captured and printed instead of delivered |
 | `kirocrew workspace create/update --dir <name>` | `--dir` is a directory NAME that must resolve to a **strict descendant of the data home** (`~` is expanded first); anything landing outside — and the home **root itself**, in any spelling — is refused with a SEL `denied` audit event. Containment, not an absolute-path ban: an absolute path *under* the home resolves where the relative form would and is accepted. The strict-descendant test is what closes the root case for tilde paths, since the per-call-site root-equality checks compare un-expanded `config_dir() / ws_dir`. Deliberately stricter than the dashboard's `POST /api/workspaces`, which accepts an absolute `dir` anywhere, screened by `is_sensitive_path`. |
@@ -1031,6 +1033,15 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
    already has it to install it. That case carries SEL
    `reason=<tool>_outside_trusted_dirs`, distinct from `<tool>_not_found`, so
    the two are separable in the audit log.
+   When the trusted lookup tool exists but returns no pid, stop makes one
+   fixed-loopback `POST /api/shutdown` request carrying the gateway generation's
+   local secret. That handler independently requires loopback origin and a
+   constant-time secret match, then triggers the same graceful shutdown event as
+   SIGTERM. The acknowledgement body is capped at 4 KiB before JSON parsing;
+   excessive nesting is treated as malformed input. A successful acknowledgement
+   ends the stop command; a missing secret, refusal, malformed response, or
+   transport failure retains the ordinary no-gateway diagnostic. This fallback never converts the pid sidecar into
+   authority to signal a process.
 3. `platform_compat.process_command_line(pid)` to verify it's a KiroCrew process —
    `/proc/<pid>/cmdline` (Linux), `ps -o command=` (macOS), `Win32_Process.CommandLine`
    via WMI (Windows). The Windows venv `kirocrew.exe` re-execs `python.exe`, so the
@@ -1063,12 +1074,19 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
      on Windows) to detect a running gateway. If found — OR if the lookup
      tool is absent (`not listening_pid_tool_available()`, so a missing
      tool is not mistaken for a dead gateway) — run the existing `_stop`
-     kill-by-port path. If not (e.g. the user runs `restart` after a
-     crash), skip the stop step rather than erroring — the user expects to
-     end up with a running gateway either way. The `_stop` call is wrapped
-     in a `try / except SystemExit` so a TOCTOU race (gateway exits between
-     the listener check and `_stop`'s own lookup → `_stop` calls
-     `sys.exit(1)`) does not abort the restart before the spawn.
+     path. When the trusted lookup tool exists but returns no pid, restart
+     independently attempts the authenticated shutdown request. An acknowledged
+     request always refuses the immediate replacement and tells the operator to
+     retry after shutdown completes: neither an absent pid sidecar nor a live
+     same-user pid from that sidecar can prove singleton-lock release, because a
+     stale pid may be recycled and exit before the incumbent. The second restart
+     sees no incumbent and safely starts the replacement.
+   - If no incumbent evidence exists (e.g. the user runs `restart` after a
+     crash), skip the stop step rather than erroring — the user expects to end
+     up with a running gateway either way. The `_stop` call is wrapped in a
+     `try / except SystemExit` so a TOCTOU race (gateway exits between the
+     listener check and `_stop`'s own lookup → `_stop` calls `sys.exit(1)`)
+     does not abort the restart before the spawn.
    - Spawn a detached `kirocrew gateway` via `subprocess.Popen`, stdin set
      to `subprocess.DEVNULL`, and stdout + stderr redirected to
      `~/.kiro/crew/gateway.log` (the same file the `kirocrew logs` command

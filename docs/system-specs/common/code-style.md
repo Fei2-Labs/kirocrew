@@ -40,6 +40,7 @@ Paths below are relative to `src/kiro_crew/`.
 | Process-wide shutdown signal | `__init__.py` | `shutdown_event`. Background loops `await shutdown_event.wait()` with a timeout instead of a plain `asyncio.sleep`, so they wake instantly on Ctrl-C. |
 | Base agent config | `config/defaults.json` | `tools`, `allowedTools`, `resources`, `hooks`, model. Packaged as package data, so editing it needs no code change. |
 | Managed MCP server specs | `agent.py` | `_MANAGED_MCP_SERVERS`: which servers are auto-registered and refreshed while preserving user customizations. |
+| AgentCore policy-field validators | `platform/agentcore_schema.py` | `AGENTCORE_GATEWAY_URL_MAX`, `WORKLOAD_NAME_MIN` / `WORKLOAD_NAME_MAX`, `normalize_agentcore_gateway_url`, `normalize_agentcore_workload_name`. AWS-free so governance can parse a policy without the optional extra. |
 | Built-in skills | `builtin_skills/<name>/SKILL.md` | Frontmatter (`always`, `triggers`, `dir`) is the skill's own contract. This is the only tree copied into a user's `~/.kiro/crew/skills/`. |
 
 Other style rules:
@@ -47,7 +48,7 @@ Other style rules:
 | Rule | Requirement |
 |---|---|
 | Line length | 100 chars (black and isort are both configured to it) |
-| Python version | >= 3.10; `from __future__ import annotations` for type hints |
+| Python version | >= 3.12; `from __future__ import annotations` for type hints |
 | Imports | `import logging` plus `logger = logging.getLogger(__name__)` |
 | Async | `asyncio` throughout; `async def` for all I/O |
 | Module-global asyncio primitives | Never a bare `asyncio.Lock()`/`Event()`/`Queue()` at module scope — it binds to the import-time (or first-use) loop and raises `RuntimeError` from any other loop (Python 3.10+). Use `kiro_crew.loop_lock.LoopBoundLock` for locks, or create the primitive inside the coroutine. CI enforces this (`loop-bound-locks` gate). |

@@ -22,6 +22,7 @@ from chat_test_helpers import _make_state
 
 from kiro_crew.config import loader
 from kiro_crew.dashboard import chat_delivery as cd
+from kiro_crew.dashboard import create_rate_limit
 from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard import stop_retry
 from kiro_crew.dashboard.chat_utils import slot_history_key
@@ -51,6 +52,21 @@ def _fresh_stop_windows():
     stop_retry.reset_for_tests()
     yield
     stop_retry.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_create_budget():
+    """The per-caller create-rate window is process-wide module state.
+
+    Nearly every create test here calls as the same caller (``chat-1``), so the
+    20-per-window budget is consumed by the file itself: left behind, the 21st
+    create in a worker process is refused with ``create_rate_limited`` and the
+    test that happens to be 21st fails for a reason it never asserted. Which
+    test that is depends on xdist distribution, which is what made it flaky.
+    """
+    create_rate_limit.reset_for_tests()
+    yield
+    create_rate_limit.reset_for_tests()
 
 
 def _slot(state, name: str, **kwargs):
@@ -925,21 +941,25 @@ class TestTheRoutesRequireTheInternalSecret:
 # ── The config switch ────────────────────────────────────────────────────────
 
 
-def test_the_trust_switch_needs_a_positive_grant():
-    """``agent.session_control`` must not enable itself from absence OR from junk.
+def test_the_switch_is_on_by_default_and_an_explicit_false_still_disables():
+    """``agent.session_control`` defaults ON; the agent config is the real grant.
 
-    Two independent ways this switch could grant cross-session reach without
-    anyone asking for it, and both are pinned here:
+    Who may reach a peer session is decided by the AGENT CONFIG, not by this
+    switch: the tools come from the `kirocrew-dashboard` MCP server, so an agent
+    that does not mount it never has them -- the same rule as every other MCP
+    server. A second default-off gate on top of that only made the capability
+    unreachable for an agent whose spec had already been given it deliberately.
 
-    * **Absent.** The three tools ride on the existing assignable
-      `kirocrew-dashboard` server, so an operator who assigned that server for
-      folder work would gain peer stop-and-read purely by upgrading. Both the
-      ``.get`` default and the dataclass field default must therefore be
-      ``False`` -- a grant has to be written down.
+    What the switch is still for is a single withdrawal: an operator who wants it
+    gone from every agent at once, without editing each spec. So the one direction
+    that must keep working is an EXPLICIT ``false``:
+
+    * **Absent.** Both the ``.get`` default and the dataclass field default are
+      ``True``, so a mounted server works with nothing else written down.
     * **Malformed.** ``bool("false")`` is ``True``, so a plain coercion loads a
       quoted opt-out as ENABLED and a user who wrote it in an editor that quotes
       values would keep cross-session control on while believing it off.
-      ``_safe_bool`` accepts only a real bool and falls back to ``False``.
+      ``_safe_bool`` accepts only a real bool.
 
     Asserted on the source rather than through ``KiroCrewConfig.load()``:
     ``load()`` merges the real data home's ``config.local.json`` and serves a
@@ -955,18 +975,22 @@ def test_the_trust_switch_needs_a_positive_grant():
     assert wiring.startswith(
         "_safe_bool("
     ), f"session_control must be parsed through _safe_bool, got: {wiring}"
-    assert wiring.endswith(
-        "False)"
-    ), f"the fallback must be False so a malformed value fails closed, got: {wiring}"
-    assert '"session_control", False' in wiring, (
-        "an absent setting must read as DISABLED -- otherwise an existing "
-        f"kirocrew-dashboard assignment gains peer stop/read on upgrade, got: {wiring}"
-    )
+    assert (
+        '"session_control", True' in wiring
+    ), f"an absent setting must read as ENABLED -- the mount is the grant, got: {wiring}"
     # The field default is the second absent path: it is what a config object
-    # built without going through the loader resolves to.
-    assert loader.AgentConfig().session_control is False, (
-        "the dataclass default must also be False, or a config built outside the "
-        "loader grants cross-session reach with nothing written down"
+    # built without going through the loader resolves to, and it must agree with
+    # the loader or the answer depends on which path produced the config.
+    assert loader.AgentConfig().session_control is True, (
+        "the dataclass default must also be True, or a config built outside the "
+        "loader disables a capability the agent's own spec was given"
+    )
+    # An explicit opt-out is the direction that still has to hold, including the
+    # quoted form `_safe_bool` exists for.
+    assert loader._safe_bool(False, True) is False
+    assert loader._safe_bool("false", True) is True, (
+        "a quoted value is not a bool, so it falls back rather than being coerced "
+        "-- the operator who means it writes a real false"
     )
 
 
@@ -2123,6 +2147,484 @@ def test_created_session_gets_its_workspace_project_dir(tmp_path):
     assert child.project == loader.default_project_dir(child.workspace)
 
 
+# ── session_create: filing at birth (#6118) ─────────────────────────────────
+
+
+def test_create_schema_bounds_the_folder_reference():
+    """`folder` takes an id OR a human path, bounded like every folder ref.
+
+    The two readings share no charset, so the schema checks only the length --
+    the same contract `chat_folder_move_session.folder` carries. Over-length is
+    refused at validation, before any resolution work.
+    """
+    from kiro_crew.validation import SESSION_CREATE_SCHEMA, ValidationError, validate_tool_args
+
+    out = validate_tool_args({"folder": "aaaaaaaaaaaa"}, SESSION_CREATE_SCHEMA)
+    assert out["folder"] == "aaaaaaaaaaaa", "an id-shaped reference must pass"
+    out = validate_tool_args({"folder": "Goals/Q3 push"}, SESSION_CREATE_SCHEMA)
+    assert out["folder"] == "Goals/Q3 push", "a '/'-separated human path must pass"
+    out = validate_tool_args({}, SESSION_CREATE_SCHEMA)
+    assert out["folder"] == "", "omitted means unfiled, not an error"
+    with pytest.raises(ValidationError):
+        validate_tool_args({"folder": "x" * 4097}, SESSION_CREATE_SCHEMA)
+
+
+def _folder(state, fid: str, name: str, **extra):
+    row = {"id": fid, "name": name, "parent_id": "", **extra}
+    state._folders.append(row)
+    return row
+
+
+def test_create_files_the_slot_at_birth(tmp_path):
+    """A named folder is applied at creation AND rides the birth metadata.
+
+    The disk half is the load-bearing one: the normal save path returns early on
+    an empty message window, so for a created-then-idle session the birth
+    metadata line is the only durable record of the placement. Dropping
+    `folder_id` from that dict files the session in memory and loses it on the
+    next restart.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    assert child.folder_id == "fold00000001", "the slot must be filed, not left for a move"
+    written = state.conversation_log.get_metadata(slot_history_key(child))
+    assert written.get("folder_id") == "fold00000001", (
+        "the placement must reach the persist-at-birth metadata -- the save path "
+        "writes nothing for an empty session, so this line is the only record"
+    )
+
+
+def test_create_refuses_an_unknown_folder(tmp_path):
+    """An unresolvable folder refuses the WHOLE create, allocating nothing.
+
+    The caller asked for a session filed in this folder; 'created but unfiled'
+    would silently honor half of that. No session exists yet, so refusal loses
+    nothing -- the same posture the move path takes on an unknown folder.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    before = state.live_slot_count()
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(
+            sc.create_session(state, caller_session_key=_key(caller), folder_id="nope00000000")
+        )
+
+    assert exc.value.code == "folder_not_found"
+    assert state.live_slot_count() == before, "a refused create must not leave a slot behind"
+
+
+def test_a_folder_deleted_mid_create_is_refused_under_the_lock(tmp_path, monkeypatch):
+    """Folder existence is decided under the folder-store lock, late.
+
+    `create_session` suspends before the allocation (project dir, config load),
+    and a folder delete can land in those windows. Existence is therefore
+    confirmed READ-ONLY under the folder-store lock (`state.read_folders`) as
+    the last suspension before the re-gate. Simulated by deleting the folder
+    inside the project-dir resolution. Mutation guard: a check that reads the
+    unlocked list before those awaits would let this create succeed into a
+    folder that is already gone.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+
+    def _delete_folder_then_resolve(_workspace):
+        # Stand in for the interleaving: the delete lands while the project
+        # directory is still being resolved off-loop.
+        state._folders[:] = [f for f in state._folders if f["id"] != "fold00000001"]
+        return str(tmp_path)
+
+    monkeypatch.setattr(sc, "default_project_dir", _delete_folder_then_resolve)
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(
+            sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+        )
+    assert exc.value.code == "folder_not_found"
+
+
+def test_filing_at_birth_unhides_the_folder_like_a_move(tmp_path):
+    """Model-B semantics apply at create exactly as they do on a move.
+
+    Moving a session into a hidden folder un-hides it (`_unhide_folder`), so a
+    session filed at creation must not land invisibly inside a folder the user
+    cannot see -- that would be a session the sidebar hides by construction.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    row = _folder(state, "fold00000001", "Goal", hidden=True)
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+
+    assert state.get_slot(created["target"]).folder_id == "fold00000001"
+    assert row["hidden"] is False, "filing into a hidden folder must un-hide it"
+
+
+def test_a_folder_cannot_smuggle_creation_past_the_caller_refusals(tmp_path):
+    """Caller eligibility precedes every folder consideration.
+
+    The move path's app-ownership rule never has to run here because an
+    app-scoped caller cannot create a session at all -- that refusal is the
+    guard the filing inherits, and it must keep firing FIRST so the folder
+    argument cannot become a probe for folder existence.
+    """
+    state = _make_state(tmp_path)
+    app_caller = _slot(state, "chat-app")
+    app_caller._app = "some-app"
+    _folder(state, "fold00000001", "Goal")
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(
+            sc.create_session(state, caller_session_key=_key(app_caller), folder_id="fold00000001")
+        )
+    assert (
+        exc.value.code == "app_scoped_caller"
+    ), "the caller refusal must precede folder handling -- not folder_not_found"
+
+
+def test_a_refused_create_leaves_a_hidden_folder_hidden(tmp_path, monkeypatch):
+    """No durable folder-tree mutation may survive a refused create.
+
+    The Model-B un-hide persists `hidden = False` to the folder store, and the
+    re-gate can still refuse AFTER the folder was confirmed -- so un-hiding
+    early would durably reverse a choice the user made, for a call that failed.
+    Simulated with the caller closing mid-create (the same interleaving the
+    re-gate exists for). Mutation guard: moving the un-hide back before the
+    re-gate flips the folder visible here.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    row = _folder(state, "fold00000001", "Goal", hidden=True)
+
+    def _close_caller_then_resolve(_workspace):
+        state._slots.pop(caller.key, None)
+        return str(tmp_path)
+
+    monkeypatch.setattr(sc, "default_project_dir", _close_caller_then_resolve)
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        asyncio.run(
+            sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+        )
+    assert exc.value.code == "caller_not_open"
+    assert row["hidden"] is True, "a refused create must not un-hide the folder"
+
+
+def test_moving_an_empty_newborn_before_its_first_message_survives_a_restart(tmp_path):
+    """A filed-at-birth session that is re-filed while still empty persists it.
+
+    Birth metadata made empty sessions durable, which made the save path's
+    empty-window early return newly consequential: the folder PATCH route and
+    the folder-delete sweep persist via `save_slot_off_loop(force=True)`, whose
+    full save has no window to write for a message-less slot -- without the
+    metadata merge, a restart would resurrect the BIRTH placement the user
+    already changed (or point at a folder they deleted).
+    """
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+    _folder(state, "fold00000002", "Other")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+    child = state.get_slot(created["target"])
+
+    # The user drags it into another folder before any message lands.
+    child.folder_id = "fold00000002"
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+    moved = state.conversation_log.get_metadata(slot_history_key(child))
+    assert moved.get("folder_id") == "fold00000002", "the move must overwrite the birth filing"
+
+    # And unfiling durably clears it (a falsy value reads as unfiled).
+    child.folder_id = ""
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+    unfiled = state.conversation_log.get_metadata(slot_history_key(child))
+    assert not unfiled.get("folder_id"), "unfiling must not resurrect the birth filing"
+
+    # An ordinary empty tab has no metadata line, and a forced save must not
+    # materialize one -- a session with no line does not survive a restart, so
+    # there is nothing to reconcile.
+    plain = _slot(state, "chat-plain")
+    asyncio.run(save_slot_off_loop(state, plain, force=True))
+    meta, readable = state.conversation_log.get_metadata_status(slot_history_key(plain))
+    assert readable and not meta, "no metadata line may be invented for a plain empty tab"
+
+
+def test_metadata_mutations_on_an_empty_newborn_survive_a_restart(tmp_path):
+    """Tags and a pin acknowledged before the first message persist.
+
+    The tag routes and the pin route persist ONLY through
+    ``save_slot_off_loop(force=True)`` -- for a message-less newborn that is
+    the empty-window merge, so a folder-only merge would acknowledge the
+    mutation and then silently drop it on restart. Clears must be explicit:
+    the merge cannot delete a key, so untag/unpin write falsy values that
+    rehydrate reads as cleared.
+    """
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+    child = state.get_slot(created["target"])
+
+    # The user tags, pins, mode-switches, and binds it before any message lands.
+    child.tags = ["tag00000001"]
+    child.pinned = True
+    child.mode = "orchestrator"
+    child._artifact = "my-artifact"
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+    meta = state.conversation_log.get_metadata(slot_history_key(child))
+    assert meta.get("tags") == ["tag00000001"], "an acknowledged tag must reach disk"
+    assert meta.get("pinned") is True, "an acknowledged pin must reach disk"
+    assert meta.get("mode") == "orchestrator", "an acknowledged mode switch must reach disk"
+    assert meta.get("artifact") == "my-artifact", "an acknowledged binding must reach disk"
+    assert meta.get("folder_id") == "fold00000001", "the merge must not drop the birth filing"
+
+    # And the clears are explicit -- a restart must not resurrect them.
+    child.tags = []
+    child.pinned = False
+    child.mode = ""
+    child._artifact = ""
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+    meta = state.conversation_log.get_metadata(slot_history_key(child))
+    assert meta.get("tags") == [], "untagging must overwrite the persisted tags"
+    assert not meta.get("pinned"), "unpinning must overwrite the persisted pin"
+    assert not meta.get("mode"), "a mode reset must overwrite the persisted mode"
+    assert not meta.get("artifact"), "an unbind must overwrite the persisted binding"
+
+
+def test_the_empty_window_merge_mirrors_the_full_saves_slot_owned_fields(tmp_path):
+    """Drift guard: every restart-relevant slot-owned field survives the merge.
+
+    The empty-window merge must persist what the FULL save's metadata line
+    would persist, or whichever route happens to flow through it silently
+    drops an acknowledged mutation on restart. Keyed to
+    ``SLOT_OWNED_META_KEYS`` so a field added to the full save later fails
+    here instead of regressing quietly. Exclusions are the history-layer /
+    conditional-identity keys the merge legitimately writes only when the
+    slot carries them.
+    """
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+    from kiro_crew.history import SLOT_OWNED_META_KEYS
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+    child = state.get_slot(created["target"])
+
+    child.tags = ["tag00000001"]
+    child.pinned = True
+    child.mode = "orchestrator"
+    child._artifact = "my-artifact"
+    child.reasoning_effort = "high"
+    child.color_index = 3
+    child.title = "Pinned title"
+    child._titled = True
+    child._title_origin = "user"
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+    meta = state.conversation_log.get_metadata(slot_history_key(child))
+
+    # History-layer bookkeeping the merge must NOT touch, the closed pair
+    # (exercised by its own test), and identity fields a plain user newborn
+    # does not carry.
+    excluded = {
+        "_type",
+        "created_at",
+        "last_consolidated",
+        "closed",
+        "closed_at",
+        "app",
+        "forked_from",
+        "linked_session_key",
+    }
+    for key in sorted(SLOT_OWNED_META_KEYS - excluded):
+        assert key in meta, f"slot-owned field {key!r} missing after an empty-window forced save"
+    assert meta.get("artifact") == "my-artifact"
+    assert meta.get("reasoning_effort") == "high"
+    assert meta.get("color_index") == 3
+    assert meta.get("title") == "Pinned title"
+    assert meta.get("title_origin") == "user"
+
+
+def test_the_empty_window_merge_reads_slot_state_at_write_time(tmp_path):
+    """The merged fields are evaluated under the history lock, not snapshotted.
+
+    Two concurrent force-saves of the same empty newborn can commit in either
+    order; a dict snapshotted before the lock would let the older save land
+    second and silently revert an acknowledged newer mutation (a tag save
+    restoring ``pinned=False`` over a pin that already committed). Pinning the
+    guard-time read: a slot mutation landing after the save call but before
+    the locked write must be what reaches disk.
+    """
+    from unittest.mock import patch
+
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+    child = state.get_slot(created["target"])
+
+    real = state.conversation_log.update_metadata_if
+
+    def _mutate_then_write(key, fields, guard):
+        # Simulates a concurrent pin committing between this save's call and
+        # its locked write: the merge must pick up the NEW value.
+        child.pinned = True
+        return real(key, fields, guard)
+
+    child.pinned = False
+    with patch.object(state.conversation_log, "update_metadata_if", _mutate_then_write):
+        asyncio.run(save_slot_off_loop(state, child, force=True))
+    meta = state.conversation_log.get_metadata(slot_history_key(child))
+    assert meta.get("pinned") is True, "the merge must write the slot state current at lock time"
+
+
+def test_closing_an_empty_newborn_does_not_resurrect_it_open(tmp_path):
+    """A close acknowledged for a message-less newborn persists to its line.
+
+    Birth metadata made empty sessions durable -- without the closed merge the
+    line stays open-shaped and the next restart resurrects a tab the user
+    dismissed.
+    """
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+    child = state.get_slot(created["target"])
+
+    asyncio.run(save_slot_off_loop(state, child, closed=True, closed_at=123.0))
+    meta = state.conversation_log.get_metadata(slot_history_key(child))
+    assert meta.get("closed") is True, "the close must reach the birth metadata line"
+    assert meta.get("closed_at") == 123.0, "the close instant must be the caller-supplied one"
+
+
+def test_an_unreadable_record_fails_the_empty_window_merge_loudly(tmp_path):
+    """A merge skipped because the record could not be READ must raise.
+
+    ``update_metadata_if`` fails closed on an unreadable record without
+    invoking the guard; swallowing that would report the save as durable -- a
+    close would remove the tab while the on-disk line stays open-shaped, and
+    the next restart resurrects it. The by-design skip (guard ran, record
+    empty: a line-less plain tab) must stay silent.
+    """
+    from unittest.mock import patch
+
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+    child = state.get_slot(created["target"])
+
+    def _unreadable(key, fields, guard):
+        # Mirrors update_metadata_if's fail-closed path: guard NOT invoked.
+        return False
+
+    with patch.object(state.conversation_log, "update_metadata_if", _unreadable):
+        with pytest.raises(Exception):
+            asyncio.run(save_slot_off_loop(state, child, closed=True, best_effort=False))
+
+    # The by-design skip stays silent: a plain empty tab has no metadata line,
+    # the guard runs, sees an empty record, and refuses without error.
+    plain = _slot(state, "chat-plain2")
+    assert asyncio.run(save_slot_off_loop(state, plain, force=True, best_effort=False)) is True
+
+
+def test_an_unhide_failure_does_not_fail_a_committed_create(tmp_path, monkeypatch):
+    """The Model-B un-hide is best-effort once the create has committed.
+
+    By the time it runs, the slot is published and persisted at birth -- a
+    folder-store write failure propagating from here would return 500 for a
+    session that EXISTS, and the caller's natural retry would create a
+    duplicate. Mutation guard: letting the exception escape fails this create.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal", hidden=True)
+
+    async def _boom(_state, _fid):
+        raise RuntimeError("folder store write failed")
+
+    monkeypatch.setattr(sc, "_unhide_folder", _boom)
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+
+    child = state.get_slot(created["target"])
+    assert child is not None, "the committed create must be reported as a success"
+    assert child.folder_id == "fold00000001"
+    written = state.conversation_log.get_metadata(slot_history_key(child))
+    assert written.get("folder_id") == "fold00000001", "the filing itself must have landed"
+
+
+def test_the_empty_window_merge_cannot_resurrect_a_deleted_session(tmp_path):
+    """The existence guard and the merge run under ONE lock.
+
+    The plain metadata update is an upsert, so a checked-then-written pair
+    would let a permanent deletion land between the read and the write and be
+    recreated as a fresh file. `update_metadata_if` re-makes the decision inside
+    the cross-process lock; a session file deleted before the forced save stays
+    deleted.
+    """
+    from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _folder(state, "fold00000001", "Goal")
+
+    created = asyncio.run(
+        sc.create_session(state, caller_session_key=_key(caller), folder_id="fold00000001")
+    )
+    child = state.get_slot(created["target"])
+    history_key = slot_history_key(child)
+    path = state.conversation_log._path(history_key)
+    assert path.exists(), "birth metadata must be on disk before the deletion"
+
+    # A permanent deletion lands, then the racing forced save arrives.
+    path.unlink()
+    child.folder_id = ""
+    asyncio.run(save_slot_off_loop(state, child, force=True))
+
+    assert not path.exists(), "the merge must not resurrect a deleted session file"
+
+
 def test_every_session_control_refusal_is_audited_as_failed():
     """A refused tool call must not be recorded as a completed one.
 
@@ -2314,11 +2816,20 @@ def test_a_mirror_link_landing_during_the_await_still_refuses(tmp_path, monkeypa
 def test_the_slot_cap_is_re_checked_after_the_await(tmp_path, monkeypatch):
     """The ceiling is read from live state, so it can fill inside the window too.
 
+    The ceiling is lowered for this test because what is under test is WHEN it is
+    read, not what it is: minting the production 500 slots is superlinear and cost
+    ~17s of pure setup for no extra property. The caller's own slot stays under the
+    lowered cap -- asserted below -- so the refusal can only come from the fill that
+    lands inside the await.
+
     Mutation guard: checking the cap only before the await lets two concurrent
     creations land over the ceiling.
     """
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
+    monkeypatch.setattr(sc, "MAX_LIVE_SLOTS", 3)
+    # Without this the test could pass on a cap checked only BEFORE the await.
+    assert state.live_slot_count() < sc.MAX_LIVE_SLOTS
 
     def _resolve_then_fill(_workspace):
         for i in range(sc.MAX_LIVE_SLOTS):
@@ -2484,6 +2995,43 @@ def test_nothing_suspends_while_the_created_slot_is_half_configured():
     assert "await" not in src[reresolve:publish], (
         "an await between re-resolving the caller and allocating the slot makes "
         "every re-read decision stale again"
+    )
+    # The folder confirmation is a suspension (it takes the folder-store lock),
+    # so it must sit BEFORE the re-resolve: after it, nothing suspends until the
+    # slot is configured, which is what makes "confirmed under the lock" still
+    # true at the assignment (folder mutations run on this loop).
+    exists_check = src.index("await state.read_folders(")
+    assert exists_check < reresolve, (
+        "the folder existence check suspends, so it must precede the caller "
+        "re-resolve -- after the re-gate nothing may suspend"
+    )
+    # And the filing itself happens inside the synchronous configuration window,
+    # so no caller ever observes the published slot unfiled -- the atomicity
+    # #6118 exists for.
+    filed = src.index("slot.folder_id = folder_id")
+    assert publish < filed < configured, (
+        "the folder must be assigned between publishing the slot and the end of "
+        "its synchronous configuration, or a caller can observe it unfiled"
+    )
+    # The Model-B un-hide is a DURABLE folder-store mutation, so it may run only
+    # after the filing actually landed: before the persist, any of the re-gate's
+    # refusals (or the write itself failing) would leave a folder the user hid
+    # permanently visible for a call that failed.
+    unhide = src.index("await _unhide_folder(")
+    persist = src.index("log.update_metadata")
+    assert persist < unhide, (
+        "un-hiding must follow the persist -- a refused create must leave no "
+        "durable folder-tree mutation behind"
+    )
+    # The allocation-to-persist span is broadcast-atomic: `get_or_create_slot`
+    # broadcasts on a leading edge, so without the suspend an idle gateway sends
+    # the new slot to every client BEFORE folder_id is assigned -- the session
+    # renders at the top level for a frame, the observable unfiled state this
+    # feature removes. Same pattern the move path pins for its own filing.
+    suspend = src.index("with state.suspend_slots_push():")
+    assert gate < suspend < publish, (
+        "the slot allocation must sit inside suspend_slots_push, so the slot's "
+        "first broadcast frame already shows it filed"
     )
 
 

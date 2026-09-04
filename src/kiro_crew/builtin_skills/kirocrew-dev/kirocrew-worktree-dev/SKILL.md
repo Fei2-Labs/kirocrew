@@ -1,6 +1,6 @@
 ---
 name: kirocrew-worktree-dev
-description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not for users' own projects): every change is built and verified inside a git worktree, never against the live gateway. Covers worktree creation, the blocking local build gates (pytest + isort + flake8 + mypy + tsc + vitest), the built-dist gotcha, feature flags, live preview paths (dev-backend.sh or isolated pods), and the PR workflow. Use only when building, testing, switching, or verifying a change to Kiro Crew's own codebase."
+description: "HARD RULE for developing the Kiro Crew source repo ITSELF (not for users' own projects): every change is built and verified inside a git worktree, never against the live gateway. Covers worktree creation, the blocking local build gates (pytest + isort + flake8 + mypy + tsc + vitest), the built-dist gotcha, feature flags, live preview paths (isolated pods, dev-backend.sh as fallback), and the PR workflow. Use only when building, testing, switching, or verifying a change to Kiro Crew's own codebase."
 triggers: kirocrew worktree, kirocrew build gate, kirocrew dev, kirocrew source, contribute to kirocrew, kirocrew repo
 repo_scope: src/kiro_crew
 ---
@@ -64,6 +64,12 @@ gates the PR; if this skill and CI disagree, CI wins. What this rule adds is
 the worktree-specific gotchas (parallelism, mypy CI-parity, dist ordering),
 not a replacement gate list.
 
+This rule covers **running** the gate and reading its verdict. **Writing** the tests
+it runs — isolation, the five determinism classes, cross-platform traps, residue
+diagnosis, suite speed — is the **writing-tests** skill. Load that one when a test is
+yours to fix; this one stays out of it rather than carrying a second, shorter copy
+that would drift.
+
 Run from the worktree root:
 
 ```bash
@@ -106,14 +112,16 @@ than fixed; if it only fails on your branch, it's yours. Never label a failure
 "known flaky" without that main-vs-branch comparison.
 
 **A confirmed flake is a bug with a root cause, not noise to retry.** Do NOT add a
-rerun, lengthen a `sleep`, or relax an assertion. Read
-`docs/system-specs/common/testing-conventions.md` § Determinism for the five classes
-and the one correct fix for each: seed nondeterministic input, poll instead of
-sleeping, `MagicMock` for sync methods, `await` after `cancel()`, and assert a
-complexity property structurally (identical invocation trace at `n` and `2n`) rather
-than by a timed duration or a tight timed ratio. To find what is
-actually flaky rather than guessing, mine CI instead of the local suite (a real flake
-often will not reproduce on macOS at all):
+rerun, lengthen a `sleep`, or relax an assertion. Once a failure is yours, FIXING it
+is the **writing-tests** skill's concern, not this one — it carries the decision order
+over `docs/system-specs/common/testing-conventions.md` § Determinism, and four of the
+five classes have a fix that looks like the obvious one and is not. Do not act on a
+one-line summary of that list, here or anywhere: pick the class from the symptom
+first.
+
+What this rule keeps is the step before that — deciding whether a red is yours at
+all. To find what is actually flaky rather than guessing, mine CI instead of the
+local suite (a real flake often will not reproduce on macOS at all):
 
 ```bash
 gh run list --workflow=ci.yml --limit 250 --json databaseId,conclusion \
@@ -128,16 +136,12 @@ a ratchet/contract test failing on feature branches is a TRUE POSITIVE, not a fl
 The Windows shards fail far more than Linux, so expect timer-granularity and
 process-semantics causes there.
 
-**Suite speed: profile, don't guess.** At ~56.5k tests, per-test setup cost dominates
-any single slow test. Time one file with `pytest test/test_x.py -n0 -q --no-cov
---durations=10` and compare a candidate fix **back to back** on the same machine
-(`git stash`, run, pop, run), because a loaded host makes an absolute number
-meaningless.
-The recurring wins are an autouse fixture requesting an unused `tmp_path`, a real
-`git` repo rebuilt per test instead of `copytree`d from a session template, and a
-production poll the test never asserts on. After any speedup, mutate the covered
-production code and confirm the test still fails. Full method and measured numbers:
-`docs/system-specs/common/testing-conventions.md` § Keeping the suite fast.
+**Suite speed is not this rule's concern.** If a gate run is slow enough to be the
+problem, the method — profile rather than guess, compare candidates back to back on
+the same host, which fixture shapes actually pay off, and the mutation check that
+proves a faster test still tests — is **writing-tests** § Keep the parallel suite
+fast, over `docs/system-specs/common/testing-conventions.md` § Keeping the suite
+fast. This rule only tells you to run the gate and how to read its verdict.
 
 **mypy must reproduce CI, not just "run".** CI installs `-e ".[voice]" --group
 dev` (mypy pinned in `pyproject.toml` `[dependency-groups] dev`) and does NOT
@@ -237,26 +241,48 @@ the gate that lets you push.
 
 **Build gates green is the floor** — it proves the code compiles and tests pass.
 Actually *running* the worktree to click through it is an **optional** preview
-step with several paths; use whichever your environment supports:
+step. **Prefer the isolated pod over `dev-backend.sh`** — it is hands-off (no
+port/data-home bookkeeping to remember) and disposable (`pod down` leaves zero
+residue), where `dev-backend.sh` leaves a foreground process and a
+`.kirocrew-dev/` directory you manage yourself. Reach for `dev-backend.sh` only
+where a pod cannot run.
 
-1. **`dev-backend.sh` (simplest).** From the worktree root:
+1. **Isolated pod (preferred).** Preview the full stack on its own port without
+   touching the live gateway:
+   ```bash
+   kirocrew pod up <worktree-name> --json   # own KIROCREW_HOME, own port, no crons
+   kirocrew pod down <worktree-name>        # zero residue
+   ```
+   Best for QA agents and end-to-end tests, but the default for a human
+   iterating on a worktree too — it needs no cleanup discipline of its own.
+   `kirocrew pod --help` for all verbs (`ls`, `status`, `logs`, `provision`,
+   …). The worktree must be built first (venv + dist); `kirocrew pod up
+   --provision` does the full on-ramp.
+
+   For behavior that needs existing data, seed a shipped fixture instead of
+   clicking state in by hand:
+   ```bash
+   kirocrew pod up <worktree-name> --seed minimal --json
+   ```
+   A bare name populates the whole isolated home; an unknown name is refused
+   with the available names. A path remains the sanitized config-only form.
+
+   Pods need Linux `systemd --user` or macOS `launchd` (`kirocrew pod install`
+   once per machine) — see [`kiro_crew/pod/README.md`](../../../pod/README.md)
+   for the platform gate. Without one of those, fall through to
+   `dev-backend.sh` below.
+
+2. **`dev-backend.sh` (fallback where a pod cannot run).** From the worktree
+   root:
    ```bash
    ./dev-backend.sh
    ```
    Starts the gateway on its own dev port using `.kirocrew-dev/` as its data
    directory (isolated from your production `~/.kiro/crew/`). It uses
    `PYTHONPATH=src` so code changes are picked up on restart. Ctrl+C to stop,
-   re-run after changes.
-
-2. **Isolated pod (no cutover, hands-off).** Preview the full stack on its own
-   port without touching the live gateway:
-   ```bash
-   kirocrew pod up <worktree-name> --json   # own KIROCREW_HOME, own port, no crons
-   kirocrew pod down <worktree-name>        # zero residue
-   ```
-   Best for QA agents and end-to-end tests. `kirocrew pod --help` for all verbs
-   (`ls`, `status`, `logs`, `provision`, …). The worktree must be built first
-   (venv + dist); `kirocrew pod up --provision` does the full on-ramp.
+   re-run after changes. Use this on a host with no `systemd --user` / `launchd`
+   (or before running `kirocrew pod install`), or when you specifically need a
+   foreground process to attach a debugger to.
 
 3. **No preview at all (also valid).** For many changes, the build gate + unit
    tests are enough confidence to cut the PR. Previewing live is optional.

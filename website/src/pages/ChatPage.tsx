@@ -7,8 +7,10 @@ import { useIsMobile } from '../hooks/useIsMobile'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
+import { settingsPath } from '../components/settingsPath'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { isBrowseCommand } from '../utils/browseCommand'
+import { isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
 // Re-exported so the symbol `ChatPage` exported before this extraction stays
 // importable from here; the implementation lives in `utils/browseCommand` so a
 // pure test need not pull ChatPage's module graph.
@@ -19,11 +21,12 @@ import type { ResizeInfo } from '../utils/resizeImage'
 import { useAppSelector, useAppDispatch, store } from '../store'
 import { useConnected } from '../hooks/useConnected'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
+import { useQueuedMessageActions } from '../hooks/useQueuedMessageActions'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 import {
   switchSlot, createSlot, deleteSlot, fetchHistory, loadOlderMessages, isSupersededPagingRejection,
-  appendMessage, appendSlotMessage, resumeFromHistory, forkSlot,
-  setSlotRunning, startLocalTurn, syncSlotRunningFromServer, setPendingInput, setAgentSwitchNotice, resolveByApprovalId, clearPendingPermissions, cancelQueuedMessage, editQueuedMessage,
+  appendMessage, appendSlotMessage, resumeFromHistory, clearUnresumableResume, forkSlot,
+  setSlotRunning, startLocalTurn, syncSlotRunningFromServer, setPendingInput, setAgentSwitchNotice, resolveByApprovalId, clearPendingPermissions,
   selectComposerBusy,
   selectContinuable,
   selectTurnInterrupted,
@@ -32,7 +35,7 @@ import {
   selectSubagent,
   setActiveSlot, truncateAfterIndex, replaceMessages,
   requestStop, pendingQuestionFor, captureStatelessCard, clearFollowupCard, dismissFollowupItem, clearFolderSuggestion, ageFolderSuggestion,
-  retireStatelessQuestion, capturePendingAskId, confirmOptimisticSend,
+  retireStatelessQuestion, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer,
   requestSlotReveal,
   mcpAppKey,
 } from '../store/chatSlice'
@@ -45,6 +48,7 @@ import { sseSlotTitle, triggerRefresh, updateSlot } from '../store/dashboardSlic
 import { performSlotSwitch } from '../lib/slotSwitch'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
+import { revealOrOpen } from '../components/FilePathMenu'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import type { PlanStepInput } from '../api/client'
 import { useProvider } from '../providers'
@@ -66,8 +70,10 @@ import McpToolsPanel from './chat/McpToolsPanel'
 import { deriveLoadedMcpTools } from '../lib/mcpLoadedTools'
 import type { McpServer } from '../types'
 import { useScrollManager } from './chat/useScrollManager'
+import { useBubbleVanishProbe } from './chat/useBubbleVanishProbe'
 import { shouldPaginateOlder, canForkAtWindow, searchScopeIsLimited } from './chat/pagination'
 import EarlierMessagesBar from './chat/EarlierMessagesBar'
+import TranscriptScrollShell from './chat/TranscriptScrollShell'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import { addPendingFile, parseFiles, prepareSendPayload, resolveFileSegment, buildFileLabels, buildRelMap, findUnreferencedAttachments, hasExactRelMention, normalizeWindowsPath, parseDirTokens, serializeDirTokens, parseDirs, resolveDirSegment, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
 import { classifyDrop } from '../utils/dropClassify'
@@ -171,7 +177,6 @@ import SessionTabStrip from '../components/SessionTabStrip'
 import { useSessionTabs } from '../hooks/useSessionTabs'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
 import { modelSupportsEffort } from '../lib/effort'
-import { isEmbeddedPane } from '../lib/embedded'
 import { providerLabel } from '../lib/sttProviders'
 import { countCompletedTurns } from '../lib/completedTurns'
 import { displayModel, pinIsWithheld } from '../lib/model'
@@ -198,9 +203,10 @@ import { TipCard, useTipTrigger } from '../components/TipCard'
 import { useVoiceInput, voiceInputSupported, type TranscriptOrigin } from '../hooks/useVoiceInput'
 import { usePushToTalk } from '../hooks/usePushToTalk'
 import VoiceDisabledModal from '../components/VoiceDisabledModal'
-import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt } from './chat'
+import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt, PinnedPromptPill } from './chat'
 import { useStreamIdle } from './chat/ChatFooter'
 import type { TurnStats } from './chat/AssistantMessage'
+import { prevUserTextFor } from './chat/share/shareSupport'
 import { turnHadPolicyBlock } from '../app-sdk/turnPolicyBlock'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { JiraHostsCtx } from '../lib/jiraHosts'
@@ -224,7 +230,7 @@ import { loadFileDrafts, saveFileDrafts as persistFileDrafts, setFileDraft } fro
 import { loadPasteDrafts, savePasteDrafts as persistPasteDrafts, setPasteDraft } from '../utils/chatPasteDrafts'
 import { loadSessionRefDrafts, saveSessionRefDrafts as persistSessionRefDrafts, setSessionRefDraft } from '../utils/chatSessionRefDrafts'
 import { addSessionRef, removeSessionRef, mergeSessionRefs, appendSessionRefLinks, type SessionRef } from '../utils/sessionRefs'
-import { findPinnedPromptIdx, findNextPromptIdx, computePinPush, nextPinnedPromptState, type PinnedPromptState, pinHandoffY, pinPushTravel, jumpAnchorIdx, DEFAULT_PINNED_CARD_H } from '../utils/pinnedPrompt'
+import { findPinnedPromptIdx, findNextPromptIdx, computePinPush, nextPinnedPromptState, type PinnedPromptState, pinHandoffY, pinPushTravel, pinHidesRow, jumpAnchorIdx, DEFAULT_PINNED_CARD_H } from '../utils/pinnedPrompt'
 import {
   adoptSourceSelections,
   commitRevealedSource,
@@ -246,13 +252,14 @@ import {
 import { deriveFollowUpOptions, parseOptions } from '../app-sdk/protocol'
 import { isNoteRow } from '../lib/noteContract'
 import OverlayDrawer from '../components/OverlayDrawer'
-import { loadChatConfig, CONTENT_WIDTH, type ChatConfig } from './chat/ChatSettings'
+import { loadChatConfig, saveChatConfig, CONTENT_WIDTH, type ChatConfig } from './chat/ChatSettings'
 import SessionFlyout, { TOGGLE_RECT } from './chat/SessionFlyout'
 import { focusComposer, focusComposerAfter, revealComposer } from './chat/composerFocus'
 import { useHoverIntent } from '../hooks/useHoverIntent'
 import { useKnowledgeFetch, extractKnowledgeQuery, expandKnowledgeBlock } from './chat/useKnowledgeFetch'
 import { KnowledgePicker } from './chat/KnowledgePicker'
-import { BookOpen, EyeOff, Loader, Pen, ChevronDown, ChevronRight, Plug, ArrowDown, MessageSquare, Sparkles, VenetianMask, Clock, Undo2, Columns2, ExternalLink, Paperclip, Folder, X } from 'lucide-react'
+import { BookOpen, EyeOff, Loader, Pen, ChevronDown, ChevronRight, Plug, MessageSquare, Sparkles, VenetianMask, Clock, Undo2, Columns2, ExternalLink, Paperclip, Folder, X } from 'lucide-react'
+import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { PanelLeftSolid, PanelLeftLight, PanelRightSolid } from '../components/icons/panels'
 
 import InfoTip from '../components/InfoTip'
@@ -285,7 +292,8 @@ import { ErrorCard } from './chat/ErrorCard'
 import WorkflowProgressBar from './chat/WorkflowProgressBar'
 import { tryQuickSend } from '../lib/quickSend'
 import { rewindWithRollback } from '../lib/rewindCall'
-import { isChatPageSurface } from '../utils/channelOrigin'
+import { isChatPageSurface, slotChannelLabel } from '../utils/channelOrigin'
+import { findSurfaceBySlotMode, surfaceLabel } from '../surfaces/registry'
 import { errMessage } from '../utils/thunkError'
 
 
@@ -356,6 +364,14 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
   )
   const sessionMessages = useAppSelector(s => s.chat.messages)
   const loadedTools = useMemo(() => deriveLoadedMcpTools(sessionMessages), [sessionMessages])
+  // What this slot's session actually reported about its MCP servers. Pushed by
+  // the gateway onto the same `slots` array the snapshot rehydrates, so it needs
+  // no query of its own — and unlike the ['mcp-servers'] query above it is keyed
+  // by SLOT, which is the whole point: that query answers a question about the
+  // agent's configuration and this answers one about this session.
+  const sessionReport = useAppSelector(
+    s => (activeSlot ? s.dashboard.slots?.find(sl => sl.key === activeSlot)?.mcp_report : null) ?? null,
+  )
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
@@ -386,6 +402,7 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
                   loaded={loadedTools}
                   toolSearchOn={toolSearchOn}
                   loading={servers.length === 0}
+                  sessionReport={sessionReport}
                 />
               </DropdownMenuSubContent>
             </DropdownMenuSub>,
@@ -461,6 +478,64 @@ export function virtualKeyFor(
     return turnLeadKey(first, msgKey)
   }
   return turnLeadKey(it, msgKey)
+}
+
+/** Virtualizer keys for the WHOLE display list, with a collision tie-break.
+ *
+ *  `virtualKeyFor` is not unique across the list: a `single` keys on
+ *  `msgKey` alone (`row-<ts>`), and a coarse OS clock can stamp two rows
+ *  appended in one tick with the same `ts` — the exact hazard `msgIdentityKey`
+ *  closes for group leads. Two rows sharing one key reach React as duplicate
+ *  siblings (one is silently dropped from the DOM — content visibly missing)
+ *  and share one HeightCache slot (each re-measure of either row reprices the
+ *  other, oscillating the spacers). Same failure from an overlapping older
+ *  page whose rows lack the `meta.mid` the prepend dedup keys on.
+ *
+ *  The tie-break is positional among COLLIDERS ONLY: the first occurrence
+ *  keeps the bare key — so the common case is byte-identical to
+ *  `virtualKeyFor` and every cached height, DOM node, and scroll anchor keyed
+ *  before this pass survives — and each later duplicate gets an occurrence
+ *  suffix. Deterministic for a given list order, so keys are stable across
+ *  re-renders. An insert BEFORE a collider shifts which physical row holds
+ *  the bare key: those rows remount (a `~#N` height or scroll anchor
+ *  persisted under the old occupant can also go stale until re-measured) —
+ *  bounded to rows that previously rendered broken (dropped sibling), and
+ *  strictly better than that render.
+ *
+ *  NOT folded into `virtualKeyFor`: uniqueness is a property of the list, not
+ *  of one row, and a per-row `~mid` suffix instead would rename every
+ *  streamed/optimistic row (which lacks `mid`) at the post-turn `refreshSlot`
+ *  rebuild (which carries it) — a mass remount per turn end. */
+/** Tie-break suffix for colliding virtualizer keys. Key plumbing only — the
+ *  string never renders as user-visible text. */
+const DUP_KEY_SUFFIX = '~#'
+
+export function uniqueRowKeys(
+  items: readonly DisplayItem[],
+  msgKey: (m: ChatMessage) => string,
+): string[] {
+  const seen = new Map<string, number>()
+  return items.map((it, i) => {
+    const base = virtualKeyFor(it, i, msgKey)
+    const n = seen.get(base)
+    if (n === undefined) {
+      seen.set(base, 1)
+      return base
+    }
+    // The suffixed candidate is re-checked against `seen` too: a NATURAL key
+    // can spell `<base>~#1` (msgKey passes through arbitrary meta), so
+    // emitting the suffix unchecked would reintroduce the duplicate this
+    // function exists to remove.
+    let count = n
+    let candidate = `${base}${DUP_KEY_SUFFIX}${count}`
+    while (seen.has(candidate)) {
+      count++
+      candidate = `${base}${DUP_KEY_SUFFIX}${count}`
+    }
+    seen.set(base, count + 1)
+    seen.set(candidate, 1)
+    return candidate
+  })
 }
 
 /** React key for a message row's INNER bubble (the virtualizer row key is
@@ -652,7 +727,12 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
       title={fullPath}
       aria-label={i18nT('pages.chatPage.open_folder', { path: fullPath })}
       onClick={e => {
-        if (e && 'shiftKey' in e && e.shiftKey) { api.revealPath(fullPath); return }
+        // Shift+click copies the path on a remote session. Route through the
+        // shared helper, not bare `api.revealPath`: the transport call is
+        // side-effect-free, so the helper is what writes the clipboard (and,
+        // locally, drives the file manager). A bare call would silently copy
+        // nothing and break the chip's hover promise.
+        if (e && 'shiftKey' in e && e.shiftKey) { void revealOrOpen(fullPath); return }
         onOpen(fullPath)
       }}
     >
@@ -845,6 +925,55 @@ const REFUSED_PRESS_TITLE_KEYS = {
 type RefusedPressAction = keyof typeof REFUSED_PRESS_TITLE_KEYS
 
 /**
+ * Sentence for the unresumable-resume notice, built from the raw facts the chat
+ * slice records (#5925).
+ *
+ * The slice stores `{ key, title, surface, reason }` rather than a finished
+ * string because a reducer cannot localize: the label for a session's origin is
+ * derived from its KEY, and that derivation lives at the render site. Keyed on
+ * the stored key alone, because the resume being narrated often came from
+ * another surface entirely (the command palette, a notification) whose row is
+ * nowhere in this page's lists.
+ *
+ * `reason: 'failed'` gets its own sentence: nothing was resumed, so there is no
+ * surface to name, and telling the user it "belongs to" somewhere would be a
+ * guess.
+ *
+ * For `reason: 'surface'` the label is resolved, never interpolated raw. The
+ * wire `surface` is a MACHINE value (`member`, `subagent`), so dropping it into
+ * localized copy renders lowercase machine vocabulary mid-sentence -- and its
+ * empty case reads "it's a Session session". So: the localized dashboard label
+ * for a dashboard key, the channel label for a channel key, the surface
+ * registry's own label when the mode is a registered surface, and otherwise a
+ * sentence that names no surface at all -- and does not say "surface" either,
+ * which is vocabulary a user meets only in settings prose.
+ *
+ * The registry lookup depends on `surfaces/builtins` having been imported (it
+ * registers by module side effect, from `App.tsx`), which always holds wherever
+ * this page renders. A miss degrades to the surface-free sentence rather than to
+ * a wrong label, so the coupling cannot produce a lie.
+ *
+ * The message keys moved to this namespace with the notice; #3640's string said
+ * "from the chat sidebar", which names a surface three of the four resume entry
+ * points never touch. The two label keys stay under `pages.chatSidebar.*`
+ * because the sidebar's own row still renders them.
+ */
+function unresumableNoticeMessage(r: { key: string; title: string; surface: string; reason: 'surface' | 'failed' }): string {
+  const title = r.title || r.key
+  if (r.reason === 'failed') {
+    return i18nT('pages.chatPage.could_not_open_this_session', { title })
+  }
+  const registered = findSurfaceBySlotMode(r.surface)
+  const surface = r.key.startsWith('dashboard')
+    ? i18nT('pages.chatSidebar.dashboard_source')
+    : slotChannelLabel(r.key) || (registered ? surfaceLabel(registered) : '')
+  if (!surface) {
+    return i18nT('pages.chatPage.this_session_is_not_a_chat_session', { title })
+  }
+  return i18nT('pages.chatPage.this_session_cannot_be_opened_in_chat', { title, surface })
+}
+
+/**
  * Where a jump-to-message came from, because the three entry points owe the
  * reader different copy when the target cannot be found.
  *
@@ -900,6 +1029,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Create-in-flight, so the flyout's New button can go inert exactly like the
   // sidebar's does instead of accepting a second click.
   const creatingSlot = useAppSelector(s => s.chat.creatingSlot)
+  // The one post-resolve answer for every resume entry point (#5925); rendered
+  // above the composer, which is the only place all of them can see.
+  const unresumableResume = useAppSelector(s => s.chat.unresumableResume)
   const activeSlot = useAppSelector(s => s.chat.activeSlot)
   // tool_call_ids in THIS slot that have a live MCP App render payload. Passed
   // to TurnBlock so app-bearing rows (which mount an interactive iframe) never
@@ -1267,11 +1399,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // short-circuits `slot.model or agent_model` and would override a template or
   // global pin the user did configure.
   const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
-  // Mid-turn steer is a POST write, so it goes through useMutation for
-  // consistent error/loading-state handling (fire-and-forget: no onSuccess).
+  // NOT fire-and-forget: the receipt is the only thing that knows whether the
+  // text reached the running turn, and the optimistic bubble asserts that it did.
   const steerMutation = useMutation({
-    mutationFn: ({ text, sendId }: { text: string; sendId?: string }) => api.steerChat(text, activeSlot!, sendId),
+    mutationFn: ({ text, sendId, slot }: { text: string; sendId?: string; slot: string }) => api.steerChat(text, slot, sendId),
+    // eslint-disable-next-line no-console -- no toast for a rejected steer, which is otherwise indistinguishable from one the agent ignored
     onError: (e) => { console.error('steer failed', e) },
+    onSuccess: (body, { sendId, slot }) => {
+      if (!sendId || !slot) return
+      const receipt = (body ?? {}) as { ok?: boolean; steered?: boolean; queued?: boolean }
+      // `steered` is the one shape the badge's claim is true for; an unreadable
+      // body confirms nothing, so it must not rewrite the bubble either.
+      if (receipt.steered || !receipt.ok) return
+      dispatch(resolveOptimisticSteer({ slot, sendId, outcome: receipt.queued ? 'queued' : 'turn' }))
+    },
   })
   const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
   const [reasoningEffortBtnRect, setReasoningEffortBtnRect] = useState<DOMRect | null>(null)
@@ -1328,7 +1469,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // (declared before `virt` in source order) to the virtualizer's API without
   // a temporal-dead-zone hazard — they are populated right after `virt` is
   // created and only read inside callbacks/effects that run post-render.
-  const isAtBottomRef = useRef(true)
+  // `vGetFollowRef` defaults to "following" so a gate that fires on the very
+  // first commit (before the mirror populates it) behaves like the fresh-slot
+  // bottom pin it accompanies.
+  const vGetFollowRef = useRef<() => boolean>(() => true)
   const vScrollToBottomRef = useRef<(behavior?: ScrollBehavior) => void>(() => {})
   const mountIndexRef = useRef<(index: number) => boolean>(() => false)
 
@@ -1591,7 +1735,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       const shouldAutoSend = embedded ? false : searchParams.get('autoSend') === '1'
       const wantNew = embedded ? false : searchParams.get('newSession') === '1'
       if (!embedded && (searchParams.get('prefill') || shouldAutoSend)) setSearchParams({}, { replace: true })
-      if (shouldAutoSend) { autoSendRef.current = pendingInput; newSessionRef.current = wantNew } else {
+      if (shouldAutoSend) {
+        autoSendRef.current = pendingInput
+        newSessionRef.current = wantNew
+        // Bump the tick, because arming the ref alone is not enough when ChatPage is
+        // ALREADY mounted. The send effect's deps are `[send, connected,
+        // autoSendTick]`: on a cold navigation, mounting and connecting move
+        // `connected` and it fires on its own, but a caller already on /chat only
+        // changes the search params. `send`'s identity does move with `activeSlot` --
+        // yet a seeder that awaits between activating its slot and setting the pending
+        // input (the command bar does, since the switch must land first) puts those in
+        // two different renders, and by the render that arms the ref none of the deps
+        // change. The prompt would then be neither sent nor visible: this branch is the
+        // one that does not fall back to the composer.
+        //
+        // Harmless on the cold path -- the effect runs, finds `connected` still false,
+        // and leaves the ref armed for the real connect. Same remedy the no-slot retry
+        // below already uses for the same reason.
+        setAutoSendTick(t => t + 1)
+      } else {
         if (activeSlot) { setDraft(drafts.current, activeSlot, pendingInput); saveDraftsDebounced() }
         setInput(pendingInput)
         setPrefillHint(true)
@@ -1723,7 +1885,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
   // Persist the composer text against the slot it BELONGS to (composerSlotRef),
   // not the live activeSlot (see the composerSlotRef note above).
-  useEffect(() => { inputRef.current = input; const s = composerSlotRef.current; if (s) { setDraft(drafts.current, s, input); saveDraftsDebounced() } }, [input, saveDraftsDebounced]) // eslint-disable-line react-hooks/exhaustive-deps -- draft key is composerSlotRef; slot-change effect handles the transition
+  // The draft key is composerSlotRef, which a ref does not need to be a
+  // dependency of; the slot-change effect below handles the transition.
+  useEffect(() => { inputRef.current = input; const s = composerSlotRef.current; if (s) { setDraft(drafts.current, s, input); saveDraftsDebounced() } }, [input, saveDraftsDebounced])
   // Per-slot draft: save current → restore target (persisted to localStorage)
   useEffect(() => {
     // Re-hydrate from localStorage — only pull in keys we don't already have
@@ -1856,7 +2020,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     // Draft key is composerSlotRef; the slot-change effect handles that
     // transition.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingFiles, saveDraftsDebounced])
   // Collapsed paste blocks backing the `[ Paste #N · M lines ]` tokens in
   // `input`. Persisted per-slot via chatPasteDrafts (localStorage, 30-day TTL)
@@ -1874,7 +2037,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       saveDraftsDebounced()
     }
     // draft key is composerSlotRef; slot-change effect handles that transition.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pasteBlocks, saveDraftsDebounced])
   // Session references staged by dragging a session from the list onto this
   // pane. Serialized as LINKS on send — never the referenced transcript.
@@ -1889,7 +2051,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       saveDraftsDebounced()
     }
     // draft key is composerSlotRef; slot-change effect handles that transition.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingSessions, saveDraftsDebounced])
   /** Stage a dropped session. Ignores duplicates and overflow (addSessionRef
    *  returns the same array, so this is a no-op re-render-free path). */
@@ -1962,7 +2123,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // the setting that turns it on instead of starting a recording that would
   // never be transcribed.
   const [voiceSetupOpen, setVoiceSetupOpen] = useState(false)
-  const [voiceDisabledReason, setVoiceDisabledReason] = useState<'disabled' | 'unavailable' | 'remote'>('disabled')
   const frozenInputRef = useRef<string | null>(null)
   // Caret snapshot taken alongside frozenInputRef, so a streaming partial (and
   // the final that replaces it) keeps inserting at the same spot. The batch
@@ -2329,17 +2489,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
    * itself.
    */
   const startVoice = useCallback((opts?: { silent?: boolean }): Promise<void> | void => {
-    // Remote instances (inside an iframe) cannot reliably capture audio from
-    // the parent machine's mic due to cross-origin delegation constraints.
-    if (isEmbeddedPane()) {
-      if (!opts?.silent) { setVoiceDisabledReason('remote'); setVoiceSetupOpen(true) }
-      return
-    }
     // Starting a recording while server-side STT is disabled would capture
     // audio that never gets transcribed. Point the user at the enable setting
     // instead — unless this came from the keyboard (see `silent`).
     if (!sttConfigLoaded || !sttEnabled || !sttAvailable) {
-      if (!opts?.silent) { setVoiceDisabledReason(sttEnabled && !sttAvailable ? 'unavailable' : 'disabled'); setVoiceSetupOpen(true) }
+      if (!opts?.silent) setVoiceSetupOpen(true)
       return
     }
     // Exclusive sessions: the mic is a single shared device, so refuse to
@@ -2939,6 +3093,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // identity on every search-state change (isOpen/term/matches), which would
     // churn this callback and the onFileOpen prop on every row. (tabsCtl still
     // churns on tab changes, but those are user actions, not per-chunk.)
+    // The lint rule still asks for the whole object because `close` is INVOKED, and
+    // a called member is attributed to its receiver — not because anything here
+    // reads `search` itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `search.close` is a useCallback([]) in useMessageSearch, so the listed member already pins everything this body calls; depending on the enclosing object instead would churn the onFileOpen prop on every transcript row each render
   }, [queryClient, tabsCtl, dispatch, search.close])
 
   /** Open a DIRECTORY as a panel tab.
@@ -2951,6 +3109,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     tabsCtl.openFolder(dirPath, activeSlotRef.current ?? null)
     dispatch(openActivityPanel())
     search.close()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- same as handleFileOpen above: `search.close` is a useCallback([]) and the enclosing `search` object is a fresh literal every render, so listing it would churn the onFolderOpen prop on every transcript row
   }, [tabsCtl, dispatch, search.close])
 
   // Open the Subagents panel from a completion card. A per-agent event
@@ -2961,6 +3120,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (parsed.kind === 'single') dispatch(selectSubagent(parsed.agentId))
     dispatch(openActivityToTab('subagents'))
   }, [dispatch])
+
+  // `filteredSlots`, not `slots`: a surface this page cannot render would chip to a
+  // destination the switch clears. Signature because heartbeats remint slot objects.
+  const sessionTitleSig = JSON.stringify(filteredSlots.map(s => [s.key, s.title || s.key]))
+  const sessionTitles = useMemo(
+    () => new Map(filteredSlots.map(s => [s.key, s.title || s.key] as const)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the value-equal pair signature, not the slot objects (see above)
+    [sessionTitleSig],
+  )
 
   // Open an artifact as a side-panel tab — the artifact twin of
   // handleFileOpen, and the single entry point every in-chat artifact
@@ -3042,7 +3210,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [tabsCtl, dispatch, search.close, handleFileOpen])
 
   const { data: forkCfg } = useQuery<{ tail_fork_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
-  const handleFork = useCallback(async (visibleIndex: number) => {
+  const handleFork = useCallback(async (visibleIndex: number, messageId?: string) => {
     if (!activeSlot) return
     try {
       // Fork WITHOUT a prompt: an unsent composer draft must never be
@@ -3058,7 +3226,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // the query has errored or settled with no data, not just while loading.
       const resolvedCfg = forkCfg ?? await api.dashboardConfig()
       const direction = resolvedCfg?.tail_fork_enabled ? 'tail' : 'head'
-      const result = await dispatch(forkSlot({ slot: activeSlot, atIndex: visibleIndex, direction })).unwrap()
+      const result = await dispatch(forkSlot({ slot: activeSlot, atIndex: visibleIndex, messageId, direction })).unwrap()
       if (result.ok) {
         await dispatch(switchSlot(result.key))
       } else {
@@ -3069,10 +3237,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
   }, [activeSlot, dispatch, forkCfg])
 
-  const handlePlanFromHere = useCallback(async (visibleIndex: number) => {
+  const handlePlanFromHere = useCallback(async (visibleIndex: number, messageId?: string) => {
     if (!activeSlot) return
     try {
-      const result = await dispatch(forkSlot({ slot: activeSlot, atIndex: visibleIndex, mode: 'orchestrator' })).unwrap()
+      const result = await dispatch(forkSlot({ slot: activeSlot, atIndex: visibleIndex, messageId, mode: 'orchestrator' })).unwrap()
       if (result.ok) {
         await dispatch(switchSlot(result.key))
         // Unified view: the forked orchestrator slot lives in the same sidebar.
@@ -3260,14 +3428,45 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const [surveyLayoutTick, setSurveyLayoutTick] = useState(0)
   const handleSurveyLayoutChange = useCallback(() => setSurveyLayoutTick((t) => t + 1), [])
   useEffect(() => {
-    if (!isAtBottomRef.current) return
+    // Gate on FOLLOW, not the 100px at-bottom band: a reader parked a little
+    // above the bottom has released follow, and re-anchoring for a tip/survey
+    // band would yank them (and replace the mounted window under them).
+    if (!vGetFollowRef.current()) return
     const raf = requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        if (isAtBottomRef.current) scrollBottom(true)
+        if (vGetFollowRef.current()) scrollBottom(true)
       })
     })
     return () => cancelAnimationFrame(raf)
   }, [activeTip, surveyLayoutTick, scrollBottom])
+
+  // Same compensation for the composer status stack (progress bars, sub-agent
+  // delivery line, queue stack). The virtualizer's own viewport branch DOES
+  // re-pin when the band shrinks the scroller's box — but a queued send is a
+  // message-array append too, and the regroup remounts tail rows while the
+  // band's spring animates the viewport, so that re-pin can land on interior
+  // heights that are still settling. Measured frame-by-frame on the pre-fix
+  // build: `scrollTop - clientHeight` math reports "at bottom" while the
+  // content sits a card-height (~21px) low, and whether it recovers depends
+  // on which re-render lands last — the defect reads as intermittent. This
+  // observer re-anchors AFTER every layout step of the band (ResizeObserver
+  // fires post-layout), so the final write always follows the last height
+  // change instead of racing it. Effect deps cannot do that: a one-shot
+  // re-anchor at mount time measures a half-grown band. Gated on FOLLOW for
+  // the same reason as the tip/survey effect above. A callback ref (not
+  // useRef + effect) so the observer re-attaches when the chat column
+  // unmounts and remounts.
+  const composerBandObserverRef = useRef<ResizeObserver | null>(null)
+  const composerBandRef = useCallback((el: HTMLDivElement | null) => {
+    composerBandObserverRef.current?.disconnect()
+    composerBandObserverRef.current = null
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => {
+      if (vGetFollowRef.current()) scrollBottom(true)
+    })
+    ro.observe(el)
+    composerBandObserverRef.current = ro
+  }, [scrollBottom])
 
   // Navigate to a (possibly off-window) display index: mount it first via the
   // virtualizer so the DOM-based scroll can find it, then scroll next frame.
@@ -3366,8 +3565,30 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const pinFoldRef = useRef<HTMLDivElement | null>(null)
   const pinCardRef = useRef<HTMLDivElement | null>(null)
   const pinEnabledRef = useRef(true)
+  // Read by updatePinnedPrompt, which keeps stable deps and so reaches config
+  // through refs rather than closing over it.
+  const pinMinimizedRef = useRef(false)
+  // Which control to focus after the next minimize/restore. Set only by the click
+  // handler, so a chip that mounts from SCROLLING never steals focus.
+  const pinFocusWantRef = useRef<'chip' | 'minimize' | null>(null)
   const [pinned, setPinned] = useState<PinnedPromptState | null>(null)
   const [pinExpanded, setPinExpanded] = useState(false)
+  /**
+   * Minimized-to-chip state, held in the shared chat config rather than local
+   * state so it survives a slot switch and a reload — the point of the control is
+   * that a narrow screen stays uncluttered without being re-told every session.
+   * `saveChatConfig` dispatches `mc-config-changed`, which this page's own listener
+   * and every other open pane already consume, so one write settles it everywhere.
+   */
+  const pinMinimized = chatConfig.pinPromptMinimized
+  const setPinMinimized = useCallback((next: boolean) => {
+    // The click unmounts the focused button, dropping focus to <body>. Name the
+    // successor; the effect below lands on it once the swap commits.
+    pinFocusWantRef.current = next ? 'chip' : 'minimize'
+    // Re-read, so a field another pane wrote since this render is not reverted by
+    // spreading a stale snapshot.
+    saveChatConfig({ ...loadChatConfig(), pinPromptMinimized: next })
+  }, [])
   // Collapsed card height — the hand-off line is derived from it, so it must be
   // known even while nothing is pinned (no card mounted to measure). Seeded with
   // the computed default and then reported by PinnedPrompt itself, which is the
@@ -3425,15 +3646,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // below has to be decidable even while nothing is mounted, or dropping the
     // banner would zero the height, zero the push, re-mount it, and oscillate at
     // frame rate.
-    const measured = pinCardRef.current?.getBoundingClientRect().height ?? 0
+    // Neither push nor drop describes a chip, whose band is a fraction of the
+    // height this math uses. A no-op while not minimized, so the card is unchanged.
+    const minimized = pinMinimizedRef.current
+    const measured = minimized ? 0 : (pinCardRef.current?.getBoundingClientRect().height ?? 0)
     const bannerH = measured > 0 ? measured : pinCollapsedHRef.current
-    const push = computePinPush(bannerH, foldY, nextTop)
+    const push = minimized ? 0 : computePinPush(bannerH, foldY, nextTop)
     // Fully pushed out: DROP the banner instead of rendering it clipped to
     // nothing. A tall incoming prompt holds this state for its whole length (it
     // takes the pin only once its own bottom clears the band), and a card clipped
     // to zero still shows a hairline of its bottom edge under sub-pixel rounding
     // and browser zoom — a bubble fragment parked over the prompt being read.
-    if (push >= pinPushTravel(bannerH)) { setPinned(null); return }
+    if (!minimized && push >= pinPushTravel(bannerH)) { setPinned(null); return }
     const full = pinItem.msg.content
     // A nudge's content is a machine-facing instruction payload behind an
     // `[auto-nudge cycle N]` tag, and a subagent completion's is a header block
@@ -3604,7 +3828,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       navScrollRafRef.current = requestAnimationFrame(tick)
     }
     navScrollRafRef.current = requestAnimationFrame(tick)
-  }, [navToDisplayIndex, scrollToDisplayIndex, pinnedJumpChrome, scrollerRef])
+  }, [navToDisplayIndex, pinnedJumpChrome, scrollerRef])
 
   // Sticky-bottom scroll state is owned by the virtualizer (`virt.isAtBottom`,
   // wired below). No local mirror — a single source of truth avoids
@@ -3747,6 +3971,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Back/Forward (new location.key) from a re-render where navigationType is
   // still stuck at 'POP'.
   const lastLocKeyRef = useRef<string | null>(null)
+  /**
+   * True while THIS page's own `navigate(-1)` — consuming the history entry the
+   * mobile sessions drawer pushed — is in flight.
+   *
+   * Declared next to the other pop refs because it is read by the same effect.
+   * That pop is not the user retracing sessions: the entry it lands on carries
+   * the `?sid=` from before the drawer opened, which is the OUTGOING session
+   * whenever the drawer was closed by picking a different one. Honoring it would
+   * switch the user straight back to the session they just left — the conflict
+   * that kept #5795 out of #5794. The URL is corrected by the `activeSlot → ?sid`
+   * effect below, which replaces (never pushes) on mobile, so the entry ends up
+   * naming the session actually on screen at the pre-drawer stack depth.
+   */
+  const drawerPopRef = useRef(false)
   const [sidError, setSidError] = useState('')
   const [newSlotFailed, setNewSlotFailed] = useState(false)
   const [highlightTs, setHighlightTs] = useState<string | null>(null)
@@ -3871,6 +4109,37 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // "the host drives ?sid" and would switch the panel onto whatever session the
     // host route happens to carry.
     if (noUrlSync) return
+    // Our own drawer-entry consumption, not a Back/Forward the user asked for.
+    // Correct the POP's stale outgoing `?sid=` HERE, in the effect that owns the
+    // POP, rather than relying on the separate activeSlot -> URL effect below.
+    // In a real mobile browser those two navigation effects can be committed in
+    // either order: a fast New Chat activates the newborn slot, closes the
+    // drawer, then this POP lands on the duplicate's predecessor naming the old
+    // slot. If the generic sync is still gated by a prior POP claim, the old URL
+    // wins and its reader switches Redux straight back, leaving an empty New
+    // Session row behind. MemoryRouter settles synchronously and hid that race.
+    //
+    // `activeSlotRef` is the render-current value even when the close originated
+    // from createSlot.fulfilled in this same commit. Replacing only this popped
+    // entry also preserves the one-entry drawer invariant: the duplicate is gone,
+    // and the surviving history entry names the session actually on screen.
+    if (drawerPopRef.current) {
+      drawerPopRef.current = false
+      lastLocKeyRef.current = location.key
+      popInFlightRef.current = false
+      const target = activeSlotRef.current
+      const urlSlot = searchParams.get('sid') || searchParams.get('slot')
+      if (target && target !== urlSlot) {
+        const next = new URLSearchParams(searchParams)
+        next.set('sid', target)
+        next.delete('slot')
+        navigate(
+          { pathname: location.pathname, search: `?${next}`, hash: location.hash },
+          { replace: true },
+        )
+      }
+      return
+    }
     // Embed: host app drives the URL — react to any ?sid change.
     // Main dashboard: honor only a genuine Back/Forward POP. react-router reports
     // the initial render as 'POP' and stays 'POP' until our own switch navigates
@@ -3896,7 +4165,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       popInFlightRef.current = true
       dispatch(switchSlot(urlSid))
     }
-  }, [searchParams, filteredSlots, activeSlot, dispatch, embedMode, navigationType, location.key, connected, noUrlSync])
+  }, [searchParams, filteredSlots, activeSlot, dispatch, embedMode, navigationType, location.key, location.pathname, location.hash, connected, noUrlSync, navigate])
   // Timeout: if slot never appears after 5s, show error.
   // Gated on `connected` so the timer only runs while the gateway is reachable
   // — otherwise an offline tab would burn its 5s while the resolve effects
@@ -3988,8 +4257,16 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // reasoning has somewhere to live and a test can pin it.
     const isSessionSwitch = !!current && current !== activeSlot
     navigate(`${basePath}${slug ? '/' + slug : ''}?${next}`, { replace: shouldReplaceSessionUrl({ isSessionSwitch, isMobile }) })
+    // `location.key` and not just `location.pathname`: consuming the mobile
+    // drawer's history entry lands on a DIFFERENT entry whose pathname is
+    // IDENTICAL (the entry was a duplicate), so pathname alone reports no change
+    // and this effect would not re-run — leaving `?sid=` naming the session the
+    // user just switched AWAY from, which a reload would then restore. The key
+    // changes on any history move, which is the thing that actually happened.
+    // POPs are still funnelled through the `popInFlightRef` bail above, so this
+    // adds a re-check, not a new writer.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSlot, filteredSlots, navigate, basePath, location.pathname, embedded, noUrlSync, isMobile])
+  }, [activeSlot, filteredSlots, navigate, basePath, location.pathname, location.key, embedded, noUrlSync, isMobile])
   // Re-fetch slot messages on mount (handles nav away + back).
   // Skip when newSession=1 — createSlot in send() will set the active slot;
   // dispatching switchSlot here would race and overwrite it.
@@ -4030,16 +4307,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
   }, [activeSlot, filteredSlots, searchParams, dispatch, slotStorageKey, connected, slotsLoaded, defaultAgent, mode, newSlotFailed])
 
-  // Slot switch: the virtualizer (keyed on sessionId = activeSlot) force-pins
-  // to the true bottom itself in a layout effect. Here we just re-arm the
-  // local at-bottom ref used by the gating effects below.
-  const prevSlotRef = useRef<string | null>(null)
-  useEffect(() => {
-    if (activeSlot !== prevSlotRef.current) {
-      prevSlotRef.current = activeSlot
-      isAtBottomRef.current = true
-    }
-  }, [activeSlot])
+  // Slot switch: the virtualizer (keyed on sessionId = activeSlot) owns entry
+  // placement — it force-pins to the bottom (arming follow) or restores a
+  // saved reading position (leaving follow released). The gating effects below
+  // read that live state via vGetFollowRef, so nothing here needs re-arming;
+  // forcing "at bottom" on switch used to yank a restored mid-history reader
+  // the moment a tip band or a running-state tick fired.
 
   // Auto-scroll during streaming — only when pinned to bottom
   const lastMsg = messages[messages.length - 1]
@@ -4089,7 +4362,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Scroll to show Footer when agent starts running (loading indicator appears)
   const prevRunningRef = useRef(false)
   useEffect(() => {
-    if (slotRunning && !prevRunningRef.current && isAtBottomRef.current) {
+    if (slotRunning && !prevRunningRef.current && vGetFollowRef.current()) {
       setTimeout(() => scrollBottom(), SCROLL_AFTER_RENDER_MS)
     }
     prevRunningRef.current = slotRunning
@@ -4106,7 +4379,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
 
   const handleResumeSession = useCallback(async (key: string, title: string) => {
     try {
-      await dispatch(resumeFromHistory({ key, title })).unwrap()
+      const result = await dispatch(resumeFromHistory({ key, title })).unwrap()
+      // The cleanup below is the SECOND half of a swap: it retires the tab the
+      // resumed session is replacing. A resume that answered with a surface
+      // this page cannot display never performs the first half -- the reducer
+      // short-circuits, so `activeSlot` still names the tab the user is in and
+      // the history row is still in the list. Running the cleanup anyway
+      // deleted that tab and discarded the text just typed into it, while the
+      // session the user asked for never opened (#5925). `ok` alone cannot
+      // tell the two apart: the wire request succeeds either way, which is why
+      // the thunk returns `surface` at all (#3624).
+      if (!result.ok || !isChatPageSurface(result.surface)) return
       if (activeSlot && activeSlot !== key) {
         delete drafts.current[activeSlot]; delete fileDrafts.current[activeSlot]; delete pasteDrafts.current[activeSlot]; prevSlot.current = null; saveDrafts()
         dispatch(deleteSlot(activeSlot)).unwrap().catch(() => {})
@@ -4480,7 +4763,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     window.dispatchEvent(new Event('voice-stop'))
     sendingRef.current = false
-    isAtBottomRef.current = true
     setTimeout(() => scrollBottom(), SCROLL_AFTER_RENDER_MS)
     if (slot) dispatch(startLocalTurn(slot))
     const controller = new AbortController()
@@ -4678,7 +4960,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [tabsCtl.activeTab, activeSlot, dispatch, send])
 
   // Auto-send when navigated with ?autoSend=1 or ?token= with prompt
-  useEffect(() => { if (connected && autoSendRef.current) { const txt = autoSendRef.current; autoSendRef.current = null; send(txt) } }, [send, connected, autoSendTick])  
+  useEffect(() => { if (connected && autoSendRef.current) { const txt = autoSendRef.current; autoSendRef.current = null; send(txt) } }, [send, connected, autoSendTick])
 
   // Widget interactivity: when a mcwidget iframe fires an action, PRE-FILL the
  // composer instead of auto-submitting. Auto-submitting would be a
@@ -4738,10 +5020,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // notice rather than by holding the dropdown open.
       dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error)))
     }
-    // queryClient and the setPending* setters are all stable (react-query
-    // client / useState setters / useCallback([])), so listing them satisfies
-    // the linter without re-creating this callback.
-  }, [activeSlot, dispatch, installedAgents, provider, queryClient, setPendingAgent, setPendingModel])
+    // The setPending* setters are useState setters, so they are stable and cost
+    // nothing to list. `installedAgents`, `provider` and `queryClient` are
+    // deliberately absent: this body reads none of them, and `installedAgents` is
+    // a fresh array on every agents refetch, so naming it would rebuild the
+    // callback — and every picker holding it — for no behavioral gain.
+  }, [activeSlot, dispatch, setPendingAgent, setPendingModel])
   const switchModel = useCallback(async (modelName: string) => {
     // 'auto' is stored VERBATIM, not collapsed to ''. Both resolve to the same
     // provider behaviour server-side, but '' is also the "never chosen" state,
@@ -4814,12 +5098,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
    *  PER CHATPAGE MOUNT: `openedAppTabsRef` is not persisted, so navigating away
    *  and back re-arms it. Closing the find pane is part of the action: `isSidePanelHidden`
    *  keeps the panel hidden while search owns the dock, so without this the click
-   *  would open a tab the user cannot see and look broken. */
+   *  would open a tab the user cannot see and look broken.
+   *
+   *  `close()` runs unconditionally, exactly as handleFileOpen / handleArtifactOpen /
+   *  handleOpenDiff do. Guarding it on `search.isOpen` would pull that value into the
+   *  closure, and `renderMessage` below holds this callback across renders where the
+   *  find pane opens — so a captured `isOpen === false` would skip the close entirely
+   *  and open the tab behind the hidden dock. `close()` is already safe with nothing
+   *  open: it only hands focus back `if (wasOpen)`. */
   const revealAppInPanel = useCallback((toolCallId: string) => {
-    if (search.isOpen) search.close()
+    search.close()
     dispatch(openActivityPanel())
     tabsCtlRef.current?.openApp(toolCallId, i18nT('pages.chatPage.mcp_app_tab_title'), activeSlot ?? null)
-  }, [dispatch, activeSlot, search])
+    // As at handleFileOpen: the rule asks for the whole `search` object only because
+    // `close` is INVOKED and a called member is attributed to its receiver, not
+    // because this body reads `search` itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `search.close` is a useCallback([]) in useMessageSearch, so the listed member already pins everything this body calls; naming the enclosing object would make this a new function every render and churn renderMessage below
+  }, [dispatch, activeSlot, search.close])
   const currentProjectRef = useRef<string | undefined>(undefined)
   currentProjectRef.current = currentSlot?.project || undefined
 
@@ -5242,6 +5537,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // `mode` prop is always '' — the slot's own mode is the source of truth for
   // header identity (Autopilot icon + tooltip).
   const effectiveMode = currentSlot?.mode || mode
+  // One spelling for every plan-chip gesture (single-click, double-click,
+  // Send-now). `sourceKeyAtClick` is the row the gesture started on.
+  const dispatchPlanFollowUp = (action: string, sourceKeyAtClick?: string | null): boolean => {
+    if (!(followUpIsPlan && isPlanAction(action) && effectiveMode === 'orchestrator' && activeSlot)) {
+      return false
+    }
+    planActionMutationRef.current.mutate({
+      slot: activeSlot,
+      action,
+      clickedSourceKey: sourceKeyAtClick,
+    })
+    return true
+  }
   const title = currentSlot?.title && currentSlot.title !== currentSlot.key ? currentSlot.title : activeSlot || ''
   const displayMode = approvalMode === 'yolo' ? 'yolo' : currentSlot?.trust ? 'trust' : currentSlot?.trust_reads ? 'trust_reads' : 'normal'
   // Resolve model for existing slots that don't have one stored
@@ -5286,15 +5594,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // The model to DISPLAY for this slot. A slot can stay pinned to a model the
   // account can no longer run (a plan downgrade leaves the pin behind): the
   // backend withholds it at spawn and runs the session on its own default, so
-  // showing the pin would name a model no turn will use. The degraded flag is
-  // the authority on whether the list can be trusted — a cached list served
-  // while /api/models fails is stale, not authoritative — and is subscribed to
-  // rather than read, because it can flip without the list changing.
+  // showing the pin would name a model no turn will use. The slot carries the
+  // backend's verdict for exactly that (`model_withheld`), and it is pinned
+  // server-side to the model it was computed for, so it always describes the
+  // first operand below whenever that operand is the slot's own pin. The
+  // degraded flag gates the list-membership fallback used when there is no
+  // verdict — a cached list served while /api/models fails is stale, not
+  // authoritative — and is subscribed to rather than read, because it can flip
+  // without the list changing.
   const _modelsDegraded = useModelsDegraded(provider.id)
   const shownModel = displayModel(
     currentSlot?.model || resolvedModel || '',
     availableModels,
     _modelsDegraded,
+    currentSlot?.model_withheld,
   )
   // True when the pin row would be a no-op: the agent already stores exactly
   // the model the composer is showing. 'auto' is the inherit spelling, never a
@@ -5341,6 +5654,38 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const projectBranch = projectGitError
     ? ''
     : projectGit?.branch || (projectGit?.detached ? projectGit.head || '' : '')
+  // Working-tree summary for the composer footer badge. Shares the Git panel's
+  // ['git-status', dir] key so panel and footer dedupe into one fetch — while
+  // the panel is open its 5s interval drives the shared cache and this observer
+  // just reads it. Gated on repo=true so a non-repo project never runs a git
+  // subprocess on an interval; the cheap HEAD-file probe above answers that.
+  const { data: projectGitStatus, isError: projectGitStatusError } = useQuery({
+    queryKey: ['git-status', _slotProject],
+    queryFn: () => api.projectGitStatus(_slotProject),
+    enabled: !!_slotProject && !projectGitError && !!projectGit?.repo,
+    staleTime: 15_000,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
+    retry: false,
+  })
+  const gitBadge = !projectGitStatusError && projectGitStatus?.repo
+    ? {
+        dirty: projectGitStatus.files.length,
+        ahead: projectGitStatus.ahead ?? 0,
+        behind: projectGitStatus.behind ?? 0,
+      }
+    : undefined
+  // The badge asserts "clean" by ABSENCE, so a stale reading right after the
+  // agent finishes editing files is misleading at exactly the decision moment
+  // the badge exists for. Invalidate the shared key on the running→idle
+  // transition; the 60s interval covers everything else.
+  const prevGitRunningRef = useRef(false)
+  useEffect(() => {
+    if (prevGitRunningRef.current && !slotRunning && _slotProject) {
+      queryClient.invalidateQueries({ queryKey: ['git-status', _slotProject] })
+    }
+    prevGitRunningRef.current = slotRunning
+  }, [slotRunning, _slotProject, queryClient])
 
   // Auto-open the Git panel when the slot has a project dir that is a git repo.
   // OPT-IN (dashboard.auto_open_git_panel, default off) because the marker below
@@ -5438,7 +5783,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const [titleDraft, setTitleDraft] = useState('')
   const lastTextIdx = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'assistant') return i
+      // Agree with renderMessage's skip: a hidden invisible-only row draws
+      // nothing, so anchoring Regenerate/variant-switching on it would make
+      // those affordances unreachable for the rest of a quiet monitor run.
+      if (messages[i].role === 'assistant' && !isHiddenInvisibleAssistantRow(messages[i])) return i
     }
     return -1
   }, [messages])
@@ -5476,7 +5824,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   useEffect(() => { if (slotRunning) setRefusedPress(null) }, [slotRunning])
   const handleRegenerate = useCallback(() => {
     if (!activeSlot || regenerating || slotRunning) return
-    const uIdx = messages.slice(0, lastTextIdx).map(mm => mm.role).lastIndexOf('user')
+    // Mirror the server's scan exactly (chat_regenerate.py): the turn being
+    // regenerated ends at the last assistant row BY ROLE — hidden
+    // invisible-only rows included — so this optimistic truncation cannot
+    // diverge from the history rewrite the server persists. The skip-aware
+    // lastTextIdx only decides which drawn row HOSTS the affordance; using it
+    // here would truncate after an earlier user row than the server does.
+    const aiIdx = messages.map(mm => mm.role).lastIndexOf('assistant')
+    if (aiIdx < 0) return
+    const uIdx = messages.slice(0, aiIdx).map(mm => mm.role).lastIndexOf('user')
     if (uIdx < 0) return
     const snapshot = [...messages]
     dispatch(truncateAfterIndex(uIdx + 1))
@@ -5486,7 +5842,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       dispatch(replaceMessages(snapshot))
       setRegenerating(false)
     })
-  }, [activeSlot, regenerating, slotRunning, messages, lastTextIdx, dispatch, showRefusedPress])
+  }, [activeSlot, regenerating, slotRunning, messages, dispatch, showRefusedPress])
 
   // ---- Continue the thread ---------------------------------------------------
   // A turn can end without the assistant handing the floor back: the connection
@@ -5767,6 +6123,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // side effect, not render-body mutation, so React's rules of render hold.
   useLayoutEffect(() => { displayItemsRef.current = displayItems }, [displayItems])
 
+  // Opt-in #7045 diagnostic: log store-vs-render counts whenever the number of
+  // mounted transcript rows drops (see useBubbleVanishProbe). Off (and free)
+  // unless the localStorage flag is set.
+  const messagesLenRef = useRef(0)
+  useLayoutEffect(() => { messagesLenRef.current = messages.length }, [messages])
+  const bubbleProbeCounts = useCallback(
+    () => ({ store: messagesLenRef.current, display: displayItemsRef.current.length }),
+    [],
+  )
+  useBubbleVanishProbe(scrollerRef, bubbleProbeCounts, activeSlot)
+
   // Pinned prompt: keep the enablement ref in sync (updatePinnedPrompt is declared
   // above chatConfig and reads it through a ref), and recompute after the list
   // changes — a new turn shifts geometry with no scroll event of its own.
@@ -5774,6 +6141,26 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     pinEnabledRef.current = chatConfig.pinLastPrompt
     if (!chatConfig.pinLastPrompt) setPinned(null)
   }, [chatConfig.pinLastPrompt])
+  // Recompute on the flip too: the band's height changes with it, so the push and
+  // drop verdicts computed against the old one are stale the moment it toggles.
+  useEffect(() => {
+    pinMinimizedRef.current = chatConfig.pinPromptMinimized
+    // Keyed on the SHARED state, not the toggle that wrote it: the toggle runs only
+    // in the clicked pane, so a second pane came back expanded on restore.
+    if (chatConfig.pinPromptMinimized) setPinExpanded(false)
+    updatePinnedPrompt()
+  }, [chatConfig.pinPromptMinimized, updatePinnedPrompt])
+  // Runs after commit so the successor exists; the ref gate means only a user
+  // toggle focuses, never a scroll-driven mount.
+  useEffect(() => {
+    const want = pinFocusWantRef.current
+    if (!want) return
+    pinFocusWantRef.current = null
+    const sel = want === 'chip'
+      ? '[data-testid="pinned-prompt-pill"]'
+      : '[data-testid="pinned-prompt-minimize"]'
+    ;(document.querySelector(sel) as HTMLElement | null)?.focus()
+  }, [chatConfig.pinPromptMinimized])
   useEffect(() => { updatePinnedPrompt() }, [displayItems, updatePinnedPrompt])
   // Expanded state PERSISTS as the pinned prompt is replaced by the next one
   // while scrolling — the user asked for a sticky "keep it open" behaviour, so we
@@ -5812,9 +6199,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (!id) { id = `mid-${msgIdSeq.current++}`; msgIds.current.set(m, id) }
     return id
   }, [])
+  const rowKeys = useMemo(
+    () => uniqueRowKeys(displayItems, stableMsgKey),
+    [displayItems, stableMsgKey],
+  )
+  // Index lookup into the deduped list, so this getKey prices an item
+  // correctly ONLY against the displayItems of its own render. Live consumers
+  // pair getKeyRef with itemsRef from the same tick; the one stale-ITEMS
+  // consumer — the prepend anchor capture — snapshots getKey ALONGSIDE the
+  // previous items (see prependPrevRef in useVirtualChat). The window-shift /
+  // tail-append captures read previous-commit DOM indices through the current
+  // render, which stays correct in the shapes they fire on (indices before
+  // the change point keep both item and bare key). The fallback covers only
+  // an out-of-range probe.
   const virtualKey = useCallback(
-    (it: DisplayItem, i: number) => virtualKeyFor(it, i, stableMsgKey),
-    [stableMsgKey],
+    (it: DisplayItem, i: number) => rowKeys[i] ?? virtualKeyFor(it, i, stableMsgKey),
+    [rowKeys, stableMsgKey],
   )
 
   // (Sticky widget detection removed — widgets now unmount with the
@@ -5892,10 +6292,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Mirror the virtualizer's follow API into the refs the early effects/handlers
   // (declared above) read. Done in a layout effect rather than the render body
   // so a concurrent render React throws away can't write stale callbacks into
-  // the refs. Layout effects run before passive effects, so the gating effect
-  // that reads isAtBottomRef.current still sees this commit's value.
+  // the refs. Layout effects run before passive effects, so the gating effects
+  // that call vGetFollowRef.current() still see this commit's callback.
   useLayoutEffect(() => {
-    isAtBottomRef.current = isAtBottom
+    vGetFollowRef.current = virt.getFollow
     vScrollToBottomRef.current = virt.scrollToBottom
     mountIndexRef.current = virt.mountIndex
   })
@@ -6033,7 +6433,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // whichever path the server took (#6075).
     const steerSendId = mintSendId()
     dispatch(appendMessage({ role: 'user', content: llmTxt, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, sendId: steerSendId } }))
-    steerMutation.mutate({ text: llmTxt, sendId: steerSendId })
+    steerMutation.mutate({ text: llmTxt, sendId: steerSendId, slot: activeSlot })
     // Staged session references are deliberately NOT part of steering: neither
     // carried into the payload nor cleared. `steerMutation`'s onError only logs,
     // so anything cleared here is gone for good — text, attachments and pastes
@@ -6046,54 +6446,33 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     saveDrafts()
   }, [activeSlot, slotRunning, send, steerMutation, saveDrafts, dispatch])
 
-  const handleCancelQueued = useCallback((queueId: string) => {
-    if (!activeSlot) return
-    const msg = messagesRef.current.find(m => m.role === 'queued' && (m.meta?.queueId as string) === queueId)
-    if (msg?.content) setInput(msg.content)
-    // Optimistically remove the card; WS event is a no-op if already gone
-    dispatch(cancelQueuedMessage({ slot: activeSlot, queue_id: queueId }))
-    api.cancelQueuedMessage(activeSlot, queueId).catch(() => {})
-  }, [activeSlot, dispatch])
-
-  const handleInterruptQueued = useCallback((queueId: string) => {
-    if (!activeSlot) return
-    api.interruptSlot(activeSlot, queueId).catch(() => {})
-  }, [activeSlot])
-
-  const handleEditQueued = useCallback((queueId: string, content: string) => {
-    if (!activeSlot) return
-    const trimmed = content.trim()
-    if (!trimmed) return
-    // Optimistically update the card; WS event reconciles other clients
-    dispatch(editQueuedMessage({ slot: activeSlot, queue_id: queueId, content: trimmed }))
-    api.editQueuedMessage(activeSlot, queueId, trimmed).catch(() => {})
-  }, [activeSlot, dispatch])
-
-  const handleReorderQueued = useCallback((queueId: string, direction: 'next' | 'later') => {
-    if (!activeSlot) return
-    const slot = activeSlot
-    // Build the order from ALL queued messages (allQueuedMessages includes
-    // hidden system deliveries and recovery continuations), not just the
-    // interactive cards: submitting only visible ids would let the backend
-    // append the omitted ones at the tail, silently demoting automation. The
-    // swap is between adjacent VISIBLE cards, expressed inside the full order.
-    const fullIds = allQueuedMessages.map(m => m.meta?.queueId as string).filter(Boolean)
-    const visibleIds = queuedMessages.map(m => m.meta?.queueId as string).filter(Boolean)
-    const vFrom = visibleIds.indexOf(queueId)
-    const vTo = direction === 'next' ? vFrom - 1 : vFrom + 1
-    if (vFrom < 0 || vTo < 0 || vTo >= visibleIds.length) return
-    const a = fullIds.indexOf(visibleIds[vFrom])
-    const b = fullIds.indexOf(visibleIds[vTo])
-    if (a < 0 || b < 0) return
-    const next = [...fullIds]
-    ;[next[a], next[b]] = [next[b], next[a]]
-    // No optimistic dispatch: the server commits and broadcasts queue_reorder
-    // to every client including this one, and that WS event is the
-    // authoritative store update. A local dispatch with rollback-on-failure
-    // could restore a stale order when the server committed but the HTTP
-    // response was lost, leaving this client in conflict with execution order.
-    api.reorderQueuedMessages(slot, next).catch(() => undefined)
-  }, [activeSlot, allQueuedMessages, queuedMessages])
+  // The queue-card recipe is shared with every other host that draws a
+  // QueueStack over this slot queue (#5891) — see useQueuedMessageActions for
+  // why cancel/edit stay optimistic and what is deliberately left to item 1.
+  //
+  // Restore MERGES, via the same helper every other recovery site in this file
+  // uses (a failed create, a failed send). Assigning was this surface's older
+  // spelling and it destroyed text: cancelling two cards in a row overwrote the
+  // first card's restored draft with the second's, and by then the first card had
+  // already been optimistically retired, so that text existed nowhere else.
+  // Whatever lands here is persisted into this slot's draft by the `[input]`
+  // effect above, so a recovered draft survives a slot switch.
+  const restoreQueuedDraft = useCallback(
+    (text: string) => setInput(prev => mergeRecoveredDraft(prev, text)),
+    [],
+  )
+  const {
+    onCancel: handleCancelQueued,
+    onInterrupt: handleInterruptQueued,
+    onEdit: handleEditQueued,
+    onReorder: handleReorderQueued,
+    pendingIds: queuePendingIds,
+  } = useQueuedMessageActions({
+    slot: activeSlot,
+    allQueued: allQueuedMessages,
+    visibleQueued: queuedMessages,
+    restoreDraft: restoreQueuedDraft,
+  })
 
 
   // Search: map message index → displayItems index for scroll-to-match
@@ -6256,7 +6635,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // The tab is still created above -- it is revealed quietly instead.
       if (!search.isOpen && !isMobile) dispatch(openActivityPanel())
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- search re-identifies on every keystroke; only its isOpen flag is read
   }, [activeSlot, chatPins.length, dispatch, isMobile, isPinned, pinMessage, search.isOpen, unpinMessage])
   const handleUnpinById = useCallback((id: string) => {
     void unpinById(id).catch(() => {})
@@ -6516,18 +6894,26 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     // An injected workflow completion event renders as a compact status card
     // (with the full result folded away) instead of a wall of raw JSON.
-    if (isWorkflowCompletionMessage(m)) return <WorkflowCompletionCard key={key} message={m} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} disclosureKey={key} />
+    if (isWorkflowCompletionMessage(m)) return <WorkflowCompletionCard key={key} message={m} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} disclosureKey={key} />
     // An injected sub-agent completion event is machine-facing prompt text (the
     // spawn-discipline instructions are addressed to the model). It renders as a
     // compact outcome row with the payload folded away, not as a chat bubble.
-    if (isSubagentCompletionMessage(m)) return <SubagentCompletionCard key={key} message={m} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} disclosureKey={key} onOpenPanel={handleSubagentPanelOpen} />
+    if (isSubagentCompletionMessage(m)) return <SubagentCompletionCard key={key} message={m} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} disclosureKey={key} onOpenPanel={handleSubagentPanelOpen} />
+    // A quiet monitor-loop cycle replies with a bare zero-width space
+    // (U+200B): the content is truthy but renders as nothing, so the row
+    // would draw as an empty bubble — one per quiet cycle, historical
+    // transcripts included. Skip it; rows carrying file-change chips still
+    // render (the chips are the content). Same skip as the app-sdk registry.
+    if (isHiddenInvisibleAssistantRow(m)) return null
     const isUser = m.role === 'user'
     const isStreaming = m.role === 'streaming'
     const isInject = m.role === 'inject'
     // Pass a stable handleFork (useCallback) + primitive index so memo()
     // on AssistantMessage can short-circuit when only unrelated state changes.
     // visibleIndexMap is O(1) per row.
-    const canFork = canForkAtWindow({ isStreaming, isInject, slotHasMore, cursorIsForActiveSlot })
+    const messageId = typeof m.meta?.mid === 'string' && m.meta.mid ? m.meta.mid : undefined
+    const canResolveOnServer = !!messageId && !isStreaming && !isInject
+    const canFork = canResolveOnServer || canForkAtWindow({ isStreaming, isInject, slotHasMore, cursorIsForActiveSlot })
     const forkIndex = canFork ? visibleIndexMapRef.current.get(i) : undefined
     const msgTime = fmtMessageTime(m.ts)
     const msgTimeFull = fmtMessageTimeFull(m.ts)
@@ -6564,7 +6950,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               const cleanContent = isNoteRow(m) ? parseOptions(stripped).text : stripped
               return <>
                 {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock className="lucide-inline" /> {cronLabel}</span>}
-                <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} /></MessageErrorBoundary></div>
+                {/* Same session wiring as the assistant branch. Without it `resolveSessionChip`
+                    refuses at its first guard and a `/chat?sid=` link gains `target="_blank"`. */}
+                <div className="msg-content px-4 py-3 text-sm leading-6 whitespace-pre-wrap rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} /></MessageErrorBoundary></div>
                 {/* No `font-mono`: a formatted date is prose, and Tailwind's
                     `font-mono` pins `var(--mono)` — a token the Font Family
                     setting never writes, so it overrode the user's choice and
@@ -6577,19 +6965,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             })()
           ) : (
             <div className="flex flex-col gap-0">
-              <AssistantMessage suppressSteerAck={turnHadPolicyBlock(messagesRef.current, i)} linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdxRef.current} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onQuote={handleQuote} onAsk={handleAsk} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? () => handleTogglePinForMessage((m.meta as Record<string, unknown>).mid as string, m.ts!, 'assistant', m.content) : undefined} showFooter={(() => {
+              <AssistantMessage suppressSteerAck={turnHadPolicyBlock(messagesRef.current, i)} prevUserText={prevUserTextFor(messagesRef.current, i)} linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdxRef.current} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} onQuote={handleQuote} onAsk={handleAsk} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? () => handleTogglePinForMessage((m.meta as Record<string, unknown>).mid as string, m.ts!, 'assistant', m.content) : undefined} showFooter={(() => {
                 // Show footer on the last assistant message of each completed turn
                 if (isStreaming) return false
                 // Find next message after this one that's assistant, user, or streaming
                 for (let j = i + 1; j < messagesRef.current.length; j++) {
-                  if (messagesRef.current[j].role === 'user') return true // end of turn — show footer
-                  if (messagesRef.current[j].role === 'assistant' || messagesRef.current[j].role === 'streaming') return false // not last assistant in turn
+                  const later = messagesRef.current[j]
+                  if (later.role === 'user') return true // end of turn — show footer
+                  // A hidden invisible-only row draws nothing, so it cannot
+                  // host the footer; pass over it to the row that renders.
+                  if (isHiddenInvisibleAssistantRow(later)) continue
+                  if (later.role === 'assistant' || later.role === 'streaming') return false // not last assistant in turn
                 }
                 // End of messages — show footer only if agent is done
                 return !slotRunning
               })()} onSpeak={handleSpeak} onRegenerate={i === lastTextIdxRef.current && !slotRunning && !regenerating && activeSlot ? handleRegenerate : undefined} variants={m.variants} variantIdx={m.variant_idx} onSwitchVariant={i === lastTextIdxRef.current && m.variants && m.variants.length > 1 && activeSlot ? (idx: number) => { api.switchVariant(activeSlot, idx).catch((e: unknown) => {
                 showRefusedPress('switch_variant', e)
-              }) } : undefined} onFork={handleFork} onPlanFromHere={handlePlanFromHere} forkIndex={forkIndex} onLoadEarlier={cursorIsForActiveSlot ? handleLoadEarlier : undefined} loadingOlder={loadingOlder} earlierRemaining={slotOldestIndex} onApplyPlan={handleApplyPlan} />
+              }) } : undefined} onFork={embedded && !popout ? undefined : handleFork} onPlanFromHere={embedded && !popout ? undefined : handlePlanFromHere} forkIndex={forkIndex} forkMessageId={canResolveOnServer ? messageId : undefined} onLoadEarlier={cursorIsForActiveSlot ? handleLoadEarlier : undefined} loadingOlder={loadingOlder} earlierRemaining={slotOldestIndex} onApplyPlan={handleApplyPlan} />
             </div>
           )}
         </div>
@@ -6603,7 +6995,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // through renderUserContentCb), so they are omitted to keep it stable.
     // cursorIsForActiveSlot/slotOldestIndex/handleLoadEarlier belong here: a switch
     // back restores the cursor while changing no other dep, stranding Fork shut.
-  }, [slotRunning, handleFileOpen, handleArtifactOpen, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, dispatch, handleOpenDiff, handlePlanFromHere, navigate, planTaskId, artifactPaths, autoNudgeLoop, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress, transcriptHot])
+    // continuable/interrupted/continuing/lastErrorIdx gate the error card's Continue
+    // control, so they belong here for the same reason: they are booleans and an int
+    // (all false/-1 for the whole of a healthy stream, so no per-chunk churn), and
+    // holding a stale copy is what leaves a superseded failure card offering a
+    // Continue — the exact pair of bugs selectContinuable's doc comment describes.
+    // handleContinue/handleFolderOpen/handleSpeak/handleApplyPlan cost nothing: each
+    // one's own dep array is already covered here (handleFolderOpen's is a subset of
+    // handleFileOpen's), so none can change identity on a render this list survives.
+    //
+    // revealAppInPanel is named here rather than excluded: it depends on
+    // `search.close` (stable) rather than the whole `search` object that
+    // useMessageSearch rebuilds as a fresh literal every render, so it holds one
+    // identity and cannot churn this callback — or renderTurnItem below it — and
+    // defeat memo(TurnBlock) for settled turns. Excluding it instead would leave it
+    // captured across a render where the find pane opens, and the stale copy would
+    // open an app tab behind the still-hidden dock.
+  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, handlePlanFromHere, planTaskId, artifactPaths, autoNudgeLoop, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, lastErrorIdx, handleContinue, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel])
 
   // Hoisted out of the row map so every TurnBlock receives the SAME function
   // identity per render — an inline closure there re-created it per row per
@@ -6612,6 +7020,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const renderTurnItem = useCallback((it: TurnItem, _j: number) => {
     // Skip hidden tool messages (✅/🚫 completions) to avoid empty py-1 wrappers
     if (it.kind === 'single' && it.msg.role === 'tool' && !it.msg.content.startsWith('🔧')) return null
+    // Same for hidden invisible-only assistant rows: renderMessage draws
+    // nothing for them, and the bare wrapper would still stack py-1 spacers,
+    // one per quiet monitor cycle.
+    if (it.kind === 'single' && isHiddenInvisibleAssistantRow(it.msg)) return null
     return <div key={turnLeadKey(it, stableMsgKey)} className={`px-4 mx-auto w-full py-1`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
       {it.kind === 'group' ? (() => {
         const unresolvedPerms = it.msgs.filter(m => m.role === 'permission' && !m.meta?.resolved)
@@ -6645,7 +7057,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
    *
    * `open` is the intent (the toggle reads it, aria reads it); mount is
    * `phase !== 'closed'`. There is one writer per transition below, and the
-   * gesture reports through `onSettle` rather than writing the phase itself.
+   * gesture reports through its `onCommit` / `onSettle` callbacks rather than
+   * writing the phase itself.
    */
   const [drawerPhase, setDrawerPhase] = useState<'closed' | 'open' | 'closing'>('closed')
   const mobileSessions = drawerPhase === 'open'
@@ -6726,6 +7139,50 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // invoke an updater more than once, which would start the settle twice.
   const drawerPhaseRef = useRef(drawerPhase)
   drawerPhaseRef.current = drawerPhase
+  /**
+   * The drawer's history entry, so the platform back gesture dismisses the
+   * drawer instead of leaving `/chat` (#5795).
+   *
+   * ONE entry, and it exists exactly while the drawer is open: every open mints
+   * it and every close that was not itself the Back spends it. The alternative --
+   * leaving it behind -- is the twin-entry defect `SidePanelLayout`'s back control
+   * documents: two entries with the same URL, so the next back-swipe visibly does
+   * nothing.
+   *
+   * The entry is a bare DUPLICATE of the one below it. The drawer is view state,
+   * not a location: a URL that moved would have to be unwound on the pop, and
+   * unwinding a `?sid=` is exactly what the sid effect would misread as the user
+   * retracing sessions.
+   *
+   * Deliberately NOT marked in `history.state`, unlike `SUBNAV_PUSH_STATE`. That
+   * marker earns its place because a SubNav drill-in CHANGES the url, so a cold
+   * deep link can land on the drilled-in entry and the marker is the only way to
+   * tell "we pushed this" from "the user arrived here". Nothing can deep-link a
+   * drawer open, so there is no such question to answer and a marker would be
+   * write-only state. Ownership is this ref, which is also the only form that is
+   * correct: a marked entry can outlive the mount that pushed it -- a reload
+   * restores `history.state`, and Forward can walk back INTO one -- so reading a
+   * marker would have the page consume an entry it never pushed.
+   */
+  const drawerEntryRef = useRef(false)
+  const locationRef = useRef(location)
+  locationRef.current = location
+  const pushDrawerEntry = useCallback(() => {
+    // Desktop's sidebar is a persistent column with its own toggle, not a layer
+    // over the content, and Back there already means "leave the route".
+    if (!isMobile || drawerEntryRef.current) return
+    const loc = locationRef.current
+    drawerEntryRef.current = true
+    navigate({ pathname: loc.pathname, search: loc.search, hash: loc.hash })
+  }, [isMobile, navigate])
+  /** Spend the entry, if we still hold one. `drawerPopRef` is what tells the sid
+   *  effect this POP is bookkeeping rather than a session the user asked for. */
+  const consumeDrawerEntry = useCallback(() => {
+    if (!drawerEntryRef.current) return
+    drawerEntryRef.current = false
+    drawerPopRef.current = true
+    navigate(-1)
+  }, [navigate])
   const openSidebar = useCallback(() => {
     if (drawerPhaseRef.current === 'open') return
     // Seat it offscreen before the mount so the first painted frame is the
@@ -6734,31 +7191,63 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     drawerPhaseRef.current = 'open'
     setDrawerPhase('open')
     animateDrawer(drawerX, 0)
-  }, [drawerX, drawerTravel])
+    pushDrawerEntry()
+  }, [drawerX, drawerTravel, pushDrawerEntry])
   /** Mount the panel for a drag in progress. Deliberately NOT `openSidebar`:
    *  that one runs the settle to the rest position, which would race the finger
    *  for the same value and pull the panel out from under it. The gesture has
-   *  already seated the offset and owns it until release. */
+   *  already seated the offset and owns it until release.
+   *
+   *  No history entry here either — the drag has not committed to anything yet,
+   *  and one the user drags back would push and immediately pop. The entry is
+   *  minted where the gesture COMMITS, in `onCommit`. */
   const beginDrawerDrag = useCallback(() => {
     drawerPhaseRef.current = 'open'
     setDrawerPhase('open')
   }, [])
-  const closeSidebar = useCallback(() => {
-    if (drawerPhaseRef.current !== 'open') return
+  /** Run the close animation and nothing else. Split out because the Back that
+   *  closes the drawer must NOT consume an entry — that pop already spent it. */
+  const runDrawerClose = useCallback(() => {
+    if (drawerPhaseRef.current !== 'open') return false
     drawerPhaseRef.current = 'closing'
     setDrawerPhase('closing')
     animateDrawer(drawerX, -drawerTravel(), () => {
       drawerPhaseRef.current = 'closed'
       setDrawerPhase('closed')
     })
+    return true
   }, [drawerX, drawerTravel])
+  const closeSidebar = useCallback(() => {
+    // Phase first, then the pop: the POP effect below skips a drawer that is no
+    // longer 'open', which is what keeps this close from being counted twice.
+    if (runDrawerClose()) consumeDrawerEntry()
+  }, [runDrawerClose, consumeDrawerEntry])
+  /**
+   * The Back that lands on the entry BELOW the drawer's: close the drawer and
+   * stay put.
+   *
+   * While the drawer is open and we hold an entry, that entry is the one on top,
+   * so any POP is a pop off it. Closing WITHOUT `consumeDrawerEntry` is the
+   * point — the pop is the consumption. `location.key` in the deps rather than
+   * `location`, so this runs once per history entry and not on every search-param
+   * rewrite the sid effect makes.
+   */
+  useEffect(() => {
+    if (navigationType !== 'POP') return
+    if (!drawerEntryRef.current || drawerPhaseRef.current !== 'open') return
+    drawerEntryRef.current = false
+    runDrawerClose()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.key, navigationType])
   // Close the drawer when a session is selected. Routed through closeSidebar so
   // it slides out — flipping straight to 'closed' would unmount it on the spot.
   useEffect(() => { if (isMobile) closeSidebar() }, [activeSlot]) // eslint-disable-line react-hooks/exhaustive-deps
   // Leaving the mobile viewport: drop the panel with no slide. There is no
   // mobile drawer to animate on the other side of that crossing, and the
-  // desktop sidebar owns its own open state.
-  useEffect(() => { if (!isMobile) setDrawerPhase('closed') }, [isMobile])
+  // desktop sidebar owns its own open state. The history entry goes with it —
+  // the desktop sidebar is a column, not a layer, so an entry standing for
+  // "a drawer is open" would be left with nothing to dismiss.
+  useEffect(() => { if (!isMobile) { setDrawerPhase('closed'); consumeDrawerEntry() } }, [isMobile]) // eslint-disable-line react-hooks/exhaustive-deps
   const chatContainerRef = useRef<HTMLDivElement>(null)
   // Measured container height — sizes the sidebar border-box morph (the panel
   // rect the box shrinks from on collapse and grows back to on expand).
@@ -6892,11 +7381,36 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     open: mobileSessions,
     x: drawerX,
     onGestureOpen: beginDrawerDrag,
-    // Committed to closing: mark it now so the sibling's gate opens immediately.
-    // 'closing' rather than 'closed' because the panel is still on screen and
-    // `drawerMounted` keys on that — unmounting here would cut the slide short.
-    onCommit: open => { if (!open) { drawerPhaseRef.current = 'closing'; setDrawerPhase('closing') } },
-    onSettle: open => { if (!open) { drawerPhaseRef.current = 'closed'; setDrawerPhase('closed') } },
+    // The gesture's COMMIT points, which is where its history entry is minted and
+    // spent — `beginDrawerDrag` only mounts the panel, and a drag the user
+    // reconsiders commits to closed without ever having minted one (both helpers
+    // are guarded on `drawerEntryRef`, so the call is a no-op then).
+    //
+    // Deliberately NOT `onSettle`. That one waits for the 120-450ms slide so a
+    // consumer cannot unmount the panel mid-animation, which is exactly what
+    // makes it the wrong signal here: the entry stands for "a drawer is open, so
+    // Back dismisses it", an INTENT, and the hook reports intent at release.
+    // Minting on arrival left the whole opening slide with the panel covering the
+    // screen and no entry to pop, so a Back there leaked past the drawer and left
+    // /chat — #5795 again, reachable by drag rather than by tap. Spending on
+    // arrival had the mirror hazard: a Back during the closing slide popped the
+    // still-unspent entry while the POP effect above ignored it (the phase is
+    // 'closing', not 'open'), and the settle then spent a second, real entry.
+    onCommit: open => {
+      if (open) { pushDrawerEntry(); return }
+      // Committed to closing: mark it now so the sibling's gate opens immediately.
+      // 'closing' rather than 'closed' because the panel is still on screen and
+      // `drawerMounted` keys on that — unmounting here would cut the slide short.
+      drawerPhaseRef.current = 'closing'
+      setDrawerPhase('closing')
+      consumeDrawerEntry()
+    },
+    // Arrival, which is bookkeeping only: the phase flip that unmounts the panel.
+    onSettle: open => {
+      if (open) return
+      drawerPhaseRef.current = 'closed'
+      setDrawerPhase('closed')
+    },
   })
   // Right-hand side panel, same gesture mirrored. Not bound when the actbar
   // column owns the panel (desktop) or while the find pane holds the dock —
@@ -6978,6 +7492,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // already open does not change activeSlot.
     if (isMobile) closeSidebar()
     return true
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only `search.close()` is read off `search`, and that member is a useCallback([]) in useMessageSearch; the object around it is rebuilt every render, so depending on it would recreate this reveal handler continuously
   }, [dispatch, isMobile, selectSource, closeSidebar])
   // Web Preview expand mode — broadcast by the Web Preview tab's
   // expand toggle. When on, hide the session list and maximize the side panel
@@ -7016,7 +7531,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     window.addEventListener(PREVIEW_EXPAND_EVENT, onPreviewExpand)
     return () => window.removeEventListener(PREVIEW_EXPAND_EVENT, onPreviewExpand)
-  }, [])
+    // Still a mount-once registration in practice: closeSidebar closes over only
+    // `drawerX` (a useMotionValue, stable for the component's lifetime) and
+    // `drawerTravel` (a useCallback([]) that reads window.innerWidth at call time),
+    // so its identity never changes. Naming it rather than relying on that keeps the
+    // listener from silently capturing a stale copy if closeSidebar ever gains a dep.
+  }, [closeSidebar])
   // The no-sessions force-open yields to expand mode: with an empty list no
   // sessions toggle is rendered, so suppressing it makes nothing inert, and the
   // preview would otherwise stay covered by a list that cannot be dismissed.
@@ -7300,6 +7820,32 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             <button onClick={dismissPinStatus} aria-label={i18nT('app.dismiss')} className="text-muted hover:text-text leading-none p-0.5"><X className="w-4 h-4" /></button>
           </div>
         )}
+        {/* Every resume entry point converges here (#5925): the sidebar row,
+            this page's own "Continue a previous chat" list, the notification
+            panel's Resume button and the two command-palette providers all end
+            on /chat -- and the two providers are plain modules with no component
+            of their own, so one shared site is what lets them narrate at all.
+
+            It sits with the pane-level banners above, OUTSIDE the
+            split / no-slot / transcript ternary below, because a resume can land
+            here with NO active slot at all (a palette or notification resume
+            while no tab is open) -- and that ternary's `!activeSlot` branch
+            renders only the empty state, so a notice placed inside the transcript
+            branch was silent in exactly that case.
+
+            Deliberately NOT in the sidebar, where #3640 first put it: that
+            pane's Older Sessions section starts closed, so a notice inside it is
+            invisible to anyone who had not already opened it, which is everyone
+            arriving from the other three paths. */}
+        {unresumableResume && (
+          <div className="mx-4 mt-2 mb-0" data-testid="unresumable-resume-error">
+            <ErrorNotice
+              message={unresumableNoticeMessage(unresumableResume)}
+              onDismiss={() => dispatch(clearUnresumableResume())}
+              variant="block"
+            />
+          </div>
+        )}
         {/* Floating sessions opener — mobile only, and only on a chat with
             nothing in it yet (a conversation gets the in-header control
             instead). Suppressed while the inline side panel is showing: it is
@@ -7475,7 +8021,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               {/* Trailing controls grouped under a single ml-auto so multiple
                   right-aligned items don't each absorb free space (two ml-auto
                   siblings split the gap, parking the split icon mid-header). */}
-              <div className="ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none">
+              {/* focus-caption-reserve: this group owns the window's top-trailing
+                  corner — where Windows and frameless Linux paint their caption
+                  controls — whenever the side panel is not holding that edge, i.e.
+                  while it is closed (the state that renders the reopen toggle
+                  below) or docked at the bottom. Right-docked and showing, the
+                  panel is at that edge instead and carries the reserve itself, so
+                  reserving here too would indent these controls for nothing. */}
+              <div className={`ml-auto flex shrink-0 items-center gap-1.5 pointer-events-none${!sidePanelWantsMount || sidePanelDock === 'bottom' ? ' focus-caption-reserve' : ''}`}>
               {/* Pop-out control, promoted to the title bar (menu items remain for
                   sidebar parity). Mirrors the split-view pattern to its left: a
                   dimmed icon to act, an accent chip when the state is active.
@@ -7521,17 +8074,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               ))}
               </div>
               {/* Header fade — softens content passing up into the opaque title
-                  row, so it hangs off that row's bottom edge. Absolutely
-                  positioned rather than in flow: as an in-flow sibling its 24px
-                  consumed layout and pushed the pinned card that far off the
-                  header. Out of flow it overlays the transcript instead, and the
-                  pinned card (painted later, and positioned) sits above it. */}
-              <div aria-hidden className="absolute top-full inset-x-0 h-6 bg-gradient-to-b from-bg to-transparent" />
+                  row, so it hangs off that row's bottom edge (anchor="below":
+                  as an in-flow sibling its 24px consumed layout and pushed the
+                  pinned card that far off the header; out of flow it overlays
+                  the transcript and the pinned card paints above it). */}
+              <EdgeFade side="top" anchor="below" />
               </div>
               {/* Fold sentinel — zero-height, always mounted. Its top edge is the
                   line the pinned prompt sticks to (see updatePinnedPrompt). */}
               <div ref={pinFoldRef} aria-hidden className="h-0" />
-              {pinned && (
+              {pinned && (pinMinimized ? (
+                <PinnedPromptPill onRestore={() => setPinMinimized(false)} />
+              ) : (
                 <PinnedPrompt
                   text={pinned.text}
                   fullText={pinned.full}
@@ -7542,10 +8096,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   expanded={pinExpanded}
                   onToggleExpanded={() => setPinExpanded(p => !p)}
                   onJump={() => scrollToPinnedPrompt(pinned.idx)}
+                  onMinimize={() => setPinMinimized(true)}
                   cardRef={pinCardRef}
                   onCollapsedHeight={onPinCollapsedHeight}
                 />
-              )}
+              ))}
             </div>
             <ChatDropOverlay active={dragOver} />
             {slotLoading && (
@@ -7608,136 +8163,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 />
               </motion.div>
             ) : (
-            <div
-              ref={scrollerRef}
-              // -1 so the bar can hand focus here on unmount without adding a tab stop.
-              tabIndex={-1}
-              // stable theming hook 'chat-container' — see website/docs/theming-contract.md
-              className="chat-container"
-              style={{
-                flex: 1,
-                // Second half of the fade-band clearance, alongside
-                // TRANSCRIPT_TAIL_SPACER_PX. Unlike the tail spacer this one also
-                // applies to a transcript short enough not to scroll, so both are
-                // needed for the last line to clear the band in every state.
-                paddingBottom: 16,
-                overflowY: 'auto',
-                // overflow-x must be pinned, not left to default `visible`: with
-                // overflowY `auto`, CSS forces the `visible` axis to compute to
-                // `auto`, so one over-wide child (a long path, a wide code block,
-                // a widget) gives the whole list a draggable horizontal scrollbar
-                // above the composer. The conversation never pans sideways —
-                // wide children scroll within themselves.
-                overflowX: 'hidden',
-                // Reserve a stable scrollbar gutter so the 6px scrollbar always
-                // occupies the same right-edge column the title overlay is inset
-                // from (see the right-1.5 inset above) — keeps the thumb visible
-                // and grabbable at the top instead of hidden behind the header.
-                scrollbarGutter: 'stable',
-                // Native scroll anchoring: when items above the viewport
-                // resize (e.g. widget iframes loading async), the browser
-                // adjusts scrollTop to keep the user's content stable.
-                // This is more precise than item-level anchoring because
-                // it works at the DOM-element granularity.
-                overflowAnchor: 'auto',
-                // Keep wheel/touch momentum inside the message list. Without
-                // this, a delta that arrives at the top or bottom edge chains
-                // to the nearest scrollable ancestor — the document, which
-                // `body{overflow-y:auto}` leaves scrollable — and drags the
-                // whole app shell by however many pixels of slack exist
-                // (a browser-extension node parked past the shell is enough).
-                overscrollBehavior: 'contain',
-              } as React.CSSProperties}
-              aria-label={i18nT('pages.chatPage.chat_messages')}
-              aria-live="polite"
+            <TranscriptScrollShell
+              scrollerRef={scrollerRef}
               onScroll={onScrollPin}
-            >
-              {/* Header spacer */}
-              <div className="h-16" />
+              virt={virt}
+              loadingOlder={loadingOlder}
+              // Second half of the fade-band clearance, alongside
+              // TRANSCRIPT_TAIL_SPACER_PX. Unlike the tail spacer this one also
+              // applies to a transcript short enough not to scroll, so both are
+              // needed for the last line to clear the band in every state.
+              scrollerStyle={{ paddingBottom: 16 }}
+              aboveRows={<>
               {/* Mid-switch `slotHasMore` still describes the outgoing chat, so the cursor
                   key gates the bar to match the paging thunk's own precondition. */}
               {slotHasMore && cursorIsForActiveSlot && (
                 <EarlierMessagesBar loading={loadingOlder} failed={olderFailed} onLoad={handleLoadEarlier} onFocusRelease={() => scrollerRef.current?.focus()} />
               )}
-              {/* Top sentinel: drives upward window expansion via virtualizer's IO. */}
-              <div ref={virt.topSentinelRef} aria-hidden style={{ height: 1 }} />
-              {/* top-16 matches the h-16 header spacer above, so the pinned spinner
-                  clears the overlay header instead of sitting under it.
-                  overflow-anchor:none so appearing/vanishing here cannot become the
-                  browser's scroll anchor and jump the list mid-fetch. */}
-              {loadingOlder && (
-                <div className="sticky top-16 z-[1] flex justify-center py-2" data-testid="older-messages-loading" role="status" aria-label={i18nT('pages.chatPage.loading_earlier_messages')} style={{ overflowAnchor: 'none', background: 'var(--bg)' }}>
-                  <Loader size={16} className="animate-spin text-muted" />
-                </div>
-              )}
-              {/* Top spacer — reserves the height of all items above the mounted
-                  window so the scrollbar stays accurate while only the window
-                  renders real DOM (keeps fast scroll cheap — O(window) nodes).
-                  overflow-anchor:none so the browser anchors on real content,
-                  not on this spacer (which resizes as the window moves). */}
-              <div aria-hidden style={{ height: virt.offsetBefore, overflowAnchor: 'none' }} />
-              {/* Message items — only the mounted window renders; everything
-                  else is represented by the top/bottom spacers. */}
-              {visibleDisplayItems.map((vi) => {
-                if (!vi.mounted) return null
-                const item = vi.data
-                const displayIdx = vi.index
-                if (item.kind === 'turn') {
-                  return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx}><TurnBlock turn={item} renderItem={renderTurnItem} collapseAll={chatConfig.collapseAllSteps} appToolCallIds={appToolCallIds} disclosure={turnDisclosure[vi.key]} disclosureKey={vi.key} onDisclosureChange={setTurnDisclosureFor} /></div>
-                }
-                return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx} className={`px-4 mx-auto w-full py-1`} style={{
-                  maxWidth: 'var(--mc-content-width, 900px)',
-                  // The pinned banner is styled as this row's own bubble and sits
-                  // at the exact position and width the bubble had when its bottom
-                  // edge reached the band's bottom, so leaving both visible is what
-                  // betrays them as two containers. Hide the real one (visibility,
-                  // NOT display — the virtualizer must keep measuring its height or
-                  // the transcript would reflow under the reader) and the bubble
-                  // appears to simply stop travelling and stick. A row is only ever
-                  // hidden once it is entirely behind the band, so a tall prompt
-                  // never leaves a visible hole above the response.
-                  //
-                  // Match by message IDENTITY (ts), not display index. `pinned.idx`
-                  // is computed in a scroll rAF against `displayItemsRef`, which is
-                  // refreshed in a layout effect — but a streaming append or a turn
-                  // regroup can still shift the list between that read and this
-                  // render, leaving `pinned.idx` pointing one row off. When it did,
-                  // the WRONG row was hidden and the real pinned bubble painted
-                  // alongside the banner — the "two stacked boxes" bug. The ts is
-                  // stable across any index shift, so it hides the right row every
-                  // frame; fall back to the index only for a message with no ts.
-                  visibility: (pinned && (pinned.ts != null
-                    ? (item.kind === 'single' && item.msg.ts === pinned.ts)
-                    : pinned.idx === displayIdx)) ? 'hidden' : undefined,
-                }}>{item.kind === 'group' ? (() => {
-                const unresolvedGroupPerms = item.msgs.filter(m => m.role === 'permission' && !m.meta?.resolved)
-                if (item.msgs.every(m => m.role === 'permission')) return null
-                return (
-                <CollapsibleToolGroup
-                  count={item.msgs.filter(m => m.role !== 'permission').length}
-                  disclosureKey={`ctg-${vi.key}`}
-                  hasPermission={false}
-                  isRunning={slotRunning && displayIdx === displayItems.length - 1}
-                  permissionMeta={unresolvedGroupPerms.at(-1)?.meta as Record<string, unknown> | undefined}
-                  pendingPermCount={unresolvedGroupPerms.length}
-                  onApprove={(() => {
-                    const aid = unresolvedGroupPerms.at(-1)?.meta?.approval_id as string | undefined
-                    if (!aid) return approve
-                    return async (action: string) => {
-                      await api.resolveApproval(aid, toApiDecision(action))
-                      dismissApproval(aid)
-                    }
-                  })()}
-                  onViewActivity={toggleAct}
-                  activityOpen={activityOpen}
-                >{item.msgs.map((m, j) => <div key={msgIdentityKey(m, stableMsgKey)}>{renderMessage(item.startIdx + j, m)}</div>)}</CollapsibleToolGroup>)
-              })() : renderMessage(item.idx, item.msg)}</div>
-              })}
-              {/* Bottom spacer — reserves the height of all items below the
-                  mounted window. overflow-anchor:none (see top spacer). */}
-              <div aria-hidden style={{ height: virt.offsetAfter, overflowAnchor: 'none' }} />
-              {/* Bottom sentinel: drives downward window expansion when in jump mode. */}
-              <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
+              </>}
+              belowRows={<>
               {/* Footer */}
               <ChatFooter running={slotRunning} stopping={slotStopping} state={slotState} lastRole={lastRole} streamTick={streamTick} regenerating={regenerating} stopState={currentSlot?.stop_state} />
               {activeSlot && !slotLoading && !embedded && !popout && slotSwitchTarget !== activeSlot && (
@@ -7776,7 +8219,75 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   which is the sliced-glyph hairline reported from a phone and the
                   reason it looked mobile-only. */}
               <div style={{ height: TRANSCRIPT_TAIL_SPACER_PX }} />
-            </div>
+              </>}
+            >
+              {/* Message items — only the mounted window renders; everything
+                  else is represented by the top/bottom spacers. */}
+              {visibleDisplayItems.map((vi) => {
+                if (!vi.mounted) return null
+                const item = vi.data
+                const displayIdx = vi.index
+                // A hidden invisible-only assistant row grouped as a loose
+                // single (short quiet-cycle batches never wrap into a turn)
+                // draws nothing in renderMessage; skip its measured py-1
+                // wrapper too, or each quiet cycle leaves an empty spacer row.
+                if (item.kind === 'single' && isHiddenInvisibleAssistantRow(item.msg)) return null
+                if (item.kind === 'turn') {
+                  return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx}><TurnBlock turn={item} renderItem={renderTurnItem} collapseAll={chatConfig.collapseAllSteps} appToolCallIds={appToolCallIds} disclosure={turnDisclosure[vi.key]} disclosureKey={vi.key} onDisclosureChange={setTurnDisclosureFor} /></div>
+                }
+                return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx} className={`px-4 mx-auto w-full py-1`} style={{
+                  maxWidth: 'var(--mc-content-width, 900px)',
+                  // The pinned banner is styled as this row's own bubble and sits
+                  // at the exact position and width the bubble had when its bottom
+                  // edge reached the band's bottom, so leaving both visible is what
+                  // betrays them as two containers. Hide the real one (visibility,
+                  // NOT display — the virtualizer must keep measuring its height or
+                  // the transcript would reflow under the reader) and the bubble
+                  // appears to simply stop travelling and stick. A row is only ever
+                  // hidden once it is entirely behind the band, so a tall prompt
+                  // never leaves a visible hole above the response.
+                  //
+                  // Match by message IDENTITY (ts), not display index. `pinned.idx`
+                  // is computed in a scroll rAF against `displayItemsRef`, which is
+                  // refreshed in a layout effect — but a streaming append or a turn
+                  // regroup can still shift the list between that read and this
+                  // render, leaving `pinned.idx` pointing one row off. When it did,
+                  // the WRONG row was hidden and the real pinned bubble painted
+                  // alongside the banner — the "two stacked boxes" bug. The ts is
+                  // stable across any index shift, so it hides the right row every
+                  // frame; fall back to the index only for a message with no ts.
+                  // Hiding is safe only while the banner stands in for the row, so
+                  // the minimized chip must not hide it — see pinHidesRow.
+                  visibility: pinHidesRow(pinned, pinMinimized, {
+                    ts: item.kind === 'single' ? item.msg.ts : undefined,
+                    idx: displayIdx,
+                  }) ? 'hidden' : undefined,
+                }}>{item.kind === 'group' ? (() => {
+                const unresolvedGroupPerms = item.msgs.filter(m => m.role === 'permission' && !m.meta?.resolved)
+                if (item.msgs.every(m => m.role === 'permission')) return null
+                return (
+                <CollapsibleToolGroup
+                  count={item.msgs.filter(m => m.role !== 'permission').length}
+                  disclosureKey={`ctg-${vi.key}`}
+                  hasPermission={false}
+                  isRunning={slotRunning && displayIdx === displayItems.length - 1}
+                  permissionMeta={unresolvedGroupPerms.at(-1)?.meta as Record<string, unknown> | undefined}
+                  pendingPermCount={unresolvedGroupPerms.length}
+                  onApprove={(() => {
+                    const aid = unresolvedGroupPerms.at(-1)?.meta?.approval_id as string | undefined
+                    if (!aid) return approve
+                    return async (action: string) => {
+                      await api.resolveApproval(aid, toApiDecision(action))
+                      dismissApproval(aid)
+                    }
+                  })()}
+                  onViewActivity={toggleAct}
+                  activityOpen={activityOpen}
+                >{item.msgs.map((m, j) => <div key={msgIdentityKey(m, stableMsgKey)}>{renderMessage(item.startIdx + j, m)}</div>)}</CollapsibleToolGroup>)
+              })() : renderMessage(item.idx, item.msg)}</div>
+              })}
+              
+            </TranscriptScrollShell>
             )}
             {/* Transcript bottom mask. Its box deliberately does NOT stop at the
                 scrollport's bottom edge — it reaches DOWN to the composer box, and
@@ -7815,15 +8326,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               }}
             />
             <div className="relative">
-              {!isAtBottom && messages.length > 0 && (
-                <div className="absolute -top-10 inset-x-0 z-10 pointer-events-none flex justify-center">
-                  <button
-                    className="w-8 h-8 rounded-full flex items-center justify-center cursor-pointer pointer-events-auto transition-all duration-200 bg-bg-elevated border border-border-strong text-text hover:bg-bg-hover hover:border-accent hover:scale-[1.06] active:scale-95 active:duration-75 shadow-md"
-                    onClick={() => { isAtBottomRef.current = true; scrollBottom(true) }}
-                    aria-label={i18nT('pages.chatPage.scroll_to_bottom')}
-                  ><ArrowDown size={14} strokeWidth={2.5} /></button>
-                </div>
-              )}
+              <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />
               {/* Status chrome never claims more than half the pane. These bars
                   are flex-flow siblings of the transcript scroller, which has an
                   automatic minimum size of 0 and collapses under pressure — an
@@ -7849,7 +8352,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   `overflow-y-auto overscroll-contain`): it replaces the global
                   always-visible `var(--border)` thumb with a hover-revealed
                   overlay one, so the capped box does not carry a permanent bar. */}
-              <div className="max-h-[50svh] overflow-y-auto overscroll-contain scrollbar-overlay pb-[11px] mb-[-11px]" data-testid="composer-status-stack">
+              <div ref={composerBandRef} className="max-h-[50svh] overflow-y-auto overscroll-contain scrollbar-overlay pb-[11px] mb-[-11px]" data-testid="composer-status-stack">
               {/* Not gated on activityOpen (unlike the two bars below): the
                   activity sidebar has no TODO view, so hiding it there would
                   lose the information rather than de-duplicate it. */}
@@ -7867,7 +8370,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               {!(activityOpen && !search.isOpen && tabsCtl.tabs.find(t => t.id === tabsCtl.activeId)?.kind === 'subagents') && <SubagentProgressBar slot={activeSlot} />}
               {!(activityOpen && !search.isOpen && tabsCtl.tabs.find(t => t.id === tabsCtl.activeId)?.kind === 'workflows') && <WorkflowProgressBar slot={activeSlot} />}
               <SubagentDeliveryProgress count={systemDeliveryCount} />
-              <QueueStack messages={queuedMessages} onCancel={handleCancelQueued} onInterrupt={handleInterruptQueued} onEdit={handleEditQueued} onReorder={handleReorderQueued} fuseBelow={followUpOptions.length === 0 && !knowledgeFetch.pendingKnowledge} />
+              <QueueStack messages={queuedMessages} onCancel={handleCancelQueued} onInterrupt={handleInterruptQueued} onEdit={handleEditQueued} onReorder={handleReorderQueued} pendingIds={queuePendingIds} fuseBelow={followUpOptions.length === 0 && !knowledgeFetch.pendingKnowledge} />
               </div>
               {flyingQuote && <FlyingQuote text={flyingQuote.text} from={flyingQuote.from} targetRef={inputAreaRef} onComplete={() => setFlyingQuote(null)} />}
               <div ref={inputAreaRef} className="relative z-10">
@@ -8008,7 +8511,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onSend={() => send()}
               canSteer={composerBusy}
               onSteer={steer}
-              onFollowUpSend={(text?: string) => send(text)}
+              onFollowUpSend={(text?: string, sourceKeyAtClick?: string | null) => {
+                // Double-click and Send-now share dispatchPlanFollowUp with
+                // single-click (#6240). First-click row identity refuses a
+                // straddled double-click on a replaced footer.
+                if (text && dispatchPlanFollowUp(text, sourceKeyAtClick)) return
+                send(text)
+              }}
               disabled={
                 /* Streaming, compaction, and stopping all
                    keep the input interactive: api_chat queues on slot.running and
@@ -8074,6 +8583,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               project={currentSlot?.project || ''}
               projectBranch={projectBranch}
               projectDetached={!projectGitError && !!projectGit?.detached}
+              projectGitDirty={gitBadge?.dirty ?? 0}
+              projectGitAhead={gitBadge?.ahead ?? 0}
+              projectGitBehind={gitBadge?.behind ?? 0}
               isMac={isMac}
               onDrop={dropTargetProps.onDrop}
               onDragOver={dropTargetProps.onDragOver}
@@ -8186,17 +8698,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 // Plan options (Go / Go All / Cancel) dispatch directly — no input fill.
                 // Non-protocol labels on a plan-shaped message keep the composer path:
                 // the endpoint would 400 them while the append was already skipped.
-                if (followUpIsPlan && isPlanAction(o) && effectiveMode === 'orchestrator' && activeSlot) {
-                  // No isPending pre-check: single-flight lives in the hook's
-                  // per-slot latch, which drops a duplicate Go/Go All but lets
-                  // Cancel through — a render-scoped isPending check would
-                  // swallow the stop control while a Go settles.
-                  // `sourceKeyAtClick` is the row the click was made on (the
-                  // chip debounces 220ms and an identical replacement footer
-                  // does not remount it); the hook refuses a stale one.
-                  planActionMutationRef.current.mutate({ slot: activeSlot, action: o, clickedSourceKey: sourceKeyAtClick })
-                  return
-                }
+                if (dispatchPlanFollowUp(o, sourceKeyAtClick)) return
                 // One-click: enabled + no shift + not busy + not already in multi-select
                 if (tryQuickSend(o, dashCfg?.quick_send, e.shiftKey, slotRunning, followUpPickedRef.current.size, send)) return
                 // Regular options: toggle. Click unpicked → append + mark; click
@@ -8235,7 +8737,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             </div>
             <VoiceDisabledModal
               open={voiceSetupOpen}
-              reason={voiceDisabledReason}
+              reason={sttEnabled && !sttAvailable ? 'unavailable' : 'disabled'}
               provider={sttProvider}
               onClose={() => setVoiceSetupOpen(false)}
               onOpenSettings={() => {
@@ -8284,7 +8786,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 defaultEffort={defaultEffort}
                 onSetDefault={() => {
                   setModelDropdown(false)
-                  navigate(`/settings/chat?highlight=${SETTINGS_DEFAULT_MODEL_ID}`)
+                  navigate(settingsPath({ tab: 'chat', highlight: SETTINGS_DEFAULT_MODEL_ID }))
                 }}
                 agentName={_modelPinAgent}
                 pinModelName={_modelPinActive || 'auto'}

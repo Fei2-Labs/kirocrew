@@ -314,3 +314,32 @@ class TestResolveSecretUris:
         # Secret is gone from the dict; non-secret remains
         assert "API_KEY" not in result
         assert result["HOST"] == "localhost"
+
+
+class TestSecretUriPrefixConstant:
+    """Single-source-of-truth for the ``secret://`` scheme prefix.
+
+    ``SECRET_URI_PREFIX`` is defined once in
+    ``kiro_crew.mcp_gateway.secret_uri`` and imported by
+    ``kiro_crew.secrets.migrate``.  These tests pin that relationship so the
+    writer (migrate) and the reader (secret_uri) cannot drift.
+    """
+
+    def test_prefix_value(self) -> None:
+        """SECRET_URI_PREFIX equals the expected scheme string."""
+        from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
+
+        assert SECRET_URI_PREFIX == "secret://"
+
+    def test_migrate_imports_same_object(self) -> None:
+        """migrate._SECRET_URI_PREFIX IS the same object as SECRET_URI_PREFIX.
+
+        Identity (``is``) rather than equality (``==``) proves that migrate
+        imports the constant from ``secret_uri`` rather than re-spelling it.
+        If the import is ever severed and the literal is re-inlined in
+        migrate.py, ``is`` fails even though ``==`` would still pass.
+        """
+        import kiro_crew.secrets.migrate as _migrate_mod
+        from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
+
+        assert _migrate_mod._SECRET_URI_PREFIX is SECRET_URI_PREFIX

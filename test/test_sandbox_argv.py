@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -316,6 +317,79 @@ class TestBuildSeatbeltProfile:
 
         sandbox_mod.assert_voice_runtime_outside_agent_workspace(sibling)
 
+    def test_voice_runtime_workspace_conflict_preflight(self, monkeypatch, tmp_path):
+        """#7392: the non-raising pre-flight mirrors the lexical guard and
+        names both paths, the data home, and the remedy."""
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        sibling = tmp_path / "workspace"
+        runtime.mkdir(parents=True)
+        sibling.mkdir()
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+
+        contains = sandbox_mod.voice_runtime_workspace_conflict(tmp_path)
+        assert contains is not None and "contains" in contains
+        assert "protected voice runtime" in contains
+        assert str(tmp_path) in contains
+        assert str(runtime) in contains
+        # Same remedy sentence as the spawn-time refusal (#7407's shared formatter).
+        assert "Pick a project subdirectory" in contains
+
+        inside = sandbox_mod.voice_runtime_workspace_conflict(runtime / "nested")
+        assert inside is not None and "inside it" in inside
+
+        assert sandbox_mod.voice_runtime_workspace_conflict(sibling) is None
+
+    def test_voice_runtime_workspace_conflict_passes_off_darwin(self, monkeypatch, tmp_path):
+        """The pre-flight matches the guards it mirrors: every spawn-time
+        guard early-returns off macOS, so an overlapping workspace spawns
+        fine on Linux/Windows today — the pre-flight must not 400 a working
+        configuration there (Design/FP review round 1)."""
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "linux")
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        runtime.mkdir(parents=True)
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+        assert sandbox_mod.voice_runtime_workspace_conflict(tmp_path) is None
+
+    def test_preflight_and_spawn_guard_refuse_with_the_same_message(self, monkeypatch, tmp_path):
+        """Drift pin (Design/FP review round 2): the pre-flight and the
+        spawn-time guard share ONE containment scan and ONE formatter, so the
+        same overlapping workspace must produce byte-identical refusal text on
+        both surfaces. If either ever grows its own copy again, this fails."""
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        runtime.mkdir(parents=True)
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+        preflight = sandbox_mod.voice_runtime_workspace_conflict(tmp_path)
+        assert preflight is not None
+        with pytest.raises(RuntimeError) as exc:
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(tmp_path)
+        assert str(exc.value) == preflight
+
+    def test_voice_runtime_workspace_conflict_fails_open_on_prime_error(
+        self, monkeypatch, tmp_path
+    ):
+        """Pre-flight passes when runtime paths cannot resolve; the spawn-time
+        guard (fail-closed) stays authoritative."""
+
+        def _boom() -> tuple[str, ...]:
+            raise OSError("no data home")
+
+        monkeypatch.setattr(sandbox_mod, "_voice_runtime_sandbox_paths", _boom)
+        assert sandbox_mod.voice_runtime_workspace_conflict(tmp_path) is None
+
     def test_delegated_macos_agent_workspace_checks_canonical_alias(self, monkeypatch, tmp_path):
         runtime = tmp_path / "real-data" / "run" / "voice-runtime"
         alias = tmp_path / "linked-runtime"
@@ -332,8 +406,16 @@ class TestBuildSeatbeltProfile:
             lambda path: str(runtime) if os.fspath(path) == str(alias) else realpath(path),
         )
 
-        with pytest.raises(RuntimeError, match="protected voice runtime"):
+        with pytest.raises(RuntimeError, match="protected voice runtime") as excinfo:
             sandbox_mod.assert_voice_runtime_outside_agent_workspace(alias)
+
+        # The refusal names the workspace as the caller spelled it (the
+        # symlink), not its canonical resolution, and classifies a hit found
+        # only on the canonical spelling as an alias relationship.
+        message = str(excinfo.value)
+        assert os.path.abspath(str(alias)) in message
+        assert "aliases" in message
+        assert str(runtime) in message
 
     @pytest.mark.parametrize(
         ("runtime_leaf", "workspace_leaf"),
@@ -385,6 +467,162 @@ class TestBuildSeatbeltProfile:
 
         with pytest.raises(RuntimeError, match="protected voice runtime"):
             sandbox_mod.assert_voice_runtime_outside_agent_workspace(workspace)
+
+    def test_voice_guard_refusal_names_both_paths_when_workspace_contains_runtime(
+        self, monkeypatch, tmp_path
+    ):
+        """Lexical 'contains' variant: both absolute paths plus the remedy."""
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        runtime.mkdir(parents=True)
+        workspace = tmp_path
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(workspace)
+
+        message = str(excinfo.value)
+        assert str(workspace) in message
+        assert str(runtime) in message
+        assert "contains" in message
+        assert (
+            "Pick a project subdirectory that does not contain the Kiro Crew data home."
+            in message
+        )
+
+    def test_voice_guard_refusal_names_both_paths_when_workspace_is_inside_runtime(
+        self, monkeypatch, tmp_path
+    ):
+        """Lexical 'inside' variant: both absolute paths plus the remedy."""
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        workspace = runtime / "nested"
+        workspace.mkdir(parents=True)
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(workspace)
+
+        message = str(excinfo.value)
+        assert str(workspace) in message
+        assert str(runtime) in message
+        assert "lives inside it" in message
+        assert (
+            "Pick a project subdirectory that does not contain the Kiro Crew data home."
+            in message
+        )
+
+    def test_voice_guard_alias_refusal_names_both_paths(self, monkeypatch, tmp_path):
+        """Filesystem-identity variant: both absolute paths plus the remedy."""
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        workspace = tmp_path / "workspace"
+        runtime.mkdir(parents=True)
+        workspace.mkdir()
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+        real_stat = sandbox_mod.os.stat
+        runtime_info = real_stat(runtime)
+
+        def alias_stat(path, *args, **kwargs):
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(str(workspace)):
+                return runtime_info
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(sandbox_mod.os, "stat", alias_stat)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(workspace)
+
+        message = str(excinfo.value)
+        assert str(workspace) in message
+        assert str(runtime) in message
+        assert "aliases" in message
+        assert (
+            "Pick a project subdirectory that does not contain the Kiro Crew data home."
+            in message
+        )
+
+    def test_voice_guard_cannot_verify_refusal_names_the_failed_stat(
+        self, monkeypatch, tmp_path
+    ):
+        """OSError variant: workspace, runtime, the failed path, and the remedy."""
+        runtime = tmp_path / "data" / "run" / "voice-runtime"
+        workspace = tmp_path / "workspace"
+        runtime.mkdir(parents=True)
+        workspace.mkdir()
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: (str(runtime),),
+        )
+        real_stat = sandbox_mod.os.stat
+
+        def failing_stat(path, *args, **kwargs):
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(str(workspace)):
+                raise PermissionError(13, "Permission denied", os.fspath(path))
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(sandbox_mod.os, "stat", failing_stat)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            sandbox_mod.assert_voice_runtime_outside_agent_workspace(workspace)
+
+        message = str(excinfo.value)
+        assert "cannot verify" in message
+        assert str(workspace) in message
+        assert str(runtime) in message
+        assert "a filesystem check failed on" in message
+        assert "Permission denied" in message
+        assert "fails closed" in message
+        assert (
+            "Pick a project subdirectory that does not contain the Kiro Crew data home."
+            in message
+        )
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_voice_guard_bind_cannot_verify_refusal_names_the_failed_open(
+        self, monkeypatch
+    ):
+        """Bind-path OSError variant: workspace, failed path, and the remedy."""
+        monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            sandbox_mod,
+            "_voice_runtime_sandbox_paths",
+            lambda: ("/protected/voice-runtime",),
+        )
+
+        def failing_open(path, **_kwargs):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+
+        monkeypatch.setattr(sandbox_mod, "_open_directory_descriptor", failing_open)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            sandbox_mod.bind_voice_safe_agent_workspace("/mutable/workspace")
+
+        message = str(excinfo.value)
+        assert "cannot verify" in message
+        assert "/mutable/workspace" in message
+        assert "/protected/voice-runtime" in message
+        assert "a filesystem check failed on" in message
+        assert "Permission denied" in message
+        assert (
+            "Pick a project subdirectory that does not contain the Kiro Crew data home."
+            in message
+        )
+        assert isinstance(excinfo.value.__cause__, OSError)
 
     def test_macos_workspace_binding_uses_opened_ancestor_identities(self, monkeypatch):
         monkeypatch.setattr(sandbox_mod.sys, "platform", "darwin")
@@ -540,9 +778,16 @@ class TestBuildSeatbeltProfile:
         closed: list[int] = []
         monkeypatch.setattr(sandbox_mod.os, "close", closed.append)
 
-        with pytest.raises(RuntimeError, match="protected voice runtime"):
+        with pytest.raises(RuntimeError, match="protected voice runtime") as excinfo:
             sandbox_mod.bind_voice_safe_agent_workspace("/mutable/workspace")
 
+        message = str(excinfo.value)
+        assert "/mutable/workspace" in message
+        assert "/protected/voice-runtime" in message
+        assert (
+            "Pick a project subdirectory that does not contain the Kiro Crew data home."
+            in message
+        )
         assert closed == [51, 52]
 
     @pytest.mark.asyncio
@@ -694,6 +939,70 @@ class TestBuildLauncherScript:
         # link=86/linkat=265 (x86_64) and linkat=37 (aarch64) must be gone
         assert "308, 155, 86, 265)" not in script
         assert "268, 41, 37)" not in script
+
+    @_POSIX_ONLY
+    def test_launcher_refuses_when_seccomp_cannot_be_installed(self):
+        """An arch with no syscall table, or a libc without prctl(2), must make
+        the launcher EXIT -- not skip Step 5/6 and exec the agent anyway.
+
+        Skipping leaves ``unshare`` permitted, so the child can enter a nested
+        user namespace, hold CAP_SYS_ADMIN over a copy of this mount tree, and
+        umount every credential mask -- the escape the filter exists to deny.
+        Both ``_inside_kirocrew_sandbox`` and
+        ``docs/system-specs/modules/security.md`` state that a sandboxed tree is
+        confined "by the outer namespace + seccomp", so a silent skip makes that
+        claim false while every caller still reads the spawn as isolated.
+        """
+        script = _build_launcher_script("strict")
+        # The generated launcher must stay valid Python at every tier.
+        for level in ("standard", "cc", "strict"):
+            compile(_build_launcher_script(level), "<launcher-%s>" % level, "exec")
+        assert "no seccomp syscall table for machine" in script
+        assert "libc exposes no prctl(2)" in script
+        # The old fail-open marker must not come back.
+        assert "unknown arch" not in script
+
+        # Execute the arch-dispatch block itself, so this proves the refusal
+        # FIRES rather than that its message is present as text.
+        lines = script.splitlines()
+        start = -1
+        end = -1
+        for index, line in enumerate(lines):
+            if start < 0 and line.strip() == "import platform as _plat":
+                start = index
+            elif start >= 0 and "if _DENY_SYSCALLS:" in line:
+                end = index
+                break
+        assert start >= 0 and end > start, "arch-dispatch block not found"
+        block = textwrap.dedent("\n".join(lines[start:end]))
+        block = block.replace("import platform as _plat", "")
+
+        class _FakePlat:
+            def __init__(self, machine):
+                self._machine = machine
+
+            def machine(self):
+                return self._machine
+
+        supported = (
+            ("x86_64", (165, 166, 272, 308, 155)),
+            ("aarch64", (40, 39, 97, 268, 41)),
+        )
+        for machine, table in supported:
+            namespace = {"sys": sys, "_plat": _FakePlat(machine)}
+            exec(block, namespace)  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected -- runs this repo's OWN generated launcher source, never external input  # noqa: E501  # fmt: skip
+            assert namespace["_DENY_SYSCALLS"] == table
+
+        for machine in ("riscv64", "armv7l", "ppc64le", "s390x"):
+            namespace = {"sys": sys, "_plat": _FakePlat(machine)}
+            with pytest.raises(SystemExit) as excinfo:
+                exec(block, namespace)  # nosemgrep: python.lang.security.audit.exec-detected.exec-detected -- runs this repo's OWN generated launcher source, never external input  # noqa: E501  # fmt: skip
+            message = str(excinfo.value)
+            assert "sandbox: BLOCKED" in message
+            assert repr(machine) in message
+            # The refusal must name the explicit opt-out, or an operator on such
+            # a host is left with no way forward.
+            assert "agent.sandbox_allow_unsandboxed_exec" in message
 
     @_POSIX_ONLY
     def test_standard_script_excludes_aws(self):
@@ -1273,19 +1582,22 @@ class TestNamespaceArgv:
     @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
     def test_wraps_with_python_launcher(self, mock_resolve):
         result = namespace_argv(["kiro-cli", "acp"], "strict")
+        # Indices come from the flag count, never a literal: the flag tuple grows
+        # (it gained -B when the bytecode redirect turned out not to reach an
+        # isolated child) and a hardcoded 3 would hand back a flag as a path.
+        script = 1 + len(sandbox_mod._LAUNCHER_INTERPRETER_FLAGS)
         assert result[0] == sys.executable
-        assert result[1] == "-I"
-        assert result[2] == "-S"
-        assert result[3].endswith(".py")
-        assert result[4] == "/usr/local/bin/kiro-cli"
-        assert result[5] == "acp"
+        assert tuple(result[1:script]) == sandbox_mod._LAUNCHER_INTERPRETER_FLAGS
+        assert result[script].endswith(".py")
+        assert result[script + 1] == "/usr/local/bin/kiro-cli"
+        assert result[script + 2] == "acp"
         # Cleanup temp file
-        os.unlink(result[3])
+        os.unlink(sandbox_mod._launcher_script_of(result))
 
     @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
     def test_launcher_script_is_executable(self, mock_resolve):
         result = namespace_argv(["kiro-cli"], "strict")
-        launcher_path = result[3]
+        launcher_path = sandbox_mod._launcher_script_of(result)
         mode = os.stat(launcher_path).st_mode
         assert mode & 0o700 == 0o700
         os.unlink(launcher_path)
@@ -1306,6 +1618,9 @@ class TestNamespaceArgv:
             flags = result[1 : result.index(script)]
             assert "-I" in flags, f"-I must be an interpreter flag, got {result!r}"
             assert "-S" in flags, f"-S must be an interpreter flag, got {result!r}"
+            # -B likewise: -I implies -E, so PYTHONPYCACHEPREFIX cannot reach
+            # this launcher and its bytecode would land in the signed bundle.
+            assert "-B" in flags, f"-B must be an interpreter flag, got {result!r}"
         finally:
             os.unlink(script)
 
@@ -2725,16 +3040,13 @@ class TestKiroInternalSandboxExclusion:
         mock_ns.assert_called_once()
 
     def test_windows_explicit_kiro_backend_delegates_before_backend_probe(self, monkeypatch):
-        """Fresh Windows installs use the positively identified Kiro sandbox."""
+        """Windows delegates only when the Kiro sandbox it delegates TO is on."""
         monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
         launch = r"C:\Program Files\Kiro\kiro-cli.exe"
         with (
             patch("kiro_crew.sel.sel", return_value=MagicMock()),
             patch("kiro_crew.sandbox.detect_backend") as mock_detect,
-            patch(
-                "kiro_crew.sandbox.kiro_internal_sandbox_enabled",
-                side_effect=AssertionError("Windows delegation must not depend on macOS settings"),
-            ),
+            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=True) as mock_cap,
         ):
             argv, cleanup = wrap_argv(
                 [launch, "acp"],
@@ -2745,6 +3057,51 @@ class TestKiroInternalSandboxExclusion:
         assert argv == [launch, "acp"]
         assert cleanup is None
         mock_detect.assert_not_called()
+        # The capability is CONSULTED, not assumed: the unwrapped argv above is
+        # only safe because the layer it defers to actually exists.
+        mock_cap.assert_called()
+
+    def test_windows_kiro_sandbox_disabled_fails_closed(self, monkeypatch):
+        """Classification alone cannot buy the Windows delegation.
+
+        A classified Kiro spawn on a host whose internal sandbox is OFF has no
+        isolation layer to delegate to, so it must fall through to the normal
+        no-backend policy and fail closed — not return an unwrapped argv while
+        the audit trail claims a delegated sandbox.
+        """
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: False)
+        with (
+            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=False),
+            patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect,
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+            pytest.raises(sandbox_mod.SandboxUnavailableError),
+        ):
+            wrap_argv(
+                [r"C:\Program Files\Kiro\kiro-cli.exe", "acp"],
+                mode="auto",
+                is_kiro_cli=True,
+            )
+        # Fall-through reached the ordinary backend decision rather than
+        # short-circuiting into the delegation.
+        mock_detect.assert_called_once_with(config_mode="auto")
+
+    def test_windows_kiro_sandbox_disabled_honours_explicit_opt_in(self, monkeypatch):
+        """The fall-through is the NORMAL path, opt-in included — not a crash."""
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: True)
+        launch = r"C:\Program Files\Kiro\kiro-cli.exe"
+        with (
+            patch("kiro_crew.sandbox.kiro_internal_sandbox_enabled", return_value=False),
+            patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect,
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+        ):
+            argv, cleanup = wrap_argv([launch, "acp"], mode="auto", is_kiro_cli=True)
+        assert argv[-2:] == [launch, "acp"]
+        assert cleanup is None
+        # Distinguishes the opted-in FALL-THROUGH from the delegation, which
+        # returns the same argv but short-circuits before any backend decision.
+        mock_detect.assert_called_once_with(config_mode="auto")
 
     @pytest.mark.parametrize("classification", [None, False])
     def test_windows_nonclassified_spawn_still_fails_closed(self, monkeypatch, classification):

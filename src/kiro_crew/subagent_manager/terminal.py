@@ -112,15 +112,24 @@ class TerminalCoordinator(ManagerComponent):
         if not pid:
             return
         info._pid = pid
-        pid_start_id = await asyncio.to_thread(platform_compat.process_start_time, pid)
+        pid_start_id = await asyncio.to_thread(platform_compat.process_start_time, pid) or ""
+        # Ownership follows the TOKEN, not the PID. `process_start_time` answers
+        # None on Windows and for a child that has already exited, and the
+        # coordinator refuses an owned record carrying no start token
+        # (INVALID_TRANSITION) -- which would abort the run before the child is
+        # ever prompted. Claiming ownership without the token would be worse
+        # still: the PID-reuse guard is the whole authority for terminating this
+        # process tree on restart, so an unverifiable identity must record as
+        # UNOWNED rather than assert an authority nothing can confirm.
+        process_owned = bool(pid_start_id)
         try:
             await self._manager._write_state_off_loop(
                 info,
                 "PID record",
                 pid=pid,
                 pid_recorded_at=time.time(),
-                pid_start_id=pid_start_id or "",
-                process_owned=True,
+                pid_start_id=pid_start_id,
+                process_owned=process_owned,
             )
         except Exception:
             logger.debug("Failed to mirror PID for %s", info.id, exc_info=True)
@@ -131,8 +140,8 @@ class TerminalCoordinator(ManagerComponent):
         await self._manager._coordinator_record_process(
             info,
             pid,
-            pid_start_id or "",
-            True,
+            pid_start_id,
+            process_owned,
         )
 
     async def _coordinator_mark_starting_impl(self, info: SubagentInfo) -> None:

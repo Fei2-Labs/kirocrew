@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { Input, SendBtn } from './ui'
@@ -32,7 +32,7 @@ function LockedAgentValue({ name }: { name: string }) {
     <span className="flex flex-col items-start gap-1">
       <span className="text-[11px] text-muted/70">{hint}</span>
       <span
-        className="inline-flex items-center rounded-full border border-border bg-bg-hover px-2.5 py-0.5 font-mono text-[12px] text-text-strong"
+        className="inline-flex max-w-full break-all items-center rounded-full border border-border bg-bg-hover px-2.5 py-0.5 font-mono text-[12px] text-text-strong"
         title={hint}
         data-testid="jobform-locked-agent"
       >
@@ -119,12 +119,20 @@ function buildBody(
   return body
 }
 
+/** One row of `GET /api/models`. The payload is kiro-cli's own `--list-models`
+ *  output after the backend's filtering, so nothing here is guaranteed: the
+ *  current spelling is `model_name`, `name` is the legacy one, and a row that
+ *  carries neither is unusable. */
+type ModelRow = { model_name?: string; name?: string; display_name?: string }
+
 interface Props {
   job?: CronJob // if provided, edit mode
   /** Seed values for a NEW job (create mode). Ignored when `job` is set. */
   prefill?: CronPrefill
   agents: KiroCrewAgent[]
   defaultAgent: string
+  /** The roster fetch failed — see AgentSelector's prop of the same name. */
+  rosterFailure?: { reloading: boolean; onReload: () => void }
   /** Pin the job to ONE crew: the agent field renders as a fixed value instead
    *  of a selector, and the submit body always carries this name. For hosts
    *  that embed the form inside a single crew's own surface, where offering a
@@ -139,9 +147,16 @@ interface Props {
   submitRef?: React.MutableRefObject<(() => void) | null>
   /** Called when saving state changes */
   onSavingChange?: (saving: boolean) => void
+  /** Called when the form's TOUCHED state changes: true once any field has
+   *  diverged from its initial value, false when they all match again (or
+   *  after a successful create resets them). Hosts that guard destruction
+   *  paths key on this rather than on mere open-ness, so looking at an empty
+   *  form and backing out never triggers a "your typed work will be lost"
+   *  confirm about work that does not exist. */
+  onDirtyChange?: (dirty: boolean) => void
 }
 
-export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange }: Props) {
+export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onDirtyChange }: Props) {
   // "" and undefined both mean unlocked, so render and submit share one truth.
   const locked = lockedAgent || undefined
   const defaults = parseJobDefaults(job)
@@ -169,7 +184,15 @@ export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgen
     queryKey: ['models'],
     queryFn: async () => {
       const m = await api.models()
-      return Array.isArray(m) ? m.map((x: any) => ({ name: x.model_name || x.name, description: x.display_name || '' })) : []
+      // A row carrying neither spelling is dropped, not mapped to '': '' is
+      // this form's own value for "inherit" (the `clearLabel` row, see
+      // `modelOptions` below), so aliasing an unusable row onto it would render
+      // a second, duplicate inherit option that silently clears the override.
+      if (!Array.isArray(m)) return []
+      return m.flatMap((x: ModelRow) => {
+        const name = x.model_name || x.name
+        return name ? [{ name, description: x.display_name || '' }] : []
+      })
     },
   })
   const [channel, setChannel] = useState(defaults.channel)
@@ -184,7 +207,42 @@ export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgen
   const [weekTime, setWeekTime] = useState(init.weekTime)
   const [tz, setTz] = useState(() => job ? (job.timezone || 'UTC') : Intl.DateTimeFormat().resolvedOptions().timeZone)
   const [cronExpr, setCronExpr] = useState(init.cronExpr)
-  const [error, setError] = useState('')
+  // Touched = any field diverged from what the form OPENED with. Compared
+  // against `init`/`defaults` (the same sources the state seeded from), so a
+  // value typed and then typed back reads as untouched again — the same rule
+  // the crew editor's own dirtyPanes uses. tz is excluded: its initial value
+  // is the machine's zone, an environment fact rather than user work worth a
+  // discard confirm. Reported through an effect keyed on the recomputed
+  // boolean, so hosts only hear about EDGES, not every keystroke.
+  const dirty =
+    name !== init.name || msg !== init.message ||
+    agent !== defaults.agent || model !== defaults.model ||
+    channel !== defaults.channel || approvalMode !== defaults.approvalMode ||
+    silent !== init.silent || strictSchedule !== defaults.strictSchedule ||
+    hideInChat !== defaults.hideInChat || schedMode !== init.schedMode ||
+    intVal !== init.intVal || intUnit !== init.intUnit ||
+    weekTime !== init.weekTime || cronExpr !== init.cronExpr ||
+    weekDays.length !== init.weekDays.length || weekDays.some((d, i) => d !== init.weekDays[i])
+  const dirtyChangeRef = useRef(onDirtyChange)
+  dirtyChangeRef.current = onDirtyChange
+  useEffect(() => { dirtyChangeRef.current?.(dirty) }, [dirty])
+  // Unmount clears the flag for the same reason CrewWakeSection's own
+  // cleanup does: the work no longer exists, so no host may keep gating on it.
+  useEffect(() => () => { dirtyChangeRef.current?.(false) }, [])
+  const [error, setErrorState] = useState('')
+  // When the submit control lives in a host's header (`externalSubmit`) the
+  // form can be taller than its pane, so a failed submit's notice — rendered
+  // at the form's bottom — lands below the fold and the click looks like a
+  // dead button. Bring the notice to the failed click, whichever layout. The
+  // tick makes a REPEATED identical failure scroll again (batching collapses
+  // `setError('')` + same message into no state change); the optional call
+  // guards jsdom, which has no scrollIntoView.
+  const errorRef = useRef<HTMLDivElement | null>(null)
+  const [errorTick, setErrorTick] = useState(0)
+  const setError = (e: string) => { setErrorState(e); if (e) setErrorTick(t => t + 1) }
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView?.({ block: 'nearest' })
+  }, [error, errorTick])
   const [saving, setSavingState] = useState(false)
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v) }
 
@@ -281,7 +339,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgen
           <Input placeholder={i18nT('components.jobForm.message_task')} style={{ flex: 2 }} value={msg} onChange={e => setMsg(e.target.value)} />
           {locked
             ? <LockedAgentValue name={locked} />
-            : <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} modal />}
+            : <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />}
           <SimpleSelect
             options={modelOptions.values}
             optionLabels={modelOptions.labels}
@@ -349,7 +407,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgen
             ? <LockedAgentValue name={locked} />
             : (<>
               <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_agent_handles_this_job_leave_default_for_t')}</span>
-              <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} modal />
+              <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />
             </>)}
         </div>
         </>)}
@@ -416,7 +474,9 @@ export default function JobForm({ job, prefill, agents, defaultAgent, lockedAgen
 
       {/* No hand-off: the notice sits beside unsaved form input, and the button
           navigates away — which would discard what the user typed. */}
-      <ErrorNotice message={error} />
+      <div ref={errorRef}>
+        <ErrorNotice message={error} />
+      </div>
     </div>
   )
 }

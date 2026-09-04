@@ -160,6 +160,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         data,
       })),
       isAtBottom: true,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},
@@ -537,7 +538,7 @@ describe('ChatPage window-event listeners', () => {
   })
 
   it('answers a run-in-terminal request exactly once, carrying its reqId back', async () => {
-    const { store } = await renderTurn()
+    await renderTurn()
     const results: { reqId?: string; ok?: boolean }[] = []
     const onResult = (e: Event) => { results.push((e as CustomEvent).detail) }
     window.addEventListener('mc:run-in-terminal-result', onResult)

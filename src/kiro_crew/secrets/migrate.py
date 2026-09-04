@@ -50,12 +50,15 @@ from pathlib import Path
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import _JIRA_TOKEN_RE, CRED_JIRA_API_TOKEN, config_dir, env_path
+from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
 from kiro_crew.secrets import SecretVault
 
 logger = logging.getLogger(__name__)
 
 #: ``secret://`` scheme prefix a migrated ``.env`` value is rewritten to.
-_SECRET_URI_PREFIX = "secret://"
+#: Imported from the resolver (single source of truth) so the writer here and
+#: the reader there can never drift.
+_SECRET_URI_PREFIX = SECRET_URI_PREFIX
 
 
 def _env_lock_path(ep: Path) -> Path:

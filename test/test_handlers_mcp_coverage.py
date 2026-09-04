@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
+from body_stream_helpers import BodyStreamPayload
 
 from kiro_crew.dashboard.handlers import mcp as mcp_mod
 from kiro_crew.mcp_discovery import McpServerInfo
@@ -43,9 +44,19 @@ def _request(
     """Minimal aiohttp request double, matching the suite's existing style."""
     req = MagicMock(spec=web.Request)
     if isinstance(body, Exception):
+        # Malformed body: real undecodable bytes for the streaming (capped)
+        # path, a raising mock for the ``request.json()`` (uncapped) path.
+        raw = b"{not json"
         req.json = AsyncMock(side_effect=body)
     else:
+        raw = json.dumps(body).encode() if body is not None else b""
+        # Kept alive: ``api_mcp_server_detail`` reads uncapped
+        # (``max_bytes=None``) and consumes ``request.json()``.
         req.json = AsyncMock(return_value=body)
+    req.content = BodyStreamPayload(raw)
+    req.content_length = len(raw) if raw else None
+    req.charset = None
+    req.can_read_body = bool(raw)
     req.app = {"state": state if state is not None else _State()}
     req.query = query or {}
     req.match_info = match_info or {}
@@ -521,6 +532,70 @@ class TestServerDetail:
         )
         assert resp.status == 400
         assert "server name is required" in _payload(resp)["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name",
+        ["../../evil", "..", "a/../b", "a" * 129, "-leading-dash"],
+        ids=["traversal", "bare-dotdot", "embedded-dotdot", "overlong", "bad-leading-char"],
+    )
+    async def test_put_rejects_a_name_the_rest_of_the_tree_would_refuse(
+        self, sandbox: SimpleNamespace, name: str
+    ) -> None:
+        """PUT is the writer, so it must not plant a key nothing else can address.
+
+        ``_is_valid_mcp_name`` is the predicate the validation-dependent readers
+        in this tree enforce (several call sites in ``mcp.py`` itself, plus
+        ``mcp_custom.py``, ``mcp_discover.py`` and ``connections.py``). A name
+        carrying ``..`` or exceeding ``_MAX_MCP_NAME_LEN`` written through this
+        route is invisible to those, so the entry cannot be managed through them.
+        """
+        _write_global(sandbox, {})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request({"command": "node"}, match_info={"name": name}, method="PUT")
+        )
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_server_name"
+        # The refusal must land before the write, not after it.
+        assert _read_global(sandbox) == {}
+
+    @pytest.mark.asyncio
+    async def test_delete_still_removes_a_malformed_junk_key(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """DELETE stays permissive on purpose, so a junk key remains clearable.
+
+        This mirrors the documented grant/revoke asymmetry in ``security.py``:
+        the writer validates, the remover does not, because guarding a remover
+        would strand exactly the entries the writer guard prevents. ``DELETE``
+        and ``api_mcp_remove`` are both such removers. Guarding this handler's
+        DELETE half is the specific regression this test forbids.
+        """
+        _write_global(sandbox, {"../../evil": {"command": "x"}})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(None, match_info={"name": "../../evil"}, method="DELETE")
+        )
+        assert resp.status == 200
+        assert _payload(resp)["removed"] is True
+        assert _read_global(sandbox) == {}
+
+    @pytest.mark.asyncio
+    async def test_put_accepts_the_names_the_validator_allows(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """The guard must not narrow the accepted set beyond the shared validator.
+
+        ``_VALID_MCP_NAME_RE`` deliberately admits ``@``, ``/``, ``.``, ``:`` and
+        ``_`` so scoped package ids (``@scope/pkg``) keep working.
+        """
+        _write_global(sandbox, {})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(
+                {"command": "node"}, match_info={"name": "@scope/pkg.name_v2:1"}, method="PUT"
+            )
+        )
+        assert resp.status == 200
+        assert "@scope/pkg.name_v2:1" in _read_global(sandbox)
 
     @pytest.mark.asyncio
     async def test_delete_absent_is_404(self, sandbox: SimpleNamespace) -> None:

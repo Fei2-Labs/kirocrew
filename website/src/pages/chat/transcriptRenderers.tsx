@@ -21,7 +21,6 @@
  */
 import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
-import StopEventCard from './StopEventCard'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
 import RecoveryCard, { resolveInjectCard } from './RecoveryCard'
 import { ErrorCard } from './ErrorCard'
@@ -100,13 +99,6 @@ export function createTranscriptRenderers(
 
   return [
     // ── Shape-matched rows, ahead of anything keyed only by role ──
-    {
-      // Replaces the default's inline danger line with the real card.
-      id: 'stop_event',
-      roles: ['*'],
-      match: m => m.kind === 'stop_event' || m.meta?.kind === 'stop_event',
-      render: (m, ctx) => ctx.row(<StopEventCard message={m} />),
-    },
     {
       // Replaces the default: same card, but wired to open a folder and the
       // side panel the way the single-chat surface does.

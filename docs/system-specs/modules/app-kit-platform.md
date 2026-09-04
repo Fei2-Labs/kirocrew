@@ -240,9 +240,61 @@ resurrected from a disabled or uninstalled app would have persisted indefinitely
 Lock order is unchanged (transaction → config → bridge-file); the widened hold is
 the innermost one.
 
+### 1a. The submission may not CREATE a name in the `<app>:<server>` region
+
+Every row above is about a name the submission **omits**. The mirror question is a
+name the submission **contains**, and until #7089 the answer was "persist it
+verbatim": an editor tab that loaded while an app was installed and running
+re-created that app's bridge on save after the app had been uninstalled or
+disabled. Same non-self-healing direction as above — reconciliation only revisits
+ENABLED apps — so the resurrected bridge stayed live and callable.
+
+`_drop_unbacked_app_entries` closes it with one rule: **a submitted name containing
+`:` that the installed spec does not hold is dropped**, because that region is
+reserved *from this endpoint* — the raw editor is not one of its writers. Two paths
+legitimately put a colon-containing key here: `_register_mcp_servers` (every app
+bridge, as `<app>:<server>`) and the MCP page's
+`handlers/mcp.py::_sync_mcp_to_agent_unlocked` (a global mcp.json server copied in
+under `mcp_server_alias`, which returns a slash-free name unchanged and so keeps a
+colon). A name either of them actually wrote is present on disk, and therefore
+untouched.
+
+| Submitted `mcpServers` entry | Verdict |
+| --- | --- |
+| plain name (no `:`), not on disk | **persisted** — this is how the user adds a server here |
+| `<app>:<server>` on disk | **persisted as submitted** — the snapshot still wins where the platform agrees the name exists |
+| `<app>:<server>` NOT on disk, app uninstalled | **dropped** — `_deregister_mcp_servers` removed it |
+| `<app>:<server>` NOT on disk, app installed but DISABLED | **dropped** — same, and reconciliation never revisits it |
+| `<app>:<server>` NOT on disk, app installed, ENABLED and DECLARING it | **dropped** — `_register_mcp_servers` skips an HTTP server with no live port and scrubs stale rows for it; a manifest's illustrative port is a dead URL that breaks every kiro session |
+| host-owned name containing `:` (an edition extra), not on disk | **persisted** — the host's key, not an app's; the host axis is unchanged |
+| any, spec readable but carrying no `mcpServers` key | **dropped** — a keyless spec holds no bridge, which is a definite answer; reading it as "unknown" lets the resurrection through |
+| any, spec unreadable, or `mcpServers` present but not an object | **persisted** — best-effort, so this endpoint stays the repair path for a corrupt spec, and nothing is deleted on evidence that cannot be read |
+
+The declared-name census is deliberately **not** consulted on this axis, and the
+last row above is why: it would rescue exactly the entry the registration path
+scrubbed on purpose. The two directions ask different questions — the absent axis
+must name an owner before KEEPING something the client asked to remove, while here
+every candidate is one the client is ADDING to a region it does not author, which
+the on-disk map answers alone. A consequence: this rule performs no manifest I/O
+and cannot raise `app_ownership_unreadable`, so it adds no new failure mode. Both
+rules read the spec **once**, through `_on_disk_mcp_servers`, so they cannot
+disagree about their baseline.
+
+The cost is that a name containing `:` can no longer be introduced through this raw
+editor; the MCP page is the path that adds a server, after which the name is on
+disk and this rule leaves it alone. Nothing becomes unremovable — an entry on disk
+stays deletable through the absent-axis rule.
+
+**Not closed here:** where the name is on disk and the submission carries a
+SUPERSEDED definition of it (an older port or command), the submitted row still
+wins and reverts a correction the registration path had made. Fixing that reverses
+the editor-snapshot-wins contract kept in #5899, and unlike resurrection it
+self-heals on the next gateway start, so it is left to a separate ruling.
+
 Writer: `apps/bridges.py::_apply_agent_mcp_policy`, `_mcp_json_path`,
 `_scrub_legacy_shared_mcp`;
-`dashboard/handlers/agents.py::_merge_unowned_servers` for the PUT side.
+`dashboard/handlers/agents.py::_merge_unowned_servers` and
+`_drop_unbacked_app_entries` for the PUT side.
 
 ## 2. Auto-approve is intersected with the governance ceiling
 
@@ -516,6 +568,35 @@ successful async startup hook that returns within the deadline is unaffected.
 
 Writer: `apps/lifecycle.py::LifecycleDispatcher._invoke`.
 
+After the hook sweep, graceful shutdown stops the backend **processes this
+gateway spawned** (`apps/hooks_integration.py::on_gateway_shutdown` →
+`stop_app_backend`). Spawned backends are gateway children: without this stop
+they reparent to PID 1 when the gateway exits and keep listening on their
+ports, and the startup stale-reap only recovers them at the **next** boot.
+Ordering is deliberate — hooks first, so an app's `on_shutdown` still has its
+own backend alive. Stop targets come from the runtime tracking table
+(`apps/backend.py::spawned_backend_names`), never from persisted `enabled`
+metadata: the metadata filter is wrong in both directions (it would signal an
+**adopted** externally-managed backend, whose contract is to survive gateway
+exit and be re-adopted on the next start, and it would miss a still-running
+child whose app was disabled cross-process, metadata-only). Driving the sweep
+from the tracking table also keeps `stop_app_backend`'s pidfile-record erasure
+away from apps with nothing running, so a retained prior-generation orphan
+record stays recoverable by the stale-reap. The stops are offloaded to the
+subprocess executor and run **concurrently under one shared deadline**
+(`_BACKEND_STOP_BUDGET_SECS`, kept under the gateway's 10-second cooperative
+shutdown budget): a serial sweep would multiply the per-app SIGTERM grace by
+the number of apps, and the supervisor's force-exit would orphan every backend
+the sweep had not reached. The sweep runs in a `finally` around hook dispatch,
+so a wedged or failing `on_shutdown` hook (dispatch awaits an invoked hook to
+completion) cannot skip it — the shutdown deadline's cancellation still reaches
+the sweep on its way out. The stop futures are shielded from the deadline: the
+executor is shared with the rest of shutdown, so a stop can still be queued
+when the budget fires, and cancelling it then would mean that backend is never
+signalled at all — instead the sweep returns and the stops finish in the
+background. The sweep is not gated on the lifecycle dispatcher being
+initialized, and one app's failing stop does not skip the rest.
+
 ## 8. An app's EventBus only exists with a real broadcast function
 
 `build_app_context` returns `events=None` when `broadcast_fn` is None, and
@@ -740,6 +821,22 @@ flagged, selection falls back to a
 deterministic order (hero art, then verified publishers, then name), so the
 surface is never empty and never arbitrary.
 
+`stargazersCount` follows the same precedent, because it is a trust cue: only
+the official catalog's publish step may mint it (baked at publish for
+git-source entries from the GitHub API, bounded to the JS safe-integer range),
+and `_apply_trust_fields` strips it entirely from external rows — an external
+index self-reporting a count would render identically to a publisher-verified
+one, and a false trust cue is worse than none. Client-side the count enters
+through `official_catalog.inventory()` **alone**: the one projection where a
+row's identity (repository) and its count come from the same catalog entry.
+`annotate()` matches rows by name — a same-name seed row can pin a different
+repository, so it never overlays the count — and the cache-served
+`list_catalog_rows()` never carries it (the cache is agent-writable). The
+count is **frozen at publish time**: it refreshes only when the catalog
+republishes (each publish re-fetches; the content-digest revision changes
+with it), so it is a trust-scale indicator, not a live metric. Absence means
+"unknown" and renders nothing — never zero.
+
 Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
 `_DEFAULT_ON_BACKFILL`, `register_builtin_apps`, `backfill_default_on_builtins`),
 `agent.py::run_first_run_setup`, `apps/discovery.py::discover_builtin_apps`,
@@ -773,7 +870,9 @@ Three tiers. Tier 0 (`dashboard`, `refresh`, `update_progress`) carries no
 sensitive payload and always delivers — and that classification is a claim about
 CONTENT, so it has to be maintained: `_push_status` writes the `dashboard` frame
 straight to each socket every few seconds, and its payload is deliberately
-counts-and-environment only. The checkout's `branch`/`commit` are stripped for app
+counts-and-environment only. The `cron_jobs` and `lessons` counts are nullable:
+`null` means the gateway's count refresh has not succeeded yet (unknown), never
+zero — app consumers must treat `null` as "no data", not `0`. The checkout's `branch`/`commit` are stripped for app
 tokens (they say what the operator is working on and have no consumer outside the
 owner surfaces); `/api/status` and the SSE stream run on dashboard-user tokens and
 keep the full snapshot. Moving the whole frame behind a declaration was rejected:
@@ -896,11 +995,38 @@ with a compensating per-response control — event scoping is that control for
 returns owner hash, host specs, cron and usage stats, and the live safety-override
 state, and an app that wants it declares it in `permissions.api`.
 
+**Implicit self-ownership stops at the shared literal routes.** Beyond the
+declared `permissions.api` allowlist, `_app_owns_path` grants an app token
+implicit ownership of its own namespace on both the reverse-proxy/UI surface
+(`/apps/<name>/...`) and the per-app management surface (`/api/apps/<name>/...`),
+via a path-boundary match so `foo` cannot reach `foo-bar`. That implicit grant is
+carved back on the `/api/apps` surface for the literal first path segments that
+resolve to a SHARED route registered before the `/api/apps/{name}` catch-all:
+`RESERVED_APP_PATH_SEGMENTS` in `token_auth` holds `registry`, `registries`,
+`blob`, `install`, and `register`, and the `/api/apps/<name>` branch of
+`_app_owns_path` refuses to match when the app name is one of them. Without the
+carve-out an app that named itself after such a segment, for example `registries`,
+would implicitly own that segment's endpoints, including the state-changing
+`POST /api/apps/registries/refresh` that triggers outbound git fetches of every
+configured registry, with no `permissions.api` grant at all (CWE-269
+authorization bypass). The carve-out is the primary boundary and binds even an
+app already published under one of these names; the `/apps/<name>` reverse-proxy
+branch is a distinct namespace whose literal-page reservations live in
+`RESERVED_ROUTE_APP_NAMES` and is intentionally left unchanged. As
+defense-in-depth for NEW apps, `apps/manifest.py` mirrors the same set as
+`RESERVED_APP_PATH_SEGMENTS` and rejects those names at validation
+(`app_name_error`, `is_reserved_app_name`); reserving a name is a one-way door, so
+that backstop only refuses names not yet admitted while the carve-out covers any
+already-published one. The two sets are duplicated rather than shared to avoid a
+`manifest` <-> `token_auth` import cycle and must stay in sync with the
+`/api/apps/` literal routes in `apps/routes.py`.
+
 Writers: `dashboard/ws_event_scope.py`, `dashboard/ws.py` (connect-time scope
 resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
 `_serialize_for_client`, `SlotOrigin`), `dashboard/token_auth.py`
-(`_APP_TOKEN_IMPLICIT_ALLOW`, `app_token_path_allowed`), `apps/manifest.py`
-(`_granted_list`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
+(`_APP_TOKEN_IMPLICIT_ALLOW`, `app_token_path_allowed`, `_app_owns_path`,
+`RESERVED_APP_PATH_SEGMENTS`), `apps/manifest.py`
+(`_granted_list`, `RESERVED_APP_PATH_SEGMENTS`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
 for developer-facing diagnostics, drift-guarded by
 `website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
 authors: [../../../src/kiro_crew/docs/app-platform-trust-model.md](../../../src/kiro_crew/docs/app-platform-trust-model.md).
@@ -931,13 +1057,15 @@ navigation behind the CSRF middleware's back. The path sits outside
 `/api/apps/` because that namespace grants an app token implicit ownership of
 `/api/apps/<its-own-name>/*` (`token_auth._app_owns_path`): an app named
 `registry` must not inherit the power to purge the shared catalog caches. The
-same exposure applies to the pre-existing fixed-segment siblings under
-`/api/apps/` (`registries`, `install`, `register` — e.g.
-`POST /api/apps/registries/refresh` is claimable by an app named
-`registries`); closing that class — reserving the colliding segments as app
-names versus a carve-out at the `_app_owns_path` boundary — is a one-way-door
-decision deliberately deferred to #7111 rather than folded into this
-endpoint's addition. The
+same exposure reached the fixed-segment siblings that do stay under `/api/apps/`
+(`registries`, `install`, `register` — e.g. `POST /api/apps/registries/refresh`,
+claimable by an app named `registries`), and that whole class is now closed by
+`RESERVED_APP_PATH_SEGMENTS` (§13): the `_app_owns_path` carve-out refuses those
+segments outright, mirrored by a manifest-time name reservation. Route placement
+remains the stronger guarantee for a NEW shared endpoint, which is why this one
+keeps it — a path outside `/api/apps/` cannot collide with any app name at all,
+so it does not depend on a hand-maintained segment list staying in sync with the
+route table. The
 dashboard's refresh button
 also posts `/api/apps/registries/refresh` (the external-registry index sweep),
 then refetches, so both of the store's sources are rebuilt by one click.

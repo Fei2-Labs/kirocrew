@@ -842,6 +842,29 @@ describe('ActivityViewer — live model downgrade flag (#5326)', () => {
     expect(chip.title).toContain('claude-opus-4.7')
   })
 
+  it('exposes the downgrade fact via aria-label (not icon/colour only)', () => {
+    // The downgrade cue is an aria-hidden AlertCircle + amber colour + a title;
+    // assistive tech gets none of those, so the chip must carry an aria-label
+    // naming both the requested and the served model.
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.7',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    const label = chip.getAttribute('aria-label') || ''
+    expect(label).toContain('claude-opus-4.8')
+    expect(label).toContain('claude-opus-4.7')
+  })
+
   it('shows normal chip when requestedModel is absent', () => {
     renderPanel(
       <ActivityViewer

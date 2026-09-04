@@ -25,12 +25,14 @@ from kiro_crew.platform.context import (
 from kiro_crew.platform.defaults import (
     DefaultAgentCatalogProvider,
     DefaultAgentExecutableResolver,
+    DefaultAgentIdentityProvider,
     DefaultAgentRuntime,
     DefaultAppRegistryPolicy,
     DefaultAppsLoader,
     DefaultCapabilityManager,
     DefaultCredentialPolicy,
     DefaultDashboardContributor,
+    DefaultDeniedRuleProvider,
     DefaultEmbeddingSource,
     DefaultExternalAccessPolicy,
     DefaultIdentityProvider,
@@ -44,6 +46,7 @@ from kiro_crew.platform.defaults import (
     DefaultProviderRegistry,
     DefaultPublishRegistry,
     DefaultSandboxPolicy,
+    DefaultSkillDiscoveryProvider,
     DefaultSlackEnterpriseGate,
     DefaultTelemetryProvider,
     DefaultTunnelProvider,
@@ -134,10 +137,13 @@ def build_default_context(
         security=PolicyAuthority(),  # _NullOverlay → baseline only
         slack_gate=DefaultSlackEnterpriseGate(),
         identity=DefaultIdentityProvider(),
+        agent_identity=DefaultAgentIdentityProvider(),
         embeddings=DefaultEmbeddingSource(),
         mcp_tooling=DefaultMcpToolingProvider(),
         agent_catalog=DefaultAgentCatalogProvider(),
         prompt_sources=DefaultPromptSourceProvider(),
+        skill_discovery=DefaultSkillDiscoveryProvider(),
+        denied_rules=DefaultDeniedRuleProvider(),
         import_sources=DefaultImportSourceProvider(),
         capability_manager=DefaultCapabilityManager(),
         external_access=DefaultExternalAccessPolicy(),
@@ -220,9 +226,9 @@ def bootstrap_context(cfg: "KiroCrewConfig") -> PlatformContext:
 
     # Register any edition-contributed ACP backends now that the context is
     # installed.  The Default ProviderRegistry.register_acp_backends() is a
-    # no-op (standalone ships Kiro-CLI-ACP only), so this is a no-op for the
-    # public edition; the Amazon companion re-registers a Claude backend through
-    # the dormant ACP_BACKEND_CLAUDE seam here.  Best-effort — a
+    # no-op: the public edition's selectable set is the baseline in
+    # ``acp_backends``, which already covers every KNOWN backend, so an edition
+    # only needs this seam for a harness the core does not ship.  Best-effort — a
     # backend-registration failure must not abort boot (the provider factory
     # still resolves).
     try:

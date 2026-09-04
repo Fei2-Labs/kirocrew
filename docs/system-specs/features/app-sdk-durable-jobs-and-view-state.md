@@ -62,10 +62,10 @@ The registry is an app implementation, not an App SDK surface.
 
 Dev Fleet tracks run descriptors in the module-memory `_RUNS` registry and
 keeps active tasks and subprocesses in `_ACTIVE_RUNS`
-(`src/kiro_crew/apps/builtins/dev_fleet/server.py`, `_RUNS` and `_ACTIVE_RUNS`).
+(`src/kiro_crew/apps/builtins/dev_fleet/runtime.py`, `_RUNS` and `_ACTIVE_RUNS`).
 Its fleet payload overlays `sync_run_id` and per-worktree provision run IDs at
 request time in `_with_live_run_pointers`; `DevFleetPage` uses those pointers
-to reattach a mounted page to a current run (`server.py`,
+to reattach a mounted page to a current run (`http_api.py`,
 `_with_live_run_pointers`; `website/src/pages/DevFleetPage.tsx`, sync and
 provision reattach effects).
 
@@ -73,9 +73,63 @@ The run records and pointers are process memory, so this reattachment applies
 within the current gateway process rather than supplying restart durability.
 During `dev_fleet_cleanup`, the app closes admission for new runs, snapshots
 active work, and kills tracked process trees (`server.py`,
-`dev_fleet_cleanup` and `_kill_tree`). That cleanup prevents a stopped gateway
+`dev_fleet_cleanup`; `runtime.py`, `_kill_tree`). That cleanup prevents a stopped gateway
 from leaving Dev Fleet subprocesses behind; it also shows why a durable record
 cannot imply that its original process is still executable.
+
+## Job SDK process scope
+
+`JobSDK` records the liveness of the gateway process. `_ORIGIN` is minted once per
+gateway process, a run's worker is a thread in that process, and `reconcile`
+resolves every non-terminal record whose origin is not the current `_ORIGIN`
+(`src/kiro_crew/apps/job_sdk.py`, `_ORIGIN`, `JobSDK.start`, `JobSDK._execute`, and
+`JobSDK.reconcile`). Staleness is decided by one question: whether the gateway
+process that minted the record survived.
+
+An app declaring `backend.entryPoint` does not execute its work in that process.
+`start_app_backend` spawns the backend under `popen_limited` as a separate OS
+process with its own interpreter and rlimit profile
+(`src/kiro_crew/apps/backend.py`, `start_app_backend`), and that app's teardown
+hook runs on the backend's own aiohttp application rather than the gateway's
+(`src/kiro_crew/apps/builtins/dev_fleet/app.json`, `backend.entryPoint`;
+`dev_fleet/server.py`, `dev_fleet_cleanup` registered on `on_cleanup`).
+`JobSDK.register` binds a kind to a Python callable held in the gateway
+(`job_sdk.py`, `JobSDK.register`), so a runner defined in a backend process has no
+registration path.
+
+Together the two produce a record that contradicts the work it describes. At
+gateway startup `_reap_stale_app_backends` terminates a backend left by a prior
+gateway generation only when the pid's identity positively matches the recorded
+one; when identity cannot be confirmed the pid is left alone (`backend.py`,
+`_reap_stale_app_backends`). A backend spared by that check keeps executing, and
+the new gateway's reconciliation marks its runs `INTERRUPTED`, recording that the
+gateway restarted while the run was executing and that no runner is registered for
+its kind — a backend-process runner has no registration path, so the resolved
+record's `interrupt_cause` is `runner_unregistered` (`job_sdk.py`,
+`JobSDK.reconcile` and `CAUSE_RUNNER_UNREGISTERED`).
+`INTERRUPTED` is a member of `TERMINAL_STATES`, so that record is neither
+reconciled again nor resumed (`job_sdk.py`, `TERMINAL_STATES`).
+
+This scope is load-bearing: an app whose run registry is process memory reports
+nothing after a restart, and reporting nothing is accurate, while a durable record
+written from a process that does not own the work reports a run as ended when it
+has not ended. Dev Fleet's registry is the process-memory case (see "Dev Fleet
+runs"). `JobSDK` describes work that the gateway process itself executes.
+
+A durable `running` record and a process actually owning the work are therefore
+two separate facts, and the public view serves both.
+`JobSDK.cancelling_and_live_ids` returns the `cancelling` and `live` run id
+sets under a single lock acquisition, so the two fields describe one instant;
+`live` is live-table membership — claimed at start, dropped after the terminal
+write — the same authority that `cancel` and `reconcile` already consult
+(`src/kiro_crew/apps/job_sdk.py`, `JobSDK.cancelling_and_live_ids`).
+`_public_view` serves that as the boolean `live` field, computed at read time
+from memory — nothing new is persisted, and `origin` and `pid` stay withheld
+(`src/kiro_crew/apps/job_routes.py`, `_public_view`). A record whose terminal
+write failed twice and a record minted by another gateway process both read
+`live: false`, which is what lets an API consumer tell a stale `running`
+record from real work between the reconciliation passes that would eventually
+resolve it.
 
 ## View position is not an App SDK contract
 

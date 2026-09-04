@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 from dataclasses import fields
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -46,10 +47,18 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
+    PROVIDER_LABEL_CODEX,
     PROVIDER_LABEL_DEFAULT,
     PROVIDER_LABELS_BY_BACKEND,
 )
-from kiro_crew.acp_backends import BASELINE_SELECTABLE_BACKENDS, selectable_backends
+from kiro_crew.acp_backends import (
+    ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_KIRO_SLASH_COMMANDS,
+    ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
+    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    BASELINE_SELECTABLE_BACKENDS,
+    selectable_backends,
+)
 from kiro_crew.config.loader import AgentConfig, _normalize_acp_backend
 from kiro_crew.providers import acp as providers_acp
 
@@ -97,30 +106,37 @@ def test_kiro_is_always_selectable() -> None:
 
 
 def test_initial_adapter_selection_is_limited_to_reviewed_backends() -> None:
-    """H1: discovery does not advertise an adapter before basic validation.
+    """H1: discovery does not advertise an adapter with no install probe.
 
-    Claude, Codex, goose, pi, and registry-only adapters remain described so
-    their integration work can continue. Claude is withheld until its settings
-    cleanup can preserve an operator's pre-existing project file. Codex is
-    withheld because its read-only mode does not permission-route passive
-    reads, so the standard sandbox cannot enforce the sensitive-path floor for
-    that backend.
+    Claude IS admitted: ``acp/client.py`` owns its whole spawn path, the adapter is
+    a public npm package, and ``agent_sdk/backend_install.py`` probes for it — so
+    the switch has something to say when a session fails to start. Adopted from
+    upstream at the 2026-09-04 sync.
 
-    FORK DIVERGENCE: upstream's staged admission withholds everything but
-    kiro/kas. This fork additionally admits ``ACP_BACKEND_COPILOT`` and
-    ``ACP_BACKEND_OPENCODE`` — unlike claude, they are not dormant/companion-only
-    seams: the fork's core resolves and spawns ``copilot --acp`` / ``opencode acp``
-    directly and both have been driven end to end (see ``acp/types.py``'s own
-    comment above ``ACP_BACKENDS_SELECTABLE`` for the per-backend verification
-    notes on the still-withheld set).
+    Codex, goose and pi stay withheld, and the reason is recorded once in
+    ``acp_backends.NOT_SHIPPED_SELECTABLE``: ``_PROBES`` has no entry for them, so
+    their readiness verdict is ``UNKNOWN`` with nothing an operator could act on.
+
+    FORK DIVERGENCE: the fork additionally admits ``ACP_BACKEND_COPILOT`` and
+    ``ACP_BACKEND_OPENCODE`` — the fork's core resolves and spawns
+    ``copilot --acp`` / ``opencode acp`` directly and both have been driven end to
+    end here.
+
+    Admission entitles a backend to no capability set; every ``ACP_BACKENDS_*``
+    membership stays a separate opt-in decision (H6).
     """
     assert selectable_backends() == frozenset(
         {
             ACP_BACKEND_KIRO,
             ACP_BACKEND_KAS,
+            ACP_BACKEND_CLAUDE,
             ACP_BACKEND_COPILOT,
             ACP_BACKEND_OPENCODE,
         }
+    )
+    # The withheld ids are withheld by being NAMED, not by omission.
+    assert selectable_backends() == acp_backends.ACP_BACKENDS_KNOWN - (
+        acp_backends.NOT_SHIPPED_SELECTABLE
     )
 
 
@@ -144,9 +160,12 @@ def test_unselectable_backend_degrades_to_kiro(persisted: object) -> None:
     Includes the non-string shapes a hand-edited config.json can hold: a gate
     that raises here turns a typo into a gateway that will not boot.
 
-    ``claude`` is in the list on purpose: it is a KNOWN id that this build does not
-    register, and the one gate reads the registry, so it degrades like any other
-    unselectable value. Registering it is what makes it survive.
+    ``claude`` is in the list on purpose, and now for the opposite reason: it ships in
+    the public baseline, so it must SURVIVE rather than degrade. The assertion below is
+    conditional on membership precisely so this row proves the gate reads the registry
+    instead of hardcoding a verdict. ``byo-harness`` covers the unknown-id case, and a
+    known id that policy has denied is covered in
+    ``test_agent_backend_governance.py``.
     """
     resolved = _normalize_acp_backend(persisted)
     assert resolved in selectable_backends()
@@ -162,16 +181,34 @@ def test_registering_a_backend_makes_it_survive_load() -> None:
     moment ago now survives, with no second gate and no code change anywhere else.
     Ordering is the edition's to get right -- registration must precede the first
     config load.
+
+    Claude Code is in the baseline (adopted from upstream at the 2026-09-04 sync),
+    so the degrading starting state is CONSTRUCTED by the discards below rather than
+    borrowed from an unshipped id. The post-restore assertion reads the snapshot, so
+    it stays correct whichever backends the build ships.
+    Both module sets are snapshotted: ``register_selectable_backend`` writes
+    the baseline too, and restoring only the effective set would leak a widened
+    baseline into the rest of the run.
     """
-    assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
+    baseline_before = set(acp_backends._baseline)
     before = set(acp_backends._selectable)
     try:
+        acp_backends._baseline.discard(ACP_BACKEND_CLAUDE)
+        acp_backends._selectable.discard(ACP_BACKEND_CLAUDE)
+        assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
+
         acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)
         assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_CLAUDE
     finally:
+        acp_backends._baseline.clear()
+        acp_backends._baseline.update(baseline_before)
         acp_backends._selectable.clear()
         acp_backends._selectable.update(before)
-    assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == ACP_BACKEND_KIRO
+    # The restore really restored: the gate reads the registry per call, so claude
+    # normalizes to itself iff it is selectable again. Expressed against the
+    # snapshot rather than a literal, so it holds whichever backends the build ships.
+    expected = ACP_BACKEND_CLAUDE if ACP_BACKEND_CLAUDE in before else ACP_BACKEND_KIRO
+    assert _normalize_acp_backend(ACP_BACKEND_CLAUDE) == expected
 
 
 def test_config_load_never_reads_the_platform_context(monkeypatch) -> None:
@@ -257,6 +294,23 @@ def test_steer_is_opt_in() -> None:
     assert ACP_BACKEND_CODEX not in ACP_BACKENDS_STEER
     assert ACP_BACKEND_OPENCODE not in ACP_BACKENDS_STEER
     assert ACP_BACKEND_PI not in ACP_BACKENDS_STEER
+
+
+def test_mcp_config_hot_reload_is_opt_in() -> None:
+    """H6: skipping the post-sync session reset is claimed by membership.
+
+    The gate must read the set — a harness added to ``ACP_BACKENDS_KNOWN`` must
+    not inherit the skip, because a wrong member leaves a freshly installed
+    server unmounted with nothing red to say why. KAS receives its servers on
+    ``session/new`` and claude reads no agent file, so neither is a member.
+    """
+    from kiro_crew import mcp_hot_reload
+
+    source = inspect.getsource(mcp_hot_reload.mcp_hot_reload_supported)
+    assert "ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD" in source
+    assert ACP_BACKEND_KIRO in ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD
+    assert ACP_BACKEND_KAS not in ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD
+    assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD
 
 
 def test_steer_capability_declares_its_stamp() -> None:
@@ -478,6 +532,181 @@ def test_every_known_backend_has_a_label() -> None:
         "PROVIDER_LABELS_BY_BACKEND"
     )
     assert len(set(labels.values())) == len(labels), "two backends share a label"
+
+
+def test_codex_is_known_but_not_shipped_selectable() -> None:
+    """H1/H8: a switch a build cannot answer for must not be offered by default.
+
+    This is not the stance ``claude`` has: claude is baseline-selectable because
+    ``client.py`` owns its spawn path and its adapter is a public npm package —
+    both true of codex now too. What codex still lacks is the other half,
+    ``backend_install.py``'s probe: without one its install row can only read
+    ``unknown``, so a failed session arrives with nothing to act on.
+    ``register_selectable_backend`` is the way in until that probe lands.
+    """
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_KNOWN
+    assert ACP_BACKEND_CODEX not in BASELINE_SELECTABLE_BACKENDS
+    assert ACP_BACKEND_CODEX not in selectable_backends()
+
+
+def test_codex_carries_its_own_provider_label() -> None:
+    """H11: the label is what keeps a codex session out of the kiro namespace.
+
+    Resume compatibility, session-map persistence and session-file cleanup all index
+    this key, so a codex session labelled ``acp`` would be resumed as kiro and then
+    pruned for want of a kiro transcript.
+    """
+    client = MagicMock()
+    client.backend = ACP_BACKEND_CODEX
+    provider = MagicMock(spec=providers_acp.AcpProvider)
+    provider.client = client
+    # Set on the PROVIDER, not only the client: provider_label resolves identity
+    # from the provider's own backend string and never reaches through to the live
+    # client (H14), so a client-only id would leave this reading the mock.
+    provider.backend = ACP_BACKEND_CODEX
+    assert providers_acp.provider_label(provider) == PROVIDER_LABEL_CODEX
+    assert PROVIDER_LABEL_CODEX != PROVIDER_LABEL_DEFAULT
+
+
+def test_model_switch_channel_is_opt_in() -> None:
+    """H6: the config-option model channel is granted by membership, not negation.
+
+    kiro-cli switches models with ``session/set_model``; the claude and codex
+    adapters implement no such request and expose the model as a session config
+    option instead. Read as ``not is_kiro`` this would hand the config-option path
+    to every harness added later, and a harness that implements neither would
+    silently no-op its model switch.
+    """
+    assert ACP_BACKEND_CLAUDE in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
+    assert ACP_BACKEND_KIRO not in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
+    assert ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION <= ACP_BACKENDS_KNOWN
+    source = "\n".join(
+        (
+            inspect.getsource(acp_client.AcpClient.set_model),
+            inspect.getsource(acp_client.AcpClient._apply_startup_model),
+        )
+    )
+    assert (
+        "ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION" in source
+    ), "the model switch must read the membership set, not a per-backend literal"
+
+
+def test_effort_channel_is_opt_in() -> None:
+    """H6: the effort channel is granted by membership, not by "not claude".
+
+    The two channels are separate opt-ins because a harness can have neither. Read
+    as ``not is_claude_backend``, an adapter harness is handed kiro's ``/effort``
+    slash command, which rides ``_kiro.dev/commands/execute`` — a verb it does not
+    implement — so the push fails -32601 and the dashboard resets the session.
+    """
+    assert ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION <= ACP_BACKENDS_KNOWN
+    assert ACP_BACKENDS_KIRO_SLASH_COMMANDS <= ACP_BACKENDS_KNOWN
+    # Disjoint: a harness must not be told to push effort down both channels.
+    assert not (ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION & ACP_BACKENDS_KIRO_SLASH_COMMANDS)
+    assert ACP_BACKEND_KIRO in ACP_BACKENDS_KIRO_SLASH_COMMANDS
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+    assert ACP_BACKEND_CODEX not in ACP_BACKENDS_KIRO_SLASH_COMMANDS
+    source = "\n".join(
+        (
+            inspect.getsource(providers_acp.AcpProvider.change_effort),
+            inspect.getsource(providers_acp.AcpProvider.clear_effort),
+            inspect.getsource(providers_acp.AcpProvider._apply_effort_overlay),
+            inspect.getsource(providers_acp.AcpProvider._apply_tool_search_overlay),
+            inspect.getsource(providers_acp.AcpProvider.stream_command),
+        )
+    )
+    assert "is_claude_backend" not in source, (
+        "the effort, overlay and slash-command seams must read a membership set; "
+        "a claude test here decides the path for every harness added later"
+    )
+
+
+def test_only_overlay_readers_are_written_to() -> None:
+    """H6: the cli.json overlay is written only for the harnesses that read it.
+
+    The clear side (``_clear_cli_overlay_effort``) is membership-gated, so a write
+    gated on anything wider leaves a stale overlay in the user's workspace that no
+    later clear can reach — and the overlay names an effort level, so a harness
+    that DOES read the file later inherits a level nobody set for it.
+    """
+    for fn in (
+        providers_acp.AcpProvider._apply_effort_overlay,
+        providers_acp.AcpProvider._apply_tool_search_overlay,
+    ):
+        source = inspect.getsource(fn)
+        assert (
+            "ACP_BACKENDS_KIRO_SLASH_COMMANDS" in source
+        ), f"{fn.__name__}: overlay write is not scoped to the overlay's readers"
+
+
+def test_codex_spawn_keeps_its_own_branch() -> None:
+    """H9/H10: codex resolves its own adapter and declares its own handshake.
+
+    Falling through to the kiro branch would spawn kiro-cli under a codex label —
+    the exact failure ACP_BACKENDS_KNOWN's rejection exists to prevent one step
+    earlier — and folding its protocol version into the claude literal would make a
+    future divergence a silent downgrade for whichever harness moved first.
+
+    FORK DIVERGENCE: upstream resolves the adapter with an in-client
+    ``_resolve_codex_acp_bin``. This fork routes the same step through its own
+    ``kiro_crew.acp.codex`` module, which additionally enforces a Node-MAJOR floor
+    (codex-acp 1.4.0 dies on Node 16). The resolver NAME is what changed; the
+    invariant is unchanged, so it is pinned at the fork's resolver. Do not
+    "restore" upstream's symbol here on a later sync — that silently drops the
+    Node floor — and do not relax it to a bare ``"codex" in spawn_source``, which
+    a comment would satisfy.
+    """
+    spawn_source = inspect.getsource(acp_client.AcpClient._spawn)
+    assert "_is_codex" in spawn_source
+    assert "resolve_argv_cached" in spawn_source
+    assert "acp import codex" in spawn_source or "acp.codex" in spawn_source
+    assert acp_client.PROTOCOL_VERSION_CODEX is not None
+    # FORK DIVERGENCE: the per-backend wire contract lives in the module-level
+    # ``_wire_contract_for_backend`` rather than inline in ``_initialize_session``.
+    # Both halves are pinned so the extraction cannot decay: codex's OWN literal is
+    # in the contract table, and the handshake still reaches that table instead of
+    # carrying a second copy that could drift.
+    contract_source = inspect.getsource(acp_client._wire_contract_for_backend)
+    assert "PROTOCOL_VERSION_CODEX" in contract_source
+    assert (
+        "PROTOCOL_VERSION_CLAUDE" in contract_source
+    ), "codex must keep its own literal rather than share the claude one (H10)"
+    assert "_wire_contract_for_backend" in inspect.getsource(
+        acp_client.AcpClient._initialize_session
+    )
+
+
+def test_each_mcp_seam_is_spliced_only_for_its_own_harness() -> None:
+    """H6: a per-harness hook must not reach a session of a different harness.
+
+    Both defaults return ``[]``, so an ungated splice is inert in this tree — but an
+    edition that overrides both hooks would hand a claude session codex's server
+    entries and vice versa, and an entry whose transport the adapter does not
+    advertise fails the whole ``session/new`` rather than being skipped. Pinned at
+    the source, in the file's existing idiom, because the splice sits inside an
+    async session-setup path with no unit-level seam.
+    """
+    for fn in (
+        acp_client.AcpClient._new_session_following_substitution,
+        acp_client.AcpClient._initialize_session,
+    ):
+        source = inspect.getsource(fn)
+        if "_codex_session_mcp_servers" not in source:
+            continue
+        assert "if self._is_codex" in source, f"{fn.__name__}: codex seam spliced ungated"
+        assert "if self._is_claude" in source, f"{fn.__name__}: claude seam spliced ungated"
+
+
+def test_codex_mcp_seam_defaults_to_empty() -> None:
+    """The public core sends no mcpServers for codex, exactly as for claude.
+
+    kiro-cli receives its servers through ``--agent``; an edition overrides the seam.
+    A non-empty default here would put servers on a public session that the adapter
+    was never configured for.
+    """
+    client = acp_client.AcpClient.__new__(acp_client.AcpClient)
+    assert client._codex_session_mcp_servers() == []
 
 
 def test_model_preflight_allows_unknown_advertised_set() -> None:

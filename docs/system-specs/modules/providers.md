@@ -77,6 +77,11 @@ Provider-agnostic event dataclass (aliased from `AcpEvent`):
 | `mcp_server_initialized` | MCP server ready after OAuth (has `server_name`) |
 | `mcp_server_init_failure` | MCP server OAuth/init failed (has `server_name`, `text`) |
 
+Terminal events also carry `synthetic_completion`. It is false for a provider's
+raw result frame and true when Kiro Crew fabricates a compatibility terminal
+because the result frame never arrived; consumers that account completed work
+must require the raw form.
+
 ### ACP providers (`providers/acp.py`)
 
 The public provider family speaks JSON-RPC 2.0 over stdio. `AcpProvider` is the
@@ -125,7 +130,7 @@ support through the `LLMProvider` defaults rather than probing concrete clients
 - `context_usage_pct()` → reads `last_prompt_stats.context_pct`
 - `context_window_tokens()` → reads `last_prompt_stats.context_window_tokens` (the real served window from `usage_update.size`, 0 if unknown). Used by the dashboard token text instead of re-deriving the window from the model id. A mid-session `set_model` (live switch on both `AcpClient` and `AcpSessionHandle`) rebases these stats via `AcpPromptStats.rebase_to_window`: the window is re-derived from `model_registry.model_window` (0 on a registry miss), `context_used_tokens` is kept, `context_pct` is recomputed and clamped, and `context_tokens_from_usage` is cleared so the next metadata `contextUsagePercentage` can backfill against the NEW model instead of being gated forever by the old model's `usage_update`. The dashboard model-switch endpoint then broadcasts one `context_usage` WS event with `reset: true` (both live-switch and session-reset paths, single and bulk), which lets the frontend reducer replace or delete its stored per-slot token counts — per-turn events without `reset` never delete. The post-compaction pct-0 broadcast carries the same flag.
 - `rate_limit_payload()` → `last_prompt_stats.rate_limit.to_payload()`, or `None` when the harness reports no plan quota (the ABC default, which is most of them). A capability on the ABC with a safe default rather than a `hasattr` probe at the call site (H8): `_context_usage_payload` gates on `isinstance(client, LLMProvider)` and attaches the dict to the existing `context_usage` WS frame under `rate_limit`. The KEY'S PRESENCE is the frontend's "this harness has a quota" signal, so an empty reading is omitted rather than sent as `{}`; a `reset` on the same frame does not clear it (compaction changes the transcript, not the account). The dashboard renders it as a section of the context popover. One known gap: the reading is held only in the live provider's stats, so a page reload shows no quota row until the next turn's frame restores it — the slot-detail context seed does not carry it.
-- `compact()` → sends `/compact` via `send_command()`
+- `compact()` → sends `/compact` via `send_command()`. The **dashboard's** manual `/compact` gates on `ACP_BACKENDS_COMPACT` first, as a pre-acquisition local command: the live session's `manual_compact_unsupported_backend` capability property (declared on the `LLMProvider` ABC with a `None` (supported) default per harness-parity H14, answered by the ACP implementations from set membership) is peeked when a session exists, else the same `agent.acp_backend` config the factory would build one with — so a refused `/compact` behaves as if the turn never started (no session created, no Slack OPTIONS expired, no one-shot turn state consumed). The reply is informational — the backend manages compaction automatically, mirroring the `cc_managed` relationship — not an error: kiro-cli answers the prompt with `_kiro.dev/compaction/status` and claude-agent-acp compacts natively in-prompt, but KAS treats the prompt as ordinary text and never emits a status, so an ungated manual `/compact` would strand `wait_for_compaction()` for the full `COMPACT_WAIT_TIMEOUT_SECS` (#7800). The **auto-compact** path consults the same capability from the compaction gate ladder (`session_compaction._compact_unsupported_backend`) and declines with `"compact_unsupported"` before the compaction task is scheduled, so no `/compact` is dispatched and the turn semaphore is never acquired — an ungated dispatch stranded the status wait for the whole `COMPACT_WAIT_TIMEOUT_SECS` while HOLDING that semaphore and then recycled the session (#7812). The **messaging-surface** `/compact` commands (Slack, Telegram, Discord, Webex, Teams, Feishu, iMessage, WeCom, Weixin and WhatsApp) gate on the same capability through `messaging.commands.compact_unsupported_backend` before dispatching, answering with `compact_unsupported_reply` (translated on the Chinese-language surfaces, plain-voiced on iMessage and WhatsApp); their context-threshold notices decline silently on such a backend — no forced hard-threshold compaction to run, and no soft nudge whose `/compact` advice cannot work (#8156). Gating covers only command dispatch — KAS auto-summarization frames keep mapping to compaction status.
 - `cancel()` → sends `session/cancel` notification
 - `supports_effort()` / `change_effort(level)` / `clear_effort()` → reasoning-effort control (see below)
 - `is_alive()` → `AcpClient.is_responsive()` (600s stale threshold)
@@ -246,17 +251,25 @@ but capabilities not independently measured against KAS are `UNVERIFIED` rather
 than copied from kiro-cli. Known absences remain `UNAVAILABLE`; both states stay
 fail-closed in code while the Settings page and doctor report why.
 
-Selectability is deliberately NOT in the descriptor. It stays in
-`ACP_BACKENDS_SELECTABLE` so there is exactly one answer to "may an operator
-persist this value", and a descriptor cannot drift from it. The initial preview
-admits only Kiro CLI and KAS. Claude, Codex, goose, OpenCode, pi, and registry-only
-adapters remain described and discoverable but cannot be persisted until their
-validation evidence admits them to the set. Claude's routing seed can merge into
-an existing project settings file, while its current reset path unlinks that whole
-file; it stays withheld until cleanup preserves operator-owned state. Codex's
-`mode=read-only` blocks writes but does not permission-route passive reads; because
-the standard sandbox leaves credential homes readable, that is not enough evidence
-for admission. KAS is fully described and is selectable (cli-fronted via `kiro-cli`).
+Selectability is deliberately NOT in the descriptor. It stays in the
+`acp_backends` registry (`selectable_backends()`) so there is exactly one answer
+to "may an operator persist this value", and a descriptor cannot drift from it.
+`BASELINE_SELECTABLE_BACKENDS` is DERIVED as `ACP_BACKENDS_KNOWN` minus the ids
+named in `NOT_SHIPPED_SELECTABLE`, so a backend is selectable unless a reason is
+written down next to it. The baseline therefore admits Kiro CLI, KAS, Claude Code,
+GitHub Copilot and OpenCode. Codex, goose and pi are the named exclusions, and the
+criterion is Stage 5 of [harness-onboarding.md](harness-onboarding.md): whether
+`agent_sdk/backend_install.py` carries an install probe. `_PROBES` covers kiro,
+kas and claude only, so a codex/goose/pi switch would render with nothing to say
+about a session that failed to start — a build that cannot run a harness is a
+different claim from a machine that has not installed it, and the probe answers
+the second. Registry-only adapters stay described and discoverable without being
+persistable. Claude is admitted because `acp/client.py` owns its whole spawn path,
+the adapter is a public npm package, and both of its components are probed; its
+routing seed can merge into a project settings file the operator already owned, so
+the seed and reset paths preserve operator-owned state rather than the switch being
+withheld for it. KAS is fully described and is selectable (cli-fronted via
+`kiro-cli`).
 Mid-turn steer is measured and granted (`ACP_BACKENDS_STEER`); session sharing
 stays fail-closed until keep-aware teardown lands. Spec-adapter steer degrades to
 follow-up.
@@ -279,8 +292,12 @@ the dashboard offers Auto only when that live session advertised it),
 `SEEDED_SETTINGS` `permission: ask` seed), `acp/tool_gate.py` (routing verdicts
 and enforcement), `acp/spec_agent_guard.py` (agent-profile fail-closed guard),
 `acp/doctor.py` (doctor rows). The withheld spec adapters that resolve ROUTED
-(goose, OpenCode, pi) are ready to start without the ungated-tools opt-out once
-they are admitted to the selectable set. Crew MCP is
+(goose, OpenCode, pi) resolve ROUTED and start without the ungated-tools opt-out;
+goose and pi are withheld from the baseline for the install-probe reason above,
+not a routing one. Claude is SEEDED_SETTINGS: `tool_gate.enforce` writes the
+`permissionMode` seed before `session/new`, reads it back, and a session whose
+verdict is anything but ROUTED — INDETERMINATE included — refuses unless
+`agent.acp_backend_allow_ungated_tools` is set. Crew MCP is
 delivered only when routing is established before `session/new`: OpenCode and pi
 receive it; goose does not because its `approve` pin is acknowledged only after
 the session exists. Codex remains withheld even though its post-session

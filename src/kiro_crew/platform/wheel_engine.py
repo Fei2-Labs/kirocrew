@@ -697,6 +697,9 @@ def verify_shadow_venv(shadow_dir: Path, expected_version: str) -> None:
             [
                 str(shadow_python),
                 "-I",
+                # -B: -I implies -E, so PYTHONPYCACHEPREFIX cannot reach this
+                # child. See ``sandbox._LAUNCHER_INTERPRETER_FLAGS``.
+                "-B",
                 "-X",
                 "utf8",
                 "-c",

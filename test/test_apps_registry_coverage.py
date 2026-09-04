@@ -2346,3 +2346,36 @@ class TestInstallFromRegistryRefusals:
         assert result["ok"] is False
         assert result["code"] == "app_execution_denied"
         assert "needs a trust grant" in result["error"]
+
+
+class TestForkUxRemovalsSurviveAnUpstreamSync:
+    """The two builtin-app removals this fork ships, pinned so a sync cannot undo them.
+
+    Both are deliberate fork divergences recorded in ``.fork-sync.yml`` under
+    ``divergences/fork-ux-removals``, and both were carried for several syncs with
+    NOTHING asserting them — an upstream merge that restored either would have gone
+    green and shipped an app the fork removed on purpose. Recording a divergence in
+    prose does not defend it; only an assertion does.
+
+    Deliberately read from the packaged tree rather than through ``registry``: what
+    ships is what is on disk, and the App Store grid reads ``hidden`` straight out of
+    the manifest.
+    """
+
+    def _builtins_dir(self) -> Path:
+        import kiro_crew
+
+        return Path(kiro_crew.__file__).parent / "apps" / "builtins"
+
+    def test_the_board_app_stays_removed(self) -> None:
+        assert not (self._builtins_dir() / "board").exists(), (
+            "the Board app is a deliberate fork removal; an upstream sync restored it"
+        )
+
+    def test_channels_stays_hidden_from_the_app_store(self) -> None:
+        manifest = self._builtins_dir() / "channels" / "app.json"
+        assert manifest.is_file(), "the Channels app manifest is missing"
+        assert json.loads(manifest.read_text(encoding="utf-8")).get("hidden") is True, (
+            "Channels is hidden from the App Store grid in this fork; "
+            "an upstream sync un-hid it"
+        )

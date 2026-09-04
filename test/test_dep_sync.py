@@ -1002,7 +1002,11 @@ def test_every_interpreter_probe_runs_isolated_with_a_neutral_cwd(tmp_path):
     for cmd, kwargs in seen:
         assert cmd[0] == str(target)
         assert cmd[1] == "-I", "probe must run the interpreter isolated"
-        assert cmd[2:4] == ["-X", "utf8"], (
+        assert cmd[2] == "-B", (
+            "-I implies -E, so PYTHONPYCACHEPREFIX cannot reach this child and "
+            "its bytecode would land inside the signed bundle"
+        )
+        assert cmd[3:5] == ["-X", "utf8"], (
             "-I implies -E, so the UTF-8 pin must ride the argv -- an env "
             "PYTHONIOENCODING is ignored and a non-ASCII path would come "
             "back locale-mangled"
@@ -1103,12 +1107,11 @@ def test_module_imports_stdlib_only():
             roots.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             roots.add(node.module.split(".")[0])
-    # Both names of the TOML ladder are allowed, and neither weakens the check:
-    # `tomllib` IS stdlib, but only from 3.11 — on the 3.10 interpreter this
-    # project still supports it is absent from `sys.stdlib_module_names`, so
-    # deriving the allowance from the running interpreter would make this test
-    # pass or fail on the version that happens to run it. `tomli` is the
-    # third-party fallback for exactly that version. Both imports are guarded, so
-    # a missing one degrades a reader rather than breaking the module.
-    third_party = roots - set(sys.stdlib_module_names) - {"tomllib", "tomli"}
+    # `tomllib` needs no allowance: it is stdlib on every interpreter this
+    # project supports, so `sys.stdlib_module_names` already covers it and this
+    # assertion would catch a floor that regressed below 3.11. `tomli` is the
+    # vestigial third-party fallback dep_sync still carries for the retired
+    # pre-3.11 leg; its import is guarded, so a missing one degrades a reader
+    # rather than breaking the module.
+    third_party = roots - set(sys.stdlib_module_names) - {"tomli"}
     assert not third_party, f"dep_sync must import stdlib only; found {sorted(third_party)}"

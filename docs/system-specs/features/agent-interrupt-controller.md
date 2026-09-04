@@ -3,20 +3,39 @@
 Status: implemented
 
 Owners: `kiro_crew.irq`; in-tree GitHub pull-request probe:
-`builtin_skills/kirocrew-dev/babysit/scripts/pr_watch.py`.
+`kiro_crew.probes.gh_pr`.
 
 ## Purpose
 
-`kiro_crew.irq` lets a script cron perform cheap observation and request an
-agent turn only when a probe reports an actionable condition. `Probe` supplies
-subject identity and a `Tick`; `irq.run` owns persisted state, deduplication,
-coalescing, and the `Skip` / `Report` / `Done` verdict. The controller's
-verdict ownership keeps probes from each encoding different retry and delivery
-policies. See `irq.Probe`, `irq.Tick`, and `irq.run`.
+`kiro_crew.irq` lets a driver perform cheap observation and request an agent
+turn only when a probe reports an actionable condition. `Probe` supplies
+subject identity and a `Tick`; the kernel owns persisted state, deduplication,
+coalescing, and the verdict. The controller's verdict ownership keeps probes
+from each encoding different retry and delivery policies. See `irq.Probe`,
+`irq.Tick`, and `irq.run`.
+
+Two drivers, one kernel, and the difference is only how the verdict is
+delivered:
+
+* `irq.run` RAISES `Skip` / `Report` / `Done`, which is what the cron runner
+  consumes. Unchanged.
+* `irq.poll` RETURNS a `Verdict(outcome, body)` with outcome `QUIET`, `WAKE`,
+  `TERMINAL`, or `FALLBACK`, for an in-process driver that owns its own wake
+  mechanism and only needs the decision -- the AutoNudge scheduler's probe gate.
+  Anything unexpected resolves to `FALLBACK`, telling the driver to keep the
+  schedule it already had, because the alternative default would convert a bug
+  into silence. A redundant cycle costs tokens; a lost wake costs the task. The
+  kernel's bounds are deliberately not forwarded through `poll`: a probe already
+  declares what it needs through `Probe.tuning`.
 
 The in-tree consumer is `PrWatchProbe`. It reads a pull request through `gh`,
-classifies pull-request state and checks, and passes its result to `irq.run`
-through `watch`. See `pr_watch.PrWatchProbe.observe` and `pr_watch.watch`.
+classifies pull-request state and checks, and hands its result to the kernel.
+The probe lives in the package rather than beside a driver because it outlives
+its drivers -- it is now driven by both the script cron adapter
+(`builtin_skills/kirocrew-dev/babysit/scripts/pr_watch.py:watch`, via `irq.run`)
+and the scheduler (via `irq.poll`), and a hyphenated skill directory is not
+importable, so a copy per driver would have meant two copies of one classifier.
+See `probes.gh_pr.PrWatchProbe.observe`.
 
 ## Authoring contract
 
@@ -84,13 +103,16 @@ When a nonempty `Tick.epoch` changes, `irq.run` removes epoch-scoped alerts and
 open-window entries, then retains epoch-independent alerts and open-window
 entries. Check-derived observations must not survive a head change, or an old
 head can be reported as current. Conversation-derived observations must survive,
-or a head change replays already-reported discussion. The carried window receives
-a fresh start stamp: this preserves the pending delivery while ensuring a fresh
-head receives its full settling floor. These invariants are pinned by
+or a head change replays already-reported discussion. Each carried entry keeps
+its own open time, so a force-push does not make a settled discussion wake serve
+the floor again. A fresh head observation is a separate entry with a fresh open
+time, so it still receives the full settling floor; on the transition tick it
+cannot ride on a carried entry that is already ready to fire.
+These invariants are pinned by
 `test_an_open_epoch_scoped_window_is_dropped_by_an_epoch_change`,
 `test_a_sticky_key_survives_an_epoch_change`,
 `test_a_fresh_epoch_anomaly_still_gets_a_full_settling_floor`, and
-`test_a_carried_sticky_entry_is_delayed_not_lost_by_the_restart`.
+`test_a_carried_sticky_entry_keeps_its_served_floor_across_epoch_change`.
 
 Dedupe re-arms after the configured re-alert interval. Future timestamps read
 as stale, and recovery clears the blind marker. The error threshold comparison
@@ -103,20 +125,46 @@ the only reporting value. See `irq.run`,
 
 ## Coalescing
 
-A non-NMI `WAKE` observation opens a persisted window. The window fires all
-entries when the convergence floor has passed and `Tick.pending` is zero, or
-when the hard cap has passed; the hard cap is independent of the floor. The
-floor prevents a newly changed subject from reporting a transient empty rollup
-as convergence. The cap prevents a permanently pending subject from losing an
-otherwise actionable wake. These properties are pinned by
+A non-NMI `WAKE` observation opens a persisted window, and each entry records its
+own open time. An entry triggers delivery when its own age has passed the
+convergence floor and `Tick.pending` is zero, or, for an epoch-independent entry,
+when its own age has passed the floor alone. Separately, when the oldest entry's
+age passes the hard cap the whole window flushes; the hard cap is independent of
+the floor and remains window level. The floor prevents a newly changed subject
+from reporting a transient empty rollup as convergence. The cap prevents a
+permanently pending subject from losing an otherwise actionable wake, and stays a
+window-level flush because withholding an unconverged entry from a cap wake would
+turn one flush into one wake per entry.
+The floor is per entry because one window holds signals of different ages: a
+partial fire leaves entries that have already waited, and a later tick can add one
+that has not. A shared window age let such an entry trigger a wake with no
+settling window of its own, so signals arriving one at a time each produced a
+wake. Once an entry triggers, the wake carries every entry the population gate
+admits, aged or not; riding along cannot add a wake, while withholding an admitted
+entry produces another one later. These properties are pinned by
 `test_floor_blocks_a_premature_converged_wake`,
-`test_hard_cap_fires_when_pending_never_drains`, and
-`test_hard_cap_outranks_a_floor_set_above_it`.
+`test_hard_cap_fires_when_pending_never_drains`,
+`test_hard_cap_outranks_a_floor_set_above_it`,
+`test_the_hard_cap_flushes_the_WHOLE_window_not_only_the_capped_entry`,
+`test_an_entry_joining_after_a_partial_fire_serves_its_own_floor`, and
+`test_coalescing_folds_staggered_reds_into_one_wake`.
+
+`coalesce_started_at` is never written. It survives as a read in `load_state`
+only, to seed entries persisted before they carried their own open time, so an
+upgrade does not restart an in-flight window; see
+`test_a_window_written_before_per_entry_ages_keeps_the_age_it_had`. Because it is
+not stored, the legacy field falls off at the first write after the upgrade.
+
+The window age the cap reads is the oldest SURVIVING entry's age, so a partial
+fire that delivers the entry which opened the window moves the cap clock onto the
+survivor. That is a bound rather than a reset: an entry is flushed no later than
+the cap measured from its own arrival. See
+`test_an_entry_left_by_a_partial_fire_still_reaches_the_cap`.
 
 While pending work remains after the floor, epoch-independent entries fire and
-epoch-scoped entries remain in the window. The partial fire retains the original
-window start time for the remaining entries, so repeated discussion cannot keep
-postponing a check-derived observation. See
+epoch-scoped entries remain in the window. The remaining entries keep their own
+open times, so repeated discussion cannot keep postponing a check-derived
+observation. See
 `test_a_sticky_wake_fires_at_the_floor_while_checks_are_still_pending` and
 `test_the_sticky_half_fires_while_the_epoch_scoped_half_keeps_waiting`.
 

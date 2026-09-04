@@ -12,6 +12,7 @@ import re
 import tempfile
 import time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from itertools import islice
@@ -25,11 +26,15 @@ from kiro_crew import members as members_mod
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     KiroCrewConfig,
     _workspace_name_for_dir,
     config_dir,
     default_project_dir,
+    published_autocompact_pct,
     resolve_agent_bindings,
 )
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed
@@ -51,11 +56,14 @@ from kiro_crew.dashboard.chat_persistence import (
     COLOR_HEX_RE,
     _attach_variants,
     _rehydrate_slot_title,
+    _validate_autocompact_pct,
     get_reasoning_effort_values,
     save_slot_off_loop,
 )
 from kiro_crew.dashboard.chat_runner import (
     _context_usage_payload,
+    _expire_mcp_oauth_banners,
+    _open_mcp_oauth_banner_mids,
     _run_chat,
     _start_next_queued_turn,
     context_entry_expired,
@@ -84,11 +92,13 @@ from kiro_crew.dashboard.chat_utils import (
     slot_history_key,
     subagents_attached,
 )
+from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import (
     DashboardState,
     _ChatSlot,
     _mark_permission_resolved,
     _normalize_slot_key,
+    append_and_surface,
     durable_row_count,
     is_stop_event_row,
     is_turn_interrupted,
@@ -102,6 +112,7 @@ from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
 from kiro_crew.safety_override import safety_override
+from kiro_crew.sandbox import voice_runtime_workspace_conflict
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -185,10 +196,10 @@ def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
 async def api_chat(request: web.Request) -> web.StreamResponse:
     """POST /api/chat — send message to a slot, stream response via SSE."""
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     message = body.get("message", "").strip()
     agent = body.get("agent", "")
     slot_name = body.get("slot")
@@ -435,7 +446,9 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 # fall back to default bindings and falsely equate a
                 # project-agent slot with a request naming the default alias.
                 # Warm the cache off-loop first so the on-loop lookup is a hit.
-                await warm_project_agent_names(slot.project or None)
+                await warm_project_agent_names(
+                    slot.project or None, operation="api_chat", source="dashboard"
+                )
                 _stored = resolve_agent_bindings(_cfg, slot.agent, slot.project or None)
                 _requested = resolve_agent_bindings(_cfg, agent, slot.project or None)
                 # Identity itself lives on ResolvedBindings, next to the field
@@ -681,7 +694,10 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # to honour it for widget-origin turns and let the text fall through to a
     # normal, fully-gated _run_chat turn instead. Mode changes and tool
     # approvals live on separate endpoints a widget iframe cannot reach.
-    _widget_origin = bool(user_meta) and user_meta.get("origin") == "widget"
+    # `is not None` (not truthiness): user_meta is normalized to dict-or-None
+    # above, and with the body typed by read_bounded_json, mypy narrows the
+    # Optional only through an explicit None check.
+    _widget_origin = user_meta is not None and user_meta.get("origin") == "widget"
     if (
         getattr(slot, "mode", "") == "orchestrator"
         and message.strip().lower() in ("go", "go all")
@@ -775,10 +791,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 if t and not t.done():
                     t.cancel()
         stop_msg = "🛑 [SYSTEM] Orchestration stopped by user."
-        slot.append("assistant", stop_msg, "msg msg-a")
-        state.broadcast_ws(
-            "chat_message", {"slot": slot.key, "role": "assistant", "content": stop_msg}
-        )
+        append_and_surface(state, slot, "assistant", stop_msg, "msg msg-a")
         state.broadcast_ws("chat_done", {"slot": slot.key})
         return web.json_response({"ok": True, "stopped": True})
 
@@ -891,12 +904,15 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
 async def api_chat_slots(request: web.Request) -> web.Response:
     """GET /api/chat/slots — list all chat slots."""
     state: DashboardState = request.app["state"]
-    # Credential-backed check status is owner-only. Non-owner and app-token
-    # callers receive source links but neither cached status nor provider work.
+    # Credential-backed check status is owner-only for PRIVATE repos. For a
+    # PUBLIC repo the lifecycle is world-visible, so an authenticated
+    # dashboard-user (non-owner) may see it too. App-token callers receive
+    # source links but neither cached status nor provider work.
     from kiro_crew.dashboard.handlers.source_providers import (
         ensure_gitlab_hosts_loaded,
         is_owner_dashboard_request,
         schedule_check_refresh,
+        schedule_visibility_refresh,
     )
 
     # Same warm-up as the WebSocket connect path: slot source-link extraction is
@@ -908,10 +924,17 @@ async def api_chat_slots(request: web.Request) -> web.Response:
         logger.debug("GitLab allowlist warm-up failed; chips may lag one round", exc_info=True)
 
     include_check_status = is_owner_dashboard_request(request)
-    payloads = state.serialize_slots(include_check_status=include_check_status)
+    is_dashboard_user = bool(request.get("is_dashboard_user"))
+    payloads = state.serialize_slots(
+        include_check_status=include_check_status, dashboard_user=is_dashboard_user
+    )
     if include_check_status:
-        # Issue links carry no check status — skip them so the scheduler never
-        # hands an issue URL to the pull-request-only chip fetch.
+        # Only the OWNER's GET drives provider work. Both the visibility probe
+        # and the status refresh run the operator's `gh`/`glab` credentials, so
+        # a non-owner request must trigger NEITHER (GPT #6789) — it renders the
+        # owner-populated caches read-only via the fail-closed is_repo_public
+        # gate in _project_source_links. Issue links carry no check status, so
+        # skip them (the fetch is pull-request-only).
         urls = [
             link["url"]
             for payload in payloads
@@ -919,6 +942,7 @@ async def api_chat_slots(request: web.Request) -> web.Response:
             if link.get("kind", "change") == "change"
         ]
         if urls:
+            schedule_visibility_refresh(urls, state.push_slots_update)
             schedule_check_refresh(urls, state.push_slots_update)
     return web.json_response(payloads)
 
@@ -989,7 +1013,8 @@ async def api_chat_slot_source_links(request: web.Request) -> web.Response:
             "GitLab allowlist warm-up failed; expanded chips may lag one round", exc_info=True
         )
 
-    # Cached status only, owner-gated exactly like the list endpoint. No
+    # Cached status only, gated exactly like the list endpoint: owner sees all,
+    # a dashboard-user sees public-repo status, app tokens see none. No
     # schedule_check_refresh here: that pushes a `slots` update, which by
     # definition cannot carry links outside the budget, so the provider work
     # would produce a result this response can never show.
@@ -1001,7 +1026,10 @@ async def api_chat_slot_source_links(request: web.Request) -> web.Response:
     # the slot's messages -- these URLs are extracted FROM those messages, so
     # gating here would withhold nothing it does not already have.
     return web.json_response(
-        slot.source_links_payload(include_check_status=is_owner_dashboard_request(request))
+        slot.source_links_payload(
+            include_check_status=is_owner_dashboard_request(request),
+            dashboard_user=bool(request.get("is_dashboard_user")),
+        )
     )
 
 
@@ -1834,6 +1862,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                                     if isinstance(msg.get("meta"), dict)
                                     else None
                                 ),
+                                mint_mid=False,
                             )
                             carry_provenance(slot.messages[-1], msg)
                             _attach_variants(slot, msg)
@@ -1979,10 +2008,10 @@ _CREATABLE_MODES = ("", "orchestrator", "crew", "design-critique")
 async def api_chat_slot_create(request: web.Request) -> web.Response:
     """POST /api/chat/slots — create a new chat slot."""
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name")
     agent = body.get("agent", "")
     model = body.get("model", "")
@@ -2288,10 +2317,18 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             cfg_proj = cfg.dashboard.default_project if cfg else ""
             if isinstance(cfg_proj, str) and cfg_proj:
                 resolved = os.path.realpath(os.path.expanduser(cfg_proj))
-                if os.path.isdir(resolved) and not is_sensitive_path(resolved):
-                    cfg_proj = resolved
-                else:
-                    cfg_proj = ""
+                eligible = os.path.isdir(resolved) and not is_sensitive_path(resolved)
+                if eligible:
+                    # #7392 round 3: a configured default that overlaps the
+                    # data home would be refused at spawn anyway — skip it
+                    # here like a sensitive path, falling back to the
+                    # workspace default instead of wedging every new slot.
+                    # Off-loop (round 4): the shared scan primes runtime
+                    # paths (realpath/mkdir) on first use.
+                    eligible = (
+                        await asyncio.to_thread(voice_runtime_workspace_conflict, resolved)
+                    ) is None
+                cfg_proj = resolved if eligible else ""
             else:
                 cfg_proj = ""
             slot.project = cfg_proj or default_project_dir(workspace)
@@ -2316,7 +2353,16 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # write, a restart rehydrates the previous title with a refreshable "auto"
     # origin and the background refresh may rewrite the pin.
     if folder_id or title:
-        await save_slot_off_loop(state, slot, force=True)
+        # The create/recreate request has been authorized against this
+        # transcript.  Do not let a rebind while the off-loop write waits on
+        # the history lock redirect its newly supplied metadata to another
+        # session.
+        await save_slot_off_loop(
+            state,
+            slot,
+            force=True,
+            expected_history_key=slot_history_key(slot),
+        )
     # Speculative session creation: overlap the ACP handshake with the user's
     # think-time before their first message. No-op unless session.eager_spawn.
     schedule_eager_spawn(state, slot)
@@ -2430,9 +2476,65 @@ async def _reset_slot_session(
     completed an LLM round-trip, and such a turn is visible to any caller's
     has_active_turn() fast path — so a decline here implies a turn that started
     microseconds ago, which cannot have posted a card yet.
+
+    A successful reset also drops the slot's MCP session report, for the same
+    reason the pending card goes: it describes the session being torn down.
+    Every caller here changes what the next session will mount (agent, model,
+    workspace) or restarts it outright, so keeping the old report would leave
+    the UI presenting a dead session's server list as the live one's — the
+    stale-evidence failure that report exists to remove.
     """
     _unblock_pending_waits(state, slot)
-    return await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
+    # Snapshot the open OAuth banners BEFORE the teardown: a successor session can
+    # start and emit its own request while this one is shutting down, and a sweep
+    # taken afterwards would withdraw that live URL too.
+    doomed_oauth_banners = _open_mcp_oauth_banner_mids(slot)
+    try:
+        reloaded = await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
+    except BaseException:
+        # Raised or cancelled mid-teardown: the session is in a state this slot
+        # cannot vouch for, so neither is its verdict. Unknown fails open.
+        slot.record_model_withheld(None)
+        raise
+    if reloaded:
+        # The withhold verdict describes the session that advertised the model
+        # list, not the slot, so it goes with the session. Routed through this one
+        # funnel for the reason above: the switch handlers that reset a session
+        # are exactly the ones that can change which models the next session will
+        # advertise (agent, workspace, and the model pick itself), and a verdict
+        # surviving that would label the new session from the old one's
+        # entitlement.
+        #
+        # Gated on the reset having HAPPENED. What decides this is whether the
+        # session the verdict describes still exists: `skip_if_busy` DECLINES
+        # while a turn is in flight, leaving that session -- and therefore its
+        # verdict -- alive and accurate, while a completed teardown ends it. The
+        # membership heuristic the frontend falls back to on `null` is not itself
+        # the defect this carries a verdict to remove; inferring entitlement from
+        # that heuristic WHILE an authoritative answer exists is. Dropping on a
+        # decline would throw the authoritative answer away and re-create exactly
+        # that.
+        slot.record_model_withheld(None)
+        # The MCP session report rides the same gate for the same reason: it
+        # describes the session that was just torn down. Clearing is a courtesy
+        # delta push -- correctness rests on the identity projector in
+        # serialize_slots -- so it only fires when something was recorded.
+        if slot.clear_mcp_report():
+            state.broadcast_ws("mcp_report_update", {"slot": slot.key, "mcp_report": None})
+        # An open MCP OAuth banner rides the same gate for the same reason, and it
+        # is the widest of the three: every caller of this funnel destroys the child
+        # that owns the loopback listener and the PKCE verifier an open banner's
+        # Authorize link is redeemable against, so the link is dead the moment the
+        # teardown completes. The gateway generation does NOT change here, so the
+        # read-time gate in `_prepare_messages` cannot infer it (issue #7654).
+        #
+        # Gating on `reloaded` is load-bearing in the OTHER direction from the two
+        # above: a `skip_if_busy` decline leaves the session, its child, and its
+        # listener alive, so retiring here would take away a button that still
+        # works -- the one outcome worse than the dead link this fixes. Limited to
+        # the pre-teardown snapshot so a successor's banner is never swept.
+        _expire_mcp_oauth_banners(state, slot, doomed_oauth_banners)
+    return reloaded
 
 
 def _resolve_stop_event(slot: _ChatSlot, outcome: str) -> None:
@@ -2724,6 +2826,10 @@ async def stop_slot_turn(
         # of having a row persisted for a message that never ran.
         for _discarded in slot._pending_steers:
             slot._steer_delivery_ids.pop(_discarded, None)
+            # Lockstep with the line above (see `_ChatSlot._steer_send_ids`): a hard
+            # kill discards the text, so there is no requeued entry left to carry
+            # the client's send id onto.
+            slot._steer_send_ids.pop(_discarded, None)
         slot._pending_steers.clear()
         state.push_slots_update()
         logger.info("Stop (force): hard-killing session for slot %s", name)
@@ -3122,15 +3228,10 @@ async def api_chat_slot_end_wait(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_end_wait")
     if denied is not None:
         return denied
-    try:
-        body = await request.json() if request.content_length else {}
-    except Exception:
-        body = {}
-    # `request.json()` happily returns a list or a scalar for well-formed JSON
-    # that simply is not an object, and `.get` on one of those raises past the
-    # except above into a 500. Normalize the shape, not just the parse.
-    if not isinstance(body, dict):
-        body = {}
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     wait_id = str(body.get("wait_id") or "").strip()
     if not wait_id:
         return web.json_response(
@@ -3201,19 +3302,37 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
 
     # Claim the stop slot synchronously BEFORE the await below: the
     # idempotency guard above is check-then-act, and a concurrent /interrupt
-    # arriving during `await request.json()` would otherwise still see
+    # arriving during the awaited body read below would otherwise still see
     # _stop_state == "idle" and slip past the guard (double stop_turn +
     # double SEL audit for one logical press). /stop is race-safe because it
     # has no await between guard and claim; this makes /interrupt match.
+    prev_auto_run = slot._auto_run
     slot._stop_state = "soft_pending"
     slot._auto_run = False
 
-    # Optionally promote a specific queue item to front
+    # Optionally promote a specific queue item to front. The except is not a
+    # parse guard (read_bounded_json owns that): it rolls the claimed stop
+    # state back when the body read fails in transit, and the refused-body
+    # branch below rolls it back the same way. Both paths also restore
+    # _auto_run: a refused request must not leave orchestrator auto-run
+    # disabled when no interrupt actually happened. The rollback is
+    # conditional on our claim being intact: a concurrent /stop arriving
+    # during the body await may escalate _stop_state (e.g. to "killing"),
+    # and an unconditional reset to "idle" would erase that escalation and
+    # admit another stop while the hard kill is still running.
     try:
-        body = await request.json() if request.content_length else {}
+        body, body_err = await read_bounded_json(request, allow_absent=True)
     except Exception:
-        slot._stop_state = "idle"
+        if slot._stop_state == "soft_pending":
+            slot._stop_state = "idle"
+            slot._auto_run = prev_auto_run
         raise
+    if body_err is not None:
+        if slot._stop_state == "soft_pending":
+            slot._stop_state = "idle"
+            slot._auto_run = prev_auto_run
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     queue_id = body.get("queue_id")
     if queue_id:
         # Wire-side field is `queue_id`; stored items carry `id` (the key
@@ -3330,10 +3449,10 @@ async def api_chat_slot_queue_edit(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_queue_edit")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     content = body.get("content")
     if not isinstance(content, str) or not content.strip():
         return web.json_response({"error": "content must be a non-empty string"}, status=400)
@@ -3375,10 +3494,10 @@ async def api_chat_slot_queue_reorder(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_queue_reorder")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     order = body.get("order")
     if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
         return web.json_response({"error": "order must be a list of queue id strings"}, status=400)
@@ -3465,9 +3584,11 @@ async def _retire_slot_nudge_loop(name: str) -> "NudgeLoop | None":
     either lands first and is removed or runs after the synchronous slot pop.
     Its uncontended acquire does not yield, so the initial retirement also
     cancels a scheduled timer before the fire callback gets another turn.
+    Legacy loops are removed. Structured monitors instead retain their durable
+    outcome and clear their timer, so terminal history remains inspectable.
 
-    The returned loop is the only remaining record of it — the persist-failure
-    path uses it to put the clock back (see :func:`_restore_slot_nudge_loop`).
+    The returned loop lets the persist-failure path put the clock back (see
+    :func:`_restore_slot_nudge_loop`).
 
     A removal that FAILS raises :exc:`_NudgeRetireFailed` rather than logging and
     carrying on. Removal drops the loop from memory first and only then writes
@@ -3516,7 +3637,33 @@ async def _restore_slot_nudge_loop(
     restored at all (it was one tick from terminal), and neither is a paused one
     — reviving that would override an explicit stop.
     """
-    if loop is None or not loop.active:
+    if loop is None:
+        return
+    monitor = getattr(loop, "monitor", None)
+    if monitor is not None:
+        if (
+            not loop.active
+            and monitor.outcome is not None
+            and monitor.outcome.value == "session_close"
+        ):
+            try:
+                from kiro_crew.autonudge import (
+                    get_instance as _autonudge_get,  # circular: autonudge -> dashboard
+                )
+
+                svc = _autonudge_get()
+                if svc is not None:
+                    await svc.restore_monitor_after_failed_session_close(
+                        loop.id,
+                        admission_check=admission_check,
+                    )
+            except Exception:
+                logger.warning(
+                    "structured monitor restore after failed slot close failed",
+                    exc_info=True,
+                )
+        return
+    if not loop.active:
         return
     try:
         from kiro_crew import autonudge  # circular: autonudge -> dashboard.chat -> chat_handlers
@@ -3585,11 +3732,17 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     mid-write, a plan between stages, and children still running after their
     parent's turn ended.
 
-    ``has_active_turn`` is the probe the reload route uses for this same teardown,
-    and it inherits that probe's edge: a turn holding the per-session semaphore
-    but not yet having a prompt in flight is not seen. Matching the sibling is
-    deliberate — a second, subtly different notion of "busy" for one teardown is
-    how the two drift apart.
+    The ``has_active_turn()`` check is a best-effort fast path; the
+    authoritative guard is the discard's ``skip_if_busy``, which probes the
+    per-session SEMAPHORE atomically with the session pop (see
+    :meth:`SessionManager.discard_conversation`). The fast path has a known
+    edge — a turn holding the semaphore but not yet having a prompt in flight
+    is invisible to it — and the atomic guard is what closes it, the same
+    contract the sibling reload route rests on, so the two teardowns keep one
+    notion of "busy". Of the refusal paths, only the atomic guard's decline is
+    SEL-recorded (``outcome="denied"``): it is the one refusal that happens
+    after the route has committed to the teardown, while the fast-path 409s
+    are pre-checks and stay unlogged, as they are on the sibling.
 
     The transcript is deliberately left in place, which means the tab still shows
     the earlier messages while the model no longer remembers them. That is the
@@ -3626,15 +3779,16 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     # however long a slow body takes to arrive. The guards must be the last thing
     # that happens before the teardown.
     #
-    # A malformed or absent body is not an error. This route took no body before,
-    # so refusing one would break every existing caller for a parameter they do
-    # not send.
+    # An absent body is not an error: this route took no body before, so
+    # refusing one would break every existing caller for a parameter they do
+    # not send. A present-but-malformed body IS refused — "sent nothing" and
+    # "sent garbage" are different facts, and only the first can be defaulted.
     replay = True
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    if isinstance(body, dict) and "replay" in body:
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    if "replay" in body:
         replay = bool(body.get("replay"))
 
     # A turn in flight on the SESSION, which ``slot.running`` cannot see: that
@@ -3674,7 +3828,29 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     if attached is not None:
         return attached
 
-    await state.sessions.discard_conversation(key, replay=replay)
+    # ``skip_if_busy``: the fast paths above cannot see a turn that holds the
+    # per-session semaphore but has not yet put a prompt in flight (an inbound
+    # channel message between the lease and its first stream event). The discard
+    # probes the semaphore atomically with the session pop, so a turn admitted
+    # after the guards above answered False is refused here instead of being
+    # torn down mid-lease.
+    discarded = await state.sessions.discard_conversation(key, replay=replay, skip_if_busy=True)
+    if not discarded:
+        sel().log_api_access(
+            caller=request.get("app", "") or "dashboard",
+            operation="slot_reset_conversation",
+            outcome="denied",
+            resources=f"slot={name} replay={replay}",
+        )
+        return web.json_response(
+            {"error": "a turn is in flight", "code": "turn_in_flight", "slot": name},
+            status=409,
+        )
+    # The fresh conversation will advertise its own model list, so the previous
+    # one's withhold verdict no longer describes this slot. Only on a performed
+    # discard: a refusal above leaves the old conversation (and its verdict) in
+    # place.
+    slot.record_model_withheld(None)
     sel().log_api_access(
         caller=request.get("app", "") or "dashboard",
         operation="slot_reset_conversation",
@@ -3998,10 +4174,10 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     Skips the active slot and pinned sessions.
     """
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     max_days = 3
     try:
         max_days = max(1, int(body.get("max_inactive_days", 3)))
@@ -4216,10 +4392,10 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_agent")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     agent_name = body.get("agent", "")
     if agent_name and not _AGENT_NAME_RE.match(agent_name):
         return web.json_response({"error": "invalid agent name"}, status=400)
@@ -4294,7 +4470,9 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 # PREVIOUS agent's project — latent until app agents could dispatch.
                 # Resolve WITH the slot's project scope (warmed off-loop first) so a
                 # project agent counts as resolved rather than falling back.
-                await warm_project_agent_names(slot.project or None)
+                await warm_project_agent_names(
+                    slot.project or None, operation="api_chat_slot_agent", source="dashboard"
+                )
                 bindings = resolve_agent_bindings(cfg, agent_name, slot.project or None)
                 ws_name = _workspace_name_for_dir(cfg, bindings.workspace_dir)
                 new_workspace = ws_name
@@ -4406,7 +4584,7 @@ def _model_rejected_reason(model_name: str, provider: str | None = None) -> str 
             provider = KiroCrewConfig.load().agent.provider
         except Exception:  # pragma: no cover - config load is resilient
             provider = ""
-    if provider == "claude_code":
+    if is_claude_code(provider):
         return None
     if model_registry.is_canonical_key(model_name):
         return (
@@ -4597,10 +4775,10 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_model")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     model_name = _normalize_model(body.get("model", ""))
     reason = _model_rejected_reason(model_name)
     if reason:
@@ -4699,6 +4877,269 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "model": model_name})
 
 
+# Per-slot transaction locks for the autocompact endpoint. The write span
+# below contains awaits (body read, forced save), so two concurrent POSTs for
+# one slot can interleave: each captures the other's value as its rollback
+# snapshot, and a failed request's compare-and-swap rollback can then erase a
+# newer request's acknowledged write (value equality cannot identify
+# ownership when both requests carry the same pct). Serializing the whole
+# reauthorize -> pin -> mutate -> persist -> rollback -> live-map span per
+# slot makes the rollback unambiguous: only one request is ever inside the
+# span, so a rollback can only undo its own write. WeakValueDictionary so an
+# idle slot's lock is reclaimed with its last reference. Keyed by the
+# TRANSCRIPT (slot_history_key), not the slot: channel-linked aliases resolve
+# distinct slot names onto one file, and two requests through different alias
+# slots must serialize against each other or the loser's rollback/flush can
+# overwrite the winner's acknowledged durable write. A rebind mid-request is
+# handled by the expected_history_key pin and the post-persist
+# reauthorization, not by the lock key.
+_autocompact_txn_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _autocompact_txn_lock(history_key: str) -> asyncio.Lock:
+    lock = _autocompact_txn_locks.get(history_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _autocompact_txn_locks[history_key] = lock
+    return lock
+
+
+async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
+    """GET/POST /api/chat/slots/{slot}/autocompact — per-session compact threshold.
+
+    GET returns the slot's override (``pct``, null when it follows the global),
+    the current global (``global_pct``), and the valid range. POST takes
+    ``{"pct": <number|null>}``: a number sets this session's override (rejected
+    outside the documented range, matching the global knob's PATCH validation),
+    null clears it back to the global. The value applies to the live session
+    immediately via the SessionManager override map and persists with the slot
+    metadata, so it survives gateway restarts.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # Session-aware ownership gate, not the slot-only check: the POST writes the
+    # override keyed by effective_session_key(slot), so a linked app-owned slot
+    # (channel stem) would let an app modify a foreign session's threshold and
+    # metadata. _check_slot_app_ownership authorizes the key the write actually
+    # lands on, same as /context and /note.
+    request_app = request.get("app", "")
+    denied = _check_slot_app_ownership(slot, name, request_app, "slot_autocompact")
+    if denied is not None:
+        return denied
+    if request.method == "GET":
+        return web.json_response(
+            {
+                "pct": slot.autocompact_pct,
+                "global_pct": published_autocompact_pct(),
+                "min": AUTOCOMPACT_PCT_MIN,
+                "max": AUTOCOMPACT_PCT_MAX,
+            }
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_json"}, status=400
+        )
+    if "pct" not in body:
+        return web.json_response(
+            {"error": "pct is required (number or null)", "code": "pct_required"}, status=400
+        )
+    pct = body["pct"]
+    if pct is not None:
+        # bool is an int subclass; True would otherwise read as 1.0 and be
+        # rejected by range, but reject it explicitly for a clear error.
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            return web.json_response(
+                {"error": "pct must be a number or null", "code": "pct_not_a_number"}, status=400
+            )
+        try:
+            pct = float(pct)
+        except OverflowError:
+            # An int too large for a float; out of range by definition.
+            return web.json_response(
+                {"error": "pct must be a finite number", "code": "pct_not_finite"}, status=400
+            )
+        if pct != pct:  # NaN
+            return web.json_response(
+                {"error": "pct must be a finite number", "code": "pct_not_finite"}, status=400
+            )
+        if not (AUTOCOMPACT_PCT_MIN <= pct <= AUTOCOMPACT_PCT_MAX):
+            return web.json_response(
+                {
+                    "error": (
+                        f"pct must be between {AUTOCOMPACT_PCT_MIN:g} "
+                        f"and {AUTOCOMPACT_PCT_MAX:g}"
+                    ),
+                    "code": "pct_out_of_range",
+                },
+                status=400,
+            )
+    # Persist via the same forced-save mechanism every other slot-metadata
+    # route uses (tags / folders / pin: save_slot_off_loop(force=True) -- the
+    # empty-window merge for message-less slots, the full save otherwise;
+    # both read the slot fields INSIDE the transcript's cross-process lock
+    # and run the delete-won guard, so a permanent delete racing this write
+    # is refused by main's own tested path). A never-saved tab's override
+    # lives only in memory until the tab first persists, exactly like its
+    # model: the empty-window merge lands only into an existing line.
+    #
+    # Transactional shape (mirrors the tag-vocabulary delete): mutate the
+    # slot field, confirm the durable write with best_effort=False, and on
+    # any failure roll the field back and return a coded error -- the
+    # SessionManager override map (the live gate) is only touched after the
+    # persist verdict, so a failed request leaves live behavior unchanged.
+    # Serialize the whole transaction per slot: with awaits inside the write
+    # span, a second concurrent POST would otherwise capture this one's value
+    # as its rollback snapshot, and value-based rollback cannot tell "my
+    # write survived" from "someone else wrote the same number". Under the
+    # lock exactly one request is inside the span, so a rollback can only
+    # undo its own write. The client's per-slot promise chain orders writes
+    # from ONE client; this lock is the cross-client half. Keyed by the
+    # TRANSCRIPT so two alias slots resolving onto one file serialize too.
+    locked_history_key = slot_history_key(slot)
+    async with _autocompact_txn_lock(locked_history_key):
+        stale = _reauthorize_after_await(state, slot, name, request_app, "slot_autocompact")
+        if stale is not None:
+            return stale
+        # Pin the write to the transcript this authorization decision covered:
+        # the persist await below is a rebind window, and the save derives its
+        # target from live routing at write time. expected_history_key makes the
+        # save refuse (False, nothing written) if the routing moved, so the
+        # durable write can never land on a transcript this request was not
+        # authorized against. No await between the reauth above and this read.
+        authorized_history_key = slot_history_key(slot)
+        if authorized_history_key != locked_history_key:
+            # The slot was rebound between the lock-key read and acquisition:
+            # this request holds the OLD transcript's lock while the write
+            # would target the new one, so the serialization guarantee does
+            # not cover it. Same disposition as the mid-persist rebind below.
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
+        prior_pct = slot.autocompact_pct
+        slot.autocompact_pct = pct
+        if state.conversation_log:
+            try:
+                applied = await save_slot_off_loop(
+                    state,
+                    slot,
+                    force=True,
+                    best_effort=False,
+                    expected_history_key=authorized_history_key,
+                )
+            except Exception:
+                # Roll back this request's write and mark dirty so the
+                # periodic flush reconverges the durable record to the live
+                # field (a non-endpoint save may have durably written this
+                # rejected value before the failure).
+                slot.autocompact_pct = prior_pct
+                slot._dirty = True
+                logger.exception("Slot %s autocompact_pct persist failed", name)
+                return web.json_response(
+                    {"error": "could not persist threshold", "code": "persist_failed"}, status=500
+                )
+            if not applied:
+                # The save refused without writing: either the delete-won guard
+                # (session permanently deleted while the save awaited the lock)
+                # or the routing-moved pin (slot rebound to another transcript
+                # mid-request). Do not resurrect, do not write elsewhere, do not
+                # mutate live state.
+                slot.autocompact_pct = prior_pct
+                return web.json_response(
+                    {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+                )
+            # Mirror the COMMITTED value to every live slot whose current
+            # transcript key is the one this write landed on — not just the
+            # requesting slot: channel-linked aliases resolve distinct slot
+            # names onto one file, and a sibling left holding the old value
+            # would persist it back over this acknowledged commit on its next
+            # flush (its ordinary save writes ``autocompact_pct``
+            # unconditionally from its own field). Membership is re-derived
+            # here, NOT assumed: a slot rebound during the persist no longer
+            # writes this file, and mirroring it would apply a live change its
+            # reauthorization is about to deny. Snapshot values() — the event
+            # loop may mutate the dict between iterations. Priors are recorded
+            # so the confirm-save failure paths below can undo the mirror.
+            mirrored: list = []
+            for other in list(state._slots.values()):
+                if other is not slot and slot_history_key(other) == authorized_history_key:
+                    mirrored.append((other, other.autocompact_pct))
+                    other.autocompact_pct = pct
+            # The mirror runs on the event loop AFTER the persist returned, but
+            # a sibling's already-queued flush can acquire the transcript's
+            # file lock in the executor BEFORE the loop resumes here and write
+            # its then-stale field over the acknowledged commit (executor
+            # threads do not wait for the event loop). The mirror above fixes
+            # every live field; this second confirmed save re-orders the
+            # durable record after any such interleaved stale write — the file
+            # lock serializes it behind the sibling's write, and every field it
+            # can read is now the committed value. Same pin, same dispositions.
+            try:
+                confirmed = await save_slot_off_loop(
+                    state,
+                    slot,
+                    force=True,
+                    best_effort=False,
+                    expected_history_key=authorized_history_key,
+                )
+            except Exception:
+                for other, other_prior in mirrored:
+                    if slot_history_key(other) == authorized_history_key:
+                        other.autocompact_pct = other_prior
+                        other._dirty = True
+                slot.autocompact_pct = prior_pct
+                slot._dirty = True
+                logger.exception("Slot %s autocompact_pct confirm-persist failed", name)
+                return web.json_response(
+                    {"error": "could not persist threshold", "code": "persist_failed"}, status=500
+                )
+            if not confirmed:
+                for other, other_prior in mirrored:
+                    if slot_history_key(other) == authorized_history_key:
+                        other.autocompact_pct = other_prior
+                        other._dirty = True
+                slot.autocompact_pct = prior_pct
+                return web.json_response(
+                    {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+                )
+        # INVARIANT for this handler: every write is immediately preceded by an
+        # authorization decision with NO await between them. The persist await is
+        # a rebind window (same mechanism as the body read), so re-decide before
+        # the live override mutation; the slot-field change above rolls back for
+        # a rebound slot, whose successor re-derives its state on restore.
+        stale = _reauthorize_after_await(state, slot, name, request_app, "slot_autocompact")
+        if stale is not None:
+            slot.autocompact_pct = prior_pct
+            return stale
+        # Reauthorization can PASS after a rebind the pin never saw: a rebind
+        # landing after the save's internal routing read leaves the durable
+        # write correctly on the authorized transcript while the slot now
+        # resolves to a different session the caller may also own. Seeding the
+        # live map from effective_session_key(slot) would then apply the
+        # threshold to a session whose transcript never received it. Refuse:
+        # the committed transcript's siblings were mirrored above and its live
+        # override re-seeds on hydration; this slot's successor re-derives.
+        if slot_history_key(slot) != authorized_history_key:
+            slot.autocompact_pct = prior_pct
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
+        live_pct = slot.autocompact_pct
+        state.sessions.set_autocompact_pct(effective_session_key(slot), live_pct)
+        logger.info("Slot %s autocompact_pct set to %r", name, live_pct)
+        return web.json_response(
+            {"ok": True, "pct": live_pct, "global_pct": published_autocompact_pct()}
+        )
+
+
 async def api_chat_slots_model(request: web.Request) -> web.Response:
     """POST /api/chat/slots/model — set the model for ALL chat slots (bulk).
 
@@ -4713,10 +5154,10 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
     ``failed`` and keeps its old model) rather than aborting the whole switch.
     """
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     model_name = _normalize_model(body.get("model", ""))
     reason = _model_rejected_reason(model_name)
     if reason:
@@ -4833,10 +5274,10 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_reasoning_effort")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     effort = body.get("reasoning_effort", "")
     valid_efforts = get_reasoning_effort_values()
     if not isinstance(effort, str) or effort not in valid_efforts:
@@ -5027,10 +5468,10 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_workspace")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     ws_name = body.get("workspace", "default")
     # Block workspace change after conversation has started
     if slot.total_messages > 0:
@@ -5058,10 +5499,10 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_project")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     project = body.get("project", "")
     if not isinstance(project, str):
         return web.json_response({"error": "project must be a string"}, status=400)
@@ -5079,6 +5520,25 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
                 error="sensitive path",
             )
             return web.json_response({"error": "Access denied"}, status=403)
+        # Pre-flight the voice-runtime workspace guard (issue #7392): a
+        # workspace that contains (or sits inside) the Kiro Crew data home is
+        # refused at agent spawn anyway, but only after the session exists and
+        # with a spawn-time stack trace. Reject it here, at the moment of
+        # choice, with the same actionable message. Off-loop: the check primes
+        # the runtime path cache (mkdir/realpath) on first use.
+        conflict = await asyncio.to_thread(voice_runtime_workspace_conflict, project)
+        if conflict is not None:
+            sel().log_api_access(
+                caller=request.get("user", "dashboard"),
+                operation="chat_slot_project",
+                outcome="denied",
+                resources=f"slot={name} project={project}",
+                error="voice runtime overlap",
+            )
+            return web.json_response(
+                {"error": conflict, "code": "workspace_overlaps_data_home"},
+                status=400,
+            )
     old_project = slot.project
     slot.project = project
     logger.info("Slot %s project set to %r", name, project)
@@ -5247,12 +5707,10 @@ async def api_chat_slot_followup(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    if not isinstance(body, dict):
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     try:
         cleaned = validate_tool_args(body, SUGGEST_FOLLOWUP_SCHEMA)
     except ValidationError as exc:
@@ -5470,6 +5928,7 @@ async def _reconcile_slot_window(state: DashboardState, slot: "_ChatSlot") -> No
                 if isinstance(msg.get("meta"), dict)
                 else None
             ),
+            mint_mid=False,
         )
         carry_provenance(slot.messages[-1], msg)
         _attach_variants(slot, msg)
@@ -5623,10 +6082,10 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             error="app cannot access member slots",
         )
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     history_key = body.get("key", name)
 
     # If slot already exists (active session), just return it — no duplicate.
@@ -6029,8 +6488,12 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         slot.created_at = meta["created_at"]
     # The identity of the transcript this resume read — lets a later save
     # recognize a file recreated by another writer after a permanent delete
-    # (the delete-won guard in ``_save_slot_to_history``).
+    # (the delete-won guard in ``_save_slot_to_history``). The observed bit
+    # records that a hydration READ happened even when the metadata carries
+    # no created_at (legacy files): without it, the guard's evidence gate
+    # treats the slot as never-hydrated and skips the delete-won comparison.
     slot._disk_meta_created_at = str(meta.get("created_at") or "")
+    slot._disk_meta_observed = bool(meta)
     # On a member key the pin came from the BINDING at slot creation above and
     # metadata may not override it (same tamperable file the guard refused to
     # trust). On an ordinary key, mode="member" may not ride in either — the
@@ -6082,6 +6545,14 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         # so a tampered/legacy JSONL can't seed a malformed sha that later
         # crashes the compare.
         slot.theme_consent_sha = normalize_theme_consent_sha(meta.get("theme_consent_sha"))
+    if meta.get("autocompact_pct") is not None:
+        # Restore the per-session compaction threshold, mirroring the
+        # persistence loaders: without this, a resumed slot's field stays None
+        # and the next save overwrites the persisted override with null, while
+        # the live gate silently falls back to the global.
+        slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
+        if slot.autocompact_pct is not None and state.sessions:
+            state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
     # Restore tags + the auto-tag once-flag (mirrors the persistence loaders).
     # Without the flag, resuming a session whose auto-tag the user removed
     # would re-run maybe_auto_tag on the next message and silently re-add it.
@@ -6130,6 +6601,7 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             meta=(
                 _redact_meta_for_role(role, m["meta"]) if isinstance(m.get("meta"), dict) else None
             ),
+            mint_mid=False,
         )
         # See the equivalent call in _rehydrate_slot_from_history: resume loads
         # the window that the next save re-serializes.
@@ -6196,10 +6668,10 @@ async def api_chat_mode(request: web.Request) -> web.Response:
     denied = deny_non_dashboard_caller(request, "chat_mode")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     mode = body.get("mode", "normal")
     raw_slot = body.get("slot")
     slot_key = raw_slot or None
@@ -6373,63 +6845,81 @@ async def api_chat_mode(request: web.Request) -> web.Response:
 
     # If any slot has a pending approval and mode is trust/yolo, auto-approve it
     if mode in ("trust", "yolo"):
-        for slot in state._slots.values():
-            for aid, fut in list(slot._approval_futures.items()):
+        # A slot-scoped ``trust`` grants auto-approval to ONE session only (the
+        # target slot and any slot sharing its effective key). The pending-approval
+        # sweep MUST honour that scope: sweeping every slot's pending prompt would
+        # clear the approval card in unrelated chats — making them LOOK approved —
+        # while their ``_trust`` flag stays False, so their very next tool call
+        # prompts again. ``yolo`` is process-global and an unscoped ``trust`` (no
+        # slot named = the documented all-slots request) still sweeps everything,
+        # including background and channel approvals. Only a slot-scoped ``trust``
+        # narrows.
+        scoped = mode == "trust" and slot is not None
+        _target_key = effective_session_key(slot) if slot is not None and scoped else None
+        for _slot in state._slots.values():
+            if scoped and effective_session_key(_slot) != _target_key:
+                continue
+            for aid, fut in list(_slot._approval_futures.items()):
                 if not fut.done():
                     fut.set_result("approved")
                     # Persist resolved state into the permission message. The
                     # periodic flush skips non-dirty slots, so the mark must
                     # flag the slot or the write can be lost on restart.
-                    if _mark_permission_resolved(slot.messages, aid, mode):
-                        slot._dirty = True
+                    if _mark_permission_resolved(_slot.messages, aid, mode):
+                        _slot._dirty = True
                     # ``slot`` keys the frame for the slot-scoped WS gate — an
                     # app token cannot receive its own resolution without it.
                     state.broadcast_ws(
                         "approval_resolved",
-                        {"id": aid, "approved": True, "slot": slot.key},
+                        {"id": aid, "approved": True, "slot": _slot.key},
                     )
                     try:
                         sel().log_api_access(
-                            caller=f"dashboard:{slot.key}",
+                            caller=f"dashboard:{_slot.key}",
                             operation=f"tool_approval:bulk_{mode}",
                             outcome="approved",
                             resources=aid,
                         )
                     except Exception:
                         logger.warning("SEL audit failed for bulk approval %s", aid, exc_info=True)
-        # Also auto-approve all pending background approvals (cron/subagent/taskrunner)
-        for aid in list(state._approval_futures):
-            fut = state._approval_futures[aid]
-            if not fut.done():
-                state.resolve_approval(aid, True)
-                try:
-                    sel().log_api_access(
-                        caller="dashboard:background",
-                        operation=f"tool_approval:bulk_{mode}",
-                        outcome="approved",
-                        resources=aid,
-                    )
-                except Exception:
-                    logger.warning("SEL audit failed for bulk approval %s", aid, exc_info=True)
-        # Auto-approve pending channel approvals
-        mgr = getattr(state, "channel_manager", None)
-        if mgr:
-            for ch in mgr._channels.values():
-                for agent in ch.members.values():
-                    fut = agent._approval_future
-                    if fut and not fut.done():
-                        fut.set_result("approved")
-                        try:
-                            sel().log_api_access(
-                                caller=f"channel:{ch.id}:{agent.agent_name}",
-                                operation=f"tool_approval:bulk_{mode}",
-                                outcome="approved",
-                                resources=getattr(fut, "_approval_id", "unknown"),
-                            )
-                        except Exception:
-                            logger.warning(
-                                "SEL audit failed for channel bulk approval", exc_info=True
-                            )
+        # Background (cron/subagent/taskrunner) and channel approvals are NOT
+        # slot-scoped, so a slot-scoped ``trust`` must leave them pending — it
+        # asked for auto-approval on one session and cannot answer for unrelated
+        # background work. Only ``yolo`` and an all-slots ``trust`` sweep them.
+        if not scoped:
+            for aid in list(state._approval_futures):
+                fut = state._approval_futures[aid]
+                if not fut.done():
+                    state.resolve_approval(aid, True)
+                    try:
+                        sel().log_api_access(
+                            caller="dashboard:background",
+                            operation=f"tool_approval:bulk_{mode}",
+                            outcome="approved",
+                            resources=aid,
+                        )
+                    except Exception:
+                        logger.warning("SEL audit failed for bulk approval %s", aid, exc_info=True)
+            # Auto-approve pending channel approvals
+            mgr = getattr(state, "channel_manager", None)
+            if mgr:
+                for ch in mgr._channels.values():
+                    for agent in ch.members.values():
+                        fut = agent._approval_future
+                        if fut and not fut.done():
+                            fut.set_result("approved")
+                            try:
+                                sel().log_api_access(
+                                    caller=f"channel:{ch.id}:{agent.agent_name}",
+                                    operation=f"tool_approval:bulk_{mode}",
+                                    outcome="approved",
+                                    resources=getattr(fut, "_approval_id", "unknown"),
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "SEL audit failed for channel bulk approval",
+                                    exc_info=True,
+                                )
 
     # Propagate trust/yolo to session approval policies so subagents inherit.
     #
@@ -6499,10 +6989,10 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     action = body.get("action", "rejected")
     original_action = action
     request_id = body.get("request_id", "")
@@ -6712,10 +7202,10 @@ async def api_chat_slot_color(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     has_ci = "color_index" in body
     has_ch = "color_hex" in body
     ci = body.get("color_index")
@@ -7138,14 +7628,10 @@ async def api_chat_slot_context(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
 
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    if not isinstance(body, dict):
-        return web.json_response(
-            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
-        )
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
 
     content = body.get("content", "")
     bad = (
@@ -7265,16 +7751,10 @@ async def api_chat_slot_note(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
 
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    # A scalar or array parses cleanly and then makes `.get` raise past the
-    # except above into a 500, so the SHAPE needs its own rejection.
-    if not isinstance(body, dict):
-        return web.json_response(
-            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
-        )
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
 
     content = body.get("content", "")
     bad = (

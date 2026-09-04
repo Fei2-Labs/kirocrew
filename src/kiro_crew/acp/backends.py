@@ -112,6 +112,11 @@ class Level(str, Enum):
     UNVERIFIED = "unverified"
 
 
+# ``session/set_config_option`` ids for reasoning effort. Which id an adapter
+# advertises is part of its ACP surface, so each descriptor names its own.
+EFFORT_CONFIG_ID = "effort"
+EFFORT_CONFIG_ID_REASONING = "reasoning_effort"
+
 # Capability keys. Named constants rather than bare strings so a typo is an
 # ImportError instead of a silently-False lookup.
 CAP_SESSION_SHARING = "session_sharing"
@@ -178,6 +183,14 @@ class BackendDescriptor:
     permission_config_id: str
     permission_config_value: str
     capabilities: Mapping[str, Level]
+    # The ``session/set_config_option`` id this adapter advertises for reasoning
+    # effort. A property of the adapter's own ACP surface, not of its vendor, so
+    # it lives here rather than as a branch at the push site (harness-parity H6):
+    # claude-agent-acp advertises ``effort`` and codex-acp advertises
+    # ``reasoning_effort``, and pushing the wrong id fails with
+    # ``Unknown config option``, which the push site reads as "no effort
+    # selector" and silently skips.
+    effort_config_id: str = EFFORT_CONFIG_ID
 
 
 _KIRO = BackendDescriptor(
@@ -307,6 +320,7 @@ _CODEX = BackendDescriptor(
     # read-only still permits reads, but commands and changes request approval.
     permission_config_id="mode",
     permission_config_value="read-only",
+    effort_config_id=EFFORT_CONFIG_ID_REASONING,
     capabilities={
         CAP_SESSION_SHARING: Level.UNAVAILABLE,
         # codex-acp advertises a dedicated `reasoning_effort` config option;

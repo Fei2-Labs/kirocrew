@@ -9,13 +9,14 @@
  * resolves to an entry that actually DRAWS something, and that the narrow
  * entries win over the broad ones they refine.
  *
- * The ordering assertions are the load-bearing ones. `mergeRenderers` normally
+ * The ordering assertions are the load-bearing ones. `mergeRenderers`
  * guarantees that a shape-matched default (a stop event, a sub-agent
- * completion) outranks anything keyed only by role. This module REPLACES both
- * of those defaults, so after the merge there are no shape-matched defaults
- * left and that guarantee is carried by this module's own array order instead.
- * Reordering the returned array can therefore silently let a role claim swallow
- * a stop event, which is exactly what these tests exist to catch.
+ * completion) outranks anything keyed only by role. This module still REPLACES
+ * the sub-agent completion, so for that row the guarantee is carried by this
+ * module's own array order instead, and reordering the returned array can
+ * silently let a role claim swallow it. The stop event is no longer overridden
+ * — the default entry draws the same StopEventCard — so it keeps the merge's
+ * own guarantee. Both are pinned below.
  */
 import { describe, it, expect } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -171,6 +172,13 @@ describe('shape still beats role after the defaults are replaced', () => {
     // this module BY ROLE, and a stop event can travel on any of them.
     expect(idFor(msg('nudge', { kind: 'stop_event' }))).toBe('stop_event')
     expect(idFor(msg('error', { kind: 'stop_event' }))).toBe('stop_event')
+  })
+
+  it('leaves the stop row to the SDK default instead of keeping a second copy', () => {
+    // The default entry already draws StopEventCard, so a host copy would only
+    // be a second place for the same card to be wired — the drift this pins
+    // shut. Resolution above proves the row still reaches the card.
+    expect(createTranscriptRenderers({ slot: 's1' }).some(r => r.id === 'stop_event')).toBe(false)
   })
 
   it('keeps the sub-agent completion card ahead of the role rows', () => {

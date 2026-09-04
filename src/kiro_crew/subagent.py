@@ -17,7 +17,7 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Container, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol, Sequence
@@ -82,6 +82,7 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
@@ -186,11 +187,71 @@ def _safe_fire(coro: Awaitable[None]) -> None:
 
 _MAX_CONCURRENT = 3
 
-#: Agent names a roster never suggests: the host default and the conductor are
-#: reached by OMITTING ``agent``, not by naming one. Shared with the spawn tools'
-#: parameter-description roster (``mcp_tools.spawn``) so the pair cannot drift
-#: when a third reserved name appears.
-UNADVERTISED_AGENTS = frozenset({"kirocrew", "kirocrew-conductor"})
+#: Agent names a roster never suggests: the host default and the conductors are
+#: reached by OMITTING ``agent``, not by naming one. Every roster inherits this
+#: as :func:`visible_agent_names`' default ``exclude``, so no other module names
+#: the set and it cannot drift when a reserved name appears.
+UNADVERTISED_AGENTS = frozenset({"kirocrew", "kirocrew-conductor", "kirocrew-pipeline-conductor"})
+
+#: Wire code for the unknown-agent refusal ``_validate_agent`` returns. It rides
+#: ``SubagentInfo.error_code`` to ``POST /api/spawn``, which forwards the FIELD as
+#: the response's ``code`` without naming the value -- so the gateway handler never
+#: spells this identifier and stays agnostic about which code it is carrying. The
+#: refusal's PROSE is advisory and free to be reworded (RFC 9457 3.1.3); this is
+#: the contract ``spawn_run`` switches on, and here is the only place the literal
+#: appears: ``mcp_tools.spawn`` imports it, under the same single-definition rule
+#: as the reserved pair above, because a respelled literal is exactly the drift a
+#: code exists to remove.
+AGENT_NOT_FOUND_CODE = "agent_not_found"
+
+
+def visible_agent_names(
+    names: Iterable[str],
+    *,
+    exclude: Container[str] = UNADVERTISED_AGENTS,
+    limit: int | None = None,
+) -> tuple[list[str], int]:
+    """Make a roster of agent names safe to render, and bound it.
+
+    Returns ``(shown, withheld)``: the names that may be rendered, and how many
+    the *limit* dropped (``0`` when nothing was dropped, so a caller appends its
+    "+N more" only when there is a remainder to report).
+
+    Three surfaces render this roster -- an unknown-agent refusal, the spawn
+    tools' parameter descriptions, and ``spawn_list``'s output -- and each one
+    used to re-implement the pipeline below. The duplication had already drifted
+    once, so the SAFETY half lives here where a fourth surface cannot omit it:
+
+    * **Grammar.** Every name must match ``_AGENT_NAME_RE`` before it is
+      rendered. This is the load-bearing filter, not a tidiness check: an agent
+      spec's ``name`` field is taken verbatim by
+      ``agent_discovery._global_agent_info`` with no validation, so a spec can
+      declare a name containing a newline plus instruction-shaped text -- which
+      is pure ASCII, so an ``isascii`` check passes it -- and it would ride this
+      string into a model's context. ``SPAWN_RUN_SCHEMA`` gates the ``agent``
+      parameter on the same grammar, so a name that fails it could never have
+      been dispatched anyway: offering it would advertise an unusable name.
+    * **Redaction.** A grammar-valid name can still be credential-shaped (an
+      AWS access key is pure alphanumerics), so each name goes through the
+      canonical context-aware shim rather than being trusted.
+    * **Bound.** Every rendered roster that reaches always-on context is capped,
+      and the remainder is returned as a count instead of being silently lost.
+
+    Order is the CALLER's: this returns names in the order it received them, so
+    each surface keeps the presentation its own copy promises. *exclude* defaults
+    to the reserved pair (reached by omitting ``agent``, never by naming one);
+    ``spawn_list`` passes an empty set on purpose, because the two bounded
+    rosters point at it as the surface that lists everything.
+    """
+    kept = [
+        redact_via_context(n)
+        for n in names
+        if n and n not in exclude and _AGENT_NAME_RE.fullmatch(n)
+    ]
+    if limit is None or len(kept) <= limit:
+        return kept, 0
+    return kept[:limit], len(kept) - limit
+
 
 # How many valid names an unknown-agent refusal carries. The string reaches a WS
 # frame, a tombstone and the caller's transcript, so it is bounded like every
@@ -207,30 +268,22 @@ def _available_agents_hint(available: list[str]) -> str:
     other invented names while every log line already held the answer, and the
     log is not a surface the caller can read (#4842).
 
-    Every name is matched against ``_AGENT_NAME_RE`` before it is rendered, then
-    redacted, then the list is bounded. The grammar is the load-bearing filter, not
-    a tidiness check: an agent spec's ``name`` field is taken verbatim by
-    ``agent_discovery._global_agent_info`` with no validation, so a spec can
-    declare a name containing a newline and instruction-shaped text -- which is
-    pure ASCII, and would ride this string into the caller's model context.
-    ``SPAWN_RUN_SCHEMA`` already gates the ``agent`` parameter on the same grammar,
-    so a name that fails it could never have been dispatched anyway: offering it
-    here would advertise an unusable name.
+    Filtering, redaction and the bound are :func:`visible_agent_names`; the
+    caller already sorted *available*, and that order is preserved.
     """
-    names = [_redact(n) for n in available if _AGENT_NAME_RE.fullmatch(n)]
-    if not names:
+    shown, withheld = visible_agent_names(available, limit=_MAX_AVAILABLE_IN_ERROR)
+    if not shown:
         # An empty roster is a different instruction than a truncated one: there
         # is no name to correct to, so the only valid move is to stop naming an
         # agent at all.
         return "; no other agents are installed - omit 'agent' to use the default"
-    shown = names[:_MAX_AVAILABLE_IN_ERROR]
     hint = "; available: " + ", ".join(shown)
-    if len(names) > len(shown):
-        hint += f" (+{len(names) - len(shown)} more, call spawn_list)"
+    if withheld:
+        hint += f" (+{withheld} more, call spawn_list)"
     return hint
 
 
-def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str]:
+def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str, str]:
     """Validate that an agent name is one kiro-cli can actually load.
 
     Runs ON the event loop (``spawn`` is synchronous), so it must not add
@@ -250,16 +303,20 @@ def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str]:
     *project_dir* must be the cwd the subagent will actually run in, because that
     is what kiro-cli resolves ``--agent`` against.
 
-    Returns (agent_name, error). If agent found, error is empty.
-    If not found, agent_name is empty and error explains what happened.
+    Returns (agent_name, error, code). If the agent is found, error and code are
+    both empty. If not, agent_name is empty, error explains what happened in prose
+    and code is the machine-readable identifier for that decision. The code is
+    returned rather than inferred by the caller so that a SECOND refusal kind
+    added here has to choose its own identifier instead of silently inheriting
+    this one.
     """
     if not requested:
-        return "", ""
+        return "", "", ""
     known = {a.name for a in list_agents()}
     if project_dir:
         known |= set(cached_project_agent_names(project_dir) or frozenset())
     if requested in known:
-        return requested, ""
+        return requested, "", ""
     available = sorted(known - UNADVERTISED_AGENTS)
     # REFUSE a named-but-unknown agent rather than silently falling back to the
     # host default: that fallback runs the full default agent (frequently at
@@ -270,7 +327,11 @@ def _validate_agent(requested: str, project_dir: str = "") -> tuple[str, str]:
     logger.warning("Agent %r not found; refusing spawn. Available: %s", requested, available)
     # The roster travels WITH the refusal, not only to the log: the caller acts on
     # the returned string, and a bare "not found" gives it nothing to correct to.
-    return "", f"agent {requested!r} not found{_available_agents_hint(available)}"
+    return (
+        "",
+        f"agent {requested!r} not found{_available_agents_hint(available)}",
+        AGENT_NOT_FOUND_CODE,
+    )
 
 
 def _vet_spawn_governance(parent_session_key: str, agent: str, app: str = "") -> str | None:
@@ -432,10 +493,11 @@ _REPORT_DRAIN_TIMEOUT = (
     30.0  # max seconds cancel_all() waits for shielded terminal reports to drain
 )
 # Max seconds a cancelled run holds cancellation open for an in-flight off-loop
-# state.json write worker: long enough for any healthy fsync, short enough that
-# a wedged FS cannot hold cancel_all()'s untimed gather — bounded shutdown plus
+# state.json write worker -- every off-loop writer, not just the per-turn
+# diagnostics one: long enough for any healthy fsync, short enough that a wedged
+# FS cannot hold cancel_all()'s untimed gather — bounded shutdown plus
 # recoverable state beats unbounded shutdown.
-_DIAG_DRAIN_TIMEOUT = 5.0
+_STATE_DRAIN_TIMEOUT = 5.0
 _STARTUP_TIMEOUT_SECS = 120  # max seconds a subagent may sit pre-first-turn with no runtime before the startup watchdog reaps it
 _ON_DONE_TIMEOUT = 1200.0  # outer cap: max total seconds for semaphore wait + injection
 # Bounds reconciliation after an uncertain coordinator claim response.
@@ -1153,6 +1215,17 @@ class SubagentInfo:
     result_path: str = ""
     result_truncated: bool = False  # completion-event copy dropped content → summary+path
     error: str = ""
+    # Machine-readable identifier for ``error``, forwarded by ``POST /api/spawn``
+    # as the response's ``code`` so a client can switch on the decision instead of
+    # parsing the prose. Set today only by the unknown-agent refusal
+    # (``AGENT_NOT_FOUND_CODE``), which is the one rejection a client acts on
+    # differently: ``spawn_run`` stops re-posting a name the gateway already
+    # refused. The other kinds that DO carry an error (bad task, low memory, a cwd
+    # refusal, governance) stay un-coded and the handler answers them under a
+    # generic code — a code with no consumer would be contract surface bought for
+    # nothing. A capacity refusal never reaches this field at all: it returns no
+    # record, and the handler answers 429 from that absence.
+    error_code: str = ""
     parent_session_key: str = ""
     agent: str = ""
     # The app that spawned this child (empty for a non-app spawn). Persisted so
@@ -1185,9 +1258,11 @@ class SubagentInfo:
     _stall_suspect_at: float = (
         0.0  # first reaper sweep that saw the idle threshold exceeded; 2-sweep confirmation (scale dampening)
     )
-    _awaiting_approval: bool = (
-        False  # True while blocked on a human tool-approval prompt; exempt from idle-stall
-    )
+    # True while blocked on a human approval prompt — either the pre-execution
+    # spawn gate or a mid-run tool prompt; exempt from idle-stall. Paired with
+    # ``_exec_started is None`` it also tells the reaper which of the two a
+    # parked run is sitting on.
+    _awaiting_approval: bool = False
     # Attribution snapshot of the tool currently in flight, mirroring what
     # ``AcpSessionHandle`` keeps for the main agent. This is what lets the
     # liveness oracle key evidence to THIS subagent's own child process (by
@@ -1388,12 +1463,19 @@ class SubagentInfo:
     _cancel_retry_used: bool = False
     # True while a cancelled run is draining an in-flight off-loop state.json
     # write worker -- every writer inside a run, the per-turn diagnostics one
-    # being the most frequent. _run's unexpected-cancel recovery gate reads it:
-    # on Python 3.10 a second outer cancel can deliver that gate BEFORE the
-    # drain finishes (wait_for's _cancel_and_wait awaits an interruptible bare
-    # future), and scheduling a recovery writer while the worker is live
-    # re-opens the stale-overwrite race the drain exists to close.
-    _diag_drain_active: bool = False
+    # being the most frequent. _run's unexpected-cancel recovery gate reads it: on Python 3.10 a second outer
+    # cancel can deliver that gate BEFORE the drain finishes (wait_for's
+    # _cancel_and_wait awaits an interruptible bare future), and scheduling a
+    # recovery writer while the worker is live re-opens the stale-overwrite race
+    # the drain exists to close.
+    _state_drain_active: bool = False
+    # Set only on the synthetic marker `_conversation_busy` returns for a
+    # conversation held by an abandoned state writer (#6298 review), so the two
+    # retention callers can say "still settling a state write" instead of
+    # promising a completion event that has already fired. The authoritative
+    # record is `SubagentManager._abandoned_state_writers`, which survives
+    # `evict_completed_agents` pruning a completed run out of `_agents`.
+    _state_writer_abandoned: bool = False
     # True between an unexpected cancellation and the recovery respawn; the
     # _run finally block skips terminal finalization (subagent_done, on_done)
     # while set so the agent is not reported done mid-recovery.
@@ -1610,7 +1692,6 @@ class SubagentManager:
         )
         self._lifecycle: SubagentLifecycle[SubagentInfo] = SubagentLifecycle()
         self._coordinator_run_id_reservations: set[str] = set()
-        self._abandoned_state_writers: set[str] = set()
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
         # (continue_conversation), so per this module's containment contract
@@ -1633,6 +1714,16 @@ class SubagentManager:
         # also re-registers it on demand.
         self._conversations: dict[str, float] = {}
         self._conv_registry_rebuilt: bool = False
+        # Run ids whose bounded state-write drain EXPIRED, so a pool worker is
+        # still live and its stale whole-file rewrite would roll back the
+        # retention `keep` a promote / release writes on the loop (#6298).
+        # `_conversation_busy` reports these as held, which defers both retention
+        # writes past the worker; each worker's own done-callback discards its id,
+        # so the set holds at most one entry per live zombie. It lives on the
+        # MANAGER, not on the run's SubagentInfo, because `evict_completed_agents`
+        # prunes completed runs out of `_agents` and an eviction must not silently
+        # release the hold.
+        self._abandoned_state_writers: set[str] = set()
         # state.json is the source of truth for retention (#1115): give the
         # SessionManager's in-memory continuable cache a disk fallback so a
         # cache miss (restart window) cannot demote a promoted conversation.
@@ -2514,9 +2605,6 @@ class SubagentManager:
     async def _teardown_run_session(self, info: SubagentInfo, session_key: str) -> bool:
         return await self._run_events._teardown_run_session_impl(info, session_key)
 
-    async def _write_state_off_loop(self, info: SubagentInfo, what: str, **fields: object) -> bool:
-        return await self._run_events._write_state_off_loop_impl(info, what, **fields)
-
     async def _await_retained_shadow_submit(self, info: SubagentInfo) -> None:
         """Keep accepted run's durable submission alive across cancellation."""
         info._coordinator_shadow_generation += 1
@@ -2636,6 +2724,9 @@ class SubagentManager:
             )
         except Exception:
             logger.debug("Failed to write tombstone for %s", info.id, exc_info=True)
+
+    async def _write_state_off_loop(self, info: SubagentInfo, what: str, **fields: object) -> bool:
+        return await self._run_events._write_state_off_loop_impl(info, what, **fields)
 
     async def _run_inner(self, info: SubagentInfo, session_key: str) -> None:
         return await self._run_events._run_inner_impl(info, session_key)
@@ -3309,7 +3400,7 @@ _COMPONENT_GLOBAL_BINDINGS = (
     _AGENT_NAME_RE,
     _OUTBOX_DRAIN_BATCH_SIZE,
     _OUTBOX_RESULT_SUMMARY_LEN,
-    _DIAG_DRAIN_TIMEOUT,
+    _STATE_DRAIN_TIMEOUT,
     _TERMINAL_RETRY_SECONDS,
     _agent_dir,
     _cleanup_session_files_sync,

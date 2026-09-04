@@ -409,8 +409,11 @@ def _probe_interpreter(
     path's unbounded wait.
     """
     target = Path(os.path.abspath(target_py))
+    # -B because -I implies -E: this child ignores ``PYTHONPYCACHEPREFIX``, so
+    # without it bytecode lands inside the signed bundle. See
+    # ``sandbox._LAUNCHER_INTERPRETER_FLAGS`` for the whole policy.
     return subprocess.run(
-        [str(target), "-I", "-X", "utf8", "-c", code],
+        [str(target), "-I", "-B", "-X", "utf8", "-c", code],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -943,6 +946,25 @@ def sync_or_reinstall(
             False,
         )
         return sync(repo, target_py, emit, timeout=timeout)
+
+    # The same requires-python gate the dependency-only substitute applies, and
+    # for the same reason -- except here pip WOULD enforce it, by refusing the
+    # build with "Requires-Python". Refusing first turns an opaque pip failure on
+    # an already-merged revision into a named reason plus the recovery hint
+    # `_refuse` prints.
+    floor_spec = requires_python(repo)
+    floor_version = interpreter_version(target_py) if floor_spec else None
+    if floor_spec and floor_version:
+        breach = python_floor_breach(floor_spec, floor_version)
+        if breach:
+            return _refuse(
+                emit,
+                f"the merged revision requires Python {floor_spec} but the target "
+                f"venv runs {floor_version[0]}.{floor_version[1]}.{floor_version[2]}, "
+                "so pip will refuse to install it.",
+                target_py,
+                repo,
+            )
 
     # `-e <repo>` rather than `-e .` with a cwd: the target is explicit in the argv
     # instead of implied by the working directory this happens to run in.

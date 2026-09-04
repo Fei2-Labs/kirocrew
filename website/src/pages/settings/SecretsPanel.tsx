@@ -3,6 +3,7 @@ import { KeyRound, Plus, Trash2 } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 
 import { SettingsSection, SettingsCard } from '../../components/settings'
+import ErrorNotice from '../../components/ErrorNotice'
 import { Btn } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
 
@@ -13,8 +14,9 @@ import { i18nT } from '../../i18n/t'
  * 403/500 as a successful mutation: `onSuccess` fired and cleared the form,
  * silently discarding the secret the user had typed without ever storing it.
  * Throwing routes those statuses to `onError` instead, which leaves the form
- * populated so the value is not lost. Matches the `!r.ok` pattern used by
- * `src/api/pins.ts`.
+ * populated so the value is not lost. This is a local `!r.ok` guard rather than
+ * the shared `api/client.ts` transport because SecretsPanel authenticates with
+ * the raw stored token, not the transport's `dashboard:ui` session key.
  */
 const j = async (r: Response) => {
   if (!r.ok) {
@@ -31,7 +33,14 @@ const j = async (r: Response) => {
   }
   return r.json()
 }
-const _sk = { 'X-Session-Key': localStorage.getItem('kiro_crew_token') || '' }
+// Send the same fixed `dashboard:ui` session key the shared transport uses
+// (`src/api/client.ts`). This panel previously read `localStorage['kiro_crew_token']`,
+// but nothing in the app ever writes that key — the browser's dashboard identity
+// is the `dashboard:ui` literal, and the backend treats a missing/empty
+// X-Session-Key as `dashboard:ui` anyway — so the read was vestigial dead code
+// that always resolved to ''. Use the literal directly so the header is explicit
+// and matches every other panel.
+const _sk = { 'X-Session-Key': 'dashboard:ui' }
 const get = (url: string) => fetch(url, { headers: { ..._sk } })
 const post = (url: string, body?: object) =>
   fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify(body) })
@@ -109,19 +118,39 @@ export function SecretsPanel() {
                   <span className="text-xs text-muted shrink-0">••••••••</span>
                 </div>
                 {deleteConfirm === name ? (
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-xs text-warn">{i18nT('settings.secrets.delete_confirm')}</span>
-                    <Btn danger onClick={() => deleteMutation.mutate(name)}>
-                      {i18nT('settings.secrets.delete')}
-                    </Btn>
-                    <Btn onClick={() => setDeleteConfirm(null)}>
-                      {i18nT('settings.secrets.cancel')}
-                    </Btn>
+                  <div className="flex flex-col items-start gap-1 md:items-end">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs text-warn">{i18nT('settings.secrets.delete_confirm')}</span>
+                      <Btn danger onClick={() => deleteMutation.mutate(name)} disabled={deleteMutation.isPending || setMutation.isPending}>
+                        {i18nT('settings.secrets.delete')}
+                      </Btn>
+                      <Btn disabled={deleteMutation.isPending} onClick={() => { setDeleteConfirm(null); deleteMutation.reset() }}>
+                        {i18nT('settings.secrets.cancel')}
+                      </Btn>
+                    </div>
+                    {deleteMutation.isError && (
+                      <ErrorNotice
+                        variant="inline"
+                        message={i18nT('settings.secrets.delete_error', {
+                          error: (deleteMutation.error as Error).message,
+                        })}
+                      />
+                    )}
                   </div>
                 ) : (
                   <button
-                    onClick={() => setDeleteConfirm(name)}
-                    className="p-1 rounded hover:bg-bg-hover text-muted hover:text-warn"
+                    onClick={() => {
+                      // Never reset a PENDING mutation: switching rows during an
+                      // in-flight DELETE would clear its gating state and permit
+                      // a duplicate whose delayed original could erase a
+                      // re-saved value. The other reset sites are unreachable
+                      // mid-flight (both Cancels are disabled while pending).
+                      if (deleteMutation.isPending) return
+                      deleteMutation.reset()
+                      setDeleteConfirm(name)
+                    }}
+                    className="p-1 rounded hover:bg-bg-hover text-muted hover:text-warn disabled:opacity-30 disabled:cursor-not-allowed"
+                    disabled={deleteMutation.isPending}
                     aria-label={i18nT('settings.secrets.delete_secret_name', { name })}
                   >
                     <Trash2 size={14} />
@@ -164,16 +193,26 @@ export function SecretsPanel() {
               </label>
             </div>
             <div className="flex gap-2">
-              <Btn primary onClick={handleAdd} disabled={!newName.trim() || !newValue}>
-                {i18nT('settings.secrets.save')}
+              <Btn primary onClick={handleAdd} disabled={!newName.trim() || !newValue || setMutation.isPending || deleteMutation.isPending}>
+                {setMutation.isPending
+                  ? i18nT('settings.secrets.saving')
+                  : i18nT('settings.secrets.save')}
               </Btn>
-              <Btn onClick={() => { setShowAdd(false); setNewName(''); setNewValue('') }}>
+              <Btn disabled={setMutation.isPending} onClick={() => { setShowAdd(false); setNewName(''); setNewValue(''); setMutation.reset() }}>
                 {i18nT('settings.secrets.cancel')}
               </Btn>
             </div>
+            {setMutation.isError && (
+              <ErrorNotice
+                variant="inline"
+                message={i18nT('settings.secrets.save_error', {
+                  error: (setMutation.error as Error).message,
+                })}
+              />
+            )}
           </div>
         ) : (
-          <Btn onClick={() => setShowAdd(true)} className="mt-2">
+          <Btn onClick={() => { setMutation.reset(); setShowAdd(true) }} className="mt-2">
             <Plus size={14} className="mr-1" />
             {i18nT('settings.secrets.add_secret')}
           </Btn>

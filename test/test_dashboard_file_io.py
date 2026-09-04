@@ -343,15 +343,30 @@ class TestFileWrite:
             assert resp.status == 200
 
         kwargs = captured["kwargs"]
-        # See the steering twin: a descriptor where the xattr syscalls exist,
-        # None where they do not (Windows), because a handle held open there
-        # would make os.replace fail. The kwarg itself must always be passed.
+        # See the steering twin: a descriptor wherever one is needed, None only
+        # where holding a handle open would make os.replace fail (Windows). The
+        # kwarg itself must always be passed.
         assert "preserve_access_control_from" in kwargs
-        if aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
+        # The branch keys on the PIN, not on xattr support. The handler pins the
+        # parent and passes parent_dir_fd, and open_access_control_source hands
+        # back a descriptor whenever dir_fd is given even where the xattr
+        # syscalls are absent -- macOS has openat and no listxattr, and the MODE
+        # carry needs a descriptor even when the ACL carry has nothing to read,
+        # or a by-name stat would reintroduce the pin/open mismatch. Keying on
+        # ACCESS_CONTROL_XATTRS_SUPPORTED alone predates that parent_dir_fd
+        # pinning and demanded None on macOS, where the descriptor is correct.
+        pinned = kwargs.get("parent_dir_fd")
+        if pinned is not None or aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
             assert isinstance(kwargs["preserve_access_control_from"], int)
             assert captured["source_bytes"] == b"hello world"
         else:  # pragma: no cover - exercised on Windows CI only
             assert kwargs["preserve_access_control_from"] is None
+        # A pinned parent may NEVER arrive with no source descriptor: that pairing
+        # is what forces the mode to come off the same inode the ACL does instead
+        # of being re-resolved by name inside a directory that could have been
+        # swapped after the pin.
+        if pinned is not None:
+            assert kwargs["preserve_access_control_from"] is not None
         assert kwargs["mode"] == stat.S_IMODE(tmp_file.stat().st_mode)
         assert tmp_file.read_text(encoding="utf-8") == "updated"
         # Off the event loop (no-blocking-call-on-event-loop): every call in the
@@ -610,7 +625,7 @@ class TestSendMessage:
         with patch(
             "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
         ) as mock_run, patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -655,7 +670,7 @@ class TestSendMessage:
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -717,7 +732,7 @@ class TestSendMessage:
         with patch(
             "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
         ) as mock_run, patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history",
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async",
             return_value=mock_slot,
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
@@ -743,6 +758,52 @@ class TestSendMessage:
                 state.notify.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_send_message_session_origin_rehydrate_reads_off_the_loop(self):
+        """The cold-slot rehydration must not parse the transcript on the loop.
+
+        Issue #7408: this handler called the SYNCHRONOUS rehydrate, which read and
+        JSON-parsed the whole transcript inline -- 100-300 ms on a large store,
+        stalling every other request. Asserted by thread identity rather than by
+        the name of the function called, so the guarantee survives a rename.
+        """
+        from kiro_crew.dashboard import chat_persistence
+
+        state = _mock_state()
+        state.get_slot = MagicMock(return_value=None)
+        state.conversation_log = MagicMock()
+        state._slots = {}
+        mock_job = MagicMock()
+        mock_job.id = "abc12345"
+        mock_job.name = "test-cron"
+        mock_job.session_key = "dashboard:chat-1-1712793600"
+        state.crons.list_jobs = MagicMock(return_value=[mock_job])
+        app = _make_send_app(state)
+        seen: list[int] = []
+
+        def _prefetch(*_a, **_kw):
+            seen.append(threading.get_ident())
+            # messages=None means "nothing persisted", so the handler falls back to
+            # the notification path -- keeping this test about the read's location.
+            return ({}, True, None, {}, None)
+
+        with patch.object(chat_persistence, "_prefetch_rehydrate_inputs", _prefetch):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/send-message",
+                    json={"text": "update", "session": "origin", "caller_session": "cron:abc12345"},
+                )
+                assert resp.status == 200
+
+        assert seen, (
+            "the off-loop prefetch never ran: either the read is happening inline "
+            "on the loop again (the #7408 defect) or this seam moved"
+        )
+        assert threading.get_ident() not in seen, (
+            "the transcript was read on the event-loop thread; the handler must "
+            "await rehydrate_slot_from_history_async"
+        )
+
+    @pytest.mark.asyncio
     async def test_send_message_session_origin_rehydrate_returns_none_falls_back(self):
         """When get_slot returns None AND rehydrate returns None (no persisted
         session on disk), fall back to normal delivery (notification + optional
@@ -757,7 +818,7 @@ class TestSendMessage:
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history", return_value=None
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async", return_value=None
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -812,7 +873,7 @@ class TestSendMessage:
         app = _make_send_app(state)
         with patch(
             "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
-        ) as mock_run, patch("kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"):
+        ) as mock_run, patch("kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/api/send-message",
@@ -835,7 +896,7 @@ class TestSendMessage:
         state.get_slot = MagicMock()
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -873,7 +934,7 @@ class TestSendMessage:
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(

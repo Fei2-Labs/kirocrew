@@ -1203,6 +1203,192 @@ _MARKED_MCP_LAUNCHER_MARKERS = (
     b"mcp start-server",  # generic ``<launcher> mcp start-server <name>`` shims
 )
 
+# ── Stranded playwright-cli browser daemon (issue #5986) ─────────────────────
+# playwright-core spawns its browser daemon as
+#   ``node <...>/playwright-core/lib/entry/cliDaemon.js <session-name> [flags]``
+# with ``detached: true`` and no ``env`` override (cli-client/session.js
+# ``startDaemon``). Two consequences make it its own orphan class:
+#
+# * detached => it is its own SESSION and PROCESS-GROUP leader, so it is
+#   invisible to the teardown child snapshot, to ``kill_process_tree``, and to
+#   the SID-based ownership test the work class uses (its SID is its own pid).
+# * no env override => it inherits the spawning agent's environment verbatim,
+#   so its EXEC-TIME environ carries both ``KIROCREW_SPAWNED`` and the
+#   generated ``PLAYWRIGHT_CLI_SESSION``. Exec-time environ is kernel-held and
+#   immutable after exec, so it is ownership evidence no process can forge for
+#   another -- unlike any on-disk registry or claim file, which a same-UID
+#   agent can write.
+#
+# Deliberately NOT keyed on the socket path the way the gatewayd class is:
+# ``Session._connect`` UNLINKS the socket whenever a connect fails, so an
+# absent socket means "a client already cleaned up after a refused connect",
+# not "the daemon is unreachable" -- and the daemon holds its listening fd
+# regardless, so absence proves nothing about the browser tree.
+_BROWSER_DAEMON_ENTRY = b"cliDaemon.js"
+
+#: Must track :data:`kiro_crew.browser_cli.launch.SESSION_ENV`. Duplicated as a
+#: literal rather than imported because ``session_pid`` is imported early by
+#: ``acp.runtime`` and must not pull the browser package's import graph onto
+#: that path; a test asserts the two stay equal.
+_BROWSER_SESSION_ENV = "PLAYWRIGHT_CLI_SESSION"
+
+#: Generated-session prefix from ``browser_cli.launch`` (``kc-<8hex>``).
+_BROWSER_SESSION_PREFIX = b"kc-"
+
+# Grace given to a TERMed browser-daemon GROUP before escalating to SIGKILL.
+# Chromium exits on TERM within a second or two; this leaves room for a profile
+# flush without letting a wedged tree hold the sweep's budget.
+_BROWSER_DAEMON_TERM_GRACE_SECONDS = 5.0
+
+
+def _is_generated_browser_session(name: bytes) -> bool:
+    """True for a Kiro-Crew-generated ``kc-<8hex>`` session name.
+
+    Mirrors ``browser_cli.launch._session_leaf``. ONLY generated names are
+    ever sweepable: an operator who named a session (``default``, ``chrome``,
+    an ``attach`` workflow) owns its lifetime, and the ``kc-`` prefix is
+    reserved precisely so the two populations cannot be confused.
+    """
+    if not name.startswith(_BROWSER_SESSION_PREFIX):
+        return False
+    leaf = name[len(_BROWSER_SESSION_PREFIX) :]
+    return len(leaf) == 8 and all(c in b"0123456789abcdef" for c in leaf)
+
+
+def _browser_daemon_session_arg(cmdline: bytes) -> bytes | None:
+    """Generated session name from a cliDaemon cmdline, or ``None``.
+
+    The daemon's argv is ``node <entry>/cliDaemon.js <session-name> [flags]``,
+    so the name is the element immediately following the entry script --
+    matched on the script's BASENAME so an npx/global/vendored install path
+    all resolve. NUL-separated argv ONLY: the space-joined ``ps`` fallback
+    cannot delimit a path containing spaces, and a mis-split argv could pair
+    the script with the wrong token, so anything without NULs fails closed.
+    """
+    args = [a for a in cmdline.split(b"\x00") if a]
+    if len(args) <= 1:
+        return None
+    for index, arg in enumerate(args[:-1]):
+        if arg.rsplit(b"/", 1)[-1] == _BROWSER_DAEMON_ENTRY:
+            name = args[index + 1]
+            return name if _is_generated_browser_session(name) else None
+    return None
+
+
+def _env_value(pid: int, key: str) -> bytes | None:
+    """Exec-time environment value for *key* in *pid*, or ``None`` if unset.
+
+    Deliberately PROPAGATES ``OSError`` instead of swallowing it like
+    :func:`_env_has_kirocrew_marker`: the callers here need to tell "read
+    said the key is absent" apart from "the read failed", because those two
+    outcomes must fail closed in OPPOSITE directions -- an absent owner
+    permits a kill, an unreadable one must forbid it. Linux-only; returns
+    ``None`` elsewhere so every caller fails closed off Linux.
+    """
+    if sys.platform != "linux":
+        return None
+    prefix = key.encode() + b"="
+    environ = Path(f"/proc/{pid}/environ").read_bytes()
+    for item in environ.split(b"\x00"):
+        if item.startswith(prefix):
+            return item[len(prefix) :]
+    return None
+
+
+def _browser_session_owner_alive(pid: int, session: bytes) -> bool:
+    """True while any live process OUTSIDE *pid*'s own tree holds *session*.
+
+    This is the ownership proof, and it is drawn entirely from the kernel.
+    Kiro Crew injects the generated ``PLAYWRIGHT_CLI_SESSION`` into exactly
+    one spawned agent process, so that value in a live process's EXEC-TIME
+    environ means the browser still has an owner. Scanning the whole process
+    table (not a manager-local set) is what makes a peer gateway sharing this
+    data home see its own live sessions and protect them.
+
+    The daemon's own tree is excluded by SID: it is spawned ``detached``, so
+    it is its own session leader and every Chromium child inherits that SID --
+    those inherit the variable too and must not be mistaken for owners.
+
+    FAIL-CLOSED to "alive": an unreadable ``/proc`` listing or an inconclusive
+    per-process read (EACCES, EIO) returns ``True``, so the sweep never kills
+    on a failed probe. A process that VANISHES mid-scan is simply not an
+    owner, which is the one error that is safe to skip.
+    """
+    if sys.platform != "linux":
+        return True
+    try:
+        entries = [e for e in Path("/proc").iterdir() if e.name.isdigit()]
+    except OSError:
+        return True
+    my_uid = os.getuid()
+    for entry in entries:
+        try:
+            other = int(entry.name)
+        except ValueError:
+            continue
+        if other == pid:
+            continue
+        try:
+            if entry.stat().st_uid != my_uid:
+                continue
+        except _PID_VANISHED_ERRORS:
+            continue
+        except OSError:
+            return True
+        if _linux_pid_sid(other) == pid:
+            continue  # the daemon's own detached tree, not an owner
+        try:
+            if _env_value(other, _BROWSER_SESSION_ENV) == session:
+                return True
+        except _PID_VANISHED_ERRORS:
+            continue
+        except OSError:
+            return True
+    return False
+
+
+def _is_sweepable_orphan_browser_daemon(pid: int, cmdline: bytes, age_seconds: float) -> bool:
+    """Fifth positive-identity path: a browser daemon whose owner is gone.
+
+    Positive identity is the conjunction of:
+
+    1. a structural cliDaemon argv carrying a GENERATED ``kc-<8hex>`` session
+       name (:func:`_browser_daemon_session_arg`, NUL-argv only) -- an
+       operator-named session is structurally excluded and never signalled;
+    2. that same name in the process's exec-time environ, which ties this
+       daemon to a name Kiro Crew itself generated rather than one an agent
+       passed with ``-s=``;
+    3. the ``KIROCREW_SPAWNED`` environ marker, proving Kiro Crew spawned the
+       tree (:func:`_env_has_kirocrew_marker`, Linux-only, fail-closed);
+    4. NO live process outside the daemon's own tree still holding that
+       session (:func:`_browser_session_owner_alive`);
+    5. age past :data:`_ORPHAN_WORK_MIN_AGE_SECONDS` -- the generous work-class
+       floor, not the 120s MCP one, so a daemon whose agent is mid-spawn or
+       briefly detached is never raced.
+
+    Every signal is a kernel fact (argv, exec-time environ, SID, process
+    liveness). Nothing here reads agent-writable filesystem state, which is
+    what made the previously withdrawn reapers unsafe.
+    """
+    if age_seconds < _ORPHAN_WORK_MIN_AGE_SECONDS:
+        return False
+    if not cmdline:
+        return False  # kernel thread / zombie — nothing meaningful to kill
+    normalized = cmdline.replace(b"\x00", b" ")
+    if any(marker in normalized for marker in _GATEWAY_MARKERS):
+        return False
+    session = _browser_daemon_session_arg(cmdline)
+    if session is None:
+        return False
+    try:
+        if _env_value(pid, _BROWSER_SESSION_ENV) != session:
+            return False
+    except OSError:
+        return False  # inconclusive — fail closed
+    if not _env_has_kirocrew_marker(pid):
+        return False
+    return not _browser_session_owner_alive(pid, session)
+
 
 def _our_orphan_pids() -> list[int]:
     """PIDs owned by current user whose parent is init (pid 1) or systemd --user.
@@ -1471,6 +1657,57 @@ def _kill_orphan_gatewayd(pid: int, cmdline: bytes) -> int:
     except (ProcessLookupError, OSError):
         pass
     _sel_orphan_kill(pid, pid, cmdline, "sigterm+sigkill")
+    return 1
+
+
+def _kill_orphan_browser_daemon(pid: int, cmdline: bytes) -> int:
+    """Group-TERM a stranded browser daemon, escalating to a group SIGKILL.
+
+    Signals the process GROUP, not the pid. The daemon is spawned
+    ``detached``, so it is its own group leader and its Chromium children
+    inherit that group -- the browser tree is the whole point of the reclaim
+    (it is where the gigabytes are), and a pid-only signal would kill the
+    supervisor and leave Chromium reparented to init as a fresh, now
+    completely unattributable leak.
+
+    TERM first so Chromium exits through its own shutdown path and flushes
+    its profile. The group is signalled only when the daemon is genuinely an
+    isolated leader (``pgid == pid``, not our own group, not init's), so
+    ``killpg`` can never reach a foreign process; identity is re-verified
+    before the escalation so a PID recycled inside the grace window is never
+    SIGKILLed.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        return 0
+    if not (pgid == pid and pgid != os.getpgrp() and pgid > 1):
+        # Not an isolated group leader: killpg would reach processes this
+        # predicate never identified. Leave it for a later sweep.
+        return 0
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return 0
+    deadline = time.monotonic() + _BROWSER_DAEMON_TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        # platform_compat.pid_exists, not a raw `os.kill(pid, 0)`: on Windows a
+        # signal-zero "probe" TERMINATES the target instead of testing it. This
+        # path is POSIX-only in practice, but routing through the shim keeps it
+        # correct on its own terms rather than depending on a caller's early-out.
+        if not platform_compat.pid_exists(pid):
+            _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm")
+            return 1
+        time.sleep(0.1)
+    try:
+        if sys.platform == "linux":
+            if Path(f"/proc/{pid}/cmdline").read_bytes() != cmdline:
+                _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm")
+                return 1
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm+sigkill")
     return 1
 
 
@@ -1758,6 +1995,7 @@ def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
             _is_sweepable_orphan_mcp(pid, cmdline)
             or _is_sweepable_orphan_gatewayd(cmdline)
             or _is_sweepable_orphan_work(pid, cmdline, pid_age)
+            or _is_sweepable_orphan_browser_daemon(pid, cmdline, pid_age)
         ):
             continue
         candidates.append(pid)
@@ -1891,6 +2129,14 @@ def kill_orphan_mcps(pids: list[int]) -> int:
                 killed += _kill_orphan_work_tree(
                     pid, cmdline, work_age, budget=_ORPHAN_SWEEP_MAX_KILLS - killed
                 )
+                continue
+            # Stranded browser daemon. Re-verify the FULL identity — argv
+            # shape, exec-time environ, live-owner probe and the age floor —
+            # immediately before signalling, so a PID recycled since the find
+            # phase cannot inherit the verdict.
+            daemon_age = _linux_pid_age(pid, time.time()) if sys.platform == "linux" else 0.0
+            if _is_sweepable_orphan_browser_daemon(pid, cmdline, daemon_age):
+                killed += _kill_orphan_browser_daemon(pid, cmdline)
         except (
             ProcessLookupError,
             PermissionError,

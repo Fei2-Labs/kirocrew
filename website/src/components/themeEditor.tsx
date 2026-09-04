@@ -95,6 +95,7 @@ export function getCurrentThemeVars(): Record<string, string> {
     '--diff-add', '--diff-add-text', '--diff-del', '--diff-del-text',
     '--diff-hunk', '--diff-hunk-text', '--diff-meta-text',
     '--shadow-sm', '--shadow-md', '--shadow-lg',
+    '--term-magenta', '--term-cyan',
   ]
   for (const k of extras) result[k] = computed.getPropertyValue(k).trim()
   return result
@@ -350,14 +351,12 @@ export function ThemeEditorPanel({ editor }: { editor: ReturnType<typeof useThem
               {/* Control is the custom <Input> (a forwardRef <input>) nested here
                   and linked via htmlFor+id; the deprecated label-has-for rule can't
                   see through the component wrapper, so scope-disable it. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="theme-editor-name">
                 <span className="text-[12px] text-muted uppercase tracking-[.04em] mb-1 block">{i18nT('components.themeEditor.theme_name')}</span>
                 <Input id="theme-editor-name" value={themeName} onChange={e => setThemeName(e.target.value)} placeholder={i18nT('components.themeEditor.my_custom_theme')} />
               </label>
             </div>
             <div className="w-16 shrink-0">
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="theme-editor-emoji">
                 <span className="text-[12px] text-muted uppercase tracking-[.04em] mb-1 block">{i18nT('components.themeEditor.emoji')}</span>
                 <Input id="theme-editor-emoji" value={themeEmoji} onChange={e => setThemeEmoji(e.target.value)} placeholder="✨" className="text-center !flex-none w-full" />

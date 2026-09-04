@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from kiro_crew.platform.interfaces import ImportSource, McpScope
+    from kiro_crew.platform.interfaces import (
+        ImportSource,
+        InboundToken,
+        McpScope,
+        SessionPrincipal,
+        WorkloadIdentity,
+    )
+    from kiro_crew.security import DeniedCommandRule
+    from kiro_crew.skill_providers.base import SkillProvider
 
 from kiro_crew import security, sso_status
 from kiro_crew.platform.interfaces import (
@@ -281,6 +289,41 @@ class DefaultIdentityProvider:
         return []
 
 
+class DefaultAgentIdentityProvider:
+    """Disabled agent-identity seam — standalone has no workload or Gateway.
+
+    ``enabled()`` is False so every public call site is a no-op. Other methods
+    return the disabled answer (``None`` / ``{}`` / the input principal) so a
+    ``safe_context_call`` fallback that degrades to the same values cannot
+    flip the seam on.
+    """
+
+    def enabled(self) -> bool:
+        return False
+
+    def workload_identity(self) -> "WorkloadIdentity | None":
+        return None
+
+    def status(self) -> Dict[str, object]:
+        # Display-only. Never token material — a token-like key here would
+        # leak bearer into the dashboard status payload.
+        return {}
+
+    def gateway_mcp_spec(self) -> Dict[str, object] | None:
+        return None
+
+    async def annotate_principal(self, principal: "SessionPrincipal") -> "SessionPrincipal":
+        return principal
+
+    async def vend_workload_access_token(self, principal: "SessionPrincipal") -> str | None:
+        return None
+
+    async def vend_gateway_inbound_token(
+        self, principal: "SessionPrincipal"
+    ) -> "InboundToken | None":
+        return None
+
+
 class DefaultEmbeddingSource:
     """Bundled in-process model (vendored llama.cpp), unsigned local inference.
 
@@ -331,6 +374,20 @@ class DefaultPromptSourceProvider:
     """No edition prompt/SOP roots — only user-authored prompts are listed."""
 
     def prompt_source_roots(self) -> List[Path]:
+        return []
+
+
+class DefaultSkillDiscoveryProvider:
+    """No edition skill discovery providers — the built-in catalog only."""
+
+    def skill_providers(self) -> List["SkillProvider"]:
+        return []
+
+
+class DefaultDeniedRuleProvider:
+    """No edition denied-command rules — the built-in catalog only."""
+
+    def denied_rules(self) -> List["DeniedCommandRule"]:
         return []
 
 

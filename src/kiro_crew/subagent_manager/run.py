@@ -10,10 +10,10 @@ if TYPE_CHECKING:
     from ..subagent import (
         _AGENT_NAME_RE,
         _CANCEL_RESUME_PREFIX,
-        _DIAG_DRAIN_TIMEOUT,
         _MAX_ERROR_DETAIL_LEN,
         _ON_DONE_TIMEOUT,
         _RESET_TIMEOUT,
+        _STATE_DRAIN_TIMEOUT,
         _SYSTEM_PREFIX,
         _TRANSIENT_CONTINUE_MSG,
         _TURN_LIMIT,
@@ -173,9 +173,9 @@ class RunEventCoordinator(ManagerComponent):
             # recovery writer the worker could race. 3.11+ delivers the outer
             # cancel only after this child task completes, so there the latch is
             # always observed False.
-            info._diag_drain_active = True
+            info._state_drain_active = True
             try:
-                deadline = time.monotonic() + _DIAG_DRAIN_TIMEOUT
+                deadline = time.monotonic() + _STATE_DRAIN_TIMEOUT
                 while not writer.done():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -185,7 +185,7 @@ class RunEventCoordinator(ManagerComponent):
                             "back a recovery run's state)",
                             what,
                             info.id,
-                            _DIAG_DRAIN_TIMEOUT,
+                            _STATE_DRAIN_TIMEOUT,
                         )
                         # The abandoned worker is a live stale writer whose
                         # rewrite is whole-file, so it can roll back the pid /
@@ -207,7 +207,7 @@ class RunEventCoordinator(ManagerComponent):
                     except asyncio.CancelledError:
                         pass  # repeated cancel: keep draining to the deadline
             finally:
-                info._diag_drain_active = False
+                info._state_drain_active = False
             raise
 
     def update_completion_keep_impl(self, mode: str, max_chars: int) -> None:
@@ -389,7 +389,7 @@ class RunEventCoordinator(ManagerComponent):
                     # recovery writer now re-opens the stale-overwrite race
                     # (#6306, #6308; reachable on 3.10 via a second outer
                     # cancel interrupting wait_for's _cancel_and_wait).
-                    and not info._diag_drain_active
+                    and not info._state_drain_active
                     and info.tool_count == 0
                 ):
                     # UNEXPECTED cancellation (not user Stop, not shutdown):
@@ -921,6 +921,12 @@ class RunEventCoordinator(ManagerComponent):
 
         # Protected identity is the only restart authority for terminating this
         # process tree. Failure must abort before the child receives a prompt.
+        #
+        # The write it makes is off-loop and drained on cancellation: update_state
+        # ends in a synchronous fsync, and the reaper, every chat turn and the
+        # heartbeat all share this loop. Off-loop also means the write TAKES
+        # update_state's per-agent lock, which on-loop callers skip, so it cannot
+        # interleave with another pool writer's read-merge-rewrite.
         await self._manager._record_process_identity(info, session_key)
 
         # Record session_id and provider type for session file cleanup
@@ -1723,6 +1729,14 @@ class RunEventCoordinator(ManagerComponent):
         info._shared_provider = provider
         if runtime.pid:
             info._pid = runtime.pid
+            # Same off-loop, drained write as the non-shared spawn path's PID
+            # record. Unguarded here: this method has no best-effort contract, so
+            # an _atomic_write failure still propagates to the caller rather than
+            # yielding a session with no recorded pid.
+            #
+            # process_owned=False with an empty start token on purpose: the PID is
+            # the PARENT's shared runtime, so this run is not the restart
+            # authority for terminating that tree.
             await self._manager._write_state_off_loop(
                 info,
                 "PID record",

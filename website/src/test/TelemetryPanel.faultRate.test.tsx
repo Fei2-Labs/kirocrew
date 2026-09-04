@@ -237,4 +237,45 @@ describe('TelemetryPanel startup faults', () => {
     expect(faultTile().textContent).toContain('1 fault')
     expect(faultTile().textContent).not.toContain('60 fault')
   })
+
+  it('does not count a cancelled turn as a fault, but keeps it in the denominator', async () => {
+    // The operator pressing Stop is not the system failing. The outcome used to
+    // fold into `error`, so every cancel landed in fault_rate's numerator; it is
+    // its own label now and the API excludes it from the numerator only -- the
+    // turn did run, so it stays in the population the rate is a share of.
+    await mount(
+      resp({
+        ...stat({ count: 100 }),
+        outcome: { ok: 90, cancelled: 9, error: 1 },
+        // 1 fault / 100 classifiable turns: cancels are in the denominator.
+        fault_rate: 0.01,
+      }),
+    )
+    await waitFor(() => expect(screen.getByText('Fault rate')).toBeInTheDocument())
+
+    expect(faultValue().textContent).toBe('1%')
+    expect(faultTile().textContent).toContain('1 fault of 100')
+    expect(faultTile().textContent).not.toContain('10 fault')
+  })
+
+  it('does not count a recovered watchdog stall as a fault', async () => {
+    // The API's _TERMINAL_FAULT_OUTCOMES excludes both recovery outcomes -- a
+    // recovered stall is re-driven in place and tracked under
+    // kirocrew.watchdog.recovery.outcome. The tile's complement rule counted
+    // them anyway, so it reported a fault count over a population the
+    // percentage next to it did not use. `stall_exhausted` (the budget-spent
+    // case) IS a fault on both sides and must still be counted.
+    await mount(
+      resp({
+        ...stat({ count: 100 }),
+        outcome: { ok: 90, tool_stall: 5, stale_recover: 3, stall_exhausted: 2 },
+        // 2 faults / 100: only the exhausted stalls.
+        fault_rate: 0.02,
+      }),
+    )
+    await waitFor(() => expect(screen.getByText('Fault rate')).toBeInTheDocument())
+
+    expect(faultValue().textContent).toBe('2%')
+    expect(faultTile().textContent).toContain('2 faults of 100')
+  })
 })

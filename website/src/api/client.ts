@@ -1,6 +1,6 @@
-import { copyToClipboard } from '../utils/clipboard'
 import { resizeImageForModel, type ResizeInfo } from '../utils/resizeImage'
 import type {
+  AppContributor,
   ChatSlot,
   IssueSource,
   McpApplyChange,
@@ -27,6 +27,19 @@ import {
   noteStaleOwnerResponse,
 } from './staleOwnerSignal'
 import { beginArtifactWrite, endArtifactWrite } from '../lib/artifactWrites'
+import { withDeadline } from '../lib/withDeadline'
+
+/** Deadline for `api.skills`. Measured on one host inside twenty minutes: 0.62s
+ *  healthy, then 9.76s, 41.41s, 168.71s for a byte-identical payload. 15s clears
+ *  the 9.76s case that still completed and cuts off the pathological ones.
+ *  Rationale in the CR description. */
+export const SKILLS_TIMEOUT_MS = 15_000
+
+/** Deadline for `api.slashCommands`. Same value as the `$`-menu's above, for the
+ *  same reason and against the same gateway: both menus are composer affordances
+ *  whose fetch blocks Enter while it is unsettled, so a divergent bound here
+ *  would only be a second number to explain. Rationale in the CR description. */
+export const SLASH_COMMANDS_TIMEOUT_MS = 15_000
 import { installApiTransport } from './apiTransport'
 import type { SessionSummary } from '../types/sessionSummary'
 import { queryClient } from './queryClient'
@@ -65,6 +78,12 @@ function themeConsentSha(colorTheme?: string): string | null {
  *  from the server or the config (an env name, a capability path, a protocol
  *  version) and is deliberately NOT translated.
  */
+/** Response of POST /api/reveal. When the backend cannot drive a file manager
+ *  (a remote or headless session) it degrades to a clipboard copy: `copy` is the
+ *  path to write. The caller (`revealOrOpen`) writes the clipboard silently — the
+ *  affordance that routed here already promised a copy. */
+type RevealResult = { copy?: string }
+
 export type McpShareReason = {
   code: string
   detail: string
@@ -209,6 +228,15 @@ export interface ConnectionStatus {
    *  "could not look" rather than "absent". */
   grantIndeterminate?: boolean
   connectedSince?: string
+}
+
+/** Authenticated provider-tool verdict returned by POST /api/connections/test. */
+export interface ConnectionTestResult {
+  schema_version: number
+  slug: string
+  verdict: 'usable' | 'no_tools' | 'failed'
+  code: string
+  toolCount: number
 }
 
 /**
@@ -755,6 +783,12 @@ export interface DeniedCommandRule {
    *  null/absent = freely toggleable. Additive — `pinned` keeps its
    *  governance-only meaning. */
   lock_reason?: 'floor' | 'policy' | null
+  /** Where the rule came from: 'builtin' = shipped in Kiro Crew's catalog;
+   *  'edition' = contributed by a composed edition through the `denied_rules`
+   *  seam. Edition rules are default-on and freely toggleable (never locked),
+   *  and are grouped by their own `category`, so the panel needs no special
+   *  case. Optional so an older gateway's response still type-checks. */
+  source?: 'builtin' | 'edition'
 }
 
 /** A user-authored denied-command pattern. */
@@ -1227,6 +1261,10 @@ export function removeAuthBanner(): void {
   // still authenticates for everything the owner gate does not front, so a
   // success proves nothing about the stale-subject denial.
   if (_staleOwnerBanner) return
+  // Auth works again, so a LATER lapse in this same document deserves its own
+  // hand-off. Deliberately after the stale-owner return above: that denial is not
+  // disproved by an unrelated success, and re-asking the hub for it loops forever.
+  _embeddedHandoffPosted = false
   if (!_sessionExpiredShown) return
   _sessionExpiredShown = false
   const el = document.getElementById('mc-session-expired')
@@ -1237,6 +1275,31 @@ export function removeAuthBanner(): void {
 // Reactive warm-path recovery: background-poll 403s funnel here, through the
 // shared single-flight refreshOnce(). True if the 30-day cookie rotated.
 let _silentRefreshExhausted = false
+// One hub hand-off per pane DOCUMENT. Without this every 403 from every
+// background poll posts another `mc-auth-expired`, and the hub answers each one
+// with an SSH token mint (rate-limited, never stopped) — a mint storm behind a
+// loading spinner. A hub re-mint reloads this iframe, which resets this latch,
+// so a pane that can recover still gets a fresh ask on every load.
+let _embeddedHandoffPosted = false
+
+/** Hand auth recovery to the hub, at most once per pane document.
+ *
+ * The wildcard target is deliberate and matches the two call sites' comments:
+ * the hub's origin is not knowable from inside the pane (tunnel hosts vary), and
+ * the message carries only a fixed type string — no secret — while the parent
+ * validates `event.origin` before acting on it (see resolveTunnelOrigin).
+ */
+function postAuthExpiredToHub(): boolean {
+  if (_embeddedHandoffPosted) return true
+  try {
+    // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
+    window.parent.postMessage({ type: 'mc-auth-expired' }, '*')
+  } catch {
+    return false // cross-origin parent unreachable — caller falls back to the banner
+  }
+  _embeddedHandoffPosted = true
+  return true
+}
 
 export function attemptSilentRefresh(): Promise<boolean> {
   return refreshOnce().then((res) => {
@@ -1255,6 +1318,7 @@ export function attemptSilentRefresh(): Promise<boolean> {
 /** Test-only: reset module auth-recovery state between cases. */
 export function __resetAuthRecoveryStateForTests(): void {
   _silentRefreshExhausted = false
+  _embeddedHandoffPosted = false
   _sessionExpiredShown = false
   _staleOwnerBanner = false
   __resetRefreshOnceForTests()
@@ -1316,17 +1380,30 @@ export function checkSessionExpired(r: Response): Response {
     // When this dashboard is running embedded in the Instances pane stack
     // (an <iframe> inside the hub), don't show the paste-token banner here —
     // the user can't easily fetch the remote token from inside the pane, and
-    // the hub owns recovery. Signal the parent, which force-mints a fresh
-    // token and reloads this iframe (mirrors the hub's auto-recovery).
-    // The message carries no secret; the parent validates event.origin before
-    // acting (see InstancesViewport / resolveTunnelOrigin).
+    // the hub owns recovery.
+    //
+    // But try OUR OWN recovery first. This pane holds the same 30-day
+    // `mc_refresh_<port>` cookie the top-level path below uses, and the common
+    // cause of a burst of 403s here is a lapsed access cookie (a laptop that
+    // slept through the proactive refresh) — which one silent refresh fixes, with
+    // no SSH mint, no iframe reload, and no lost pane state. Handing that to the
+    // hub instead costs a remote mint and a full reload of this document.
+    //
+    // Only when the refresh cannot recover do we signal the parent, which
+    // force-mints a fresh token and reloads this iframe. That hand-off is
+    // latched to once per document (see postAuthExpiredToHub): the hub answers
+    // every ask with a mint, so an unrepairable session used to produce one mint
+    // per rate-limit window for as long as the window stayed open.
     if (window.parent && window.parent !== window) {
-      try {
-        window.parent.postMessage({ type: 'mc-auth-expired' }, '*')
-      } catch {
-        /* cross-origin parent unreachable — fall through to the banner below */
+      if (!_silentRefreshExhausted) {
+        void attemptSilentRefresh().then((ok) => {
+          if (ok) removeAuthBanner()
+          else postAuthExpiredToHub()
+        })
+        return r
       }
-      return r
+      if (postAuthExpiredToHub()) return r
+      // Cross-origin parent unreachable — fall through to the banner below.
     }
     // Mid-session the access cookie can lapse (20h TTL, or laptop sleep
     // pausing the proactive refresh timer) while the tab stays open. The
@@ -1366,18 +1443,15 @@ function handleStaleOwnerSession(): void {
   // Embedded in the Instances pane stack: hand recovery to the hub, mirroring
   // checkSessionExpired — the hub force-mints a fresh token (whose subject is
   // derived from the current owner) and reloads this iframe.
+  // No silent refresh attempt here, unlike checkSessionExpired: re-minting from
+  // the incoming subject keeps the stale bootstrap subject, so a "successful"
+  // refresh would rotate the cookie and be denied again. The hand-off is latched
+  // to once per document, and `_staleOwnerBanner` above keeps a later 2xx from
+  // re-opening it — a hub re-mint cannot fix this denial either, so asking twice
+  // only buys another SSH mint.
   if (typeof window !== 'undefined' && window.parent && window.parent !== window) {
-    try {
-      // The wildcard target mirrors checkSessionExpired's hand-off above: the
-      // hub's origin is not knowable from inside the pane (tunnel hosts vary),
-      // and the message carries only a fixed type string — no secret — while
-      // the parent validates event.origin before acting on it.
-      // nosemgrep: javascript.browser.security.wildcard-postmessage-configuration.wildcard-postmessage-configuration
-      window.parent.postMessage({ type: 'mc-auth-expired' }, '*')
-      return
-    } catch {
-      /* cross-origin parent unreachable — fall through to the banner below */
-    }
+    if (postAuthExpiredToHub()) return
+    // Cross-origin parent unreachable — fall through to the banner below.
   }
   showSessionExpiredBanner(i18nT('api.client.stale_owner_session'))
 }
@@ -1513,8 +1587,8 @@ function trackArtifactWrite(url: string, res: Promise<Response>): Promise<Respon
 const projectHeader = (projectKey?: string): HeadersInit | undefined =>
   projectKey ? { 'X-Steering-Project': projectKey } : undefined
 
-const get = (url: string, sessionKey?: string) =>
-  fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) } })
+const get = (url: string, sessionKey?: string, signal?: AbortSignal) =>
+  fetch(url, { headers: { ...(sessionKey ? { 'X-Session-Key': sessionKey } : _sk) }, ...(signal ? { signal } : {}) })
 const post = (url: string, body?: object, sessionKey?: string, extra?: HeadersInit) =>
   trackArtifactWrite(url, fetch(url, {
     method: 'POST',
@@ -1777,6 +1851,26 @@ export interface KiroPrerequisiteStatus {
    * verbatim and untranslated: it names the file and the construct refused.
    */
   agent_spec_rejection_detail?: string
+  /**
+   * Whether the installed kiro-cli exposes the `acp` subcommand every Kiro Crew
+   * session is launched through. False means the CLI runs and is signed in but
+   * is too OLD to start a session, so `ready` is forced false. The remedy is an
+   * update, not a reinstall. Optional because a gateway older than this field
+   * does not send it — treat a missing value as `true` (supported).
+   */
+  acp_supported?: boolean
+  /**
+   * The command that updates the CLI in place (`kiro-cli update`). Unlike
+   * `login_command`, Kiro Crew also runs this FOR the owner via the update-cli
+   * POST — it is the CLI's own self-update. Rendered verbatim in a `<code>`.
+   */
+  update_command?: string
+  /**
+   * Failure text from an update-cli attempt. Empty when none was attempted or it
+   * succeeded. Shown verbatim and untranslated: it names why the self-update did
+   * not complete.
+   */
+  cli_update_error?: string
 }
 
 export interface KiroBonusCreditGrantPayload {
@@ -2153,6 +2247,11 @@ export const api = {
   // cross-site triggerable and would leave no audit record.
   repairKiroPrerequisiteSpecs: () =>
     post('/api/kiro-prerequisite/repair-specs').then(j) as Promise<KiroPrerequisiteStatus>,
+  // A POST for the same CSRF/audit reasons as the spec repair above. Runs the
+  // CLI's own in-place self-update on the gateway host and returns the
+  // post-update snapshot; `cli_update_error` is empty on success.
+  updateKiroPrerequisiteCli: () =>
+    post('/api/kiro-prerequisite/update-cli').then(j) as Promise<KiroPrerequisiteStatus>,
   // KAS-mode in-product sign-in (no kiro-cli, no terminal). Status is a cheap
   // read; every step that changes sign-in state is a POST for the same
   // CSRF/audit reasons as the spec repair above. Error responses carry a
@@ -2244,7 +2343,7 @@ export const api = {
   // the enterprise ceiling is file-authored and un-editable via the UI.
   governancePolicy: () => get('/api/governance/policy').then(j) as Promise<GovernancePolicyData>,
   suggestions: (force?: boolean) => fetch(`/api/suggestions${force ? '?force=1' : ''}`).then(j) as Promise<{ suggestions: string[]; generated_at: number; stale: boolean }>,
-  branding: () => fetch('/api/dashboard/branding').then(j) as Promise<{ bot_name: string; avatar: string }>,
+  branding: () => fetch('/api/dashboard/branding').then(j) as Promise<{ bot_name: string; avatar: string; direct_local?: boolean }>,
   // Instances (multi-instance management) — owner-only, gated by instances.enabled.
   // listInstances throws ApiError(403) when the feature is disabled; callers
   // should catch and render the enable toggle rather than an error. `active`
@@ -2439,12 +2538,21 @@ export const api = {
     fetch('/api/models' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
-  slashCommands: (opts?: { slot?: string }) =>
-    fetch('/api/slash-commands' + (opts?.slot ? '?slot=' + encodeURIComponent(opts.slot) : '')).then(j),
+  // Bounded HERE, not per initiator: react-query dedupes on the key, so the
+  // weakest initiator would otherwise decide whether the promise is bounded.
+  slashCommands: (signal?: AbortSignal) =>
+    withDeadline(SLASH_COMMANDS_TIMEOUT_MS, signal, s =>
+      fetch('/api/slash-commands', { signal: s }).then(j)),
   chatSlotAgent: (slot: string, agent: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j) as Promise<{ ok?: boolean; agent?: string; workspace?: string }>,
   chatSlotModel: (slot: string, model: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/model', { model }).then(j) as Promise<{ ok?: boolean; model?: string }>,
+  /** This slot's auto-compact threshold override (null = follows the global). */
+  chatSlotAutocompact: (slot: string) =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact').then(j) as Promise<{ pct: number | null; global_pct: number; min: number; max: number }>,
+  /** Set (number) or clear (null) this slot's auto-compact threshold override. */
+  setChatSlotAutocompact: (slot: string, pct: number | null) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact', { pct }).then(j) as Promise<{ ok?: boolean; pct: number | null; global_pct: number }>,
   chatSlotsModel: (model: string, skip_running: boolean) =>
     post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{ ok: boolean; model: string; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
   chatSlotReasoningEffort: (slot: string, reasoning_effort: string) =>
@@ -2472,7 +2580,6 @@ export const api = {
   browseDirs: (path?: string) => fetch('/api/browse-dirs' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string }[] }>,
   browseFiles: (path?: string) => fetch('/api/browse-files' + (path ? '?path=' + encodeURIComponent(path) : '')).then(j) as Promise<{ path: string; parent: string; dirs: { name: string; path: string; mtime: number }[]; files: { name: string; path: string; mtime: number }[] }>,
   projectGit: (path: string) => fetch('/api/project/git?path=' + encodeURIComponent(path)).then(j) as Promise<{ path: string; repo: boolean; repoRoot?: string; branch?: string; detached?: boolean; head?: string }>,
-  /** `fresh` bypasses the backend's repo-discovery cache, for an explicit refresh. */
   projectGitStatus: (path: string, fresh = false) => fetch('/api/project/git/status?path=' + encodeURIComponent(path) + (fresh ? '&refresh=1' : '')).then(j) as Promise<{ repo: boolean; repoRoot?: string; branch?: string; ahead?: number; behind?: number; refused?: boolean
     truncated?: boolean; reposTruncated?: boolean
     files: ProjectGitFile[]
@@ -2506,7 +2613,7 @@ export const api = {
     return fetch('/api/crons/' + jobId + '/history' + (qs ? '?' + qs : ''), { headers: { ..._sk } }).then(j)
   },
   cronRunDetail: (jobId: string, runId: string) => fetch('/api/crons/' + jobId + '/history/' + encodeURIComponent(runId), { headers: { ..._sk } }).then(j),
-  cronScript: (jobId: string) => fetch('/api/crons/' + jobId + '/script').then(j),
+  cronScript: (jobId: string) => fetch('/api/crons/' + jobId + '/script', { headers: { ..._sk } }).then(j),
   ackCron: (id: string, summary: string, ts?: string) => post('/api/crons/' + id + '/ack', { summary, ts }).then(j),
   cronHistoryAll: (opts?: { offset?: number; limit?: number; jobId?: string }) => {
     const p = new URLSearchParams()
@@ -2566,7 +2673,15 @@ export const api = {
   setWebhooksEnabled: (enabled: boolean) => post('/api/webhooks/switch', { enabled }).then(j),
   // Prompts (Agent SOPs)
   prompts: () => fetch('/api/prompts').then(j),
-  promptDetail: (name: string) => fetch('/api/prompts/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
+  promptDetail: (name: string, scope?: 'global' | 'local') =>
+    fetch('/api/prompts/' + name.split('/').map(encodeURIComponent).join('/')
+      + (scope ? '?scope=' + scope : '')).then(j),
+  createPrompt: (name: string, content: string, scope: 'global' | 'local') =>
+    post('/api/prompts', { name, content, scope }).then(j),
+  updatePrompt: (name: string, scope: 'global' | 'local', content: string, baseHash: string) =>
+    put('/api/prompts/' + encodeURIComponent(name) + '?scope=' + scope, { content, base_hash: baseHash }).then(j),
+  deletePrompt: (name: string, scope: 'global' | 'local') =>
+    del('/api/prompts/' + encodeURIComponent(name) + '?scope=' + scope).then(j),
   // Skills
   // sessionKey names the REAL chat slot so the server can resolve THIS chat's
   // project and include its `<project>/.kiro/skills`. Without it the shared
@@ -2579,9 +2694,12 @@ export const api = {
   // {skills, agent_scoped: true, agent} instead of the bare array, so the
   // picker can cue the scope (and tell "nothing mapped" from "nothing exists").
   // Consume through lib/skillsPayload.ts unwrapSkills() rather than assuming an array.
-  skills: (sessionKey?: string, agent?: string) =>
-    get('/api/skills' + (agent ? '?agent=' + encodeURIComponent(agent) : ''),
-        sessionKey).then(j),
+  // Bounded HERE, not per initiator: react-query dedupes on the key, so the
+  // weakest initiator would otherwise decide whether the promise is bounded.
+  skills: (sessionKey?: string, agent?: string, signal?: AbortSignal) =>
+    withDeadline(SKILLS_TIMEOUT_MS, signal, s =>
+      get('/api/skills' + (agent ? '?agent=' + encodeURIComponent(agent) : ''),
+          sessionKey, s).then(j)),
   /** Project-skills trust: this chat's grant state plus every stored grant. */
   skillTrust: (sessionKey?: string) => get('/api/skills/-/trust', sessionKey).then(j),
   /** Grant trust to THIS chat's project. The server takes the directory from
@@ -2628,8 +2746,19 @@ export const api = {
   // slot is precisely what can move, so it cannot close this on its own.
   createSteering: (name: string, content: string, source?: string, sessionKey?: string, projectKey?: string) =>
     post('/api/steering', { name, content, source }, sessionKey, projectHeader(projectKey)).then(j),
-  updateSteering: (key: string, content: string, sessionKey?: string, projectKey?: string) =>
-    put('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), { content }, sessionKey, projectHeader(projectKey)).then(j),
+  /** Save a steering file. `declaration` optionally rewrites its front matter
+   *  (mode and pattern) SERVER-side — an empty string on a field removes that
+   *  key. The editor never splices YAML into its own
+   *  textarea: the body is the user's document, and the server's writer
+   *  preserves it byte for byte. */
+  updateSteering: (
+    key: string,
+    content: string,
+    sessionKey?: string,
+    projectKey?: string,
+    declaration?: { inclusion?: string; file_match_pattern?: string },
+  ) =>
+    put('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), { content, ...(declaration ?? {}) }, sessionKey, projectHeader(projectKey)).then(j),
   deleteSteering: (key: string, sessionKey?: string, projectKey?: string) =>
     del('/api/steering/' + key.split('/').map(encodeURIComponent).join('/'), undefined, sessionKey, projectHeader(projectKey)).then(j),
 
@@ -2697,10 +2826,25 @@ export const api = {
     post('/api/connections/mint', { slug }).then(j) as Promise<{ ok: boolean; slug: string; state: string; token: string }>,
   connectionsMintState: (slug: string) =>
     fetch(`/api/connections/mint?slug=${encodeURIComponent(slug)}`).then(j) as Promise<ConnectionMintState>,
+  // Warm every mintable provider's URL in one activation, so a later Connect
+  // serves a URL the warm table already holds instead of paying a cold spawn.
+  // Deliberately BODYLESS: what is mintable is a fact about the user's registry
+  // and grant state, never a caller's choice, and the bound on what may be
+  // spawned stays on the server's side of the wire. `preminting` names the
+  // providers warming was STARTED for, which is why it can answer before any of
+  // them holds a URL — a card's verdict remains its mint state, never this.
+  // Owner-gated, so a non-owner session rejects (403); the caller is expected to
+  // treat that as "no warm table", not as an error worth showing.
+  connectionsPremint: () =>
+    post('/api/connections/premint').then(j) as Promise<{ ok: boolean; preminting: string[] }>,
   // Authorization verdict + first-connect time per visible provider. Additive to
   // the mint feed above; never mints.
   connectionsStatus: () =>
     fetch('/api/connections/status').then(j) as Promise<{ schema_version: number; connections: ConnectionStatus[] }>,
+  // Promptless authenticated enumeration through kiro-cli. The runtime owns
+  // bearer injection and provider tools/list; this receives only a verdict and count.
+  connectionsTest: (slug: string) =>
+    post('/api/connections/test', { slug }).then(j) as Promise<ConnectionTestResult>,
   // Dispose an in-flight mint (process, listener, spec). Does NOT touch the MCP
   // config entry — the card owns that. `token` fences a sibling tab's row.
   connectionsCancel: (slug: string, token?: string) =>
@@ -2751,7 +2895,6 @@ export const api = {
   // to be treated as fail-open rather than as a verdict.
   acpBackends: ({ probe }: { probe?: boolean } = {}) =>
     fetch('/api/acp-backends' + (probe ? '?probe=1' : '')).then(j) as Promise<AcpBackendsResponse>,
-
   // Optional integrations — backend endpoints are graceful no-ops on a public
   // install (AIM / kiro usage are stubbed). Kept so the UI compiles and
   // degrades gracefully (panels render empty when the feature is absent).
@@ -2822,6 +2965,8 @@ export const api = {
   // Issue sources. `refresh` bypasses the server's cached payload; the panel
   // never polls, so a refresh is always an explicit user action.
   fetchIssueSource: (url: string, refresh = false) => post('/api/source/issue', { url, refresh }).then(j) as Promise<IssueSource>,
+  /** Top contributors to an app's source repo (GitHub only). Owner-gated. */
+  appContributors: (url: string, refresh = false) => post('/api/source/contributors', { url, refresh }).then(j) as Promise<{ contributors: AppContributor[] }>,
   chatSlots: () => fetch('/api/chat/slots').then(j),
   /** All goal loops across sessions. Returns `{enabled:false, loops:[]}` when
    *  the auto-nudge feature flag is off, so callers need no flag check. */
@@ -2860,7 +3005,7 @@ export const api = {
   approveChatSlot: (slot: string, action: string, extra?: Record<string, string>) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/approve', { action, ...extra }).then(j),
   planAction: (slot: string, action: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/plan-action', { action }).then(j),
   resumeChatSlot: (key: string, title?: string) => post('/api/chat/slots/' + encodeURIComponent(key) + '/resume', { name: key, key, title: title || key }).then(j),
-  forkChatSlot: (slot: string, atIndex?: number, prompt?: string, mode?: string, direction?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/fork', { ...(atIndex !== undefined ? { at_message_index: atIndex } : {}), ...(prompt ? { prompt } : {}), ...(mode ? { mode } : {}), ...(direction ? { direction } : {}) }).then(j),
+  forkChatSlot: (slot: string, atIndex?: number, prompt?: string, mode?: string, direction?: string, messageId?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/fork', { ...(atIndex !== undefined ? { at_message_index: atIndex } : {}), ...(messageId ? { at_message_id: messageId } : {}), ...(prompt ? { prompt } : {}), ...(mode ? { mode } : {}), ...(direction ? { direction } : {}) }).then(j),
   sideOpen: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/open', {}).then(j) as Promise<{ ok: boolean; open: boolean; messages: number; last_run_id: string; created_at: string }>,
   sideTurn: (slot: string, question: string, opts?: { steer?: boolean }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/turn', { question, ...(opts?.steer ? { steer: true } : {}) }).then(j) as Promise<{ ok: boolean; run_id?: string; messages?: number; steered?: boolean; pending?: boolean; queued?: boolean; demoted?: boolean; queue_id?: string; still_queued?: boolean; depth?: number; steer_id?: string }>,
   sideQueueCancel: (slot: string, queueId: string) => del('/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId), { client: TAB_ID }).then(j) as Promise<{ ok: boolean; content: string; depth: number }>,
@@ -2948,13 +3093,15 @@ export const api = {
   // Mid-turn steer: inject into the RUNNING turn instead of queueing. Fire-and-forget
   // JSON response ({ok, steered}); the backend falls back to queue if steer is
   // unavailable so the text is never dropped.
+  // `ws=1` because a steer that races `chat_done` falls through to the plain send
+  // path, whose JSON receipt is gated on it — without it that arm streams SSE.
   // `sendId` is the client-minted correlation id stamped on the optimistic steer
   // bubble (same convention as the plain send path). It rides in `meta`, which
   // BOTH backend paths persist — the accepted-steer row and the new-turn row a
   // steer that races chat_done falls onto — so the bubble is reconcilable, and
   // its accepted-vs-new-turn ambiguity resolvable, by id identity (#6075).
   steerChat: (message: string, slot?: string, sendId?: string) =>
-    fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, steer: true, ...(sendId ? { meta: { sendId } } : {}) }) }).then(j),
+    fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ message, slot, steer: true, ...(sendId ? { meta: { sendId } } : {}) }) }).then(j),
   sessionsHealth: () => fetch('/api/sessions/health').then(j),
   // Knowledge
   knowledgeSearch: (q: string) => get(`/api/knowledge/search-for-context?q=${encodeURIComponent(q)}`).then(j),
@@ -3045,10 +3192,12 @@ export const api = {
   // hands a regular file to its default application. Headless hosts have
   // neither, so the backend answers with `copy` and the path goes to the
   // clipboard instead of the call silently doing nothing.
-  revealPath: (path: string, action: 'open' | 'reveal' = 'reveal') => post('/api/reveal', { path, action }).then(j).then((r: { copy?: string }) => {
-    if (r.copy) copyToClipboard(r.copy)
-    return r
-  }),
+  // This is a SIDE-EFFECT-FREE transport call: it neither writes the clipboard
+  // nor shows a dialog. The single caller `revealOrOpen` owns the clipboard copy,
+  // so the degrade is presented in exactly one place instead of in the transport
+  // layer where a dialog is a surprise.
+  revealPath: (path: string, action: 'open' | 'reveal' = 'reveal') =>
+    post('/api/reveal', { path, action }).then(j) as Promise<RevealResult>,
   collectDiagnostics: (body: { note: string; include_logs: boolean }) =>
     post('/api/diagnostics/collect', body).then(j) as Promise<{
       zip_path: string
@@ -3460,9 +3609,9 @@ export const api = {
   artifactSessionDocs: (session?: string) =>
     get(`/api/artifacts/session-docs${session ? `?session=${encodeURIComponent(session)}` : ''}`).then(j) as Promise<{ docs: SessionDoc[] }>,
   /** Turn a session document path into a real, saved (pinned) file-backed artifact.
-   * `originSessionKey` records which chat session saved it (for the Source column). */
+   * `originSessionKey` records the saving session; `slug_collided_with` names the plain slug, present only when the store had to suffix it. */
   materializeArtifact: (path: string, originSessionKey?: string) =>
-    post('/api/artifacts/materialize', { path, ...(originSessionKey ? { origin_session_key: originSessionKey } : {}) }).then(j),
+    post('/api/artifacts/materialize', { path, ...(originSessionKey ? { origin_session_key: originSessionKey } : {}) }).then(j) as Promise<{ slug: string; slug_collided_with?: string }>,
   // Artifact publishing / sharing. Local publish/sharing management
   // only — remote-browse / clone / fork surfaces are not part of this edition.
   publishArtifact: (slug: string, body: { visibility?: 'PRIVATE' | 'SHARED' | 'PUBLIC'; shared_with?: string[]; provider?: string }) =>

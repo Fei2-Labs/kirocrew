@@ -43,10 +43,16 @@ from kiro_crew.config.loader import (
     resolve_agent_bindings,
 )
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
+from kiro_crew.dashboard.chat_folders import _unhide_folder
 from kiro_crew.dashboard.chat_persistence import _TRANSIENT_ROLES as _PERSISTENCE_TRANSIENT_ROLES
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
 from kiro_crew.dashboard.create_rate_limit import SESSION_CREATE, allow_create
-from kiro_crew.dashboard.state import MAX_LIVE_SLOTS, MAX_SLOTS_PER_CREATOR, SlotOrigin
+from kiro_crew.dashboard.state import (
+    MAX_LIVE_SLOTS,
+    MAX_SLOTS_PER_CREATOR,
+    SlotOrigin,
+    _safe_folder_tree,
+)
 from kiro_crew.dashboard.stop_retry import allow_escalation
 from kiro_crew.history import metadata_now_iso, transcript_stem
 from kiro_crew.security import redact, redact_and_truncate
@@ -75,6 +81,26 @@ MAX_READ_CONTENT_CHARS = 4000
 # conversations unattended. Notifications are the supported path for those
 # (``send_message``), not session control.
 UNATTENDED_SLOT_PREFIXES = ("cron-", "workflow-")
+
+
+def _member_caller(caller_key: str) -> bool:
+    """Whether *caller_key* is a crew member's pinned DM slot.
+
+    A member DM session dispatches its real work into worker sessions it
+    creates and patrols — that is the member operating model, not an optional
+    capability — so the surface authorizes it WITHOUT the global
+    ``agent.session_control`` opt-in. What bounds it instead is ownership:
+    :func:`authorize_target` restricts a member caller to slots it created
+    itself, so the automatic grant never reaches the user's own sessions.
+
+    Spelled through the members module's own prefix constant (imported
+    lazily — members imports validation which sits below this module in the
+    layering) rather than a restated literal, so the two cannot drift.
+    """
+    from kiro_crew.members import DM_SLOT_KEY_PREFIX
+
+    return caller_key.startswith(DM_SLOT_KEY_PREFIX)
+
 
 # Roles a read must not count, taken from the persistence layer's own list rather
 # than restated here: those are exactly the rows rehydration DROPS, so any cursor
@@ -593,6 +619,7 @@ async def create_session(
     caller_session_key: str,
     title: str = "",
     agent: str = "",
+    folder_id: str = "",
 ) -> dict[str, Any]:
     """Open a new session in the caller's workspace, persisted at birth.
 
@@ -606,16 +633,37 @@ async def create_session(
     there is no target yet), and the child inherits the caller's workspace. Both
     matter because a caller refusal missing here, or a workspace not inherited,
     would hand back a session outside the boundary the other verbs enforce.
+
+    ``folder_id`` files the slot as part of creation (#6118): it is assigned in
+    the same synchronous window that configures the slot, the whole
+    allocation-to-persist span runs under ``suspend_slots_push`` so the slot's
+    first broadcast frame already shows it filed, and the placement rides in the
+    persist-at-birth metadata so it survives a restart. An unknown folder
+    refuses the whole create -- nothing exists yet, so refusal loses nothing,
+    matching the move path's posture -- and existence is confirmed READ-ONLY
+    under the folder-store lock (``read_folders``) before the allocation; the
+    Model-B un-hide runs only after the filing has landed, so a refused create
+    leaves no folder-tree mutation behind. Authorization needs no new path: the
+    folder tree cannot be reshaped from here (the id must already exist), and
+    every caller class the move path's app-ownership rule exists to stop is
+    already refused above it -- an app-scoped caller cannot create a session at
+    all (`app_scoped_caller`).
     """
-    if not session_control_enabled():
-        raise SessionControlError(
-            "session control is disabled in config (agent.session_control)",
-            code="session_control_disabled",
-        )
     caller_key = caller_slot_key(state, caller_session_key)
     if not caller_key:
         raise SessionControlError(
             "caller session could not be identified", code="caller_unidentified"
+        )
+    # The caller is resolved BEFORE the config gate so a member DM session —
+    # for which dispatching work into workers is the operating model, not an
+    # opt-in — passes without `agent.session_control`. Every other caller
+    # still needs the switch. The member's automatic grant is bounded by
+    # ownership in `authorize_target`, not here: creation makes the caller
+    # the owner by construction.
+    if not session_control_enabled() and not _member_caller(caller_key):
+        raise SessionControlError(
+            "session control is disabled in config (agent.session_control)",
+            code="session_control_disabled",
         )
     if caller_key.startswith(UNATTENDED_SLOT_PREFIXES):
         raise SessionControlError(
@@ -736,10 +784,28 @@ async def create_session(
     # can see and take over the work. SYSTEM-origin slots fall outside the
     # `slots:user` WS scope, which would hide it from the sidebar.
 
+    if folder_id:
+        # Confirmed under the folder-store lock -- the only place existence
+        # cannot go stale against a concurrent delete (see `read_folders`) --
+        # and READ-ONLY on purpose: the Model-B un-hide is a durable mutation,
+        # and it runs only after the filing actually lands (below, after the
+        # persist), so a create the re-gate refuses leaves no folder-tree state
+        # behind. Placed BEFORE the re-gate so the last suspension this
+        # coroutine takes is here: after the re-gate nothing suspends until the
+        # slot is fully configured, so the folder confirmed here cannot be
+        # deleted before the assignment lands (folder mutations run on this
+        # loop).
+        def _exists(folders: list[dict[str, Any]]) -> bool:
+            return any(str(f.get("id") or "") == folder_id for f in _safe_folder_tree(folders))
+
+        if not await state.read_folders(_exists):
+            raise SessionControlError("folder not found", code="folder_not_found")
+
     # Re-resolved and re-gated HERE, adjacent to the allocation, because every
-    # decision above was made before this coroutine suspended -- twice, for the
-    # project directory and the config load -- and the inputs to those decisions are
-    # live state that can flip inside either window.
+    # decision above was made before this coroutine suspended -- for the
+    # project directory, the config load, and the folder confirmation -- and the
+    # inputs to those decisions are live state that can flip inside any of those
+    # windows.
     #
     # Re-reading the slot TABLE is the part that matters most: closing the caller's
     # tab removes its slot, and a Python reference to the removed object stays
@@ -807,86 +873,146 @@ async def create_session(
     # the same reason: it decides which workspace actually EXECUTES the turn, so it
     # must never be observable as empty. Everything after this point is synchronous
     # until the slot is fully configured.
-    slot = state.get_or_create_slot(
-        None, agent=agent_name, workspace=workspace, origin=SlotOrigin.USER
-    )
-    # Attribute the slot to the caller that asked for it, which is what makes the
-    # per-creator ceiling above countable. Written here, inside the synchronous
-    # window that follows the mint, so no suspension point separates the cap test
-    # from this write -- otherwise two concurrent creates could both pass a ceiling
-    # that one of them had already filled. Only this entry point sets it: a
-    # person's own tab and a fork reach `get_or_create_slot` directly and stay
-    # unattributed, so ordinary human use never consumes an automated caller's
-    # share.
-    slot._created_by = caller_key
-    # cwd must follow the workspace too, or file search and project-scoped agents
-    # resolve against a directory the slot does not claim -- the same
-    # authorization-vs-execution split as the agent binding, one layer down.
-    if not slot.project:
-        slot.project = project_dir
-    if title.strip():
-        slot.title = sanitize_outbound(title.strip())[:200]
-        slot._titled = True
-    # Persist at birth. `save_slot_off_loop` cannot do this: the save it wraps
-    # returns early on an empty message window -- before its `force` check -- so a
-    # freshly created session, which has no messages by definition, would write
-    # nothing at all. The tool would then hand back a session that does not survive
-    # a restart.
     #
-    # Awaited, and a failure RETRACTS the slot rather than merely propagating: an
-    # unpersisted slot stays in the table, usable in memory and addressable by its
-    # creator, then vanishes on restart. Reporting the failure while leaving that
-    # behind is the worse of the two outcomes, because the caller sees an error and
-    # the session exists anyway. Same retraction the fork path uses on a failed
-    # build.
-    try:
-        await asyncio.to_thread(
-            log.update_metadata,
-            slot_history_key(slot),
-            {
-                "_type": "metadata",
-                # The slot's OWN durable identity, and its origin, both of which
-                # the normal save path writes -- but a slot created here may never
-                # reach that path: `_save_slot_to_history` returns early on an
-                # empty message window, so for a session that is created and then
-                # sits idle THIS dict is the only record on disk. Omitting `origin`
-                # is silently destructive on the next restart: rehydrate falls back
-                # to the fail-closed empty sentinel, so a session opened as USER
-                # comes back unattributed and `slots:user` subscribers stop seeing
-                # it. Checked field-by-field against the save path; these are the
-                # only fields a slot carries at birth that it does not already
-                # write.
-                "tab_id": slot._tab_id,
-                "origin": slot._origin,
-                "created_at": metadata_now_iso(),
-                "workspace": slot.workspace,
-                "agent": slot.agent or "",
-                "project": slot.project or "",
-                "title": slot.title or "",
-                "memory_mode": getattr(slot, "memory_mode", "persistent"),
-            },
+    # The whole allocation-to-persist span runs under `suspend_slots_push`:
+    # `get_or_create_slot` broadcasts on a leading edge, so without the suspend an
+    # idle gateway serializes and sends the new slot BEFORE `folder_id` is
+    # assigned -- every client (and any app on `slots:user`) would render the
+    # session at the top level for a frame, the observable unfiled state #6118
+    # exists to remove. It also covers the persist and its failure retraction, so
+    # a slot whose birth write fails is never broadcast at all. Same pattern the
+    # move path uses ("file the slot before the coalesced broadcast").
+    with state.suspend_slots_push():
+        slot = state.get_or_create_slot(
+            None, agent=agent_name, workspace=workspace, origin=SlotOrigin.USER
         )
-    except Exception:
-        # Retract, but never at the cost of work already in flight. The slot is
-        # addressable from the moment `get_or_create_slot` publishes it, which is
-        # before this await, so a turn can have started on it while the write was
-        # in the worker thread. Popping the slot then would leave that turn running
-        # with nothing pointing at it -- unreachable, unstoppable, and invisible to
-        # the stop verb. A phantom session that vanishes on the next restart is the
-        # lesser harm, so liveness wins over tidiness and the slot stays.
-        if not slot.running and not slot.messages:
-            state._slots.pop(slot.key, None)
+        # Attribute the slot to the caller that asked for it, which is what makes the
+        # per-creator ceiling above countable. Written here, inside the synchronous
+        # window that follows the mint, so no suspension point separates the cap test
+        # from this write -- otherwise two concurrent creates could both pass a ceiling
+        # that one of them had already filled. Only this entry point sets it: a
+        # person's own tab and a fork reach `get_or_create_slot` directly and stay
+        # unattributed, so ordinary human use never consumes an automated caller's
+        # share.
+        slot._created_by = caller_key
+        # cwd must follow the workspace too, or file search and project-scoped agents
+        # resolve against a directory the slot does not claim -- the same
+        # authorization-vs-execution split as the agent binding, one layer down.
+        if not slot.project:
+            slot.project = project_dir
+        if folder_id:
+            # Filed inside the same synchronous window that configures the slot, so
+            # the session is never observable unfiled -- the atomicity #6118 exists
+            # for. Existence was confirmed under the store lock above, and folder
+            # mutations run on this loop, so the folder cannot have been deleted
+            # between that check and this assignment. No `_folder_changed` flag: the
+            # slot's first turn carries the armed first-turn breadcrumb injection
+            # (`is_new` in chat_runner), so the [FOLDER] line reaches the model
+            # without it.
+            slot.folder_id = folder_id
+        if title.strip():
+            slot.title = sanitize_outbound(title.strip())[:200]
+            slot._titled = True
+        # Persist at birth. `save_slot_off_loop` cannot do this: the save it wraps
+        # returns early on an empty message window -- a full save has nothing to
+        # write -- so a freshly created session, which has no messages by
+        # definition, would write nothing at all. The tool would then hand back a
+        # session that does not survive a restart.
+        #
+        # Awaited, and a failure RETRACTS the slot rather than merely propagating: an
+        # unpersisted slot stays in the table, usable in memory and addressable by its
+        # creator, then vanishes on restart. Reporting the failure while leaving that
+        # behind is the worse of the two outcomes, because the caller sees an error and
+        # the session exists anyway. Same retraction the fork path uses on a failed
+        # build.
+        try:
+            await asyncio.to_thread(
+                log.update_metadata,
+                slot_history_key(slot),
+                {
+                    "_type": "metadata",
+                    # The slot's OWN durable identity, and its origin, both of which
+                    # the normal save path writes -- but a slot created here may never
+                    # reach that path: `_save_slot_to_history` runs a full save only
+                    # when the window has messages, so for a session that is created
+                    # and then sits idle THIS dict is the only record on disk.
+                    # Omitting `origin` is silently destructive on the next restart:
+                    # rehydrate falls back to the fail-closed empty sentinel, so a
+                    # session opened as USER comes back unattributed and `slots:user`
+                    # subscribers stop seeing it. Checked field-by-field against the
+                    # save path; these are the only fields a slot carries at birth
+                    # that it does not already write.
+                    "tab_id": slot._tab_id,
+                    "origin": slot._origin,
+                    "created_at": metadata_now_iso(),
+                    "workspace": slot.workspace,
+                    "agent": slot.agent or "",
+                    "project": slot.project or "",
+                    "title": slot.title or "",
+                    "memory_mode": getattr(slot, "memory_mode", "persistent"),
+                    # Only when filed, mirroring the normal save path, which omits
+                    # `folder_id` from the metadata line when empty. Without this
+                    # the filing would not survive a restart: for an idle newborn
+                    # THIS dict is the only record of the placement on disk.
+                    **({"folder_id": slot.folder_id} if slot.folder_id else {}),
+                    # Creator attribution, only when this entry point set it. The
+                    # member ownership boundary in `authorize_target` reads it, so
+                    # losing it on restart would strand every worker a member
+                    # dispatched — controllable in memory, orphaned after reboot.
+                    **({"created_by": slot._created_by} if slot._created_by else {}),
+                },
+            )
+        except Exception:
+            # Retract, but never at the cost of work already in flight. The slot is
+            # addressable from the moment `get_or_create_slot` publishes it, which is
+            # before this await, so a turn can have started on it while the write was
+            # in the worker thread. Popping the slot then would leave that turn running
+            # with nothing pointing at it -- unreachable, unstoppable, and invisible to
+            # the stop verb. A phantom session that vanishes on the next restart is the
+            # lesser harm, so liveness wins over tidiness and the slot stays.
+            if not slot.running and not slot.messages:
+                state._slots.pop(slot.key, None)
+            state.push_slots_update()
+            raise
+        if slot.folder_id:
+            # Model-B un-hide, applied only NOW that the filing has actually
+            # landed -- running it any earlier persists `hidden = False` for a
+            # create a later gate can still refuse, durably reversing a choice
+            # the user made for a call that failed. The move path holds the same
+            # order (assign, confirm, then un-hide). If the folder was deleted
+            # while the persist was in the worker thread, the delete's own sweep
+            # already unfiled this slot (it is published), so the guard reads
+            # the fresh value and skips; the metadata line can then briefly
+            # carry a dangling folder_id, the same accepted residual a move
+            # racing a delete leaves, and readers fall back to "(unfiled)".
+            #
+            # Best-effort: the create is already COMMITTED (slot published,
+            # persisted at birth), so a folder-store write failure here must not
+            # propagate -- the request would report failure for a session that
+            # exists, and the caller's retry would create a duplicate. A folder
+            # left hidden with a session inside is the recoverable lesser harm.
+            try:
+                await _unhide_folder(state, slot.folder_id)
+            except Exception:
+                logger.warning(
+                    "create_session: filing committed for %s but un-hiding folder %s failed",
+                    slot.key,
+                    slot.folder_id,
+                    exc_info=True,
+                )
         state.push_slots_update()
-        raise
-    state.push_slots_update()
     _audit(
         caller_session_key=caller_key,
         operation="create",
         slot_key=slot.key,
         outcome="allowed",
-        detail={"agent": slot.agent or ""},
+        detail={"agent": slot.agent or "", "folder_id": slot.folder_id or ""},
     )
-    return {"ok": True, "target": slot.key, "title": slot.title or slot.key}
+    return {
+        "ok": True,
+        "target": slot.key,
+        "title": slot.title or slot.key,
+    }
 
 
 def authorize_target(
@@ -945,18 +1071,21 @@ def authorize_target(
         )
         return SessionControlError(reason, status=status, code=code)
 
-    if not skip_enabled_check and not session_control_enabled():
-        raise deny(
-            "session control is disabled in config (agent.session_control)",
-            "session_control_disabled",
-        )
-
     caller_key = caller_slot_key(state, caller_session_key)
     if not caller_key:
         # Without a resolved caller the self-target guard is blind, and a session
         # that can reach every peer while being unidentifiable is exactly the
         # shape this surface must not have.
         raise deny("caller session could not be identified", "caller_unidentified")
+    # Resolved before the config gate: a member DM session is authorized
+    # WITHOUT `agent.session_control` — dispatching and patrolling workers is
+    # its operating model — and is bounded instead by the ownership check
+    # below, which restricts it to slots it created itself.
+    if not skip_enabled_check and not session_control_enabled() and not _member_caller(caller_key):
+        raise deny(
+            "session control is disabled in config (agent.session_control)",
+            "session_control_disabled",
+        )
     if caller_key.startswith(UNATTENDED_SLOT_PREFIXES):
         raise deny(
             "unattended sessions (scheduled runs) cannot control other sessions",
@@ -1056,6 +1185,16 @@ def authorize_target(
         # Workspaces are the memory boundary; reaching across one would let a
         # session act on work it cannot see.
         raise deny("target session belongs to a different workspace", "workspace_mismatch")
+    if _member_caller(caller_key) and getattr(slot, "_created_by", "") != caller_key:
+        # The member's automatic authorization reaches ONLY the workers it
+        # created itself (`created_by` is written at birth and rehydrated on
+        # restart). Always enforced for member callers — even when the global
+        # switch is on — so a member's reach never silently widens to the
+        # user's own sessions because of an unrelated opt-in.
+        raise deny(
+            "a crew member can only control worker sessions it created itself",
+            "not_creator",
+        )
 
     return slot
 

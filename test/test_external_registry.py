@@ -2338,7 +2338,7 @@ def _real_argv(captured_argv):
     """Strip the spawn shim's own prologue from a captured argv.
 
     ``create_subprocess_limited`` runs commands through the post-exec shim
-    (``python -I -S -c <shim> --rlimits=… -- <real argv>``), so a captured
+    (``python -I -S -B -c <shim> --rlimits=… -- <real argv>``), so a captured
     spawn no longer starts with the command itself. Return the argv after the
     ``--`` separator, with argv[0] reduced to its basename (git resolves to an
     absolute path, and to ``git.EXE`` on Windows).

@@ -212,6 +212,18 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
             <code
               className={`text-[11px] px-1.5 py-0.5 rounded shrink-[4] min-w-0 max-w-[7rem] truncate inline-block align-middle [direction:rtl] [unicode-bidi:plaintext] text-left${liveDowngrade ? ' bg-warn-subtle border border-warn/20 text-warn' : resolvedKnown ? ' text-accent/70 bg-accent/10' : ' text-muted/60 bg-bg-hover'}`}
               data-testid="subagent-model"
+              // The downgrade meaning rides on the amber colour + the AlertCircle
+              // glyph (aria-hidden), and the chip's [direction:rtl] truncation can
+              // reorder how a screen reader voices the id — so mirror the tooltip
+              // text into an aria-label. Otherwise AT users hear only the bare
+              // (possibly truncated) model id with no requested-vs-served context,
+              // the exact fact this chip exists to surface. Parallels the sibling
+              // SubagentCompletionCard's role="status" downgrade banner.
+              aria-label={liveDowngrade
+                ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: a.requestedModel, resolved: a.model })
+                : resolvedKnown
+                  ? i18nT('pages.chat.activityViewer.model_label', { model: a.model })
+                  : i18nT('pages.chat.activityViewer.model_effective', { model: display })}
               title={liveDowngrade
                 ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: a.requestedModel, resolved: a.model })
                 : resolvedKnown

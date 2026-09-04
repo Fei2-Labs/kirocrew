@@ -1,5 +1,5 @@
 /**
- * RemoteCrewPanel — Settings → Remote Crew. One page, two tabs:
+ * RemoteCrewPanel — Settings → Remote Instances. One page, two tabs:
  *
  *   1. "Your crews" (default) — the machines you can switch to from the top
  *      header: any in-progress cloud launch (a durable gateway job), the
@@ -50,8 +50,6 @@ import {
 } from '../../api/client'
 import { Card, Btn, Badge, IconButton } from '../../components/ui'
 import { SettingsToggle } from '../../components/settings'
-import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_REMOTE_CREW_CHAT, setPreviewFlag } from '../../utils/previewFlags'
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -62,8 +60,11 @@ import {
 import ErrorNotice from '../../components/ErrorNotice'
 import AskAgentButton from '../../components/AskAgentButton'
 import type { ErrorReport } from '../../utils/errorReport'
+import { parseErrorCode } from '../../utils/errorReport'
 import { reportInstanceFailure } from '../../utils/instanceFailureReport'
 import { readPersistedString, usePersistedString } from '../../hooks/usePersistedString'
+import { usePersistedBool } from '../../hooks/usePersistedBool'
+import { AUTO_CONNECT_KEY } from '../../hooks/useAutoConnectInstances'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { removeWarm, setCrewEditForm } from '../../store/instancesSlice'
@@ -650,7 +651,10 @@ export function RemoteCrewPanel() {
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()
   const [tab, setTab] = useState<'crews' | 'setup'>('crews')
-  const remoteCrewChat = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
+  // Default-on: when set, the web app auto-connects every crew on load and on
+  // tab focus (see useAutoConnectInstances). Off lets a many-crew user stop the
+  // per-load SSH + token-mint fan-out.
+  const [autoConnect, setAutoConnect] = usePersistedBool(AUTO_CONNECT_KEY, true)
 
   // Setup-tab form + preflight state. `checkedProfile`/`checkedRegion` are the
   // committed values the preflight ran against, so typing a profile does not
@@ -766,13 +770,32 @@ export function RemoteCrewPanel() {
   const launches = useMemo(() => launchesQuery.data?.jobs ?? [], [launchesQuery.data])
   const inProgress = useMemo(() => launches.filter(isInProgress), [launches])
 
+  // An OLDER gateway POSIX-gates the read-only launch-history route too, so a
+  // Windows host answers 400 posix_host_required for it. That is not a load
+  // failure — the gateway is refusing a capability, not failing to read — and
+  // letting it reach `loadError` below replaced the entire crew list, hand-added
+  // SSH rows included, with a cloud-provisioning error and no way to connect,
+  // edit or remove anything. Current gateways answer the route on every
+  // platform; this keeps the panel usable against one that does not.
+  //
+  // Safe to proceed with no launch history — and it does NOT rest on the host
+  // having no cloud crews, which a carried-over config dir would break. The row
+  // itself does not assume: an SSM target with no matching job renders as
+  // `unverifiedCloud`, keeping the confirm step and the copy about what Remove
+  // does not do.
+  const cloudUnsupported =
+    launchesQuery.error instanceof ApiError &&
+    launchesQuery.error.status === 400 &&
+    parseErrorCode(launchesQuery.error.body) === 'posix_host_required'
+
   // Both queries gate the crew list: a row's cloud-vs-manual identity comes from the
   // launch history, and the two destructive actions are NOT interchangeable. Treating
   // absent launch data as [] makes a real cloud crew render as "added by you", whose
   // trash button is a single unconfirmed click that unregisters the instance and
   // leaves the EC2 stack running and billing, invisible to the dashboard. So the list
   // waits until both are known, and surfaces either failure instead of guessing.
-  const loadError = !disabled && (instancesQuery.isError || launchesQuery.isError)
+  const loadError =
+    !disabled && (instancesQuery.isError || (launchesQuery.isError && !cloudUnsupported))
   const authExpired =
     isAuthExpiredError(instancesQuery.error) || isAuthExpiredError(launchesQuery.error)
   const listLoading = !disabled && (instancesQuery.isLoading || launchesQuery.isLoading)
@@ -1130,18 +1153,12 @@ export function RemoteCrewPanel() {
 
       {tab === 'crews' ? (
         <div className="space-y-4">
-          {/* Preview opt-in for dispatching a chat to a crew. It lives here
-           *  rather than in Developer > Feature Previews because the capability
-           *  is meaningless without a connected crew, and this is the page where
-           *  crews are managed — so the toggle sits next to the thing it acts on.
-           *  No ingress link of its own: flipping it puts the create-menu entry
-           *  back in the same tick, and that menu is already reachable. */}
           <Card>
             <SettingsToggle
-              label={i18nT('pages.settings.remoteCrewPanel.chat_on_a_crew')}
-              description={i18nT('pages.settings.remoteCrewPanel.chat_on_a_crew_desc')}
-              checked={remoteCrewChat}
-              onChange={v => setPreviewFlag(PREVIEW_REMOTE_CREW_CHAT, v)}
+              label={i18nT('pages.settings.remoteCrewPanel.auto_connect')}
+              description={i18nT('pages.settings.remoteCrewPanel.auto_connect_desc')}
+              checked={autoConnect}
+              onChange={setAutoConnect}
             />
           </Card>
           <Card>

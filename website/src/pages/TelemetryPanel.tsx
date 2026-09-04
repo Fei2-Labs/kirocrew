@@ -41,6 +41,26 @@ type Startup = {
   by_channel: (Stat & { name: string })[]
 }
 type Turn = Stat & { outcome: Record<string, number>; fault_rate: number }
+
+/**
+ * Outcomes that are NOT faults, mirroring the API's `_TERMINAL_FAULT_OUTCOMES`
+ * complement. Kept as one named set so the fault count below and any future
+ * reader cannot drift apart, and so adding an outcome is one edit rather than a
+ * search for `k === 'ok'` comparisons.
+ */
+const TURN_NON_FAULT_OUTCOMES = new Set([
+  'ok',
+  // Recovered-in-place watchdog stalls, tracked separately under
+  // kirocrew.watchdog.recovery.outcome.
+  'tool_stall',
+  'stale_recover',
+  // The operator pressed Stop. Counting it would report a deliberate user
+  // action as the system failing.
+  'cancelled',
+  // No stop reason was available for this turn; excluded from both sides of
+  // fault_rate by the API (see the comment in HealthBar).
+  'unclassified',
+])
 type ContextSession = {
   slot: string
   turns: number
@@ -1623,21 +1643,27 @@ function StartupTab({ s, faults, total, days }: { s: Startup; faults: number; to
 function HealthBar({ t, days }: { t: Turn | null; days: number }) {
   const turnFaults = t
     ? // Count faults the way the API computes fault_rate: everything that is
-      // neither "ok" nor "unclassified". Naming the failure outcomes explicitly
-      // (error + timeout) dropped any other value — including the "unknown" that
-      // shards predating the attribute aggregate under — so the tile could show a
-      // rate over one population beside a count over another, and a fault in a
-      // third outcome read as zero faults. Hence a complement rule, not a list.
+      // neither "ok" nor a named non-fault outcome. Naming the failure outcomes
+      // explicitly (error + timeout) dropped any other value — including the
+      // "unknown" that shards predating the attribute aggregate under — so the
+      // tile could show a rate over one population beside a count over another,
+      // and a fault in a third outcome read as zero faults. Hence a complement
+      // rule with an exemption list, not a list of failures.
       //
-      // "unclassified" joins "ok" in the exemption because it is not an outcome
-      // at all: it marks a turn whose surface had no stop reason to give (a
-      // helper call site passing a bare TurnUsage). The API excludes it from
-      // BOTH sides of fault_rate for that reason, so counting it here would put
-      // every clean cron/heartbeat/workflow turn in this tile's fault count
-      // while the percentage beside it excluded them — the two-populations bug
-      // this complement rule exists to prevent, in a new place.
+      // "unclassified" is exempt because it is not an outcome at all: it marks a
+      // turn whose surface had no stop reason to give (a helper call site
+      // passing a bare TurnUsage). The API excludes it from BOTH sides of
+      // fault_rate for that reason, so counting it here would put every clean
+      // cron/heartbeat/workflow turn in this tile's fault count while the
+      // percentage beside it excluded them — the two-populations bug this
+      // complement rule exists to prevent, in a new place.
+      //
+      // "cancelled" is exempt because the operator pressing Stop is not the
+      // system failing. It IS in fault_rate's denominator (the turn ran), so
+      // unlike "unclassified" it stays in `turnClassified` below — only the
+      // numerator excludes it, on both sides.
       Object.entries(t.outcome).reduce(
-        (n, [k, v]) => (k === 'ok' || k === 'unclassified' ? n : n + v),
+        (n, [k, v]) => (TURN_NON_FAULT_OUTCOMES.has(k) ? n : n + v),
         0,
       )
     : 0

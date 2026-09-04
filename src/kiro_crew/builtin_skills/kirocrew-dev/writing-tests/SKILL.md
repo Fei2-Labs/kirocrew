@@ -17,6 +17,24 @@ repo_scope: src/kiro_crew
 > the decision order — what to check first, and what the failure looks like when you
 > get it wrong.
 
+## Where this skill stops, and which sibling takes over
+
+This skill owns **authoring** a test: isolation, determinism, cross-platform
+behaviour, diagnosing a residue failure, and suite speed. Three siblings own the
+neighbouring steps, and none of them restates what is here:
+
+| You are doing | Skill |
+|---|---|
+| Writing, fixing, or speeding up a test | **this skill** |
+| Running the build gate in a worktree, and deciding whether a red is yours | **kirocrew-worktree-dev** |
+| Driving a branch to a review-ready PR and through CI | **prepare-pr** |
+| Polling that PR until it is green | **babysit** |
+
+The line that matters most in practice: **kirocrew-worktree-dev** tells you whether a
+failure is yours (re-run it on `origin/main`, mine CI for what is genuinely flaky);
+once it is yours, the fix is here. Do not fix a flake from a summary of the five
+determinism classes — pick the class from the symptom, in Rule 2.
+
 ## The two properties, and why they are one problem
 
 A test must be **hermetic** (no effect that outlives it, anywhere but its own tmp dir)

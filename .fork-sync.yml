@@ -105,6 +105,19 @@ conflict_policy:
   # Remaining first-party modules with no recorded fork divergence: upstream's
   # version is authoritative. If a resolution here turns out to need judgment,
   # promote the path to its own rule above rather than deciding it twice.
+  #
+  # READ THIS BEFORE RESOLVING A BATCH. `upstream_wins` means upstream's version
+  # is the BASE and the fork's own delta is then RE-APPLIED on top. It does NOT
+  # mean `git checkout --theirs`. At the 997be5f4a sync that shortcut was taken
+  # across 68 paths at once and silently dropped fork work in EVERY one of them --
+  # `git diff <prev upstream base> main -- <path>` was non-empty for all 75 paths
+  # resolved that way, including +1176 lines of durable run-coordinator behaviour
+  # in subagent.py and the whole ACP catalog in the i18n locales. Nothing conflicts,
+  # nothing errors; the loss only surfaces if a pinned test happens to cover it.
+  # Recovery, if it happens again: `git checkout -m -- <path>` re-presents the
+  # original conflict, so the batch can be resolved properly without redoing the
+  # merge. Resolve these one subsystem at a time and diff each against the fork
+  # parent afterwards.
   - glob: "src/kiro_crew/**"
     policy: upstream_wins
   - glob: "website/src/**"
@@ -126,6 +139,49 @@ conflict_policy:
     policy: fork_wins
     note: "Fork keeps its own version cadence (matches CHANGELOG.md)."
 
+  # ── the desktop shell: upstream is extracting main.js into siblings ──
+  - glob: "website/electron/main.js"
+    policy: upstream_wins
+    keystone: true
+    note: |
+      Upstream is dissolving this monolith into the siblings already beside it
+      (gateway-supervisor.js, window-lifecycle.js, ipc-registrar.js, app-menu.js,
+      …). It went 4463 -> 464 lines in one sync, so the whole file conflicts and
+      the fork side is a 4000-line stale snapshot: NEVER resolve toward it, or a
+      sync silently un-does the extraction. Take upstream's file whole, then
+      re-derive the fork's own hunks with `git diff <prev base> main -- <path>`
+      and PORT each one into the sibling that now owns that behaviour — a hunk
+      left in main.js parses and never runs. Keystone because that port is
+      judgment: the fork's tray gateway controls belong in window-lifecycle.js
+      (tray) plus gateway-supervisor.js (state), not here.
+  - glob: "website/electron/@(window-lifecycle|gateway-supervisor|ipc-registrar).js"
+    policy: upstream_wins
+    note: |
+      Extraction targets for the main.js hunks above; they are upstream-authored
+      and churn every sync. A fork behaviour ported in must be ADDITIVE and
+      OPTIONAL at the seam (see divergences/desktop-tray-gateway-controls), so
+      upstream's own structure keeps merging cleanly next time.
+
+  - glob: "website/electron/test/*.js"
+    policy: upstream_wins
+    note: |
+      Upstream retargets these at the module it just extracted (the tray
+      assertions moved from MAIN_JS to WINDOW_LIFECYCLE_JS). Its version knows
+      where the code went; the fork's does not. Take upstream, then re-point any
+      fork-only assertion at the new module rather than keeping the old target.
+      A pinned export/key LIST here is expected to go red when the fork adds a
+      seam — extend the list, do not delete the assertion.
+
+  # ── screenshot capture harnesses: upstream's copy is the fresher one ──
+  - glob: "website/scripts/capture-*.mjs"
+    policy: upstream_wins
+    note: |
+      Both sides ADD the same path when a UI change needs evidence, so these
+      surface as AA conflicts rather than UU. In every case measured so far
+      upstream's file is a strict superset — byte-identical prologue plus the
+      extra captures its later work needed. Diff the two before assuming it:
+      take upstream, then port any capture the fork has and upstream lacks.
+
 divergences:
   - id: auth-grant-sources
     what: "Only explicit slot trust or global YOLO auto-approves a tool call."
@@ -146,13 +202,36 @@ divergences:
     decided: 2026-08-23
 
   - id: opencode-copilot-selectable
-    what: "opencode and copilot are in ACP_BACKENDS_SELECTABLE; upstream withholds both."
+    what: "The fork ships copilot and opencode as selectable IN ADDITION TO upstream's set."
     why: |
-      Unlike claude, these are not dormant seams — the fork's core resolves and
-      spawns `opencode acp` / `copilot --acp` directly and both were driven end
-      to end here. Upstream's staged admission withholds everything but kiro/kas.
-    pinned_by: "test/test_harness_parity.py::test_initial_adapter_selection_is_limited_to_reviewed_backends, test/test_acp_backend_opencode_pi.py::test_opencode_is_known_and_admitted"
+      The fork's core resolves and spawns `copilot --acp` / `opencode acp`
+      directly and both were driven end to end here, so a build that serves them
+      must let an operator select them.
+
+      NARROWED at the 2026-09-04 sync: this entry used to also record that the
+      fork WITHHELD claude where upstream shipped it. That half is retired —
+      claude was ADOPTED from upstream at this sync. Upstream's criterion was
+      accepted: `acp/client.py` already owns the whole Claude spawn path, the
+      adapter is a public npm package, and `agent_sdk/backend_install.py` probes
+      for both of its components, so the exclusion removed only the switch. The
+      remaining divergence is purely additive: upstream {kiro, kas, claude} plus
+      the fork's {copilot, opencode}.
+
+      The mechanism also moved. `BASELINE_SELECTABLE_BACKENDS` is now DERIVED as
+      `ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE`, adopting upstream's
+      NOT_SHIPPED_SELECTABLE as the one place a narrowing is recorded — promoted
+      from the test file into `acp_backends.py` so the module owns it. The fork's
+      membership is {codex, goose, pi}, each because `backend_install.py` carries
+      no install probe for it (`_PROBES` covers kiro, kas, claude only), so their
+      readiness verdict is UNKNOWN with nothing an operator could act on. Claude
+      is NOT a member.
+
+      Selectability entitles claude to no capability set: it stays OUT of
+      ACP_BACKENDS_KIRO_DIALECT (so the direct Kiro factory cannot be handed it),
+      out of INTERNAL_SANDBOX, STEER, SESSION_SHARING and ACP_RUNTIME.
+    pinned_by: "test/test_harness_parity.py::test_initial_adapter_selection_is_limited_to_reviewed_backends, test/test_acp_backend_opencode_pi.py::test_opencode_is_known_and_admitted, test/test_agent_backend_editable.py::test_baseline_ships_the_reviewed_backends_only, test/test_acp_claude_backend.py::TestRoutingRestsOnTheAdapterReadPath::test_claude_is_selectable_only_because_its_tool_calls_are_gated, test/test_provider_dispatch.py::TestKiroDialectSet"
     decided: 2026-08-31
+    revised: 2026-09-04
 
   - id: copilot-backend-identity
     what: "is_copilot_backend predicate + 'copilot' in session_pid._MANAGED_AGENT_MARKERS."
@@ -186,11 +265,112 @@ divergences:
     pinned_by: "scripts/scrub-lint.sh (CI: De-Amazon Scrub Lint)"
     decided: 2026-08-19
 
+  - id: desktop-tray-gateway-controls
+    what: "The tray menu shows a live Gateway status label plus Start/Stop/Restart."
+    why: |
+      Fork feature (07ad84b5d). It lived in main.js, which upstream has since
+      extracted, so the sync that slims main.js is exactly when it disappears
+      with no conflict marker. Now split the way upstream's structure wants:
+      gateway-supervisor.js owns controlState/runControlAction/observeState,
+      window-lifecycle.js renders the items, main.js only wires the two. The
+      OPTIONAL `gatewayControls` option is load-bearing — absent, createTray
+      renders upstream's exact pre-feature template.
+
+      Two upstream invariants this must not trample: stopGatewayGracefully
+      deliberately KEEPS "spawned" ownership so a failed update install may
+      respawn, so `running` is derived from the live child plus adopted
+      ownership rather than from gatewayOwnership alone; and the observer is
+      notification-only, wrapped so a throwing tray callback cannot break boot.
+    pinned_by: |
+      website/electron/test/gateway-supervisor.test.js (controlState/observeState/
+      runControlAction), website/electron/test/hide-to-tray.test.js::"keeps the
+      fork's gateway controls on the tray menu"
+    decided: 2026-09-04
+
+  - id: signed-bundle-bytecode-floor
+    status: scoped
+    what: "SCOPED — -B is retired where PYTHONPYCACHEPREFIX reaches the child, and RETAINED where it cannot."
+    why: |
+      Introduced by fork commit d82fd1a4b as a blanket interpreter-level `-B` on
+      every bundled Python entry point, to stop __pycache__ appearing inside the
+      signed macOS bundle after environment scrubbing.
+
+      At the 2026-09-04 sync an operator decision adopted upstream's redirect as
+      the OWNER of bytecode policy: `website/electron/gateway-env.js`
+      `gatewayBytecodeEnvironment()` REDIRECTS the cache rather than forbidding
+      writes (faster warm start), pointing PYTHONPYCACHEPREFIX at
+      `<kirocrewDir>/cache/pycache` on POSIX and setting it to "" on PACKAGED
+      WINDOWS so CPython consumes the build-time caches
+      `packaging/precompile_windows.py` ships beside the bundled modules.
+
+      The blanket `-B` was removed first, then measurement showed the redirect
+      does not reach every child, so the floor was RESTORED on exactly the spawns
+      it cannot reach. THIS ENTRY IS THEREFORE NOT FULLY RETIRED. A future sync
+      must read the two halves separately:
+
+      HALF 1 — prefix-reachable: `-B` is RETIRED and must NOT come back. `-B` is
+      an interpreter-level flag no environment variable can lift, so a surviving
+      `-B` on a child that inherits the prefix silently defeats the warm start
+      for that path only. Do not re-add it there, and do not read its absence as
+      an upstream regression. Sites that gave it up permanently (`-s` is a
+      separate no-user-site-packages concern and stays everywhere):
+        * packaging/build-desktop.sh — POSIX launcher and the Windows
+          `kirocrew.cmd` shim.
+        * website/electron/main.js / gateway-supervisor.js — already on
+          upstream's side before the decision.
+        * src/kiro_crew/agent.py — the Windows `.cmd`→`python.exe` unwrap, which
+          inherits the prefix and whose `-B` was actively fighting the redirect.
+
+      HALF 2 — env-unreachable: `-B` is RETAINED and is a FORK BEHAVIOUR AN
+      UPSTREAM SYNC MUST NOT DROP. `-I` (isolated) implies `-E`, so such a child
+      ignores every `PYTHON*` variable including PYTHONPYCACHEPREFIX; a child
+      spawned with `strip_python_env=True` never receives it at all. There the
+      redirect is INERT and CPython falls back to its default location — beside
+      the bundled sources inside the code-signed `.app`. Every one of these is a
+      short-lived one-shot probe, helper or supervisor that gains nothing from a
+      bytecode cache, so the retained floor costs none of the warm start the
+      operator chose. Sites that KEEP `-B` (all `-I`, some also env-stripped):
+        * src/kiro_crew/sandbox.py — `_PROBE_SHIM_CODE` namespace probe,
+          `_SPAWN_SHIM_CODE` post-exec shim, and `_LAUNCHER_INTERPRETER_FLAGS`
+          (the Linux namespace launcher, also reached with strip_python_env=True).
+        * src/kiro_crew/validation.py — the bounded ReDoS pattern child.
+        * src/kiro_crew/kiro_prerequisite.py — the POSIX process-group
+          supervisor (this spawn is BOTH `-I` and strip_python_env=True).
+        * src/kiro_crew/platform_compat.py — the interpreter-version probe.
+        * src/kiro_crew/dep_sync.py — `_probe_interpreter`.
+        * src/kiro_crew/platform/wheel_engine.py — the shadow-tree version probe.
+        * src/kiro_crew/apps/builtins/dev_fleet/worktree_ops.py — the dependency
+          preflight snapshot and the sync-runner bootstrap.
+
+      The canonical prose statement of the rule lives beside
+      `sandbox._LAUNCHER_INTERPRETER_FLAGS`; every other site carries a
+      three-line pointer to it.
+
+      STILL UNCOVERED after this change: a Python that is neither prefix-reachable
+      nor `-I`. In practice that is a bare shell `kirocrew ...` through the bundled
+      POSIX launcher (`-s -m kiro_crew`, no `-B`, and no gateway env because the
+      Electron shell is not in the chain), which can still write __pycache__ into
+      the bundle. That is the operator-accepted residue of choosing the redirect:
+      closing it would require re-adding `-B` to the launcher, i.e. reverting
+      HALF 1. Also out of scope on purpose: `pptx_maker`'s
+      provision/engine spawns, which run a managed `uv` tree outside the bundle
+      rather than the bundled interpreter.
+    pinned_by: "test/test_build_desktop_launcher_symlink.py::test_bytecode_policy_is_scoped_by_whether_the_prefix_can_reach_the_child (pins BOTH halves: gatewayBytecodeEnvironment is the owner the gateway spawn reads and no prefix-reachable entry point re-adds -B; and every list/tuple literal under src/kiro_crew carrying \"-I\" must also carry \"-B\", found by ast so a new isolated spawn cannot land without it), website/electron/test/gateway-env.test.js"
+    decided: 2026-09-04
+    revised: 2026-09-04
+
   - id: fork-ux-removals
     what: "Channels app hidden from the App Store; Board app removed."
     why: "Deliberate fork UX divergence; an upstream sync must not restore them."
-    pinned_by: null   # TODO: no test defends this — write one, or it will come back
+    pinned_by: "test/test_apps_registry_coverage.py::TestForkUxRemovalsSurviveAnUpstreamSync"
     decided: 2026-08-19
+    note: |
+      Carried UNPINNED through several syncs and survived each one by luck. Pinned
+      at the 997be5f4a sync after verifying the assertions actually go red when the
+      divergence is reverted (channels `hidden` flipped to false -> the test fails).
+      They read the packaged tree rather than going through `registry`, because what
+      ships is what is on disk and the App Store grid reads `hidden` straight out of
+      the manifest.
 
 toolchain:
   python: ".venv/bin/python3"

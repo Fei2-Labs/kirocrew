@@ -45,6 +45,16 @@ class ContinuationCoordinator(ManagerComponent):
         ``spawn_release`` delete the session files it needs (the accepted run
         would then die with ``resume_failed``), or let a second continue race
         the same conversation.
+
+        A FINISHED run also holds its conversation while its id sits in
+        ``_abandoned_state_writers``: its bounded state-write drain expired, so a
+        worker is still live and its stale whole-file rewrite would roll back the
+        ``keep`` that this gate's two callers write on the loop (#6298). Holding
+        defers those writes past the worker instead of letting it undo them. That
+        record lives on the manager rather than on the run, because
+        ``evict_completed_agents`` prunes completed runs out of ``_agents`` and an
+        eviction must not release the hold; the worker's own done-callback
+        discards the id, so the hold lasts exactly as long as the danger.
         """
         # A release whose off-loop file cleanup is still running has already
         # given up the registry entry, so nothing else would report it busy —
@@ -65,6 +75,14 @@ class ContinuationCoordinator(ManagerComponent):
                     task="",
                     queued=True,
                 )
+        # Checked last: a live or queued run gives the caller a better message.
+        # Same synthetic-marker shape as the queued branch above — the run may
+        # already have been evicted from _agents, which is exactly why this record
+        # is not kept there.
+        if conv_key.startswith("subagent:"):
+            held = conv_key[len("subagent:") :]
+            if held in self._manager._abandoned_state_writers:
+                return SubagentInfo(id=held, task="", _state_writer_abandoned=True)
         return None
 
     def _keep_recorded_on_disk_impl(self, key: str) -> bool:
@@ -237,9 +255,14 @@ class ContinuationCoordinator(ManagerComponent):
                 done=True,
                 parent_session_key=parent_session_key,
                 error=(
-                    f"conversation_busy: run {busy.id} is in flight on this "
-                    "conversation — use spawn_steer to inject into it, or wait "
-                    "for its completion event"
+                    f"conversation_busy: run {busy.id} is still settling a state "
+                    "write on this conversation — retry shortly"
+                    if busy._state_writer_abandoned
+                    else (
+                        f"conversation_busy: run {busy.id} is in flight on this "
+                        "conversation — use spawn_steer to inject into it, or wait "
+                        "for its completion event"
+                    )
                 ),
             )
             return info
@@ -657,10 +680,16 @@ class ContinuationCoordinator(ManagerComponent):
         if self._manager._on_done is None:
             return
         label_msgs = messages if messages is not None else info.pending_followups
+        # The label joins the RAW messages and redacts the JOIN before any
+        # bound: bounding first can split a credential at a cut into fragments
+        # no redaction regex matches, and redacting per message would blind the
+        # multi-line PEM pattern to a key whose header and footer sit in
+        # DIFFERENT messages. The budget scales with the message count,
+        # matching the former 120-chars-per-message cap.
+        followup_label = _redact("; ".join(label_msgs))[: 120 * len(label_msgs)]
         synthetic = failure_info or SubagentInfo(
             id=uuid.uuid4().hex[:8],
-            task=f"[follow_up of run {info.id}] "
-            + _redact("; ".join(m[:120] for m in label_msgs) or "queued follow-up"),
+            task=f"[follow_up of run {info.id}] " + (followup_label or "queued follow-up"),
             done=True,
             parent_session_key=info.parent_session_key,
             error=reason,
@@ -697,6 +726,11 @@ class ContinuationCoordinator(ManagerComponent):
         conv_key = f"subagent:{conv_id}"
         busy = self._manager._conversation_busy(conv_key)
         if busy is not None:
+            if busy._state_writer_abandoned:
+                return (
+                    False,
+                    f"conversation_busy: run {busy.id} is still settling a state write",
+                ), None
             return (False, f"conversation_busy: run {busy.id} is in flight"), None
         provider_label = (
             self._manager._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT

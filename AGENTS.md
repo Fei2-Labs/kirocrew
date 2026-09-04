@@ -91,10 +91,25 @@ This repo is the de-Amazoned public fork of an internal package. Never re-add:
   [Harness parity](#harness-parity-kiro-is-first-class-the-rest-are-adapted), and
   the trust rule is that an adapter whose tool calls Kiro Crew cannot govern is
   REFUSED by default with one named opt-out.
+  Upstream ships `ACP_BACKEND_CLAUDE` as a publicly selectable harness whose whole
+  spawn path lives in `acp/client.py`, so keep two of its properties in view rather
+  than rediscover them: a Claude session starts with **no Crew MCP tools**
+  (`_claude_session_mcp_servers` defaults to `[]`), and a tool pre-approved in
+  Claude's own settings — including a `.claude/settings.json` inside a cloned
+  project — never reaches Kiro Crew's approval path, so its deny rules and audit log
+  do not see that call. Both are disclosed on the Agent Backend panel and in
+  [claude-code-provider](docs/system-specs/features/claude-code-provider.md). The
+  fork's refusal rule above governs: that second property is exactly the
+  "cannot govern" case, so the harness is refused by default and reached only
+  through the one named opt-out. Do not widen its reach further, and do not treat
+  disclosure alone as sufficient.
 - **OSS-flipped defaults:** always-on in-process embeddings, Piper TTS by default,
   a default-open Slack enterprise gate, lazy STT extras.
 - **Fork UX divergences:** the Channels app is hidden from the App Store and the
-  Board app is removed. An upstream sync must not restore them.
+  Board app is removed. An upstream sync must not restore them. The
+  `no-new-builtin-apps` rule in `AUTOSDE.yaml` blocks this in review — and
+  blocks any NEW built-in app: the built-in set is closed, and new apps ship
+  as external apps through the KiroCrewApps registry.
 
 `scripts/scrub-lint.sh` gates `src/`, `website/src/`, `scripts/`, `config/`,
 `packaging/`, and the top level; keep `docs/` clean by convention. Rationale for

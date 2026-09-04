@@ -251,9 +251,18 @@ describe('messageRenderers — the assistant footer rule', () => {
 })
 
 describe('messageRenderers — cards, pills and banners', () => {
-  it('draws a stop event as a full-width row', () => {
-    renderRow(msg({ role: 'system', content: 'zzq-stopped', kind: 'stop_event' }))
-    expect(screen.getByTestId('row')).toHaveTextContent('zzq-stopped')
+  it('draws a stop event on the shared StopEventCard, reading its state off meta', () => {
+    // A stop row's `content` is the card's own JSON envelope, never prose, so the
+    // entry hands the whole message to the card and lets it read `meta.state`.
+    // Recipe parity with the dashboard is pinned in AppSdkStopEventCardParity.
+    const data = { kind: 'stop_event', id: 'stop-zzq', state: 'stopped', outcome: null }
+    const json = JSON.stringify(data)
+    const m = msg({ role: 'system', content: json, cls: json, meta: data })
+    const { entry } = renderRow(m)
+    expect(entry?.id).toBe('stop_event')
+    const card = screen.getByTestId('stop-event-card')
+    expect(screen.getByTestId('row')).toContainElement(card)
+    expect(card.getAttribute('data-state')).toBe('stopped')
   })
 
   it('draws error and notice rows', () => {

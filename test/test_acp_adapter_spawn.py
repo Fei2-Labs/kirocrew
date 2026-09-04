@@ -179,13 +179,26 @@ class TestSpawnResolvesEachBackendsOwnArgv:
         The regression was structural: two branches, `_is_claude` and else. A
         backend absent from the chain is not refused, it is silently served
         kiro-cli, so the assertion is that each id appears in the dispatch.
+
+        FORK DIVERGENCE: upstream's codex arm dispatches on the
+        ``ACP_BACKEND_CODEX`` literal and resolves the adapter in-client. This
+        fork dispatches on the positive ``_is_codex`` predicate and routes the
+        resolution through ``kiro_crew.acp.codex``, which additionally enforces a
+        Node-MAJOR floor (codex-acp 1.4.0 dies on Node 16). Only the symbols
+        changed: codex still has its OWN positive branch and still does not fall
+        through to kiro. Pinned at the fork's symbols so a later sync cannot
+        "restore" upstream's and silently drop the Node floor, and not relaxed to
+        a bare ``"codex" in source``, which a comment would satisfy. The same
+        invariant is pinned from the other side in
+        ``test_harness_parity.py::test_codex_spawn_keeps_its_own_branch``.
         """
         import inspect
 
         from kiro_crew.acp.client import AcpClient
 
         source = inspect.getsource(AcpClient._spawn)
-        assert "ACP_BACKEND_CODEX" in source
+        assert "_is_codex" in source
+        assert "acp import codex" in source or "acp.codex" in source
         assert "ACP_BACKEND_GOOSE" in source
         assert "ACP_BACKEND_OPENCODE" in source
         assert "ACP_BACKEND_PI" in source

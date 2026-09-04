@@ -141,6 +141,17 @@ contextBridge.exposeInMainWorld("localGatewayAPI", {
   set: (enabled) => ipcRenderer.invoke("local-gateway:set", !!enabled),
 });
 
+// Read-only WSL2 host-runtime readout for the Host runtime card on System >
+// Services (HostRuntimeCard). Detection only — no config writes, no
+// persistence. The main-process handler rejects every sender whose gateway is
+// not genuinely local, so a connection window pointed at a remote gateway
+// gets a rejection here rather than the host's distro inventory. Absent in
+// plain browsers — the card treats a missing bridge as "not an Electron
+// shell" and renders nothing.
+contextBridge.exposeInMainWorld("wslAPI", {
+  detect: () => ipcRenderer.invoke("wsl:detect"),
+});
+
 // Native zoom bridge for the Settings > Display "Zoom Level" stepper.
 // Chromium's per-origin zoom (the thing Cmd/Ctrl +/- changes) is not
 // reachable from page JS, so the renderer round-trips through main.js.

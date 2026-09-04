@@ -25,6 +25,7 @@ from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
@@ -114,6 +115,16 @@ class TestBackendPredicates:
         provider = _build_provider(backend)
         assert provider.is_acp_runtime_backend is (backend in ACP_BACKENDS_ACP_RUNTIME)
 
+    def test_codex_is_not_on_the_acp_runtime(self):
+        """The membership the parametrised test above defers to, pinned so it holds.
+
+        codex-acp is one process per session, so it belongs on AcpClient. Adding it
+        to ACP_BACKENDS_ACP_RUNTIME would route an activated codex session onto
+        AcpRuntime + AcpSessionHandle — the wrong transport for a per-session Node
+        adapter — and without this assertion that edit would land green.
+        """
+        assert _build_provider(ACP_BACKEND_CODEX).is_acp_runtime_backend is False
+
 
 class TestUnknownBackendRejected:
     """A typo must fail loudly rather than silently driving kiro-cli."""
@@ -130,7 +141,9 @@ class TestUnknownBackendRejected:
                 AcpProvider(acp_backend="Kas")  # case matters
         message = str(exc.value)
         assert ACP_BACKEND_KAS in message
-        assert ACP_BACKEND_CLAUDE not in message
+        # The message lists what is ACCEPTED, so a known-but-withheld id must not
+        # appear in it: naming one would advertise a value the gate then refuses.
+        assert ACP_BACKEND_CODEX not in message
 
 
 class TestProviderLabel:

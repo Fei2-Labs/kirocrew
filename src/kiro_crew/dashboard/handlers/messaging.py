@@ -43,7 +43,7 @@ from kiro_crew.dashboard.channel_folders import (
     ensure_channel_folder,
     stored_folder_name,
 )
-from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
+from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
     _remove_queued_by_id,
@@ -239,14 +239,24 @@ def _sel():
 
 # ── Subagents ──
 
+#: Generic ``code`` for a spawn rejection that mints no identifier of its own.
+#: Spelled once for the two handlers that answer with it (``api_spawn`` and
+#: ``api_spawn_continue``), so the pair cannot drift apart. A rejection a client
+#: acts on differently gets its OWN code at the decision instead -- see
+#: ``subagent.AGENT_NOT_FOUND_CODE``.
+_SPAWN_REJECTED_CODE = "spawn_rejected"
+
 
 async def api_spawn(request: web.Request) -> web.Response:
     """POST /api/spawn — spawn a subagent.
 
-    Invariant: every error returned after ``state.subagents.spawn`` is called
-    must include ``counted: true``. The manager counts submissions on entry;
-    omitting the flag would make ``spawn_run`` reconcile the member again and
-    could close a batch wave early.
+    Invariant: every error returned after ``state.subagents.spawn`` actually
+    COUNTED the submission must include ``counted: true``. The manager counts
+    submissions on entry; omitting the flag would make ``spawn_run`` reconcile
+    the member again and could close a batch wave early. The converse matters
+    just as much: reporting the flag for a rejection that never reached the
+    counter tells the reconcile to skip a member nobody submitted, and the wave
+    closes one short. ``info.counted`` is the authority, not the call site.
     """
     state: DashboardState = request.app["state"]
     if not state.subagents:
@@ -362,13 +372,32 @@ async def api_spawn(request: web.Request) -> web.Response:
         # batch members) announced through the completion consumer
         # (_announce_rejection). "counted" tells spawn_run's client-side
         # reconcile to skip this member.
+        #
+        # ``code`` is what the client switches on; ``error`` is advisory prose
+        # (RFC 9457 3.1.3). Only the unknown-agent refusal mints its own
+        # identifier today, because it is the only rejection a client treats
+        # differently — spawn_run stops re-posting a name already refused. Every
+        # other rejection reports the generic code, matching the sibling
+        # /continue handler below.
+        #
+        # ``counted`` is reported ONLY when the submission really was counted: a
+        # rejection that never reached the counter must not tell spawn_run's
+        # reconcile to skip the member, or the wave closes one short.
+        # Two dict LITERALS rather than one hoisted local: the error-code gate
+        # can only read a `code` key it can see statically, and a body built up
+        # in a variable lands in its `opaque_body` bucket -- the shape the
+        # ratchet caps precisely so hoisting is not an escape hatch.
         if bool(getattr(info, "counted", True)):
             return web.json_response(
-                {"error": info.error, "code": "spawn_rejected", "counted": True},
+                {
+                    "error": info.error,
+                    "code": info.error_code or _SPAWN_REJECTED_CODE,
+                    "counted": True,
+                },
                 status=400,
             )
         return web.json_response(
-            {"error": info.error, "code": "spawn_rejected"},
+            {"error": info.error, "code": info.error_code or _SPAWN_REJECTED_CODE},
             status=400,
         )
     resp: dict[str, object] = {"id": info.id, "task": task, "status": "spawned"}
@@ -515,7 +544,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
             return web.json_response({"error": info.error, "code": "conversation_busy"}, status=409)
         if info.error.startswith("conversation_gone"):
             return web.json_response({"error": info.error, "code": "conversation_gone"}, status=404)
-        return web.json_response({"error": info.error, "code": "spawn_rejected"}, status=400)
+        return web.json_response({"error": info.error, "code": _SPAWN_REJECTED_CODE}, status=400)
     response: dict[str, object] = {
         "id": info.id,
         "conversation": conv_id,
@@ -888,7 +917,49 @@ async def api_spawn_status(request: web.Request) -> web.Response:
         data["turns"] = info.turns
         data["last_tool"] = _redact(info.last_tool)
         data["elapsed"] = round(time.time() - info.started)
+        # Same predicate, same present-only-while-true convention as
+        # api_spawn_list. This endpoint is the one a blocking `kirocrew spawn
+        # run` polls every 2s (cli_commands.py), so leaving it out is what kept
+        # the CLI reproduction of #6484 silent: the caller sat on "waiting for
+        # result..." while the answer ("a prompt is waiting for you") was only
+        # discoverable from a separate `spawn list` or a log grep.
+        if _awaiting_spawn_approval(info):
+            data["awaiting_approval"] = True
     return web.json_response(data)
+
+
+def _awaiting_spawn_approval(info: object) -> bool:
+    """True only while a run is parked on the SPAWN-approval gate.
+
+    ``_awaiting_approval`` alone is NOT sufficient: ``run.py`` sets the same
+    flag for TOOL approvals raised INSIDE a running subagent (three sites), so
+    reading it bare would report a run at turn 5 waiting on a tool prompt as
+    though it were waiting to START -- rendering "waiting for spawn approval"
+    and telling a caller to approve it "to start this run" that already
+    started. ``_exec_started`` is the permanent discriminator: it is stamped
+    once when execution begins, so ``None`` means the run never entered
+    execution, which for a registered run is only reachable via the spawn gate.
+
+    Both read paths go through this ONE predicate rather than repeating the
+    pair, because the two handlers build their payloads independently and a
+    drift between them is invisible to a behavioural test.
+
+    ``subagent_manager/terminal.py`` computes the same pair for the reap message
+    (#7325). Deliberately not extracted onto ``SubagentInfo``: that read is a
+    plain attribute read on a live run inside the manager package, whereas this
+    one must survive the info doubles the handlers are tested with (below), and
+    unifying them would mean editing a reap path this change does not otherwise
+    touch. The duplication is two lines and both sites name each other.
+
+    ``getattr`` with a strict ``is True`` / ``is None``: these handlers are
+    exercised with lightweight info doubles (SimpleNamespace / MagicMock) that
+    carry only the fields a case cares about, so a bare attribute read raises
+    and a truthy Mock would otherwise advertise a wait that isn't happening.
+    """
+    return (
+        getattr(info, "_awaiting_approval", False) is True
+        and getattr(info, "_exec_started", None) is None
+    )
 
 
 async def api_spawn_list(request: web.Request) -> web.Response:
@@ -915,6 +986,14 @@ async def api_spawn_list(request: web.Request) -> web.Response:
             entry["turns"] = info.turns
             entry["last_tool"] = _redact(info.last_tool)
             entry["elapsed"] = round(time.time() - info.started)
+            # Present only while the run is parked on its spawn-approval
+            # prompt, so the default payload is unchanged. Without it a run
+            # waiting for a human is byte-identical to one that is executing --
+            # which is how #6484 presented: `kirocrew spawn list` showed the
+            # same hourglass for a run that had no child process and was only
+            # ever waiting to be approved.
+            if _awaiting_spawn_approval(info):
+                entry["awaiting_approval"] = True
         # Present only when a group was actually withheld, so the default
         # (everything on) payload is unchanged.
         withheld = [
@@ -2350,7 +2429,7 @@ async def api_send_message(request: web.Request) -> web.Response:
         # "Origin reachable" = one of:
         #   - Hot: slot in state._slots (user has the tab open) → fast path
         #   - Cold: slot not loaded but JSONL exists without closed=true →
-        #     _rehydrate_slot_from_history restores it from disk, tab reappears
+        #     rehydrate_slot_from_history_async restores it from disk, tab reappears
         #
         # "Origin unreachable" = any of:
         #   - User clicked ✕ on the tab (closed=true in JSONL metadata) —
@@ -2399,15 +2478,17 @@ async def api_send_message(request: web.Request) -> web.Response:
             slot_key, job_name = _resolve_session_target(state, target_session, caller_session)
             if slot_key:
                 # Resolve the origin slot. get_slot is the hot path (fast,
-                # O(1) dict lookup). On miss, _rehydrate_slot_from_history
-                # restores from disk if the session exists and isn't closed.
+                # O(1) dict lookup). On miss, rehydrate_slot_from_history_async
+                # restores from disk if the session exists and isn't closed,
+                # with the transcript read on a worker thread so a large store
+                # does not stall the loop for every other request.
                 # Truly-gone sessions (never persisted, deleted, or closed)
                 # return None and delivery falls through to the Slack DM
                 # path below — no phantom empty tab is ever created.
                 slot = state.get_slot(slot_key)
                 was_loaded = slot is not None
                 if slot is None:
-                    slot = _rehydrate_slot_from_history(state, slot_key)
+                    slot = await rehydrate_slot_from_history_async(state, slot_key)
                 logger.info(
                     "send_message session=origin resolved slot_key=%s job=%s was_loaded=%s rehydrated=%s",
                     slot_key,

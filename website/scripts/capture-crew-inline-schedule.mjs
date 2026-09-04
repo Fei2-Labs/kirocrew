@@ -93,7 +93,56 @@ async function main() {
       await page.waitForTimeout(250)
       await save('inline-form-open')
 
+      if (theme === 'dark') {
+        // The draft guard: a rail pane switch away from typed work asks
+        // before destroying it. The guard keys on TYPED work, not on the
+        // form being open — a pristine form switches panes unprompted — so
+        // the capture types a name first, and the shot shows the confirm
+        // over a draft that genuinely has something to lose.
+        await sheet.locator('#jobform-name').fill('morning digest')
+        await sheet.locator('[data-testid="crew-rail-overview"]').click()
+        await page.getByTestId('crew-sched-discard-confirm')
+          .waitFor({ state: 'visible', timeout: 5000 })
+        await page.waitForTimeout(250)
+        await page.screenshot({ path: `${OUT}/${theme}-discard-confirm.png` })
+        shot.push(`${theme}-discard-confirm.png`)
+      }
+
       await context.close()
+
+      if (theme === 'dark') {
+        // The 320px case the header now survives: below `md` both header
+        // actions collapse to labeled icon-only controls, so the heading and
+        // the buttons fit the ~216px pane instead of clipping against its
+        // overflow-x-hidden ancestor.
+        const narrow = await browser.newContext({
+          viewport: { width: 320, height: 720 },
+          deviceScaleFactor: 2,
+        })
+        const npage = await narrow.newPage()
+        logPageProblems(npage)
+        await stubDashboardApi(npage, {
+          theme,
+          extra: async (path, route) => (await editorApi(path, route))
+            || (await crewsApi({ crews: CREWS, defaultAgent: 'kirocrew' })(path, route)),
+        })
+        await npage.goto(base + '/capabilities', { waitUntil: 'domcontentloaded' })
+        // At 320px the capabilities page renders as a navigation menu; the
+        // crews grid lives behind its "Agents" entry.
+        const agentsNav = npage.locator('#main-content').getByText('Agents', { exact: true }).first()
+        await agentsNav.waitFor({ state: 'visible', timeout: 15000 })
+        await agentsNav.click()
+        await npage.locator('#main-content [data-testid="crew-card"], #main-content [data-testid="crew-row"]').first()
+          .waitFor({ state: 'visible', timeout: 15000 })
+        await npage.locator('#main-content [data-testid="crew-card"], #main-content [data-testid="crew-row"]', { hasText: 'oncall' }).first().click()
+        const nsheet = npage.getByRole('dialog')
+        await nsheet.waitFor({ state: 'visible', timeout: 15000 })
+        await nsheet.locator('[data-testid="crew-rail-schedules"]').click()
+        await npage.waitForTimeout(400)
+        await nsheet.screenshot({ path: `${OUT}/${theme}-narrow-pane-icon-only.png` })
+        shot.push(`${theme}-narrow-pane-icon-only.png`)
+        await narrow.close()
+      }
     }
   } finally {
     await browser.close()

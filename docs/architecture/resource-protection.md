@@ -68,11 +68,15 @@ context recycle catches it.
 `_spawn_exec_shim.py` applies **after `exec`**, in the single-threaded child.
 `sandbox.create_subprocess_limited()` is the accessor every agent-influenced ASYNC spawn
 uses: it prepends the shim via `spawn_shim_argv()` and passes `preexec_fn=None`.
-The shim runs as `sys.executable -I -B -S -c <captured source>`: `-I` excludes
+The shim runs as `sys.executable -I -S -B -c <captured source>`: `-I` excludes
 environment and user-site influence, `-S` prevents site initialization, and `-B`
-prevents this isolated interpreter from writing bytecode beside a bundled stdlib.
-That last flag is explicit because `-I` ignores Electron's `PYTHONPYCACHEPREFIX`,
-and interpreter flags do not propagate through a later `sys.executable` exec.
+writes no bytecode. Bytecode policy is OWNED by
+`website/electron/gateway-env.js` `gatewayBytecodeEnvironment`, which REDIRECTS
+the cache with `PYTHONPYCACHEPREFIX` rather than forbidding writes — but `-I`
+implies `-E` and so IGNORES that variable. Without `-B` this shim would fall back
+to CPython's default location, beside the bundled sources inside a code-signed
+`.app`; `-B` is scoped to exactly the spawns the redirect cannot reach
+(`.fork-sync.yml` `signed-bundle-bytecode-floor`, `status: scoped`).
 
 Four profiles:
 
@@ -80,7 +84,7 @@ Four profiles:
 |---------|---------|--------|
 | `tool` (default) | Every ordinary agent-influenced spawn | The full rlimit ceiling plus `oom_score_adj=1000` |
 | `session_host` | The trusted ACP session-host spawns (`acp/client.py`, `acp/runtime.py`) | RAISES NOFILE to the inherited hard limit and does nothing else. A session host multiplexes many MCP pipe pairs, and the 1024 cap caused EMFILE crashes. No OOM bias: a trusted session host must not be the preferred kill target |
-| `build` | The dev-fleet build spawns (`apps/builtins/dev_fleet/server.py`) | Vite and npm need thousands of descriptors; keeps the OOM bias |
+| `build` | The dev-fleet build spawns (`apps/builtins/dev_fleet/runtime.py`) | Vite and npm need thousands of descriptors; keeps the OOM bias |
 | `none` | The user's own interactive terminal | No rlimits, no OOM bias, so the shim has nothing to deliver |
 
 Async, shim-routed spawns cover MCP server probes (`mcp_discovery.py`), the app
@@ -453,9 +457,12 @@ itself and the injection works as described above.
   `_BatchRuntimeHolder` multiplexes every concurrent review onto ONE batch-scoped
   `AcpRuntime` rather than a pool of subprocesses.
 
-- **Browser-triggerable read-only FS scans run on an isolated pool.** Dashboard list
+- **Browser-triggerable filesystem work runs on an isolated pool.** Dashboard list
   endpoints (`GET /api/skills`, `/api/agents/installed`, `/api/prompts`, plus the themes,
   steering and prompt readers) do `os.walk`-style filesystem discovery on the dedicated
   `discovery_executor` pool (`executors.py`), kept separate from the reaper-critical
   `maintenance_executor` so a burst of concurrent user-triggered scans can never starve the
-  orphan sweeps.
+  orphan sweeps. The prompt WRITE handlers (`POST /api/prompts`,
+  `PUT`/`DELETE /api/prompts/{name}`) use the same pool for the same reason: directory
+  resolution, the link check, and the write itself all touch the filesystem, and on a
+  network-mounted home that is a multi-second stall the event loop must not take.

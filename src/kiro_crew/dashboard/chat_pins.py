@@ -68,11 +68,13 @@ def _authorize_app_slot(
 
 
 def _redacted_pin(pin: dict) -> dict:
-    """Copy of ``pin`` with the preview re-redacted at the output boundary.
+    """Copy of ``pin`` with the free-text ``preview`` re-redacted at the output boundary.
 
     chat_pins.json read from disk may predate the current redactor patterns
-    (or have been written by an older version), so never trust stored text on
-    the way out -- every response path must go through this helper.
+    (or have been written by an older version), so the stored ``preview`` --
+    the only field carrying user prose -- is re-run through the redactors on
+    the way out. The remaining fields (``mid``, ``message_ts``, ``slot_key``)
+    are structural identifiers and pass through unchanged.
     """
     return {
         **pin,
@@ -211,7 +213,15 @@ async def api_chat_pins_create(request: web.Request) -> web.Response:
             # disk may hold an unredacted credential from an older version.
             return web.json_response(_redacted_pin(existing), status=200)
 
-        slot_pin_count = sum(1 for p in state._chat_pins if p["slot_key"] == slot_key)
+        # Scope the quota to the caller's own records so one origin_app filling
+        # the slot to the cap cannot block a different origin_app from pinning
+        # in the same slot -- matching the (slot_key, mid, origin_app) scope
+        # used by the idempotency lookup above and api_chat_pins_list.
+        slot_pin_count = sum(
+            1
+            for p in state._chat_pins
+            if p["slot_key"] == slot_key and p.get("origin_app", "") == request_app
+        )
         if slot_pin_count >= _MAX_PINS_PER_SLOT:
             return web.json_response(
                 {

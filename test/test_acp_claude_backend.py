@@ -156,16 +156,30 @@ class TestRoutingRestsOnTheAdapterReadPath:
         assert CC_PERMISSION_MODE_DEFAULT in claude.PERMISSION_ROUTED_MODES
         assert not (claude.PERMISSION_ROUTED_MODES & claude.PERMISSION_BYPASS_MODES)
 
-    def test_claude_is_withheld_until_settings_cleanup_preserves_existing_files(self) -> None:
-        """Governability is necessary but not sufficient for selectability.
+    def test_claude_is_selectable_only_because_its_tool_calls_are_gated(
+        self, tmp_path: Path
+    ) -> None:
+        """Governability is what selectability rests on, and it still binds.
 
-        The current reset path unlinks the project settings file. Because the
-        routing seed may merge into a file the operator already owned, Claude
-        cannot be selectable until cleanup removes only Crew-owned state.
+        Claude is in the baseline (adopted from upstream at the 2026-09-04 sync):
+        ``acp/client.py`` owns its whole spawn path and ``backend_install.py``
+        probes for both of its components, so the switch has something to say when
+        a session fails to start. What makes offering it safe is this file's own
+        subject — the seed establishes routing, so ``tool_gate.enforce`` starts the
+        session with ``allow_ungated=False``. If the seed ever stopped establishing
+        it, the verdict would resolve INDETERMINATE and the start would refuse
+        unless the operator set the one named opt-out
+        (``agent.acp_backend_allow_ungated_tools``). That is the fail-closed
+        direction, and being selectable does not weaken it.
         """
+        from kiro_crew.acp import tool_gate
         from kiro_crew.acp_backends import selectable_backends
 
-        assert ACP_BACKEND_CLAUDE not in selectable_backends()
+        assert ACP_BACKEND_CLAUDE in selectable_backends()
+        # Refuses by raising if the seed did not make the adapter ROUTED.
+        tool_gate.enforce(ACP_BACKEND_CLAUDE, tmp_path, allow_ungated=False)
+        verdict, _ = tool_gate.resolve_verdict(ACP_BACKEND_CLAUDE, tmp_path)
+        assert verdict is Verdict.ROUTED
 
 
 class TestSeeding:

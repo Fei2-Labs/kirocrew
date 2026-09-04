@@ -23,9 +23,14 @@ import { RemoteCrewPanel } from '../pages/settings/RemoteCrewPanel'
 vi.mock('../api/client', () => {
   class ApiError extends Error {
     status: number
-    constructor(status: number, message: string) {
+    // The real class carries the raw response body so a caller can read the
+    // structured `code` the human message collapses away — the panel branches
+    // on it to tell an unsupported-platform refusal from a load failure.
+    body: string
+    constructor(status: number, message: string, body = '') {
       super(message)
       this.status = status
+      this.body = body
     }
   }
   return {
@@ -1043,7 +1048,7 @@ describe('RemoteCrewPanel — editing a crew', () => {
     })
     await u.click(screen.getByRole('button', { name: /Set up a new one/i }))
     await u.click(screen.getByRole('button', { name: /Your instances/i }))
-    const reopened = within(await screen.findByRole('group', { name: /Edit dev-box-1/i }))
+    await screen.findByRole('group', { name: /Edit dev-box-1/i })
 
     // The port moved externally, which is a machine coordinate, so the save is
     // withheld until the user adopts the current record. The point of the test

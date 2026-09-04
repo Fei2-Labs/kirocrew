@@ -266,4 +266,20 @@ describe('action footer on touch devices', () => {
     render(<UserMessage content="hello" renderContent={renderContent} />)
     expect(screen.getByTitle('Copy').className).toContain('p-0.5')
   })
+
+  // The pin toggle is a stateful control: assistive tech needs its on/off
+  // state via aria-pressed, not only the title/aria-label text swap.
+  it('exposes aria-pressed on the pin toggle reflecting the pinned prop', () => {
+    const { rerender } = render(
+      <UserMessage content="hi" renderContent={renderContent} messageTs="ts-pin" onTogglePin={() => {}} />
+    )
+    const unpinned = screen.getByTitle('Pin message')
+    expect(unpinned).toHaveAttribute('aria-pressed', 'false')
+
+    rerender(
+      <UserMessage content="hi" renderContent={renderContent} messageTs="ts-pin" pinned onTogglePin={() => {}} />
+    )
+    const pinned = screen.getByTitle('Unpin message')
+    expect(pinned).toHaveAttribute('aria-pressed', 'true')
+  })
 })

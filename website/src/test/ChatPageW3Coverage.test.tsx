@@ -184,6 +184,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         data,
       })),
       isAtBottom: true,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},
@@ -415,7 +416,9 @@ describe('renderUserContent — folder references', () => {
       }),
       { shiftKey: true },
     )
-    expect(apiMocks.revealPath).toHaveBeenCalledWith('/repo/main/src')
+    // Shift-click routes through the shared `revealOrOpen`, which passes the
+    // explicit 'reveal' action to the transport.
+    expect(apiMocks.revealPath).toHaveBeenCalledWith('/repo/main/src', 'reveal')
     expect(openFolder).not.toHaveBeenCalled()
   })
 
@@ -549,6 +552,30 @@ describe('ChatPage — queued message actions', () => {
     expect(apiMocks.cancelQueuedMessage).toHaveBeenCalledWith('chat-1', 'q1')
     // Optimistically removed rather than waiting for the WS echo.
     await waitFor(() => expect(queueProps!.messages.map(m => m.meta?.queueId)).toEqual(['q2']))
+  })
+
+  it('cancelling two cards in a row keeps both drafts instead of overwriting the first', async () => {
+    // The restore MERGES. Assigning was the older spelling on this surface and it
+    // destroyed text: the second cancel overwrote the first card's restored draft,
+    // and the first card had already been optimistically retired, so that text
+    // survived nowhere. Mutation check: pass the bare `setInput` as `restoreDraft`
+    // in ChatPage and this goes red while the test above still passes.
+    await renderWithQueue()
+    act(() => { queueProps!.onCancel('q1') })
+    await waitFor(() => expect(inputProps!.value).toBe('run the tests'))
+    act(() => { queueProps!.onCancel('q2') })
+    await waitFor(() => expect(inputProps!.value).toContain('then deploy'))
+    expect(inputProps!.value).toContain('run the tests')
+    await waitFor(() => expect(queueProps!.messages).toEqual([]))
+  })
+
+  it('cancelling into a half-typed composer keeps what the user was writing', async () => {
+    await renderWithQueue()
+    act(() => { inputProps!.onChange('half-typed thought') })
+    await waitFor(() => expect(inputProps!.value).toBe('half-typed thought'))
+    act(() => { queueProps!.onCancel('q1') })
+    await waitFor(() => expect(inputProps!.value).toContain('run the tests'))
+    expect(inputProps!.value).toContain('half-typed thought')
   })
 
   it('interrupting a queued card asks the server to interrupt that entry only', async () => {

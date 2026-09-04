@@ -429,7 +429,10 @@ class TestRedactLogViaContext:
     #: actually reachable. Deliberately NOT a list of every redaction call site --
     #: `security_posture.NON_EGRESS_REDACTION_MODULES` owns that axis. This one
     #: only pins that a site already converged cannot silently drift back, which
-    #: is how the class grew in the first place.
+    #: is how the class grew in the first place. A site born on the baseline
+    #: tomorrow is a different question, and a list cannot answer it:
+    #: `test_security_posture.TestGateSideLogRedactorSpelling` owns that half by
+    #: scanning for the property instead.
     CONVERGED_LOG_SITES = (
         "platform/update_provider.py",
         "task_planner.py",

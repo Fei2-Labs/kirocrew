@@ -1,8 +1,8 @@
 """Which ACP backends this build can serve — the one place that decides.
 
 The question this module owns is **capability**: can this build drive the harness
-at all? The public edition registers kiro-cli and KAS; an edition plugin adds its
-own from ``ProviderRegistry.register_acp_backends`` by calling
+at all? The baseline is ``ACP_BACKENDS_KNOWN`` minus the ids named in
+``NOT_SHIPPED_SELECTABLE``; an edition plugin adds its own from ``ProviderRegistry.register_acp_backends`` by calling
 :func:`register_selectable_backend`, the structural twin of
 ``publish_provider.register_provider``.
 
@@ -39,6 +39,13 @@ logger = logging.getLogger(__name__)
 
 ACP_BACKEND_CLAUDE = "claude"
 ACP_BACKEND_KAS = "kas"
+# The Codex ACP adapter: a Node stdio server that boots the Codex app server and
+# translates ACP onto its operations. Known so that an edition shipping a provider
+# for it can register the id; absent from BASELINE_SELECTABLE_BACKENDS below, so no
+# build offers it until something registers it. Authentication is the adapter's
+# own: the ChatGPT-subscription OAuth that `codex login` persists under
+# $CODEX_HOME. No API key is read or stored here.
+ACP_BACKEND_CODEX = "codex"
 # The kiro-cli backend is spelled as the empty string throughout, so name it
 # rather than leaving every call site to infer it from "not claude".
 ACP_BACKEND_KIRO = ""
@@ -55,11 +62,6 @@ ACP_BACKEND_KIRO = ""
 # ``acp.types``; those stay opt-in memberships earned with evidence.
 ACP_BACKEND_COPILOT = "copilot"
 ACP_BACKEND_OPENCODE = "opencode"
-
-# OpenAI Codex through the standalone codex-acp adapter, authenticated by the
-# ChatGPT-subscription OAuth that `codex login` persists under $CODEX_HOME. No
-# API key is read or stored: the adapter reads its own credential file.
-ACP_BACKEND_CODEX = "codex"
 
 # goose through its own built-in `goose acp` server. Unlike the codex and claude
 # adapters, goose DELEGATES filesystem reads/writes and terminal execution back to
@@ -99,30 +101,69 @@ ACP_BACKENDS_KNOWN: FrozenSet[str] = frozenset(
 # Positive membership avoids silently capturing future harnesses (H5).
 ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
+# ── Capability: where a harness gets its MCP servers ──
+
+#: Harnesses that receive their MCP servers as a PER-SESSION array on
+#: ``session/new`` / ``session/load`` instead of reading an agent file.
+#:
+#: kiro-cli (and KAS, which is kiro-cli's relay) is handed ``--agent`` and loads
+#: the spec itself, so Crew passes it an empty array — a duplicate there would
+#: shadow the spec's own entries. claude-agent-acp reads no agent file at all, so
+#: the array is the ENTIRE MCP surface of the session: an empty one means the
+#: harness works while every Crew tool is silently absent.
+#:
+#: A membership set rather than ``_is_claude`` because this is a property of the
+#: transport, not of Anthropic: any ACP adapter that does not read Crew's agent
+#: spec belongs here, and the next such harness should join the set rather than
+#: add a second branch at the call site (harness-parity H6).
+ACP_BACKENDS_SESSION_MCP_ARRAY: FrozenSet[str] = frozenset({ACP_BACKEND_CLAUDE})
+
 # ── The selectable registry ──
 
-#: What the public edition ships. ``ACP_BACKEND_CLAUDE`` is deliberately absent:
-#: it is a dormant seam reached by its own provider, not something a public build
-#: can serve a session with.
+#: Known ids the BASELINE deliberately does not offer, each with the reason it
+#: cannot be offered yet. The healthy state is as small as possible, and empty is
+#: legal.
 #:
-#: FORK DIVERGENCE: this fork also ships ``ACP_BACKEND_COPILOT`` and
-#: ``ACP_BACKEND_OPENCODE``. Unlike claude they are NOT dormant seams — this
-#: build resolves and spawns ``copilot --acp`` / ``opencode acp`` directly (see
-#: ``acp.client._spawn``) and both have been driven end to end here, so a build
-#: that serves them must also let an operator select them. They belong in the
-#: BASELINE rather than going through ``register_selectable_backend``: that entry
-#: point is for an edition layering onto a build it does not own, whereas here
-#: the fork IS the build.
-#: Pinned by test_harness_parity.py::test_initial_adapter_selection_is_limited_to_reviewed_backends
-#: and test_acp_backend_opencode_pi.py::test_opencode_is_known_and_admitted.
-BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = frozenset(
+#: An id sits outside the baseline ONLY by being NAMED here. The criterion is
+#: whether ``agent_sdk/backend_install.py`` carries an install PROBE for the
+#: harness: a build that cannot run a harness is a different claim from a machine
+#: that has not installed it, and the probe already answers the second. Without a
+#: probe the switch renders with nothing to say about a session that failed to
+#: start, which is the state this list exists to keep out of the dashboard.
+#:
+#: ``_PROBES`` covers kiro, kas and claude. codex, goose and pi have no entry, so
+#: their verdict is ``UNKNOWN`` with an empty ``missing_components`` and no
+#: ``install_command`` — nothing an operator could act on.
+NOT_SHIPPED_SELECTABLE: FrozenSet[str] = frozenset(
     {
-        ACP_BACKEND_KIRO,
-        ACP_BACKEND_KAS,
-        ACP_BACKEND_COPILOT,
-        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_PI,
     }
 )
+
+#: What this build ships as selectable: ``ACP_BACKENDS_KNOWN`` MINUS
+#: :data:`NOT_SHIPPED_SELECTABLE`. Derived rather than listed, so the two cannot
+#: drift and there is one place a narrowing is recorded — next to its reason.
+#:
+#: ``ACP_BACKEND_CLAUDE`` is a member. It is not a dormant seam: ``acp/client.py``
+#: owns the whole Claude spawn path, the adapter is a public npm package, and
+#: ``backend_install.py`` probes for it, so excluding it removed only the switch.
+#: Adopted from upstream at the 2026-09-04 sync.
+#:
+#: FORK DIVERGENCE: this fork also ships ``ACP_BACKEND_COPILOT`` and
+#: ``ACP_BACKEND_OPENCODE`` in addition to upstream's set — this build resolves and
+#: spawns ``copilot --acp`` / ``opencode acp`` directly (see ``acp.client._spawn``)
+#: and both have been driven end to end here. They belong in the BASELINE rather
+#: than going through ``register_selectable_backend``: that entry point is for an
+#: edition layering onto a build it does not own, whereas here the fork IS the build.
+#:
+#: Membership in the baseline entitles a backend to NO capability set. Every
+#: ``ACP_BACKENDS_*`` set below stays an explicit opt-in decision (H6).
+#: Pinned by test_agent_backend_editable.py::test_baseline_ships_the_reviewed_backends_only,
+#: test_harness_parity.py::test_initial_adapter_selection_is_limited_to_reviewed_backends
+#: and test_acp_backend_opencode_pi.py::test_opencode_is_known_and_admitted.
+BASELINE_SELECTABLE_BACKENDS: FrozenSet[str] = ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE
 
 # ── Policy-facing spelling ──
 # A governance rule is written by a human into ``security_policy.json`` and is
@@ -189,8 +230,9 @@ def register_selectable_backend(backend: str) -> None:
 
     Called from an edition's ``ProviderRegistry.register_acp_backends`` alongside
     the provider registration itself — registering the provider without this
-    leaves the harness runnable but unreachable, which is exactly the state the
-    hard-coded list produced ("Not enabled in this build" on a build that had it).
+    leaves the harness runnable but unreachable, which is exactly the state a
+    hard-coded list produced: an option absent from the dashboard on a build that
+    could run it.
 
     Writes the BASELINE and the effective set together, so an edition that
     registers after a policy pass has already run is still visible to the next
@@ -306,3 +348,238 @@ def resolve_selected_backend(value: object) -> str:
             ", ".join(repr(b) for b in sorted(selectable)),
         )
     return ACP_BACKEND_KIRO
+
+
+# ── Capability membership (harness-parity H6, H7) ──
+# Every capability a backend may claim is an OPT-IN set here, never a negation at
+# the call site. ``not is_claude_backend`` reads correctly with two backends and
+# then silently hands the capability to the third, so a harness that has never
+# demonstrated the capability inherits it — and the operator who never opted into
+# that harness is the one who finds out. Adding a member is a deliberate edit
+# with evidence; inheriting a default is not a decision. See
+# docs/system-specs/modules/harness-parity.md.
+
+# Backends whose single process can host N concurrent ACP sessions (AcpRuntime
+# demux) AND can persist a SHARED subagent session across teardown. KAS runs on
+# AcpRuntime (multi-session), but its teardown maps to _kiro/session/delete,
+# which removes the persisted session — so a shared subagent would strand
+# spawn_continue (conversation_gone). KAS therefore opts in only once a
+# keep-aware teardown lands (native subagent work); until then its subagents get
+# dedicated sessions. claude-agent-acp runs through AcpClient (one process per
+# session) and is not a member. codex-acp is not either, for the same reason: one
+# adapter process serves one session, so there is nothing to share.
+ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO})
+
+# Backends that can mount a DIFFERENT MCP tool set on one session than the
+# on-disk agent template declares — the capability crew-member dispatch rides
+# on. claude-agent-acp takes the whole server list as a per-session
+# ``session/new`` ``mcpServers`` array; the KAS engine takes the full agent
+# definition over the wire (``_meta.kiro.customAgents``). kiro-cli v2 reads
+# the template from disk at spawn and exposes no wire channel, so a member
+# session on it stays a plain chat: the dispatch tools are simply not
+# mounted, never mounted-and-refused. codex-acp is DELIBERATELY excluded
+# too: its session MCP array is still unimplemented (``[]`` — see
+# ``_codex_session_mcp_servers``), so it has no per-session mount to ride;
+# exclusion withholds only the extra auto-approve grant, the fail-safe
+# direction.
+ACP_BACKENDS_MEMBER_DISPATCH = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS})
+
+# Backends implementing the ``_session/steer`` extension (mid-turn steer). Neither
+# claude-agent-acp nor codex-acp implements it, so a steer sent to either would be
+# answered with method-not-found rather than reaching the turn.
+ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that can serve a MANUAL ``/compact`` (the user-typed slash command).
+# Both members act on the ``/compact`` prompt that ``AcpProvider.compact()``
+# sends: claude-agent-acp performs the compaction natively inside the
+# session/prompt turn, and kiro-cli ACKs the prompt then emits
+# ``_kiro.dev/compaction/status``, which ``wait_for_compaction()`` picks up.
+# KAS is NOT a member: it treats the ``/compact`` prompt as ordinary text and
+# never emits a compaction status in response — its ``summarization_*`` frames
+# (mapped to compaction status by ``acp.kas_wire``) fire only for
+# KAS-initiated auto-summarization. A manual ``/compact`` on KAS therefore
+# strands the status waiter for the full ``COMPACT_WAIT_TIMEOUT_SECS`` (#7800),
+# so the manual entry points refuse it up front instead. This set gates ONLY
+# the manual command: KAS auto-summarization keeps mapping to compaction
+# status unchanged.
+ACP_BACKENDS_COMPACT = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
+
+# Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
+# inside Kiro Crew's seatbelt (kernel EPERM) — so ``sandbox.wrap_argv`` skips
+# Crew's own layer for them. This is the one membership test that fails OPEN:
+# claiming it for a harness with no internal sandbox hands isolation to a layer
+# that never starts and leaves the agent process unconfined. Only kiro-cli
+# qualifies; a Node or Python harness does not, however it is spawned.
+#
+# KAS is NOT a member even though Crew now spawns it as ``kiro-cli acp
+# --agent-engine v3`` and the process on the end of the argv IS kiro-cli. The
+# relay spawns the KAS server without an ``--sandbox`` argument, and KAS's
+# sandbox factory resolves an absent config to its no-op backend, so no OS
+# sandbox starts inside — adding KAS here would skip Crew's seatbelt in favour of
+# a layer that does not exist. See :mod:`kiro_crew.acp.kas_transport`.
+#
+# codex-acp is excluded on the same rule: it is a Node adapter, so Crew's own layer
+# is the only OS confinement a codex session gets. The Codex sandbox modes the
+# adapter can apply are in-process policy, not an OS sandbox that Crew's would
+# nest inside.
+ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
+
+# Backends served by AcpRuntime + AcpSessionHandle — the kiro-agent family
+# (kiro-cli and KAS) whose single process hosts N sessions via demux.
+# claude-agent-acp runs one AcpClient per session and is NOT a
+# member. Membership drives the shared runtime start path and the kiro-family
+# spawn conventions: members read the cli.json effort/tool-search overlay and
+# receive effort at spawn, whereas claude applies it via a live push after the
+# session is ready. Stated as opt-in membership (harness-parity H5/H6) so the
+# four sites that mean "kiro or kas" say so positively rather than as
+# ``not is_claude_backend`` — an inference that silently captures every harness
+# added later. This is a SUPERSET of ACP_BACKENDS_SESSION_SHARING: running on
+# AcpRuntime is necessary for session sharing but not sufficient (KAS runs here
+# yet is excluded from sharing until keep-aware teardown lands). codex-acp is not a
+# member: it is spawned per session and reads none of the kiro-family cli.json
+# overlay, so it takes the AcpClient path.
+ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends whose sign-in lives in kiro-cli's OWN identity store, so an external
+# ``kiro-cli logout`` (or a switch to another account) invalidates a process that
+# is already running. Membership is what authorizes retiring a live session's
+# child when that store starts naming a different account: a harness
+# authenticated some other way must not be recycled on a store it never reads.
+# KAS is a member: it is spawned as ``kiro-cli acp --agent-engine v3
+# --auth-method cli`` (see :mod:`kiro_crew.acp.kas_transport`), and that
+# ``--auth-method cli`` is precisely the demonstration this set waits for — the
+# relay resolves every access token from kiro-cli's own store, so a logout that
+# invalidates the kiro backend invalidates a running KAS relay identically.
+# Excluding it would let a KAS session keep serving turns on the previous
+# account's credentials. Positive membership rather than "not claude"
+# (harness-parity H5).
+#
+# codex-acp is excluded: it signs in through its own credentials file, so a
+# kiro-cli logout says nothing about whether a running codex session is still
+# authenticated, and retiring its child on that signal would end a live turn for
+# no reason.
+ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that speak KIRO's wire dialect rather than the public ACP spec, and
+# are therefore servable by the direct ``AcpProvider`` the first-class Kiro
+# factory constructs. A SPEC-dialect id needs ``SpecAdapterAcpProvider`` and must
+# reach it through the registry dispatcher; handing one to ``AcpProvider`` is the
+# catch-all inheritance of the Kiro provider contract H5 forbids, and two SPEC
+# backends (copilot, opencode) are selectable on a plain public build, so it is a
+# reachable mistake rather than a hypothetical one.
+#
+# Lives HERE, in the leaf, because the only consumer that needs it —
+# ``members.select_provider_backend``, the per-session half of the ONE selection
+# gate — sits above ``kiro_crew.acp`` and may not import it
+# (``scripts/check_agent_sdk_boundary.py``). ``acp/backends.py``'s descriptor
+# table remains the authority on dialect; this set is pinned against
+# ``dialect_of`` in both directions by
+# ``test_provider_dispatch.py::TestKiroDialectSet``, so it cannot drift from it.
+#
+# Positive membership, never "not spec" (H5/H6): a harness added to
+# ``ACP_BACKENDS_KNOWN`` without a decision here is treated as SPEC and routed to
+# the dispatcher, which is the failing-closed direction.
+ACP_BACKENDS_KIRO_DIALECT = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that switch models through ``session/set_config_option("model", ...)``
+# rather than the kiro-native ``session/set_model`` request. Opt-in for the same
+# reason as every set above: a switch sent down a channel the adapter does not
+# implement is answered with method-not-found, and the session keeps serving turns
+# on the model the operator thought they had just left.
+# FORK DIVERGENCE: the fork's spec adapters take the model the same way. Granted
+# as MEMBERSHIP rather than by widening the call site to ``_is_spec_adapter``:
+# that predicate reads as "everything that is not kiro or kas", so the next
+# adapter would inherit the channel without anyone deciding it (H6), and a build
+# that implements neither request would silently no-op its model switch.
+ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION = frozenset(
+    {
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_COPILOT,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_PI,
+    }
+)
+
+# Backends that take a reasoning-effort change through
+# ``session/set_config_option("effort", ...)``. A SEPARATE set from the model
+# channel above despite identical membership today: the two config options are
+# advertised independently, and ``AcpClient.supports_config_option`` exists
+# precisely because adapter builds ship one without the other. Collapsing them
+# would make an adapter that gained model-switching inherit an effort channel it
+# never advertised.
+ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
+
+# Backends that resolve the WIRE model id from the provider's OWN advertised list
+# (captured from ``session/new`` and cached across sessions) rather than trusting
+# the stored id verbatim. Needed where the spelling a backend SERVES differs from
+# the one Crew stored: claude-agent-acp advertises versioned ``…[1m]`` ids whose
+# bare form collapses to the base (200K) context window. A member both FEEDS the
+# advertised-model cache on capture and FOLDS the id onto it — at spawn and on a
+# warm-pool ``set_model`` — so a switched model lands on the served spelling.
+# Opt-in (harness-parity H6): a future adapter with the same spelling gap joins
+# here; one whose wire ids are already exact (kiro-cli serves its ids verbatim and
+# gets windows from the ``--list-models`` cache) never needs to.
+ACP_BACKENDS_ADVERTISED_MODEL_SELECTION = frozenset({ACP_BACKEND_CLAUDE})
+
+# Backends that seed a per-session settings file — claude-agent-acp's
+# ``settings.local.json`` — to lock the model + permission surface. The file is
+# written once at spawn, but a warm-pool claim switches model on a process that
+# has ALREADY read it, so a member must RE-SEED it on ``set_model``: the
+# spawn-time write alone leaves a stale allowlist/model behind, which is what let
+# a switched model collapse to its base window on a claimed pool runtime. Opt-in
+# for the same reason as every set here — a harness with no such file is not a
+# member and takes no re-seed.
+ACP_BACKENDS_SEED_LOCAL_SETTINGS = frozenset({ACP_BACKEND_CLAUDE})
+
+# Which model-registry NAMESPACE a backend's ids live in. This is a registry index
+# key, NOT a provider-identity check (see agent_sdk.provider_identity, note 3): a
+# context window is a property of the MODEL, so the same model reached via two
+# backends shares one namespace. Consulted only for
+# ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION`` members — to pick the registry index
+# the wire id folds against — but mapped for every known backend so a future
+# member already has an entry. Defaults to the ``acp`` (kiro) namespace, where
+# every non-claude id the registry carries lives today. The literals are the
+# model_registry's own provider keys, spelled here rather than imported to keep
+# this load-path leaf free of a ``kiro_crew.model_registry`` dependency.
+_MODEL_REGISTRY_NAMESPACE_BY_BACKEND: dict = {
+    ACP_BACKEND_CLAUDE: "claude_code",
+    ACP_BACKEND_KIRO: "acp",
+    ACP_BACKEND_KAS: "acp",
+    ACP_BACKEND_CODEX: "acp",
+}
+
+
+def model_registry_namespace(backend: str) -> str:
+    """The model-registry namespace key for *backend* (default ``acp``)."""
+    return _MODEL_REGISTRY_NAMESPACE_BY_BACKEND.get(backend, "acp")
+
+
+# Backends implementing ``_kiro.dev/commands/execute`` — the kiro extension that
+# runs a slash command as an RPC. Non-members have no equivalent verb, so their
+# slash commands go through ``session/prompt`` and are interpreted by the adapter
+# (or degrade to prompt text) instead of returning -32601 for the whole call.
+#
+# The same membership decides who reads the workspace ``cli.json`` overlay: the
+# kiro-family harnesses take effort and Tool Search from that file at spawn, and
+# writing it for a harness that never reads it leaves a stale file in the user's
+# workspace that no later clear can reach.
+ACP_BACKENDS_KIRO_SLASH_COMMANDS = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+# Backends that reconcile an edited agent config into their RUNNING sessions: a
+# file watcher on ``~/.kiro/agents`` and ``mcp.json`` restarts only the changed
+# MCP servers, keeps the conversation, and applies the edit at the next turn
+# boundary. Membership is what lets the dashboard's MCP writers SKIP the session
+# reset they otherwise perform after a config change — so a wrong member here
+# leaves a user's freshly installed server unmounted until they restart by hand,
+# with nothing red to tell them why. :mod:`kiro_crew.mcp_hot_reload` owns the
+# gate and additionally pins a version floor: the capability belongs to a
+# kiro-cli release, not to the harness name alone.
+#
+# KAS is NOT a member: its MCP servers are broker stubs injected on
+# ``session/new`` (:mod:`kiro_crew.acp.kas_agents`), so nothing on disk
+# describes its running set for a watcher to reconcile against. claude-agent-acp
+# reads no agent file at all (``ACP_BACKENDS_SESSION_MCP_ARRAY``), and codex-acp
+# has not demonstrated the capability — neither inherits it.
+ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD = frozenset({ACP_BACKEND_KIRO})

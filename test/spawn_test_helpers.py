@@ -2,7 +2,7 @@
 
 Resource limits are applied AFTER ``exec`` by ``kiro_crew._spawn_exec_shim``, so
 every spawn routed through ``sandbox.create_subprocess_limited`` carries an argv
-prefix (``<python> -I -B -S -c <shim source> [options] --``) ahead of the real
+prefix (``<python> -I -S -B -c <shim source> [options] --``) ahead of the real
 command. Tests that care about the command itself use :func:`strip_spawn_shim`
 rather than hard-coding the prefix, which varies with the resource profile.
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
-_SHIM_FLAGS = ("-I", "-B", "-S", "-c")
+_SHIM_FLAGS = ("-I", "-S", "-B", "-c")
 _ARGV_SEPARATOR = "--"
 
 
@@ -25,11 +25,17 @@ def strip_spawn_shim(args: Sequence[str]) -> tuple[str, ...]:
 
     The scan for the ``--`` terminator starts after the shim's source argument,
     so a ``--`` inside the command itself is never mistaken for the separator.
+
+    Prefix length is derived from ``_SHIM_FLAGS`` rather than spelled as literal
+    indices: a flag added to or removed from the shim would otherwise leave this
+    slicing one token off and silently hand back a flag where a command is
+    expected.
     """
     argv = tuple(args)
-    if len(argv) < 7 or argv[0] != sys.executable or argv[1:5] != _SHIM_FLAGS:
+    source = 1 + len(_SHIM_FLAGS)  # argv[source] is the shim source string
+    if len(argv) < source + 2 or argv[0] != sys.executable or argv[1:source] != _SHIM_FLAGS:
         return argv
-    index = 5  # argv[5] is the shim source string
+    index = source
     while index < len(argv) and argv[index] != _ARGV_SEPARATOR:
         index += 1
     return argv[index + 1 :]

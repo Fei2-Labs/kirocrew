@@ -224,35 +224,38 @@ describe('ChatInput approval flow', () => {
     expect(screen.queryByText('Trust reads')).not.toBeInTheDocument()
   })
 
-  it('withholds ALL trust controls when no slot backs the composer (#5486)', () => {
-    // Without a slot, a trust decision could only resolve through the one-shot
-    // api.resolveApproval, which has no trust verb — so the controls must not
-    // be offered at all (class invariant of #5400/#5434: a surface offers only
-    // trust verbs its resolve path honors). Note the card is read-only, so
-    // BOTH Trust reads and the Trust dropdown are on the line here.
+  // #5486: with no slot to grant on, the Trust affordances are WITHHELD rather
+  // than quietly resolved through the one-shot endpoint. `api.approveChatSlot`
+  // is slot-scoped, so a Trust click used to fall through to
+  // `api.resolveApproval` — which has no trust verb — running the tool once
+  // while the composer reported a standing grant. Same fail-closed rule as
+  // #5400 on the spawn card and #5434 on the collapsed tool row: offer only
+  // trust verbs the resolve path honors. The mapping that performed the
+  // downgrade is pinned separately in ChatInput.trustOneShot.test.tsx.
+  //
+  // `activeSlot: null` reaches this through `useSlotId`'s global fallback; a
+  // `<SlotProvider slotId={null}>` cell (an intentionally empty pane) reaches
+  // the same predicate through the provider branch.
+  it('withholds the Trust dropdown when there is no slot to grant on (#5486)', () => {
     const state = stateWithApproval()
     state.chat!.activeSlot = null
     const store = createTestStore(state)
     renderWithProviders(<ChatInput {...defaultProps} />, { store })
-    expect(screen.getByText('Allow once')).toBeInTheDocument()
-    expect(screen.getByText('Reject')).toBeInTheDocument()
     expect(screen.queryByText('Trust')).not.toBeInTheDocument()
-    expect(screen.queryByText('Trust reads')).not.toBeInTheDocument()
+    // Withholding the trust tier must not take the approval bar with it: the
+    // decisions the one-shot endpoint CAN honor are still offered.
+    expect(screen.getByText('Allow once')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeInTheDocument()
   })
 
-  it('records the decision that was actually granted, not the one requested (#5486)', async () => {
-    // The reachable trust path: the slot-scoped grant carries the trust verb
-    // verbatim, so the UI state may (and must) report 'trust'.
-    const store = createTestStore(stateWithApproval())
+  it('withholds Trust reads when there is no slot to grant on (#5486)', () => {
+    const state = stateWithApproval()
+    state.chat!.activeSlot = null
+    const store = createTestStore(state)
     renderWithProviders(<ChatInput {...defaultProps} />, { store })
-    fireEvent.click(screen.getByText('Trust'))
-    fireEvent.click(screen.getByText('Trust all tools'))
-    await waitFor(() => {
-      expect(api.approveChatSlot).toHaveBeenCalledWith('slot-1', 'trust', { request_id: 'ap-123' })
-    })
-    const resolved = store.getState().chat.messages[1].meta?.resolved
-    expect(resolved).toBe('trust')
-    expect(api.resolveApproval).not.toHaveBeenCalled()
+    // is_read_only is '1' in this fixture, so the button renders whenever the
+    // gate allows it — its absence here is the gate, not a missing precondition.
+    expect(screen.queryByText('Trust reads')).not.toBeInTheDocument()
   })
 
   it('handles API error gracefully without crashing', async () => {

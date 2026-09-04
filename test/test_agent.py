@@ -1311,10 +1311,11 @@ class TestKirocrewMcpInvocation:
         with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value=str(shim)):
             cmd, args = _kirocrew_mcp_invocation("mcp-cron")
         assert cmd == str(interpreter)
-        # -B keeps the signed bundle immutable even after Python env scrubbing;
         # -P keeps the spawn CWD off sys.path (the bundle interpreter is pinned
-        # 3.12, so the 3.11+ flag is safe); -s drops user site-packages.
-        assert args == ["-B", "-P", "-s", "-m", "kiro_crew", "mcp-cron"]
+        # 3.12, so the 3.11+ flag is safe); -s drops user site-packages. No -B:
+        # bytecode policy has one owner (gateway-env.js gatewayBytecodeEnvironment),
+        # and an interpreter flag here would override its PYTHONPYCACHEPREFIX.
+        assert args == ["-P", "-s", "-m", "kiro_crew", "mcp-cron"]
 
     def test_cmd_shim_without_interpreter_falls_back_to_sys_executable(self, tmp_path: Path):
         """Corrupted bundle: shim present but python.exe missing -> sys.executable."""

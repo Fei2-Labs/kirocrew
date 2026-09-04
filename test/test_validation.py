@@ -985,8 +985,16 @@ class TestValidateMcpToolArguments:
                       "properties": {"s": {"type": "string", "pattern": "x+"}}},
                      "could not be safely evaluated")
 
-    def test_pattern_child_disables_bytecode_writes(self):
-        """Isolated mode ignores PYTHONPYCACHEPREFIX, so the child also needs -B."""
+    def test_pattern_child_runs_an_isolated_interpreter_on_a_fixed_argv(self):
+        """``-I`` is the invariant: no env, no user-site, no inherited sys.path.
+
+        The child carries ``-B``. Bytecode policy is owned by
+        ``website/electron/gateway-env.js`` ``gatewayBytecodeEnvironment``, which
+        REDIRECTS the cache rather than forbidding writes — but ``-I`` implies
+        ``-E``, so this child never sees ``PYTHONPYCACHEPREFIX`` and would write
+        beside the bundled sources without ``-B`` (see ``.fork-sync.yml``
+        ``signed-bundle-bytecode-floor``, scoped at the 2026-09-04 sync).
+        """
         completed = subprocess.CompletedProcess(args=[], returncode=0)
         with patch.object(validation_module.subprocess, "run", return_value=completed) as run:
             assert validation_module._bounded_pattern_search("x", "x") is True

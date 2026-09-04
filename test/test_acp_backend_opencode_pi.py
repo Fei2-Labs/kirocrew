@@ -27,7 +27,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
 )
-from kiro_crew.acp_backends import selectable_backends
+from kiro_crew.acp_backends import NOT_SHIPPED_SELECTABLE, selectable_backends
 
 
 @pytest.mark.parametrize("backend", [ACP_BACKEND_OPENCODE, ACP_BACKEND_PI])
@@ -44,18 +44,22 @@ class TestOpenCodeAndPiAreAdaptedOnly:
 
 
 def test_pi_is_known_but_withheld_from_the_initial_preview() -> None:
+    """Withheld by being NAMED, not by omission: ``backend_install.py`` has no
+    install probe for pi, so its readiness verdict is ``UNKNOWN`` with nothing an
+    operator could act on."""
     assert ACP_BACKEND_PI in ACP_BACKENDS_KNOWN
+    assert ACP_BACKEND_PI in NOT_SHIPPED_SELECTABLE
     assert ACP_BACKEND_PI not in selectable_backends()
 
 
 def test_opencode_is_known_and_admitted() -> None:
-    """FORK DIVERGENCE: upstream's staged admission withholds every adapter but
-    kiro/kas at this point in the rollout. This fork additionally admits
+    """FORK DIVERGENCE: upstream's set does not carry OpenCode. This fork admits
     ``ACP_BACKEND_OPENCODE`` — unlike pi, it is not dormant/companion-only: the
     fork's core resolves and spawns ``opencode acp`` directly and it has been
     driven end to end (see ``acp/types.py``'s own comment above
     ``ACP_BACKENDS_SELECTABLE`` for the verification notes)."""
     assert ACP_BACKEND_OPENCODE in ACP_BACKENDS_KNOWN
+    assert ACP_BACKEND_OPENCODE not in NOT_SHIPPED_SELECTABLE
     assert ACP_BACKEND_OPENCODE in selectable_backends()
 
 

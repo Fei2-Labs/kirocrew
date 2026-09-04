@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId, memo } from 'react'
-import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Keyboard, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText } from 'lucide-react'
+import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Keyboard, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText, FileDiff, PenLine } from 'lucide-react'
+import SketchDialog from './SketchDialog'
 import CopyBranchButton from './CopyBranchButton'
 import RejectDropdown from './RejectDropdown'
 import { usePointerDrag } from '../hooks/usePointerDrag'
@@ -8,10 +9,11 @@ import VoiceStatusBar from './VoiceStatusBar'
 import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
 import type { AudioSample } from '../hooks/mic'
 import { createPortal } from 'react-dom'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useBranding } from '../hooks/useBranding'
 import { useAppSelector, useAppDispatch } from '../store'
-import { resolveByApprovalId, openActivityToTool, openActivityToTab, selectSlotPendingApproval, selectSlotPendingSpawnApprovals, markSubagentApproving, sseSubagentDone } from '../store/chatSlice'
+import { resolveByApprovalId, openActivityToTool, openActivityToTab, selectSlotPendingApproval, selectSlotPendingSpawnApprovals, markSubagentApproving, sseSubagentDone, setAgentSwitchNotice } from '../store/chatSlice'
+import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { useSlotId } from '../providers/SlotContext'
 import { useToolPillVisible } from '../store/toolPillRegistry'
 import { ToolDetails } from '../pages/chat/ToolDetails'
@@ -29,7 +31,7 @@ import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
-import { Btn } from './ui'
+import { Badge, Btn, Slider } from './ui'
 import { useTouchPushToTalk } from '../hooks/useTouchPushToTalk'
 import { consumeComposerRelease } from '../pages/chat/composerFocus'
 import BusySendButton, { useBusySendMode } from './BusySendButton'
@@ -70,7 +72,7 @@ const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/bmp,image/
 // test_accept_list_covers_every_accepted_extension pins this set against the
 // server's, from the Python side, since a vitest cannot read the Python constant.
 const VIDEO_ACCEPT = 'video/mp4,video/x-m4v,video/quicktime,video/webm'
-const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.md,.json,.har,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
+const FILE_ACCEPT = IMAGE_ACCEPT + ',' + VIDEO_ACCEPT + ',.txt,.md,.json,.excalidraw,.har,.yaml,.yml,.xml,.csv,.log,.py,.js,.ts,.tsx,.jsx,.html,.css,.sh,.bash,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.zip,.tar,.gz'
 
 // Extension per image MIME type, mirroring IMAGE_ACCEPT. Used to synthesize a
 // filename for clipboard-pasted images (see nameClipboardImage).
@@ -135,26 +137,8 @@ import { useMeasuredHeight } from '../hooks/useMeasuredHeight'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields, fmtPercent, fmtRelative } from '../i18n/format'
-import { Badge } from './ui'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
-const providerDisplayName = (providerLabel: string): string => {
-  switch (providerLabel) {
-    case 'acp':
-      return i18nT('pages.settings.chatPanel.backend_kiro_cli')
-    case 'copilot':
-      return i18nT('pages.settings.chatPanel.backend_copilot')
-    case 'kas':
-      return i18nT('pages.settings.chatPanel.backend_kas')
-    case 'opencode':
-      return i18nT('pages.settings.chatPanel.backend_opencode')
-    case 'claude_code':
-      return i18nT('pages.settings.chatPanel.backend_claude_code')
-    default:
-      return providerLabel
-  }
-}
-
 const INPUT_MIN_H = 44
 const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
@@ -194,6 +178,26 @@ function sameBlocks(a: PasteBlock[], b: PasteBlock[]): boolean {
   return b.every(x => ids.has(x.id))
 }
 
+/** Human label for a persisted ACP backend id. Falls through to the raw id so a
+ *  backend the dashboard does not yet know still names itself rather than
+ *  rendering blank. */
+const providerDisplayName = (providerLabel: string): string => {
+  switch (providerLabel) {
+    case 'acp':
+      return i18nT('pages.settings.chatPanel.backend_kiro_cli')
+    case 'copilot':
+      return i18nT('pages.settings.chatPanel.backend_copilot')
+    case 'kas':
+      return i18nT('pages.settings.chatPanel.backend_kas')
+    case 'opencode':
+      return i18nT('pages.settings.chatPanel.backend_opencode')
+    case 'claude_code':
+      return i18nT('pages.settings.chatPanel.backend_claude_code')
+    default:
+      return providerLabel
+  }
+}
+
 /** The decisions that request a STANDING trust grant. Single source for this
  *  surface: the routing guard in `handleApprovalAction` and the tests read this
  *  set, so a new tier added to the Trust controls must be added here to reach
@@ -202,8 +206,9 @@ function sameBlocks(a: PasteBlock[], b: PasteBlock[]): boolean {
 export const TRUST_DECISIONS = new Set(['trust_command', 'trust_base', 'trust', 'trust_reads'])
 
 /** Resolve one approval decision over the ONE-SHOT `api.resolveApproval`
- *  endpoint, which has no trust verb: it can honor exactly `approve`,
- *  `reject`, or `reject_once`, and the next identical call prompts again.
+ *  endpoint, which has no trust verb: POST /api/approvals/{id}/{action} honors
+ *  exactly `approve`, `reject`, or `reject_once`
+ *  (dashboard/handlers/sessions.py), and the next identical call prompts again.
  *
  *  Returns the wire verb to send AND the decision to RECORD in UI state —
  *  which is the grant actually made, never the one requested (#5400 on the
@@ -269,6 +274,24 @@ function stripTrailingBlankLines(s: string): string {
     break
   }
   return sawNewline ? s.slice(0, i + 1) : s
+}
+
+/** True when the text on the caret's line, before the caret, is ONLY markdown
+ *  blockquote markers — `>`, `> > `, optionally indented. A collapsed-paste
+ *  chip then flows on that line (`> [ Paste #1 · N lines ]`) instead of being
+ *  forced onto its own line, which strands the `>` above the chip and makes
+ *  the user delete the injected newline to quote a paste. Whitespace alone
+ *  (no `>`) is NOT a quote prefix — the own-line shape stays for those.
+ *  Linear scan, no regex. */
+function isBlockquotePrefix(linePrefix: string): boolean {
+  let sawMarker = false
+  for (let i = 0; i < linePrefix.length; i++) {
+    const c = linePrefix.charCodeAt(i)
+    if (c === 62 /* > */) { sawMarker = true; continue }
+    if (c === 32 /* space */ || c === 9 /* \t */) continue
+    return false
+  }
+  return sawMarker
 }
 
 /** Auto-size textarea to fit content (only when not manually sized).
@@ -451,17 +474,12 @@ interface ChatInputProps {
   agentName?: string
   agentSource?: string
   modelName?: string
-  /** Persisted ACP backend identity for this session (for example "opencode"). */
-  providerLabel?: string
   onAgentClick?: (rect: DOMRect) => void
   onModelClick?: (rect: DOMRect) => void
   onProjectClick?: (rect: DOMRect) => void
   contextPct?: number
   contextUsedTokens?: number
   contextWindowTokens?: number
-  /** Plan rate-limit reading for the harness behind this slot, when it reports
-   * one. Rendered inside the context popover; most harnesses report nothing. */
-  rateLimit?: { status?: string; limit_type?: string; utilization?: number; resets_at?: number }
   showContextPct?: boolean
   /** Show used/window token counts in the inline context readout. */
   showContextTokens?: boolean
@@ -505,6 +523,16 @@ interface ChatInputProps {
   projectBranch?: string
   /** True when the project's HEAD is detached, so the label is a commit. */
   projectDetached?: boolean
+  /** Uncommitted file count in the project's working tree (0 = clean). */
+  /** Persisted ACP backend identity for this session (for example "opencode"). */
+  providerLabel?: string
+  /** Plan rate-limit reading for the harness behind this slot, when it reports
+   * one. Rendered inside the context popover; most harnesses report nothing. */
+  rateLimit?: { status?: string; limit_type?: string; utilization?: number; resets_at?: number }
+  projectGitDirty?: number
+  /** Commits ahead of / behind the branch's upstream, when it tracks one. */
+  projectGitAhead?: number
+  projectGitBehind?: number
   memoryMode?: string
   cleanMode?: boolean
   /** User-sent messages for ↑/↓ history navigation (oldest → newest). */
@@ -525,8 +553,9 @@ interface ChatInputProps {
    *  chip debounces, and the row can advance inside that window); `undefined`
    *  when no `followUpSourceKey` is supplied. */
   onFollowUpSelect?: (option: string, event: React.MouseEvent, sourceKeyAtClick?: string | null) => void
-  /** Double-click a follow-up option — send with option text directly (bypasses setInput race) */
-  onFollowUpSend?: (text?: string) => void
+  /** Immediate send (double-click / Send-now). Second arg is the click-time
+   *  row identity FollowUpBar already snapshots for onSelect. */
+  onFollowUpSend?: (text?: string, sourceKeyAtClick?: string | null) => void
   /** Quick Send enabled — clicking sends immediately */
   quickSend?: boolean
   /** Layout mode for the follow-up bar: 'multiline' (default) or 'scroll' (original single-line). */
@@ -811,14 +840,12 @@ function ChatInput({
   agentName,
   agentSource,
   modelName,
-  providerLabel,
   onAgentClick,
   onModelClick,
   onProjectClick,
   contextPct,
   contextUsedTokens,
   contextWindowTokens,
-  rateLimit,
   showContextPct,
   showContextTokens,
   isRunning = false,
@@ -838,6 +865,11 @@ function ChatInput({
   project,
   projectBranch,
   projectDetached,
+  providerLabel,
+  rateLimit,
+  projectGitDirty,
+  projectGitAhead,
+  projectGitBehind,
   memoryMode,
   cleanMode,
   sentMessages,
@@ -932,13 +964,16 @@ function ChatInput({
     || (pendingApproval?.content || '').match(/^(?:🔧\s*)?\[([a-z_]+)\]/)?.[1]
     || ''
   const approvalIsUnattended = UNATTENDED_APPROVAL_SOURCES.has(approvalSource)
-  /** Whether the Trust controls may be offered at all: only where the
-   *  slot-scoped standing trust (api.approveChatSlot) is available and a human
-   *  is attached. FAIL-CLOSED, same class invariant as #5400/#5434: a surface
-   *  must not offer a trust verb its resolve path does not honor. Without a
-   *  slot the resolve would fall back to the one-shot api.resolveApproval,
-   *  which has no trust verb — the composer would report a standing grant that
-   *  was never created (#5486). */
+  /** True when a standing Trust grant can actually be RECORDED for this card.
+   *  FAIL-CLOSED: the Trust affordances are withheld unless this holds, because
+   *  the only other resolve path is the one-shot `api.resolveApproval`, which
+   *  has no trust verb — offering Trust there claims a standing grant the
+   *  backend never records (#5400, #5434, #5486).
+   *  - `activeSlot`: `api.approveChatSlot` is slot-scoped, so with no slot the
+   *    grant has nowhere to land and `handleApprovalAction` falls through to the
+   *    one-shot endpoint.
+   *  - `!approvalIsUnattended`: session trust is incoherent for a job that is
+   *    not this session (see `approvalSource` above). */
   const approvalCanTrust = !approvalIsUnattended && !!activeSlot
   const simplified = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
@@ -1171,7 +1206,14 @@ function ChatInput({
   const fileInputId = useId()
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
+  const [sketchOpen, setSketchOpen] = useState(false)
   const [ctxPopoverOpen, setCtxPopoverOpen] = useState(false)
+  // Per-session auto-compact threshold (slider in the context popover). The
+  // debounce timer collapses a slider drag into one POST; the fetch itself is
+  // the React Query below (declared after the shared queryClient), so the
+  // value lives in the standard cache rather than hand-rolled state.
+  const autoCompactTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const autoCompactPending = useRef<{ slot: string; pct: number | null } | null>(null)
   // Shelf responsiveness: measure the shelf row width and collapse chips to
   // icon-only (agent/project) + drop the model effort label when space is tight.
   // Truncation handles the in-between cases.
@@ -1202,6 +1244,18 @@ function ChatInput({
       ? `${base}\n${i18nT('components.chatInput.detached_head_at', { branch: projectBranch })}`
       : `${base}\n${i18nT('components.chatInput.branch', { branch: projectBranch })}`
   }, [project, projectBranch, projectDetached])
+  // Tooltip for the working-tree badge. Reuses the Git panel's catalog entry
+  // so the badge adds no i18n keys; the arrow segments are glyph+number only
+  // (script-neutral, plain concatenation — a template literal here reads as an
+  // untranslated string to the i18n gate). Empty when the tree is clean and in
+  // sync, which is also what hides the badge.
+  const gitBadgeTitle = useMemo(() => {
+    const parts: string[] = []
+    if (projectGitDirty) parts.push(i18nT('components.gitPanel.uncommitted', { count: projectGitDirty }))
+    if (projectGitAhead) parts.push('\u2191' + String(projectGitAhead))
+    if (projectGitBehind) parts.push('\u2193' + String(projectGitBehind))
+    return parts.join(' \u00b7 ')
+  }, [projectGitDirty, projectGitAhead, projectGitBehind])
   // Focus the composer when the dictation panel is up (as before) OR while a
   // batch transcript is landing (voiceTranscribing), so Enter sends and typing
   // edits the result. Deliberately NOT keyed on bare voiceRecording: focusing
@@ -1313,8 +1367,8 @@ function ChatInput({
     if (steerActive && onSteer) onSteer()
     else onSend()
   }, [disabled, voiceTranscribing, steerActive, onSteer, onSend])
-  const sendFollowUp = useCallback((text?: string) => {
-    if (!disabled) onFollowUpSend?.(text)
+  const sendFollowUp = useCallback((text?: string, sourceKeyAtClick?: string | null) => {
+    if (!disabled) onFollowUpSend?.(text, sourceKeyAtClick)
   }, [disabled, onFollowUpSend])
   const { botName } = useBranding()
   const isMobile = useIsMobile()
@@ -1395,7 +1449,104 @@ function ChatInput({
   // cheap to call on every focus. The key and the session key must match
   // SkillPickerMenu's exactly — including the trailing agent segment — or the
   // prefetch warms a different entry and the menu still pays the fetch on open.
+  // The deadline binds HERE too, not only in the menu: react-query dedupes on that
+  // shared key, so the menu opening onto this fetch never runs its own queryFn.
   const queryClient = useQueryClient()
+  // Per-session auto-compact threshold: fetched lazily on popover open (the
+  // slots frame stays untouched), cached under the standard query layer. The
+  // slider writes optimistically into the cache per step and the debounced
+  // mutation collapses a drag into one POST; the response re-syncs the cache.
+  const autoCompactQuery = useQuery({
+    queryKey: ['slot-autocompact', activeSlot ?? null],
+    queryFn: () => api.chatSlotAutocompact(activeSlot as string),
+    enabled: ctxPopoverOpen && !!activeSlot,
+    staleTime: 30_000,
+  })
+  const autoCompact = autoCompactQuery.data ?? null
+  // INVARIANT: every threshold POST is chained onto the previous
+  // write for that slot, so writes commit in issue order — a delayed earlier
+  // POST can never land after (and overwrite) a newer value on the server.
+  // ALL dispatch sites (the debounced mutation, the cross-slot flush, the
+  // unmount flush) MUST go through enqueueAutoCompactWrite; never call
+  // api.setChatSlotAutocompact directly from this component.
+  const autoCompactChain = useRef<Map<string, Promise<unknown>>>(new Map())
+  const enqueueAutoCompactWrite = useCallback((slot: string, pct: number | null) => {
+    const prev = autoCompactChain.current.get(slot) ?? Promise.resolve()
+    // Chain through settle (not just success): a failed write must not block
+    // — or reorder — the writes queued behind it.
+    const next = prev.then(
+      () => api.setChatSlotAutocompact(slot, pct),
+      () => api.setChatSlotAutocompact(slot, pct),
+    )
+    autoCompactChain.current.set(slot, next.then(() => undefined, () => undefined))
+    return next
+  }, [])
+  const autoCompactMutation = useMutation({
+    mutationFn: ({ slot, pct }: { slot: string; pct: number | null }) => enqueueAutoCompactWrite(slot, pct),
+    onSuccess: (r, vars) => {
+      queryClient.setQueryData(
+        ['slot-autocompact', vars.slot],
+        (prev: { pct: number | null; global_pct: number; min: number; max: number } | undefined) =>
+          prev ? { ...prev, pct: r.pct, global_pct: r.global_pct } : prev,
+      )
+    },
+    onError: (err, vars) => {
+      // A rejected write must not leave the optimistic value cached: refetch
+      // the server truth so the slider snaps back to the applied threshold.
+      queryClient.invalidateQueries({ queryKey: ['slot-autocompact', vars.slot] })
+      // Surface the failure the way the sibling per-slot settings do (model,
+      // reasoning effort): a silent snap-back leaves the user's compaction
+      // intent unapplied with no explanation — and with the popover closed,
+      // no visible change at all.
+      dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(err)))
+    },
+  })
+  const pushAutoCompact = useCallback((pct: number | null) => {
+    if (!activeSlot) return
+    const slot = activeSlot
+    queryClient.setQueryData(
+      ['slot-autocompact', slot],
+      (prev: { pct: number | null; global_pct: number; min: number; max: number } | undefined) =>
+        prev ? { ...prev, pct } : prev,
+    )
+    if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current)
+    // Debouncing only ever supersedes a write for the SAME slot. A pending
+    // write for another slot (drag on A, switch, drag on B within the window)
+    // is a different session's change: flush it now instead of discarding it,
+    // or A would silently keep its old threshold on the server.
+    const pending = autoCompactPending.current
+    if (pending && pending.slot !== slot) {
+      autoCompactPending.current = null
+      autoCompactMutation.mutate({ slot: pending.slot, pct: pending.pct })
+    }
+    autoCompactPending.current = { slot, pct }
+    autoCompactTimer.current = setTimeout(() => {
+      autoCompactPending.current = null
+      autoCompactMutation.mutate({ slot, pct })
+    }, 400)
+  }, [activeSlot, queryClient, autoCompactMutation])
+  // Flush (not discard) a pending debounced write on unmount: cancelling the
+  // sole POST would leave the server on the old threshold while the user saw
+  // their change accepted. Fire the API call directly -- the component is
+  // gone, so the mutation's cache re-sync has nothing left to update.
+  useEffect(() => () => {
+    if (autoCompactTimer.current) clearTimeout(autoCompactTimer.current)
+    const pending = autoCompactPending.current
+    if (pending) {
+      autoCompactPending.current = null
+      // On rejection, drop the optimistic value from the cache so a return to
+      // this slot refetches server truth instead of showing a threshold the
+      // session never applied (mirrors the mutation's onError). Routed through
+      // the per-slot chain so the flush cannot overtake an in-flight write.
+      void enqueueAutoCompactWrite(pending.slot, pending.pct).catch((err) => {
+        queryClient.invalidateQueries({ queryKey: ['slot-autocompact', pending.slot] })
+        // The component is gone but the store is not: surface the failure
+        // like the sibling settings do, or the user's last change before
+        // navigating away silently never applies.
+        dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(err)))
+      })
+    }
+  }, [queryClient, enqueueAutoCompactWrite, dispatch])
   const skillSlotKey = slotId ? `dashboard:${slotId}` : undefined
   const skillSlotKeyRef = useRef(skillSlotKey)
   skillSlotKeyRef.current = skillSlotKey
@@ -1404,7 +1555,7 @@ function ChatInput({
   const prefetchSkills = useCallback(() => {
     queryClient.prefetchQuery({
       queryKey: ['skills', skillSlotKey ?? null, project ?? null, agentName ?? null],
-      queryFn: () => api.skills(skillSlotKey, agentName),
+      queryFn: ({ signal }) => api.skills(skillSlotKey, agentName, signal),
       staleTime: skillsCacheStaleTime(project),
     })
   }, [queryClient, skillSlotKey, project, agentName])
@@ -1653,7 +1804,14 @@ function ChatInput({
   // Reset manual height when input is cleared (new message sent)
   const prevValueRef = useRef(value)
   useEffect(() => {
-    if (prevValueRef.current && !value) resetHeight()
+    if (prevValueRef.current && !value) {
+      resetHeight()
+      // Picker open state is derived only in the textarea's own onChange, so the
+      // parent-driven send-clear would otherwise leave a stale menu open.
+      setSlashMenuOpen(false)
+      setFilePickerOpen(false); setFileQuery('')
+      setSkillPickerOpen(false); setSkillQuery('')
+    }
     // Exit history mode when value diverges from the recalled message
     // (user edited it, or the send pipeline cleared it).
     if (historyIdxRef.current !== -1 && value !== sentMessages?.[historyIdxRef.current]) {
@@ -1662,6 +1820,14 @@ function ChatInput({
     }
     prevValueRef.current = value
   }, [value, resetHeight, sentMessages])
+
+  // ChatInput is one instance shared by every slot, so a switch would carry the
+  // previous tab's menu over; an unsent draft never hits the clear above.
+  useEffect(() => {
+    setSlashMenuOpen(false)
+    setFilePickerOpen(false); setFileQuery('')
+    setSkillPickerOpen(false); setSkillQuery('')
+  }, [slotId])
 
   // Record undo snapshots as the controlled value changes.
   useEffect(() => {
@@ -2224,7 +2390,7 @@ function ChatInput({
       }
       e.preventDefault()
     }
-  }, [fireComposer, onChange, sentMessages, sendOnEnter, pasteBlocks, onPasteBlocksChange, connected, ime, optimizePrompt])
+  }, [fireComposer, onChange, sentMessages, sendOnEnter, pasteBlocks, onPasteBlocksChange, connected, ime, optimizePrompt, promptOptimizer])
 
   /** Intercept clipboard paste — files go to upload path, big text gets collapsed into a token. */
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -2285,8 +2451,13 @@ function ChatInput({
       // Surround the token with newlines so the chip lives on its own line —
       // long-form pasted content rarely flows with typed text around it.
       // Skip the leading newline when the caret is at the start of a line,
-      // and the trailing one when the caret is at the end of a line.
-      const leadingNewline = before && !before.endsWith('\n') ? '\n' : ''
+      // and the trailing one when the caret is at the end of a line. Also
+      // skip the leading one when everything before the caret on its line is
+      // a bare blockquote prefix (`> `, `> > `, optionally indented): the
+      // user is quoting the paste, and forcing the chip down a line strands
+      // the `>` above it.
+      const linePrefix = before.slice(before.lastIndexOf('\n') + 1)
+      const leadingNewline = before && !before.endsWith('\n') && !isBlockquotePrefix(linePrefix) ? '\n' : ''
       const trailingNewline = after && !after.startsWith('\n') ? '\n' : ''
       const insert = leadingNewline + token + trailingNewline
       valueFromUserRef.current = true // a paste is a real user edit, not a draft restore
@@ -3074,6 +3245,9 @@ function ChatInput({
       )}
 
       <input id={fileInputId} ref={fileInputRef} type="file" aria-label={i18nT('components.chatInput.attach_files')} multiple accept={FILE_ACCEPT} className="sr-only" onChange={handleFileInputChange} />
+      {onUploadFiles && (
+        <SketchDialog open={sketchOpen} onOpenChange={setSketchOpen} onInsert={onUploadFiles} returnFocusRef={inputRef} />
+      )}
 
       {typedCommandMenus && <SlashCommandMenu input={value} anchorRef={inputRef as React.RefObject<HTMLElement>} open={slashMenuOpen} sendOnEnter={sendOnEnter} onSelect={cmd => { onChange(cmd); setSlashMenuOpen(false) }} onClose={() => setSlashMenuOpen(false)} />}
 
@@ -3327,7 +3501,6 @@ function ChatInput({
               <div className="relative shrink-0" ref={plusWrapRef}>
                 {directFilePicker ? (
                   /* Association is intentionally absent while uploads disable the control. */
-                  // eslint-disable-next-line jsx-a11y/label-has-for
                   <label
                     htmlFor={uploading ? undefined : fileInputId}
                     aria-disabled={uploading || undefined}
@@ -3377,6 +3550,26 @@ function ChatInput({
                         </button>
                       )}
                     </div>
+                    {/* Sketch is a full-width menu ROW, not a third tile: the
+                        tile group above is capped at two peer actions by the
+                        max-two-buttons-per-row rule, and wrapping a third onto
+                        a second grid line is the remedy that rule explicitly
+                        rejects. A stacked row (the same shape as the trigger
+                        shortcuts below) is its own row by construction. */}
+                    <div className="mt-2 flex flex-col gap-0.5">
+                      <button
+                        type="button"
+                        onClick={() => { setPlusOpen(false); setSketchOpen(true) }}
+                        title={i18nT('components.chatInput.sketch')}
+                        className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded-lg bg-transparent hover:bg-bg-hover transition-colors cursor-pointer text-left"
+                      >
+                        <PenLine size={14} className="w-4 shrink-0 text-muted lucide-inline" />
+                        <div className="min-w-0">
+                          <div className="text-[12px] font-medium text-text">{i18nT('components.chatInput.sketch')}</div>
+                          <div className="text-[11px] text-muted leading-snug">{i18nT('components.chatInput.sketch_desc')}</div>
+                        </div>
+                      </button>
+                    </div>
                     {/* In-input trigger shortcuts: clicking inserts the sigil
                      *  and opens the matching picker (same as typing /, @, $). */}
                     <div className="mt-2 pt-2 border-t border-border flex flex-col gap-0.5">
@@ -3423,6 +3616,24 @@ function ChatInput({
                   document.body
                 )}
               </div>
+            )}
+            {/* Touch path: directFilePicker replaces the "+" drop-up with a
+                bare file-input label, so the menu's Sketch row never mounts
+                there. A pencil button restores the entry on exactly the
+                devices where finger/stylus drawing works best. Two peer
+                actions (label + pencil) — at the max-two-buttons-per-row cap,
+                not over it; the non-touch branch keeps Sketch in the menu. */}
+            {onUploadFiles && directFilePicker && (
+              <button
+                className="w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all disabled:opacity-30 bg-transparent border-none text-muted hover:text-text hover:bg-bg-hover shrink-0"
+                onClick={() => setSketchOpen(true)}
+                disabled={uploading}
+                aria-haspopup="dialog"
+                aria-label={i18nT('components.chatInput.sketch')}
+                title={i18nT('components.chatInput.sketch')}
+              >
+                <PenLine size={17} />
+              </button>
             )}
             {/* The wrapper exists for the edge cues: absolutely-positioned
                 children of the scroller itself would travel with the scrolled
@@ -3732,6 +3943,41 @@ function ChatInput({
           )}
           </div>
           )}
+          {!!projectBranch && !!gitBadgeTitle && (
+            /* Working-tree badge: dirty count (warn pill) plus ahead/behind
+               arrows, the Git panel's own vocabulary. Renders only when there
+               is signal, so a clean in-sync tree keeps the footer as it was.
+               A passive READOUT, not a button: the shelf row already carried
+               three actions on base (agent, picker, copy) and
+               max-two-buttons-per-row forbids growing a 3+ row, exactly like
+               the context readout on the right. The Git panel stays one click
+               away in the sidebar. NOT gated on shelfCompact: icon+digits
+               have no text label to shed, and hiding the badge at narrow
+               widths would remove the only tree-state signal
+               (narrow-viewport-required). */
+            <span
+              className="inline-flex items-center gap-1 h-7 shrink-0 text-[11px] font-mono px-1.5 text-muted"
+              role="status"
+              title={gitBadgeTitle}
+              aria-label={gitBadgeTitle}
+            >
+              {!!projectGitDirty && (
+                /* The icon makes the count read as "changed files" on a cold
+                   look — a bare warn number beside a branch name could be
+                   anything (UX review finding). */
+                <span className="inline-flex items-center gap-0.5 px-1 py-px rounded bg-warn/15 text-warn">
+                  <FileDiff size={11} className="shrink-0" />
+                  {projectGitDirty}
+                </span>
+              )}
+              {(!!projectGitAhead || !!projectGitBehind) && (
+                <span>
+                  {!!projectGitAhead && <>&#x2191;{projectGitAhead}</>}
+                  {!!projectGitBehind && <>{projectGitAhead ? ' ' : ''}&#x2193;{projectGitBehind}</>}
+                </span>
+              )}
+            </span>
+          )}
           </div>
           <div className="flex items-center shrink-0">
           {contextPct != null && (() => {
@@ -3801,6 +4047,44 @@ function ChatInput({
                           {modelName && (
                             <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
                               <span className="text-muted">{i18nT('components.chatInput.model')}</span><span className="text-text truncate max-w-[120px]" title={modelName}>{modelName}</span>
+                            </div>
+                          )}
+                          {autoCompactQuery.isLoading && (
+                            <div className="mt-2 pt-2 border-t border-border" aria-hidden="true">
+                              <div className="h-4 mb-1 rounded bg-bg-hover animate-pulse" />
+                              <div className="h-5 rounded bg-bg-hover animate-pulse" />
+                            </div>
+                          )}
+                          {autoCompactQuery.isError && !autoCompact && (
+                            <div className="mt-2 pt-2 border-t border-border text-[10px] text-muted">
+                              {i18nT('components.chatInput.auto_compact_load_failed')}
+                            </div>
+                          )}
+                          {autoCompact && (
+                            <div className="mt-2 pt-2 border-t border-border">
+                              <div className="flex items-center justify-between mb-1">
+                                <span className="text-[11px] text-muted">{i18nT('components.chatInput.auto_compact_at')}</span>
+                                <span className="text-[12px] font-mono font-bold text-accent">{fmtPercent(Math.round(autoCompact.pct ?? autoCompact.global_pct) / 100)}</span>
+                              </div>
+                              <Slider
+                                value={autoCompact.pct ?? autoCompact.global_pct}
+                                onChange={v => pushAutoCompact(v)}
+                                min={autoCompact.min}
+                                max={autoCompact.max}
+                                step={1}
+                                formatValue={v => fmtPercent(v / 100)}
+                                aria-label={i18nT('components.chatInput.auto_compact_threshold')}
+                              />
+                              {autoCompact.pct != null ? (
+                                <Btn
+                                  className="mt-1 px-0 py-0 border-none text-[10px] text-muted underline hover:text-text hover:bg-transparent"
+                                  onClick={() => pushAutoCompact(null)}
+                                >
+                                  {i18nT('components.chatInput.reset_to_global', { pct: Math.round(autoCompact.global_pct) })}
+                                </Btn>
+                              ) : (
+                                <div className="mt-1 text-[10px] text-muted">{i18nT('components.chatInput.following_global', { pct: Math.round(autoCompact.global_pct) })}</div>
+                              )}
                             </div>
                           )}
                   </div>

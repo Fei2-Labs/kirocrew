@@ -17,19 +17,43 @@ from typing import Any, Dict, List
 import pytest
 
 from kiro_crew import acp_backends
-from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+)
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers.agents import _supply_live_enum
 from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
 
 FIELD = "agent.acp_backend"
 
+#: The narrowing this file expects the module to record, spelled out here so a
+#: change to ``acp_backends.NOT_SHIPPED_SELECTABLE`` goes red rather than being
+#: absorbed by a derived assertion. Each member's reason lives next to the module
+#: constant: ``backend_install.py`` carries no install probe for it.
+EXPECTED_NOT_SHIPPED_SELECTABLE = frozenset(
+    {
+        ACP_BACKEND_CODEX,
+        acp_backends.ACP_BACKEND_GOOSE,
+        acp_backends.ACP_BACKEND_PI,
+    }
+)
+
 
 @pytest.fixture
 def restore_registry():
-    """Snapshot/restore the module-global selectable set around a mutation."""
+    """Snapshot/restore the module-global selectable sets around a mutation.
+
+    BOTH sets, because ``register_selectable_backend`` writes both: restoring only
+    ``_selectable`` would leak a widened baseline into every later test in the run.
+    """
+    baseline_before = set(acp_backends._baseline)
     before = set(acp_backends._selectable)
     yield
+    acp_backends._baseline.clear()
+    acp_backends._baseline.update(baseline_before)
     acp_backends._selectable.clear()
     acp_backends._selectable.update(before)
 
@@ -44,8 +68,7 @@ def test_the_allowlist_resolves_the_set_and_never_carries_a_literal():
 
     This is the drift fix itself: the old literal made a registered backend fail
     the PATCH with a misleading "invalid value", which is what the dashboard
-    surfaced as an option that was "not enabled in this build" on a build that had
-    it.
+    surfaced as an unavailable option on a build that actually had it.
     """
     spec = _EDITABLE_CONFIG[FIELD]
     assert "values" not in spec, "a frozen list here is exactly the drift being removed"
@@ -59,9 +82,19 @@ def test_the_default_backend_is_accepted_by_its_own_allowlist():
 
 
 def test_a_registered_backend_reaches_the_allowlist(restore_registry):
-    """An edition registering a backend must not need a core edit to be writable."""
+    """An edition registering a backend must not need a core edit to be writable.
+
+    Every KNOWN backend is now in the public baseline, so the "not yet registered"
+    starting state has to be constructed rather than borrowed from Claude Code. That
+    is the honest shape anyway: what is being tested is that the allowlist RESOLVES
+    the registry per call, not that any particular id starts out absent.
+    """
+    acp_backends._baseline.discard(ACP_BACKEND_CLAUDE)
+    acp_backends._selectable.discard(ACP_BACKEND_CLAUDE)
     assert ACP_BACKEND_CLAUDE not in _EDITABLE_CONFIG[FIELD]["values_fn"]()
+
     acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)
+
     assert ACP_BACKEND_CLAUDE in _EDITABLE_CONFIG[FIELD]["values_fn"]()
 
 
@@ -111,13 +144,17 @@ def test_the_field_declares_no_static_enum():
 
 
 def test_baseline_ships_the_reviewed_backends_only():
-    """The build's capability, stated once so a widening is deliberate.
+    """The build's capability, stated once so a widening OR a narrowing is deliberate.
 
-    FORK DIVERGENCE: upstream's baseline is ``{"", "kas"}``. This fork also ships
-    ``ACP_BACKEND_COPILOT`` and ``ACP_BACKEND_OPENCODE`` — unlike claude they are
-    not dormant seams, the fork's core spawns ``copilot --acp`` / ``opencode acp``
-    directly and both have been driven end to end. Same rationale, and the same
-    membership, as ``test_harness_parity.py``'s
+    ``ACP_BACKEND_CLAUDE`` is a member: ``acp/client.py`` owns the whole Claude
+    spawn path, the adapter is a public npm package, and ``backend_install.py``
+    probes for it, so the exclusion removed only the switch. Adopted from upstream
+    at the 2026-09-04 sync.
+
+    FORK DIVERGENCE: the fork ships ``ACP_BACKEND_COPILOT`` and
+    ``ACP_BACKEND_OPENCODE`` in addition to upstream's set — the fork's core spawns
+    ``copilot --acp`` / ``opencode acp`` directly and both have been driven end to
+    end. Same rationale, and the same membership, as ``test_harness_parity.py``'s
     ``test_initial_adapter_selection_is_limited_to_reviewed_backends`` and
     ``test_acp_backend_opencode_pi.py``'s ``test_opencode_is_known_and_admitted``.
     """
@@ -125,8 +162,16 @@ def test_baseline_ships_the_reviewed_backends_only():
     assert baseline == sorted(
         [
             ACP_BACKEND_KIRO,
+            ACP_BACKEND_CLAUDE,
             ACP_BACKEND_KAS,
             acp_backends.ACP_BACKEND_COPILOT,
             acp_backends.ACP_BACKEND_OPENCODE,
         ]
     )
+    # The structural half: an id may sit outside the baseline only by being NAMED
+    # in ``NOT_SHIPPED_SELECTABLE``, so a plain ``baseline != known`` — a silently
+    # dropped adapter — still fails rather than relaxing.
+    assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - acp_backends.NOT_SHIPPED_SELECTABLE)
+    # And the narrowing itself is pinned, so widening the exclusion list is not a
+    # way to make the assertion above pass again.
+    assert acp_backends.NOT_SHIPPED_SELECTABLE == EXPECTED_NOT_SHIPPED_SELECTABLE

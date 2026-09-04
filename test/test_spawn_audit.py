@@ -691,13 +691,22 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # per-step modes; provision wraps the pod CLI argv) and the spawn
         # carries resource_limit_preexec() — routing again here would nest
         # sandboxes. The chokepoint is applied at the call sites.
-        "apps/builtins/dev_fleet/server.py::worker",
+        "apps/builtins/dev_fleet/runtime.py::worker",
+        # The sync runner (the module worktree_ops's sync snapshots and runs by
+        # path) executes step argvs it reads from its steps_json input -- and
+        # every one of those argvs was ALREADY wrapped through
+        # sandboxed_spawn_argv (with per-step modes) by worktree_ops at
+        # composition time, before serialization. Routing again inside the
+        # runner would nest sandboxes, exactly as the runtime.py::worker entry
+        # above records for the outer spawn; the chokepoint is applied at the
+        # composition site.
+        "apps/builtins/dev_fleet/sync_runner.py::run_step",
         # Dev Fleet builtin backend: async version routes all git/gh through
         # _run_cmd which calls sandboxed_spawn_argv (the chokepoint). Only
         # _resolve_primary_checkout uses subprocess.run directly (one-shot
         # git rev-parse at startup, no agent input, no sandbox needed).
-        "apps/builtins/dev_fleet/server.py::_resolve_primary_checkout",
-        "apps/builtins/dev_fleet/server.py::worker",
+        "apps/builtins/dev_fleet/repository.py::_resolve_primary_checkout",
+        "apps/builtins/dev_fleet/runtime.py::worker",
         # dep_sync stands in for `pip install -e .` on a checkout whose console
         # script is locked, and it spawns the same shapes that step did:
         # `<target python> -c <fixed metadata/version probe>` and `<target python>
@@ -709,7 +718,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # from that checkout's own declarations -- the same ones `pip install -e .`
         # would have read, so this adds no surface the step it replaces did not
         # already have. Routing here would also NEST sandboxes: dep_sync runs as a
-        # sync step, which server.py::worker already wrapped through
+        # sync step, which runtime.py::worker already wrapped through
         # sandboxed_spawn_argv, and a filesystem-scoped wrapper around pip would
         # block the venv writes that are the point of the step.
         #
@@ -737,7 +746,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # wrapped through sandboxed_spawn_argv before handing it to the runner.
         # So all three of its spawns are already inside that sandbox, and routing
         # them again would nest one sandbox inside itself; the chokepoint is
-        # applied at the call site, exactly as for server.py::worker.
+        # applied at the call site, exactly as for runtime.py::worker.
         #
         # No argv is agent-influenced. _extract spawns
         # `<git> -C <repo> show <remote>/<base branch>:website/<fixed filename>`:
@@ -831,6 +840,37 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # classification as ``cli_doctor.py::_doctor`` above.
         "cli_doctor.py::_discord_intent_grants",
         "cli_doctor.py::_doctor_mcp_tools",
+        # The AST heuristic matches ``asyncio.run`` (attr ``run`` on base
+        # ``asyncio``), used to drive one async capability-manager read from the
+        # loop-less doctor path so the Credentials section can report whether this
+        # host mounts a credential-vending MCP server. Unlike the sibling
+        # ``asyncio.run`` entries above this one is not purely a false positive:
+        # on a composed edition the awaited ``list_mcp()`` does reach that
+        # edition's own package manager as a child process. It is benign for the
+        # reasons the allowlist asks for — the argv is the manager's own fixed
+        # subcommand with no agent-influenced component, the result is read-only
+        # and never carries a credential value, and the public default spawns
+        # nothing at all (``available()`` is False, so the await is never issued).
+        # Note this section IS reachable from a tool call, so the waiver rests on
+        # those three legs rather than on who invokes doctor.
+        "cli_doctor.py::_credential_vendor_line",
+        # ``aws configure list-profiles`` / ``aws configure get credential_process``
+        # for the Credentials section. Fixed argv — the subcommand is a literal and
+        # NOTHING is interpolated, so no component is agent-influenced; the binary
+        # is resolved through ``platform_compat.trusted_system_bin("aws")`` rather
+        # than ``PATH`` — which can lead with an agent-writable worktree venv
+        # ``bin`` while doctor runs as the operator — and a miss means no spawn at
+        # all.
+        # Read-only and 10s-capped. These two exist SO THAT doctor does not parse
+        # ``~/.aws/config`` itself: that file is inside a directory the sensitive-
+        # path floor fences from the agent, and ``kirocrew doctor`` is reachable
+        # from a tool call, so reading it here would vend through a diagnostic what
+        # the floor refuses directly. ``aws configure`` is the sanctioned path the
+        # deny-remediation text itself names, and the profile set it returns is the
+        # same information an allowed command already gives the agent — a
+        # credential VALUE is never requested or printed.
+        "cli_doctor.py::_aws_profile_names",
+        "cli_doctor.py::_aws_auto_refreshes",
         # Read-only diagnostic for the Source Checkout section: ``git -C <repo>
         # rev-parse/rev-list`` with a hardcoded argv whose only variable is the
         # install's own source directory (derived from the package's module

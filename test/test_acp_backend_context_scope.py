@@ -74,11 +74,20 @@ class TestBrandingStaysClaudeOnly:
 
         Rewriting kiro-cli branding to Claude's wording on a Codex session would
         tell the user they are talking to the wrong product.
+
+        Pinned at the named constant rather than the bare ``"claude_code"``
+        literal: the gate is unchanged and still compares one exact session-map
+        label, and ``provider_identity.py``'s own note prefers the constant over
+        a literal for that label. The bite is the same either way -- a widening
+        of branding would have to replace this comparison with a set or a
+        dialect test, and this assertion is what fails when it does.
         """
         import inspect
 
+        from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE
         from kiro_crew.context import ContextBuilder
 
+        assert PROVIDER_LABEL_CLAUDE == "claude_code"
         source = inspect.getsource(ContextBuilder.build_message)
-        assert 'provider_type == "claude_code"' in source, "branding must stay claude-only"
+        assert "provider_type == PROVIDER_LABEL_CLAUDE" in source, "branding must stay claude-only"
         assert "is_spec_adapter_provider_label" in source, "skills must widen"

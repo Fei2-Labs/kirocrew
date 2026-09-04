@@ -323,26 +323,49 @@ same way). Key details:
 - **Interpreter** is a python-build-standalone CPython 3.12 with `@executable_path`-
   relative dylib references (genuinely portable, no system Python dependency).
 - **Entry point** is `bin/kirocrew` — a shell script that execs
-  `bin/python3.12 -B -s -m kiro_crew "$@"`. The interpreter-level `-B` is the
-  immutable signed-bundle floor: it survives environment scrubbing in managed MCP
-  probe and pooled-backend paths.
-- **Bytecode stays outside the signed resources** — Electron exports
-  `PYTHONPYCACHEPREFIX=<data home>/cache/pycache` for the gateway interpreter, so
-  ordinary imports cannot create `__pycache__` under `backend-dist/`. Gateway
-  helpers that deliberately launch `sys.executable -I` cannot rely on that
-  variable because isolated mode ignores every `PYTHON*` environment setting;
-  the prerequisite process-group supervisor, Linux namespace probe, resource-limit
-  spawn shim, and bounded regex evaluator therefore add the interpreter-level
-  `-B` flag. Each isolated interpreter must carry its own `-B`: the flag is not
-  inherited by a later `exec()` of `sys.executable`. App backend children are not
-  isolated interpreters; their `minimal_env()` allowlist instead preserves the
-  cache prefix because a builtin backend can fall back to the same bundled
-  interpreter. Managed MCP discovery probes and pooled backends deliberately scrub
-  inherited Python variables, including the cache prefix; the bundled console
-  launcher therefore carries its own `-B`, and Windows paths that unwrap the `.cmd`
-  shim repeat that flag explicitly. Third-party and customized probes remain fully
-  scrubbed. Together these paths keep normal startup from changing sealed resources
-  after codesigning.
+  `bin/python3.12 -s -m kiro_crew "$@"`. `-s` drops user site-packages so a stray
+  `~/.local/lib` package cannot shadow a bundled module. There is no `-B`.
+- **Bytecode is REDIRECTED, not forbidden, and one helper owns that** —
+  `website/electron/gateway-env.js` `gatewayBytecodeEnvironment(platform,
+  cachePath, isPackaged)`, threaded into the gateway spawn by
+  `gateway-supervisor.js`. On POSIX it returns
+  `{ PYTHONPYCACHEPREFIX: <data home>/cache/pycache }`, so ordinary imports write
+  their caches outside `backend-dist/` rather than not at all — the point being a
+  faster warm start. On a PACKAGED WINDOWS bundle it returns
+  `{ PYTHONPYCACHEPREFIX: "" }` on purpose, so CPython consumes the checked-hash
+  caches `packaging/precompile_windows.py` shipped beside the bundled modules;
+  PE Authenticode does not seal a resource tree the way macOS code signing does,
+  and a per-machine install may be read-only to the user. App backend children
+  inherit the prefix through `apps.registry.minimal_env()`, whose allowlist keeps
+  `PYTHONPYCACHEPREFIX` for exactly that reason.
+  No **prefix-reachable** entry point may re-add `-B`. An interpreter flag cannot
+  be lifted by an environment variable, so one appearing there would override the
+  prefix on that path alone and silently give up the warm start this design chose.
+  A child the prefix CANNOT reach is the opposite case — see the next bullet.
+- **Where the redirect cannot reach, `-B` covers it instead** — an `-I`
+  (isolated) child ignores every `PYTHON*` variable including the prefix, and a
+  child spawned with `strip_python_env=True` never receives it, so there the
+  redirect is inert and CPython falls back to writing `__pycache__` beside the
+  bundled sources — inside a code-signed macOS `.app`, where it can invalidate the
+  signature. Those spawns therefore CARRY `-B`: the prerequisite process-group
+  supervisor, the Linux namespace probe, the post-exec resource-limit spawn shim,
+  the namespace launcher itself, the bounded regex evaluator, the interpreter and
+  shadow-tree version probes, and the dev-fleet preflight/sync-runner children.
+  Each is a short-lived one-shot helper, so the cache it gives up is worth
+  nothing, and the warm start the redirect buys is untouched. The rule — not a
+  file list — is pinned by
+  `test/test_build_desktop_launcher_symlink.py::test_bytecode_policy_is_scoped_by_whether_the_prefix_can_reach_the_child`,
+  which fails both on an isolated spawn missing `-B` and on a `-B` reappearing on
+  a prefix-reachable entry point. Policy record: `.fork-sync.yml`
+  `signed-bundle-bytecode-floor` (`status: scoped`).
+- **What is STILL not covered, stated plainly** — a Python that is neither
+  prefix-reachable nor `-I`. Two cases remain. A bare shell `kirocrew ...` through
+  `bin/kirocrew` runs `-s -m kiro_crew` with no gateway env in the chain, so it
+  can write bytecode into the bundle; closing that would mean re-adding `-B` to
+  the launcher, i.e. reverting the redirect decision. And a managed MCP probe or
+  pooled backend is spawned with `strip_python_env=True` on an argv this package
+  derives and matches by equality (`agent._kirocrew_mcp_invocation`), so it has
+  neither the prefix nor `-B`.
 - **Stdlib probes verified** — `stdlib_probe_gate` fails the build if any package
   the launcher's readiness check probes is missing from the pruned tree, so a
   drifted probe list breaks the build instead of every user's launch (see
@@ -372,12 +395,28 @@ same way). Key details:
 
 ## How the app finds and launches the backend
 
-When the app starts, [`main.js`](../../website/electron/main.js) first checks
-whether a gateway is already running. An existing gateway—including a local SSH
-forward to a remote gateway—is reused. Otherwise the shell locates the backend
-binary via [`find-bin.js`](../../website/electron/find-bin.js), spawns it as
-`kirocrew gateway --no-open`, polls `/api/status`, and loads the dashboard once
-it is healthy.
+When the app starts, [`main.js`](../../website/electron/main.js) composes the
+desktop lifecycle and delegates gateway ownership to
+[`gateway-supervisor.js`](../../website/electron/gateway-supervisor.js). The
+supervisor first checks whether a gateway is already running. An existing
+gateway—including a local SSH forward to a remote gateway—is reused. Otherwise
+it locates the backend binary via
+[`find-bin.js`](../../website/electron/find-bin.js), spawns it as `kirocrew
+gateway --no-open`, polls `/api/status`, and loads the dashboard once it is
+healthy.
+
+Host-runtime discovery stays behind the same main-process ownership boundaries.
+The `wsl:detect` handler in
+[`ipc-registrar.js`](../../website/electron/ipc-registrar.js) fails closed unless
+the sender has the fixed primary origin,
+[`window-lifecycle.js`](../../website/electron/window-lifecycle.js) proves that
+its window uses a local gateway rather than a configured tunnel, and
+[`gateway-supervisor.js`](../../website/electron/gateway-supervisor.js)
+positively identifies the primary listener as Kiro Crew or its service. A
+manual SSH tunnel, foreign listener, unbound port, or unavailable owner probe is
+therefore refused; only then may
+[`wsl-detection.js`](../../website/electron/wsl-detection.js) run the trusted
+system `wsl.exe` path.
 
 Before spawning a **bundled** backend the shell checks that the bundle's Python
 stdlib is fully on disk
@@ -423,8 +462,9 @@ Only a **bundled** backend qualifies — a user's own install or a `PATH` `kiroc
 failing on a stdlib import is a broken environment, and "wait for the installer"
 would be misleading advice there. And only the **current launch attempt** is read:
 the log is append-only across launches, so the text is sliced from the last spawn
-marker (`SPAWN_MARKER`, owned by `bundle-integrity.js` and logged by `main.js` so
-writer and reader cannot drift). Without that, an older traceback could relabel
+marker (`SPAWN_MARKER`, owned by `bundle-integrity.js` and logged by
+`gateway-supervisor.js` so writer and reader cannot drift). Without that, an
+older traceback could relabel
 this attempt's unrelated failure — a `SIGKILL`, or a bound port whose real remedy
 is force-stop rather than a bare Retry — and show a reassuring dialog over a live
 fault. When the marker has scrolled out of the tail, attribution is unknowable and
@@ -579,7 +619,7 @@ The function is pure — `fs`, `os`, `path`, `process.resourcesPath`,
 `__dirname`, and the arch are injected — so both arch branches are
 unit-testable without mocking globals.
 
-### `main.js` — spawning the gateway
+### `gateway-supervisor.js` — owning the gateway lifecycle
 
 - Ensures `KIROCREW_HOME` (default `~/.kiro/crew`, overridable via the
   `KIROCREW_HOME` env var) exists, then spawns the backend with
@@ -604,8 +644,10 @@ unit-testable without mocking globals.
   per-user install at `%LOCALAPPDATA%\Kiro-Cli` — so desktop launches find
   user-local installations without mutating the shell environment or requiring
   the already-running gateway to inherit an installer-updated `PATH`.
-- On window close the app hides to the tray; quitting sends `SIGTERM` to the
-  gateway process.
+- [`window-lifecycle.js`](../../website/electron/window-lifecycle.js) hides the
+  app to the tray on window close; the composition root delegates quit-time
+  gateway teardown to the supervisor, which performs the graceful shutdown and
+  signal escalation contract.
 
 ## Code signing & notarization (macOS)
 
@@ -849,9 +891,31 @@ About panel:
 `managedBy` names the owning system in the "updates are managed by …"
 message; `updateCommand` renders as a copyable command. An empty or
 unparsable body still counts as managed — an operator who dropped the file
-gets the safe behavior even when the metadata is wrong. For local testing,
-the `KIROCREW_EXTERNALLY_MANAGED` env var points at a marker file (any other
-non-empty value marks the install managed with no metadata).
+gets the safe behavior even when the metadata is wrong.
+
+The body is only read when the marker's **provenance** can be established:
+neither the marker nor its directory may be owned by the account the app runs
+as, and neither may be group- or world-writable. Ownership rather than current
+mode bits, because a POSIX owner can always `chmod +w` back — a marker the app's
+own user owns is one a prompt-injected agent shell could have planted and then
+made read-only. `updateCommand`/`checkCommand` are executed through a shell on
+the managed auto-update path, so a marker in a user-owned resources directory
+(Homebrew, `pip --user`, `~/Applications`) is treated as a bare marker: managed,
+updater off, no metadata and nothing to run. Packagers that want the managed
+commands honored must install the resources directory root-owned.
+
+The commands run with a **constructed environment**, not the app's own. Only an explicit pass-through set reaches them — `USER`, `LOGNAME`, `TZ`, `TMPDIR`, the `LANG`/`LC_*` locale vars, and the proxy vars — plus a narrowed system-only `PATH` and `cwd=/`. `HOME` is deliberately excluded: Python derives its user-site directory from it, so passing it through would let a planted `sitecustomize.py` run on every `python` start. Everything else is absent by construction, because `shell: true` means a shell interprets the command and a shell reads its environment as code: the loader family (`LD_*`/`DYLD_*`), the interpreter family (`PYTHON*`, `NODE_OPTIONS`), the startup files (`BASH_ENV`, `ENV`), the tracing pair (`SHELLOPTS` plus a command-substituting `PS4`), word splitting (`IFS`), and exported shell functions (`BASH_FUNC_*`, which shadow a command name outright). A packager whose updater needs any other variable must set it inside its own command rather than relying on inheritance.
+
+**On Windows the marker's commands are never honored.** There is no POSIX owner
+to read and `access(W_OK)` does not model ACLs, so no honest provenance verdict
+exists; the check fails closed by declaration and every Windows marker is
+treated as bare (managed, updater off). A Windows packager drives updates with
+its own installer, not through this marker.
+
+For local testing, the `KIROCREW_EXTERNALLY_MANAGED` env var points at a marker
+file (any other non-empty value marks the install managed with no metadata).
+It is honored on unpackaged builds only — a packaged app ignores it, because
+its launch environment is user-writable.
 
 The gateway has the matching seam for its own surfaces: an operator's
 `security_policy.json` `updates` block (`check_command` / `apply_command`)

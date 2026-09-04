@@ -12,8 +12,12 @@ from pathlib import Path
 
 from kiro_crew.secrets import SecretVault
 
-#: Scheme prefix for a vault secret reference.
-_SECRET_URI_PREFIX = "secret://"
+#: Scheme prefix for a vault secret reference. Single source of truth: the
+#: importer (``kiro_crew.secrets.migrate``) writes references with this prefix
+#: and the source-provider check reads it, so both import it from here rather
+#: than re-spelling the literal.
+SECRET_URI_PREFIX = "secret://"
+_SECRET_URI_PREFIX = SECRET_URI_PREFIX  # internal alias for existing call sites
 
 #: Validation accepts EVERY name the vault write path can store, rejecting
 #: only what can never round-trip: the empty name and names with

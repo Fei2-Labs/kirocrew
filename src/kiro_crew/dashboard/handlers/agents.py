@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ from kiro_crew.agent_discovery import (
     spec_model,
     spec_str,
 )
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
 from kiro_crew.apps.bridges import _registration_source
 from kiro_crew.apps.manager import (
@@ -53,11 +55,13 @@ from kiro_crew.config.loader import (
     KiroCrewAgentConfig,
     KiroCrewConfig,
     _safe_color,
+    coerce_effort,
+    inject_kiro_cli_api_key,
     normalize_agent_model,
-    read_config_for_update,
     resolve_agent_bindings,
     resolve_agent_config_path,
     resolve_effective_model,
+    update_config_locked,
     write_config_atomically,
 )
 from kiro_crew.config.schema import SCHEMA_REGISTRY, config_entry_to_dict
@@ -68,6 +72,7 @@ from kiro_crew.dashboard.chat_utils import (
     SLASH_COMMAND_DESCRIPTIONS,
     _history_key_for,
     is_deprecated_model,
+    run_config_write,
 )
 from kiro_crew.dashboard.handlers._shared import (
     MAX_AGENT_SKILLS,
@@ -82,6 +87,7 @@ from kiro_crew.dashboard.handlers._shared import (
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import (
@@ -179,7 +185,157 @@ def _installed_agent_config() -> Path:
     return kiro_agents_dir_path() / AGENT_FILENAME
 
 
-def _merge_unowned_servers(config: dict[str, Any], installed_path: Path) -> tuple[str, ...]:
+def _on_disk_mcp_servers(installed_path: Path) -> dict[str, Any] | None:
+    """The installed spec's ``mcpServers`` map, or ``None`` when it cannot be read.
+
+    ONE read, TWO rules. ``_merge_unowned_servers`` (a name ABSENT from the
+    submission) and :func:`_drop_unbacked_app_entries` (a name PRESENT in a stale
+    submission) are two directions of one question -- what does on-disk state say
+    about this name -- so neither may read the file for itself. Two reads inside
+    one commit unit could only ever agree by luck, and a rule pair disagreeing
+    about its baseline is a defect that surfaces as a name both preserved and
+    dropped.
+
+    ``None`` AND ``{}`` ARE DIFFERENT ANSWERS and collapsing them is a defect --
+    in EITHER direction. ``{}`` means the spec was read and holds no bridge under
+    any name; ``None`` means it could not be interpreted at all. That distinction
+    only matters to the present-axis rule, and there it decides the verdict:
+    against ``{}`` every namespaced name the client submits is an addition the
+    platform never made, while against ``None`` nothing is known and nothing may be
+    decided. The absent-axis rule is indifferent -- it has nothing to preserve
+    either way -- which is why its own read conflated the two harmlessly for as long
+    as it was the only caller.
+
+    A MISSING ``mcpServers`` KEY IS ``{}``, NOT ``None``, and the difference is
+    load-bearing rather than cosmetic. A readable spec that simply carries no such
+    key holds no bridge, which is a definite answer; reading it as "unknown" hands
+    the stale-snapshot rule a reason to stand down and lets the resurrection
+    through. That state is reachable from this very handler: a PUT whose submission
+    omits ``mcpServers`` is persisted verbatim by ``_write_installed_config``, and
+    ``_deregister_mcp_servers`` pops its entries out of ``get("mcpServers", {})``
+    without ever adding the key back, so a spec can sit keyless while an old editor
+    tab still holds a bridge in its snapshot.
+
+    A ``mcpServers`` PRESENT BUT NOT AN OBJECT still answers ``None``, deliberately.
+    The file parsed, but that value cannot be interpreted, and the same
+    cannot-interpret state is what the submitted-side guard in
+    ``_merge_unowned_servers`` refuses to act on. Deleting the client's entries on
+    the strength of a value we cannot read is the guess this whole span exists to
+    avoid.
+
+    BEST-EFFORT ON AN UNREADABLE SPEC, deliberately. Missing (a first-ever write),
+    corrupt, or holding a non-object ``mcpServers`` all answer ``None``: there is
+    nothing authoritative to read, and this editor is the user's repair path for
+    exactly that state, so failing the PUT closed would leave a broken agent
+    unfixable from the dashboard. Neither rule then acts and the snapshot lands as
+    it did pre-fix; enabled apps re-register their servers on the next gateway
+    start (``reconcile_enabled_app_resources``), so the loss self-heals.
+
+    The CALLER holds bridges' flock across this read and the spec write, so no
+    in-gateway writer of this file can commit between them.
+    """
+    try:
+        on_disk = json.loads(installed_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(on_disk, dict):
+        return None
+    if "mcpServers" not in on_disk:
+        return {}  # read cleanly and holds no bridge: a definite answer
+    servers = on_disk["mcpServers"]
+    return servers if isinstance(servers, dict) else None
+
+
+def _drop_unbacked_app_entries(
+    config: dict[str, Any], existing: dict[str, Any] | None
+) -> tuple[str, ...]:
+    """Drop submitted ``<app>:<server>`` entries the installed spec does not hold (#7089).
+
+    THE STALE-SNAPSHOT AXIS, the mirror of ``_merge_unowned_servers``. That rule
+    decides what happens to a name the submission OMITS. This one decides one
+    narrow question about a name the submission CONTAINS: may the client CREATE a
+    name in the app-namespace region THROUGH THIS PUT? Not while the installed spec
+    is READABLE -- so a submitted namespaced name with no row on disk is dropped.
+    The readability qualifier is not a hedge: an unreadable spec answers nothing, so
+    the submission lands as it did pre-fix, and a rule stated without it would
+    contradict the best-effort path below.
+
+    THE REGION IS RESERVED FROM THIS ENDPOINT, not owned by a single writer, and
+    the distinction is worth stating because the weaker claim is false. Two paths
+    legitimately write a ``:``-containing key into this spec: ``_register_mcp_servers``
+    builds every app bridge as ``f"{app_name}:{server_name}"``, and the MCP page's
+    ``handlers/mcp.py::_sync_mcp_to_agent_unlocked`` copies a global mcp.json server
+    in under ``mcp_server_alias``, which returns a slash-free name UNCHANGED and so
+    preserves a colon (``npm:foo`` stays ``npm:foo``). What this rule withholds is
+    the ability to introduce such a name through the RAW EDITOR, where the client's
+    copy is indistinguishable from a resurrection; a name either of those writers
+    has actually placed on disk is present, and therefore untouched.
+
+    THE ROW-BY-ROW TABLE LIVES IN THE SPEC, ``docs/system-specs/modules/app-kit-platform.md``
+    section 1a, which is this axis's designated home; the absent axis keeps its
+    table in :func:`_app_declared_server_names` instead. Only what a reader of this
+    code has to know to not undo it is repeated here.
+
+    ABSENCE FROM DISK IS A VERDICT, not a gap, and it is reached three ways --
+    which is why the client's copy cannot be trusted over it:
+
+    * the app was UNINSTALLED (``_deregister_mcp_servers`` removed the bridge and
+      the app directory is gone);
+    * the app is installed but DISABLED (same deregistration; startup
+      reconciliation deliberately never revisits it);
+    * the app is installed and ENABLED but the entry was SKIPPED on purpose --
+      ``_register_mcp_servers`` refuses to write an HTTP server with no resolvable
+      live port, and scrubs any stale entry for it, because a manifest's
+      illustrative port is a reachable-LOOKING dead URL that kiro-cli dials on
+      every request and that breaks EVERY kiro session, not just that app's.
+
+    WHAT THIS DELIBERATELY DOES NOT DO: it never rewrites a submitted value. Where
+    the name is on disk AND in the submission, the submitted row still wins
+    untouched -- the editor-snapshot-wins contract kept in #5899 and re-affirmed
+    for #6664, pinned by ``test_app_owned_entry_present_in_the_snapshot_is_updated``.
+    Reversing it needs a maintainer ruling and is tracked separately.
+
+    THE DECLARED-NAME CENSUS IS DELIBERATELY NOT CONSULTED, and this is the one
+    part a later change is most likely to undo, so the reason is here rather than
+    only in the spec. The absent-axis rule must name an owner because it decides
+    whether to KEEP something the client asked to remove; every candidate here is
+    one the client is asking to ADD to a region it does not author, which the
+    on-disk map answers by itself. A census consulted here would RESCUE the third
+    case above and write back the dead URL the registration path scrubbed on
+    purpose. It also keeps this rule free of manifest I/O, so it cannot raise
+    :class:`AppOwnershipUnreadable` and adds no new way for a PUT to fail.
+
+    Host-owned names are excluded, including an edition extra whose key contains
+    ``:``: that key is the HOST's, and the host axis is unchanged here. Order
+    against the absent-axis rule is immaterial -- a name this rule drops is by
+    definition not on disk, so it cannot enter that rule's absent set.
+
+    Returns the names it dropped, for the caller to log.
+    """
+    submitted = config.get("mcpServers")
+    if not isinstance(submitted, dict) or not submitted:
+        # Absent, empty, or a shape kiro-cli rejects outright: nothing to decide,
+        # and the existing verbatim-persist behaviour is unchanged.
+        return ()
+    if existing is None:
+        # The spec could not be read, so nothing is authoritative. See
+        # :func:`_on_disk_mcp_servers` for why this is best-effort rather than a
+        # refusal.
+        return ()
+    host = emission_eligible_mcp_servers()
+    dropped = tuple(
+        sorted(
+            name for name in submitted if ":" in name and name not in existing and name not in host
+        )
+    )
+    for name in dropped:
+        del submitted[name]
+    return dropped
+
+
+def _merge_unowned_servers(
+    config: dict[str, Any], existing: dict[str, Any] | None
+) -> tuple[str, ...]:
     """Re-add ``mcpServers`` entries the submitting client does not own.
 
     MERGE-ON-WRITE (#6664). This PUT persists a whole-file snapshot the client
@@ -227,10 +383,13 @@ def _merge_unowned_servers(config: dict[str, Any], installed_path: Path) -> tupl
       explicit intent; the app lifecycle (disable/uninstall, which calls
       ``_deregister_mcp_servers``) is what removes it.
 
-    BEST-EFFORT ON AN UNREADABLE SPEC, deliberately. A corrupt installed spec has
-    no parseable entries to preserve, and this editor is the user's repair path
-    for exactly that state -- failing the PUT closed would leave a broken agent
-    with no way to fix it from the dashboard. So an unreadable spec preserves
+    BEST-EFFORT ON AN UNREADABLE SPEC, deliberately -- and the read itself now
+    lives in :func:`_on_disk_mcp_servers`, performed once on this rule's behalf and
+    on :func:`_drop_unbacked_app_entries`'s, so both directions decide from the
+    SAME bytes instead of from two reads that could disagree. A corrupt installed
+    spec has no parseable entries to preserve, and this editor is the user's repair
+    path for exactly that state -- failing the PUT closed would leave a broken
+    agent with no way to fix it from the dashboard. So an unreadable spec preserves
     nothing and the snapshot lands as it did pre-fix; enabled apps re-register
     their servers on the next gateway start
     (``reconcile_enabled_app_resources``), so the loss self-heals.
@@ -270,16 +429,11 @@ def _merge_unowned_servers(config: dict[str, Any], installed_path: Path) -> tupl
         )
         return ()
     submitted_servers: dict[str, Any] = submitted if isinstance(submitted, dict) else {}
-    try:
-        on_disk = json.loads(installed_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        # Missing (a first-ever write) or corrupt: nothing recoverable to
-        # preserve. See BEST-EFFORT above.
-        return ()
-    if not isinstance(on_disk, dict):
-        return ()
-    existing = on_disk.get("mcpServers")
-    if not isinstance(existing, dict) or not existing:
+    if not existing:
+        # Unreadable (``None``) or read and empty (``{}``): either way there is
+        # nothing recoverable to preserve, so the two answers are equivalent HERE
+        # and only here. See :func:`_on_disk_mcp_servers` for why they are not
+        # equivalent to the present-axis rule, and for the BEST-EFFORT reasoning.
         return ()
     absent = {name: spec for name, spec in existing.items() if name not in submitted_servers}
     if not absent:
@@ -639,7 +793,10 @@ def _commit_agent_config(
        the harmless end: it can raise :class:`AppOwnershipUnreadable` while
        having mutated only the in-memory *config*, so the caller's 500 is exact
        and all three targets are byte-identical (see
-       :func:`_app_or_host_owned` for why refusing beats guessing);
+       :func:`_app_or_host_owned` for why refusing beats guessing). The
+       stale-snapshot rule shares that step and adds NO prefix of its own: it
+       performs no I/O beyond the one read they share and cannot raise, so its
+       only effect is on the in-memory *config*;
     1. the ``config.json`` read raises :class:`ConfigReadError` — nothing
        durable, and the caller's 500 is exact;
     2. the ``config.json`` write fails — nothing durable;
@@ -749,14 +906,30 @@ def _commit_agent_config_locked(
     invariant documented on :func:`_commit_agent_config` applies here, and this
     is never called from anywhere else.
     """
-    # (0a) MERGE-ON-WRITE, immediately before the filter that governs the map it
-    # produces. Inside the unit for the same reason as (0) and (1): the on-disk
-    # read has to be adjacent to the write it feeds, or a bridge registration
-    # landing during the (unbounded, cross-process) flock wait is clobbered
-    # exactly as before the fix. BEFORE the filter, not after, so the entries it
-    # re-adds are governed too -- re-injecting them afterwards would hand an
-    # ``autoApprove`` on a preserved entry a path around step (0).
-    preserved = _merge_unowned_servers(config, installed_path)
+    # (0a) ON-DISK STATE DECIDES BOTH DIRECTIONS, immediately before the filter
+    # that governs the map they produce. Inside the unit for the same reason as
+    # (0) and (1): the on-disk read has to be adjacent to the write it feeds, or a
+    # bridge registration landing during the (unbounded, cross-process) flock wait
+    # is clobbered exactly as before the fix. BEFORE the filter, not after, so the
+    # entries the merge re-adds are governed too -- re-injecting them afterwards
+    # would hand an ``autoApprove`` on a preserved entry a path around step (0).
+    #
+    # ONE read for the two rules, so they cannot disagree about their baseline:
+    # #6664's merge decides names ABSENT from the submission, #7089's rule decides
+    # namespaced names PRESENT in a stale one. Their order is immaterial (see
+    # :func:`_drop_unbacked_app_entries`).
+    existing = _on_disk_mcp_servers(installed_path)
+    dropped = _drop_unbacked_app_entries(config, existing)
+    if dropped:
+        # WARNING, not info: the client submitted these and they are not being
+        # persisted, which is the one outcome here a user could be surprised by.
+        logger.warning(
+            "agent-config PUT: dropped %d app-namespaced mcpServers entry/entries the "
+            "installed spec does not hold, so a stale snapshot cannot resurrect them: %s",
+            len(dropped),
+            ", ".join(dropped),
+        )
+    preserved = _merge_unowned_servers(config, existing)
     if preserved:
         logger.info(
             "agent-config PUT: kept %d mcpServers entry/entries the client does not own: %s",
@@ -764,17 +937,29 @@ def _commit_agent_config_locked(
             ", ".join(preserved),
         )
     sanitize(config)
-    # (1) The one fallible READ, and it precedes every write.
+
+    # (1)+(2) config.json, read AND written inside one hold of the
+    # ``<config>.json.lock`` sidecar. The caller's ``_get_config_lock()`` is an
+    # asyncio lock: it serializes this against sibling handlers on this event
+    # loop and nothing else. The ~69 ``update_config_locked`` writers -- the CLI,
+    # the boot refresh, another gateway process -- take the advisory lock
+    # instead, so without this the two families could interleave and whichever
+    # renamed second published a document that never saw the other's change.
     #
-    # Fail closed: writing back a {} baseline would drop every other setting
-    # just to record removedTools (see read_config_for_update).
-    mc_cfg = read_config_for_update(mc_cfg_path)
-    if removed_per_key:
-        mc_cfg["removedTools"] = removed_per_key
-    else:
-        mc_cfg.pop("removedTools", None)
-    # (2) config.json — the snapshot the read above produced, still current.
-    write_config_atomically(mc_cfg_path, mc_cfg)
+    # Still the one fallible READ, and it still precedes every write: with the
+    # default ``on_corrupt="fail"`` an unreadable config raises
+    # :class:`ConfigReadError` out of here before anything durable happens, so
+    # the caller's 500 stays exact. Failing closed is the point -- writing back a
+    # {} baseline would drop every other setting just to record removedTools
+    # (see read_config_for_update).
+    def _record_removed_tools(mc_cfg: dict) -> dict:
+        if removed_per_key:
+            mc_cfg["removedTools"] = removed_per_key
+        else:
+            mc_cfg.pop("removedTools", None)
+        return mc_cfg
+
+    update_config_locked(mc_cfg_path, mutate=_record_removed_tools, stamp_meta=False)
     # (3) agent_model_state.json bookkeeping — after (2), before (4).
     changed = agent_state.lift_and_strip_bookkeeping(config, name)
     # (4) the installed spec, under the caller's bridge-file lock.
@@ -1071,6 +1256,7 @@ async def api_default_agent(request: web.Request) -> web.Response:
                 status=400,
             )
         path = _h.config_path()
+
         # This read-modify-write must hold the SAME in-process lock every other
         # ``config.json`` RMW in the dashboard takes (agent create/update/delete,
         # capability install/uninstall, the agent-config PUT). The event loop no
@@ -1079,24 +1265,36 @@ async def api_default_agent(request: web.Request) -> web.Response:
         # can capture a baseline the worker is about to republish — and the last
         # atomic rename silently reverts the other side's unrelated settings.
         #
-        # Loop-side ``async with`` rather than an offload: the lock is an
-        # asyncio lock (``LoopBoundLock``) acquired exactly this way by every
-        # sibling RMW in this module, and the read and write below are
-        # synchronous with NO await between them, so once the lock is held the
-        # pair is already indivisible — a worker hop would add a cancellation
-        # point where today there is none.
-        async with _get_config_lock():
-            try:
-                data = read_config_for_update(path)
-            except ConfigReadError:
-                # Fail closed: writing back a {} baseline would drop every other setting.
-                logger.exception("Refusing to set default agent: config unreadable")
-                return web.json_response(
-                    {"error": "failed to read config file", "code": "config_unreadable"},
-                    status=500,
-                )
+        # That lock is not sufficient on its own, though: it is an asyncio lock,
+        # so it serializes only same-loop callers. The read-modify-write itself
+        # goes through ``update_config_locked``, which holds the
+        # ``<config>.json.lock`` sidecar across its own read and write and so
+        # also serializes against the CLI, worker threads and other processes.
+        #
+        # ``run_config_write`` is the one async entry point that holds BOTH --
+        # its own docstring says so -- and it is what every other converted
+        # dashboard writer uses. It takes the loop-side lock, dispatches the
+        # synchronous read-modify-write to a worker thread so an unbounded
+        # advisory-flock wait never stalls the gateway, and SHIELDS that worker
+        # in a drain loop so the lock cannot be released with a write still in
+        # flight. Composing those three by hand here would be a third copy of a
+        # helper that already exists, free to drift from it.
+        def _set_default(data: dict) -> dict:
             data["default_agent"] = name
-            write_config_atomically(path, data)
+            return data
+
+        try:
+            await run_config_write(
+                update_config_locked, path, mutate=_set_default, stamp_meta=False
+            )
+        except ConfigReadError:
+            # Fail closed: writing back a {} baseline would drop every other
+            # setting. Nothing durable ran, so this 500 is exact.
+            logger.exception("Refusing to set default agent: config unreadable")
+            return web.json_response(
+                {"error": "failed to read config file", "code": "config_unreadable"},
+                status=500,
+            )
         return web.json_response({"ok": True, "default_agent": name})
     cfg = KiroCrewConfig.load()
     return web.json_response({"default_agent": cfg.default_agent})
@@ -1113,8 +1311,8 @@ def _supply_live_enum(entry: dict, values: list[str] | None = None) -> None:
 
     The field carries no static ``enum`` on purpose (see ``AgentConfig``): an
     edition registers its backends at boot, strictly after ``SCHEMA_REGISTRY`` is
-    built, so a frozen list could only be wrong — it would call a registered
-    backend "not enabled in this build" while the PATCH allowlist accepted it.
+    built, so a frozen list could only be wrong — it would omit a registered
+    backend from the dashboard while the PATCH allowlist accepted it.
 
     Resolved from the same owner as the PATCH allowlist and the config load path,
     so the three cannot disagree. One binding today, so it is spelled once rather
@@ -1938,7 +2136,17 @@ async def api_models(request: web.Request) -> web.Response:
         try:
             env = {**os.environ}
             env["PATH"] = augmented_path(env.get("PATH", ""))
-            _resolve_ssh_auth_sock(env)
+            # OFF the loop: the resolver globs /tmp/ssh-*/agent.* and stats
+            # every hit, so its latency scales with the /tmp entry count. Its
+            # sibling wrapper's contract states it must never run on the event
+            # loop, and this endpoint is polled every 8s while degraded.
+            await asyncio.to_thread(_resolve_ssh_auth_sock, env)
+            # The Docker entrypoint removes credentials from the long-lived
+            # gateway environment.  This fixed-argv child is the official
+            # kiro-cli and KIRO_API_KEY is its own model credential, so settle
+            # the same single key the interactive ACP spawn receives.  Keep
+            # the protected .env read off the gateway loop.
+            await asyncio.to_thread(inject_kiro_cli_api_key, env)
             env = scrub_agent_subprocess_env(env)
             proc = await create_subprocess_limited(
                 *argv,
@@ -2454,7 +2662,13 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     if project_dir:
         try:
             project_names = await asyncio.get_running_loop().run_in_executor(
-                discovery_executor(), project_agent_names, project_dir
+                discovery_executor(),
+                functools.partial(
+                    project_agent_names,
+                    project_dir,
+                    operation="api_kirocrew_agents",
+                    source="dashboard",
+                ),
             )
         except Exception:
             logger.warning("Failed to list project agents for %s", project_dir, exc_info=True)
@@ -2652,6 +2866,14 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     # filesystem work off the event loop.
     model = await asyncio.to_thread(resolve_effective_model, cfg, agent_name or None)
     bindings = resolve_agent_bindings(cfg, agent_name or None)
+    # Effort resolves through its own chain, served from the SAME resolver the
+    # provider factory calls so the pane cannot disagree with what a session will
+    # actually run at -- including the role-aware default, which a crew bound to a
+    # background worker agent takes instead of the chat default. Keyed on what the
+    # bindings resolved, which is what makes an omitted `agent` answer for the
+    # configured default crew rather than for no crew at all.
+    crew_effort = cfg.crew_pinned_effort(None, bindings.resolved_alias)
+    session_effort = cfg.resolve_session_effort(bindings.kiro_agent, bindings.resolved_alias)
     return web.json_response(
         {
             "model": model,
@@ -2659,8 +2881,84 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
             "kiro_agent": bindings.kiro_agent,
             # Whether the agent itself pins the model, vs inheriting it.
             "pinned": bool(bindings.model),
+            # The effort a new session on this crew starts at, and whether the
+            # crew pinned it or inherited a default. "" means no tier pins one
+            # and the model's own default applies.
+            "reasoning_effort": session_effort,
+            "effort_pinned": bool(crew_effort),
         }
     )
+
+
+def _effort_inputs(crew: KiroCrewAgentConfig | None) -> tuple[str, str] | None:
+    """The crew fields `resolve_session_effort` reads, or ``None`` for no crew.
+
+    Derived from the resolver's inputs rather than enumerated per call site. The
+    chain reads two things off the record -- the pin itself, and the bound
+    ``kiro_agent`` the role default keys on -- and the factory answers from the
+    config it captured, so ANY change to either (including a crew appearing or
+    disappearing) must invalidate that capture. Three rounds of review found the
+    per-condition version incomplete one case at a time (an unpinned crew whose
+    binding makes it a background worker; a re-bound `kiro_agent`); comparing this
+    tuple before and after a write is the invariant those cases are instances of,
+    and a future field the chain starts reading is added here once instead of at
+    every handler.
+    """
+    if crew is None:
+        return None
+    return (crew.kiro_agent, coerce_effort(crew.reasoning_effort))
+
+
+async def _refresh_session_defaults(request: web.Request, crew: str) -> None:
+    """Rebuild the provider factory so a crew's new effort pin reaches new sessions.
+
+    The factory resolves the pin from the config it captured when it was built, so
+    a write alone stays invisible until a restart. That is the same staleness
+    ``api_kirocrew_config_patch`` already handles for ``agent.reasoning_effort``
+    and ``agent.role_efforts.*``, and for the same reason it uses
+    ``refresh_defaults()`` rather than ``reload_provider_factory()``: the factory
+    is rebuilt and the warm pool drained WITHOUT touching live sessions, so an
+    in-flight turn is not killed because a default changed. The pool must drain
+    either way -- a pre-warmed child carries the old effort overlay, and the claim
+    path never re-pushes effort.
+
+    Best-effort: the write is already durable, so a crew save must not fail
+    because the refresh did. A failure costs one gateway lifetime of staleness,
+    which is what the behaviour was before this call existed.
+    """
+    state = request.app.get("state")
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return
+    try:
+        await sessions.refresh_defaults()
+    except Exception:
+        logger.warning(
+            "Could not refresh session defaults after saving crew %r; the pin "
+            "applies from the next gateway start",
+            crew,
+            exc_info=True,
+        )
+
+
+def _crew_effort_rejected(raw: object) -> str | None:
+    """Reason a crew's reasoning-effort pin is unusable, or ``None`` to allow it.
+
+    Rejects rather than coercing, which is the opposite of the config-file load
+    path (:func:`coerce_effort`). The difference is who is watching: a typo in a
+    hand-edited file must not stop the gateway from booting, but a typo sent by
+    the crew form has an author on the other end, and silently storing ``""``
+    would read back as "inherits" and look like the save was lost.
+
+    ``""`` is the inherit sentinel and always allowed -- it is how a pin is
+    cleared.
+    """
+    if not isinstance(raw, str):
+        return "reasoning_effort must be a string"
+    val = raw.strip()
+    if val in EFFORT_VALUES:
+        return None
+    return "reasoning_effort must be one of: " + ", ".join(("(empty)", *EFFORT_LEVELS))
 
 
 def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
@@ -2691,7 +2989,7 @@ def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str 
     # intentionally map away from. Its entitlement guard lives in its own
     # provider path, where full configured ids and bare advertised ids can be
     # canonicalized before comparison.
-    if provider == "claude_code":
+    if is_claude_code(provider):
         return None
 
     # The registry knows each model under several spellings and only one is what
@@ -2802,6 +3100,13 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": "session_color must be #rrggbb or empty", "code": "invalid_color_hex"},
             status=400,
         )
+    _raw_effort = body.get("reasoning_effort", "")
+    effort_reason = _crew_effort_rejected(_raw_effort)
+    if effort_reason:
+        return web.json_response(
+            {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
+        )
+    reasoning_effort = _raw_effort.strip()
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name in cfg.agents:
@@ -2814,12 +3119,19 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             workspace=body.get("workspace", "default"),
             memory_store=body.get("memory_store", "default"),
             model=model,
+            reasoning_effort=reasoning_effort,
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
             session_color=session_color,
         )
         cfg.save()
+    # A crew APPEARING changes what the effort chain resolves even with no pin of
+    # its own: the factory's captured config does not know the crew, so it cannot
+    # read the binding the role default keys on, and a scheduled or messaging
+    # session naming that crew would take the chat default instead. Creation is
+    # therefore always a change by `_effort_inputs` (None -> a tuple).
+    await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.create",
@@ -2847,6 +3159,15 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         )
     if "model" in body:
         pending_model = normalize_agent_model(body["model"])
+    # Rejected before the config is even loaded: the check is pure, and every
+    # validation must land before the first field assignment below so a bad value
+    # cannot leave the in-memory record half-updated.
+    if "reasoning_effort" in body:
+        effort_reason = _crew_effort_rejected(body["reasoning_effort"])
+        if effort_reason:
+            return web.json_response(
+                {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
+            )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name not in cfg.agents:
@@ -2860,6 +3181,8 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     {"error": model_reason, "code": "invalid_model"}, status=400
                 )
         agent = cfg.agents[name]
+        # Captured BEFORE any mutation: what the effort chain reads today.
+        effort_inputs_before = _effort_inputs(agent)
         changed: list[str] = []
         if "kiro_agent" in body:
             agent.kiro_agent = body["kiro_agent"]
@@ -2876,6 +3199,10 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             # str()-coerced — see the create path for why.
             agent.model = normalize_agent_model(body["model"])
             changed.append("model")
+        if "reasoning_effort" in body:
+            # Already validated above; "" is the inherit sentinel and clears a pin.
+            agent.reasoning_effort = body["reasoning_effort"].strip()
+            changed.append("reasoning_effort")
         if "description" in body:
             agent.description = body["description"]
             changed.append("description")
@@ -2898,7 +3225,16 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         if "source" in body:
             agent.source = body["source"]
             changed.append("source")
+        effort_inputs_after = _effort_inputs(agent)
         cfg.save()
+    # Compared, not merely "the body carried the field": the crew form sends
+    # reasoning_effort on every save (that is what makes clearing a pin possible)
+    # and refresh_defaults drains the warm pool, so refreshing on presence would
+    # cost a cold start on every unrelated crew edit. A re-bound kiro_agent counts
+    # too -- the role default reads it. Outside the config lock, because the
+    # refresh takes the session locks.
+    if effort_inputs_after != effort_inputs_before:
+        await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.update",
@@ -2927,6 +3263,10 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
             )
         del cfg.agents[name]
         cfg.save()
+    # A crew DISAPPEARING is the other half of the same invariant: the captured
+    # config still holds the record, so a cron or messaging job still naming the
+    # crew would keep resolving its old pin and binding.
+    await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.delete",

@@ -2,7 +2,9 @@
 
 Session files: ~/.kiro/crew/sessions/{safe_key}.jsonl
 Each entry tracks provenance (source_thread, source_user) for citation.
-Files auto-rotate at 512KB, keeping last 200 lines.
+Appends through ``ConversationLog.append`` auto-rotate at 10MB, keeping up to 200
+lines within that byte cap. The dashboard whole-file save does not rotate, so a
+transcript written only through it is bounded by its message window instead.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ import os
 import re
 import threading
 import time as _time
-from collections.abc import Callable, Container, Iterator
+import uuid
+from collections.abc import Callable, Container, Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,6 +35,7 @@ from kiro_crew.frontmatter import (  # noqa: F401 - facade re-exports
     frontmatter_value,
 )
 from kiro_crew.history_cache import (
+    _METADATA_CACHE_MAX,
     _TRANSCRIPT_CACHE_MAX,
     HistoryCacheCoordinator,
     _FileChangeCacheEntry,
@@ -171,6 +175,7 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "agent",
         "model",
         "reasoning_effort",
+        "autocompact_pct",
         "mode",
         "workspace",
         "project",
@@ -236,7 +241,7 @@ def carry_unowned_metadata(
     return rebuilt
 
 
-_SESSION_MAX_BYTES = 2 * 1024 * 1024  # 2MB
+_SESSION_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 _SESSION_KEEP_LINES = 200
 # Bounded cross-process lock acquisition. The per-session sidecar ``flock`` is
 # acquired on the hot ``append`` path, which some transports (Telegram/WeCom/
@@ -474,6 +479,73 @@ def append_off_loop(
             logger.warning("append_off_loop: offloaded append failed key=%s: %r", key, exc)
 
     loop.run_in_executor(None, _do).add_done_callback(_report)
+
+
+def append_rows_if_absent_off_loop(
+    conversation_log: "ConversationLog",
+    key: str,
+    rows: "Sequence[tuple[str, str, str, str | None]]",
+    *,
+    agent: str | None = None,
+) -> Any:
+    """Persist SEVERAL rows of one turn as one indivisible off-loop write.
+
+    :func:`append_if_absent_off_loop` dispatches each row as its own executor
+    task, so a caller writing a prompt+result PAIR hands two worker threads two
+    independent writes: they can land out of order, and one can fail while the
+    other succeeds. The transcript then replays a run whose rows are reversed or
+    half-present, and no timestamp ordering repairs it because each row's ``ts``
+    is correct on its own.
+
+    This routes the whole group through ONE task holding
+    :meth:`ConversationLog.atomic_appends`, whose contract names this hazard as
+    the companion a multi-append caller needs precisely BECAUSE it moved the
+    write off the loop. ``_locked`` is reentrant per key per thread, so the
+    per-row locks inside ``append_if_absent`` reuse the hold rather than
+    deadlocking on it.
+
+    *rows* is an ordered sequence of ``(role, content, cls, mid)``; they are
+    appended in that order. Each row keeps ``append_if_absent``'s idempotence,
+    so a row the periodic slot save already serialized is skipped individually
+    without dropping its siblings.
+
+    Returns the executor future, or None when the write already happened inline
+    (no running loop). Best-effort like its siblings: a lock timeout or I/O
+    error only skips the durable replay copy the slot already carries.
+    """
+
+    def _do() -> None:
+        with conversation_log.atomic_appends(key):
+            for role, content, cls, mid in rows:
+                conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls, mid=mid)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        try:
+            _do()
+        except Exception:  # noqa: BLE001 - best-effort durable copy
+            logger.warning(
+                "append_rows_if_absent_off_loop: inline append failed key=%s",
+                key,
+                exc_info=True,
+            )
+        return None
+
+    def _report(fut: "asyncio.Future[None]") -> None:
+        exc = fut.exception()
+        if exc is not None:
+            logger.warning(
+                "append_rows_if_absent_off_loop: offloaded append failed key=%s: %r",
+                key,
+                exc,
+            )
+
+    fut = loop.run_in_executor(None, _do)
+    fut.add_done_callback(_report)
+    return fut
 
 
 def append_if_absent_off_loop(
@@ -863,6 +935,35 @@ def metadata_now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+def mint_row_mid() -> str:
+    """Mint a durable per-row delivery identity for a transcript row.
+
+    The ONE place the ``meta.mid`` format is spelled. ``_ChatSlot.append`` mints
+    the id for a row that enters a dashboard window, and the dashboard
+    dual-writers (``cron_inject``, ``workflow_inject``, ``crew_chat``) read it back
+    off that append to stamp their durable copy (``row_mid``). A writer with no
+    slot to mint from -- a channel dispatcher persisting a turn it ran on its own
+    session -- has to mint the id itself, and it must produce the SAME shape,
+    because the readers match on the value, not on who wrote it.
+
+    Why a channel row needs one AT WRITE TIME: the dashboard's merge keys on
+    ``meta.mid`` and nothing else. ``isRedeliveredMessage`` drops a redelivered row
+    by it, ``olderHeadAbovePage`` cuts the retained scrollback head at it, and
+    ``rowIdentities``/``tailNotInPage`` decide by it which prior rows a page already
+    carries -- and every one of those DECLINES rather than guesses when the id is
+    absent or has changed. A row persisted without one is re-minted by each surface
+    that materializes it (``channel_slots._rebuild_window`` /
+    ``refresh_channel_window``), so one logical row carries a different identity on
+    every pass, silently degrading all three at once.
+
+    Random rather than a per-key counter, for the reason ``_ChatSlot.append``
+    gives: a counter rebased after a restore can reissue an id a restored row
+    already holds, and a colliding id makes a client DROP a real message. A
+    random id has no such failure mode.
+    """
+    return f"m-{uuid.uuid4().hex[:16]}"
+
+
 def monotonic_transcript_ts(previous: str | None, now: datetime) -> str:
     """Stamp a transcript row so it sorts strictly AFTER *previous*.
 
@@ -1139,7 +1240,15 @@ class ConversationLog:
         #: invalidation generation and a warm hit requires both fields to
         #: match, so a preserved-mtime metadata edit through another
         #: instance (whose pops cannot reach this cache) still unhits.
-        self._meta_cache: _LRUCache[tuple[float, int, dict]] = _LRUCache(cache_max)
+        #:
+        #: Sized by ``_METADATA_CACHE_MAX``, NOT ``cache_max``: this memo holds one
+        #: parsed first line per session rather than a transcript window, and
+        #: ``list_sessions`` reads it in a whole-directory cyclic scan that an LRU
+        #: smaller than the corpus cannot hit. Same reasoning the search budgets
+        #: already use to decline that knob. Deliberately not overridable: a test
+        #: that needs a small bound assigns ``_meta_cache`` directly rather than
+        #: adding a constructor parameter no product caller uses.
+        self._meta_cache: _LRUCache[tuple[float, int, dict]] = _LRUCache(_METADATA_CACHE_MAX)
         #: Bounded, mtime-keyed LRU of formatted ``recent()`` windows keyed by
         #: (key, max_messages, roles). The tail-read fast path intentionally
         #: never warms ``_msg_cache`` (it returns a partial view), so a session
@@ -2664,5 +2773,5 @@ class ConversationLog:
     def _rewrite_session_locked(self, key: str, messages: list[dict]) -> None:
         self._rewrite_coordinator._rewrite_session_locked(key, messages)
 
-    def _maybe_rotate(self, path: Path, key: str, *, max_drop: int | None = None) -> int:
-        return self._rewrite_coordinator._maybe_rotate(path, key, max_drop=max_drop)
+    def _maybe_rotate(self, path: Path, key: str) -> None:
+        self._rewrite_coordinator._maybe_rotate(path, key)

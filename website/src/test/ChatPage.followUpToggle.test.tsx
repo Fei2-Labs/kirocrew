@@ -303,4 +303,22 @@ describe('ChatPage plan follow-ups (issue #5893 parity)', () => {
     expect(composer().value).toBe('Approve it')
     expect(api.planAction).not.toHaveBeenCalled()
   })
+
+  it('double-click on a plan chip dispatches the plan action, never sendChat (issue #6240)', async () => {
+    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go', 'chat-plan-dbl')
+    fireEvent.doubleClick(chip('Go'))
+    await waitFor(() => expect(api.planAction).toHaveBeenCalledTimes(1))
+    expect(api.planAction).toHaveBeenCalledWith('chat-plan-dbl', 'Go')
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
+
+  it('Send now on a plan chip dispatches the plan action, never sendChat (issue #6240)', async () => {
+    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go', 'chat-plan-sendnow')
+    fireEvent.click(screen.getByRole('button', { name: 'Send now: Go All' }))
+    await waitFor(() => expect(api.planAction).toHaveBeenCalledTimes(1))
+    expect(api.planAction).toHaveBeenCalledWith('chat-plan-sendnow', 'Go All')
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
 })

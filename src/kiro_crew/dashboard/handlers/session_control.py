@@ -129,6 +129,7 @@ async def api_session_control_create(request: web.Request) -> web.Response:
             caller_session_key=_read_session_key(request),
             title=str(body.get("title") or ""),
             agent=str(body.get("agent") or ""),
+            folder_id=str(body.get("folder_id") or ""),
         )
     except sc.SessionControlError as exc:
         return _refusal(exc)

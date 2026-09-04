@@ -13,8 +13,10 @@ lightweight background work (heartbeat, lesson extraction).  It
 stays alive between uses, serialized by the per-session semaphore.
 
 At >= ``cfg.session.autocompact_pct`` context usage, fires a background
-compaction task. Both backends compact **in place** so the session — and
-any queued or agentic work on it — continues without a user nudge:
+compaction task. A backend that can serve ``/compact`` compacts **in
+place** so the session — and any queued or agentic work on it —
+continues without a user nudge; one that cannot is declined before any
+dispatch:
 
 * **kiro-cli:** run ``/compact`` in place under the session semaphore
   (native command execute + ``_kiro.dev/compaction/status`` wait). The
@@ -29,6 +31,13 @@ any queued or agentic work on it — continues without a user nudge:
   semaphore. The SDK preserves the same session ID across the
   compact_boundary; the session keeps its summary and continues without
   a recycle.
+* **KAS:** nothing is dispatched. KAS treats the ``/compact`` prompt as
+  ordinary text and never answers it with a compaction status, so the
+  gate declines (``compact_unsupported``) before the compaction task is
+  scheduled: an ungated dispatch stranded the wait for the full budget
+  while holding the semaphore and then recycled the session (#7812). KAS
+  summarizes on its own initiative, the same way ``cc_managed`` leaves
+  Claude-Code sessions to compact themselves.
 
 A failed compact records a per-key cooldown so a broken /compact does
 not fire on every subsequent turn. The compact callback fires on both
@@ -93,7 +102,6 @@ if TYPE_CHECKING:
 from kiro_crew import model_registry, platform_compat, shutdown_event
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp.types import (
-    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ACP_RUNTIME,
     PROVIDER_LABEL_CLAUDE,
@@ -103,8 +111,11 @@ from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk import backend_uses_registry_model_ids
+from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     CONTEXT_WARN_MARGIN_PCT,
     POOL_SIZE_MAX,
     build_provider_factory,
@@ -133,6 +144,9 @@ from kiro_crew.session_allocation import (
     AllocationConstants,
     AllocationDeps,
     SessionAllocationService,
+)
+from kiro_crew.session_allocation import SessionBusyError as SessionBusyError  # noqa: F401
+from kiro_crew.session_allocation import (
     SessionClosingError,
     SessionRegistryState,
 )
@@ -194,28 +208,35 @@ from kiro_crew.stats import Stats
 from kiro_crew.watchdog import CleanupHook, SessionWatchdog
 
 # The standalone ClaudeCodeProvider was removed in the KiroACP-only refactor;
-# the public core ships kiro-cli (ACP) only. The name is kept (always None) so
-# the legacy ``ClaudeCodeProvider is not None and isinstance(...)`` guards below
-# short-circuit cleanly. The claude-agent-acp seam survives via
-# ``_is_claude_backend`` (the internal companion re-registers Claude Code).
+# Claude Code is now driven through the ACP adapter instead. The name is kept
+# (always None) so the legacy ``ClaudeCodeProvider is not None and
+# isinstance(...)`` guards below short-circuit cleanly. The live path is
+# ``_is_claude_backend``, on a harness the public build ships as selectable.
 ClaudeCodeProvider = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
 
 def _is_claude_backend(provider: Any) -> bool:
-    """Check if a provider drives the claude-agent-acp seam via the ACP adapter.
+    """Check if a provider drives claude-agent-acp via the ACP adapter.
 
-    Returns True when an AcpProvider wraps claude-agent-acp (backend="claude").
-    Dormant in the public core (the factory never selects it); the internal
-    companion re-registers the Claude Code provider over this same seam.
+    Returns True when an AcpProvider wraps claude-agent-acp (backend="claude"),
+    which the public build offers: ``BASELINE_SELECTABLE_BACKENDS`` includes it, so
+    the factory selects it whenever an operator has chosen it and the adapter is
+    installed.
+
+    The ``isinstance`` gate and the backend-string read stay here -- they are
+    what makes this predicate mock-safe, and the shape they read is the
+    provider's own business. Only the comparison is delegated to
+    ``agent_sdk.backend_identity``, so this and ``AcpProvider.is_claude_backend``
+    cannot disagree about which string counts as the claude backend.
     """
     from kiro_crew.providers.acp import AcpProvider  # circular import: providers -> session
 
     if not isinstance(provider, AcpProvider):
         return False
     backend = getattr(provider.client, "backend", "")
-    return backend == ACP_BACKEND_CLAUDE
+    return is_claude_backend_name(backend)
 
 
 def _provider_label(provider: Any) -> str:
@@ -1075,6 +1096,7 @@ class SessionManager:
                 drain_active_turns_timeout_secs=_DRAIN_ACTIVE_TURNS_TIMEOUT_SECS,
                 unbind_reason_session_destroyed=UNBIND_REASON_SESSION_DESTROYED,
                 first_turn_nothing_armed=FirstTurnState.NOTHING_ARMED,
+                provider_label_claude=PROVIDER_LABEL_CLAUDE,
             ),
             get_unlink_session_queue=lambda: _unlink_session_queue,
             get_child_process_helpers=lambda: _load_child_process_helpers(),
@@ -1767,9 +1789,19 @@ class SessionManager:
             parent_session_key, agent=agent, cwd=cwd
         )
 
-    async def _reacquire_and_validate(self, key: str, sess: "_Session") -> bool:
+    async def _reacquire_and_validate(
+        self,
+        key: str,
+        sess: "_Session",
+        *,
+        wait_if_busy: bool = True,
+    ) -> bool:
         """Acquire outside the registry lock and revalidate identity."""
-        return await self._allocation_boundary()._reacquire_and_validate(key, sess)
+        return await self._allocation_boundary()._reacquire_and_validate(
+            key,
+            sess,
+            wait_if_busy=wait_if_busy,
+        )
 
     async def _evict_stale_session(self, key: str, sess: "_Session") -> None:
         """Evict and close the exact stale session."""
@@ -2002,6 +2034,7 @@ class SessionManager:
         extra_env: dict[str, str] | None = None,
         speculative: bool = False,
         speculative_resume: bool = False,
+        wait_if_busy: bool = True,
         _won_race_retries: int = 0,
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
@@ -2016,6 +2049,7 @@ class SessionManager:
             extra_env=extra_env,
             speculative=speculative,
             speculative_resume=speculative_resume,
+            wait_if_busy=wait_if_busy,
             _won_race_retries=_won_race_retries,
             **extra_factory_kwargs,
         )
@@ -2039,6 +2073,37 @@ class SessionManager:
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:
         """Delegate context accounting and compaction triggering."""
         return self._compaction.check_context_usage(key, provider)
+
+    def set_autocompact_pct(self, key: str, pct: float | None) -> None:
+        """Set or clear (``None``) *key*'s per-session compaction threshold.
+
+        Values clamp into the documented ``AUTOCOMPACT_PCT_MIN``–``MAX`` range,
+        the same guarantee the config loader gives the global knob: an
+        out-of-range override (e.g. from a hand-edited persistence file) must
+        degrade to the nearest firing value, never silently disable the
+        backstop. The override is keyed independently of live-session
+        membership, so it survives resets and recycles; callers that persist it
+        (the dashboard slot) re-seed it after a gateway restart.
+        """
+        if pct is not None:
+            if pct != pct:  # NaN: comparisons below would both be False
+                return
+            try:
+                pct = min(max(float(pct), AUTOCOMPACT_PCT_MIN), AUTOCOMPACT_PCT_MAX)
+            except OverflowError:
+                # An int too large for a float; ignore like NaN.
+                return
+        self._compaction.set_autocompact_pct(key, pct)
+
+    def drop_autocompact_overrides_matching(
+        self, exact_keys: set[str], folded_keys: set[str], fold: Callable[[str], str]
+    ) -> int:
+        """Drop threshold overrides for permanently deleted, slotless sessions.
+
+        The slotless complement of ``destroy()``'s override clear — see the
+        coordinator method for the matching contract.
+        """
+        return self._compaction.drop_autocompact_overrides_matching(exact_keys, folded_keys, fold)
 
     async def compact_if_needed(self, key: str) -> str:
         """Delegate awaited between-turn compaction."""
@@ -2588,6 +2653,10 @@ class SessionManager:
     async def drain_warm_pool(self) -> list:
         """Remove and return all queued warm providers."""
         return await self._pool.drain_warm_pool()
+
+    def warm_providers(self) -> list[LLMProvider]:
+        """Snapshot the queued warm providers without consuming them."""
+        return self._pool.warm_providers()
 
     # ── Idle cleanup ──
 

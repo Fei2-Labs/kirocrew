@@ -120,7 +120,8 @@ Current status:
   that import closure beside its sources. Windows consumes those caches directly,
   avoiding the thousand-file cache-population burst that otherwise overlaps
   Defender's post-install scanning. macOS and Linux still redirect bytecode out
-  of the signed/read-only app tree. The loading screen retains its extended
+  of the signed/read-only app tree, and the `-I` isolated helpers that ignore that
+  redirect carry `-B` instead. The loading screen retains its extended
   Windows handoff window as a slow-machine fallback; a child exit or spawn error
   still fails immediately and includes the launch-log cause. CI starts the
   just-installed bundled interpreter against an isolated data home and requires
@@ -135,7 +136,7 @@ The source install below remains the fully supported path.
 |------|-----|--------|
 | **Git for Windows** | clone the repo | https://git-scm.com/download/win |
 | **kiro-cli** | the agent backend (ACP); the first dashboard launch can install it | Kiro Crew setup page or kiro-cli's native Windows release |
-| **Python 3.10-3.13** | the venv runtime. `python_requires` is `>=3.10` and 3.13 is in the supported range, but **3.12 is the tested Windows runtime** (it is what the Windows CI shard runs, and numpy 1.x ships no 3.13 Windows wheel) | https://python.org (install user-scoped), or `winget install Python.Python.3.12` |
+| **Python 3.12-3.13** | the venv runtime. `python_requires` is `>=3.12` and 3.13 is in the supported range, but **3.12 is the tested Windows runtime** (it is what the Windows CI shard runs, and numpy 1.x ships no 3.13 Windows wheel) | https://python.org (install user-scoped), or `winget install Python.Python.3.12` |
 | **Node.js** (optional) | builds the full React dashboard; without it the gateway serves the prebuilt bundle | `winget install OpenJS.NodeJS.LTS` |
 
 No admin is required — everything installs user-scoped under `%USERPROFILE%`.
@@ -219,9 +220,14 @@ that dir is appended to the MCP spawn `PATH` automatically
 `python -m kiro_crew <sub>` when the `kirocrew.exe` wrapper isn't resolvable.
 In the desktop bundle the relocatable `bin\kirocrew.cmd` shim is preferred
 over `Scripts\kirocrew.exe` (whose embedded interpreter path names the build
-machine) and is unwrapped to `<root>\python.exe -B -P -s -m kiro_crew <sub>` when
-spawned. `-B` keeps runtime bytecode out of the signed bundle even after managed
-MCP environment scrubbing removes `PYTHONPYCACHEPREFIX`.
+machine) and is unwrapped to `<root>\python.exe -P -s -m kiro_crew <sub>` when
+spawned. No `-B`: this child INHERITS the gateway env, and on a packaged Windows
+bundle `gatewayBytecodeEnvironment` sets `PYTHONPYCACHEPREFIX=""` on purpose so
+CPython consumes the build-time caches `packaging/precompile_windows.py` ships
+beside the bundled modules; an interpreter flag here would defeat them. `-B` is
+retained only where the prefix provably cannot reach the child — every `-I`
+isolated spawn, which ignores `PYTHON*` entirely (`.fork-sync.yml`
+`signed-bundle-bytecode-floor`, `status: scoped`).
 
 ## Kiro sandbox delegation and the unsandboxed-exec opt-in
 

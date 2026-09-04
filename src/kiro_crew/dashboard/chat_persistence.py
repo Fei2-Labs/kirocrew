@@ -20,6 +20,8 @@ from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import agent_model_map
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     CHAT_ENTRY_CACHE_BYTES_DEFAULT,
     CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
     KiroCrewConfig,
@@ -217,6 +219,32 @@ def _validate_reasoning_effort(raw: object) -> str:
     if raw:
         logger.warning("Discarding invalid persisted reasoning_effort: %r", raw)
     return ""
+
+
+def _validate_autocompact_pct(raw: object) -> float | None:
+    """Return *raw* as a threshold percent within the documented range, else None.
+
+    Restore-path twin of the endpoint validation: a tampered or corrupted
+    metadata file must not seed an override that can never fire (over the max)
+    or that thrashes compaction (under the min). Out-of-range finite values
+    clamp — matching how the loader treats the global knob — while
+    non-numeric/NaN values are discarded.
+    """
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            value = float(raw)
+        except OverflowError:
+            # An int too large for a float; a corrupted metadata file must not
+            # abort the restore path.
+            logger.warning("Discarding oversized persisted autocompact_pct")
+            return None
+        if value != value:  # NaN
+            logger.warning("Discarding NaN persisted autocompact_pct")
+            return None
+        return min(max(value, AUTOCOMPACT_PCT_MIN), AUTOCOMPACT_PCT_MAX)
+    if raw is not None:
+        logger.warning("Discarding invalid persisted autocompact_pct: %r", raw)
+    return None
 
 
 def save_all_slots_to_history(state: DashboardState) -> None:
@@ -902,6 +930,9 @@ def _rehydrate_slot_from_history(
         # recognize a file recreated by another writer after a permanent
         # delete (delete-won guard).
         slot._disk_meta_created_at = str(meta.get("created_at") or "")
+        # Legacy metadata has no ``created_at``: record the observation
+        # itself so the guard's missing-file witness still fires for it.
+        slot._disk_meta_observed = bool(meta)
         # Member keys keep the binding-derived agent/mode: transcript metadata
         # is the operator-editable file the pin must not re-derive from.
         if meta.get("agent") and _member_identity is None:
@@ -926,12 +957,20 @@ def _rehydrate_slot_from_history(
                 )
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+        if meta.get("autocompact_pct") is not None:
+            slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if meta.get("workspace"):
             slot.workspace = meta["workspace"]
         if meta.get("project"):
             slot.project = meta["project"]
         if meta.get("mode") and _member_identity is None:
             slot.mode = meta["mode"]
+        if meta.get("created_by"):
+            # Creator attribution restored so the member ownership boundary in
+            # session-control authorization survives a restart: without it every
+            # worker a member dispatched would come back unowned and the
+            # fail-closed `not_creator` check would strand them.
+            slot._created_by = str(meta["created_by"])
         if meta.get("folder_id"):
             slot.folder_id = meta["folder_id"]
         if meta.get("channel_folder_filed"):
@@ -985,6 +1024,13 @@ def _rehydrate_slot_from_history(
             # Skipped, the slot would answer from a dashboard-only session and the
             # channel thread would stop seeing its replies.
             slot.linked_session_key = str(meta["linked_session_key"])
+        # Re-seed the live compaction threshold. The SessionManager's override
+        # map is process-local, so a rehydrated slot must push its persisted
+        # value back or the session silently compacts at the global threshold.
+        # After the link assignment above, so a channel-born slot seeds the
+        # session its turns actually run on.
+        if slot.autocompact_pct is not None and state.sessions:
+            state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
         # Restore the persisted tab_id so cross-restart fork chaining survives.
         # get_or_create_slot (called by our caller) assigns a fresh random uuid to
         # slot._tab_id; if we don't overwrite it here, the next _flush_dirty_slots
@@ -1098,6 +1144,7 @@ def _rehydrate_slot_from_history(
                 # (chat_utils._prepare_messages), which is the only path that returns
                 # meta to a client.
                 meta=(m["meta"] if isinstance(m.get("meta"), dict) else None),
+                mint_mid=False,
             )
             # Provenance is not a slot.append() argument, so carry it onto the
             # message the append just created. Without this the window loses where
@@ -1372,6 +1419,9 @@ def _apply_recent_session(
     # recognize a file recreated by another writer after a permanent delete
     # (delete-won guard).
     slot._disk_meta_created_at = str(meta.get("created_at") or "")
+    # Legacy metadata has no ``created_at``: record the observation itself so
+    # the guard's missing-file witness still fires for it.
+    slot._disk_meta_observed = bool(meta)
     # Member keys keep the binding-derived agent/mode: transcript metadata is
     # the operator-editable file the pin must not re-derive from.
     if meta.get("agent") and _member_identity is None:
@@ -1393,12 +1443,20 @@ def _apply_recent_session(
             logger.debug("Failed to resolve model for restored slot %s", slot_name, exc_info=True)
     if meta.get("reasoning_effort"):
         slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+    if meta.get("autocompact_pct") is not None:
+        slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
     if meta.get("project"):
         slot.project = meta["project"]
     if meta.get("mode") and _member_identity is None:
         slot.mode = meta["mode"]
+    if meta.get("created_by"):
+        # Same rehydration as _rehydrate_slot_from_history: without it a
+        # member-created worker restored through the recent-session path
+        # loses its creator binding and authorize_target refuses the
+        # legitimate member with not_creator.
+        slot._created_by = str(meta["created_by"])
     if meta.get("folder_id"):
         slot.folder_id = meta["folder_id"]
     if meta.get("channel_folder_filed"):
@@ -1458,6 +1516,9 @@ def _apply_recent_session(
         real_key = state.sessions.channel_key_for_stem(key)
         if real_key:
             slot.linked_session_key = real_key
+    # Re-seed the live compaction threshold (see _rehydrate_slot_from_history).
+    if slot.autocompact_pct is not None and state.sessions:
+        state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
     tab_id = meta.get("tab_id")
     if not tab_id:
         tab_id = uuid.uuid4().hex[:12]
@@ -1493,6 +1554,7 @@ def _apply_recent_session(
             ts=m.get("ts", ""),
             broadcast=False,
             meta=(m["meta"] if isinstance(m.get("meta"), dict) else None),
+            mint_mid=False,
         )
         # See the equivalent call in _rehydrate_slot_from_history.
         carry_provenance(slot.messages[-1], m)
@@ -2419,6 +2481,7 @@ def _save_slot_to_history(
     closed_at: float | None = None,
     force: bool = False,
     rewrite: bool = False,
+    expected_history_key: str | None = None,
 ) -> bool:
     """Persist slot messages to JSONL history (append-safe).
 
@@ -2510,6 +2573,20 @@ def _save_slot_to_history(
         history_key = slot_history_key(slot)
         if getattr(slot, "linked_session_key", "") == routing:
             break
+    if expected_history_key is not None and history_key != expected_history_key:
+        # The caller authorized a write against a specific transcript and the
+        # slot's routing moved before this snapshot (a rebind on the event
+        # loop wins any race with this worker). Writing would land the
+        # caller's mutation on a transcript it never authorized -- refuse the
+        # whole save instead, exactly like the delete-won guard: return False
+        # with nothing written, and let the caller roll back and re-decide.
+        logger.warning(
+            "Slot %s save refused: routing moved from %s to %s during the write",
+            slot.key,
+            expected_history_key,
+            history_key,
+        )
+        return False
     kept = [m for m in window if not _note_authorized_elsewhere(m.get("meta"), note_auth_key)]
     dropped_notes = len(window) - len(kept)
     window = kept
@@ -2540,6 +2617,165 @@ def _save_slot_to_history(
             note_auth_key,
         )
     if not window:
+        if force or closed:
+            # A FORCED (or closing) save of a message-less slot is a metadata
+            # mutation (folder filing/unfiling, a tag assignment, a pin, a
+            # pinned title, a mode switch, a close) -- the full save below has no window to
+            # write, but the mutation still has to reach disk. This became
+            # reachable when `session_create` started persisting `folder_id`
+            # at birth (#6118): an empty newborn HAS a metadata line, so any
+            # acknowledged metadata change before its first message must
+            # overwrite that line, or a restart resurrects the birth state the
+            # user already changed. The merge carries every slot-owned field a
+            # force/closed save is responsible for -- not just `folder_id`:
+            # the tag routes, the pin route, the recreate PATCH (folder or
+            # pinned title) and the close path all persist ONLY through this
+            # save, so a folder-only merge would silently drop their
+            # acknowledged writes on restart. Merged ONLY into an existing
+            # line: a slot with no line at all does not survive a restart, so
+            # there is nothing to reconcile, and materializing files for every
+            # empty tab here would create transcripts nothing else expects.
+            # The existence guard runs INSIDE the same cross-process lock as
+            # the merge (`update_metadata_if`): the plain update is an upsert,
+            # so a checked-then-written pair would let a permanent deletion
+            # land between the two and be resurrected as a fresh file.
+            # Clearable fields are written even when empty -- the merge cannot
+            # delete a key, and rehydrate treats a falsy value as cleared
+            # (unfiled / untagged / unpinned / untitled / default mode). Fails
+            # closed on an unreadable record, per `update_metadata_if`'s own
+            # contract.
+            def _fresh_fields() -> dict:
+                # Mirrors the FULL save's slot-owned enumeration (the
+                # ``meta_line`` construction below), so a forced save of an
+                # empty slot persists exactly what a forced save of a
+                # non-empty slot would persist for the metadata line -- the
+                # invariant that keeps this branch from silently dropping
+                # whichever acknowledged mutation a route happens to persist
+                # through it (folder, tags, pin, title, mode, project,
+                # artifact binding, ...). Two write classes, matching
+                # rehydrate's semantics:
+                # - CLEARABLE fields are written even when empty (the merge
+                #   cannot delete a key; rehydrate treats a falsy value as
+                #   cleared: unfiled / untagged / unpinned / untitled /
+                #   default mode / unbound artifact / uncolored).
+                # - IDENTITY and MONOTONIC fields are written only when
+                #   truthy, exactly like the full save (origin's fail-closed
+                #   sentinel and the once-flags must never be erased by a
+                #   writer that has not learned them).
+                fields: dict = {
+                    "folder_id": slot.folder_id or "",
+                    "tags": list(slot.tags),
+                    "pinned": bool(slot.pinned),
+                    "mode": slot.mode or "",
+                    "artifact": slot._artifact or "",
+                    "reasoning_effort": slot.reasoning_effort or "",
+                    "color_index": slot.color_index,
+                    "color_hex": slot.color_hex or "",
+                    "color_theme": slot.color_theme or "",
+                    "memory_mode": slot.memory_mode,
+                    "model": slot.model,
+                    # None means "follow the global threshold" and is the
+                    # cleared value (rehydrate reads it with ``is not None``),
+                    # so the override is CLEARABLE: written even when None,
+                    # like the other clearable fields above.
+                    "autocompact_pct": slot.autocompact_pct,
+                }
+                if slot.title and slot.title != slot.key:
+                    fields["title"] = slot.title
+                    # Persist the title's provenance next to it (mirrors the
+                    # full save): without it rehydration conservatively
+                    # re-classifies an auto title as "user" and locks the
+                    # refresh out.
+                    _origin = getattr(slot, "_title_origin", "")
+                    if _origin:
+                        fields["title_origin"] = _origin
+                    _mark = getattr(slot, "_title_refresh_mark", 0)
+                    if _mark:
+                        fields["title_refresh_mark"] = _mark
+                else:
+                    fields["title"] = ""
+                if slot.agent:
+                    fields["agent"] = slot.agent
+                if slot.workspace:
+                    fields["workspace"] = slot.workspace
+                if slot.project:
+                    fields["project"] = slot.project
+                if slot._app:
+                    fields["app"] = slot._app
+                if slot._origin:
+                    fields["origin"] = slot._origin
+                if getattr(slot, "_created_by", ""):
+                    # Creator attribution: the member ownership boundary in
+                    # session-control authorization reads it, so dropping it here
+                    # would orphan a member's workers on the next restart.
+                    fields["created_by"] = slot._created_by
+                if slot.linked_session_key:
+                    fields["linked_session_key"] = slot.linked_session_key
+                if getattr(slot, "channel_origin", False):
+                    fields["channel_origin"] = True
+                if slot.forked_from is not None:
+                    fields["forked_from"] = slot.forked_from
+                if getattr(slot, "_tab_id", None):
+                    fields["tab_id"] = slot._tab_id
+                if getattr(slot, "_auto_tagged", False):
+                    # Once-flag, monotonic (see the full save): written when
+                    # set, never cleared.
+                    fields["auto_tagged"] = True
+                if getattr(slot, "_human_seen", False):
+                    fields["human_seen"] = True
+                if slot._channel_folder_filed:
+                    # Sticky like the full save; the disk-carry half is
+                    # inherent here since a merge never deletes a key.
+                    fields["channel_folder_filed"] = True
+                if closed:
+                    # Without this a closed empty newborn's line stays
+                    # open-shaped and the next restart resurrects a tab the
+                    # user dismissed.
+                    fields["closed"] = True
+                    fields["closed_at"] = closed_at if closed_at is not None else time.time()
+                return fields
+
+            # The slot fields are read INSIDE the guard, which
+            # `update_metadata_if` evaluates under the cross-process lock at
+            # write time -- exactly the contract that method exists for ("the
+            # decision is re-made here rather than trusted from before the
+            # lock"). A dict snapshotted before the lock could commit out of
+            # order: a tag save that snapshotted `pinned=False` before a
+            # concurrent pin request committed `pinned=True` would land its
+            # stale aggregate second and silently revert the acknowledged pin.
+            # The full save has the same shape -- it builds its metadata line
+            # from slot state inside the locked block -- so whichever writer
+            # commits last writes the newest slot state.
+            merged_fields: dict = {}
+            guard_state = {"ran": False}
+
+            def _refresh_under_lock(meta: dict) -> bool:
+                guard_state["ran"] = True
+                if not meta:
+                    return False
+                merged_fields.clear()
+                merged_fields.update(_fresh_fields())
+                return True
+
+            applied = state.conversation_log.update_metadata_if(
+                history_key,
+                merged_fields,
+                _refresh_under_lock,
+            )
+            if not applied and not guard_state["ran"]:
+                # `update_metadata_if` fails CLOSED on an unreadable record
+                # WITHOUT invoking the guard -- that is a failed write, not the
+                # by-design skip for a line-less tab (where the guard runs and
+                # sees an empty record). Returning True here would report a
+                # merge that never happened as durable: a close would remove
+                # the tab while the on-disk line stays open-shaped and the
+                # next restart resurrects it. Raise instead, matching the save
+                # contract: best-effort callers log + mark the slot dirty, and
+                # archival callers (close, best_effort=False) roll back and
+                # keep the slot.
+                raise OSError(
+                    f"empty-window metadata merge skipped: record unreadable for {history_key}"
+                )
         return True
     # Skip a pure no-op: a freshly resumed slot with no new AND no edited
     # messages. ``slot._dirty`` is set by both append and in-place edits
@@ -2621,7 +2857,13 @@ def _save_slot_to_history(
             # all-zero counters while its delete must still win against the
             # save of its first message.
             _known = slot._disk_meta_created_at
-            if _known:
+            # ``created_at`` is the identity, but legacy metadata carries none
+            # — the observation BIT is the evidence there, so a save racing a
+            # permanent delete cannot recreate a legacy transcript through the
+            # "no identity recorded" gap. The missing-file witness needs only
+            # the observation; the identity COMPARISON below still needs the
+            # recorded ``created_at``.
+            if _known or slot._disk_meta_observed:
                 try:
                     path.stat()
                 except FileNotFoundError:
@@ -2642,7 +2884,8 @@ def _save_slot_to_history(
                     # retries once the transient read failure clears, instead
                     # of the delete-won path discarding the content. A
                     # readable-but-absent ``created_at`` (legacy meta) fails
-                    # open to the pre-guard behavior.
+                    # open for an EXISTING file only — a missing file is the
+                    # legacy delete witness via the observation bit above.
                     if not _meta_readable:
                         raise OSError(
                             f"history metadata for {history_key} is transiently "
@@ -2650,7 +2893,14 @@ def _save_slot_to_history(
                             "before writing — save deferred for retry"
                         )
                     _current = str(existing_meta.get("created_at") or "")
-                    if _current and _current != _known:
+                    # Compare identities only when one was RECORDED: a legacy
+                    # observation (``_known`` empty) cannot distinguish "the
+                    # same legacy file, stamped with a ``created_at`` by a
+                    # sibling's save since" from "a fresh incarnation born
+                    # after a delete" — fail open for the existing file,
+                    # matching the documented legacy behavior above. The
+                    # missing-file witness is the legacy delete evidence.
+                    if _known and _current and _current != _known:
                         _delete_won = True
             if _delete_won:
                 # WARNING, with the slot key: for a slot the delete's cleanup
@@ -2720,6 +2970,9 @@ def _save_slot_to_history(
             meta_line["model"] = slot.model
             if slot.reasoning_effort:
                 meta_line["reasoning_effort"] = slot.reasoning_effort
+            # Unconditional, matching the empty-window merge mirror: None is
+            # the cleared "follow the global" value, not an absent field.
+            meta_line["autocompact_pct"] = slot.autocompact_pct
             if slot.mode:
                 meta_line["mode"] = slot.mode
             if slot.workspace and slot.workspace != "default":
@@ -2747,6 +3000,10 @@ def _save_slot_to_history(
             # slot would lose the CRON tag that keeps it out of ``slots:user``.
             if slot._origin:
                 meta_line["origin"] = slot._origin
+            if getattr(slot, "_created_by", ""):
+                # Creator attribution — read by the member ownership boundary in
+                # session-control authorization; see the partial-save mirror above.
+                meta_line["created_by"] = slot._created_by
             # Artifact companion binding — persisted so a bound
             # session restored after a gateway restart (or resumed from the
             # History page) comes back as the artifact's active bound session.
@@ -2961,69 +3218,11 @@ def _save_slot_to_history(
             # from ``existing_meta`` when present), so the delete-won guard can
             # recognize a file recreated by another writer after a permanent
             # delete on the NEXT save.
-            #
-            # Read before the rotation below, but valid after it either way:
-            # rotation rewrites the meta line to stamp ``rotated_at`` and
-            # preserves every other field, so ``created_at`` — the only field
-            # this identity depends on — survives a rotation unchanged.
             slot._disk_meta_created_at = str(meta_line.get("created_at") or "")
-            # Enforce the session byte cap on THIS path too, against the FROZEN
-            # PREFIX. ``_maybe_rotate`` used to have exactly one caller
-            # (``ConversationLog.append``), so a transcript written only through
-            # this whole-file save was never size-checked while the documented cap
-            # said otherwise. The prefix is also the part that actually grows
-            # without bound: the live window is capped at ``_MAX_SLOT_MESSAGES``,
-            # so every byte a long session accumulates beyond that lands in the
-            # prefix, and the prefix is what this save re-emits verbatim forever.
-            #
-            # ``max_drop`` is the whole reason this call is safe. This save writes
-            # ``meta + frozen_prefix + serialize(window)``, so a line rotation
-            # drops from the WINDOW region is one the slot still holds in
-            # ``slot.messages`` — the next save re-emits it, rotation drops it
-            # again, and the two churn forever. Measured on the unbounded call at
-            # 30 x 100 KB with no frozen prefix: rotation dropped 10 window rows,
-            # and each of the next 5 ordinary saves resurrected and re-dropped the
-            # same 10 (5 rotations, 50 re-archived lines). Capping the drop at the
-            # prefix leaves the window's head as the file's first message line,
-            # which is the only state the frozen-prefix + window model can
-            # express; there is no representable state with a hole at the front of
-            # the window.
-            #
-            # Deliberately NOT closed by trimming ``slot.messages`` instead: this
-            # runs in the flush executor thread (see the snapshot rationale at the
-            # top of this function), where every other window mutation in the
-            # dashboard is loop-only, and it would delete messages out from under
-            # an open tab. The cost of the cap is that a session whose entire
-            # transcript is still its live window stays oversized until the memory
-            # trim gives it a prefix, or until an ``append`` writer rotates it
-            # uncapped. Oversized is recoverable; churn and lost rows are not.
-            #
-            # The ceiling is counted off the prefix bytes actually written, not
-            # ``disk_older``: on a short/truncated file the prefix carries fewer
-            # lines than the counter claims, and ``count("\n")`` is the count that
-            # matches how rotation will re-split the file.
-            #
-            # Called INSIDE ``_locked`` and after the mtime restore, so rotation
-            # cannot race another writer and cannot resurrect an mtime the close
-            # path deliberately rewound.
-            dropped = state.conversation_log._maybe_rotate(
-                path, history_key, max_drop=frozen_prefix.count("\n")
-            )
-            if dropped:
-                # Rotation removed leading messages, which moves the frozen-prefix
-                # boundary this slot is holding. Reconcile it: without this, every
-                # later save rebuilds its payload from ``body[:disk_older]`` — a
-                # floor that no longer exists — RESURRECTING the dropped messages,
-                # which rotation then drops again.
-                #
-                # A plain subtraction, because ``max_drop`` above guarantees
-                # ``dropped`` came entirely from the prefix. ``_disk_window_len``
-                # is deliberately left alone: it is a PREFIX length over the
-                # window ("``messages[:n]`` are on disk"), so there is no value it
-                # could take to describe a window whose head is missing from disk —
-                # which is exactly why rotation is not allowed to create that
-                # state.
-                slot._disk_older_count = max(0, slot._disk_older_count - dropped)
+            # A committed save is a direct observation of the file this slot
+            # writes — even when the carried-forward metadata is legacy and
+            # has no ``created_at`` for the identity string above.
+            slot._disk_meta_observed = True
             # Record the post-write mtime in the frozen-prefix cache (even when
             # there is no frozen prefix, ``disk_older == 0``). The cache doubles
             # as the "did another process touch this file since we last wrote
@@ -3036,28 +3235,17 @@ def _save_slot_to_history(
             # the on-disk window region (after the frozen prefix), and because
             # ``disk_older`` is unchanged a bare frozen+window rebuild on the next
             # save would otherwise silently delete them.
-            #
-            # After a rotation the cached tuple would be stale on the two fields
-            # that matter: ``disk_older`` and ``frozen_prefix`` describe the
-            # pre-rotation file. Caching it is worse than caching nothing,
-            # because the next save trusts the cache instead of re-reading and so
-            # re-emits the dropped rows. Drop the cache and let that save pay one
-            # O(file) re-read against the reconciled counts above; rotation is
-            # rare, so this costs nothing on the steady path.
-            if dropped:
+            try:
+                _st = path.stat()
+                slot._frozen_prefix_cache = (
+                    _st.st_mtime,
+                    _st.st_size,
+                    disk_older,
+                    frozen_prefix,
+                    foreign_lines,
+                )
+            except OSError:
                 slot._frozen_prefix_cache = None
-            else:
-                try:
-                    _st = path.stat()
-                    slot._frozen_prefix_cache = (
-                        _st.st_mtime,
-                        _st.st_size,
-                        disk_older,
-                        frozen_prefix,
-                        foreign_lines,
-                    )
-                except OSError:
-                    slot._frozen_prefix_cache = None
             state.conversation_log._invalidate_cache(history_key)
             state.conversation_log.note_tab_id(history_key, tab_id)
             return True
@@ -3076,7 +3264,9 @@ def session_was_deleted(state: DashboardState, slot: _ChatSlot) -> bool:
     ``_dirty``, after which those callers skip their own flush arm entirely and
     would copy from the in-memory window. This probe answers directly, however
     the flush ordering fell out. Same evidence rule: the slot must have
-    OBSERVED its file on disk (``_disk_meta_created_at`` non-empty — recorded
+    OBSERVED its file on disk (``_disk_meta_created_at`` non-empty, or the
+    ``_disk_meta_observed`` bit for legacy metadata that records no
+    ``created_at`` — both recorded
     at the hydrate sites and at committed saves, nowhere else), so a fresh
     slot is never "deleted". Witnesses, in order: a missing file
     (``FileNotFoundError``; any other ``stat`` failure also refuses — the
@@ -3103,7 +3293,11 @@ def session_was_deleted(state: DashboardState, slot: _ChatSlot) -> bool:
     # ``_resumed_count`` optimistically after a best-effort save that may have
     # failed, and a restored zero-message session has all-zero counters).
     known = str(getattr(slot, "_disk_meta_created_at", "") or "")
-    if not known:
+    # Same widening as the guard: legacy metadata records no ``created_at``,
+    # so the observation BIT carries the evidence there — the missing-file
+    # stat below is the legacy delete witness, while the identity comparison
+    # at the tail still requires the recorded ``known``.
+    if not known and not bool(getattr(slot, "_disk_meta_observed", False)):
         return False
     path_fn = getattr(state.conversation_log, "_path", None)
     if path_fn is None:
@@ -3159,7 +3353,10 @@ def session_was_deleted(state: DashboardState, slot: _ChatSlot) -> bool:
             # Still there, so the empty ``created_at`` is a genuine legacy-
             # metadata answer, which fails OPEN by the documented rule.
             return False
-        if current != known:
+        # Compare identities only when one was RECORDED (same rule as the
+        # guard): a legacy observation cannot tell "the same legacy file,
+        # stamped since by a sibling's save" from a fresh incarnation.
+        if known and current != known:
             return True
     return False
 
@@ -3174,6 +3371,7 @@ async def save_slot_off_loop(
     force: bool = False,
     rewrite: bool = False,
     best_effort: bool = True,
+    expected_history_key: str | None = None,
 ) -> bool:
     """Persist a slot from the event loop without blocking or dropping the save.
 
@@ -3201,9 +3399,17 @@ async def save_slot_off_loop(
     the session: the save still runs off-loop (patient acquire), but any
     exception propagates so the caller can roll back and keep the slot.
 
-    Returns ``False`` only when the save was skipped because the session was
-    permanently deleted while the save awaited the lock (the delete-won guard
-    in :func:`_save_slot_to_history`) — that skip raises nothing, for either
+    ``expected_history_key``: the transcript key the caller authorized its
+    mutation against. The save refuses (returns ``False``, nothing written)
+    when the slot's routing no longer resolves to that key at write time -- a
+    rebind on the event loop can land between the caller's authorization and
+    the worker's routing snapshot, and without this pin the durable write
+    would target a transcript the caller never authorized.
+
+    Returns ``False`` only when the save was skipped WITHOUT writing: the
+    session was permanently deleted while the save awaited the lock (the
+    delete-won guard in :func:`_save_slot_to_history`), or the routing moved
+    off ``expected_history_key``. Neither skip raises, for either
     ``best_effort`` mode, so a clean return NO LONGER proves a committed write.
     Callers that go on to republish the slot's content elsewhere (fork, the
     transfer export) must check the return; archival callers (close/cleanup)
@@ -3219,8 +3425,24 @@ async def save_slot_off_loop(
             closed_at=closed_at,
             force=force,
             rewrite=rewrite,
+            expected_history_key=expected_history_key,
         )
 
+    def _begin_guarded_metadata_write() -> None:
+        inflight = getattr(slot, "_metadata_persist_inflight", 0)
+        # Production slots initialize this counter, while compatibility callers
+        # may provide a mock that synthesizes missing attributes. Treat a
+        # non-integer value as an absent counter rather than leaking it into the
+        # write's cleanup path.
+        slot._metadata_persist_inflight = inflight + 1 if type(inflight) is int else 1
+
+    def _finish_guarded_metadata_write() -> None:
+        inflight = getattr(slot, "_metadata_persist_inflight", 0)
+        slot._metadata_persist_inflight = (
+            inflight - 1 if type(inflight) is int and inflight > 0 else 0
+        )
+
+    guarded_metadata = expected_history_key is not None
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -3243,6 +3465,8 @@ async def save_slot_off_loop(
                 return True
         return _do()
     if best_effort:
+        if guarded_metadata:
+            _begin_guarded_metadata_write()
         try:
             return await loop.run_in_executor(None, _do)
         except Exception:  # noqa: BLE001 - best-effort durable copy
@@ -3253,9 +3477,18 @@ async def save_slot_off_loop(
                 "save_slot_off_loop: offloaded save failed slot=%s", slot.key, exc_info=True
             )
             return True
+        finally:
+            if guarded_metadata:
+                _finish_guarded_metadata_write()
     # Non-best-effort: propagate so the caller can roll back (do NOT remove the
     # session until the durable write is confirmed).
-    return await loop.run_in_executor(None, _do)
+    if guarded_metadata:
+        _begin_guarded_metadata_write()
+    try:
+        return await loop.run_in_executor(None, _do)
+    finally:
+        if guarded_metadata:
+            _finish_guarded_metadata_write()
 
 
 def _build_history_prefix(slot: _ChatSlot) -> str:

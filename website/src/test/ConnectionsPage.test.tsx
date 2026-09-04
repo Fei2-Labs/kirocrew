@@ -1,12 +1,15 @@
-import { isValidLoopbackReturnAddress } from '../utils/loopbackReturnAddress'
+import { isValidLoopbackReturnAddress, normalizeLoopbackReturnAddress } from '../utils/loopbackReturnAddress'
 import { describe, expect, it } from 'vitest'
+import type { ConnectionStatus } from '../api/client'
 import type { ChatMessage, McpServer } from '../types'
 import {
+  confirmedGrantPresent,
   connectionStateFor,
   disconnectFeedback,
   effectiveOAuth,
   latestOAuthByServer,
   mintOutcome,
+  probeIndicatesConnected,
   uninstallOnCancel,
   withMintedUrl,
   type OAuthState,
@@ -20,6 +23,14 @@ const server = (status: string): McpServer => ({
   status,
   source: 'mcp.json',
   enabled: true,
+})
+
+/** One entry of the /api/connections/status authorization feed. */
+const status = (over: Partial<ConnectionStatus> = {}): ConnectionStatus => ({
+  slug: 'notion',
+  status: 'connected',
+  grantPresent: true,
+  ...over,
 })
 
 describe('Connections card states', () => {
@@ -350,6 +361,33 @@ describe('loopback OAuth return-address validation', () => {
   ])('rejects unsafe or incomplete return address %s', value => {
     expect(isValidLoopbackReturnAddress(value)).toBe(false)
   })
+
+  // #7406: iOS Safari copies address-bar URLs without the scheme; the
+  // scheme-less paste must normalize to http:// and validate.
+  it.each([
+    '127.0.0.1:43123/?code=one-time&state=s',
+    'localhost:43123/callback?code=one-time',
+    '[::1]:43123/?code=one-time',
+  ])('accepts a scheme-less loopback paste %s via the http default', value => {
+    expect(normalizeLoopbackReturnAddress(value)).toBe(`http://${value}`)
+    expect(isValidLoopbackReturnAddress(value)).toBe(true)
+  })
+
+  it.each([
+    // The http default must not widen containment beyond the strict form.
+    '10.0.0.5:43123/?code=x',
+    'evil.example:43123/?code=x',
+    '127.0.0.1/?code=x',
+    // An explicit non-http scheme stays rejected — no rewrite to http.
+    'ftp://127.0.0.1:43123/?code=x',
+  ])('scheme default still rejects %s', value => {
+    expect(isValidLoopbackReturnAddress(value)).toBe(false)
+  })
+
+  it('leaves an already-schemed value untouched', () => {
+    expect(normalizeLoopbackReturnAddress(' http://127.0.0.1:43123/?code=x '))
+      .toBe('http://127.0.0.1:43123/?code=x')
+  })
 })
 
 describe('the authorization axis resolves the needs_auth ambiguity', () => {
@@ -382,5 +420,46 @@ describe('the authorization axis resolves the needs_auth ambiguity', () => {
       .toBe('needs-attention')
     // A grant says nothing about an endpoint that is actually broken.
     expect(connectionStateFor(server('error'), undefined, false, true)).toBe('needs-attention')
+  })
+})
+
+describe('one probe reading serves both the badge and the Test button', () => {
+  // The badge and the Test button used to fold the SAME probe answer twice, and
+  // disagreed: a connected provider showed Connected beside a "test failed".
+  // This is the single predicate both now consume, so the truth table is pinned
+  // here rather than inferred from either surface.
+  it('reads a tokenless needs_auth beside a grant as connected', () => {
+    expect(probeIndicatesConnected('needs_auth', true)).toBe(true)
+  })
+
+  it('refuses needs_auth when no grant is held', () => {
+    // Absent AND indeterminate: neither is a grant, so neither may claim health.
+    expect(probeIndicatesConnected('needs_auth', false)).toBe(false)
+    expect(probeIndicatesConnected('needs_auth', undefined)).toBe(false)
+  })
+
+  it('accepts ok unless the grant is CONFIRMED absent', () => {
+    // Reachability is cached, so it outlives revocation — only a confirmed
+    // absence is a fresher fact than it. Indeterminate keeps the prior verdict.
+    expect(probeIndicatesConnected('ok', true)).toBe(true)
+    expect(probeIndicatesConnected('ok', undefined)).toBe(true)
+    expect(probeIndicatesConnected('ok', false)).toBe(false)
+  })
+
+  it('never lets a grant launder a broken or unknown probe', () => {
+    for (const status of ['error', 'disabled', 'unknown', 'probing', 'outdated']) {
+      expect(probeIndicatesConnected(status, true)).toBe(false)
+      expect(probeIndicatesConnected(status, undefined)).toBe(false)
+    }
+  })
+
+  it('collapses an indeterminate grant lookup to the honest hedge', () => {
+    // `grantPresent: false` from a lookup that FAILED means "could not look" —
+    // it must not reach either surface as a confirmed absence.
+    expect(confirmedGrantPresent(undefined)).toBeUndefined()
+    expect(confirmedGrantPresent(status({ grantPresent: false, grantIndeterminate: true })))
+      .toBeUndefined()
+    expect(confirmedGrantPresent(status({ grantPresent: false }))).toBe(false)
+    expect(confirmedGrantPresent(status({ grantPresent: true }))).toBe(true)
   })
 })

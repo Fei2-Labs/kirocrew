@@ -2,7 +2,7 @@
 
 ## Overview
 
-Dev Fleet is a builtin App Store app (`kiro_crew/apps/builtins/dev_fleet/server.py`) for
+Dev Fleet is a builtin App Store app (`kiro_crew/apps/builtins/dev_fleet/`) for
 managing KiroCrew feature worktrees (git worktrees of the main repo) and their isolated
 pod test instances. It runs as a managed app backend SUBPROCESS: an aiohttp server on the
 backend-assigned port, reached only through the gateway proxy. Every proxied request
@@ -23,6 +23,39 @@ Gateway session auth (token/cookie) gates the proxy entrance as with all builtin
 6. **GitHub PR status** — TTL-cached `gh pr list` queries for merge state
 7. **Make Live** — repoint the live gateway at another worktree via a
    live-target pointer file (no service definition is ever mutated)
+
+## Backend component boundaries
+
+`server.py` is the composition facade: it registers the unchanged HTTP routes,
+coordinates startup and shutdown, and owns the process entry point. The implementation
+behind that facade is split by state and lifecycle ownership:
+
+- `runtime.py` owns command security, toolchain resolution, run descriptors, active
+  subprocesses, and shutdown admission.
+- `repository.py` owns `MAIN_REPO`, repository discovery and validation, git/worktree
+  access, and dirty-state inspection.
+- `live.py` owns live-target discovery, gateway restart backends, the Make Live lock and
+  committed-cutover latch, and rollback.
+- `fleet_state.py` owns PR/context/resource caches, fleet projections and tombstones, and
+  provision reattachment state.
+- `worktree_ops.py` owns pod actions, worktree remove/sync/rebase/prune orchestration, and
+  the background task handles.
+- `http_api.py` owns proxy HMAC verification, request/audit adapters, and response-shape
+  translation.
+
+Dependencies run in that direction from HTTP adapters toward the lower-level owners;
+lower-level components do not call back through `server.py`. Cross-component calls use
+the owning module, so mutable locks, registries, caches, and scalar state each have one
+authoritative instance. The facade forwards legacy private attribute reads, writes, and
+deletes to that owner, but tests patch the actual owner rather than treating the facade as
+a dependency-injection namespace.
+
+The split does not change lifecycle ordering. Shutdown first closes admission and
+snapshots active runs under the runtime admission lock, then kills process trees before
+cancelling their workers, and only then cancels the idle refresher/reaper/prune tasks.
+Destructive worktree operations retain the lock order `_wt_lock(name)` ->
+`_MAKE_LIVE_LOCK` -> `_GIT_MUTATION_LOCK`; changing either ordering can strand a build or
+deadlock removal against a live cutover.
 
 ## Main Checkout Discovery
 
@@ -80,9 +113,10 @@ instead of failing catch it and say what the degraded answer is — upstream-rem
 resolution falls back to `origin`, build-pending detection reports nothing pending,
 fallback-remote loading leaves the list empty, sync refuses with its usual
 `{"ok": false}` shape, and the background refresher idles. Bare `MAIN_REPO` loads outside
-the accessor are limited to truthiness guards, enforced for loads within `server.py` by an
-AST ratchet (`test/test_dev_fleet_repo_accessor.py`); a helper split out into a sibling
-module must route through `_repo()` by convention, since the ratchet only sees this file.
+the accessor are limited to truthiness guards. An AST ratchet scans every Dev Fleet backend
+component (`test/test_dev_fleet_repo_accessor.py`) and permits the authoritative load only
+inside `repository._repo()`; helpers in every sibling module must route through that
+accessor.
 
 Every OTHER route that resolves a worktree (`/worktree`, `/disk`, `/prune-candidates`,
 `/prune-run`, the pod routes, `/rebase`, `/make-live`) reaches `_discover_worktrees` too, so

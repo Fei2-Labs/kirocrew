@@ -449,6 +449,18 @@ class TestInstallSnapshot:
             probe.COMPONENT_CLAUDE_ACP_ADAPTER,
             probe.COMPONENT_CLAUDE_CODE_CLI,
         ]
+        # codex is in ACP_BACKENDS_KNOWN with no entry in ``_PROBES``, so it gets a
+        # row -- the endpoint lists every id the switch can show -- but the row can
+        # only say ``unknown`` and must name nothing to install. That gap is why
+        # codex is absent from BASELINE_SELECTABLE_BACKENDS: offering the switch
+        # would offer a verdict this payload cannot supply.
+        assert by_policy["codex"]["installed"] == "unknown"
+        assert by_policy["codex"]["missing_components"] == []
+        assert by_policy["codex"]["install_command"] == ""
+        # ``selectable`` is NOT asserted here: this module owns the machine half
+        # only, and the field is minted by the endpoint's merge with the registry
+        # descriptors -- pinned in ``test_acp_backends_endpoint.py``. The exact
+        # five-key row shape asserted above is what keeps it from reappearing.
 
     def test_an_unknown_row_names_no_components(self, monkeypatch):
         """The three-state rule, enforced at the payload boundary too.

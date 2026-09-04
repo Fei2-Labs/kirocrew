@@ -103,12 +103,52 @@ export function isSelfScroll(
 }
 
 /**
- * Next `stick` state after a *user-initiated* scroll: follow only if the caller
- * enabled followOutput AND the user is at the bottom. (Self-scrolls must be
- * filtered out by the caller via `isSelfScroll` before calling this.)
+ * Distance (px) from the true bottom within which a user scroll RE-ENGAGES
+ * follow. Deliberately much tighter than DEFAULT_BOTTOM_THRESHOLD: that 100px
+ * band drives the jump-to-bottom pill's visibility, and reusing it for follow
+ * meant a deliberate 3-99px scroll-up kept `stick` armed — the next content
+ * change then yanked the reader back to the bottom. Re-engaging only when the
+ * user has returned essentially to the bottom keeps "scrolled up to read"
+ * positions belonging to the user.
  */
-export function stickAfterUserScroll(atBottom: boolean, followOutput: boolean): boolean {
-  return followOutput && atBottom
+export const FOLLOW_REENGAGE_PX = 16
+
+/**
+ * Direction-aware `stick` decision for a *user-initiated* scroll (self-scrolls
+ * filtered out by the caller via `isSelfScroll`):
+ *
+ *   1. At the true bottom (within the DPR-aware epsilon) → follow. This also
+ *      absorbs the layout engine's clamp: a mid-stream content SHRINK drops
+ *      scrollTop (which reads as an upward move) but lands exactly at the new
+ *      bottom — releasing there froze streaming follow for the rest of the
+ *      turn.
+ *   2. Any other upward move → release, regardless of distance from the
+ *      bottom. The scroll position now belongs to the user; only returning to
+ *      the bottom (3) re-engages.
+ *   3. Downward arrival within FOLLOW_REENGAGE_PX of the bottom → re-engage.
+ *   4. Otherwise (downward/neutral, still away from the bottom) → keep the
+ *      previous state.
+ *
+ * `prevScrollTop < 0` means "no prior observation this session". Direction is
+ * unknowable then, so the decision is position-only and CONSERVATIVE: follow
+ * only within the re-engage band. Keeping a stale `stick` on an unattributable
+ * away-from-bottom scroll is how a reader gets yanked.
+ */
+export function resolveUserScrollStick(args: {
+  stick: boolean
+  followOutput: boolean
+  scrollTop: number
+  prevScrollTop: number
+  geom: ScrollGeom
+}): boolean {
+  const { stick, followOutput, scrollTop, prevScrollTop, geom } = args
+  if (!followOutput) return false
+  const dist = distanceFromBottom(geom)
+  if (dist <= atBottomEpsilon()) return true
+  if (prevScrollTop < 0) return dist <= FOLLOW_REENGAGE_PX
+  if (scrollTop < prevScrollTop - 0.5) return false
+  if (dist <= FOLLOW_REENGAGE_PX) return true
+  return stick
 }
 
 /** Result of an automatic (RO / append) pin evaluation. */
@@ -133,15 +173,31 @@ export interface AutoPinResult {
  *
  * `lastWriteTop < 0` disables the scroll-up guard (used right after a slot
  * switch, before we have written anything this session).
+ *
+ * `viewportShrink` (px, default 0) is how much the SCROLLER'S OWN BOX has
+ * shrunk since that reference was recorded — chrome mounting below the
+ * transcript (a queue band, an attachment strip, a tip card), often
+ * spring-animated over several frames. Our own shrink inflates
+ * `distanceFromBottom` with no user input, so without this allowance the
+ * distance guard reads it as "meaningfully away from the bottom". Paired with
+ * a content SHRINK in the same commit window — a tail-row remount clamping
+ * scrollTop below `lastWriteTop` — that produced a full user-scroll-up
+ * signature out of two of our own layout changes: follow released mid
+ * animation and the content settled a card-height low. Judging the distance
+ * against the box we were last a bottom FOR keeps the guard measuring the
+ * user's move rather than our own. Only the shrink's own pixels are forgiven,
+ * so a genuine drag inside the same tick still releases.
  */
 export function evaluateAutoPin(args: {
   stick: boolean
   geom: ScrollGeom
   lastWriteTop: number
   epsilon?: number
+  viewportShrink?: number
 }): AutoPinResult {
   const { stick, geom, lastWriteTop } = args
   const epsilon = args.epsilon ?? SELF_SCROLL_EPSILON
+  const viewportShrink = Math.max(0, args.viewportShrink ?? 0)
   const target = bottomTarget(geom)
   if (!stick) return { pin: false, stick: false, target }
   // Release only on a genuine user scroll-UP: scrollTop dropped below our last
@@ -154,7 +210,7 @@ export function evaluateAutoPin(args: {
   if (
     lastWriteTop >= 0 &&
     geom.scrollTop < lastWriteTop - epsilon &&
-    distanceFromBottom(geom) > epsilon
+    distanceFromBottom(geom) - viewportShrink > epsilon
   ) {
     return { pin: false, stick: false, target }
   }

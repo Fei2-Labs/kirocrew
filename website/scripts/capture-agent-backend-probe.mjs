@@ -42,16 +42,15 @@ const row = (id, policy_id, over = {}) => ({
 })
 
 /**
- * Scene 1 — what THIS host actually returns today: kiro and kas resolved, claude
- * not selectable on a public build (its registry row is absent) and, separately,
- * only half-installed. `selectable: false` is what the panel reports, because the
- * build gate outranks the machine gate.
+ * Scene 1 — what THIS host actually returns today. Claude Code IS selectable on a
+ * public build (`acp/client.py` owns its whole spawn path and the adapter is a public
+ * npm package), so the only thing standing between this operator and a Claude session
+ * is the adapter itself, and the panel names it plus the command that installs it.
  */
 const SCENE_LOCAL = {
-  schemaEnum: ['', 'kas'],
+  schemaEnum: ['', 'kas', 'claude'],
   backends: [
     row('claude', 'claude', {
-      selectable: false,
       installed: 'missing',
       missing_components: ['claude-agent-acp'],
       install_command: CLAUDE_INSTALL,
@@ -62,14 +61,16 @@ const SCENE_LOCAL = {
 }
 
 /**
- * Scene 2 — the missing-component line. Same host state, but on a build whose
- * edition registered the claude provider, so the machine gate is now the one that
- * decides and the panel names the component plus its install command.
+ * Scene 2 — a managed deployment whose policy denies the harness. The row is GONE,
+ * not greyed: a dimmed chip invites the reader to go find out how to enable it, and
+ * there is nothing they can do from this machine. The footer sentence is what
+ * explains the absence.
  */
-const SCENE_MISSING = {
-  schemaEnum: ['', 'kas', 'claude'],
+const SCENE_DENIED = {
+  schemaEnum: ['', 'kas'],
   backends: [
     row('claude', 'claude', {
+      selectable: false,
       installed: 'missing',
       missing_components: ['claude-agent-acp'],
       install_command: CLAUDE_INSTALL,
@@ -165,11 +166,14 @@ const reloadScene = async (next) => {
 }
 
 await page.goto(`${base}/developer?tab=agent-backend`, { waitUntil: 'domcontentloaded' })
+await page.getByText(CLAUDE_INSTALL, { exact: false }).waitFor({ timeout: 20000 })
 await shoot('agent-backend-local.png')
 
-await reloadScene(SCENE_MISSING)
-await page.getByText(CLAUDE_INSTALL, { exact: false }).waitFor({ timeout: 20000 })
-await shoot('agent-backend-missing.png')
+await reloadScene(SCENE_DENIED)
+await page
+  .getByRole('button', { name: 'Claude Code' })
+  .waitFor({ state: 'detached', timeout: 20000 })
+await shoot('agent-backend-denied.png')
 
 await reloadScene(SCENE_UNKNOWN)
 await shoot('agent-backend-unknown.png')

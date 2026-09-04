@@ -1087,8 +1087,8 @@ def test_spawned_probe_disables_bytecode_writes(monkeypatch):
     assert captured["argv"] == [
         sys.executable,
         "-I",
-        "-B",
         "-S",
+        "-B",
         "-c",
         sb._PROBE_SHIM_CODE,
     ]

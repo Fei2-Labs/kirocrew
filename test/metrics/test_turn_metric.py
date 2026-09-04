@@ -67,13 +67,26 @@ class TestTurnMetricOutcomeMapping:
     def test_completed_is_ok(self):
         assert _turn_call(_run(5000, "completed"))["attrs"]["outcome"] == "ok"
 
-    def test_cancelled_is_error(self):
-        assert _turn_call(_run(400, "cancelled"))["attrs"]["outcome"] == "error"
+    def test_cancelled_is_its_own_outcome_not_error(self):
+        """A user cancel is not a system fault.
+
+        It used to map to ``error``, which put every press of Stop into
+        fault_rate's numerator. The label must be distinct AND stay out of
+        ``telemetry._TERMINAL_FAULT_OUTCOMES`` (pinned by the drift gate in
+        test_telemetry_handler).
+        """
+        assert _turn_call(_run(400, "cancelled"))["attrs"]["outcome"] == "cancelled"
 
     def test_refusal_is_error(self):
         assert _turn_call(_run(100, "refusal"))["attrs"]["outcome"] == "error"
 
     def test_error_prefix_is_error(self):
+        """Also pins that the cancelled branch matches by EXACT equality.
+
+        This reason contains the word "cancel" but is not
+        ``STOP_REASON_CANCELLED`` — a substring test would reclassify the
+        watchdog's confirmed wedge as a deliberate user action.
+        """
         assert _turn_call(_run(2000, "error: cancel unacked"))["attrs"]["outcome"] == "error"
 
     def test_stale_recover_is_distinct_outcome(self):
@@ -106,7 +119,7 @@ class TestTurnMetricOutcomeMapping:
         """The exhausted flag is a stall-budget signal; it must never relabel
         an ordinary outcome."""
         assert _turn_call(_run(1500, "end_turn", exhausted=True))["attrs"]["outcome"] == "ok"
-        assert _turn_call(_run(400, "cancelled", exhausted=True))["attrs"]["outcome"] == "error"
+        assert _turn_call(_run(400, "cancelled", exhausted=True))["attrs"]["outcome"] == "cancelled"
 
     def test_timeout_is_timeout(self):
         assert _turn_call(_run(120000, "timeout"))["attrs"]["outcome"] == "timeout"

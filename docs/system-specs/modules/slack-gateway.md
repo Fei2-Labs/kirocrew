@@ -286,6 +286,7 @@ Slack `file_share` messages are processed in `_route_message()` after dedup + au
 - Tool calls shown inline as 🔧 _tool name_
 - **Thinking/reasoning content** filtered from the main response — accumulated separately and posted as a 💭 thread reply after the main message. Inline `<thinking>` / `</thinking>` tags are also stripped as a safety net. The thread reply is suppressed when `slack.show_thinking` is `false` (default `true`).
 - Final message split into multiple posts if over 3900 chars (via `split_message()`)
+- **Credential-redaction notice** — when the delivered text (answer or thinking) still carries a `security.CREDENTIAL_REDACTION_TAGS` placeholder, one `messaging.renderer.credential_redaction_notice` message is posted in the thread after the answer is committed, so the reader knows a command they copy will not run as pasted. Redaction is NOT relaxed — Slack is an egress path. Counted from the tag in the sent text rather than the redactor's warnings list, which is empty on the streaming path because each chunk was already redacted upstream. **One notice per turn**: answer and thinking share a single tally. Approving a review-mode draft (`interactions.py`) posts the same notice for the same reason, since that publishes to the whole channel. Both posts are best-effort — a failed notice must never turn a delivered answer into a failed turn
 
 ## Message Queue (`session.py` + `events.py`)
 
@@ -347,7 +348,7 @@ Triggers in-place ACP `/compact` on the current thread's session:
 
 ## Wedged-Session Recovery (`AcpPromptBusy`)
 
-When kiro-cli reports a prompt is still in flight ("already in progress" — a tool stall, timeout, or message race), `AcpClient` raises `AcpPromptBusy` (`acp/client.py`) with a friendly "I'm still processing a previous request… if it persists, send `!restart`" message. `handle_message` catches it and auto-resets the wedged session via `sessions.reset(session_key)` so the next message cold-starts cleanly, then records the failure (the reset itself is best-effort — a reset failure is logged, not raised).
+When kiro-cli reports a prompt is still in flight ("already in progress" — a tool stall, timeout, or message race), `AcpClient` raises `AcpPromptBusy` (`acp/client.py`) with a friendly "I'm still processing a previous request… it clears on its own once the stale turn expires" message. `handle_message` catches it and auto-resets the wedged session via `sessions.reset(session_key)` so the next message cold-starts cleanly, then records the failure (the reset itself is best-effort — a reset failure is logged, not raised). The message deliberately names no command: the auto-reset above is what recovers the session, so the text has nothing to ask the user for (it used to say `!restart`, which is Slack-only, owner-gated, and restarts the gateway rather than the session -- see `common/error-handling.md`).
 
 ## OPTIONS Buttons (`format.py`)
 
@@ -413,6 +414,49 @@ When a subagent with a Slack parent session completes, the synthesized LLM respo
 A parent session born on any other channel (Telegram, Discord, `unified:` DM buckets, …) delivers the same synthesized reply through the governed cross-surface transport ladder instead (`_deliver_channel_reply` in `gateway.py`): the conversation is resolved via origin link (recorded by Discord's inbound dispatch) → non-Slack mirror link (e.g. a Telegram `/link` binding) → for direct (1:1) sessions only, the stored `"{namespace}:{user_id}"` channel value resolved through `transport.resolve_configured_target`; the target is vetted by `_resolve_channel_target` (SEL-audited, fail-closed, capability-gated on `supports_proactive_send`), then redacted and chunked to the transport's `max_message_chars`. Delivery is best-effort and fail-closed on ambiguity — group/forum sessions without an origin or mirror link, dispatchers that record neither, and denied egress all degrade to the dashboard notification (never a cross-conversation send), and the injected ACP turn still keeps the parent session aware of the result.
 
 ## Tool Approval via Slack
+
+### Structured monitor completion adapters
+
+The AutoNudge router keeps its historical `on_fire -> bool`, `cycle_count`,
+`fired`, and rearm contracts. A separate runtime-only hook is supplied only when
+a structured monitor already has an actionable fingerprint marked in-flight;
+legacy loops and ordinary channel messages receive none. `MonitorController`
+runs the typed GitHub probe off the event loop, persists the decision and
+in-flight claim, and calls the Slack/Discord or dashboard adapter only for
+`WAKE_ACTIONABLE`. The adapter receives the already formatted envelope and does
+not add the legacy cycle tag. Every non-actionable, retry, and terminal decision
+dispatches zero turns.
+
+Slack's structured inline nudge runs through `TurnDriver` with the shared,
+session-bound directive consumer. Genuine core-MCP `monitor_update`,
+`monitor_stop`, and structured `autonudge_stop` tool results therefore mutate
+the authoritative Slack monitor before any later raw completion; forged or
+sub-agent results retain the driver's fail-closed behavior. Legacy nudges keep
+their collector path. Both paths consume `provider_last_turn_usage(client)`
+exactly once. That one `TurnUsage` object is fanned out to the existing usage-row
+writer and, when the stream observed safe completion evidence, the monitor hook.
+ACP-synthesized terminals are excluded. Because stale-stream synthesis reuses
+`end_turn`, that reason remains uncharged until ACP events expose provenance;
+other safe reasons determine cancellation or failure.
+Stream exhaustion and timeout before that event still write the existing usage
+row but do not report monitor completion or charge the monitor budget. Callback
+or usage-row persistence failure does not change the Slack delivery result. A
+structured stream that started reports `DISPATCHED` even if it exhausts or raises
+before `EVENT_COMPLETE`; the controller's persisted evidence deadline resolves
+the missing callback. Legacy callers retain their historical boolean result.
+
+Discord synthetic nudge injection passes the same hook through
+`DiscordDispatcher` to `TurnDriver`. Only a safe `EVENT_COMPLETE` reason reports
+completion; a command return, dispatch exception, or renderer
+`close()` is not completion evidence. Thus dashboard, Slack, and Discord all
+reach the same typed controller callback even though their transport lifecycles
+remain different. A queued dashboard turn revalidates its claim after background
+admission and before entering `_run_chat`, so a stopped monitor cannot run
+prompt-submit hooks; `_run_chat` revalidates again immediately before provider
+entry to cover revocation during turn setup. Their pre-completion delivery
+contract is also shared:
+`DISPATCHED`, `BUSY`, or `UNAVAILABLE`; BUSY is an ordinary durable retry of the
+same claimed wake, while only UNAVAILABLE terminates the monitor.
 
 Background task approvals (subagent, cron, task runner, and AutoNudge) post approval buttons to Slack DM via `_interactive_approval()`, racing with dashboard approval:
 
@@ -566,7 +610,7 @@ Config example (remote access via URL):
 - **Interactive payload access check**: `interactions.dispatch()` uses deny-by-default — rejects unless the clicking user is positively confirmed as allowed. Non-allowed users receive an ephemeral message ("⛔ You are not authorized to use these buttons.") and the original buttons remain intact for the owner to click later.
 - Dedup cache (`SeenCache`) prevents processing duplicate Slack events
 - Bot self-message filtering via `bot_id` check
-- **Trusted bot IDs** (`slack.trusted_bot_ids` in config): allows specific bot IDs to bypass the blanket `bot_id` filter, enabling multi-node mesh communication. Empty list = all bot messages dropped (default), and a bot id NOT in the list is denied exactly as with no list (fail-closed, `error=untrusted_bot`). Admission requires a positive `bot_id` match against the allowlist; the match sets `from_trusted_bot`, which lets the `bot_id` stand in as `sender_id` and grants access equivalent to an allowed user — authorization is explicit via the `trusted_bot_ids` config allowlist, not the `slack_allowed_users` list. All trusted-bot permission decisions emit SEL audit events (allowed decisions carry `resources="trusted_bot"` so the decision basis is traceable). Echo protection: error replies to trusted-bot messages are suppressed on both dispatch routes — the native path (`from_trusted_bot` in `handle_message`) and the default transport path (`from_trusted_bot` in `handle_message_transport`, threaded through the immediate call, both session queues, and `_dispatch_queued`; the error message is suppressed but the thread status is still cleared). Successful-reply loops are bounded by the **per-thread turn cap** (`slack.trusted_bot_turn_limit`, default 5, minimum 1): a thread that has run that many consecutive trusted-bot turns admits no more (`error=trusted_bot_turn_limit_reached`) until an allowed human posts in it, which resets the count — without the cap, two mutually trusted gateways would admit each other's replies as fresh turns indefinitely. Only a message that actually dispatches a turn moves the count (Slack retries, message/app_mention duplicate pairs, and activation-dropped messages do not). Review-mode channels deny trusted bots outright (`error=trusted_bot_denied_in_review_channel`): the review draft flow delivers via an ephemeral to the sender, which requires a human user id. The gateway's own bot id (cached from the startup `auth.test` that enterprise validation already performs) is never trusted even when listed (`error=own_bot_id_never_trusted`) — otherwise every reply would re-enter the handler as fresh input, a self-reply loop; when `auth.test` was unavailable the self identity is unverified and the admission FAILS CLOSED, trusting nobody (`error=trusted_bot_requires_verified_self_id`) — the same posture enterprise validation takes for a configured allowlist with unverifiable workspace identity.
+- **Trusted bot IDs** (`slack.trusted_bot_ids` in config): allows specific bot IDs to bypass the blanket `bot_id` filter, enabling multi-node mesh communication. Empty list = all bot messages dropped (default), and a bot id NOT in the list is denied exactly as with no list (fail-closed, `error=untrusted_bot`). Admission requires a positive `bot_id` match against the allowlist; the match sets `from_trusted_bot`, which lets the `bot_id` stand in as `sender_id` and grants access equivalent to an allowed user — authorization is explicit via the `trusted_bot_ids` config allowlist, not the `slack_allowed_users` list. All trusted-bot permission decisions emit SEL audit events (allowed decisions carry `resources="trusted_bot"` so the decision basis is traceable). Echo protection: error replies to trusted-bot messages are suppressed on both dispatch routes — the native path (`from_trusted_bot` in `handle_message`) and the default transport path (`from_trusted_bot` in `handle_message_transport`, threaded through the immediate call, both session queues, and `_dispatch_queued`; the error message is suppressed but the thread status is still cleared). Successful-reply loops are bounded by the **per-thread turn cap** (`slack.trusted_bot_turn_limit`, default 5, minimum 1): a thread that has run that many consecutive trusted-bot turns admits no more (`error=trusted_bot_turn_limit_reached`) until an allowed human posts in it, which resets the count — without the cap, two mutually trusted gateways would admit each other's replies as fresh turns indefinitely. Only a message that actually dispatches a turn moves the count (Slack retries, message/app_mention duplicate pairs, and activation-dropped messages do not). Review-mode channels deny trusted bots outright (`error=trusted_bot_denied_in_review_channel`): the review draft flow delivers via an ephemeral to the sender, which requires a human user id. The gateway's own bot id (cached from the startup `auth.test` that enterprise validation already performs) is never trusted even when listed (`error=own_bot_id_never_trusted`) — otherwise every reply would re-enter the handler as fresh input, a self-reply loop; when `auth.test` was unavailable the self identity is unverified and the admission FAILS CLOSED, trusting nobody (`error=trusted_bot_requires_verified_self_id`) — the same posture enterprise validation takes for a configured allowlist with unverifiable workspace identity. The (unwired) `SlackTransport.receive` inbound path applies the same admission — positive allow-list match via its `trusted_bot_ids` constructor param, own-bot exclusion, fail-closed unverified self id, audited decisions, trust before the subtype filter — so the two Slack inbound paths agree about which peer bots are admissible.
 - Socket Mode — no public URL exposed
 - Credentials stored in `~/.kiro/crew/.env` with `chmod 600`
 
