@@ -409,17 +409,22 @@ Probes run from `POST /api/mcp/probe`:
     Managed server identity changes only the sandbox-backend carve-out below; it
     does not weaken this environment scrub. Customized and third-party commands
     receive neither the trusted launcher contract nor any restored Python key.
-    A desktop-managed server whose prefix was scrubbed writes bytecode wherever
-    CPython's default puts it, and that is the one gap the scoped `-B` floor does
-    NOT close. Bytecode policy is owned by the redirect
+    Because that scrub removes `PYTHONPYCACHEPREFIX` too, the scoped `-B` floor
+    covers this spawn: bytecode policy is owned by the redirect
     (`website/electron/gateway-env.js` `gatewayBytecodeEnvironment` →
-    `PYTHONPYCACHEPREFIX`), and `-B` is retained only on the spawns the redirect
-    provably cannot reach — every `-I` isolated child, including the namespace
-    probe and post-exec spawn shim in `sandbox.py`. The managed-server invocation
-    is neither: it is an argv this package derives and matches by EQUALITY
-    (`agent._kirocrew_mcp_invocation` / `_is_first_party_managed_argv`), so a flag
-    added there would have to be added to every matcher in lockstep. See
-    `.fork-sync.yml` `signed-bundle-bytecode-floor` (`status: scoped`).
+    `PYTHONPYCACHEPREFIX`), and `-B` is retained on exactly the spawns the
+    redirect provably cannot reach — every `-I` isolated child (the namespace
+    probe and post-exec spawn shim in `sandbox.py` among them) and both
+    interpreter shapes of `agent._kirocrew_mcp_invocation`, whose probe spawn is
+    env-stripped here. That argv is matched by EQUALITY against a fresh
+    resolution (`_is_first_party_managed_argv`), so the flag has exactly one
+    author and both sides move together; the refusal of the CWD-shadowable
+    `-m kiro_crew` fallback is keyed on the FLAGS
+    (`_module_invocation_without_safe_path`) rather than a fixed argv prefix, so
+    prepending `-B` cannot smuggle it past the carve-out. What stays uncovered is
+    the standalone-console-script shape (`kirocrew <sub>`), which takes no
+    interpreter flags at all — the same residue as a bare shell `kirocrew ...`.
+    See `.fork-sync.yml` `signed-bundle-bytecode-floor` (`status: scoped`).
   - **A managed server FALLS BACK to its declared tool list when — and only when —
     the sandbox refuses.** `kirocrew-core` / `-cron` / `-computer` declare their
     tools statically in this package (`mcp_core._list_tools()` and friends, the very

@@ -1289,13 +1289,13 @@ class TestKirocrewMcpInvocation:
         with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value="kirocrew"):
             cmd, args = _kirocrew_mcp_invocation("mcp-core")
         assert cmd == sys.executable
-        assert args == ["-m", "kiro_crew", "mcp-core"]
+        assert args == ["-B", "-m", "kiro_crew", "mcp-core"]
 
     def test_unwraps_cmd_shim_to_sibling_interpreter(self, tmp_path: Path):
         """A resolved bin/kirocrew.cmd is never emitted verbatim (#4439).
 
         Mirrors website/electron/main.js: the shim is unwrapped to
-        ``<root>/python.exe -B -s -m kiro_crew <sub>`` so kiro-cli spawns the
+        ``<root>/python.exe -B -P -s -m kiro_crew <sub>`` so kiro-cli spawns the
         interpreter, not a batch file.
         """
         from kiro_crew.agent import _kirocrew_mcp_invocation
@@ -1312,10 +1312,12 @@ class TestKirocrewMcpInvocation:
             cmd, args = _kirocrew_mcp_invocation("mcp-cron")
         assert cmd == str(interpreter)
         # -P keeps the spawn CWD off sys.path (the bundle interpreter is pinned
-        # 3.12, so the 3.11+ flag is safe); -s drops user site-packages. No -B:
-        # bytecode policy has one owner (gateway-env.js gatewayBytecodeEnvironment),
-        # and an interpreter flag here would override its PYTHONPYCACHEPREFIX.
-        assert args == ["-P", "-s", "-m", "kiro_crew", "mcp-cron"]
+        # 3.12, so the 3.11+ flag is safe); -s drops user site-packages. -B is
+        # required because the managed-server probe spawns this argv with
+        # strip_python_env=True, which removes the PYTHONPYCACHEPREFIX redirect
+        # gateway-env.js sets — without it that child writes __pycache__ beside
+        # the bundled sources inside the code-signed .app.
+        assert args == ["-B", "-P", "-s", "-m", "kiro_crew", "mcp-cron"]
 
     def test_cmd_shim_without_interpreter_falls_back_to_sys_executable(self, tmp_path: Path):
         """Corrupted bundle: shim present but python.exe missing -> sys.executable."""
@@ -1329,7 +1331,7 @@ class TestKirocrewMcpInvocation:
         with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value=str(shim)):
             cmd, args = _kirocrew_mcp_invocation("mcp-core")
         assert cmd == sys.executable
-        assert args == ["-m", "kiro_crew", "mcp-core"]
+        assert args == ["-B", "-m", "kiro_crew", "mcp-core"]
 
 
 class TestKiroHooksMerge:

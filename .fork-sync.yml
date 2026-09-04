@@ -318,8 +318,6 @@ divergences:
           `kirocrew.cmd` shim.
         * website/electron/main.js / gateway-supervisor.js — already on
           upstream's side before the decision.
-        * src/kiro_crew/agent.py — the Windows `.cmd`→`python.exe` unwrap, which
-          inherits the prefix and whose `-B` was actively fighting the redirect.
 
       HALF 2 — env-unreachable: `-B` is RETAINED and is a FORK BEHAVIOUR AN
       UPSTREAM SYNC MUST NOT DROP. `-I` (isolated) implies `-E`, so such a child
@@ -341,21 +339,41 @@ divergences:
         * src/kiro_crew/platform/wheel_engine.py — the shadow-tree version probe.
         * src/kiro_crew/apps/builtins/dev_fleet/worktree_ops.py — the dependency
           preflight snapshot and the sync-runner bootstrap.
+        * src/kiro_crew/agent.py — BOTH interpreter shapes of
+          `_kirocrew_mcp_invocation` (the `sys.executable -m kiro_crew` fallback
+          and the Windows `.cmd`→`python.exe` unwrap). Not `-I`, but the
+          managed-server probe / pooled-backend spawn in
+          `mcp_discovery.probe_server` goes through
+          `sandboxed_spawn_argv_async(..., strip_python_env=True, ...)`, which
+          removes every `PYTHON*` key, so the redirect is inert for that child
+          and CPython falls back to `__pycache__` beside the bundled sources in
+          the signed `.app`. A kiro-cli-spawned managed server DOES inherit the
+          prefix and merely skips writing bytecode — one import-time parse, paid
+          on the path that cannot be told apart from the probe because both read
+          the same single-source-of-truth argv. That argv is compared by EQUALITY
+          for the `first_party_fixed_argv` carve-out, so the flag must stay in
+          `_kirocrew_mcp_invocation` alone; `mcp_discovery`'s refusal of the
+          CWD-shadowable `-m kiro_crew` fallback is keyed on the FLAGS
+          (`_module_invocation_without_safe_path`, `-P` absent) rather than an
+          `args[:2]` prefix, so a prepended `-B` cannot silently widen it.
 
       The canonical prose statement of the rule lives beside
       `sandbox._LAUNCHER_INTERPRETER_FLAGS`; every other site carries a
       three-line pointer to it.
 
       STILL UNCOVERED after this change: a Python that is neither prefix-reachable
-      nor `-I`. In practice that is a bare shell `kirocrew ...` through the bundled
-      POSIX launcher (`-s -m kiro_crew`, no `-B`, and no gateway env because the
-      Electron shell is not in the chain), which can still write __pycache__ into
-      the bundle. That is the operator-accepted residue of choosing the redirect:
+      nor flag-carrying. In practice that is a bare shell `kirocrew ...` through the
+      bundled POSIX launcher (`-s -m kiro_crew`, no `-B`, and no gateway env because
+      the Electron shell is not in the chain), which can still write __pycache__ into
+      the bundle — and, for the same reason, the standalone-console-script shape of
+      `_kirocrew_mcp_invocation` (`kirocrew <sub>`), which is that launcher and
+      accepts no interpreter flags. That is the operator-accepted residue of choosing
+      the redirect:
       closing it would require re-adding `-B` to the launcher, i.e. reverting
       HALF 1. Also out of scope on purpose: `pptx_maker`'s
       provision/engine spawns, which run a managed `uv` tree outside the bundle
       rather than the bundled interpreter.
-    pinned_by: "test/test_build_desktop_launcher_symlink.py::test_bytecode_policy_is_scoped_by_whether_the_prefix_can_reach_the_child (pins BOTH halves: gatewayBytecodeEnvironment is the owner the gateway spawn reads and no prefix-reachable entry point re-adds -B; and every list/tuple literal under src/kiro_crew carrying \"-I\" must also carry \"-B\", found by ast so a new isolated spawn cannot land without it), website/electron/test/gateway-env.test.js"
+    pinned_by: "test/test_build_desktop_launcher_symlink.py::test_bytecode_policy_is_scoped_by_whether_the_prefix_can_reach_the_child (pins BOTH halves: gatewayBytecodeEnvironment is the owner the gateway spawn reads and no prefix-reachable entry point re-adds -B; and every list/tuple literal under src/kiro_crew carrying \"-I\" must also carry \"-B\", found by ast so a new isolated spawn cannot land without it), website/electron/test/gateway-env.test.js, test/test_agent.py::TestKirocrewMcpInvocation (both interpreter shapes carry -B), test/test_mcp_discovery.py::TestFirstPartyManagedArgv::test_a_prepended_flag_does_not_smuggle_the_fallback_past_the_refusal + ::test_a_freshly_resolved_invocation_still_compares_first_party (the equality carve-out survives the flag without being loosened)"
     decided: 2026-09-04
     revised: 2026-09-04
 

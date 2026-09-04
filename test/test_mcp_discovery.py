@@ -2974,11 +2974,11 @@ class TestFixStaleManagedCommand:
         spec = {"command": "kirocrew", "args": []}
         with patch(
             "kiro_crew.agent._kirocrew_mcp_invocation",
-            return_value=("/venv/Scripts/python.exe", ["-m", "kiro_crew", "mcp-cron"]),
+            return_value=("/venv/Scripts/python.exe", ["-B", "-m", "kiro_crew", "mcp-cron"]),
         ):
             _fix_stale_managed_command("kirocrew-cron", spec)
         assert spec["command"] == "/venv/Scripts/python.exe"
-        assert spec["args"] == ["-m", "kiro_crew", "mcp-cron"]
+        assert spec["args"] == ["-B", "-m", "kiro_crew", "mcp-cron"]
 
     def test_maps_each_managed_server_to_its_subcommand(self):
         from kiro_crew.mcp_discovery import _fix_stale_managed_command
@@ -4146,11 +4146,61 @@ class TestFirstPartyManagedArgv:
 
         import kiro_crew.mcp_discovery as md
 
-        fallback = (sys.executable, ["-m", "kiro_crew", "mcp-core"])
+        fallback = (sys.executable, ["-B", "-m", "kiro_crew", "mcp-core"])
         monkeypatch.setattr(md, "_resolved_managed_invocation", {"kirocrew-core": fallback})
         monkeypatch.setattr("kiro_crew.agent._managed_mcp_env", lambda: {})
         assert not md._is_first_party_managed_argv(
             "kirocrew-core", fallback[0], list(fallback[1]), {}
+        )
+
+    def test_a_prepended_flag_does_not_smuggle_the_fallback_past_the_refusal(
+        self, monkeypatch
+    ) -> None:
+        """The refusal is keyed on the flags, not on ``args[:2]``.
+
+        ``-B`` is prepended to both interpreter shapes (the probe strips
+        ``PYTHONPYCACHEPREFIX``, so the flag is the only bytecode policy that
+        reaches the child), and a positional prefix test would have answered
+        "not a module invocation" for ``-B -m kiro_crew`` and handed the
+        CWD-shadowable fallback the unconfined carve-out.
+        """
+        import kiro_crew.mcp_discovery as md
+
+        assert md._module_invocation_without_safe_path(["-m", "kiro_crew", "mcp-core"])
+        assert md._module_invocation_without_safe_path(["-B", "-m", "kiro_crew", "mcp-core"])
+        # ``-P`` ahead of the ``-m`` keeps the child's CWD off sys.path, so the
+        # bundle's Windows unwrap is not disqualified.
+        assert not md._module_invocation_without_safe_path(
+            ["-B", "-P", "-s", "-m", "kiro_crew", "mcp-core"]
+        )
+        # A console script takes no interpreter flags and runs no ``-m``.
+        assert not md._module_invocation_without_safe_path(["mcp-core"])
+        assert not md._module_invocation_without_safe_path([])
+        # ``-m`` naming some other module is not this invocation at all.
+        assert not md._module_invocation_without_safe_path(["-m", "pytest"])
+
+    def test_a_freshly_resolved_invocation_still_compares_first_party(
+        self, monkeypatch
+    ) -> None:
+        """With an EMPTY resolution cache the gate resolves through the real
+        :func:`kiro_crew.agent._kirocrew_mcp_invocation`, so the carve-out keeps
+        working after the argv shape changes — and a customized command, args or
+        env still compares unequal."""
+        import kiro_crew.agent as agent_mod
+        import kiro_crew.mcp_discovery as md
+
+        monkeypatch.setattr(md, "_resolved_managed_invocation", {})
+        monkeypatch.setattr(agent_mod, "_resolve_kirocrew_bin", lambda: "/opt/bin/kirocrew")
+        monkeypatch.setattr("kiro_crew.agent._managed_mcp_env", lambda: {})
+        command, args = agent_mod._kirocrew_mcp_invocation("mcp-core")
+
+        assert md._is_first_party_managed_argv("kirocrew-core", command, list(args), {})
+        assert not md._is_first_party_managed_argv("kirocrew-core", "/tmp/shim", list(args), {})
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core", command, [*args, "--extra"], {}
+        )
+        assert not md._is_first_party_managed_argv(
+            "kirocrew-core", command, list(args), {"LD_PRELOAD": "/tmp/evil.so"}
         )
 
     def test_third_party_server_is_never_first_party(self, monkeypatch) -> None:

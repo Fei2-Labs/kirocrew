@@ -1086,9 +1086,9 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
     source of truth for the managed invocation. That handles every layout:
     a standalone ``bin/kirocrew`` (POSIX) / ``Scripts\\kirocrew.exe`` (Windows
     pip install) console script when one resolves, the Windows bundle's
-    ``bin\\kirocrew.cmd`` shim (unwrapped to ``<root>\\python.exe -P -s -m
-    kiro_crew <sub>``), and otherwise the ``<interpreter> -m kiro_crew <sub>``
-    fallback. Both ``command`` AND ``args``
+    ``bin\\kirocrew.cmd`` shim (unwrapped to ``<root>\\python.exe -B -P -s -m
+    kiro_crew <sub>``), and otherwise the ``<interpreter> -B -m kiro_crew
+    <sub>`` fallback. Both ``command`` AND ``args``
     are rewritten — the fallback needs ``["-m", "kiro_crew", <sub>]``, so
     re-resolving the command alone (the old behavior) silently dropped the args
     and spawned a bare ``kirocrew`` that isn't on PATH (Windows: ``command not
@@ -1121,6 +1121,24 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
         spec["args"] = args
 
 
+def _module_invocation_without_safe_path(args: list[str]) -> bool:
+    """True when *args* run ``-m kiro_crew`` with no ``-P`` ahead of the ``-m``.
+
+    Keyed on the flags, never on a fixed prefix position: interpreter flags are
+    additive (``-B`` pins bytecode policy for a child whose
+    ``PYTHONPYCACHEPREFIX`` was stripped, see
+    :func:`kiro_crew.agent._kirocrew_mcp_invocation`), and a positional
+    ``args[:2]`` test silently starts answering False — i.e. "safe" — the first
+    time one is prepended. Only ``-P``/``PYTHONSAFEPATH`` keeps the child's CWD
+    off ``sys.path``, so its absence is what disqualifies a module invocation
+    from the first-party carve-out.
+    """
+    for i, arg in enumerate(args):
+        if arg == "-m":
+            return args[i + 1 : i + 2] == ["kiro_crew"] and "-P" not in args[:i]
+    return False
+
+
 def _is_first_party_managed_argv(
     name: str, command: str | None, args: list[str], env: dict[str, str] | None
 ) -> bool:
@@ -1130,8 +1148,12 @@ def _is_first_party_managed_argv(
     managed NAME alone is deliberately not enough: only agent-config entries are
     force-re-resolved through :func:`_fix_stale_managed_command`, so a row
     introduced from an mcp.json scope could carry user-config command text under
-    a managed name. Requiring equality against the freshly re-resolved
-    invocation (:func:`kiro_crew.agent._kirocrew_mcp_invocation`, the single
+    a managed name. That force-re-resolve is also why the equality needs no
+    tolerance for a shape change across an upgrade: :func:`list_servers` runs it
+    over every agent-config managed row before any probe target exists, so an
+    already-written ``kirocrew.json`` carrying the previous argv is rewritten to
+    the running install's shape in the same pass rather than compared against
+    it. Requiring equality against the freshly re-resolved invocation (:func:`kiro_crew.agent._kirocrew_mcp_invocation`, the single
     source of truth) makes "the argv is derived inside this package" a checked
     property rather than an assumption — any customized command or args compares
     unequal and keeps the full fail-close + opt-in behavior.
@@ -1162,13 +1184,14 @@ def _is_first_party_managed_argv(
         logger.debug("managed MCP invocation resolution failed", exc_info=True)
         return False
     expected_command, expected_args = invocation
-    # Refuse the interpreter fallback (`<python> -m kiro_crew <sub>`): `python
-    # -m` prepends the child's CWD to sys.path (this package supports 3.10, so
-    # `-P`/PYTHONSAFEPATH cannot be assumed), and the probe child inherits the
-    # gateway's cwd — a planted `kiro_crew/` tree there would shadow the
-    # installed package and run unconfined. Only a resolved console-script
-    # binary, whose entrypoint imports from its own install, qualifies.
-    if expected_args[:2] == ["-m", "kiro_crew"]:
+    # Refuse the interpreter fallback (`<python> [-B] -m kiro_crew <sub>`):
+    # `python -m` prepends the child's CWD to sys.path (this package supports
+    # 3.10, so `-P`/PYTHONSAFEPATH cannot be assumed), and the probe child
+    # inherits the gateway's cwd — a planted `kiro_crew/` tree there would
+    # shadow the installed package and run unconfined. Only a resolved
+    # console-script binary, whose entrypoint imports from its own install, or
+    # the bundle's `-P`-pinned unwrap qualifies.
+    if _module_invocation_without_safe_path(expected_args):
         return False
     return (
         command == expected_command

@@ -726,6 +726,22 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     needs no PATH entry and ignores any broken launcher. ``python -m
     kiro_crew`` dispatches the same CLI as the ``kirocrew`` console script.
 
+    Both interpreter shapes carry ``-B``. Bytecode policy is normally owned by
+    the desktop launcher's ``PYTHONPYCACHEPREFIX`` redirect
+    (``gatewayBytecodeEnvironment`` in ``website/electron/gateway-env.js``), and
+    where that variable reaches the child an interpreter flag would defeat the
+    warm start the operator chose. It does NOT reach every child of this
+    invocation: the managed-server probe / pooled-backend spawn goes through
+    ``sandboxed_spawn_argv_async(..., strip_python_env=True, ...)``, which
+    removes every ``PYTHON*`` variable, so that child would fall back to writing
+    ``__pycache__`` beside the bundled sources inside a code-signed ``.app`` and
+    can invalidate the signature. ``-B`` is the only policy that survives the
+    strip; a kiro-cli-spawned managed server still inherits the redirect and
+    simply skips writing bytecode, which costs one import-time parse. The
+    standalone-console-script shape below takes no interpreter flags at all
+    (``kirocrew <sub>``), so it stays uncovered — the same gap as a bare shell
+    ``kirocrew ...``, and it is closable only by the environment.
+
     A resolved ``bin\\kirocrew.cmd`` (the Windows bundle's relocatable shim,
     see :func:`_kirocrew_bin_subpath`) is unwrapped to the sibling
     interpreter — ``<root>\\python.exe -B -P -s -m kiro_crew <sub>`` — instead of
@@ -741,7 +757,7 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
     """
     bin_path = _resolve_kirocrew_bin()
     if bin_path == "kirocrew":  # unresolved sentinel from _resolve_kirocrew_bin
-        return sys.executable, ["-m", "kiro_crew", subcommand]
+        return sys.executable, ["-B", "-m", "kiro_crew", subcommand]
     if bin_path.endswith(".cmd"):
         interpreter = Path(bin_path).parent.parent / "python.exe"
         if _interpreter_runnable(interpreter):
@@ -754,8 +770,8 @@ def _kirocrew_mcp_invocation(subcommand: str) -> tuple[str, list[str]]:
             # generic ``sys.executable`` fallbacks below and above stay
             # ``-P``-free because the project still supports Python 3.10,
             # which lacks the flag.
-            return str(interpreter), ["-P", "-s", "-m", "kiro_crew", subcommand]
-        return sys.executable, ["-m", "kiro_crew", subcommand]
+            return str(interpreter), ["-B", "-P", "-s", "-m", "kiro_crew", subcommand]
+        return sys.executable, ["-B", "-m", "kiro_crew", subcommand]
     return bin_path, [subcommand]
 
 
