@@ -56,9 +56,16 @@ if command -v git >/dev/null 2>&1 && git -C "$REPO_DIR" rev-parse --git-dir >/de
   # --short=8 matches fork_version.REVISION_WIDTH. `|| true` so `set -e` cannot
   # abort the packaging run on an unborn HEAD.
   FORK_REVISION="$(git -C "$REPO_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
-  # Untracked files count: the question is "were these the bytes that ran", and
-  # a packaging run over an untracked patch is exactly the case worth marking.
-  if [ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null || true)" ]; then
+  # Untracked entries count only under the paths that SHIP, matching
+  # fork_version.SHIPPED_SOURCE_PATHS. A bare `status --porcelain` reads every
+  # untracked entry as dirtiness, and a working checkout permanently carries
+  # operator scratch (.kiro/, .trellis/, .playwright-mcp/) that is untracked
+  # without being ignored -- so every packaged build got stamped dirty, and a
+  # marker that never clears carries no signal. A tracked modification anywhere
+  # still counts.
+  if [ -n "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
+    FORK_DIRTY="True"
+  elif [ -n "$(git -C "$REPO_DIR" status --porcelain -- src/kiro_crew website/src 2>/dev/null || true)" ]; then
     FORK_DIRTY="True"
   fi
 fi
