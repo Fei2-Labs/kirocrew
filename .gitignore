@@ -162,3 +162,11 @@ evals/*/iteration-*/
 # committing one. This repo is public, so an operator's memory pointer must
 # never land in it.
 .kiro/steering/shared-memory.md
+
+# Operator scratch from local tooling. Nothing under these is tracked, and this
+# repo is PUBLIC -- left merely untracked they are one `git add -A` away from
+# being published, which is the same hazard the steering leaf above closes.
+# They also make every packaged build read as dirty until the shipped-paths rule
+# in scripts/stamp-distribution.sh filters them out.
+.trellis/
+.playwright-mcp/
