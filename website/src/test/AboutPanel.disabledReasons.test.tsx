@@ -123,4 +123,18 @@ describe('AboutPanel disabled-update reasons', () => {
     })
     expect(await screen.findByText(/read-only disk image/i)).toBeTruthy()
   })
+  it('names the fork, not the platform, when the build came from a fork', async () => {
+    mountWithUpdateApi({
+      version: '0.4.0-rc.9',
+      platform: 'darwin-arm64',
+      packaged: true,
+      disabled: 'fork',
+      forkRevision: '77a49f4b',
+    })
+    expect(await screen.findByText(/packaged from a fork/i)).toBeTruthy()
+    // The platform has a lane and the channel is fine; blaming either would
+    // point the user at a switch that cannot restore updates here.
+    expect(screen.queryByText(/unavailable in this build on this platform/i)).toBeNull()
+    expect(screen.queryByText(/release channel has no builds/i)).toBeNull()
+  })
 })

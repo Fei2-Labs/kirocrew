@@ -178,6 +178,20 @@ conflict_policy:
       OPTIONAL at the seam (see divergences/desktop-tray-gateway-controls), so
       upstream's own structure keeps merging cleanly next time.
 
+  - glob: "website/electron/auto-update.js"
+    policy: upstream_wins
+    keystone: true
+    note: |
+      Upstream owns the whole updater; the fork adds exactly one thing —
+      `readForkRevision()` plus the `disabled: "fork"` gate that runs after the
+      externally-managed block and before the dev-build gate (see
+      divergences/fork-electron-updater-suppression). Take upstream's file whole,
+      then RE-ADD those two hunks. Keystone because losing them is silent and
+      catastrophic in one direction: the app quietly downloads an upstream
+      release and offers to install it over the fork. After any sync, assert the
+      gate is back by running `node --test website/electron/test/auto-update.test.js`
+      — the fork tests there fail loudly if it is gone.
+
   - glob: "website/electron/test/*.js"
     policy: upstream_wins
     note: |
@@ -215,6 +229,26 @@ divergences:
       fork build an upstream artifact, because applying one REPLACES the fork.
     pinned_by: "test/test_fork_version.py, test/test_fork_update_suppression.py"
     decided: 2026-09-04
+
+  - id: fork-electron-updater-suppression
+    what: |
+      `website/electron/auto-update.js` refuses to arm electron-updater when the
+      bundle's baked `FORK_REVISION` is non-empty: `initAutoUpdate` returns
+      `disabled: "fork"` before the feed is ever configured, and About renders a
+      named reason for it.
+    why: |
+      The Python release-feed check and the Electron auto-updater are TWO
+      INDEPENDENT LANES, and suppressing only the first left the second live: a
+      fork install downloaded upstream 0.5.0 in the background and offered
+      "Install Update & Restart App", which would have overwritten the fork's own
+      bytes with a different product. No version string can express "not on your
+      lane" — the artifact is a different line of descent — so the refusal is
+      structural and ahead of arming. The revision is read from the Python stamp
+      (`kiro_crew/_build_info.py`) rather than a marker of the updater's own, so
+      the two lanes cannot disagree about whether this is a fork.
+    pinned_by: "website/electron/test/auto-update.test.js, website/src/test/AboutPanel.disabledReasons.test.tsx"
+    decided: 2026-09-05
+
 
   - id: auth-grant-sources
     what: "Only explicit slot trust or global YOLO auto-approves a tool call."

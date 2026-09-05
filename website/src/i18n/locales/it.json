@@ -11979,6 +11979,7 @@
         "automatic_updates_are_unavailable_in_this_build": "Gli aggiornamenti automatici non sono disponibili in questa build",
         "automatic_updates_unavailable_dev_build": "Gli aggiornamenti automatici non sono disponibili in questa build (build di sviluppo).",
         "automatic_updates_unavailable_channel": "Gli aggiornamenti automatici non sono disponibili perché questo canale di rilascio non ha ancora build per la tua piattaforma. Cambia canale qui sopra per ricevere gli aggiornamenti.",
+        "automatic_updates_unavailable_fork": "Gli aggiornamenti automatici non sono disponibili perché questa build proviene da un fork. Il feed degli aggiornamenti pubblica release upstream, che sostituirebbero questa build invece di aggiornarla.",
         "automatic_updates_unavailable_platform": "Gli aggiornamenti automatici non sono disponibili in questa build su questa piattaforma.",
         "automatic_updates_unavailable_translocated": "Gli aggiornamenti automatici non sono disponibili perché macOS sta eseguendo questa app da una copia temporanea di sola lettura. Spostala nella cartella Applicazioni e riaprila.",
         "automatic_updates_unavailable_volume": "Gli aggiornamenti automatici non sono disponibili perché questa app è in esecuzione da un'immagine disco di sola lettura. Spostala nella cartella Applicazioni e riaprila.",

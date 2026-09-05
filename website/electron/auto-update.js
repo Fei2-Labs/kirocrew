@@ -638,6 +638,56 @@ function manualDownloadUrl(channel, osPlatform, osArch = process.arch, linuxForm
 }
 
 /**
+ * The FORK REVISION baked into this bundle's Python backend, or "".
+ *
+ * WHY THE UPDATER NEEDS THIS: the feeds under DEFAULT_FEED_BASE publish
+ * UPSTREAM artifacts. A fork build carries commits that exist in no upstream
+ * release, so every upstream version reads as "newer" to a difference-based
+ * gate -- and accepting it does not update this install, it REPLACES it with a
+ * different product, silently discarding the fork's own code. There is no
+ * version string that can express "these bytes are not on your lane": the
+ * artifact is simply not from this feed's line of descent.
+ *
+ * WHY IT IS READ FROM THE PYTHON STAMP rather than a marker of the updater's
+ * own: scripts/stamp-distribution.sh already writes FORK_REVISION into
+ * kiro_crew/_build_info.py at packaging time, and it is the value every other
+ * surface (the version string, the release-feed check) reports. A second,
+ * independently-written marker is a second thing that can disagree, and a
+ * disagreement here means the app either offers a replacement it must not, or
+ * refuses updates it should take.
+ *
+ * Fails to "" on ANY error. An unreadable stamp must not disable updates for
+ * the upstream population, whose bundles this file is simply absent from
+ * (a non-fork build stamps FORK_REVISION = "").
+ *
+ * @param {{resourcesPath?: string}} [opts]
+ * @returns {string} short git sha, or "" when this is not a fork build
+ */
+function readForkRevision({ resourcesPath = process.resourcesPath } = {}) {
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    if (!resourcesPath) return "";
+    const backendDir = path.join(resourcesPath, "backend-dist");
+    // One bundle per arch (universal builds ship two); either answers, and both
+    // are stamped from the same checkout in the same packaging run.
+    for (const entry of fs.readdirSync(backendDir)) {
+      const libDir = path.join(backendDir, entry, "lib");
+      let pythons = [];
+      try { pythons = fs.readdirSync(libDir); } catch { continue; }
+      for (const py of pythons) {
+        const stamp = path.join(libDir, py, "site-packages", "kiro_crew", "_build_info.py");
+        let text = "";
+        try { text = fs.readFileSync(stamp, "utf8"); } catch { continue; }
+        const m = /^FORK_REVISION\s*=\s*"([0-9a-f]*)"/m.exec(text);
+        if (m && m[1]) return m[1];
+      }
+    }
+  } catch { /* not a packaged bundle, or no backend on disk */ }
+  return "";
+}
+
+/**
  * Apply the update-policy flags this app REQUIRES. Every one of these differs
  * from the electron-updater default, and each maps to a decision we already
  * made deliberately — so they are set in one audited place rather than
@@ -872,6 +922,14 @@ function initAutoUpdate(deps) {
     ? externallyManaged
     : readExternallyManaged({ resourcesPath });
 
+  // Fork revision. Resolved once and BEFORE getInfo(), for the same
+  // temporal-dead-zone reason as `managed`: getInfo reports it and the
+  // early-return stubs hand getInfo out. Injectable so a test can assert both
+  // verdicts without packaging a bundle.
+  const forkRevision = deps.forkRevision !== undefined
+    ? deps.forkRevision
+    : readForkRevision({ resourcesPath });
+
   // When the in-app UI is wired (onUpdateState provided), it owns the prompt;
   // the native dialog stays as the fallback for headless / no-renderer cases.
   const uiDriven = typeof onUpdateState === "function";
@@ -996,6 +1054,9 @@ function initAutoUpdate(deps) {
       updateCommand: managed ? managed.updateCommand || "" : "",
       platform,
       packaged: !!app.isPackaged,
+      // Non-empty when this bundle was packaged from a fork, which is why the
+      // updater is disabled: see readForkRevision.
+      forkRevision,
       // Escape hatch for a failed install (see manualDownloadUrl).
       downloadUrl: manualDownloadUrl(currentChannel(), osPlatform, osArch, linux.format),
       // Replay seed for a freshly mounted renderer (see lastEmittedState).
@@ -1355,6 +1416,23 @@ function initAutoUpdate(deps) {
       install: () => managedInstall(),
       getInfo,
     };
+  }
+  // FORK BUILD. These bytes were packaged from a fork of the upstream source,
+  // so nothing this feed publishes is a successor to them: "installing" an
+  // upstream release would overwrite the fork's own code with a different
+  // product. The version comparison cannot see that -- a fork carries the base
+  // version plus a local segment, and the gate is difference-based -- so the
+  // refusal has to be structural, ahead of arming the updater. Reported to the
+  // UI like every other no-lane verdict, which renders "unavailable" rather
+  // than a Check button that can only ever offer the wrong artifact.
+  //
+  // The Python side refuses the same release feed independently
+  // (kiro_crew's release check reports fork_suppressed); this closes the
+  // electron-updater lane, which is a separate channel with its own download
+  // and its own install prompt.
+  if (forkRevision) {
+    log.info(`[update] fork build ${forkRevision} — auto-update disabled (upstream feed is not this build's lane)`);
+    return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "fork" };
   }
   // Updating requires an installed, signed bundle (macOS code signature
   // validation is mandatory for Squirrel.Mac; Linux AppImage needs the
@@ -2111,6 +2189,7 @@ module.exports = {
   manualDownloadUrl,
   resolveLinuxInstall,
   readExternallyManaged,
+  readForkRevision,
   canRewriteMarker,
   DEFAULT_FEED_BASE,
   DOWNLOAD_BASE,

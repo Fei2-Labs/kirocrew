@@ -13,6 +13,7 @@ const {
   canRewriteMarker,
   DEFAULT_FEED_BASE,
   SUPPORTED_PLATFORMS,
+  readForkRevision,
 } = require("../auto-update");
 
 // ---------------------------------------------------------------------------
@@ -547,6 +548,9 @@ function makeDeps(opts = {}) {
     // Externally-managed verdict. null (the default) = not managed, decided
     // here so no test's outcome depends on the host filesystem.
     externallyManaged = null,
+    // Fork-build verdict. "" (the default) = an upstream build, decided here so
+    // no test's outcome depends on whether the host has a fork bundle on disk.
+    forkRevision = "",
   } = opts;
   const calls = { setFeedURL: [], checkForUpdates: 0, downloadUpdate: 0, quitAndInstall: [] };
   const handlers = {};
@@ -582,6 +586,7 @@ function makeDeps(opts = {}) {
     // whatever the host filesystem happens to allow.
     probeBundleWritable: () => bundleWritable,
     externallyManaged,
+    forkRevision,
     feedBase: "https://cdn.example.dev/feed",
     onUpdateState: (s) => states.push(s),
     log: { info: () => {}, warn: () => {}, error: () => {} },
@@ -2493,4 +2498,40 @@ test("a genuine install failure after a straddling check settles still fires rec
   assert.strictEqual(calls.quitAndInstall.length, 1, "the retry must commit once the check has settled");
   emit("error", new Error("Squirrel could not validate the update"));
   assert.strictEqual(installFailedCalls, 2, "recovery must remain armed for a real install failure after the check settles");
+});
+
+// ---------------------------------------------------------------------------
+// FORK BUILDS. The feed publishes upstream artifacts, which are not successors
+// to a fork's bytes -- accepting one replaces the product rather than updating
+// it. The refusal is structural, ahead of arming the updater.
+// ---------------------------------------------------------------------------
+
+test("a fork build returns disabled:'fork' and never arms the updater", () => {
+  const { deps, calls } = makeDeps({ forkRevision: "77a49f4b" });
+  const u = initAutoUpdate(deps);
+  assert.strictEqual(u.disabled, "fork");
+  assert.strictEqual(calls.setFeedURL.length, 0, "the upstream feed must never be contacted");
+  assert.strictEqual(calls.checkForUpdates, 0);
+  assert.strictEqual(deps.autoUpdater.autoDownload, undefined, "policy flags must not be applied");
+  assert.strictEqual(typeof u.check, "function");
+  assert.strictEqual(typeof u.download, "function");
+  assert.strictEqual(typeof u.install, "function");
+  assert.strictEqual(typeof u.getInfo, "function");
+});
+
+test("a fork build reports its revision through getInfo, an upstream build reports ''", () => {
+  assert.strictEqual(initAutoUpdate(makeDeps({ forkRevision: "77a49f4b" }).deps).getInfo().forkRevision,
+    "77a49f4b");
+  assert.strictEqual(initAutoUpdate(makeDeps({}).deps).getInfo().forkRevision, "");
+});
+
+test("an upstream build still arms the updater (the gate is not a blanket refusal)", () => {
+  const { deps, calls } = makeDeps({ forkRevision: "" });
+  assert.strictEqual(initAutoUpdate(deps).disabled, undefined);
+  assert.ok(calls.setFeedURL.length >= 1);
+});
+
+test("readForkRevision fails to '' on an unreadable bundle rather than disabling updates", () => {
+  assert.strictEqual(readForkRevision({ resourcesPath: "/nonexistent-resources-path" }), "");
+  assert.strictEqual(readForkRevision({ resourcesPath: "" }), "");
 });

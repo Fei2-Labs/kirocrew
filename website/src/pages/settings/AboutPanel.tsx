@@ -1525,6 +1525,13 @@ export function AboutPanel() {
             <p className="text-sm text-muted">
               {updatesDisabled === 'dev'
                 ? i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_dev_build')
+                // A fork build has no lane on this feed at all: every artifact
+                // it publishes is a different line of descent, so installing
+                // one replaces the product rather than updating it. Named
+                // rather than folded into the platform string because the
+                // platform is fine and nothing the user can change here helps.
+                : updatesDisabled === 'fork'
+                ? i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_fork')
                 : updatesDisabled === 'translocated'
                   ? i18nT('pages.settings.aboutPanel.automatic_updates_unavailable_translocated')
                   : updatesDisabled === 'volume'
