@@ -155,3 +155,10 @@ website/.vitest-reports/
 
 # Skill eval A/B outputs (regenerated per run; not review artifacts)
 evals/*/iteration-*/
+
+# Machine-local steering that points Kiro Crew at ~/.shared-memory. Scoped to
+# this one leaf rather than the whole directory: .kiro/steering/ is where real
+# project steering belongs, and ignoring all of it would silently stop anyone
+# committing one. This repo is public, so an operator's memory pointer must
+# never land in it.
+.kiro/steering/shared-memory.md
