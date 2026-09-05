@@ -26,6 +26,9 @@ vi.mock('../../api/client', () => ({
   },
   api: {
     deniedCommands: vi.fn(),
+    // The rules section mounts WorkflowPolicyCard, which reads this on mount.
+    workflowPolicy: vi.fn(),
+    setWorkflowPolicy: vi.fn(),
     toggleBuiltinDeniedCommand: vi.fn(),
     setDeniedCommandsDisableAll: vi.fn(),
     addUserDeniedCommand: vi.fn(),

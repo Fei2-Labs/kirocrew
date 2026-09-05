@@ -178,6 +178,28 @@ conflict_policy:
       OPTIONAL at the seam (see divergences/desktop-tray-gateway-controls), so
       upstream's own structure keeps merging cleanly next time.
 
+  - glob: "src/kiro_crew/@(security|sandbox).py"
+    policy: upstream_wins
+    keystone: true
+    note: |
+      Upstream churns both heavily and is actively TIGHTENING the deny gate, so
+      take its file whole. Then re-add the fork's seams (see
+      divergences/workflow-policy-keystone-opt-ins), which are small and easy to
+      lose in a 5-figure-line merge:
+        security.py  `_git_publication_floor_applies()`; the
+                     `if publish_sources and not _git_publication_floor_applies()`
+                     branch in `is_denied`; the empty-set return in
+                     `floor_enforced_builtin_command_ids()`; the
+                     `workflow_policy.json` leaf in `_CREW_SECRET_LEAVES`.
+        sandbox.py   `_sensitive_env_prefixes()` and `_spawn_scrub_env_prefixes()`
+                     (upstream has a module-level `_SPAWN_SCRUB_ENV_PREFIXES`
+                     constant -- the fork needs the FUNCTION, or the ssh opt-in
+                     silently needs a restart on that one path).
+      Losing a seam fails in the SAFE direction (the floor re-applies, the socket
+      is scrubbed), so it will not show up as a security incident -- it shows up
+      as the operator's workflow breaking again. `test/test_workflow_policy.py`
+      is what catches it; run it after every sync.
+
   - glob: "website/electron/auto-update.js"
     policy: upstream_wins
     keystone: true
@@ -249,6 +271,37 @@ divergences:
     pinned_by: "website/electron/test/auto-update.test.js, website/src/test/AboutPanel.disabledReasons.test.tsx"
     decided: 2026-09-05
 
+  - id: workflow-policy-keystone-opt-ins
+    what: |
+      `src/kiro_crew/workflow_policy.py` plus the keystone
+      `<config dir>/workflow_policy.json` (on `security._CREW_SECRET_LEAVES`)
+      carry two operator opt-ins upstream does not have:
+      `git_publication_mode: protected|repository_governed` retires the
+      verb-anchored git-publication floor in favour of the remote host's
+      rulesets and branch protection, and `forward_ssh_agent` drops
+      `SSH_AUTH_SOCK` from the sandbox scrub set. Enforcement seams:
+      `security._git_publication_floor_applies()`,
+      `security.floor_enforced_builtin_command_ids()`,
+      `sandbox._sensitive_env_prefixes()` / `_spawn_scrub_env_prefixes()`, the
+      `/api/security/workflow-policy` handlers, and `WorkflowPolicyCard` in
+      `SecurityPanel.tsx`.
+    why: |
+      Upstream's floor denies a bare `git push` and any push to
+      main/master/mainline, un-disableably, and scrubs `SSH_AUTH_SOCK` in every
+      sandbox mode. On a repo whose publication controls already live at the
+      remote, that is path-dependence rather than protection — the boundary
+      becomes the command's spelling — and the ssh scrub makes an ssh remote or
+      an ssh-signed commit impossible from inside the sandbox. Both are open
+      upstream requests with no implementation: kirodotdev/KiroCrew#5629 and
+      #8104. If either lands upstream, PREFER the upstream mechanism and retire
+      this one rather than carrying both.
+
+      BOTH values widen what the agent may do, which is why they live on a
+      keystone the agent cannot read or write rather than in `config.json`, why
+      every read fails soft to the restrictive position, and why both predicates
+      test strict equality instead of truthiness.
+    pinned_by: "test/test_workflow_policy.py, website/src/pages/settings/SecurityPanel.workflowPolicy.test.tsx"
+    decided: 2026-09-05
 
   - id: auth-grant-sources
     what: "Only explicit slot trust or global YOLO auto-approves a tool call."

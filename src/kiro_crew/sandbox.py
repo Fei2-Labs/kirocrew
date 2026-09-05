@@ -237,6 +237,14 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # turn computer use on for itself.
     "denied_commands.json",
     "computer_use.json",
+    # The loosening opt-ins (``workflow_policy.py``). READ-ONLY, not hidden, and
+    # the direction is the reason: a sandboxed reader that finds it absent falls
+    # back to the restrictive position, so masking it would silently re-impose the
+    # git-publication floor and re-scrub the ssh-agent socket for exactly the
+    # workflow the operator turned this on to allow. Writable, meanwhile, lets an
+    # auto-approved agent retire its own publication floor and hand itself the
+    # operator's signing keys.
+    "workflow_policy.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
 )
@@ -327,6 +335,12 @@ _CREW_READONLY_TARGETS: list[str] = _crew_home_entries(_CREW_READONLY_LEAVES)
 _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = ("profiles",)
 _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     "computer_use.json",
+    # ``workflow_policy.load_state`` reads an absent file as ``{}`` and ``{}`` as
+    # the restrictive default, so an empty document is absent-equivalent for every
+    # reader -- which is what makes sealing it safe. Without the seal an absent
+    # file stays creatable inside the sandbox, and the next read adopts whatever
+    # the agent wrote there.
+    "workflow_policy.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
 )
@@ -1457,6 +1471,35 @@ _SENSITIVE_ENV_PREFIXES: list[str] = [
     "GNUPGHOME",
     "GIT_ASKPASS",
 ]
+
+
+def _sensitive_env_prefixes() -> list[str]:
+    """The scrub set for THIS host's current keystone state.
+
+    ``SSH_AUTH_SOCK`` leaves the set when the operator has opted into forwarding
+    on the keystone ``workflow_policy.json`` (see ``workflow_policy.py``). That
+    is a real widening and it is deliberate: with the socket scrubbed, an ssh
+    remote and a signed commit (``commit.gpgsign=true`` with ``gpg.format=ssh``)
+    are both impossible from inside the sandbox -- the agent finds no askpass and
+    the commit simply fails -- so the operator either forwards the socket or
+    cannot use the repos that require signing. What they accept by opting in is
+    that every key the running ssh-agent holds is usable by anything inside the
+    sandbox for as long as that agent is unlocked.
+
+    Everything else in the set stays unconditionally. Read per call rather than
+    frozen at import, because the operator can flip the opt-in without a restart;
+    fails to the FULL set on any error, so an unreadable keystone still scrubs.
+    """
+    prefixes = list(_SENSITIVE_ENV_PREFIXES)
+    try:
+        from kiro_crew import workflow_policy
+
+        if workflow_policy.forward_ssh_agent():
+            prefixes = [p for p in prefixes if p != "SSH_AUTH_SOCK"]
+    except Exception:
+        logger.debug("workflow policy read failed; scrubbing SSH_AUTH_SOCK", exc_info=True)
+    return prefixes
+
 
 # Python interpreter env that must NOT leak into a *foreign* Python subprocess
 # launched under the sandbox (e.g. the MCP servers kiro-cli spawns, such as
@@ -2783,7 +2826,7 @@ def _build_launcher_script(
         dirs = _sandbox_policy().strict_dirs()
     files = _CC_FILES if sandbox_level in ("cc", "strict") else []
     expose_files = _CC_EXPOSE_FILES if sandbox_level == "cc" else []
-    env_prefixes = list(_SENSITIVE_ENV_PREFIXES)
+    env_prefixes = _sensitive_env_prefixes()
     if sandbox_level in ("cc", "strict"):
         # Block agent subprocesses from reading credentials via os.environ
         # (the file-level bind-mount of ~/.kiro/crew/.env hides them on disk;
@@ -4072,7 +4115,7 @@ def _sandbox_env_scrub_keys(sandbox_level: str, strip_python_env: bool) -> list[
     keys to :func:`_unset_env_argv` for a trusted-absolute-path ``env`` prefix),
     so the two paths can never scrub different sets.
     """
-    prefixes = list(_SENSITIVE_ENV_PREFIXES)
+    prefixes = _sensitive_env_prefixes()
     if sandbox_level in ("cc", "strict"):
         prefixes.extend(_AGENT_DENIED_ENV_KEYS)
     if strip_python_env:
@@ -6032,7 +6075,12 @@ async def wrap_argv_async(
 # at the parent level too means the guarantee holds even on the opted-in
 # ``sandbox_allow_unsandboxed_exec`` fail-open path where no launcher runs.
 # Prefix match via ``startswith`` (mirrors the launcher's ENV_PREFIXES check).
-_SPAWN_SCRUB_ENV_PREFIXES: list[str] = list(_SENSITIVE_ENV_PREFIXES) + list(_AGENT_DENIED_ENV_KEYS)
+def _spawn_scrub_env_prefixes() -> list[str]:
+    """Per-call because the ssh-agent opt-in is per-call (see
+    :func:`_sensitive_env_prefixes`). Frozen at import it would have pinned
+    whatever the keystone said when the module first loaded, so flipping the
+    opt-in would take a restart on this path and none of the others."""
+    return _sensitive_env_prefixes() + list(_AGENT_DENIED_ENV_KEYS)
 
 
 def scrub_env(
@@ -6043,7 +6091,7 @@ def scrub_env(
     """Return a copy of *env* (default ``os.environ``) with credential-bearing
     keys removed.
 
-    Drops every key whose name starts with one of ``_SPAWN_SCRUB_ENV_PREFIXES``
+    Drops every key whose name starts with one of ``_spawn_scrub_env_prefixes()``
     (AWS secret/session vars, SSH_AUTH_SOCK, GNUPGHOME, GIT_ASKPASS, and the
     Slack/owner tokens seeded into ``os.environ`` for trusted children). Used to
     build the environment for agent-influenced spawns so a spawned process
@@ -6052,7 +6100,7 @@ def scrub_env(
     *extra_prefixes* adds more name prefixes to drop (e.g.
     ``_PYTHON_ENV_PREFIXES`` when the spawn is a foreign Python child).
     """
-    prefixes = _SPAWN_SCRUB_ENV_PREFIXES + (extra_prefixes or [])
+    prefixes = _spawn_scrub_env_prefixes() + (extra_prefixes or [])
     src = os.environ if env is None else env
     return {k: v for k, v in src.items() if not any(k.startswith(p) for p in prefixes)}
 

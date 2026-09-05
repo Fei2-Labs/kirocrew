@@ -19,6 +19,9 @@ vi.mock('../../api/client', () => ({
   api: {
     // The panel's rail reads these on mount regardless of the selected section.
     deniedCommands: vi.fn(),
+    // The rules section mounts WorkflowPolicyCard, which reads this on mount.
+    workflowPolicy: vi.fn(),
+    setWorkflowPolicy: vi.fn(),
     governancePolicy: vi.fn(),
     securityPosture: vi.fn(),
     kirocrewConfig: vi.fn(),

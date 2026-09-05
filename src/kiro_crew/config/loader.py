@@ -802,6 +802,22 @@ def denied_commands_path() -> Path:
     return config_dir() / "denied_commands.json"
 
 
+def workflow_policy_path() -> Path:
+    """Return path to workflow_policy.json — the loosening operator opt-ins.
+
+    Same KEYSTONE reasoning as :func:`denied_commands_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: both values it holds
+    WIDEN what the agent may do when opened — one retires Kiro Crew's own
+    git-publication floor in favour of the repository host's controls, the other
+    forwards ``SSH_AUTH_SOCK`` into the sandbox. A ceiling an agent could flip is
+    not a ceiling, so it stays out of the agent-readable ``config.json``.
+
+    Holds ``{git_publication_mode, forward_ssh_agent}``; every read fails soft to
+    the restrictive position. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "workflow_policy.json"
+
+
 def computer_use_state_path() -> Path:
     """Return path to computer_use.json — the computer-use primary enable.
 

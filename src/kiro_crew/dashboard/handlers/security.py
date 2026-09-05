@@ -525,11 +525,14 @@ async def api_denied_command_builtin_toggle(request: web.Request) -> web.Respons
         _audit(request, operation=op, outcome="denied", resources=f"{rule_id}=unknown")
         return web.json_response({"error": "unknown builtin rule"}, status=404)
 
-    # Floor-enforced rules (always-on git-publish floor) are never opt-out-able:
-    # a disable must be rejected here, before any state write, or disabled_ids
-    # records an id nothing ever reads (silent no-op opt-out). Re-enabling stays
-    # a no-op success below. Pure set lookup — no FS, safe on the event loop.
-    if not enabled and rule_id in floor_enforced_builtin_command_ids():
+    # Floor-enforced rules (the always-on git-publish floor) are never
+    # opt-out-able: a disable must be rejected here, before any state write, or
+    # disabled_ids records an id nothing ever reads (silent no-op opt-out).
+    # Re-enabling stays a no-op success below. The set is NOT constant — the
+    # keystone's repository-governed publication mode empties it — so it is read
+    # per request, and off the event loop because that read touches the FS.
+    floor_ids = await asyncio.to_thread(floor_enforced_builtin_command_ids)
+    if not enabled and rule_id in floor_ids:
         _audit(request, operation=op, outcome="denied", resources=f"{rule_id}=floor_enforced")
         return web.json_response(
             {
@@ -563,6 +566,115 @@ async def api_denied_command_builtin_toggle(request: web.Request) -> web.Respons
         return err
     _audit(request, operation=op, outcome="ok", resources=f"{rule_id}={enabled}")
     return await _snapshot_response()
+
+
+# ── workflow policy (the loosening keystone opt-ins) ──
+
+
+def _workflow_policy_payload() -> dict:
+    """The keystone's current state, plus what it implies, as ONE object.
+
+    ``floor_enforced_ids`` travels with the mode because the two must agree on
+    screen: repository-governed mode empties that set, and a panel that rendered
+    the git-publish rows locked while the mode said the floor had stood down
+    would be describing a control that is not there.
+    """
+    from kiro_crew import workflow_policy
+    from kiro_crew.security import floor_enforced_builtin_command_ids
+
+    state = workflow_policy.load_state()
+    return {
+        "git_publication_mode": workflow_policy.git_publication_mode(state),
+        "forward_ssh_agent": workflow_policy.forward_ssh_agent(state),
+        "floor_enforced_ids": sorted(floor_enforced_builtin_command_ids()),
+    }
+
+
+async def api_workflow_policy_get(request: web.Request) -> web.Response:
+    """GET /api/security/workflow-policy — the loosening opt-ins (read, no audit)."""
+    return web.json_response(await asyncio.to_thread(_workflow_policy_payload))
+
+
+async def api_workflow_policy_patch(request: web.Request) -> web.Response:
+    """PATCH /api/security/workflow-policy — {git_publication_mode?, forward_ssh_agent?}.
+
+    Both fields WIDEN what the agent may do, so every change is audited whichever
+    direction it moves: an operator reconstructing "when did the publication floor
+    come off" must find it in the log, and a tightening is equally worth having.
+
+    Read-modify-write on the whole object, and a corrupt file is refused rather
+    than clobbered — resetting an unparseable ceiling to defaults would silently
+    change whichever setting the operator did not touch.
+    """
+    from kiro_crew import workflow_policy
+
+    op = "security.workflow_policy.update"
+    try:
+        body = await request.json()
+    except Exception:
+        _audit(request, operation=op, outcome="denied", resources="invalid_json")
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        _audit(request, operation=op, outcome="denied", resources="bad_type")
+        return web.json_response(
+            {"error": "body must be an object", "code": "bad_type"}, status=400
+        )
+
+    mode = body.get("git_publication_mode")
+    if mode is not None and mode not in workflow_policy.GIT_PUBLICATION_MODES:
+        _audit(request, operation=op, outcome="denied", resources=f"mode={mode!r}")
+        return web.json_response(
+            {"error": "unknown git_publication_mode", "code": "unknown_mode"}, status=400
+        )
+    forward = body.get("forward_ssh_agent")
+    if forward is not None and not isinstance(forward, bool):
+        _audit(request, operation=op, outcome="denied", resources="forward_ssh_agent=bad_type")
+        return web.json_response(
+            {"error": "forward_ssh_agent must be a boolean", "code": "bad_type"}, status=400
+        )
+
+    def _write() -> dict:
+        # A file that exists but does not parse reads as {} here, which would let
+        # this write present defaults as the operator's choice for the field they
+        # did NOT send. Refuse instead; the operator repairs or deletes the file.
+        path = workflow_policy.workflow_policy_path()
+        if path.exists():
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise ValueError("workflow_policy.json is unreadable") from exc
+            if not isinstance(raw, dict):
+                raise ValueError("workflow_policy.json is not an object")
+            state = dict(raw)
+        else:
+            state = {}
+        if mode is not None:
+            state[workflow_policy.KEY_GIT_PUBLICATION_MODE] = mode
+        if forward is not None:
+            state[workflow_policy.KEY_FORWARD_SSH_AGENT] = forward
+        workflow_policy.save_state(state)
+        return _workflow_policy_payload()
+
+    try:
+        payload = await asyncio.to_thread(_write)
+    except ValueError as exc:
+        _audit(request, operation=op, outcome="denied", resources="corrupt_state")
+        return web.json_response({"error": str(exc), "code": "corrupt_state"}, status=409)
+    except OSError:
+        logger.exception("workflow policy write failed")
+        _audit(request, operation=op, outcome="error", resources="write_failed")
+        return web.json_response({"error": "write failed", "code": "write_failed"}, status=500)
+
+    _audit(
+        request,
+        operation=op,
+        outcome="ok",
+        resources=(
+            f"git_publication_mode={payload['git_publication_mode']} "
+            f"forward_ssh_agent={payload['forward_ssh_agent']}"
+        ),
+    )
+    return web.json_response(payload)
 
 
 # ── disable-all ──
@@ -1013,6 +1125,7 @@ async def _preflight_agent_config_mutable() -> None:
     config lock during the write. It only ensures the common, already-detectable
     failures are reported before anything is stopped.
     """
+
     def _check() -> None:
         path = config_path()
         if path.is_file():
@@ -1063,6 +1176,7 @@ async def _mutate_agent_config(mutate) -> None:
     lock so a concurrent writer cannot slip a corrupt file in between the check
     and the load.
     """
+
     def _read_modify_write() -> None:
         path = config_path()
 
@@ -1247,7 +1361,11 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
         # Compare even when one side is empty: an app changing between a local
         # install and a repository-backed source is also a changed consent scope.
         if consent_repository != repository:
-            reason = "missing_repository" if repository and not consent_repository else "repository_changed"
+            reason = (
+                "missing_repository"
+                if repository and not consent_repository
+                else "repository_changed"
+            )
             _audit(request, operation=op, outcome="denied", resources=f"{name}={reason}")
             return web.json_response(
                 {
@@ -1304,9 +1422,7 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
             await _mutate_agent_config(_mutate)
         except ConfigCorruptError as exc:
             _audit(request, operation=op, outcome="denied", resources=f"{name}=config_corrupt")
-            return web.json_response(
-                {"error": str(exc), "code": "config_corrupt"}, status=409
-            )
+            return web.json_response({"error": str(exc), "code": "config_corrupt"}, status=409)
         except TrustSettingOverlayOwned as exc:
             # 409, not 200: writing config.json here changes NOTHING while the
             # overlay owns the setting, and a success response would tell the
@@ -1343,9 +1459,7 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
         )
 
         def _undo(agent_raw: dict) -> None:
-            agent_raw["apps_trusted"] = [
-                a for a in _trusted_list_raw(agent_raw) if a != name
-            ]
+            agent_raw["apps_trusted"] = [a for a in _trusted_list_raw(agent_raw) if a != name]
             repositories = _trusted_repositories_raw(agent_raw)
             repositories.pop(name, None)
             agent_raw["apps_trusted_local"] = [
@@ -1427,9 +1541,7 @@ async def api_trusted_app_revoke(request: web.Request) -> web.Response:
             await _preflight_agent_config_mutable()
         except ConfigCorruptError as exc:
             _audit(request, operation=op, outcome="denied", resources=f"{name}=config_corrupt")
-            return web.json_response(
-                {"error": str(exc), "code": "config_corrupt"}, status=409
-            )
+            return web.json_response({"error": str(exc), "code": "config_corrupt"}, status=409)
         except TrustSettingOverlayOwned as exc:
             _audit(request, operation=op, outcome="denied", resources=f"{name}=overlay_owned")
             return web.json_response(
@@ -1513,9 +1625,7 @@ async def api_trusted_app_revoke(request: web.Request) -> web.Response:
                     disabled = bool(await _run_off_loop(lambda: disable_app(name).ok))
 
         def _mutate(agent_raw: dict) -> None:
-            agent_raw["apps_trusted"] = [
-                a for a in _trusted_list_raw(agent_raw) if a != name
-            ]
+            agent_raw["apps_trusted"] = [a for a in _trusted_list_raw(agent_raw) if a != name]
             repositories = _trusted_repositories_raw(agent_raw)
             repositories.pop(name, None)
             agent_raw["apps_trusted_local"] = [
@@ -1527,9 +1637,7 @@ async def api_trusted_app_revoke(request: web.Request) -> web.Response:
             await _mutate_agent_config(_mutate)
         except ConfigCorruptError as exc:
             _audit(request, operation=op, outcome="denied", resources=f"{name}=config_corrupt")
-            return web.json_response(
-                {"error": str(exc), "code": "config_corrupt"}, status=409
-            )
+            return web.json_response({"error": str(exc), "code": "config_corrupt"}, status=409)
         except TrustSettingOverlayOwned as exc:
             # 409, not 200: writing config.json here changes NOTHING while the
             # overlay owns the setting, and a success response would tell the
@@ -1550,9 +1658,7 @@ async def api_trusted_app_revoke(request: web.Request) -> web.Response:
         outcome="ok",
         resources=f"{name} was_granted={was_granted} disabled={disabled}",
     )
-    return await _trusted_apps_response(
-        {"disabled": disabled, "warnings": teardown_warnings}
-    )
+    return await _trusted_apps_response({"disabled": disabled, "warnings": teardown_warnings})
 
 
 async def api_trusted_apps_allow_all(request: web.Request) -> web.Response:
@@ -1606,9 +1712,7 @@ async def api_trusted_apps_allow_all(request: web.Request) -> web.Response:
             await _preflight_agent_config_mutable()
         except ConfigCorruptError as exc:
             _audit(request, operation=op, outcome="denied", resources="config_corrupt")
-            return web.json_response(
-                {"error": str(exc), "code": "config_corrupt"}, status=409
-            )
+            return web.json_response({"error": str(exc), "code": "config_corrupt"}, status=409)
         except TrustSettingOverlayOwned as exc:
             _audit(request, operation=op, outcome="denied", resources="overlay_owned")
             return web.json_response(
@@ -1633,9 +1737,7 @@ async def api_trusted_apps_allow_all(request: web.Request) -> web.Response:
         await _mutate_agent_config(_mutate)
     except ConfigCorruptError as exc:
         _audit(request, operation=op, outcome="denied", resources="config_corrupt")
-        return web.json_response(
-            {"error": str(exc), "code": "config_corrupt"}, status=409
-        )
+        return web.json_response({"error": str(exc), "code": "config_corrupt"}, status=409)
     except TrustSettingOverlayOwned as exc:
         # 409, not 200: writing config.json here changes NOTHING while the
         # overlay owns the setting, and a success response would tell the
@@ -1811,9 +1913,7 @@ async def _stop_apps_running_on_blanket_trust(
                 was_enabled = bool(record.get("enabled"))
                 if require_enabled and not was_enabled:
                     continue
-                swept = await teardown_app_runtime(
-                    name, record, withdrawing_trust=True
-                )
+                swept = await teardown_app_runtime(name, record, withdrawing_trust=True)
                 for note in (*swept.warnings, *swept.failures):
                     logger.warning("blanket-trust teardown of %r: %s", name, note)
                 if not swept.ok:

@@ -1008,6 +1008,55 @@ backend keeps pinned rules enforced under `disable_all` via
 pins`), so a pin on one rule must not block opting every *other* (unpinned) rule
 out.
 
+### Git publication mode, and the ssh-agent opt-in (`workflow_policy.json`)
+
+Two operator opt-ins live on the keystone `<config dir>/workflow_policy.json`,
+read through `workflow_policy.py`. The leaf is on `_CREW_SECRET_LEAVES`, so the
+agent can neither read nor write it, and the dashboard
+`GET`/`PATCH /api/security/workflow-policy` handlers are the only writers. Both
+are separate decisions with separate defaults, and both WIDEN what the agent may
+do when opened — so every read fails soft to the restrictive position, and both
+`git_publication_mode()` and `forward_ssh_agent()` test strict equality rather
+than truthiness (a hand-edited `"true"` string must not open a ceiling).
+
+- **`git_publication_mode`** — `"protected"` (default) keeps the verb-anchored
+  git-publication floor described above. `"repository_governed"` stands it down:
+  `is_denied` still detects the push (so the ALLOW audit still fires through
+  `push_allow_pending`) but skips the branch-name tags entirely, and
+  `floor_enforced_builtin_command_ids()` returns the empty set so the Settings
+  panel stops rendering those rows locked. Nothing else moves — credential
+  exfiltration, self-protection, sensitive paths and the destructive-command
+  rules all still evaluate a push, which is what
+  `test_workflow_policy.py::test_repository_governed_mode_widens_nothing_but_the_branch_name_floor`
+  pins with compound commands rather than bare ones.
+
+  Why the mode exists: branch names are not a global security boundary. Where a
+  repository already defines its publication controls at the remote host
+  (rulesets, branch protection, required reviews and checks), the built-in floor
+  produces path-dependent behaviour rather than protection — an ordinary
+  `git push` is refused while the equivalent ref update through a host API is
+  not — so the effective boundary becomes the command's spelling. The mode hands
+  that decision to the host and says so on screen, with a warning that the remote
+  protections must be configured first.
+
+  `floor_enforced_builtin_command_ids()` is therefore **no longer constant**, and
+  callers must re-read rather than cache it. The API's disable rejection reads it
+  per request and off the event loop, because the read touches the filesystem.
+
+- **`forward_ssh_agent`** — `false` (default) keeps `SSH_AUTH_SOCK` in
+  `sandbox._sensitive_env_prefixes()`, so agent-run `ssh` and `git` cannot reach
+  the operator's ssh-agent. `true` removes that one prefix and nothing else: the
+  AWS secret/session vars, `GNUPGHOME` and `GIT_ASKPASS` stay scrubbed. The set
+  is computed per call rather than frozen at import — `_spawn_scrub_env_prefixes()`
+  is a function for exactly this reason — so flipping the opt-in takes effect
+  without a restart on every spawn path rather than on some of them.
+
+  What the operator accepts: every key the running ssh-agent holds becomes usable
+  by anything inside the sandbox for as long as that agent is unlocked. It exists
+  because an ssh remote and an ssh-signed commit (`commit.gpgsign=true` with
+  `gpg.format=ssh`) are otherwise impossible from inside the sandbox — the agent
+  finds no askpass and the commit fails with nothing actionable surfaced.
+
 **Live reload (no restart)** — a mutation hot-reloads the running
 `HookManager` via `_reload_live_hooks` so the PreToolUse gate reflects the new
 opt-out state immediately. The **heartbeat**-scoped manager

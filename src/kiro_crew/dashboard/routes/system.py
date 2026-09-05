@@ -93,6 +93,8 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/security/stats", handlers.api_security_stats)
     app.router.add_get("/api/security/posture", handlers.api_security_posture)
     app.router.add_get("/api/security/denied-commands", handlers.api_denied_commands_list)
+    app.router.add_get("/api/security/workflow-policy", handlers.api_workflow_policy_get)
+    app.router.add_patch("/api/security/workflow-policy", handlers.api_workflow_policy_patch)
     app.router.add_patch(
         "/api/security/denied-commands/disable-all", handlers.api_denied_commands_disable_all
     )

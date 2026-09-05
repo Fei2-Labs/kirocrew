@@ -1894,10 +1894,19 @@ def floor_enforced_builtin_command_ids() -> frozenset[str]:
     render them locked/forced-on and the toggle API must reject a disable, or
     the opt-out is a silent no-op (UI reports success, the floor still denies).
 
+    NOT constant across configurations.  In the keystone's
+    ``repository_governed`` publication mode the floor stands down (see
+    ``_git_publication_floor_applies``), so these rules become ordinary
+    configurable-tier rows and the set is EMPTY -- rendering them locked there
+    would tell the operator a control is un-opt-out-able when the mode they chose
+    already retired it.  Callers must therefore re-read rather than cache.
+
     DISPLAY/API accessor only: nothing in the enforcement path reads it, so it
-    cannot weaken the floor.  Pure and deterministic (module-scope derivation
-    from the catalog category), safe to call from any thread.
+    cannot weaken the floor.  Safe to call from any thread; it performs one
+    fail-soft keystone read, which reports the floor as APPLYING on any error.
     """
+    if not _git_publication_floor_applies():
+        return frozenset()
     return _FLOOR_ENFORCED_RULE_IDS
 
 
@@ -6185,6 +6194,29 @@ def _git_publish_floor_tags(text_lower: str) -> frozenset[str]:
     return frozenset(tags)
 
 
+def _git_publication_floor_applies() -> bool:
+    """Whether the verb-anchored git-publication floor should deny at all.
+
+    Reads the keystone ``workflow_policy.json`` (see ``workflow_policy.py``),
+    which the agent can neither read nor write, so this is an operator decision
+    and not a value a prompt-injected shell can reach. Fails to ``True`` -- the
+    floor APPLIES -- on any error: an unreadable ceiling must not be read as
+    permission, and this predicate is the only thing standing between the agent
+    and an unparsed push target.
+
+    The ``workflow_policy`` import stays function-local for the same reason the
+    ``config.loader`` one does elsewhere in this module: it keeps this module's
+    import graph independent of the loader's.
+    """
+    try:
+        from kiro_crew import workflow_policy
+
+        return workflow_policy.git_publication_floor_applies()
+    except Exception:
+        logger.debug("workflow policy read failed; git-publication floor applies", exc_info=True)
+        return True
+
+
 def _is_push_to_protected_branch(text_lower: str) -> bool:
     """Return True if ANY ``git push`` in the command targets a protected branch.
 
@@ -6594,6 +6626,14 @@ _CREW_SECRET_LEAVES: list[str] = [
     # handler is the only writer and it opens the path directly, not through this
     # gate, so the operator's Settings toggle still works.
     "computer_use.json",
+    # The loosening operator opt-ins (``workflow_policy.py``). Gated for the same
+    # reason as the leaves around it, and the direction matters: BOTH values here
+    # widen the agent's reach when opened -- one retires the git-publication floor,
+    # the other forwards the operator's ssh-agent socket into the sandbox. An agent
+    # that could write this file could grant itself both and then use the
+    # operator's signing keys to publish. Read is gated too: knowing the floor is
+    # off is exactly the reconnaissance a push evasion would want.
+    "workflow_policy.json",
     # Browser Mode's durable ENABLE gate. Same class of control as
     # ``computer_use.json`` directly above: while it is present the browse proxy
     # is registered and the ``browser_*`` tools are in the agent's tool list,
@@ -13976,7 +14016,16 @@ def is_denied(
     # keeps the per-rule opt-out semantics exactly as written -- a rule an operator
     # disabled stays disabled at whatever depth it fires.
     publish_sources = [source for source in payload_sources if _is_git_publish(source)]
-    if publish_sources:
+    if publish_sources and not _git_publication_floor_applies():
+        # REPOSITORY-GOVERNED mode: the operator has declared the remote host's
+        # controls (rulesets, branch protection, required reviews and checks)
+        # authoritative for publication, so Kiro Crew stops parsing branch names.
+        # The push still falls through to every other tier below -- credential
+        # exfiltration, self-protection, sensitive paths, the destructive-command
+        # rules -- and ``push_allow_pending`` keeps the ALLOW audit, so the event
+        # log records the push either way. Only the branch-name floor stands down.
+        push_allow_pending = True
+    elif publish_sources:
         floor_tags: frozenset[str] = frozenset()
         for publish_source in publish_sources:
             floor_tags |= _git_publish_floor_tags(publish_source)

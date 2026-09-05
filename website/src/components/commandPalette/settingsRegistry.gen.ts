@@ -1535,6 +1535,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "Denied Commands"
   },
   {
+    "id": "security.forward-the-ssh-agent-socket",
+    "label": "Forward the ssh-agent socket",
+    "labelKey": "pages.settings.securityPanel.forward_ssh_agent_title",
+    "description": "Lets the agent use ssh remotes and ssh-signed commits from inside the sandbox.",
+    "tab": "security",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "security.governance-policy",
     "labelKey": "pages.settings.securityPanel.governance_policy",
     "tab": "security",

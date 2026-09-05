@@ -823,6 +823,24 @@ export interface AwsConsentStatus {
 }
 
 /** Full denied-commands snapshot returned by every denied-commands endpoint. */
+/** The keystone opt-ins that LOOSEN an agent restriction (`workflow_policy.json`).
+ *
+ *  Both fields widen what the agent may do when opened, and neither lives in the
+ *  agent-readable config — they are written only through this API. */
+export interface WorkflowPolicyData {
+  /** `protected` keeps Kiro Crew's own git-publication floor; `repository_governed`
+   *  hands publication governance to the remote host's rulesets and branch
+   *  protection, and Kiro Crew stops parsing branch names. */
+  git_publication_mode: 'protected' | 'repository_governed'
+  /** Whether `SSH_AUTH_SOCK` reaches the sandboxed agent, so ssh remotes and
+   *  ssh-signed commits work from inside it. */
+  forward_ssh_agent: boolean
+  /** Built-in rule ids the always-on floor enforces RIGHT NOW. Empty in
+   *  repository-governed mode, which is why it travels with the mode: the deny
+   *  rows must not render locked once the floor has stood down. */
+  floor_enforced_ids: string[]
+}
+
 export interface DeniedCommandsData {
   builtins: DeniedCommandRule[]
   user_added: DeniedUserRule[]
@@ -2314,6 +2332,9 @@ export const api = {
   // Denied commands (Settings → Security). Every endpoint returns the full
   // refreshed snapshot so callers can seed their query cache from the response.
   deniedCommands: () => get('/api/security/denied-commands').then(j) as Promise<DeniedCommandsData>,
+  workflowPolicy: () => get('/api/security/workflow-policy').then(j) as Promise<WorkflowPolicyData>,
+  setWorkflowPolicy: (patchBody: Partial<Pick<WorkflowPolicyData, 'git_publication_mode' | 'forward_ssh_agent'>>) =>
+    patch('/api/security/workflow-policy', patchBody).then(j) as Promise<WorkflowPolicyData>,
   toggleBuiltinDeniedCommand: (id: string, enabled: boolean) =>
     patch('/api/security/denied-commands/builtins/' + encodeURIComponent(id), { enabled }).then(j) as Promise<DeniedCommandsData>,
   setDeniedCommandsDisableAll: (value: boolean) =>

@@ -8,7 +8,7 @@ import { Badge, Btn, Input, Toggle, Checkbox } from '../../components/ui'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import Modal from '../../components/Modal'
 import InfoTip from '../../components/InfoTip'
-import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData } from '../../api/client'
+import { api, ApiError, type DeniedCommandsData, type DeniedCommandRule, type DeniedUserRule, type GovernanceDistributionData, type GovernancePolicyData, type GovernanceScope, type GovernanceScopeDetail, type SecurityPostureData, type TailnetStatusData, type TrustedAppsData, type WorkflowPolicyData } from '../../api/client'
 import { PostureDisclosureRow, CODE_BASE as POSTURE_CODE_BASE } from './PostureDisclosure'
 import { MobileLoginCard } from './MobileLoginCard'
 
@@ -1576,6 +1576,100 @@ function PostureSection() {
  * rules across 10 categories) and there is no reason to build it while the
  * reader is looking at something else.
  */
+/**
+ * The keystone opt-ins that LOOSEN a restriction (`workflow_policy.json`).
+ *
+ * Rendered at the TOP of the rules section because the publication mode decides
+ * whether the git-publish rows below it are locked: an operator who cannot find
+ * why those switches will not move is looking for this card.
+ *
+ * Both controls widen what the agent may do, so each states the cost in the same
+ * breath as the switch rather than behind a tooltip. Neither is stored in the
+ * agent-readable config — the API is the only writer.
+ */
+function WorkflowPolicyCard() {
+  const qc = useQueryClient()
+  const { data } = useQuery<WorkflowPolicyData>({ queryKey: ['workflow-policy'], queryFn: api.workflowPolicy })
+  const save = useMutation({
+    mutationFn: (body: Partial<Pick<WorkflowPolicyData, 'git_publication_mode' | 'forward_ssh_agent'>>) => api.setWorkflowPolicy(body),
+    onSuccess: (snap: WorkflowPolicyData) => {
+      qc.setQueryData(['workflow-policy'], snap)
+      // The deny rows' locked state is derived from the same floor this mode
+      // retires, so the rule list has to repaint with it or it keeps showing
+      // locks for a floor that has stood down.
+      qc.invalidateQueries({ queryKey: ['denied-commands'] })
+    },
+  })
+
+  const mode = data?.git_publication_mode ?? 'protected'
+  const governed = mode === 'repository_governed'
+
+  return (
+    <SettingsCard>
+      <div className="text-[13px] font-semibold text-text">{i18nT('pages.settings.securityPanel.git_publication_title')}</div>
+      <div className="text-[12px] text-muted mt-0.5 mb-2 leading-relaxed">{i18nT('pages.settings.securityPanel.git_publication_desc')}</div>
+      <div className="flex flex-col gap-1.5" role="radiogroup" aria-label={i18nT('pages.settings.securityPanel.git_publication_title')} data-setting-label={i18nT('pages.settings.securityPanel.git_publication_title')}>
+        {(['protected', 'repository_governed'] as const).map(k => {
+          const selected = mode === k
+          return (
+            <button
+              key={k}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              disabled={save.isPending || !data}
+              onClick={() => { if (!selected) save.mutate({ git_publication_mode: k }) }}
+              className={`flex items-start gap-2.5 text-left rounded-md border px-3 py-2 transition-colors bg-transparent cursor-pointer disabled:cursor-not-allowed disabled:opacity-60 ${selected ? 'border-accent bg-accent-subtle' : 'border-border hover:bg-bg-hover'}`}
+            >
+              <span className="shrink-0 mt-0.5">
+                {selected ? <CheckCircle2 size={14} className="text-accent" /> : <Circle size={14} className="text-muted" />}
+              </span>
+              <span className="flex-1">
+                <span className="block text-[12px] text-text">
+                  {k === 'protected'
+                    ? i18nT('pages.settings.securityPanel.git_publication_protected')
+                    : i18nT('pages.settings.securityPanel.git_publication_repository_governed')}
+                </span>
+                <span className="block text-[11px] text-muted mt-0.5 leading-relaxed">
+                  {k === 'protected'
+                    ? i18nT('pages.settings.securityPanel.git_publication_protected_desc')
+                    : i18nT('pages.settings.securityPanel.git_publication_repository_governed_desc')}
+                </span>
+              </span>
+            </button>
+          )
+        })}
+      </div>
+      {governed && (
+        <div className="text-[11px] text-warn mt-2 flex items-start gap-1">
+          <AlertTriangle size={11} className="shrink-0 mt-0.5" />
+          <span>{i18nT('pages.settings.securityPanel.git_publication_repository_governed_warning')}</span>
+        </div>
+      )}
+
+      <div className="border-t border-border mt-3 pt-2">
+        <SettingsToggle
+          label={i18nT('pages.settings.securityPanel.forward_ssh_agent_title')}
+          description={i18nT('pages.settings.securityPanel.forward_ssh_agent_desc')}
+          checked={data?.forward_ssh_agent ?? false}
+          disabled={save.isPending || !data}
+          onChange={next => save.mutate({ forward_ssh_agent: next })}
+        />
+        {data?.forward_ssh_agent && (
+          <div className="text-[11px] text-warn mt-1 flex items-start gap-1">
+            <AlertTriangle size={11} className="shrink-0 mt-0.5" />
+            <span>{i18nT('pages.settings.securityPanel.forward_ssh_agent_warning')}</span>
+          </div>
+        )}
+      </div>
+
+      {save.isError && (
+        <div className="text-[12px] text-danger mt-1.5">{i18nT('pages.settings.securityPanel.failed_to_save_workflow_policy')}</div>
+      )}
+    </SettingsCard>
+  )
+}
+
 function DeniedCommandsSection({ draft, onDraftChange, noteDraft, onNoteDraftChange }: { draft: string; onDraftChange: (next: string) => void; noteDraft: string; onNoteDraftChange: (next: string) => void }) {
   const qc = useQueryClient()
   const { data: dc } = useQuery<DeniedCommandsData>({ queryKey: ['denied-commands'], queryFn: api.deniedCommands })
@@ -2410,6 +2504,7 @@ export function SecurityPanel({ basePath }: { basePath?: string } = {}) {
                 <YoloDurationCard />
               </SettingsSection>
             )}
+            {key === 'rules' && <WorkflowPolicyCard />}
             {key === 'rules' && <DeniedCommandsSection draft={denyDraft} onDraftChange={setDenyDraft} noteDraft={denyNoteDraft} onNoteDraftChange={setDenyNoteDraft} />}
             {key === 'tailnet' && (
               <SettingsSection title={i18nT('pages.settings.securityPanel.tailnet_section')}>

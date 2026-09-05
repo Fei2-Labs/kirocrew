@@ -214,7 +214,6 @@ src/kiro_crew/dashboard/handlers/mcp_apps.py
 src/kiro_crew/dashboard/handlers/mcp_custom.py
 src/kiro_crew/dashboard/handlers/memory.py
 src/kiro_crew/dashboard/handlers/notifications_push.py
-src/kiro_crew/dashboard/handlers/security.py
 src/kiro_crew/dashboard/handlers/side.py
 src/kiro_crew/dashboard/handlers/sso_login.py
 src/kiro_crew/dashboard/handlers/steering.py
