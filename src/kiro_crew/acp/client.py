@@ -102,6 +102,7 @@ from kiro_crew.acp.types import (
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
+    EVENT_PERMISSION_REQUEST,
     EVENT_SUBAGENT_ACTIVITY,
     EVENT_SUBAGENT_LIST,
     EVENT_TEXT_CHUNK,
@@ -1195,6 +1196,13 @@ _SKILL_FILE_BASENAME = "SKILL.md"
 #: reads. Far above any real turn's distinct skill reads; bounds memory for a
 #: long-lived session at the cost of at most one duplicate credit after a reset.
 _MAX_NOTED_SKILL_READS = 512
+
+#: How many shell permission requests may sit parked waiting for their arguments
+#: at once (see ``_park_unverified_permission``). A turn cannot legitimately hold
+#: more than a handful; past this the park is skipped and the request takes the
+#: unchanged deny-by-default path, so a backend that never refines cannot grow
+#: this map for the life of the turn.
+_MAX_PARKED_PERMISSIONS = 16
 
 
 def _mentions_skill_file(raw_params: dict | None, command: str | None) -> bool:
@@ -3191,6 +3199,11 @@ class AcpClient:
         # tool_call_id — the RESULT event carries no title. See
         # _maybe_fire_post_tool_hooks.
         self._observed_tool_calls: dict[str, tuple[str, str]] = {}
+        # Shell permission requests whose arguments had not streamed yet, keyed
+        # by toolCallId (see ``_park_unverified_permission``). Emptied per turn
+        # by ``_dispatch_events`` and flushed on every exit, so nothing parked
+        # here can outlive the turn that parked it.
+        self._parked_permissions: dict[str, JsonRpcMessage] = {}
         self._last_stop_reason: str = ""
         # Dynamic config from ACP session/new response and config_option_update notifications.
         # The effort selector is consumed from here, and so is the MODEL list on a
@@ -6673,6 +6686,9 @@ class AcpClient:
         self._tool_call_params.clear()
         # Reset the per-turn observed-tool-call bookkeeping (see __init__).
         self._observed_tool_calls.clear()
+        # Nothing may carry over: a parked request belongs to the turn that
+        # parked it, and the cancel below answers whatever the last turn left.
+        self._parked_permissions.clear()
         # A prior abandoned turn may have left server requests waiting. Answer
         # every one before this turn consumes more frames.
         await self._cancel_pending_permissions()
@@ -6695,6 +6711,12 @@ class AcpClient:
 
             if action == "complete":
                 got_complete = True
+                # A parked request is an outstanding JSON-RPC request the agent
+                # is blocked on. The turn may not end holding one, so anything
+                # whose arguments never arrived is emitted now and takes the
+                # unchanged deny-by-default path.
+                for _stranded in self._flush_parked_permissions():
+                    yield _stranded
                 result = msg.result or {}
                 reason = ""
                 if isinstance(result, dict):
@@ -6736,6 +6758,10 @@ class AcpClient:
                 )
                 return
             if action == "error":
+                # Same reason as the complete branch: never raise while holding a
+                # request the agent is blocked on.
+                for _stranded in self._flush_parked_permissions():
+                    yield _stranded
                 _raise_acp_error(msg.error, self._advertised_model_ids(), backend=self.backend)
             if action == "permission":
                 # Layer-2 evidence that the backend actually asks. The pre-flight
@@ -6745,7 +6771,13 @@ class AcpClient:
                     await self._reject_unanswerable_permission(msg)
                     continue
                 self._saw_permission_request = True
-                yield self._build_permission_event(msg)
+                _perm_event = self._build_permission_event(msg)
+                # Held, not dropped: a shell request whose arguments are still
+                # streaming is re-gated the moment they land, and flushed
+                # unchanged (i.e. denied) if they never do.
+                if self._park_unverified_permission(_perm_event, msg):
+                    continue
+                yield _perm_event
             elif action == "server_request_unknown":
                 await self._reject_unknown_server_request(msg)
             elif action == "update":
@@ -6846,6 +6878,15 @@ class AcpClient:
                 if tool_refine_event:
                     await self._maybe_note_skill_read(tool_refine_event)
                     yield tool_refine_event
+                    # This refinement is what a parked permission request was
+                    # waiting for: the caches now hold the arguments, so rebuild
+                    # and emit it. Yielded AFTER the refinement so the consumer's
+                    # pill is already patched when the approval arrives.
+                    _released = self._release_parked_permission(
+                        tool_refine_event.tool_call_id or ""
+                    )
+                    if _released is not None:
+                        yield _released
             elif action == "metadata":
                 self._track_metadata(msg)
             elif action == "compaction":
@@ -8329,6 +8370,112 @@ class AcpClient:
             )
         except Exception:  # pragma: no cover - audit must not break a live turn
             logger.debug("Could not record in-band ungated-tool event", exc_info=True)
+
+    def _park_unverified_permission(self, event: AcpEvent, msg: JsonRpcMessage) -> bool:
+        """Hold a shell permission request whose ARGUMENTS have not arrived yet.
+
+        Some adapters announce a tool call before its arguments finish streaming:
+        the initial ``tool_call`` notification carries an empty ``rawInput``, the
+        ``session/request_permission`` follows immediately, and the
+        ``tool_call_update`` refinement that actually carries ``{"command": …}``
+        lands a millisecond LATER. Gating on announcement therefore reads no
+        command at all, and ``HookManager.on_tool_call``'s deny-by-default
+        backstop refuses the call -- measured on the opencode backend as three
+        SEL events one millisecond apart: ``denied``, then two ``refined``.
+
+        That refusal is correct in isolation and deliberately has no override
+        (see ``hooks.py``: an override could only return ``allow``, which a
+        downstream YOLO/trust tier would then auto-grant). The fix upstream's own
+        comment asks for is to recognize the payload instead -- so this parks the
+        request until the arguments exist and gates it then, rather than admitting
+        a command no gate read.
+
+        Parking changes no verdict. It only changes WHEN the verdict is computed:
+
+        * a request whose arguments never arrive is flushed unchanged by
+          :meth:`_flush_parked_permissions` and takes exactly the same
+          deny-by-default path it takes today;
+        * the released event is rebuilt from the same frame through the same
+          parser, so the gate still reads the adapter's structured arguments and
+          never the LLM-authored title;
+        * nothing is auto-approved that was not before -- the hooks gate, the
+          trust tiers and the human prompt all run on the released event.
+
+        Returns True when the caller must NOT yield the event yet.
+
+        Only a request that is answerable and identifiable is parkable: without a
+        ``toolCallId`` there is nothing to match a refinement against, and an
+        unanswerable frame was already rejected upstream of here.
+        """
+        if event.kind != EVENT_PERMISSION_REQUEST:
+            return False
+        # Positive conditions only: park a call the transport CLASSIFIED as shell
+        # and whose command is missing. A non-shell request, or one whose command
+        # is already recoverable, is gated now exactly as before.
+        if not event.is_shell or event.shell_command:
+            return False
+        tool_call_id = event.tool_call_id or ""
+        if not tool_call_id:
+            return False
+        parked = getattr(self, "_parked_permissions", None)
+        if parked is None:
+            # Legacy/minimal construction (``__new__``) never ran __init__, so
+            # there is nowhere to park. Fall through to the unchanged deny rather
+            # than inventing state on a client that predates this mechanism.
+            return False
+        if len(parked) >= _MAX_PARKED_PERMISSIONS:
+            logger.warning(
+                "parked-permission cap reached (%d); gating %s without its arguments",
+                _MAX_PARKED_PERMISSIONS,
+                tool_call_id,
+            )
+            return False
+        parked[tool_call_id] = msg
+        logger.info(
+            "Permission request %s held for its arguments (req=%s)",
+            tool_call_id,
+            event.request_id,
+        )
+        return True
+
+    def _release_parked_permission(self, tool_call_id: str) -> AcpEvent | None:
+        """Rebuild a parked permission event now that its arguments are cached.
+
+        Called after a refinement wrote the provenance caches for this
+        ``toolCallId``. Returns None when nothing was parked for it, or when the
+        rebuild still cannot recover a command -- in which case the request stays
+        parked so a later refinement can still complete it, and the flush denies
+        it if none does.
+        """
+        parked = getattr(self, "_parked_permissions", None)
+        if not parked or not tool_call_id or tool_call_id not in parked:
+            return None
+        event = self._build_permission_event(parked[tool_call_id])
+        if not event.shell_command:
+            return None
+        del parked[tool_call_id]
+        logger.info("Permission request %s released with its arguments", tool_call_id)
+        return event
+
+    def _flush_parked_permissions(self) -> list[AcpEvent]:
+        """Emit every still-parked request so the turn cannot end holding one.
+
+        A parked request is an OUTSTANDING JSON-RPC request: the agent blocks on
+        its response, so it must reach a consumer that answers it. Flushing on
+        every exit is what keeps a missing refinement a DENY (the existing
+        behaviour) rather than a hang. The abandoned-generator case is covered
+        one layer out by ``_cancel_pending_permissions``, which answers every
+        entry in ``_permission_options`` at the next turn's start and on cancel.
+
+        The flushed events are rebuilt, not the originals: a refinement may have
+        landed for one of them after its own release check ran.
+        """
+        parked = getattr(self, "_parked_permissions", None)
+        if not parked:
+            return []
+        pending = list(parked.values())
+        parked.clear()
+        return [self._build_permission_event(msg) for msg in pending]
 
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
         """Build one permission event through the transport-shared parser.

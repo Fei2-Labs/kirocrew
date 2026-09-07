@@ -248,6 +248,40 @@ the exact cached server/tool pair; governance consumers receive that pair and
 the ambiguity bit directly and consume its canonical `@server/tool` reference
 instead of reparsing the display title.
 
+**A shell permission request whose ARGUMENTS have not streamed yet is held, not
+denied.** Some adapters announce a tool call before its arguments finish
+streaming: the initial `tool_call` notification carries an empty `rawInput`, the
+`session/request_permission` follows immediately, and the `tool_call_update`
+refinement carrying `{"command": …}` lands a millisecond later. Gating on the
+announcement reads no command, so `HookManager.on_tool_call`'s deny-by-default
+backstop refuses an ordinary call — measured on the opencode backend as three
+SEL events one millisecond apart (`denied`, `refined`, `refined`), with the
+persisted tool input carrying the full command all along.
+
+`_dispatch_events` therefore PARKS such a request (`_park_unverified_permission`,
+keyed by `toolCallId`, capped at `_MAX_PARKED_PERMISSIONS`) instead of yielding
+it, releases it through the same parser once the refinement has written the
+provenance caches (`_release_parked_permission`), and flushes anything still
+parked on the `complete` and `error` exits (`_flush_parked_permissions`). The
+verdict is unchanged in every direction — only its timing moves:
+
+- a request whose arguments never arrive is flushed **unverified** and takes
+  exactly the deny-by-default path it took before;
+- the released event is rebuilt from the same frame through
+  `build_permission_event`, so the gate still reads the adapter's structured
+  arguments and never the LLM-authored title;
+- a partial refinement that still carries no command does **not** consume the
+  park, so a later one can still complete it;
+- nothing is auto-approved that was not before: the hooks gate, the trust tiers
+  and the human prompt all run on the released event;
+- a client constructed with `__new__` (legacy/embedder paths) has nowhere to
+  park and falls back to the unchanged deny.
+
+The turn may never END holding one, because the agent is blocked on the response
+— a hang would be strictly worse than a deny. The abandoned-generator case is
+covered one layer out by `_cancel_pending_permissions`, which answers every
+entry in `_permission_options` at the next turn's start and on cancel.
+
 **Only an advertised optionId is ever sent, and no answer is invented.** `approve_tool(request_id, option_id=None, *, always=False)` resolves the advertised `allow_once` id from what THIS request recorded, and answers `outcome: "cancelled"` when there is none — a request advertising no one-shot allow option cannot be approved. There is **no grant storage**: Kiro Crew never selects `allow_always`, even when `always=True` or when that is the only advertised allow option, because persisting an adapter-side always-allow would skip later PreToolUse hooks. An **explicit** `option_id` is accepted only when it equals the advertised `allow_once` id; anything else — unknown, other kind, a stale prompt, a superseded request — cancels rather than substituting or echoing a foreign id. Every path **consumes** the recorded entry, so a request can be answered at most once. `_cancel_pending_permissions` drains the map and answers every still-outstanding request with `cancelled` before a turn is cancelled and before teardown; without it the adapter is left blocked on a reverse request that will never be answered, which strands the turn rather than ending it.
 
 **Permission frames are bound to one handle.** A `session/request_permission` with a missing `sessionId` is answered once at connection level (`-32601`) and is never approved from a session handle. A frame whose `sessionId` belongs to a different registered handle is rejected on this one. A foreign id that is not another registered session is a routed backend-internal child and may be answered on the owner handle. Unknown `optionId` values fail closed (cancel / reject), never invent an answer.

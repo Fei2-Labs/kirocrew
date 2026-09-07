@@ -200,6 +200,25 @@ conflict_policy:
       as the operator's workflow breaking again. `test/test_workflow_policy.py`
       is what catches it; run it after every sync.
 
+  - glob: "src/kiro_crew/acp/client.py"
+    policy: upstream_wins
+    keystone: true
+    note: |
+      9k+ lines, upstream rewrites it constantly. Take upstream whole, then
+      re-add the fork's parked-permission mechanism (see
+      divergences/permission-argument-race-park): the three helpers next to
+      `_build_permission_event`, the two module/instance state declarations, and
+      the FIVE call sites inside `_dispatch_events` (per-turn clear, park on the
+      permission branch, release after the refinement, flush on `complete`,
+      flush before `_raise_acp_error`).
+
+      Losing the flush call sites is the dangerous half and it fails LOUD in the
+      worst way: the agent blocks forever on an unanswered JSON-RPC request
+      instead of getting a deny. Losing the park is merely a regression to the
+      old behaviour. `test/test_permission_argument_race.py` covers both --
+      run it after every sync, and check upstream PR #6777 first, which may
+      supersede the whole divergence.
+
   - glob: "website/electron/auto-update.js"
     policy: upstream_wins
     keystone: true
@@ -302,6 +321,57 @@ divergences:
       test strict equality instead of truthiness.
     pinned_by: "test/test_workflow_policy.py, website/src/pages/settings/SecurityPanel.workflowPolicy.test.tsx"
     decided: 2026-09-05
+
+  - id: permission-argument-race-park
+    what: |
+      `acp/client.py` PARKS a `session/request_permission` that is classified as
+      shell but whose arguments have not streamed yet, releases it once the
+      `tool_call_update` refinement writes the provenance caches, and flushes
+      anything still parked on the `complete` / `error` exits.
+      Seams: `_MAX_PARKED_PERMISSIONS`, `self._parked_permissions`,
+      `_park_unverified_permission`, `_release_parked_permission`,
+      `_flush_parked_permissions`, plus five call sites inside
+      `_dispatch_events`.
+    why: |
+      opencode announces a tool call before its arguments finish streaming, so
+      `hooks.py`'s `is_shell and not command` deny-by-default backstop refused
+      every shell call from it. Measured: three SEL events one millisecond apart
+      (`denied`, `refined`, `refined`) while the persisted tool input carried the
+      full `{"command": ...}` the whole time, and `security.is_denied()` returns
+      None for that command -- nothing about it was actually disallowed.
+
+      That refusal is correct and deliberately has NO override: `ToolHookResult`
+      carries only allow / auto_approve / deny, so a suppression could at best
+      return `allow`, which a downstream YOLO or trust tier would then
+      auto-grant. Upstream's own comment names the right fix -- "the fix belongs
+      in recognizing the payload shape, not in admitting commands no gate read"
+      -- so this defers the READ rather than weakening the verdict. A request
+      whose arguments never arrive is still denied.
+
+      Modelled on upstream PR #9053 (issue #9024), which fixes the sibling case
+      (KAS sends no `tool_call` frame at all) and establishes the two rules this
+      follows: read the truth off the payload rather than a cache, and never let
+      a waiver turn a hard deny into an auto-approve. That PR does NOT fix this
+      case, and no upstream issue covers it.
+    pinned_by: "test/test_permission_argument_race.py"
+    decided: 2026-09-07
+
+  - id: opencode-backend-pending-upstream
+    what: |
+      The fork ships `ACP_BACKEND_OPENCODE` as a selectable harness with its own
+      adapter (`acp/opencode.py`) and registry entries.
+    why: |
+      Upstream PR #6777 (`feat(acp): add OpenCode harness`) is OPEN and does the
+      same thing its own way. When it lands, PREFER the upstream harness and
+      retire the fork's -- including divergences/permission-argument-race-park if
+      upstream's frame handling makes it unnecessary. Carrying both is how two
+      opencode identities end up in one `ACP_BACKENDS_*` set with different
+      capability memberships.
+
+      Check the PR's state at the start of every sync; do not re-derive the
+      fork's adapter on top of it.
+    pinned_by: "test/test_acp_backends_endpoint.py (selectable set), test/test_permission_argument_race.py"
+    decided: 2026-09-07
 
   - id: auth-grant-sources
     what: "Only explicit slot trust or global YOLO auto-approves a tool call."
