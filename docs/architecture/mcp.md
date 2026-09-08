@@ -653,6 +653,32 @@ Do NOT add regex to match natural-language variants of a command. The LLM does
 the interpreting. Handler keywords are only for instant user-typed commands that
 need no model round-trip (`cron list`, `spawn list`).
 
+### `session_handoff` serves callers that are not kiro-cli
+
+Every other tool here is reached by the agent Kiro Crew itself spawned.
+`session_handoff` is the one reached from OUTSIDE: an agent running in Claude
+Code or OpenClaw adds `kirocrew mcp-core` as an MCP server and hands work over,
+getting back a trackable Kiro Crew session (upstream #7697). That changes two
+assumptions, and both are load-bearing:
+
+- **No caller identity exists, and the tool must not want one.** An external
+  process has no gateway-injected `KIROCREW_SESSION_KEY` and no signed host pid,
+  so `_resolve_session_key_strict()` answers `""` and every session-TARGETING
+  tool correctly fails closed. `session_handoff` CREATES a session instead:
+  there is nothing to target and nothing to spoof, and the session belongs to
+  the operator rather than to the caller. Resolving identity leniently here
+  would walk process ancestors and attach to whatever slot happens to be up the
+  tree — the exact trap the statelessness rule names.
+- **It is gated on an operator opt-in, unlike every other tool in this server.**
+  `workflow_policy.allow_external_handoff`, default OFF. Installing a tool
+  server is not consent to autonomous runs; see security.md for the full
+  reasoning and for what a handed-over session is still NOT granted.
+
+The CLI twin is `kirocrew handoff`, which exists for the MCP-first pairing above
+and because an external agent that can only run a shell still needs the door.
+Both post the same body to `POST /api/chat/handoff`, where the single chokepoint
+(`dashboard/handoff.py`) lives, so neither can get a different answer.
+
 ### Server and tool inventory
 
 Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into

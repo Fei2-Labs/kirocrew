@@ -242,6 +242,57 @@ def _spawn(args: argparse.Namespace) -> None:
     print("Usage: kirocrew spawn {run|list}")
 
 
+def _handoff(args: argparse.Namespace) -> None:
+    """Start a trackable Kiro Crew session for work handed over from outside.
+
+    The CLI half of the ``session_handoff`` MCP tool. Both post the same body to
+    the same endpoint, where every decision lives — so an external agent that
+    can only run a shell command reaches exactly the same gate as one that
+    speaks MCP, and neither can get a different answer.
+    """
+    base = f"http://127.0.0.1:{args.port}"
+    payload = {
+        "origin": args.origin,
+        "prompt": args.prompt,
+        "project": args.project,
+        "title": args.title,
+        "agent": args.agent,
+        "model": args.model,
+        "start": bool(args.start),
+    }
+    req = urllib.request.Request(
+        f"{base}/api/chat/handoff",
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-Internal-Secret": _internal_secret(args.port),
+        },
+    )
+    try:
+        with loopback_urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+            print(f"Error: {body.get('error', e.reason)}")
+        except Exception:
+            print(f"Error: {e.code} {e.reason}")
+        sys.exit(1)
+    except (urllib.error.URLError, OSError):
+        print("Error: gateway not running (cannot reach dashboard on port %d)" % args.port)
+        sys.exit(1)
+
+    slot = result.get("slot", "")
+    if result.get("started"):
+        state = "running"
+    elif result.get("queued"):
+        state = "queued behind the current turn"
+    else:
+        state = "parked (nothing sent)"
+    print(f"Session {slot} — {state}")
+    print(f"Open: {base}/chat?sid={slot}")
+
+
 def _spawn_run(args: argparse.Namespace, base: str) -> None:
     """Spawn a subagent via the dashboard API."""
     data = json.dumps({"task": args.task}).encode()

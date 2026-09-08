@@ -1567,6 +1567,15 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "label": "How long auto-approve stays on"
   },
   {
+    "id": "security.let-other-agents-hand-work-over",
+    "label": "Let other agents hand work over",
+    "labelKey": "pages.settings.securityPanel.allow_external_handoff_title",
+    "description": "Lets an agent running outside Kiro Crew — Claude Code, OpenClaw, Codex — start a session here that you can watch and continue.",
+    "tab": "security",
+    "type": "toggle",
+    "occurrence": 1
+  },
+  {
     "id": "security.live-security-posture",
     "labelKey": "pages.settings.securityPanel.live_security_posture",
     "tab": "security",

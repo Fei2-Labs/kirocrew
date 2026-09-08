@@ -61,6 +61,7 @@ from kiro_crew.validation import (
     REGISTER_HOOK_SCHEMA,
     RESET_CONVERSATION_SCHEMA,
     SELECT_CREW_SCHEMA,
+    SESSION_HANDOFF_SCHEMA,
     SET_PROJECT_SCHEMA,
     SUGGEST_FOLLOWUP_SCHEMA,
     TASK_RUN_SCHEMA,
@@ -508,6 +509,83 @@ def schemas() -> list[dict[str, Any]]:
                         "description": "Replacement actionable-wake instructions",
                     },
                 },
+            },
+        },
+        {
+            "name": "session_handoff",
+            "description": (
+                "Hand a piece of work over to Kiro Crew as a NEW trackable session. "
+                "Use when you are running OUTSIDE Kiro Crew (Claude Code, OpenClaw, "
+                "Codex) and the user wants the work continued there: the session "
+                "appears in the Kiro Crew sidebar labelled with where it came from, "
+                "keeps its own history, and can be resumed by hand. "
+                "\n\n"
+                "This does NOT move your conversation. It starts a fresh Kiro Crew "
+                "session whose first message is the prompt you pass, so state the "
+                "task completely — the new session cannot see anything you did not "
+                "put in `prompt`. Reference files by absolute path rather than "
+                "pasting them; the prompt is capped. "
+                "\n\n"
+                "By default the session STARTS its turn immediately and runs "
+                "unattended, and this returns without waiting for it — poll the "
+                "session, or tell the user to open the returned slot. Pass "
+                "start=false to create it parked instead. "
+                "\n\n"
+                "Authorization: the operator must have turned external handoff on "
+                "(Settings > Security > Rules); it is OFF by default and this tool "
+                "then refuses. A handed-over session gains NO approval authority — "
+                "it runs under the grants already in place and stops at the first "
+                "tool they do not cover, so do not promise the user it will finish "
+                "unattended."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "origin": {
+                        "type": "string",
+                        "enum": ["claude_code", "openclaw", "codex", "external"],
+                        "description": (
+                            "Which tool you are. Shown to the user as the session's "
+                            "source, so name yourself honestly; 'external' is the "
+                            "fallback for a tool with no id of its own."
+                        ),
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The work item, stated completely and standalone. Max "
+                            "16000 characters."
+                        ),
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path the new session should work in. Vetted "
+                            "server-side; a sensitive path (~/.aws, ~/.ssh, the Kiro "
+                            "Crew trust root) is refused. Omit for no project."
+                        ),
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Short session title for the sidebar. Optional.",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Kiro Crew agent to answer. Omit for the default.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model id. Omit to inherit the session default.",
+                    },
+                    "start": {
+                        "type": "boolean",
+                        "description": (
+                            "Start the turn now (default true). false creates the "
+                            "session parked for the user to send by hand."
+                        ),
+                    },
+                },
+                "required": ["origin", "prompt"],
             },
         },
         {
@@ -1324,6 +1402,56 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def session_handoff(name: str, args: dict[str, Any]) -> str:
+    """Start a trackable Kiro Crew session for work handed over from outside.
+
+    Stateless, and it must be: the caller is an EXTERNAL agent, so it has no
+    Kiro Crew session identity at all (no gateway-injected session key, no signed
+    host pid). Resolving one would either fail closed or — with the lenient
+    resolver — walk process ancestors and attach to whatever slot happens to be
+    up the tree. Creating a NEW session is what makes identity unnecessary here:
+    there is nothing to target and nothing to spoof, and the session that appears
+    belongs to the operator rather than to the caller.
+
+    Every decision lives behind ``POST /api/chat/handoff`` in
+    ``dashboard.handoff`` — the operator opt-in, the closed origin set, the
+    project vetting, the unattended wiring, the audit — so this tool and the HTTP
+    route cannot drift apart.
+    """
+    args = validate_tool_args(args, SESSION_HANDOFF_SCHEMA)
+    d = mcp_core._post(
+        "/api/chat/handoff",
+        {
+            "origin": args["origin"],
+            "prompt": args["prompt"],
+            "project": args.get("project", ""),
+            "title": args.get("title", ""),
+            "agent": args.get("agent", ""),
+            "model": args.get("model", ""),
+            "start": args.get("start", True),
+        },
+    )
+    if d.get("error"):
+        # The refusal text is operator-facing and already actionable (it names
+        # the setting to turn on), so it is surfaced verbatim rather than
+        # flattened into a generic failure the caller cannot act on.
+        return f"Error: {d['error']}"
+    slot = str(d.get("slot", ""))
+    if d.get("started"):
+        state = "running now"
+    elif d.get("queued"):
+        state = "queued behind the session's current turn"
+    else:
+        state = "created and parked (nothing sent)"
+    where = f" in {d['project']}" if d.get("project") else ""
+    return (
+        f"Handed over to Kiro Crew session {slot}{where} — {state}. "
+        "It runs under the approval grants already in place and will stop at any "
+        "tool they do not cover; tell the user to open that session in Kiro Crew "
+        "to watch or continue it."
+    )
+
+
 def set_project(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, SET_PROJECT_SCHEMA)
     # Stateless: the session-aware consumer (chat_runner) applies the
@@ -1384,6 +1512,7 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "monitor_inspect": monitor_inspect,
     "monitor_stop": monitor_stop,
     "monitor_update": monitor_update,
+    "session_handoff": session_handoff,
     "set_project": set_project,
     "reset_conversation": reset_conversation,
     "suggest_followup": suggest_followup,

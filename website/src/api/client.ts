@@ -835,6 +835,9 @@ export interface WorkflowPolicyData {
   /** Whether `SSH_AUTH_SOCK` reaches the sandboxed agent, so ssh remotes and
    *  ssh-signed commits work from inside it. */
   forward_ssh_agent: boolean
+  /** Whether an agent running OUTSIDE Kiro Crew (Claude Code, OpenClaw, Codex)
+   *  may start an unattended session here via `session_handoff`. */
+  allow_external_handoff: boolean
   /** Built-in rule ids the always-on floor enforces RIGHT NOW. Empty in
    *  repository-governed mode, which is why it travels with the mode: the deny
    *  rows must not render locked once the floor has stood down. */
@@ -2333,7 +2336,7 @@ export const api = {
   // refreshed snapshot so callers can seed their query cache from the response.
   deniedCommands: () => get('/api/security/denied-commands').then(j) as Promise<DeniedCommandsData>,
   workflowPolicy: () => get('/api/security/workflow-policy').then(j) as Promise<WorkflowPolicyData>,
-  setWorkflowPolicy: (patchBody: Partial<Pick<WorkflowPolicyData, 'git_publication_mode' | 'forward_ssh_agent'>>) =>
+  setWorkflowPolicy: (patchBody: Partial<Pick<WorkflowPolicyData, 'git_publication_mode' | 'forward_ssh_agent' | 'allow_external_handoff'>>) =>
     patch('/api/security/workflow-policy', patchBody).then(j) as Promise<WorkflowPolicyData>,
   toggleBuiltinDeniedCommand: (id: string, enabled: boolean) =>
     patch('/api/security/denied-commands/builtins/' + encodeURIComponent(id), { enabled }).then(j) as Promise<DeniedCommandsData>,

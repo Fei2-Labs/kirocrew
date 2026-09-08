@@ -49,6 +49,7 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/source/contributors", api_app_contributors)
     app.router.add_get("/api/chat/slots", chat.api_chat_slots)
     app.router.add_post("/api/chat/slots", chat.api_chat_slot_create)
+    app.router.add_post("/api/chat/handoff", chat.api_chat_handoff)
     app.router.add_post("/api/chat/slots/cleanup", chat.api_chat_slots_cleanup)
     app.router.add_post("/api/chat/slots/model", chat.api_chat_slots_model)
     # Static segment BEFORE the {slot} routes below, matching the cleanup/model

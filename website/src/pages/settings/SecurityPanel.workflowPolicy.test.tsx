@@ -37,11 +37,14 @@ const GOVERNED_LABEL = 'Repository-governed'
 const GOVERNED_WARNING = /Configure branch protection on the remote/i
 const SSH_LABEL = 'Forward the ssh-agent socket'
 const SSH_WARNING = /Every key your ssh-agent holds/i
+const HANDOFF_LABEL = 'Let other agents hand work over'
+const HANDOFF_WARNING = /Any program running as you can then start an unattended session/i
 
 function policy(overrides: Partial<WorkflowPolicyData> = {}): WorkflowPolicyData {
   return {
     git_publication_mode: 'protected',
     forward_ssh_agent: false,
+    allow_external_handoff: false,
     floor_enforced_ids: ['git-publish-push-bare'],
     ...overrides,
   }
@@ -151,6 +154,44 @@ describe('ssh-agent forwarding', () => {
     fireEvent.click(screen.getByRole('switch', { name: SSH_LABEL }))
     await waitFor(() => {
       expect(api.setWorkflowPolicy).toHaveBeenCalledWith({ forward_ssh_agent: true })
+    })
+  })
+})
+
+describe('external handoff', () => {
+  beforeEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+    ;(api.deniedCommands as ReturnType<typeof vi.fn>).mockResolvedValue({
+      builtins: [], user_added: [], disable_all: false, effective_count: 0, governance_locked: false,
+    })
+    ;(api.securityPosture as ReturnType<typeof vi.fn>).mockResolvedValue({ controls: [] })
+    ;(api.governancePolicy as ReturnType<typeof vi.fn>).mockResolvedValue({ scopes: [] })
+    ;(api.kirocrewConfig as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    ;(api.tailnetStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: false, governance_pinned: false, host: '', origin: '', resolved_at: 0, state: 'off',
+    })
+  })
+
+  it('is off by default and carries no warning until it is on', async () => {
+    await renderRules()
+    expect(screen.getByRole('switch', { name: HANDOFF_LABEL })).toBeTruthy()
+    expect(screen.queryByText(HANDOFF_WARNING)).toBeNull()
+  })
+
+  it('states what it opens while it is active', async () => {
+    await renderRules(policy({ allow_external_handoff: true }))
+    expect(screen.getByText(HANDOFF_WARNING)).toBeTruthy()
+  })
+
+  it('sends only its own field, leaving the other two alone', async () => {
+    await renderRules()
+    ;(api.setWorkflowPolicy as ReturnType<typeof vi.fn>).mockResolvedValue(
+      policy({ allow_external_handoff: true }),
+    )
+    fireEvent.click(screen.getByRole('switch', { name: HANDOFF_LABEL }))
+    await waitFor(() => {
+      expect(api.setWorkflowPolicy).toHaveBeenCalledWith({ allow_external_handoff: true })
     })
   })
 })

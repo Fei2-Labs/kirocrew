@@ -586,6 +586,7 @@ def _workflow_policy_payload() -> dict:
     return {
         "git_publication_mode": workflow_policy.git_publication_mode(state),
         "forward_ssh_agent": workflow_policy.forward_ssh_agent(state),
+        "allow_external_handoff": workflow_policy.allow_external_handoff(state),
         "floor_enforced_ids": sorted(floor_enforced_builtin_command_ids()),
     }
 
@@ -632,6 +633,12 @@ async def api_workflow_policy_patch(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "forward_ssh_agent must be a boolean", "code": "bad_type"}, status=400
         )
+    handoff = body.get("allow_external_handoff")
+    if handoff is not None and not isinstance(handoff, bool):
+        _audit(request, operation=op, outcome="denied", resources="allow_external_handoff=bad_type")
+        return web.json_response(
+            {"error": "allow_external_handoff must be a boolean", "code": "bad_type"}, status=400
+        )
 
     def _write() -> dict:
         # A file that exists but does not parse reads as {} here, which would let
@@ -652,6 +659,8 @@ async def api_workflow_policy_patch(request: web.Request) -> web.Response:
             state[workflow_policy.KEY_GIT_PUBLICATION_MODE] = mode
         if forward is not None:
             state[workflow_policy.KEY_FORWARD_SSH_AGENT] = forward
+        if handoff is not None:
+            state[workflow_policy.KEY_ALLOW_EXTERNAL_HANDOFF] = handoff
         workflow_policy.save_state(state)
         return _workflow_policy_payload()
 
@@ -671,7 +680,8 @@ async def api_workflow_policy_patch(request: web.Request) -> web.Response:
         outcome="ok",
         resources=(
             f"git_publication_mode={payload['git_publication_mode']} "
-            f"forward_ssh_agent={payload['forward_ssh_agent']}"
+            f"forward_ssh_agent={payload['forward_ssh_agent']} "
+            f"allow_external_handoff={payload['allow_external_handoff']}"
         ),
     )
     return web.json_response(payload)

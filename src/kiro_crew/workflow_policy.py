@@ -10,9 +10,9 @@ writes on the tool path and ``is_sensitive_bash_command`` blocks the shell forms
 (``cat``, ``>``, ``tee``, archive extraction into the trust root). The only writer
 is the dashboard handler, which does not route through the agent tool gate.
 
-Two INDEPENDENT opt-ins live here. They are not a general "overrides" bucket:
+Three INDEPENDENT opt-ins live here. They are not a general "overrides" bucket:
 each is a named decision with its own default, its own failure direction, and its
-own reason for existing. Do not add a third without the same treatment.
+own reason for existing. Do not add a fourth without the same treatment.
 
 ``git_publication_mode``
     ``"protected"`` (default) keeps Kiro Crew's built-in git-publication floor:
@@ -44,9 +44,28 @@ own reason for existing. Do not add a third without the same treatment.
     otherwise impossible from inside the sandbox — the agent finds no askpass and
     the commit simply fails.
 
-Every read fails soft to the SAFE position — ``protected`` and no forwarding — for
-the same reason ``computer_use.load_state`` fails soft to disabled: a missing,
-truncated or hand-mangled ceiling file must never be read generously.
+``allow_external_handoff``
+    ``False`` (default) refuses ``POST /api/chat/handoff`` and its
+    ``session_handoff`` MCP tool: an external agent cannot make this host start
+    an unattended Kiro Crew run.
+
+    ``True`` permits it. What that opens is narrow but real: any local process
+    that can read the gateway's own secret — which is every process running as
+    this user — can then create a chat session and START a turn in it, without a
+    human in the loop at that moment. It is a separate decision from installing
+    the MCP server, because installing a read-only tool server and authorising
+    autonomous runs are not the same consent.
+
+    What it deliberately does NOT open: a handed-over session gains no approval
+    authority. It runs under the grants the operator already made (slot trust,
+    YOLO) and stops at the first tool those do not cover, exactly like any other
+    unattended slot. Auto-approval sources stay slot trust or YOLO only — see the
+    ``auth-grant-sources`` divergence, which removed ``approval_mode: "auto"`` as
+    an unconditional grant. Opening this flag must never become a fourth source.
+
+Every read fails soft to the SAFE position — ``protected``, no forwarding, no
+handoff — for the same reason ``computer_use.load_state`` fails soft to disabled:
+a missing, truncated or hand-mangled ceiling file must never be read generously.
 """
 
 from __future__ import annotations
@@ -85,6 +104,9 @@ GIT_PUBLICATION_MODES: frozenset[str] = frozenset(
 
 #: Key holding the ssh-agent forwarding opt-in.
 KEY_FORWARD_SSH_AGENT = "forward_ssh_agent"
+
+#: Key holding the external-handoff opt-in.
+KEY_ALLOW_EXTERNAL_HANDOFF = "allow_external_handoff"
 
 
 def workflow_policy_path() -> Path:
@@ -160,6 +182,17 @@ def forward_ssh_agent(state: "dict | None" = None) -> bool:
     return data.get(KEY_FORWARD_SSH_AGENT) is True
 
 
+def allow_external_handoff(state: "dict | None" = None) -> bool:
+    """Whether an external agent may start an unattended session on this host.
+
+    Strict identity against ``True``, like the other two: a hand-edited
+    ``"true"`` string is truthy in Python and must not authorise autonomous runs
+    launched by anything that can read a local secret.
+    """
+    data = load_state() if state is None else state
+    return data.get(KEY_ALLOW_EXTERNAL_HANDOFF) is True
+
+
 def save_state(state: dict) -> None:
     """Write the keystone state atomically, owner-only.
 
@@ -180,6 +213,9 @@ def save_state(state: dict) -> None:
     forward = state.get(KEY_FORWARD_SSH_AGENT, False)
     if not isinstance(forward, bool):
         raise ValueError("forward_ssh_agent must be a bool")
+    handoff = state.get(KEY_ALLOW_EXTERNAL_HANDOFF, False)
+    if not isinstance(handoff, bool):
+        raise ValueError("allow_external_handoff must be a bool")
     payload: dict[str, Any] = dict(state)
     atomic_write(
         workflow_policy_path(), json.dumps(payload, indent=2) + "\n", mode=_STATE_FILE_MODE

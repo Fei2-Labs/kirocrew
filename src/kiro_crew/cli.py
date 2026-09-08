@@ -1438,6 +1438,41 @@ Examples:
         "--env", "-e", action="append", metavar="K=V", help="Extra env vars (repeatable)"
     )
 
+    # handoff (the CLI half of the session_handoff MCP tool — MCP-first pairs
+    # every LLM-facing capability with a command, so an external agent that can
+    # only run a shell still reaches it).
+    handoff_parser = cli_help.add_command(
+        sub,
+        "handoff",
+        epilog="""
+Examples:
+  kirocrew handoff --origin claude_code 'finish the migration in ~/repo'
+  kirocrew handoff --origin openclaw --project ~/repo --title 'DNS sync' 'run the dry-run'
+  kirocrew handoff --origin external --no-start 'review this later'
+
+Requires external handoff to be ON (Settings > Security > Rules); it is off by
+default. The new session runs under the approval grants already in place.
+""",
+        formatter_class=_fmt,
+    )
+    handoff_parser.add_argument("prompt", help="The work item, stated standalone")
+    handoff_parser.add_argument(
+        "--origin",
+        default="external",
+        choices=["claude_code", "openclaw", "codex", "external"],
+        help="Which tool is handing over (shown as the session's source)",
+    )
+    handoff_parser.add_argument("--project", default="", help="Absolute path to work in")
+    handoff_parser.add_argument("--title", default="", help="Session title for the sidebar")
+    handoff_parser.add_argument("--agent", default="", help="Kiro Crew agent to answer")
+    handoff_parser.add_argument("--model", default="", help="Model id")
+    handoff_parser.add_argument(
+        "--no-start",
+        dest="start",
+        action="store_false",
+        help="Create the session parked instead of starting its turn",
+    )
+
     # spawn
     spawn_parser = cli_help.add_command(
         sub,
@@ -2701,6 +2736,10 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         from kiro_crew.cli_commands import _cron
 
         _cron(args)
+    elif args.command == "handoff":
+        from kiro_crew.cli_commands import _handoff
+
+        _handoff(args)
     elif args.command == "spawn":
         from kiro_crew.cli_commands import _spawn
 

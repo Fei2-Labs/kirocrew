@@ -43,6 +43,7 @@ from kiro_crew.dashboard.chat_fork import api_chat_slot_fork  # noqa: F401
 from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     MAX_COLOR_INDEX,
     api_chat,
+    api_chat_handoff,
     api_chat_mode,
     api_chat_slot_agent,
     api_chat_slot_approve,

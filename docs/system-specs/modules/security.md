@@ -1051,6 +1051,28 @@ than truthiness (a hand-edited `"true"` string must not open a ceiling).
   callers must re-read rather than cache it. The API's disable rejection reads it
   per request and off the event loop, because the read touches the filesystem.
 
+- **`allow_external_handoff`** — `false` (default) refuses
+  `POST /api/chat/handoff` and its `session_handoff` MCP tool, so an agent
+  running outside Kiro Crew (Claude Code, OpenClaw, Codex) cannot make this host
+  start an unattended run. `true` permits it.
+
+  The transport already admits any local process running as this user — the
+  gateway secret is readable by all of them — so the endpoint grants no new
+  transport reach. The opt-in exists because "a local process may read my
+  sessions" and "a local process may start an autonomous agent run on my
+  machine" are different consents, and installing a tool server must not
+  silently give the second.
+
+  What it does NOT open: a handed-over session gains no approval authority. The
+  slot is created APP-OWNED (`_app = "handoff:<origin>"`), which puts it on the
+  unattended path — the deny-fast approval window applies and the turn is
+  charged against the background-turn cap — and it runs under the grants the
+  operator already made, stopping at the first tool they do not cover.
+  Auto-approval sources stay slot trust or YOLO only (the `auth-grant-sources`
+  divergence); this flag must never become a third. Chokepoint, closed origin
+  set, project vetting and the both-directions audit live in
+  `dashboard/handoff.py`; `test_handoff.py` pins the closed direction.
+
 - **`forward_ssh_agent`** — `false` (default) keeps `SSH_AUTH_SOCK` in
   `sandbox._sensitive_env_prefixes()`, so agent-run `ssh` and `git` cannot reach
   the operator's ssh-agent. `true` removes that one prefix and nothing else: the

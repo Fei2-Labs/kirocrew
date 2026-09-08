@@ -1591,7 +1591,7 @@ function WorkflowPolicyCard() {
   const qc = useQueryClient()
   const { data } = useQuery<WorkflowPolicyData>({ queryKey: ['workflow-policy'], queryFn: api.workflowPolicy })
   const save = useMutation({
-    mutationFn: (body: Partial<Pick<WorkflowPolicyData, 'git_publication_mode' | 'forward_ssh_agent'>>) => api.setWorkflowPolicy(body),
+    mutationFn: (body: Partial<Pick<WorkflowPolicyData, 'git_publication_mode' | 'forward_ssh_agent' | 'allow_external_handoff'>>) => api.setWorkflowPolicy(body),
     onSuccess: (snap: WorkflowPolicyData) => {
       qc.setQueryData(['workflow-policy'], snap)
       // The deny rows' locked state is derived from the same floor this mode
@@ -1659,6 +1659,22 @@ function WorkflowPolicyCard() {
           <div className="text-[11px] text-warn mt-1 flex items-start gap-1">
             <AlertTriangle size={11} className="shrink-0 mt-0.5" />
             <span>{i18nT('pages.settings.securityPanel.forward_ssh_agent_warning')}</span>
+          </div>
+        )}
+      </div>
+
+      <div className="border-t border-border mt-3 pt-2">
+        <SettingsToggle
+          label={i18nT('pages.settings.securityPanel.allow_external_handoff_title')}
+          description={i18nT('pages.settings.securityPanel.allow_external_handoff_desc')}
+          checked={data?.allow_external_handoff ?? false}
+          disabled={save.isPending || !data}
+          onChange={next => save.mutate({ allow_external_handoff: next })}
+        />
+        {data?.allow_external_handoff && (
+          <div className="text-[11px] text-warn mt-1 flex items-start gap-1">
+            <AlertTriangle size={11} className="shrink-0 mt-0.5" />
+            <span>{i18nT('pages.settings.securityPanel.allow_external_handoff_warning')}</span>
           </div>
         )}
       </div>

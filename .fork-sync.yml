@@ -298,7 +298,9 @@ divergences:
       `git_publication_mode: protected|repository_governed` retires the
       verb-anchored git-publication floor in favour of the remote host's
       rulesets and branch protection, and `forward_ssh_agent` drops
-      `SSH_AUTH_SOCK` from the sandbox scrub set. Enforcement seams:
+      `SSH_AUTH_SOCK` from the sandbox scrub set.
+      A THIRD key `allow_external_handoff` gates
+      divergences/external-agent-handoff. Enforcement seams:
       `security._git_publication_floor_applies()`,
       `security.floor_enforced_builtin_command_ids()`,
       `sandbox._sensitive_env_prefixes()` / `_spawn_scrub_env_prefixes()`, the
@@ -372,6 +374,43 @@ divergences:
       fork's adapter on top of it.
     pinned_by: "test/test_acp_backends_endpoint.py (selectable set), test/test_permission_argument_race.py"
     decided: 2026-09-07
+
+  - id: external-agent-handoff
+    what: |
+      An agent running OUTSIDE Kiro Crew starts a trackable session here:
+      `dashboard/handoff.py` (the chokepoint), `POST /api/chat/handoff`, the
+      `session_handoff` MCP tool in `mcp_tools/control.py`, the
+      `kirocrew handoff` CLI twin, the `handoff_origin` field on the serialized
+      slot, and a third keystone opt-in `allow_external_handoff` in
+      `workflow_policy.json` (default OFF).
+    why: |
+      Upstream asks for this in two halves and has implemented neither:
+      kirodotdev/KiroCrew#7697 (an entry point an external agent can call, whose
+      run must appear as a real trackable session) and #7797 (finding
+      non-dashboard sessions in the dashboard, for kiro-cli). The operator wanted
+      Claude Code and OpenClaw work continuable in Kiro Crew; handing the WORK
+      over is the clean half of that, because importing another tool's transcript
+      would need a new read-only slot kind and could never actually continue.
+
+      Both clients reach it through one door: they are MCP clients, so
+      `kirocrew mcp-core` in their own `mcpServers` config is the whole
+      integration. No per-tool adapter.
+
+      Security shape, all deliberate:
+        * identity is NOT resolved -- an external caller has none, and creating a
+          session rather than targeting one is what makes that safe;
+        * the slot is app-owned (`handoff:<origin>`), so it lands on the
+          unattended path: deny-fast approval window plus the background-turn cap;
+        * it gains NO approval authority. Auto-approve sources stay slot trust or
+          YOLO only (see divergences/auth-grant-sources). This must never become
+          a third source;
+        * `KNOWN_ORIGINS` is closed because the value is persisted, rendered in
+          the sidebar, and interpolated into the provenance line the model reads.
+
+      If #7697 lands upstream, PREFER its entry point and retire this one rather
+      than carrying both.
+    pinned_by: "test/test_handoff.py, website/src/pages/settings/SecurityPanel.workflowPolicy.test.tsx"
+    decided: 2026-09-08
 
   - id: auth-grant-sources
     what: "Only explicit slot trust or global YOLO auto-approves a tool call."

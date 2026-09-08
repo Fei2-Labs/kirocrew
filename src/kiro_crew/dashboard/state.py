@@ -7438,6 +7438,12 @@ class DashboardState:
                 "slack_channel": slack_channel,
                 "slack_thread_ts": slack_thread_ts,
                 "provider_label": self._resolve_provider_label(slot),
+                # Where a handed-over session came from ("claude_code",
+                # "openclaw", …), or "" for every other slot. Derived from the
+                # ``_app`` owner tag rather than stored twice, and validated
+                # against the closed origin set on the way out, so a hand-edited
+                # session file cannot put free text on the sidebar.
+                "handoff_origin": self._handoff_origin(slot),
             }
         )
         # Live harness, not the configured default: an open chat keeps the
@@ -7447,6 +7453,20 @@ class DashboardState:
         if live_backend is not None:
             payload["acp_backend"] = live_backend
         return payload
+
+    def _handoff_origin(self, slot: _ChatSlot) -> str:
+        """The external tool that handed this session over, or ``""``.
+
+        Defensive: ``serialize_slot`` runs on every sidebar push, and a slot
+        whose ``_app`` predates this tag (or is an ordinary App Kit app) must
+        answer "" rather than raise into the serializer.
+        """
+        try:
+            from kiro_crew.dashboard.handoff import origin_of
+
+            return origin_of(getattr(slot, "_app", "") or "")
+        except Exception:  # pragma: no cover - the serializer must never raise
+            return ""
 
     def _resolve_provider_label(self, slot: _ChatSlot) -> str:
         """Return the ACP backend identity actually bound to *slot*.

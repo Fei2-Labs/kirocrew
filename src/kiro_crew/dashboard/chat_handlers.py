@@ -2005,6 +2005,56 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
 _CREATABLE_MODES = ("", "orchestrator", "crew", "design-critique")
 
 
+async def api_chat_handoff(request: web.Request) -> web.Response:
+    """POST /api/chat/handoff — an external agent starts a trackable session.
+
+    Thin: every decision (the operator opt-in, the closed origin set, the
+    project vetting, the unattended wiring, the audit) lives in
+    ``dashboard.handoff``, because the ``session_handoff`` MCP tool reaches the
+    same chokepoint and the two must not drift.
+
+    Returns 403 with ``code: "handoff_not_permitted"`` while the keystone opt-in
+    is off, which is the default — installing the MCP server does not by itself
+    authorise autonomous runs on this host.
+    """
+    from kiro_crew.dashboard.handoff import HandoffRefused, start_handoff
+
+    state: DashboardState = request.app["state"]
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None
+    try:
+        result = await start_handoff(
+            state,
+            origin=body.get("origin", ""),
+            prompt=body.get("prompt", ""),
+            project=body.get("project", "") or "",
+            agent=body.get("agent", "") or "",
+            model=body.get("model", "") or "",
+            title=body.get("title", "") or "",
+            # Absent means START. The caller is an agent handing work over, and
+            # a handoff that silently parked would look identical to one that
+            # ran until someone opened the dashboard.
+            start=body.get("start", True) is not False,
+        )
+    except HandoffRefused as exc:
+        # Two STATIC statuses rather than ``status=exc.status``: a computed status
+        # is how the error-code contract gate gets defeated (it cannot see
+        # whether a response is even an error), so that bucket is ratcheted too.
+        # The classification here is genuinely two-valued — the caller got the
+        # request wrong, or the operator has not permitted it — so writing it out
+        # costs nothing and keeps the response statically checkable.
+        # The body is written out at each site rather than hoisted into a local:
+        # the contract gate ratchets an opaque body for the same reason it
+        # ratchets a computed status — hoisting is the other way to make an
+        # un-coded response invisible to a static scan.
+        if exc.status == 400:
+            return web.json_response({"error": str(exc), "code": exc.code}, status=400)
+        return web.json_response({"error": str(exc), "code": exc.code}, status=403)
+    return web.json_response(result)
+
+
 async def api_chat_slot_create(request: web.Request) -> web.Response:
     """POST /api/chat/slots — create a new chat slot."""
     state: DashboardState = request.app["state"]

@@ -173,6 +173,11 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
         "TEAMS_MAX_ACTIVITY_BYTES",
         _BOUNDED_EXPLICIT,
     ),
+    # External-agent handoff. The body is one work-item prompt plus a handful of
+    # control fields, and the prompt has its own tighter cap
+    # (``handoff.MAX_PROMPT_CHARS``) enforced after parsing -- so the shared
+    # ceiling is the right OUTER bound and is applied by taking the default.
+    "chat_handlers.py::api_chat_handoff": ("<default>", _BOUNDED_CONTROL_FIELDS),
     # agents.py tranche.
     "handlers/agents.py::api_agent_config": ("None", _UNBOUNDED_USER_CONTENT),
     "handlers/agents.py::api_default_agent": ("None", _CONTROL_FIELDS_CAP_PENDING),

@@ -1317,6 +1317,40 @@ SET_PROJECT_SCHEMA = ToolSchema(
 # returns most of what the reset reclaimed. The HTTP route
 # (POST /api/chat/slots/{slot}/reset-conversation) still carries a replay flag
 # for the rare caller that genuinely wants the provider reset without it.
+# session_handoff launches a NEW trackable session for work an EXTERNAL agent
+# hands over (Claude Code, OpenClaw, ...). Every field is caller-authored and
+# two of them land somewhere durable, so the shapes are tight:
+#
+# - ``origin`` is an enum, not free text: it is persisted on the slot, rendered
+#   in the sidebar, and interpolated into the provenance line the model reads.
+#   ``dashboard.handoff.KNOWN_ORIGINS`` is the authority; this list mirrors it
+#   and ``test_handoff`` pins the two together, because a value that passes here
+#   and is refused there would be a 400 the caller cannot act on.
+# - ``prompt`` carries the work item. The cap matches
+#   ``handoff.MAX_PROMPT_CHARS``: a caller with more context to move references
+#   a file instead, which also keeps it out of the session log.
+# - ``project`` is an absolute path, re-vetted server-side (realpath, isdir,
+#   not sensitive) exactly as the dashboard's own slot-create vets it.
+# - ``title`` is display-only.
+SESSION_HANDOFF_SCHEMA = ToolSchema(
+    tool_name="session_handoff",
+    fields=[
+        FieldSpec(
+            "origin",
+            str,
+            required=True,
+            max_len=32,
+            allowed=frozenset({"claude_code", "openclaw", "codex", "external"}),
+        ),
+        FieldSpec("prompt", str, required=True, max_len=16_000),
+        FieldSpec("project", str, max_len=4096, pattern=_ABSOLUTE_PATH_RE),
+        FieldSpec("title", str, max_len=200),
+        FieldSpec("agent", str, max_len=64),
+        FieldSpec("model", str, max_len=128),
+        FieldSpec("start", bool, default=True),
+    ],
+)
+
 RESET_CONVERSATION_SCHEMA = ToolSchema(
     tool_name="reset_conversation",
     fields=[],
